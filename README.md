@@ -57,7 +57,7 @@ Don't want to manage infrastructure? **[Lux Cloud](https://luxdb.dev)** is manag
 - **Auth** -- password authentication via `LUX_PASSWORD`
 - **Pub/Sub** -- SUBSCRIBE, UNSUBSCRIBE, PUBLISH
 - **TTL support** -- EX, PX, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL
-- **Sub-2MB binary** -- starts instantly, zero runtime dependencies
+- **856KB Docker image** -- the entire database fits in under 1MB. Redis is 30MB. Dragonfly is 180MB.
 - **MIT licensed** -- no license rug-pulls, unlike Redis (RSALv2/SSPL)
 
 ## Quick Start
