@@ -19,3 +19,4 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+panic = "abort"
