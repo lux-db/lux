@@ -1,0 +1,14 @@
+{
+  "name": "@luxdb/sdk",
+  "version": "0.2.0",
+  "description": "TypeScript client for Lux key-value store",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mattyhogan/lux"
+  },
+  "keywords": ["lux", "redis", "key-value", "database", "sdk"]
+}

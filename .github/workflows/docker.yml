@@ -1,0 +1,118 @@
+name: Docker Image
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-amd64:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:build-amd64
+          cache-from: type=gha,scope=docker-amd64
+          cache-to: type=gha,mode=max,scope=docker-amd64
+
+      - run: echo "${{ steps.build.outputs.digest }}" > /tmp/digest-amd64.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-amd64
+          path: /tmp/digest-amd64.txt
+
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:build-arm64
+          cache-from: type=gha,scope=docker-arm64
+          cache-to: type=gha,mode=max,scope=docker-arm64
+
+      - run: echo "${{ steps.build.outputs.digest }}" > /tmp/digest-arm64.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-arm64
+          path: /tmp/digest-arm64.txt
+
+  merge:
+    needs: [build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: docker-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Create manifest
+        run: |
+          AMD64_DIGEST=$(cat /tmp/digests/digest-amd64.txt)
+          ARM64_DIGEST=$(cat /tmp/digests/digest-arm64.txt)
+          TAGS=$(echo "${{ steps.meta.outputs.tags }}" | tr '\n' ' ')
+          for TAG in $TAGS; do
+            docker buildx imagetools create -t "$TAG" \
+              "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${AMD64_DIGEST}" \
+              "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${ARM64_DIGEST}"
+          done

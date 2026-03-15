@@ -1,0 +1,21 @@
+[package]
+name = "lux"
+version = "0.2.0"
+edition = "2021"
+description = "A fast, multi-threaded key-value store. Drop-in Redis replacement."
+license = "MIT"
+repository = "https://github.com/mattyhogan/lux"
+keywords = ["redis", "key-value", "database", "cache"]
+categories = ["database", "caching"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+parking_lot = "0.12"
+hashbrown = "0.14"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
