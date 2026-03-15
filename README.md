@@ -5,12 +5,12 @@
 <h1 align="center">Lux</h1>
 
 <p align="center">
-  <strong>The fastest Redis-compatible key-value store.</strong><br/>
-  Multi-threaded. Written in Rust. 2-4x faster than Redis.
+  <strong>A drop-in Redis replacement. 3-5x faster.</strong><br/>
+  Multi-threaded. Written in Rust. MIT licensed forever.
 </p>
 
 <p align="center">
-  <a href="https://luxdb.dev">LuxDB Cloud</a> &middot;
+  <a href="https://luxdb.dev">Lux Cloud</a> &middot;
   <a href="https://luxdb.dev/vs/redis">Benchmarks</a> &middot;
   <a href="https://luxdb.dev/architecture">Architecture</a>
 </p>
@@ -19,50 +19,46 @@
 
 ## Why Lux?
 
-Redis is single-threaded. Lux is not.
+Redis is single-threaded by design. Every command runs on one core. Lux takes the opposite approach: a **sharded concurrent architecture** built in Rust that safely uses all your cores. Change your connection string. Everything else stays the same.
 
-Lux uses a **sharded concurrent architecture** with per-shard reader-writer locks, zero-copy RESP parsing, and pipeline batching by shard. Every core works in parallel. The shard count auto-tunes based on your CPU count.
+**Works with every Redis client** -- ioredis, redis-py, go-redis, Jedis, redis-rb. Zero code changes.
 
-### Benchmarks (12-core, redis-benchmark, 50 clients)
+### Benchmarks
 
-| Benchmark | Lux | Redis 7 | Ratio |
-|-----------|-----|---------|-------|
-| SET | 104,493 rps | 45,455 rps | **2.30x** |
-| GET | 104,822 rps | 46,168 rps | **2.27x** |
-| SET (pipeline 16) | 1,488,095 rps | 541,126 rps | **2.75x** |
-| GET (pipeline 16) | 1,488,095 rps | 704,225 rps | **2.11x** |
-| SET (pipeline 64) | **4,640,372 rps** | 1,992,032 rps | **2.33x** |
-| GET (pipeline 64) | **4,629,630 rps** | 1,879,699 rps | **2.46x** |
-| SET (pipeline 256) | **10,178,117 rps** | 2,301,496 rps | **4.42x** |
-| GET (pipeline 256) | **10,282,776 rps** | 3,427,592 rps | **3.00x** |
+`redis-benchmark`, 50 clients, 1M requests per test. All competitors on the same machine.
 
-The advantage grows with core count. On a 4-core Raspberry Pi 5, Lux matches Redis at parity. On 12+ cores, it pulls ahead on every benchmark. At high pipeline depths it reaches **10M+ ops/sec**.
+| Pipeline | Lux | Redis 7 | Valkey 9 | KeyDB | Lux vs Redis |
+|----------|-----|---------|----------|-------|-------------|
+| 1 | 106K | 110K | 108K | 68K | 0.97x |
+| 16 | 1.49M | 902K | 745K | 930K | **1.65x** |
+| 64 | **4.65M** | 1.50M | 1.16M | 1.41M | **3.10x** |
+| 128 | **7.19M** | 1.73M | 1.30M | 1.46M | **4.16x** |
+| 256 | **10.5M** | 1.88M | 1.41M | 1.35M | **5.59x** |
 
-## LuxDB Cloud
+At pipeline depth 256, Lux hits **10.5 million SET ops/sec**. That's 5.6x faster than Redis. The gap grows with core count and pipeline depth because Lux's shard batching and multi-threading scale with concurrency while Redis hits a single-core ceiling.
 
-Don't want to manage infrastructure? **[LuxDB Cloud](https://luxdb.dev)** is managed Lux hosting.
+## Lux Cloud
+
+Don't want to manage infrastructure? **[Lux Cloud](https://luxdb.dev)** is managed Lux hosting.
 
 - **$5/mo** per instance, 1GB memory
 - 4x more memory than Redis Cloud at the same price
 - Deploy in seconds, connect with any Redis client
-- Persistence, monitoring, and auth included
-
-```bash
-redis-cli -h your-instance.luxdb.dev -p 30115 -a your-password
-```
+- Persistence, monitoring, and web console included
 
 ## Features
 
 - **80+ Redis commands** -- strings, lists, hashes, sets, pub/sub
-- **RESP protocol** -- works with redis-cli, ioredis, redis-py, any Redis client
-- **Multi-threaded** -- auto-tuned shards with parking_lot RwLocks, tokio async runtime
-- **Zero-copy parser** -- RESP arguments are byte slices into the read buffer, zero heap allocations
-- **Pipeline batching** -- commands grouped by shard, one lock acquisition per shard per batch
-- **Persistence** -- automatic snapshots, configurable interval via `LUX_SAVE_INTERVAL`
-- **Auth** -- `LUX_PASSWORD` env var enables AUTH command
-- **Pub/Sub** -- SUBSCRIBE, UNSUBSCRIBE, PUBLISH with broadcast channels
+- **RESP protocol** -- drop-in compatible with every Redis client
+- **Multi-threaded** -- auto-tuned shards, parking_lot RwLocks, tokio async runtime
+- **Zero-copy parser** -- RESP arguments are byte slices into the read buffer
+- **Pipeline batching** -- commands grouped by shard, one lock acquisition per batch
+- **Persistence** -- automatic snapshots, configurable interval
+- **Auth** -- password authentication via `LUX_PASSWORD`
+- **Pub/Sub** -- SUBSCRIBE, UNSUBSCRIBE, PUBLISH
 - **TTL support** -- EX, PX, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL
 - **Sub-2MB binary** -- starts instantly, zero runtime dependencies
+- **MIT licensed** -- no license rug-pulls, unlike Redis (RSALv2/SSPL)
 
 ## Quick Start
 
@@ -74,31 +70,29 @@ cargo build --release
 Lux starts on `0.0.0.0:6379` by default. Connect with any Redis client:
 
 ```bash
-redis-cli -p 6379
+redis-cli
 > SET hello world
 OK
 > GET hello
 "world"
 ```
 
+### Docker
+
+```bash
+docker run -d -p 6379:6379 ghcr.io/lux-db/lux:latest
+```
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LUX_PORT` | `6379` | TCP port to listen on |
-| `LUX_PASSWORD` | (none) | Enable AUTH, require this password |
-| `LUX_DATA_DIR` | `.` | Directory for snapshot files |
+| `LUX_PORT` | `6379` | TCP port |
+| `LUX_PASSWORD` | (none) | Enable AUTH |
+| `LUX_DATA_DIR` | `.` | Snapshot directory |
 | `LUX_SAVE_INTERVAL` | `60` | Snapshot interval in seconds (0 to disable) |
-| `LUX_SHARDS` | auto | Number of shards (default: num_cpus * 16, rounded to power of 2) |
+| `LUX_SHARDS` | auto | Shard count (default: num_cpus * 16) |
 | `LUX_RESTRICTED` | (none) | Set to `1` to disable KEYS, FLUSHALL, FLUSHDB |
-
-### Docker
-
-```bash
-docker run -d -p 6379:6379 \
-  -e LUX_PASSWORD=mysecretpassword \
-  ghcr.io/mattyhogan/lux:latest
-```
 
 ### Node.js SDK
 
@@ -109,12 +103,7 @@ npm install @luxdb/sdk
 ```typescript
 import { Lux } from "@luxdb/sdk"
 
-const db = new Lux({
-  host: "localhost",
-  port: 6379,
-  password: "mysecretpassword"
-})
-
+const db = new Lux({ host: "localhost", port: 6379 })
 await db.connect()
 await db.set("hello", "world")
 console.log(await db.get("hello")) // "world"
@@ -122,26 +111,19 @@ console.log(await db.get("hello")) // "world"
 
 ## Supported Commands
 
-### Strings
-`SET` `GET` `SETNX` `SETEX` `PSETEX` `GETSET` `MGET` `MSET` `STRLEN` `APPEND` `INCR` `DECR` `INCRBY` `DECRBY`
+**Strings:** `SET` `GET` `SETNX` `SETEX` `PSETEX` `GETSET` `MGET` `MSET` `STRLEN` `APPEND` `INCR` `DECR` `INCRBY` `DECRBY`
 
-### Keys
-`DEL` `EXISTS` `KEYS` `SCAN` `TYPE` `RENAME` `TTL` `PTTL` `EXPIRE` `PEXPIRE` `PERSIST` `DBSIZE` `FLUSHDB` `FLUSHALL`
+**Keys:** `DEL` `EXISTS` `KEYS` `SCAN` `TYPE` `RENAME` `TTL` `PTTL` `EXPIRE` `PEXPIRE` `PERSIST` `DBSIZE` `FLUSHDB` `FLUSHALL`
 
-### Lists
-`LPUSH` `RPUSH` `LPOP` `RPOP` `LLEN` `LRANGE` `LINDEX`
+**Lists:** `LPUSH` `RPUSH` `LPOP` `RPOP` `LLEN` `LRANGE` `LINDEX`
 
-### Hashes
-`HSET` `HMSET` `HGET` `HMGET` `HDEL` `HGETALL` `HKEYS` `HVALS` `HLEN` `HEXISTS` `HINCRBY`
+**Hashes:** `HSET` `HMSET` `HGET` `HMGET` `HDEL` `HGETALL` `HKEYS` `HVALS` `HLEN` `HEXISTS` `HINCRBY`
 
-### Sets
-`SADD` `SREM` `SMEMBERS` `SISMEMBER` `SCARD` `SUNION` `SINTER` `SDIFF`
+**Sets:** `SADD` `SREM` `SMEMBERS` `SISMEMBER` `SCARD` `SUNION` `SINTER` `SDIFF`
 
-### Pub/Sub
-`PUBLISH` `SUBSCRIBE` `UNSUBSCRIBE`
+**Pub/Sub:** `PUBLISH` `SUBSCRIBE` `UNSUBSCRIBE`
 
-### Server
-`PING` `ECHO` `INFO` `SAVE` `AUTH` `CONFIG` `CLIENT` `SELECT` `COMMAND`
+**Server:** `PING` `ECHO` `INFO` `SAVE` `BGSAVE` `LASTSAVE` `AUTH` `CONFIG` `CLIENT` `SELECT` `COMMAND` `DUMP` `RESTORE`
 
 ## Architecture
 
@@ -159,9 +141,7 @@ Client connections (tokio tasks)
    FNV Hash -> Shard Selection (pre-computed, reused for HashMap lookup)
 ```
 
-Each shard is cache-line aligned (`#[repr(align(128))]`) to prevent false sharing. Values stored as `bytes::Bytes`. Common responses pre-serialized as static byte slices. Expiration checks use a cached `Instant::now()` captured once per pipeline batch. Background sweep task evicts expired keys every 100ms.
-
-Read the full architecture deep dive at [luxdb.dev/architecture](https://luxdb.dev/architecture).
+Read the full deep dive at [luxdb.dev/architecture](https://luxdb.dev/architecture).
 
 ## License
 

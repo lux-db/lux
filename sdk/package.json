@@ -8,7 +8,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mattyhogan/lux"
+    "url": "https://github.com/lux-db/lux"
   },
   "keywords": ["lux", "redis", "key-value", "database", "sdk"]
 }
