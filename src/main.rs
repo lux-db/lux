@@ -8,6 +8,7 @@ mod pubsub;
 mod resp;
 mod snapshot;
 mod store;
+mod tables;
 
 use bytes::BytesMut;
 use cmd::CmdResult;

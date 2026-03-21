@@ -12,6 +12,7 @@ mod sort;
 mod sorted_sets;
 mod streams;
 mod strings;
+mod tables;
 mod timeseries;
 mod vectors;
 
@@ -638,6 +639,36 @@ pub fn execute(
             }
             if cmd_eq(cmd, b"TSINFO") {
                 return timeseries::cmd_tsinfo(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"TCREATE") {
+                return tables::cmd_tcreate(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"TINSERT") {
+                return tables::cmd_tinsert(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"TGET") {
+                return tables::cmd_tget(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"TQUERY") {
+                return tables::cmd_tquery(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"TUPDATE") {
+                return tables::cmd_tupdate(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"TDEL") {
+                return tables::cmd_tdel(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"TDROP") {
+                return tables::cmd_tdrop(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"TCOUNT") {
+                return tables::cmd_tcount(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"TSCHEMA") {
+                return tables::cmd_tschema(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"TLIST") {
+                return tables::cmd_tlist(args, store, out, now);
             }
         }
         b'U' => {
@@ -1716,6 +1747,16 @@ pub fn is_known_command(cmd: &[u8]) -> bool {
         || cmd_eq(cmd, b"BITOP")
         || cmd_eq(cmd, b"KSUB")
         || cmd_eq(cmd, b"KUNSUB")
+        || cmd_eq(cmd, b"TCREATE")
+        || cmd_eq(cmd, b"TINSERT")
+        || cmd_eq(cmd, b"TGET")
+        || cmd_eq(cmd, b"TQUERY")
+        || cmd_eq(cmd, b"TUPDATE")
+        || cmd_eq(cmd, b"TDEL")
+        || cmd_eq(cmd, b"TDROP")
+        || cmd_eq(cmd, b"TCOUNT")
+        || cmd_eq(cmd, b"TSCHEMA")
+        || cmd_eq(cmd, b"TLIST")
 }
 
 pub fn validate_args(args: &[&[u8]]) -> Result<(), String> {

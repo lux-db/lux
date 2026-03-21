@@ -262,6 +262,11 @@ pub fn is_write_command(cmd: &[u8]) -> bool {
         || eq(cmd, b"SORT")
         || eq(cmd, b"TSADD")
         || eq(cmd, b"TSMADD")
+        || eq(cmd, b"TCREATE")
+        || eq(cmd, b"TINSERT")
+        || eq(cmd, b"TUPDATE")
+        || eq(cmd, b"TDEL")
+        || eq(cmd, b"TDROP")
 }
 
 #[cfg(test)]
