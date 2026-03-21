@@ -31,8 +31,53 @@ pub fn cmd_quit(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Insta
     CmdResult::Written
 }
 
-pub fn cmd_hello(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
-    resp::write_array_header(out, 14);
+pub fn cmd_hello(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    let mut authenticated = false;
+    let mut auth_failed = false;
+    let mut i = 2;
+    while i < args.len() {
+        if cmd_eq(args[i], b"AUTH") {
+            if i + 2 >= args.len() {
+                resp::write_error(
+                    out,
+                    "ERR wrong number of arguments for 'hello' AUTH section",
+                );
+                return CmdResult::Written;
+            }
+            let password = arg_str(args[i + 2]);
+            let expected = std::env::var("LUX_PASSWORD").unwrap_or_default();
+            if expected.is_empty() {
+                resp::write_error(out, "ERR Client sent AUTH, but no password is set");
+                return CmdResult::Written;
+            } else if password == expected {
+                authenticated = true;
+            } else {
+                auth_failed = true;
+            }
+            i += 3;
+        } else if cmd_eq(args[i], b"SETNAME") {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    if auth_failed {
+        resp::write_error(out, "WRONGPASS invalid password");
+        return CmdResult::Written;
+    }
+
+    let requested_proto = if args.len() >= 2 {
+        arg_str(args[1]).parse::<i64>().unwrap_or(2)
+    } else {
+        2
+    };
+
+    if requested_proto == 3 {
+        resp::write_map_header(out, 7);
+    } else {
+        resp::write_array_header(out, 14);
+    }
     resp::write_bulk(out, "server");
     resp::write_bulk(out, "lux");
     resp::write_bulk(out, "version");
@@ -47,6 +92,10 @@ pub fn cmd_hello(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Inst
     resp::write_bulk(out, "master");
     resp::write_bulk(out, "modules");
     resp::write_array_header(out, 0);
+
+    if authenticated {
+        return CmdResult::Authenticated;
+    }
     CmdResult::Written
 }
 

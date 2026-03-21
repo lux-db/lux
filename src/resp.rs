@@ -82,6 +82,13 @@ pub fn write_array_header(buf: &mut BytesMut, len: usize) {
     }
 }
 
+pub fn write_map_header(buf: &mut BytesMut, len: usize) {
+    buf.put_u8(b'%');
+    let mut tmp = itoa::Buffer::new();
+    buf.extend_from_slice(tmp.format_usize(len).as_bytes());
+    buf.extend_from_slice(b"\r\n");
+}
+
 pub fn write_bulk_array(buf: &mut BytesMut, items: &[String]) {
     write_array_header(buf, items.len());
     for item in items {

@@ -179,3 +179,39 @@ fn auth_missing_args() {
         "AUTH needs password arg: {resp}"
     );
 }
+
+#[test]
+fn hello_allowed_without_auth() {
+    let port: u16 = 16606;
+    let _server = start_lux_with_password(port, "secret123");
+    let mut conn = connect(port);
+
+    let resp = send_and_read(&mut conn, &["HELLO"]);
+    assert!(resp.contains("lux"), "HELLO allowed pre-auth: {resp}");
+}
+
+#[test]
+fn hello_with_auth_authenticates() {
+    let port: u16 = 16607;
+    let _server = start_lux_with_password(port, "secret123");
+    let mut conn = connect(port);
+
+    let resp = send_and_read(&mut conn, &["HELLO", "3", "AUTH", "default", "secret123"]);
+    assert!(resp.contains("lux"), "HELLO returns server info: {resp}");
+
+    let resp = send_and_read(&mut conn, &["SET", "k", "v"]);
+    assert!(resp.contains("+OK"), "authenticated via HELLO: {resp}");
+}
+
+#[test]
+fn hello_with_wrong_password_rejected() {
+    let port: u16 = 16608;
+    let _server = start_lux_with_password(port, "secret123");
+    let mut conn = connect(port);
+
+    let resp = send_and_read(&mut conn, &["HELLO", "3", "AUTH", "default", "wrongpass"]);
+    assert!(resp.contains("WRONGPASS"), "bad password in HELLO: {resp}");
+
+    let resp = send_and_read(&mut conn, &["SET", "k", "v"]);
+    assert!(resp.contains("NOAUTH"), "still locked out: {resp}");
+}

@@ -578,6 +578,7 @@ async fn handle_connection(
                 for args in &commands {
                     if !authenticated
                         && !cmd_eq_fast(args[0], b"AUTH")
+                        && !cmd_eq_fast(args[0], b"HELLO")
                         && !cmd_eq_fast(args[0], b"PING")
                         && !cmd_eq_fast(args[0], b"QUIT")
                     {
@@ -723,6 +724,7 @@ async fn handle_connection(
                 for args in &commands {
                     if !authenticated
                         && !cmd_eq_fast(args[0], b"AUTH")
+                        && !cmd_eq_fast(args[0], b"HELLO")
                         && !cmd_eq_fast(args[0], b"PING")
                         && !cmd_eq_fast(args[0], b"QUIT")
                     {
