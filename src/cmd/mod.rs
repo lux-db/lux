@@ -36,7 +36,7 @@ pub enum CmdResult {
     },
     Publish {
         channel: String,
-        message: String,
+        message: Bytes,
     },
     BlockPop {
         keys: Vec<String>,

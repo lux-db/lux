@@ -51,7 +51,7 @@ pub enum MessageKind {
 #[derive(Clone, Debug)]
 pub struct Message {
     pub channel: String,
-    pub payload: String,
+    pub payload: Bytes,
     pub pattern: Option<String>,
     pub kind: MessageKind,
 }
@@ -192,7 +192,7 @@ impl Broker {
         tx.subscribe()
     }
 
-    pub fn publish(&self, channel: &str, payload: String) -> i64 {
+    pub fn publish(&self, channel: &str, payload: Bytes) -> i64 {
         let mut count = 0i64;
         {
             let channels = self.channels.read();
@@ -350,10 +350,10 @@ impl Broker {
         key: &str,
         cmd: &[u8],
     ) {
-        let mut op: Option<String> = None;
+        let mut op: Option<Bytes> = None;
         if let Some(tx) = exact_subs.get(key) {
             let operation = op
-                .get_or_insert_with(|| std::str::from_utf8(cmd).unwrap_or("").to_ascii_lowercase());
+                .get_or_insert_with(|| Bytes::copy_from_slice(&cmd.to_ascii_lowercase()));
             let msg = Message {
                 channel: key.to_string(),
                 payload: operation.clone(),
@@ -366,7 +366,7 @@ impl Broker {
         for (pat, tx) in glob_subs.iter() {
             if glob_match(pat, key) {
                 let operation = op.get_or_insert_with(|| {
-                    std::str::from_utf8(cmd).unwrap_or("").to_ascii_lowercase()
+                    Bytes::copy_from_slice(&cmd.to_ascii_lowercase())
                 });
                 let msg = Message {
                     channel: key.to_string(),
@@ -499,17 +499,17 @@ mod tests {
     fn subscribe_and_publish() {
         let broker = Broker::new();
         let mut rx = broker.subscribe("test-channel");
-        let count = broker.publish("test-channel", "hello".to_string());
+        let count = broker.publish("test-channel", Bytes::from_static(b"hello"));
         assert_eq!(count, 1);
         let msg = rx.try_recv().unwrap();
         assert_eq!(msg.channel, "test-channel");
-        assert_eq!(msg.payload, "hello");
+        assert_eq!(msg.payload.as_ref(), b"hello");
     }
 
     #[test]
     fn publish_to_empty_channel_returns_zero() {
         let broker = Broker::new();
-        let count = broker.publish("nobody-listening", "hello".to_string());
+        let count = broker.publish("nobody-listening", Bytes::from_static(b"hello"));
         assert_eq!(count, 0);
     }
 
@@ -518,9 +518,9 @@ mod tests {
         let broker = Broker::new();
         let mut rx1 = broker.subscribe("ch");
         let mut rx2 = broker.subscribe("ch");
-        broker.publish("ch", "msg".to_string());
-        assert_eq!(rx1.try_recv().unwrap().payload, "msg");
-        assert_eq!(rx2.try_recv().unwrap().payload, "msg");
+        broker.publish("ch", Bytes::from_static(b"msg"));
+        assert_eq!(rx1.try_recv().unwrap().payload.as_ref(), b"msg");
+        assert_eq!(rx2.try_recv().unwrap().payload.as_ref(), b"msg");
     }
 
     #[test]
@@ -528,20 +528,20 @@ mod tests {
         let broker = Broker::new();
         let mut rx_a = broker.subscribe("a");
         let _rx_b = broker.subscribe("b");
-        broker.publish("a", "only-a".to_string());
-        assert_eq!(rx_a.try_recv().unwrap().payload, "only-a");
+        broker.publish("a", Bytes::from_static(b"only-a"));
+        assert_eq!(rx_a.try_recv().unwrap().payload.as_ref(), b"only-a");
     }
 
     #[test]
     fn multiple_messages_in_order() {
         let broker = Broker::new();
         let mut rx = broker.subscribe("ch");
-        broker.publish("ch", "first".to_string());
-        broker.publish("ch", "second".to_string());
-        broker.publish("ch", "third".to_string());
-        assert_eq!(rx.try_recv().unwrap().payload, "first");
-        assert_eq!(rx.try_recv().unwrap().payload, "second");
-        assert_eq!(rx.try_recv().unwrap().payload, "third");
+        broker.publish("ch", Bytes::from_static(b"first"));
+        broker.publish("ch", Bytes::from_static(b"second"));
+        broker.publish("ch", Bytes::from_static(b"third"));
+        assert_eq!(rx.try_recv().unwrap().payload.as_ref(), b"first");
+        assert_eq!(rx.try_recv().unwrap().payload.as_ref(), b"second");
+        assert_eq!(rx.try_recv().unwrap().payload.as_ref(), b"third");
     }
 
     #[test]

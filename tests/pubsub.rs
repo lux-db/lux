@@ -11,6 +11,16 @@ fn resp_cmd(args: &[&str]) -> Vec<u8> {
     buf.into_bytes()
 }
 
+fn resp_cmd_raw(args: &[&[u8]]) -> Vec<u8> {
+    let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+    for arg in args {
+        buf.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        buf.extend_from_slice(arg);
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf
+}
+
 fn read_all(stream: &mut TcpStream) -> String {
     let mut data = Vec::with_capacity(4096);
     let mut buf = [0u8; 8192];
@@ -26,6 +36,21 @@ fn read_all(stream: &mut TcpStream) -> String {
     String::from_utf8_lossy(&data).to_string()
 }
 
+fn read_all_bytes(stream: &mut TcpStream) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4096);
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(len) => data.extend_from_slice(&buf[..len]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(_) => break,
+        }
+    }
+    data
+}
+
 fn send_and_read(stream: &mut TcpStream, args: &[&str]) -> String {
     stream.write_all(&resp_cmd(args)).unwrap();
     thread::sleep(Duration::from_millis(50));
@@ -34,6 +59,10 @@ fn send_and_read(stream: &mut TcpStream, args: &[&str]) -> String {
 
 fn send(stream: &mut TcpStream, args: &[&str]) {
     stream.write_all(&resp_cmd(args)).unwrap();
+}
+
+fn send_raw(stream: &mut TcpStream, args: &[&[u8]]) {
+    stream.write_all(&resp_cmd_raw(args)).unwrap();
 }
 
 fn find_lux_binary() -> Option<std::path::PathBuf> {
@@ -149,6 +178,35 @@ fn publish_delivers_message_to_subscriber() {
     assert!(resp.contains("message"), "message type: {resp}");
     assert!(resp.contains("events"), "channel name: {resp}");
     assert!(resp.contains("hello_world"), "payload: {resp}");
+}
+
+#[test]
+fn publish_preserves_binary_payload_bytes() {
+    let port: u16 = 16710;
+    let _server = start_lux(port);
+    let mut sub_conn = connect(port);
+    let mut pub_conn = connect(port);
+
+    send(&mut sub_conn, &["SUBSCRIBE", "events"]);
+    thread::sleep(Duration::from_millis(100));
+    let _ = read_all_bytes(&mut sub_conn);
+
+    let payload: &[u8] = b"\x00\xff\x80msgpack\x00\x01";
+    send_raw(&mut pub_conn, &[b"PUBLISH", b"events", payload]);
+    thread::sleep(Duration::from_millis(100));
+    let _ = read_all_bytes(&mut pub_conn);
+
+    let resp = read_all_bytes(&mut sub_conn);
+    assert!(resp.windows(b"message".len()).any(|w| w == b"message"), "message type missing: {resp:?}");
+    assert!(resp.windows(b"events".len()).any(|w| w == b"events"), "channel missing: {resp:?}");
+
+    let mut needle = format!("${}\r\n", payload.len()).into_bytes();
+    needle.extend_from_slice(payload);
+    needle.extend_from_slice(b"\r\n");
+    assert!(
+        resp.windows(needle.len()).any(|w| w == needle.as_slice()),
+        "binary payload not preserved exactly: {resp:?}"
+    );
 }
 
 #[test]

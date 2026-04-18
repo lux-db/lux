@@ -655,7 +655,7 @@ async fn handle_connection(
                                     resp::write_bulk(&mut write_buf, "kmessage");
                                     resp::write_bulk(&mut write_buf, msg.pattern.as_deref().unwrap_or(""));
                                     resp::write_bulk(&mut write_buf, &msg.channel);
-                                    resp::write_bulk(&mut write_buf, &msg.payload);
+                                    resp::write_bulk_raw(&mut write_buf, &msg.payload);
                                 }
                                 pubsub::MessageKind::PubSub => {
                                     if let Some(ref pat) = msg.pattern {
@@ -663,12 +663,12 @@ async fn handle_connection(
                                         resp::write_bulk(&mut write_buf, "pmessage");
                                         resp::write_bulk(&mut write_buf, pat);
                                         resp::write_bulk(&mut write_buf, &msg.channel);
-                                        resp::write_bulk(&mut write_buf, &msg.payload);
+                                        resp::write_bulk_raw(&mut write_buf, &msg.payload);
                                     } else {
                                         resp::write_array_header(&mut write_buf, 3);
                                         resp::write_bulk(&mut write_buf, "message");
                                         resp::write_bulk(&mut write_buf, &msg.channel);
-                                        resp::write_bulk(&mut write_buf, &msg.payload);
+                                        resp::write_bulk_raw(&mut write_buf, &msg.payload);
                                     }
                                 }
                             }

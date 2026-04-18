@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::time::Instant;
 
 use crate::resp;
@@ -13,7 +13,7 @@ pub fn cmd_publish(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Ins
     }
     CmdResult::Publish {
         channel: arg_str(args[1]).to_string(),
-        message: arg_str(args[2]).to_string(),
+        message: Bytes::copy_from_slice(args[2]),
     }
 }
 
