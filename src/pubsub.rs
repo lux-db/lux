@@ -352,8 +352,8 @@ impl Broker {
     ) {
         let mut op: Option<Bytes> = None;
         if let Some(tx) = exact_subs.get(key) {
-            let operation = op
-                .get_or_insert_with(|| Bytes::copy_from_slice(&cmd.to_ascii_lowercase()));
+            let operation =
+                op.get_or_insert_with(|| Bytes::copy_from_slice(&cmd.to_ascii_lowercase()));
             let msg = Message {
                 channel: key.to_string(),
                 payload: operation.clone(),
@@ -365,9 +365,8 @@ impl Broker {
         }
         for (pat, tx) in glob_subs.iter() {
             if glob_match(pat, key) {
-                let operation = op.get_or_insert_with(|| {
-                    Bytes::copy_from_slice(&cmd.to_ascii_lowercase())
-                });
+                let operation =
+                    op.get_or_insert_with(|| Bytes::copy_from_slice(&cmd.to_ascii_lowercase()));
                 let msg = Message {
                     channel: key.to_string(),
                     payload: operation.clone(),

@@ -197,8 +197,14 @@ fn publish_preserves_binary_payload_bytes() {
     let _ = read_all_bytes(&mut pub_conn);
 
     let resp = read_all_bytes(&mut sub_conn);
-    assert!(resp.windows(b"message".len()).any(|w| w == b"message"), "message type missing: {resp:?}");
-    assert!(resp.windows(b"events".len()).any(|w| w == b"events"), "channel missing: {resp:?}");
+    assert!(
+        resp.windows(b"message".len()).any(|w| w == b"message"),
+        "message type missing: {resp:?}"
+    );
+    assert!(
+        resp.windows(b"events".len()).any(|w| w == b"events"),
+        "channel missing: {resp:?}"
+    );
 
     let mut needle = format!("${}\r\n", payload.len()).into_bytes();
     needle.extend_from_slice(payload);
