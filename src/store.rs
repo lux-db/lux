@@ -5,6 +5,7 @@ use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU32, AtomicUsize};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 pub static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
@@ -116,20 +117,6 @@ impl Hasher for FxHasher {
     }
 }
 
-pub fn num_shards() -> usize {
-    static SHARDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SHARDS.get_or_init(|| {
-        std::env::var("LUX_SHARDS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                let cpus = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4);
-                (cpus * 16).next_power_of_two().clamp(16, 1024)
-            })
-    })
-}
 #[allow(dead_code)]
 pub const MAX_SHARDS: usize = 1024;
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
@@ -199,6 +186,7 @@ pub(crate) struct Shard {
 }
 
 pub struct Store {
+    config: Arc<crate::ServerConfig>,
     shards: Box<[RwLock<Shard>]>,
     pub(crate) vector_index: RwLock<crate::hnsw::HnswIndex>,
     disk_shards: Option<Box<[parking_lot::Mutex<crate::disk::DiskShard>]>>,
@@ -263,7 +251,11 @@ pub fn estimate_entry_memory(key: &str, value: &StoreValue) -> usize {
 
 impl Store {
     pub fn new() -> Self {
-        let n = num_shards();
+        Self::new_with_config(Arc::new(crate::ServerConfig::default()))
+    }
+
+    pub fn new_with_config(config: Arc<crate::ServerConfig>) -> Self {
+        let n = config.shards;
         let shards: Vec<RwLock<Shard>> = (0..n)
             .map(|_| {
                 RwLock::new(Shard {
@@ -274,10 +266,10 @@ impl Store {
             })
             .collect();
 
-        let config = crate::disk::storage_config();
         let disk_shard_count = n.min(64);
-        let (disk_shards, wal_shards) = if config.mode == crate::disk::StorageMode::Tiered {
-            let dir = std::path::Path::new(&config.dir);
+        let (disk_shards, wal_shards) = if config.storage.mode == crate::disk::StorageMode::Tiered
+        {
+            let dir = std::path::Path::new(&config.storage.dir);
             let ds: Vec<parking_lot::Mutex<crate::disk::DiskShard>> = (0..disk_shard_count)
                 .map(|i| {
                     parking_lot::Mutex::new(
@@ -300,12 +292,17 @@ impl Store {
         };
 
         Self {
+            config,
             shards: shards.into_boxed_slice(),
             vector_index: RwLock::new(crate::hnsw::HnswIndex::new(0)),
             disk_shards,
             wal_shards,
             wal_suppress: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub fn config(&self) -> &crate::ServerConfig {
+        &self.config
     }
 
     pub fn shard_count(&self) -> usize {
@@ -339,11 +336,11 @@ impl Store {
         self.disk_shards.is_some()
     }
 
-    pub fn lock_read_shard(&self, idx: usize) -> parking_lot::RwLockReadGuard<'_, Shard> {
+    pub(crate) fn lock_read_shard(&self, idx: usize) -> parking_lot::RwLockReadGuard<'_, Shard> {
         self.shards[idx].read()
     }
 
-    pub fn lock_write_shard(&self, idx: usize) -> parking_lot::RwLockWriteGuard<'_, Shard> {
+    pub(crate) fn lock_write_shard(&self, idx: usize) -> parking_lot::RwLockWriteGuard<'_, Shard> {
         self.shards[idx].write()
     }
 
@@ -656,7 +653,7 @@ impl Store {
     }
 
     #[inline(always)]
-    pub fn get_from_shard(
+    pub(crate) fn get_from_shard(
         data: &HashMap<String, Entry, FxBuildHasher>,
         key: &[u8],
         now: Instant,
@@ -676,7 +673,7 @@ impl Store {
     }
 
     #[inline(always)]
-    pub fn get_and_write(
+    pub(crate) fn get_and_write(
         data: &HashMap<String, Entry, FxBuildHasher>,
         key: &[u8],
         now: Instant,
@@ -696,7 +693,7 @@ impl Store {
     }
 
     #[inline(always)]
-    pub fn set_on_shard(
+    pub(crate) fn set_on_shard(
         data: &mut HashMap<String, Entry, FxBuildHasher>,
         key: &[u8],
         value: &[u8],

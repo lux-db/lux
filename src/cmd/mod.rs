@@ -77,8 +77,8 @@ pub enum CmdResult {
     ScriptOp,
 }
 
-fn is_restricted() -> bool {
-    std::env::var("LUX_RESTRICTED").is_ok_and(|v| v == "1" || v == "true")
+fn is_restricted(store: &Store) -> bool {
+    store.config().restricted
 }
 
 #[inline(always)]
@@ -134,7 +134,7 @@ pub fn execute(
         || cmd_eq(cmd, b"FLUSHALL")
         || cmd_eq(cmd, b"FLUSHDB")
         || cmd_eq(cmd, b"DEBUG"))
-        && is_restricted()
+        && is_restricted(store)
     {
         resp::write_error(out, "ERR command disabled in restricted mode");
         return CmdResult::Written;
@@ -848,9 +848,9 @@ pub fn execute_with_wal(
     execute(store, cache, broker, args, out, now)
 }
 
-pub type ShardData = hashbrown::HashMap<String, Entry, crate::store::FxBuildHasher>;
+pub(crate) type ShardData = hashbrown::HashMap<String, Entry, crate::store::FxBuildHasher>;
 
-pub fn execute_on_shard(
+pub(crate) fn execute_on_shard(
     data: &mut ShardData,
     _store: &Store,
     _broker: &Broker,
@@ -1007,7 +1007,12 @@ pub fn execute_on_shard(
     }
 }
 
-pub fn execute_on_shard_read(data: &ShardData, args: &[&[u8]], out: &mut BytesMut, now: Instant) {
+pub(crate) fn execute_on_shard_read(
+    data: &ShardData,
+    args: &[&[u8]],
+    out: &mut BytesMut,
+    now: Instant,
+) {
     if args.is_empty() || args.len() < 2 {
         resp::write_error(out, "ERR no command");
         return;
@@ -1991,11 +1996,12 @@ mod tests {
 
     #[test]
     fn auth_wrong_password() {
-        std::env::set_var("LUX_PASSWORD", "secret123");
-        let store = Store::new();
+        let mut cfg = crate::ServerConfig::default();
+        cfg.password = "secret123".to_string();
+        cfg.require_auth = true;
+        let store = Store::new_with_config(std::sync::Arc::new(cfg));
         let out = exec_str(&store, &[b"AUTH", b"wrong"]);
         assert!(out.contains("WRONGPASS"));
-        std::env::remove_var("LUX_PASSWORD");
     }
 
     #[test]

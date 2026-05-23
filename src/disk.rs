@@ -44,7 +44,7 @@ fn crc32(data: &[u8]) -> u32 {
     crc ^ 0xFFFF_FFFF
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageMode {
     /// All data in memory. Eviction deletes permanently. Zero disk overhead.
     Memory,
@@ -52,28 +52,28 @@ pub enum StorageMode {
     Tiered,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StorageConfig {
     pub mode: StorageMode,
     pub dir: String,
 }
 
-static STORAGE_CONFIG: OnceLock<StorageConfig> = OnceLock::new();
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            mode: StorageMode::Memory,
+            dir: "./storage".to_string(),
+        }
+    }
+}
 
-pub fn storage_config() -> &'static StorageConfig {
-    STORAGE_CONFIG.get_or_init(|| {
-        let mode = match std::env::var("LUX_STORAGE_MODE")
-            .unwrap_or_default()
-            .to_lowercase()
-            .as_str()
-        {
-            "tiered" => StorageMode::Tiered,
-            _ => StorageMode::Memory,
-        };
-        let data_dir = std::env::var("LUX_DATA_DIR").unwrap_or_else(|_| ".".to_string());
-        let dir = std::env::var("LUX_STORAGE_DIR")
-            .unwrap_or_else(|_| format!("{}/storage", data_dir.trim_end_matches('/')));
-        StorageConfig { mode, dir }
-    })
+impl StorageMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageMode::Memory => "memory",
+            StorageMode::Tiered => "tiered",
+        }
+    }
 }
 
 /// Write-ahead log for crash recovery.

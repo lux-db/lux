@@ -101,7 +101,7 @@ impl Broker {
         self.list_waiter_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn drain_list_waiters(
+    pub(crate) fn drain_list_waiters(
         &self,
         key: &str,
         shard_data: &mut hashbrown::HashMap<

@@ -126,7 +126,7 @@ async fn handle_request(
         return Ok(true);
     }
 
-    let password = std::env::var("LUX_PASSWORD").unwrap_or_default();
+    let password = &store.config().password;
     if !password.is_empty() {
         let auth = headers
             .iter()

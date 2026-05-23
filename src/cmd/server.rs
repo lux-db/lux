@@ -31,7 +31,7 @@ pub fn cmd_quit(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Insta
     CmdResult::Written
 }
 
-pub fn cmd_hello(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+pub fn cmd_hello(args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
     let mut authenticated = false;
     let mut auth_failed = false;
     let mut i = 2;
@@ -45,7 +45,7 @@ pub fn cmd_hello(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Insta
                 return CmdResult::Written;
             }
             let password = arg_str(args[i + 2]);
-            let expected = std::env::var("LUX_PASSWORD").unwrap_or_default();
+            let expected = &store.config().password;
             if expected.is_empty() {
                 resp::write_error(out, "ERR Client sent AUTH, but no password is set");
                 return CmdResult::Written;
@@ -170,12 +170,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub fn cmd_auth(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+pub fn cmd_auth(args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
     if args.len() < 2 {
         resp::write_error(out, "ERR wrong number of arguments for 'auth' command");
         return CmdResult::Written;
     }
-    let expected = std::env::var("LUX_PASSWORD").unwrap_or_default();
+    let expected = &store.config().password;
     if expected.is_empty() {
         resp::write_error(out, "ERR Client sent AUTH, but no password is set");
     } else if constant_time_eq(arg_str(args[1]).as_bytes(), expected.as_bytes()) {
@@ -227,7 +227,7 @@ pub fn cmd_noop_ok(
 
 fn build_info(store: &Store, _section: &str, now: Instant) -> String {
     let uptime = START_TIME.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
-    let restricted = is_restricted();
+    let restricted = is_restricted(store);
     let powered_by = if restricted {
         "\r\npowered_by:LuxDB Cloud (luxdb.dev)"
     } else {
@@ -278,7 +278,7 @@ fn build_info(store: &Store, _section: &str, now: Instant) -> String {
         crate::pubsub::KEY_EVENTS_EMITTED.load(Ordering::Relaxed),
         crate::pubsub::KEY_EVENTS_COALESCED.load(Ordering::Relaxed),
         store.approximate_memory(),
-        if crate::disk::storage_config().mode == crate::disk::StorageMode::Tiered {
+        if store.config().storage.mode == crate::disk::StorageMode::Tiered {
             "tiered"
         } else {
             "memory"

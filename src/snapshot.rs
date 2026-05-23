@@ -7,17 +7,13 @@ use std::time::{Duration, Instant};
 
 const HEADER: &[u8; 4] = b"LUX\x01";
 
-fn snapshot_path() -> String {
-    let dir = std::env::var("LUX_DATA_DIR").unwrap_or_else(|_| ".".to_string());
+fn snapshot_path(store: &Store) -> String {
+    let dir = &store.config().data_dir;
     format!("{}/lux.dat", dir.trim_end_matches('/'))
 }
 
-fn snapshot_interval() -> Duration {
-    let secs: u64 = std::env::var("LUX_SAVE_INTERVAL")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60);
-    Duration::from_secs(secs)
+fn snapshot_interval(store: &Store) -> Duration {
+    store.config().save_interval
 }
 
 fn write_bytes(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
@@ -68,7 +64,7 @@ fn read_string(r: &mut impl Read) -> io::Result<String> {
 }
 
 pub fn save(store: &Store) -> io::Result<usize> {
-    let path = snapshot_path();
+    let path = snapshot_path(store);
     if let Some(parent) = Path::new(&path).parent() {
         fs::create_dir_all(parent)?;
     }
@@ -182,7 +178,7 @@ fn save_binary(w: &mut impl Write, entries: &[crate::store::DumpEntry]) -> io::R
 }
 
 pub fn load(store: &Store) -> io::Result<usize> {
-    let path_str = snapshot_path();
+    let path_str = snapshot_path(store);
     let path = Path::new(&path_str);
     if !path.exists() {
         return Ok(0);
@@ -470,7 +466,7 @@ fn load_legacy(store: &Store, file: fs::File) -> io::Result<usize> {
 }
 
 pub async fn background_save_loop(store: Arc<Store>) {
-    let interval = snapshot_interval();
+    let interval = snapshot_interval(&store);
     if interval.is_zero() {
         return;
     }
@@ -481,7 +477,7 @@ pub async fn background_save_loop(store: Arc<Store>) {
                 println!("snapshot: saved {n} keys");
                 store.truncate_wal();
             }
-            Err(e) => eprintln!("snapshot error: {e} (path: {})", snapshot_path()),
+            Err(e) => eprintln!("snapshot error: {e} (path: {})", snapshot_path(&store)),
         }
     }
 }

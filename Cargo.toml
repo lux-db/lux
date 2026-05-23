@@ -8,6 +8,14 @@ repository = "https://github.com/lux-db/lux"
 keywords = ["redis", "key-value", "database", "cache"]
 categories = ["database", "caching"]
 
+[lib]
+name = "lux"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lux"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
