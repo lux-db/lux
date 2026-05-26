@@ -2015,9 +2015,11 @@ mod tests {
 
     #[test]
     fn auth_wrong_password() {
-        let mut cfg = crate::ServerConfig::default();
-        cfg.password = "secret123".to_string();
-        cfg.require_auth = true;
+        let cfg = crate::ServerConfig {
+            password: "secret123".to_string(),
+            require_auth: true,
+            ..Default::default()
+        };
         let store = Store::new_with_config(std::sync::Arc::new(cfg));
         let out = exec_str(&store, &[b"AUTH", b"wrong"]);
         assert!(out.contains("WRONGPASS"));

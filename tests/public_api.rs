@@ -77,15 +77,19 @@ async fn run_with_config_instances_keep_runtime_state_isolated() {
     let tmp_a = tempfile::tempdir().unwrap();
     let tmp_b = tempfile::tempdir().unwrap();
 
-    let mut cfg_a = lux::ServerConfig::default();
-    cfg_a.port = 0;
-    cfg_a.shards = 4;
-    cfg_a.data_dir = tmp_a.path().display().to_string();
+    let cfg_a = lux::ServerConfig {
+        port: 0,
+        shards: 4,
+        data_dir: tmp_a.path().display().to_string(),
+        ..Default::default()
+    };
 
-    let mut cfg_b = lux::ServerConfig::default();
-    cfg_b.port = 0;
-    cfg_b.shards = 4;
-    cfg_b.data_dir = tmp_b.path().display().to_string();
+    let cfg_b = lux::ServerConfig {
+        port: 0,
+        shards: 4,
+        data_dir: tmp_b.path().display().to_string(),
+        ..Default::default()
+    };
 
     let handle_a = lux::run_with_config(cfg_a).await.unwrap();
     let handle_b = lux::run_with_config(cfg_b).await.unwrap();
@@ -122,10 +126,12 @@ async fn run_with_config_instances_keep_runtime_state_isolated() {
 #[tokio::test]
 async fn run_with_config_port_zero_assigns_ephemeral_port() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = lux::ServerConfig::default();
-    cfg.port = 0;
-    cfg.shards = 4;
-    cfg.data_dir = tmp.path().display().to_string();
+    let cfg = lux::ServerConfig {
+        port: 0,
+        shards: 4,
+        data_dir: tmp.path().display().to_string(),
+        ..Default::default()
+    };
 
     let handle = lux::run_with_config(cfg).await.unwrap();
     let addr = handle
@@ -139,10 +145,12 @@ async fn run_with_config_port_zero_assigns_ephemeral_port() {
 #[tokio::test]
 async fn run_with_config_can_disable_resp_explicitly() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = lux::ServerConfig::default();
-    cfg.enable_resp = false;
-    cfg.shards = 4;
-    cfg.data_dir = tmp.path().display().to_string();
+    let cfg = lux::ServerConfig {
+        enable_resp: false,
+        shards: 4,
+        data_dir: tmp.path().display().to_string(),
+        ..Default::default()
+    };
 
     let handle = lux::run_with_config(cfg).await.unwrap();
     assert!(
@@ -158,13 +166,15 @@ async fn run_with_config_emits_startup_events_when_callback_set() {
     let events = Arc::new(Mutex::new(Vec::<lux::ServerInfoEvent>::new()));
     let sink = events.clone();
 
-    let mut cfg = lux::ServerConfig::default();
-    cfg.enable_resp = false;
-    cfg.shards = 4;
-    cfg.data_dir = tmp.path().display().to_string();
-    cfg.on_info = Some(Arc::new(move |event| {
-        sink.lock().unwrap().push(event);
-    }));
+    let cfg = lux::ServerConfig {
+        enable_resp: false,
+        shards: 4,
+        data_dir: tmp.path().display().to_string(),
+        on_info: Some(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        })),
+        ..Default::default()
+    };
 
     let handle = lux::run_with_config(cfg).await.unwrap();
     handle.shutdown_and_wait().await.unwrap();
@@ -183,14 +193,16 @@ async fn run_with_config_returns_after_snapshot_and_wal_replay() {
     let tmp = tempfile::tempdir().unwrap();
     let storage_dir = tmp.path().join("storage");
 
-    let mut cfg = lux::ServerConfig::default();
-    cfg.port = 0;
-    cfg.shards = 4;
-    cfg.data_dir = tmp.path().display().to_string();
-    cfg.save_interval = Duration::ZERO;
-    cfg.storage = lux::StorageConfig {
-        mode: lux::StorageMode::Tiered,
-        dir: storage_dir.display().to_string(),
+    let cfg = lux::ServerConfig {
+        port: 0,
+        shards: 4,
+        data_dir: tmp.path().display().to_string(),
+        save_interval: Duration::ZERO,
+        storage: lux::StorageConfig {
+            mode: lux::StorageMode::Tiered,
+            dir: storage_dir.display().to_string(),
+        },
+        ..Default::default()
     };
 
     let handle = lux::run_with_config(cfg.clone()).await.unwrap();
@@ -214,9 +226,12 @@ async fn run_with_config_returns_after_snapshot_and_wal_replay() {
     append_corrupt_wal_frames(&storage_dir);
     let events = Arc::new(Mutex::new(Vec::<lux::ServerWarnEvent>::new()));
     let sink = events.clone();
-    cfg.on_warn = Some(Arc::new(move |event| {
-        sink.lock().unwrap().push(event);
-    }));
+    let cfg = lux::ServerConfig {
+        on_warn: Some(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        })),
+        ..cfg
+    };
 
     let handle = lux::run_with_config(cfg).await.unwrap();
     let addr = handle.local_addr().unwrap();
@@ -252,11 +267,13 @@ async fn run_with_config_reports_http_bind_errors_before_ready() {
     let port = occupied.local_addr().unwrap().port();
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut cfg = lux::ServerConfig::default();
-    cfg.enable_resp = false;
-    cfg.http_port = port;
-    cfg.shards = 4;
-    cfg.data_dir = tmp.path().display().to_string();
+    let cfg = lux::ServerConfig {
+        enable_resp: false,
+        http_port: port,
+        shards: 4,
+        data_dir: tmp.path().display().to_string(),
+        ..Default::default()
+    };
 
     match lux::run_with_config(cfg).await {
         Ok(handle) => {
