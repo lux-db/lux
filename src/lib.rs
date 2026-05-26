@@ -258,10 +258,7 @@ impl ServerHandle {
     pub async fn wait(self) -> std::io::Result<()> {
         match self.server_task.await {
             Ok(result) => result,
-            Err(e) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("server task failed: {e}"),
-            )),
+            Err(e) => Err(std::io::Error::other(format!("server task failed: {e}"))),
         }
     }
 
@@ -303,7 +300,7 @@ async fn wait_for_startup<T>(
     closed_message: &'static str,
 ) -> std::io::Result<T> {
     rx.await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, closed_message))?
+        .map_err(|_| std::io::Error::other(closed_message))?
 }
 
 pub async fn run() -> std::io::Result<()> {
@@ -434,17 +431,15 @@ async fn server_main(
         });
         let on_error = config.on_error.clone();
         background_tasks.spawn(async move {
-            if let Err(e) = http::start_http_server(
+            let http_config = http::HttpServerConfig {
                 http_port,
-                http_store,
-                http_broker,
-                http_cache,
                 max_rows,
                 max_body,
                 on_ready,
-                Some(startup_tx),
-            )
-            .await
+                startup_ready: Some(startup_tx),
+            };
+            if let Err(e) =
+                http::start_http_server(http_config, http_store, http_broker, http_cache).await
             {
                 if let Some(on_error) = on_error {
                     on_error(ServerErrorEvent::HttpServerFailed {

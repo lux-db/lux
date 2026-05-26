@@ -26,39 +26,46 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Start the HTTP API listener and serve requests forever.
+/// Runtime options for the HTTP API listener.
 ///
 /// `startup_ready` is used by `run_with_config` to include the HTTP bind in
 /// the server readiness contract. `on_ready` remains the user-facing log hook.
+pub struct HttpServerConfig {
+    pub http_port: u16,
+    pub max_rows: Option<usize>,
+    pub max_body: usize,
+    pub on_ready: Option<Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>>,
+    pub startup_ready: Option<oneshot::Sender<std::io::Result<std::net::SocketAddr>>>,
+}
+
+/// Start the HTTP API listener and serve requests forever.
 pub async fn start_http_server(
-    port: u16,
+    config: HttpServerConfig,
     store: Arc<Store>,
     broker: Broker,
     cache: SharedSchemaCache,
-    max_rows: Option<usize>,
-    max_body: usize,
-    on_ready: Option<Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>>,
-    startup_ready: Option<oneshot::Sender<std::io::Result<std::net::SocketAddr>>>,
 ) -> std::io::Result<()> {
-    let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+    let addr: std::net::SocketAddr = format!("0.0.0.0:{}", config.http_port).parse().unwrap();
     // Bind before notifying either readiness channel so callers never observe
     // a ready server with a missing HTTP listener.
     let listener = match bind_listener(addr) {
         Ok(listener) => listener,
         Err(e) => {
-            if let Some(startup_ready) = startup_ready {
+            if let Some(startup_ready) = config.startup_ready {
                 let _ = startup_ready.send(Err(std::io::Error::new(e.kind(), e.to_string())));
             }
             return Err(e);
         }
     };
     let local_addr = listener.local_addr()?;
-    if let Some(startup_ready) = startup_ready {
+    if let Some(startup_ready) = config.startup_ready {
         let _ = startup_ready.send(Ok(local_addr));
     }
-    if let Some(on_ready) = on_ready {
+    if let Some(on_ready) = config.on_ready {
         on_ready(local_addr);
     }
+    let max_rows = config.max_rows;
+    let max_body = config.max_body;
 
     loop {
         let (socket, _) = listener.accept().await?;
