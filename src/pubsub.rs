@@ -13,10 +13,41 @@ type KeyEvent = (Box<[u8]>, Box<[u8]>);
 const CHANNEL_CAPACITY: usize = 1024;
 const KEY_EVENT_QUEUE_CAPACITY: usize = 65536;
 
-pub static KEY_EVENTS_ENQUEUED: AtomicU64 = AtomicU64::new(0);
-pub static KEY_EVENTS_DROPPED: AtomicU64 = AtomicU64::new(0);
-pub static KEY_EVENTS_EMITTED: AtomicU64 = AtomicU64::new(0);
-pub static KEY_EVENTS_COALESCED: AtomicU64 = AtomicU64::new(0);
+/// Snapshot of key-event counters for this broker instance.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KeyEventStats {
+    pub enqueued: u64,
+    pub dropped: u64,
+    pub emitted: u64,
+    pub coalesced: u64,
+}
+
+struct KeyEventCounters {
+    enqueued: AtomicU64,
+    dropped: AtomicU64,
+    emitted: AtomicU64,
+    coalesced: AtomicU64,
+}
+
+impl KeyEventCounters {
+    fn new() -> Self {
+        Self {
+            enqueued: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            emitted: AtomicU64::new(0),
+            coalesced: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> KeyEventStats {
+        KeyEventStats {
+            enqueued: self.enqueued.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+            emitted: self.emitted.load(Ordering::Relaxed),
+            coalesced: self.coalesced.load(Ordering::Relaxed),
+        }
+    }
+}
 
 pub struct BlockedPopRequest {
     pub tx: mpsc::Sender<(String, Bytes)>,
@@ -36,6 +67,7 @@ pub struct Broker {
     key_worker_txs: Arc<Vec<mpsc::UnboundedSender<KeyEvent>>>,
     key_worker_rxs: Arc<parking_lot::Mutex<Option<Vec<mpsc::UnboundedReceiver<KeyEvent>>>>>,
     key_event_overflow: Arc<parking_lot::Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
+    key_event_counters: Arc<KeyEventCounters>,
     list_waiters: Arc<parking_lot::Mutex<HashMap<String, VecDeque<BlockedPopRequest>>>>,
     list_waiter_count: Arc<AtomicU64>,
     stream_waiters: Arc<parking_lot::Mutex<HashMap<String, Vec<mpsc::Sender<()>>>>>,
@@ -80,6 +112,7 @@ impl Broker {
             key_worker_txs: Arc::new(worker_txs),
             key_worker_rxs: Arc::new(parking_lot::Mutex::new(Some(worker_rxs))),
             key_event_overflow: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            key_event_counters: Arc::new(KeyEventCounters::new()),
             list_waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             list_waiter_count: Arc::new(AtomicU64::new(0)),
             stream_waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -89,6 +122,10 @@ impl Broker {
 
     pub fn next_waiter_id(&self) -> u64 {
         self.waiter_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn key_event_stats(&self) -> KeyEventStats {
+        self.key_event_counters.snapshot()
     }
 
     pub fn has_list_waiters(&self, _key: &str) -> bool {
@@ -293,16 +330,22 @@ impl Broker {
         if self.key_sub_count.load(Ordering::Relaxed) == 0 {
             return;
         }
-        KEY_EVENTS_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+        self.key_event_counters
+            .enqueued
+            .fetch_add(1, Ordering::Relaxed);
         match self.key_event_tx.try_send((key.into(), cmd.into())) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full((k, c))) => {
                 let mut overflow = self.key_event_overflow.lock();
                 overflow.insert(k.into_vec(), c.into_vec());
-                KEY_EVENTS_COALESCED.fetch_add(1, Ordering::Relaxed);
+                self.key_event_counters
+                    .coalesced
+                    .fetch_add(1, Ordering::Relaxed);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                KEY_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+                self.key_event_counters
+                    .dropped
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -325,7 +368,9 @@ impl Broker {
     fn dispatch_key_event(&self, key: Box<[u8]>, cmd: Box<[u8]>) {
         let index = self.key_worker_index(&key);
         if self.key_worker_txs[index].send((key, cmd)).is_err() {
-            KEY_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+            self.key_event_counters
+                .dropped
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -336,7 +381,7 @@ impl Broker {
             return;
         }
         if let Ok(key_str) = std::str::from_utf8(key) {
-            Self::emit_key_event(exact_snap.as_ref(), glob_snap.as_ref(), key_str, cmd);
+            self.emit_key_event(exact_snap.as_ref(), glob_snap.as_ref(), key_str, cmd);
         }
     }
 
@@ -345,6 +390,7 @@ impl Broker {
     }
 
     fn emit_key_event(
+        &self,
         exact_subs: &KeyExactSubMap,
         glob_subs: &[(String, broadcast::Sender<Message>)],
         key: &str,
@@ -361,7 +407,9 @@ impl Broker {
                 kind: MessageKind::KeyEvent,
             };
             let _ = tx.send(msg);
-            KEY_EVENTS_EMITTED.fetch_add(1, Ordering::Relaxed);
+            self.key_event_counters
+                .emitted
+                .fetch_add(1, Ordering::Relaxed);
         }
         for (pat, tx) in glob_subs.iter() {
             if glob_match(pat, key) {
@@ -374,7 +422,9 @@ impl Broker {
                     kind: MessageKind::KeyEvent,
                 };
                 let _ = tx.send(msg);
-                KEY_EVENTS_EMITTED.fetch_add(1, Ordering::Relaxed);
+                self.key_event_counters
+                    .emitted
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -552,7 +602,7 @@ mod tests {
         drop(rx1);
         broker.kunsub("table:users");
 
-        Broker::emit_key_event(
+        broker.emit_key_event(
             broker.key_exact_subs.read().as_ref(),
             broker.key_glob_subs.read().as_ref(),
             "table:users",

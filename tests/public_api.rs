@@ -41,6 +41,14 @@ fn send_and_read(stream: &mut TcpStream, args: &[&str]) -> String {
     String::from_utf8_lossy(&data).to_string()
 }
 
+fn info_usize(info: &str, field: &str) -> usize {
+    let prefix = format!("{field}:");
+    info.lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or_else(|| panic!("missing numeric INFO field {field}: {info:?}"))
+}
+
 fn append_corrupt_wal_frames(storage_dir: &std::path::Path) {
     // Append a full-length frame with a bad checksum so startup can skip it
     // and still report the corruption through the public callback.
@@ -62,6 +70,53 @@ fn append_corrupt_wal_frames(storage_dir: &std::path::Path) {
         file.write_all(&[0xFF; 46]).unwrap();
         file.flush().unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_with_config_instances_keep_runtime_state_isolated() {
+    let tmp_a = tempfile::tempdir().unwrap();
+    let tmp_b = tempfile::tempdir().unwrap();
+
+    let mut cfg_a = lux::ServerConfig::default();
+    cfg_a.port = 0;
+    cfg_a.shards = 4;
+    cfg_a.data_dir = tmp_a.path().display().to_string();
+
+    let mut cfg_b = lux::ServerConfig::default();
+    cfg_b.port = 0;
+    cfg_b.shards = 4;
+    cfg_b.data_dir = tmp_b.path().display().to_string();
+
+    let handle_a = lux::run_with_config(cfg_a).await.unwrap();
+    let handle_b = lux::run_with_config(cfg_b).await.unwrap();
+    let mut conn_a = connect(handle_a.local_addr().unwrap());
+    let mut conn_b = connect(handle_b.local_addr().unwrap());
+
+    // Exercise only instance A before reading INFO from both servers. Global
+    // counters would make instance B report A's commands and memory.
+    assert!(send_and_read(&mut conn_a, &["SET", "shared", "one"]).contains("+OK"));
+    assert!(send_and_read(&mut conn_a, &["GET", "shared"]).contains("one"));
+    assert!(send_and_read(&mut conn_b, &["GET", "shared"]).contains("$-1"));
+
+    let info_a = send_and_read(&mut conn_a, &["INFO"]);
+    let info_b = send_and_read(&mut conn_b, &["INFO"]);
+
+    assert_eq!(info_usize(&info_a, "connected_clients"), 1);
+    assert_eq!(info_usize(&info_b, "connected_clients"), 1);
+    assert!(
+        info_usize(&info_a, "total_commands_processed")
+            > info_usize(&info_b, "total_commands_processed"),
+        "instance A should not share command counters with instance B"
+    );
+    assert!(
+        info_usize(&info_a, "used_memory_bytes") > info_usize(&info_b, "used_memory_bytes"),
+        "instance B should not inherit instance A's memory counter"
+    );
+
+    drop(conn_a);
+    drop(conn_b);
+    handle_a.shutdown_and_wait().await.unwrap();
+    handle_b.shutdown_and_wait().await.unwrap();
 }
 
 #[tokio::test]

@@ -4,34 +4,10 @@ use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
+use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-
-pub static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
-pub static LRU_CLOCK: AtomicU32 = AtomicU32::new(0);
-
-/// Subtract from USED_MEMORY without underflow. Clamps to 0 instead of wrapping.
-fn mem_sub(amount: usize) {
-    USED_MEMORY
-        .fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |current| Some(current.saturating_sub(amount)),
-        )
-        .ok();
-}
-
-/// Add to USED_MEMORY.
-fn mem_add(amount: usize) {
-    USED_MEMORY.fetch_add(amount, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Persistence error counters. Exposed via INFO command so operators can
-/// monitor and alert on silent data-safety issues.
-pub static PERSISTENCE_ERR_WAL_APPEND: AtomicUsize = AtomicUsize::new(0);
-pub static PERSISTENCE_ERR_WAL_FSYNC: AtomicUsize = AtomicUsize::new(0);
-pub static PERSISTENCE_ERR_DISK_WRITE: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId {
@@ -185,9 +161,43 @@ pub(crate) struct Shard {
     pub(crate) used_memory: usize,
 }
 
+/// Mutable counters that must belong to one embedded server instance.
+///
+/// These used to be process-wide statics, which made INFO, eviction, and
+/// durability counters bleed across multiple Lux runtimes in one binary.
+pub(crate) struct StoreMetrics {
+    start_time: Instant,
+    used_memory: AtomicUsize,
+    lru_clock: AtomicU32,
+    connected_clients: AtomicUsize,
+    total_commands: AtomicUsize,
+    persistence_err_wal_append: AtomicUsize,
+    persistence_err_wal_fsync: AtomicUsize,
+    persistence_err_disk_write: AtomicUsize,
+}
+
+impl StoreMetrics {
+    fn new() -> Self {
+        Self {
+            start_time: Instant::now(),
+            used_memory: AtomicUsize::new(0),
+            lru_clock: AtomicU32::new(0),
+            connected_clients: AtomicUsize::new(0),
+            total_commands: AtomicUsize::new(0),
+            persistence_err_wal_append: AtomicUsize::new(0),
+            persistence_err_wal_fsync: AtomicUsize::new(0),
+            persistence_err_disk_write: AtomicUsize::new(0),
+        }
+    }
+}
+
 pub struct Store {
     config: Arc<crate::ServerConfig>,
     shards: Box<[RwLock<Shard>]>,
+    metrics: StoreMetrics,
+    /// Serializes Lua script execution for this runtime without blocking other
+    /// embedded Lux instances in the same process.
+    script_gate: RwLock<()>,
     pub(crate) vector_index: RwLock<crate::hnsw::HnswIndex>,
     disk_shards: Option<Box<[parking_lot::Mutex<crate::disk::DiskShard>]>>,
     wal_shards: Option<Box<[parking_lot::Mutex<crate::disk::Wal>]>>,
@@ -343,6 +353,8 @@ impl Store {
         Self {
             config,
             shards: shards.into_boxed_slice(),
+            metrics: StoreMetrics::new(),
+            script_gate: RwLock::new(()),
             vector_index: RwLock::new(crate::hnsw::HnswIndex::new(0)),
             disk_shards,
             wal_shards,
@@ -352,6 +364,105 @@ impl Store {
 
     pub fn config(&self) -> &crate::ServerConfig {
         &self.config
+    }
+
+    /// Current instance uptime used by INFO.
+    pub(crate) fn uptime_seconds(&self) -> u64 {
+        self.metrics.start_time.elapsed().as_secs()
+    }
+
+    pub(crate) fn connected_clients(&self) -> usize {
+        self.metrics.connected_clients.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn client_connected(&self) {
+        self.metrics
+            .connected_clients
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn client_disconnected(&self) {
+        self.metrics
+            .connected_clients
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn total_commands(&self) -> usize {
+        self.metrics.total_commands.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn add_total_commands(&self, count: usize) {
+        self.metrics
+            .total_commands
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub(crate) fn lru_clock(&self) -> u32 {
+        self.metrics.lru_clock.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_lru_clock(&self, clock: u32) {
+        self.metrics.lru_clock.store(clock, Ordering::Relaxed);
+    }
+
+    /// Subtract from this instance's memory counter without underflow.
+    fn mem_sub(&self, amount: usize) {
+        self.metrics
+            .used_memory
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(amount))
+            })
+            .ok();
+    }
+
+    fn mem_add(&self, amount: usize) {
+        self.metrics
+            .used_memory
+            .fetch_add(amount, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_wal_append_error(&self) {
+        self.metrics
+            .persistence_err_wal_append
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_wal_fsync_error(&self) {
+        self.metrics
+            .persistence_err_wal_fsync
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_disk_write_error(&self) {
+        self.metrics
+            .persistence_err_disk_write
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn persistence_wal_append_errors(&self) -> usize {
+        self.metrics
+            .persistence_err_wal_append
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn persistence_wal_fsync_errors(&self) -> usize {
+        self.metrics
+            .persistence_err_wal_fsync
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn persistence_disk_write_errors(&self) -> usize {
+        self.metrics
+            .persistence_err_disk_write
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn script_read_guard(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.script_gate.read()
+    }
+
+    pub(crate) fn script_write_guard(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.script_gate.write()
     }
 
     pub fn shard_count(&self) -> usize {
@@ -405,7 +516,7 @@ impl Store {
                     let mem = estimate_entry_memory(key, &entry.value);
                     shard.data.remove(key);
                     shard.used_memory = shard.used_memory.saturating_sub(mem);
-                    mem_sub(mem);
+                    self.mem_sub(mem);
                     shard.version += 1;
                     return;
                 }
@@ -426,7 +537,7 @@ impl Store {
                 let disk_idx = (fx_hash(key.as_bytes()) % disk_shards.len() as u64) as usize;
                 let mut disk = disk_shards[disk_idx].lock();
                 if let Err(e) = disk.put(key, &dump) {
-                    PERSISTENCE_ERR_DISK_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.record_disk_write_error();
                     self.emit_error(crate::ServerErrorEvent::DiskEvictionWriteFailed {
                         key: key.to_string(),
                         error: e.to_string(),
@@ -446,7 +557,7 @@ impl Store {
                 if let Some(entry) = shard.data.remove(key) {
                     let mem = estimate_entry_memory(key, &entry.value);
                     shard.used_memory = shard.used_memory.saturating_sub(mem);
-                    mem_sub(mem);
+                    self.mem_sub(mem);
                     shard.version += 1;
                 }
             }
@@ -455,7 +566,7 @@ impl Store {
             if let Some(entry) = shard.data.remove(key) {
                 let mem = estimate_entry_memory(key, &entry.value);
                 shard.used_memory = shard.used_memory.saturating_sub(mem);
-                mem_sub(mem);
+                self.mem_sub(mem);
                 shard.version += 1;
             }
         }
@@ -595,8 +706,7 @@ impl Store {
                 for w in ws.iter() {
                     let mut wal = w.lock();
                     if let Err(e) = wal.append_command(args) {
-                        PERSISTENCE_ERR_WAL_APPEND
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.record_wal_append_error();
                         self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
                             error: e.to_string(),
                         });
@@ -606,7 +716,7 @@ impl Store {
                 let idx = self.disk_shard_index(args[1]);
                 let mut wal = ws[idx].lock();
                 if let Err(e) = wal.append_command(args) {
-                    PERSISTENCE_ERR_WAL_APPEND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.record_wal_append_error();
                     self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
                         error: e.to_string(),
                     });
@@ -722,7 +832,7 @@ impl Store {
             for w in ws.iter() {
                 let mut wal = w.lock();
                 if let Err(e) = wal.fsync() {
-                    PERSISTENCE_ERR_WAL_FSYNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.record_wal_fsync_error();
                     self.emit_error(crate::ServerErrorEvent::WalFsyncFailed {
                         error: e.to_string(),
                     });
@@ -773,6 +883,7 @@ impl Store {
 
     #[inline(always)]
     pub(crate) fn set_on_shard(
+        &self,
         data: &mut HashMap<String, Entry, FxBuildHasher>,
         key: &[u8],
         value: &[u8],
@@ -783,7 +894,7 @@ impl Store {
         let expires_at = ttl.map(|d| now + d);
         let new_value = StoreValue::Str(Bytes::copy_from_slice(value));
         let new_size = estimate_entry_memory(key_str(key), &new_value);
-        let clock = LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed);
+        let clock = self.lru_clock();
         match data
             .raw_entry_mut()
             .from_hash(hash, |k| k.as_bytes() == key)
@@ -795,11 +906,9 @@ impl Store {
                 entry.expires_at = expires_at;
                 entry.lru_clock = clock;
                 if new_size >= old_size {
-                    USED_MEMORY
-                        .fetch_add(new_size - old_size, std::sync::atomic::Ordering::Relaxed);
+                    self.mem_add(new_size - old_size);
                 } else {
-                    USED_MEMORY
-                        .fetch_sub(old_size - new_size, std::sync::atomic::Ordering::Relaxed);
+                    self.mem_sub(old_size - new_size);
                 }
             }
             hashbrown::hash_map::RawEntryMut::Vacant(e) => {
@@ -813,7 +922,7 @@ impl Store {
                     },
                     |k| fx_hash(k.as_bytes()),
                 );
-                mem_add(new_size);
+                self.mem_add(new_size);
             }
         }
     }
@@ -881,7 +990,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        Self::set_on_shard(&mut shard.data, key, value, ttl, now);
+        self.set_on_shard(&mut shard.data, key, value, ttl, now);
         self.remove_from_disk(key);
     }
 
@@ -902,18 +1011,18 @@ impl Store {
             Entry {
                 value: new_value,
                 expires_at: None,
-                lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+                lru_clock: self.lru_clock(),
             },
         );
         if let Some(old_entry) = old {
             let old_mem = estimate_entry_memory(ks, &old_entry.value);
             if mem >= old_mem {
-                mem_add(mem - old_mem);
+                self.mem_add(mem - old_mem);
             } else {
-                mem_sub(old_mem - mem);
+                self.mem_sub(old_mem - mem);
             }
         } else {
-            mem_add(mem);
+            self.mem_add(mem);
         }
         true
     }
@@ -940,18 +1049,18 @@ impl Store {
             Entry {
                 value: new_value,
                 expires_at: None,
-                lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+                lru_clock: self.lru_clock(),
             },
         );
         if let Some(oe) = old_entry {
             let old_mem = estimate_entry_memory(ks, &oe.value);
             if mem >= old_mem {
-                mem_add(mem - old_mem);
+                self.mem_add(mem - old_mem);
             } else {
-                mem_sub(old_mem - mem);
+                self.mem_sub(old_mem - mem);
             }
         } else {
-            mem_add(mem);
+            self.mem_add(mem);
         }
         old
     }
@@ -981,7 +1090,7 @@ impl Store {
                 let is_vector = matches!(&entry.value, StoreValue::Vector(_));
                 let mem = estimate_entry_memory(key_str(key), &entry.value);
                 shard.used_memory = shard.used_memory.saturating_sub(mem);
-                mem_sub(mem);
+                self.mem_sub(mem);
                 if is_vector {
                     vector_keys_removed.push(key_str(key).to_string());
                 }
@@ -1053,18 +1162,18 @@ impl Store {
             Entry {
                 value: new_value,
                 expires_at,
-                lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+                lru_clock: self.lru_clock(),
             },
         );
         if let Some(oe) = old_entry {
             let old_mem = estimate_entry_memory(ks, &oe.value);
             if mem >= old_mem {
-                mem_add(mem - old_mem);
+                self.mem_add(mem - old_mem);
             } else {
-                mem_sub(old_mem - mem);
+                self.mem_sub(old_mem - mem);
             }
         } else {
-            mem_add(mem);
+            self.mem_add(mem);
         }
         Ok(new_val)
     }
@@ -1081,9 +1190,9 @@ impl Store {
                     new_val.extend_from_slice(s);
                     new_val.extend_from_slice(value);
                     let len = new_val.len() as i64;
-                    mem_add(value.len());
+                    self.mem_add(value.len());
                     entry.value = StoreValue::Str(Bytes::from(new_val));
-                    entry.lru_clock = LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed);
+                    entry.lru_clock = self.lru_clock();
                     return len;
                 }
             }
@@ -1097,18 +1206,18 @@ impl Store {
             Entry {
                 value: new_value,
                 expires_at: None,
-                lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+                lru_clock: self.lru_clock(),
             },
         );
         if let Some(oe) = old_entry {
             let old_mem = estimate_entry_memory(ks, &oe.value);
             if mem >= old_mem {
-                mem_add(mem - old_mem);
+                self.mem_add(mem - old_mem);
             } else {
-                mem_sub(old_mem - mem);
+                self.mem_sub(old_mem - mem);
             }
         } else {
-            mem_add(mem);
+            self.mem_add(mem);
         }
         len
     }
@@ -1236,7 +1345,7 @@ impl Store {
                 Some(e) if !e.is_expired_at(now) => {
                     let mem = estimate_entry_memory(key_str(key), &e.value);
                     shard.used_memory = shard.used_memory.saturating_sub(mem);
-                    mem_sub(mem);
+                    self.mem_sub(mem);
                     e
                 }
                 _ => return Err("ERR no such key".to_string()),
@@ -1248,7 +1357,7 @@ impl Store {
         let mem = estimate_entry_memory(key_str(new_key), &entry.value);
         shard.data.insert(key_string(new_key), entry);
         shard.used_memory += mem;
-        mem_add(mem);
+        self.mem_add(mem);
         Ok(())
     }
 
@@ -1345,7 +1454,7 @@ impl Store {
             let mut shard = shard.write();
             shard.version += 1;
             shard.data.clear();
-            mem_sub(shard.used_memory);
+            self.mem_sub(shard.used_memory);
             shard.used_memory = 0;
         }
         *self.vector_index.write() = crate::hnsw::HnswIndex::new(0);
@@ -1369,7 +1478,7 @@ impl Store {
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::List(VecDeque::new()),
             expires_at: None,
-            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: self.lru_clock(),
         });
         if entry.is_expired_at(now) {
             entry.value = StoreValue::List(VecDeque::new());
@@ -1383,7 +1492,7 @@ impl Store {
                 let len = list.len() as i64;
                 let _ = entry;
                 shard.used_memory += added_mem;
-                mem_add(added_mem);
+                self.mem_add(added_mem);
                 Ok(len)
             }
             _ => Err(WRONGTYPE.to_string()),
@@ -1399,7 +1508,7 @@ impl Store {
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::List(VecDeque::new()),
             expires_at: None,
-            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: self.lru_clock(),
         });
         if entry.is_expired_at(now) {
             entry.value = StoreValue::List(VecDeque::new());
@@ -1413,7 +1522,7 @@ impl Store {
                 let len = list.len() as i64;
                 let _ = entry;
                 shard.used_memory += added_mem;
-                mem_add(added_mem);
+                self.mem_add(added_mem);
                 Ok(len)
             }
             _ => Err(WRONGTYPE.to_string()),
@@ -1430,7 +1539,7 @@ impl Store {
                     let val = list.pop_front()?;
                     let freed = val.len() + 32;
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                     Some(val)
                 }
                 _ => None,
@@ -1449,7 +1558,7 @@ impl Store {
                     let val = list.pop_back()?;
                     let freed = val.len() + 32;
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                     Some(val)
                 }
                 _ => None,
@@ -1532,7 +1641,7 @@ impl Store {
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Hash(HashMap::new()),
             expires_at: None,
-            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: self.lru_clock(),
         });
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Hash(HashMap::new());
@@ -1555,11 +1664,11 @@ impl Store {
                 }
                 if mem_delta > 0 {
                     shard.used_memory += mem_delta as usize;
-                    mem_add(mem_delta as usize);
+                    self.mem_add(mem_delta as usize);
                 } else if mem_delta < 0 {
                     let freed = (-mem_delta) as usize;
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                 }
                 Ok(added)
             }
@@ -1610,7 +1719,7 @@ impl Store {
                         }
                     }
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                     Ok(removed)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -1695,7 +1804,7 @@ impl Store {
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Hash(HashMap::new()),
             expires_at: None,
-            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: self.lru_clock(),
         });
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Hash(HashMap::new());
@@ -1726,17 +1835,17 @@ impl Store {
                     let added = field.len() + new_len + 64;
                     let _ = entry;
                     shard.used_memory += added;
-                    mem_add(added);
+                    self.mem_add(added);
                 } else if new_len > old_len {
                     let added = new_len - old_len;
                     let _ = entry;
                     shard.used_memory += added;
-                    mem_add(added);
+                    self.mem_add(added);
                 } else if old_len > new_len {
                     let freed = old_len - new_len;
                     let _ = entry;
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                 }
                 Ok(new_val)
             }
@@ -1752,7 +1861,7 @@ impl Store {
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Set(HashSet::new()),
             expires_at: None,
-            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: self.lru_clock(),
         });
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Set(HashSet::new());
@@ -1769,7 +1878,7 @@ impl Store {
                     }
                 }
                 shard.used_memory += mem_added;
-                mem_add(mem_added);
+                self.mem_add(mem_added);
                 Ok(added)
             }
             _ => Err(WRONGTYPE.to_string()),
@@ -1792,7 +1901,7 @@ impl Store {
                         }
                     }
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                     Ok(removed)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -1900,7 +2009,7 @@ impl Store {
                 groups: std::collections::HashMap::new(),
             }),
             expires_at: None,
-            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: self.lru_clock(),
         });
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Stream(StreamData {
@@ -1976,11 +2085,11 @@ impl Store {
                 let _ = entry;
                 if added > trimmed_mem {
                     shard.used_memory += added - trimmed_mem;
-                    mem_add(added - trimmed_mem);
+                    self.mem_add(added - trimmed_mem);
                 } else if trimmed_mem > added {
                     let freed = trimmed_mem - added;
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                 }
 
                 Ok(id)
@@ -2123,7 +2232,7 @@ impl Store {
                     groups: std::collections::HashMap::new(),
                 }),
                 expires_at: None,
-                lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+                lru_clock: self.lru_clock(),
             });
             if entry.is_expired_at(now) {
                 entry.value = StoreValue::Stream(StreamData {
@@ -2564,7 +2673,7 @@ impl Store {
                         }
                     }
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                     Ok(removed)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -2589,7 +2698,7 @@ impl Store {
                         trimmed += 1;
                     }
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                     Ok(trimmed)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -2667,7 +2776,7 @@ impl Store {
 
     #[allow(dead_code)]
     pub fn approximate_memory(&self) -> usize {
-        USED_MEMORY.load(std::sync::atomic::Ordering::Relaxed)
+        self.metrics.used_memory.load(Ordering::Relaxed)
     }
 
     pub fn dump_all(&self, now: Instant) -> Vec<DumpEntry> {
@@ -2785,11 +2894,11 @@ impl Store {
                     Entry {
                         value: sv,
                         expires_at,
-                        lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+                        lru_clock: self.lru_clock(),
                     },
                 );
                 shard.used_memory += mem;
-                mem_add(mem);
+                self.mem_add(mem);
                 drop(shard);
                 self.vector_index.write().insert(key_clone, index_data);
                 return;
@@ -2810,11 +2919,11 @@ impl Store {
             Entry {
                 value: store_value,
                 expires_at,
-                lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+                lru_clock: self.lru_clock(),
             },
         );
         shard.used_memory += mem;
-        mem_add(mem);
+        self.mem_add(mem);
     }
 
     pub fn getdel(&self, key: &[u8], now: Instant) -> Option<Bytes> {
@@ -2828,7 +2937,7 @@ impl Store {
                     let entry = shard.data.remove(ks).unwrap();
                     let freed = estimate_entry_memory(ks, &entry.value);
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                     if let StoreValue::Str(s) = entry.value {
                         Some(s)
                     } else {
@@ -2907,7 +3016,7 @@ impl Store {
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Str(Bytes::new()),
             expires_at: None,
-            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: self.lru_clock(),
         });
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Str(Bytes::new());
@@ -2928,7 +3037,7 @@ impl Store {
                 let added = new_len - old_len;
                 let _ = entry;
                 shard.used_memory += added;
-                mem_add(added);
+                self.mem_add(added);
             }
             len
         } else {
@@ -2958,7 +3067,7 @@ impl Store {
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Str(Bytes::new()),
             expires_at: None,
-            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: self.lru_clock(),
         });
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Str(Bytes::new());
@@ -2983,7 +3092,7 @@ impl Store {
                     let added = new_len - old_len;
                     let _ = entry;
                     shard.used_memory += added;
-                    mem_add(added);
+                    self.mem_add(added);
                 }
                 Ok(old)
             }
@@ -3262,7 +3371,7 @@ impl Store {
                 labels: labels.clone().unwrap_or_default(),
             }),
             expires_at: None,
-            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: self.lru_clock(),
         });
         if entry.is_expired_at(now) {
             entry.value = StoreValue::TimeSeries(TimeSeriesData {
@@ -3301,11 +3410,11 @@ impl Store {
                 let _ = entry;
                 if added > trimmed {
                     shard.used_memory += added - trimmed;
-                    mem_add(added - trimmed);
+                    self.mem_add(added - trimmed);
                 } else if trimmed > added {
                     let freed = trimmed - added;
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                 }
                 Ok(timestamp)
             }
@@ -3522,11 +3631,11 @@ impl Store {
         }?;
         if delta > 0 {
             shard.used_memory += delta as usize;
-            mem_add(delta as usize);
+            self.mem_add(delta as usize);
         } else if delta < 0 {
             let freed = (-delta) as usize;
             shard.used_memory = shard.used_memory.saturating_sub(freed);
-            mem_sub(freed);
+            self.mem_sub(freed);
         }
         Ok(())
     }
@@ -3552,7 +3661,7 @@ impl Store {
                         let len = list.len() as i64;
                         let _ = entry;
                         shard.used_memory += added;
-                        mem_add(added);
+                        self.mem_add(added);
                         Ok(len)
                     } else {
                         Ok(-1)
@@ -3604,7 +3713,7 @@ impl Store {
                     }
                     let freed = removed as usize * elem_size;
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                     Ok(removed)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -3642,7 +3751,7 @@ impl Store {
                     if before_size > after_size {
                         let freed = before_size - after_size;
                         shard.used_memory = shard.used_memory.saturating_sub(freed);
-                        mem_sub(freed);
+                        self.mem_sub(freed);
                     }
                     Ok(())
                 }
@@ -3671,7 +3780,7 @@ impl Store {
         };
         if let Some(len) = result {
             shard.used_memory += added_mem;
-            mem_add(added_mem);
+            self.mem_add(added_mem);
             len
         } else {
             0
@@ -3697,7 +3806,7 @@ impl Store {
         };
         if let Some(len) = result {
             shard.used_memory += added_mem;
-            mem_add(added_mem);
+            self.mem_add(added_mem);
             len
         } else {
             0
@@ -3727,7 +3836,7 @@ impl Store {
                         if let Some(ref val) = v {
                             let freed = val.len() + 32;
                             shard.used_memory = shard.used_memory.saturating_sub(freed);
-                            mem_sub(freed);
+                            self.mem_sub(freed);
                         }
                         v
                     }
@@ -3744,7 +3853,7 @@ impl Store {
             let entry = shard.data.entry(ks).or_insert_with(|| Entry {
                 value: StoreValue::List(VecDeque::new()),
                 expires_at: None,
-                lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+                lru_clock: self.lru_clock(),
             });
             if entry.is_expired_at(now) {
                 entry.value = StoreValue::List(VecDeque::new());
@@ -3758,7 +3867,7 @@ impl Store {
                     list.push_back(v.clone());
                 }
                 shard.used_memory += added;
-                mem_add(added);
+                self.mem_add(added);
             }
         }
         val
@@ -3778,7 +3887,7 @@ impl Store {
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Hash(HashMap::new()),
             expires_at: None,
-            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: self.lru_clock(),
         });
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Hash(HashMap::new());
@@ -3793,7 +3902,7 @@ impl Store {
                     let added = field.len() + value.len() + 64;
                     map.insert(fs.to_string(), Bytes::copy_from_slice(value));
                     shard.used_memory += added;
-                    mem_add(added);
+                    self.mem_add(added);
                     Ok(true)
                 }
             }
@@ -3815,7 +3924,7 @@ impl Store {
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Hash(HashMap::new()),
             expires_at: None,
-            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: self.lru_clock(),
         });
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Hash(HashMap::new());
@@ -3846,17 +3955,17 @@ impl Store {
                     let added = field.len() + new_len + 64;
                     let _ = entry;
                     shard.used_memory += added;
-                    mem_add(added);
+                    self.mem_add(added);
                 } else if new_len > old_len {
                     let added = new_len - old_len;
                     let _ = entry;
                     shard.used_memory += added;
-                    mem_add(added);
+                    self.mem_add(added);
                 } else if old_len > new_len {
                     let freed = old_len - new_len;
                     let _ = entry;
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                 }
                 Ok(s)
             }
@@ -3897,7 +4006,7 @@ impl Store {
                         result.push(member);
                     }
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                     Ok(result)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -3948,7 +4057,7 @@ impl Store {
                         let r = set.remove(key_str(member));
                         if r {
                             shard.used_memory = shard.used_memory.saturating_sub(mem_size);
-                            mem_sub(mem_size);
+                            self.mem_sub(mem_size);
                         }
                         r
                     }
@@ -3967,7 +4076,7 @@ impl Store {
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Set(HashSet::new()),
             expires_at: None,
-            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: self.lru_clock(),
         });
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Set(HashSet::new());
@@ -3978,7 +4087,7 @@ impl Store {
                 if set.insert(key_string(member)) {
                     let _ = entry;
                     shard.used_memory += mem_size;
-                    mem_add(mem_size);
+                    self.mem_add(mem_size);
                 }
                 Ok(true)
             }
@@ -4053,7 +4162,7 @@ impl Store {
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::SortedSet(BTreeMap::new(), HashMap::new()),
             expires_at: None,
-            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: self.lru_clock(),
         });
         if entry.is_expired_at(now) {
             entry.value = StoreValue::SortedSet(BTreeMap::new(), HashMap::new());
@@ -4096,7 +4205,7 @@ impl Store {
                     }
                 }
                 shard.used_memory += mem_added;
-                mem_add(mem_added);
+                self.mem_add(mem_added);
                 Ok(if ch { added + changed } else { added })
             }
             _ => Err(WRONGTYPE.to_string()),
@@ -4165,7 +4274,7 @@ impl Store {
                         }
                     }
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                     Ok(removed)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -4305,7 +4414,7 @@ impl Store {
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::SortedSet(BTreeMap::new(), HashMap::new()),
             expires_at: None,
-            lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: self.lru_clock(),
         });
         if entry.is_expired_at(now) {
             entry.value = StoreValue::SortedSet(BTreeMap::new(), HashMap::new());
@@ -4387,7 +4496,7 @@ impl Store {
                         }
                     }
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                     Ok(result)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -4420,7 +4529,7 @@ impl Store {
                         }
                     }
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    mem_sub(freed);
+                    self.mem_sub(freed);
                     Ok(result)
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -4482,11 +4591,11 @@ impl Store {
                 Entry {
                     value: StoreValue::SortedSet(tree, scores),
                     expires_at: None,
-                    lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+                    lru_clock: self.lru_clock(),
                 },
             );
             shard.used_memory += mem;
-            mem_add(mem);
+            self.mem_add(mem);
         }
         Ok(count)
     }
@@ -4543,11 +4652,11 @@ impl Store {
                 Entry {
                     value: StoreValue::SortedSet(tree, scores),
                     expires_at: None,
-                    lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+                    lru_clock: self.lru_clock(),
                 },
             );
             shard.used_memory += mem;
-            mem_add(mem);
+            self.mem_add(mem);
         }
         Ok(count)
     }
@@ -4581,11 +4690,11 @@ impl Store {
                 Entry {
                     value: StoreValue::SortedSet(tree, scores),
                     expires_at: None,
-                    lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+                    lru_clock: self.lru_clock(),
                 },
             );
             shard.used_memory += mem;
-            mem_add(mem);
+            self.mem_add(mem);
         }
         Ok(count)
     }
@@ -4700,7 +4809,7 @@ impl Store {
                         let is_vector = matches!(&entry.value, StoreValue::Vector(_));
                         let mem = estimate_entry_memory(&key, &entry.value);
                         shard.used_memory = shard.used_memory.saturating_sub(mem);
-                        mem_sub(mem);
+                        self.mem_sub(mem);
                         if is_vector {
                             expired_vectors.push(key);
                         }
@@ -4739,22 +4848,22 @@ impl Store {
                 let cached = crate::hll::hll_count(&regs);
                 e.value = StoreValue::HyperLogLog(regs, cached);
                 e.expires_at = None;
-                e.lru_clock = LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed);
+                e.lru_clock = self.lru_clock();
                 let new_mem = estimate_entry_memory(ks, &e.value);
                 if new_mem > old_mem {
                     let diff = new_mem - old_mem;
                     shard.used_memory += diff;
-                    mem_add(diff);
+                    self.mem_add(diff);
                 } else {
                     let diff = old_mem - new_mem;
                     shard.used_memory = shard.used_memory.saturating_sub(diff);
-                    mem_sub(diff);
+                    self.mem_sub(diff);
                 }
                 Ok(if changed { 1 } else { 0 })
             }
             Some(e) => match &mut e.value {
                 StoreValue::HyperLogLog(regs, cached) => {
-                    e.lru_clock = LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed);
+                    e.lru_clock = self.lru_clock();
                     let mut changed = false;
                     for elem in elements {
                         if crate::hll::hll_add(regs, elem) {
@@ -4784,11 +4893,11 @@ impl Store {
                     Entry {
                         value: sv,
                         expires_at: None,
-                        lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+                        lru_clock: self.lru_clock(),
                     },
                 );
                 shard.used_memory += mem;
-                mem_add(mem);
+                self.mem_add(mem);
                 Ok(if changed { 1 } else { 0 })
             }
         }
@@ -4870,22 +4979,22 @@ impl Store {
                 if new_mem > old_mem {
                     let diff = new_mem - old_mem;
                     shard.used_memory += diff;
-                    mem_add(diff);
+                    self.mem_add(diff);
                 } else {
                     let diff = old_mem - new_mem;
                     shard.used_memory = shard.used_memory.saturating_sub(diff);
-                    mem_sub(diff);
+                    self.mem_sub(diff);
                 }
             } else {
                 shard.used_memory += new_mem;
-                mem_add(new_mem);
+                self.mem_add(new_mem);
             }
             shard.data.insert(
                 key_string(dest),
                 Entry {
                     value: sv,
                     expires_at: None,
-                    lru_clock: LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+                    lru_clock: self.lru_clock(),
                 },
             );
         }
@@ -4913,7 +5022,7 @@ impl Store {
         });
         let new_mem = estimate_entry_memory(&ks, &new_value);
         let expires_at = ttl.map(|d| now + d);
-        let clock = LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed);
+        let clock = self.lru_clock();
         if let Some(old) = shard.data.insert(
             ks.clone(),
             Entry {
@@ -4924,13 +5033,13 @@ impl Store {
         ) {
             let old_mem = estimate_entry_memory(&ks, &old.value);
             if new_mem >= old_mem {
-                mem_add(new_mem - old_mem);
+                self.mem_add(new_mem - old_mem);
             } else {
-                mem_sub(old_mem - new_mem);
+                self.mem_sub(old_mem - new_mem);
             }
             shard.used_memory = shard.used_memory.saturating_sub(old_mem) + new_mem;
         } else {
-            mem_add(new_mem);
+            self.mem_add(new_mem);
             shard.used_memory += new_mem;
         }
         drop(shard);

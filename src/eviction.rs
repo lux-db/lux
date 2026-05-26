@@ -1,5 +1,4 @@
-use crate::store::{Store, USED_MEMORY};
-use std::sync::atomic::Ordering;
+use crate::store::Store;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvictionPolicy {
@@ -85,7 +84,7 @@ pub fn evict_if_needed(store: &Store) -> Result<(), &'static str> {
     let tiered = store.is_tiered();
 
     let mut iterations = 0;
-    while USED_MEMORY.load(Ordering::Relaxed) > max {
+    while store.approximate_memory() > max {
         iterations += 1;
         if iterations > 128 {
             if tiered {
@@ -115,7 +114,7 @@ pub fn evict_if_needed(store: &Store) -> Result<(), &'static str> {
 
 fn evict_lru(store: &Store, sample_size: usize, volatile_only: bool) -> bool {
     let n = store.shard_count();
-    let seed = USED_MEMORY.load(Ordering::Relaxed);
+    let seed = store.approximate_memory();
     let start_shard = seed % n;
 
     let mut best_key: Option<String> = None;
@@ -160,7 +159,7 @@ fn evict_lru(store: &Store, sample_size: usize, volatile_only: bool) -> bool {
 
 fn evict_random(store: &Store, volatile_only: bool) -> bool {
     let n = store.shard_count();
-    let seed = USED_MEMORY.load(Ordering::Relaxed);
+    let seed = store.approximate_memory();
     let start_shard = seed % n;
 
     for offset in 0..n {

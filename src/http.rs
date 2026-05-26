@@ -1377,7 +1377,7 @@ fn exec_simple(
     let mut out = BytesMut::with_capacity(1024);
     let now = Instant::now();
 
-    let _guard = crate::SCRIPT_GATE.read();
+    let _guard = store.script_read_guard();
     let result = cmd::execute(store, cache, broker, &arg_bytes, &mut out, now);
 
     match result {

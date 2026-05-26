@@ -24,9 +24,7 @@ use cmd::CmdResult;
 use pubsub::Broker;
 use resp::Parser;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use store::Store;
 use tables::SharedSchemaCache;
@@ -38,10 +36,6 @@ use tokio::task::{JoinHandle, JoinSet};
 pub use disk::{StorageConfig, StorageMode};
 pub use eviction::{parse_eviction_policy, parse_memory_size, EvictionConfig, EvictionPolicy};
 
-pub(crate) static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static TOTAL_COMMANDS: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static START_TIME: OnceLock<Instant> = OnceLock::new();
-static SCRIPT_GATE: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
 const SUB_MODE_BATCH_MAX: usize = 64;
 
 /// Runtime configuration for an embedded Lux server.
@@ -322,7 +316,6 @@ pub async fn run() -> std::io::Result<()> {
 /// Readiness means storage has initialized, any snapshot has loaded, WAL replay
 /// has completed, and configured listeners have bound successfully.
 pub async fn run_with_config(config: ServerConfig) -> std::io::Result<ServerHandle> {
-    START_TIME.set(Instant::now()).ok();
     let listener = if config.enable_resp {
         let addr = config.listen_addr();
         Some(TcpListener::bind(&addr).await?)
@@ -396,7 +389,9 @@ async fn server_main(
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let now = Instant::now();
                 let secs = now.duration_since(start).as_secs() as u32;
-                store::LRU_CLOCK.store(secs & 0x00FF_FFFF, std::sync::atomic::Ordering::Relaxed);
+                // Keep LRU aging scoped to this runtime; eviction decisions
+                // should not depend on other embedded instances.
+                store.set_lru_clock(secs & 0x00FF_FFFF);
                 store.expire_sweep(now);
             }
         });
@@ -497,18 +492,18 @@ async fn server_main(
 
                     let require_auth = config.require_auth;
                     conn_tasks.spawn(async move {
-                        CONNECTED_CLIENTS.fetch_add(1, Ordering::Relaxed);
+                        store.client_connected();
                         let result = handle_connection(
                             socket,
                             peer,
-                            store,
+                            store.clone(),
                             broker,
                             require_auth,
                             script_engine,
                             schema_cache,
                         )
                         .await;
-                        CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+                        store.client_disconnected();
                         if let Err(e) = result {
                             if e.kind() != std::io::ErrorKind::ConnectionReset {
                                 if let Some(on_warn) = on_warn {
@@ -645,7 +640,7 @@ async fn handle_tx_cmd(
                 for owned_args in &queue {
                     let refs: Vec<&[u8]> = owned_args.iter().map(|v| v.as_slice()).collect();
                     let cmd_result = {
-                        let _guard = SCRIPT_GATE.read();
+                        let _guard = store.script_read_guard();
                         cmd::execute_with_wal(store, schema_cache, broker, &refs, write_buf, now)
                     };
                     match cmd_result {
@@ -1045,7 +1040,7 @@ async fn handle_connection(
                         resp::write_error(&mut write_buf, "NOAUTH Authentication required");
                         continue;
                     }
-                    TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
+                    store.add_total_commands(1);
 
                     if handle_tx_cmd(
                         args,
@@ -1066,7 +1061,7 @@ async fn handle_connection(
                     }
 
                     let cmd_result = {
-                        let _guard = SCRIPT_GATE.read();
+                        let _guard = store.script_read_guard();
                         cmd::execute_with_wal(
                             &store,
                             &schema_cache,
@@ -1185,7 +1180,7 @@ async fn handle_connection(
                 }
             } else {
                 let cmd_count = commands.len();
-                TOTAL_COMMANDS.fetch_add(cmd_count, Ordering::Relaxed);
+                store.add_total_commands(cmd_count);
 
                 let mut has_special = in_multi;
                 let mut all_single_key_rw = true;
@@ -1265,7 +1260,7 @@ async fn handle_connection(
                         }
 
                         let cmd_result = {
-                            let _guard = SCRIPT_GATE.read();
+                            let _guard = store.script_read_guard();
                             cmd::execute_with_wal(
                                 &store,
                                 &schema_cache,
@@ -1788,7 +1783,7 @@ fn handle_eval(
         script.to_string()
     };
 
-    let _guard = SCRIPT_GATE.write();
+    let _guard = store.script_write_guard();
     match lua::eval(&actual_script, keys, argv, store, broker, now) {
         Ok(result) => {
             out.extend_from_slice(&result);

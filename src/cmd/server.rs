@@ -1,10 +1,9 @@
 use bytes::BytesMut;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use crate::pubsub::Broker;
 use crate::resp;
 use crate::store::Store;
-use crate::{CONNECTED_CLIENTS, START_TIME, TOTAL_COMMANDS};
 
 use super::{arg_str, cmd_eq, is_restricted, CmdResult};
 
@@ -99,13 +98,19 @@ pub fn cmd_hello(args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instan
     CmdResult::Written
 }
 
-pub fn cmd_info(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+pub fn cmd_info(
+    args: &[&[u8]],
+    store: &Store,
+    broker: &Broker,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
     let section = if args.len() > 1 {
         arg_str(args[1]).to_lowercase()
     } else {
         "all".to_string()
     };
-    let info = build_info(store, &section, now);
+    let info = build_info(store, broker, &section, now);
     resp::write_bulk(out, &info);
     CmdResult::Written
 }
@@ -225,8 +230,8 @@ pub fn cmd_noop_ok(
     CmdResult::Written
 }
 
-fn build_info(store: &Store, _section: &str, now: Instant) -> String {
-    let uptime = START_TIME.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
+fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> String {
+    let key_event_stats = broker.key_event_stats();
     let restricted = is_restricted(store);
     let powered_by = if restricted {
         "\r\npowered_by:LuxDB Cloud (luxdb.dev)"
@@ -270,13 +275,13 @@ fn build_info(store: &Store, _section: &str, now: Instant) -> String {
          vector_keys:{}\r\n",
         env!("CARGO_PKG_VERSION"),
         store.shard_count(),
-        uptime,
-        CONNECTED_CLIENTS.load(Ordering::Relaxed),
-        TOTAL_COMMANDS.load(Ordering::Relaxed),
-        crate::pubsub::KEY_EVENTS_ENQUEUED.load(Ordering::Relaxed),
-        crate::pubsub::KEY_EVENTS_DROPPED.load(Ordering::Relaxed),
-        crate::pubsub::KEY_EVENTS_EMITTED.load(Ordering::Relaxed),
-        crate::pubsub::KEY_EVENTS_COALESCED.load(Ordering::Relaxed),
+        store.uptime_seconds(),
+        store.connected_clients(),
+        store.total_commands(),
+        key_event_stats.enqueued,
+        key_event_stats.dropped,
+        key_event_stats.emitted,
+        key_event_stats.coalesced,
         store.approximate_memory(),
         if store.config().storage.mode == crate::disk::StorageMode::Tiered {
             "tiered"
@@ -285,9 +290,9 @@ fn build_info(store: &Store, _section: &str, now: Instant) -> String {
         },
         store.disk_usage_bytes(),
         store.disk_key_count(),
-        crate::store::PERSISTENCE_ERR_WAL_APPEND.load(Ordering::Relaxed),
-        crate::store::PERSISTENCE_ERR_WAL_FSYNC.load(Ordering::Relaxed),
-        crate::store::PERSISTENCE_ERR_DISK_WRITE.load(Ordering::Relaxed),
+        store.persistence_wal_append_errors(),
+        store.persistence_wal_fsync_errors(),
+        store.persistence_disk_write_errors(),
         store.dbsize(now),
         store.dbsize(now),
         store.vcard(now)
