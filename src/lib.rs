@@ -1,16 +1,23 @@
-pub mod cmd;
-pub mod disk;
-pub mod eviction;
-pub mod geo;
-pub mod hll;
-pub mod hnsw;
-pub mod http;
-pub mod lua;
-pub mod pubsub;
-pub mod resp;
-pub mod snapshot;
-pub mod store;
-pub mod tables;
+//! Library entry points for embedding Lux in another Rust process.
+//!
+//! The crate exposes the runtime surface (`ServerConfig`, `ServerHandle`,
+//! `run_with_config`) and keeps command/storage internals private so embedded
+//! callers cannot mutate state outside the normal command, WAL, and snapshot
+//! pipeline.
+
+mod cmd;
+mod disk;
+mod eviction;
+mod geo;
+mod hll;
+mod hnsw;
+mod http;
+mod lua;
+mod pubsub;
+mod resp;
+mod snapshot;
+mod store;
+mod tables;
 
 use bytes::BytesMut;
 use cmd::CmdResult;
@@ -25,30 +32,83 @@ use store::Store;
 use tables::SharedSchemaCache;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
-pub static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
-pub static TOTAL_COMMANDS: AtomicUsize = AtomicUsize::new(0);
-pub static START_TIME: OnceLock<Instant> = OnceLock::new();
+pub use disk::{StorageConfig, StorageMode};
+pub use eviction::{parse_eviction_policy, parse_memory_size, EvictionConfig, EvictionPolicy};
+
+pub(crate) static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static TOTAL_COMMANDS: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static START_TIME: OnceLock<Instant> = OnceLock::new();
 static SCRIPT_GATE: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
 const SUB_MODE_BATCH_MAX: usize = 64;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Runtime configuration for an embedded Lux server.
+///
+/// Defaults match the standalone binary where possible. Library users can
+/// override listeners, persistence, auth, eviction, and logging without relying
+/// on process-wide environment variables.
+#[derive(Clone)]
 pub struct ServerConfig {
+    /// Interface used by the RESP listener.
     pub bind_host: String,
+    /// RESP port. When `enable_resp` is true, `0` asks the OS for any free port.
     pub port: u16,
+    /// HTTP API port. `0` disables the HTTP API.
     pub http_port: u16,
+    /// Optional row cap for HTTP table responses.
     pub max_rows: Option<usize>,
+    /// Maximum accepted HTTP request body size in bytes.
     pub max_body: usize,
+    /// Password used by AUTH/HELLO and HTTP bearer auth.
     pub password: String,
+    /// Whether RESP connections must authenticate before non-public commands.
     pub require_auth: bool,
+    /// Disables administrative commands such as SAVE/FLUSH/DEBUG.
     pub restricted: bool,
+    /// Number of in-memory shards.
     pub shards: usize,
+    /// Directory for snapshots and default storage subdirectories.
     pub data_dir: String,
+    /// Background snapshot interval. `Duration::ZERO` disables background saves.
     pub save_interval: Duration,
-    pub storage: disk::StorageConfig,
-    pub eviction: eviction::EvictionConfig,
+    /// Persistence/storage mode configuration.
+    pub storage: StorageConfig,
+    /// Memory pressure eviction configuration.
+    pub eviction: EvictionConfig,
+    /// Enables the RESP listener. Use this instead of overloading `port = 0`.
+    pub enable_resp: bool,
+    /// Optional informational event sink. Library mode is silent when unset.
+    pub on_info: Option<Arc<dyn Fn(ServerInfoEvent) + Send + Sync>>,
+    /// Optional warning event sink for recovered or skipped conditions.
+    pub on_warn: Option<Arc<dyn Fn(ServerWarnEvent) + Send + Sync>>,
+    /// Optional error event sink for failed runtime operations.
+    pub on_error: Option<Arc<dyn Fn(ServerErrorEvent) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("bind_host", &self.bind_host)
+            .field("port", &self.port)
+            .field("http_port", &self.http_port)
+            .field("max_rows", &self.max_rows)
+            .field("max_body", &self.max_body)
+            .field("password", &"<redacted>")
+            .field("require_auth", &self.require_auth)
+            .field("restricted", &self.restricted)
+            .field("shards", &self.shards)
+            .field("data_dir", &self.data_dir)
+            .field("save_interval", &self.save_interval)
+            .field("storage", &self.storage)
+            .field("eviction", &self.eviction)
+            .field("enable_resp", &self.enable_resp)
+            .field("on_info", &self.on_info.as_ref().map(|_| "<callback>"))
+            .field("on_warn", &self.on_warn.as_ref().map(|_| "<callback>"))
+            .field("on_error", &self.on_error.as_ref().map(|_| "<callback>"))
+            .finish()
+    }
 }
 
 impl Default for ServerConfig {
@@ -65,9 +125,111 @@ impl Default for ServerConfig {
             shards: default_shard_count(),
             data_dir: ".".to_string(),
             save_interval: Duration::from_secs(60),
-            storage: disk::StorageConfig::default(),
-            eviction: eviction::EvictionConfig::default(),
+            storage: StorageConfig::default(),
+            eviction: EvictionConfig::default(),
+            enable_resp: true,
+            on_info: None,
+            on_warn: None,
+            on_error: None,
         }
+    }
+}
+
+/// Informational runtime events emitted through `ServerConfig::on_info`.
+#[derive(Clone, Debug)]
+pub enum ServerInfoEvent {
+    /// Tiered storage was configured for this data directory.
+    TieredStorageEnabled { dir: String },
+    /// Snapshot file was absent during startup.
+    NoSnapshotFound,
+    /// Snapshot loaded successfully during startup.
+    SnapshotLoaded { keys: usize },
+    /// Background snapshot completed successfully.
+    SnapshotSaved { keys: usize },
+    /// WAL replay completed and applied at least one command.
+    WalReplayed { commands: usize },
+    /// HTTP listener bound successfully.
+    HttpReady { addr: std::net::SocketAddr },
+}
+
+/// Warning runtime events emitted through `ServerConfig::on_warn`.
+///
+/// Warnings are conditions Lux recovered from, such as skipping corrupted
+/// persisted data or dropping a single failed client connection.
+#[derive(Clone, Debug)]
+pub enum ServerWarnEvent {
+    /// One checksummed WAL frame failed CRC validation and was skipped.
+    WalCorruptedFrameSkipped {
+        shard: usize,
+        stored_crc: u32,
+        computed_crc: u32,
+    },
+    /// Summary count for corrupted WAL frames skipped during replay.
+    WalCorruptedFramesSkipped { shard: usize, frames: usize },
+    /// One checksummed disk entry failed CRC validation during index rebuild.
+    DiskCorruptedEntrySkipped { shard: usize, offset: u64 },
+    /// One disk entry failed to deserialize during index rebuild.
+    DiskEntryParseFailed {
+        shard: usize,
+        offset: u64,
+        error: String,
+    },
+    /// Summary count for corrupted disk entries skipped while rebuilding.
+    DiskCorruptedEntriesSkipped { shard: usize, entries: usize },
+    /// RESP connection handler returned a non-reset I/O error.
+    ConnectionFailed {
+        peer: std::net::SocketAddr,
+        error: String,
+    },
+}
+
+/// Error runtime events emitted through `ServerConfig::on_error`.
+///
+/// Errors are failed runtime operations that may affect availability,
+/// durability, or persistence.
+#[derive(Clone, Debug)]
+pub enum ServerErrorEvent {
+    /// Snapshot load failed during startup.
+    SnapshotLoadFailed { error: String },
+    /// Background snapshot failed.
+    SnapshotSaveFailed { error: String, path: String },
+    /// WAL replay failed for a shard.
+    WalReplayFailed { shard: usize, error: String },
+    /// WAL truncate after snapshot failed.
+    WalTruncateFailed { error: String },
+    /// Eviction-to-disk failed; the key remains in memory.
+    DiskEvictionWriteFailed { key: String, error: String },
+    /// Opportunistic compaction on the eviction path failed.
+    InlineCompactionFailed { error: String },
+    /// Background disk compaction failed.
+    DiskCompactionFailed { shard: usize, error: String },
+    /// WAL append failed before an in-memory mutation was made durable.
+    WalAppendFailed { error: String },
+    /// Dumping cold data into a snapshot failed.
+    SnapshotDiskDumpFailed { error: String },
+    /// Periodic WAL fsync failed.
+    WalFsyncFailed { error: String },
+    /// HTTP server task returned an error after startup.
+    HttpServerFailed { error: String },
+}
+
+/// Internal dispatch helpers keep emit sites explicit about severity while
+/// preserving the library's silent-by-default behavior.
+pub(crate) fn emit_info(config: &ServerConfig, event: ServerInfoEvent) {
+    if let Some(on_info) = &config.on_info {
+        on_info(event);
+    }
+}
+
+pub(crate) fn emit_warn(config: &ServerConfig, event: ServerWarnEvent) {
+    if let Some(on_warn) = &config.on_warn {
+        on_warn(event);
+    }
+}
+
+pub(crate) fn emit_error(config: &ServerConfig, event: ServerErrorEvent) {
+    if let Some(on_error) = &config.on_error {
+        on_error(event);
     }
 }
 
@@ -80,7 +242,7 @@ impl ServerConfig {
 pub struct ServerHandle {
     shutdown_tx: watch::Sender<bool>,
     server_task: JoinHandle<std::io::Result<()>>,
-    local_addr: std::net::SocketAddr,
+    local_addr: Option<std::net::SocketAddr>,
 }
 
 pub fn default_shard_count() -> usize {
@@ -91,7 +253,7 @@ pub fn default_shard_count() -> usize {
 }
 
 impl ServerHandle {
-    pub fn local_addr(&self) -> std::net::SocketAddr {
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         self.local_addr
     }
 
@@ -140,18 +302,42 @@ async fn recv_broadcast_batch(
     Some(batch)
 }
 
+/// Wait for a startup task to report readiness, treating a dropped sender as
+/// startup failure
+async fn wait_for_startup<T>(
+    rx: oneshot::Receiver<std::io::Result<T>>,
+    closed_message: &'static str,
+) -> std::io::Result<T> {
+    rx.await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, closed_message))?
+}
+
 pub async fn run() -> std::io::Result<()> {
     let handle = run_with_config(ServerConfig::default()).await?;
     handle.wait().await
 }
 
+/// Start a server and return only after startup work has completed.
+///
+/// Readiness means storage has initialized, any snapshot has loaded, WAL replay
+/// has completed, and configured listeners have bound successfully.
 pub async fn run_with_config(config: ServerConfig) -> std::io::Result<ServerHandle> {
     START_TIME.set(Instant::now()).ok();
-    let addr = config.listen_addr();
-    let listener = TcpListener::bind(&addr).await?;
-    let local_addr = listener.local_addr()?;
+    let listener = if config.enable_resp {
+        let addr = config.listen_addr();
+        Some(TcpListener::bind(&addr).await?)
+    } else {
+        None
+    };
+    let local_addr = if let Some(listener) = &listener {
+        Some(listener.local_addr()?)
+    } else {
+        None
+    };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let server_task = tokio::spawn(server_main(listener, config, shutdown_rx));
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let server_task = tokio::spawn(server_main(listener, config, shutdown_rx, ready_tx));
+    wait_for_startup(ready_rx, "server startup failed before readiness signal").await?;
     Ok(ServerHandle {
         shutdown_tx,
         server_task,
@@ -160,16 +346,22 @@ pub async fn run_with_config(config: ServerConfig) -> std::io::Result<ServerHand
 }
 
 async fn server_main(
-    listener: TcpListener,
+    listener: Option<TcpListener>,
     config: ServerConfig,
     mut shutdown_rx: watch::Receiver<bool>,
+    ready_tx: oneshot::Sender<std::io::Result<()>>,
 ) -> std::io::Result<()> {
     let config = Arc::new(config);
     let store = Arc::new(Store::new_with_config(config.clone()));
     let schema_cache: SharedSchemaCache =
         std::sync::Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
-    if config.storage.mode == disk::StorageMode::Tiered {
-        println!("storage: tiered mode (dir: {})", config.storage.dir);
+    if config.storage.mode == StorageMode::Tiered {
+        emit_info(
+            &config,
+            ServerInfoEvent::TieredStorageEnabled {
+                dir: config.storage.dir.clone(),
+            },
+        );
     }
     let broker = Broker::new();
     let script_engine = Arc::new(lua::ScriptEngine::new());
@@ -178,9 +370,14 @@ async fn server_main(
         .wal_suppress
         .store(true, std::sync::atomic::Ordering::Relaxed);
     match snapshot::load(&store) {
-        Ok(0) => println!("no snapshot found"),
-        Ok(n) => println!("loaded {n} keys from snapshot"),
-        Err(e) => eprintln!("snapshot load error: {e}"),
+        Ok(0) => emit_info(&config, ServerInfoEvent::NoSnapshotFound),
+        Ok(n) => emit_info(&config, ServerInfoEvent::SnapshotLoaded { keys: n }),
+        Err(e) => emit_error(
+            &config,
+            ServerErrorEvent::SnapshotLoadFailed {
+                error: e.to_string(),
+            },
+        ),
     }
     store
         .wal_suppress
@@ -205,7 +402,7 @@ async fn server_main(
         });
     }
 
-    if config.storage.mode == disk::StorageMode::Tiered {
+    if config.storage.mode == StorageMode::Tiered {
         {
             let store = store.clone();
             background_tasks.spawn(async move {
@@ -226,6 +423,7 @@ async fn server_main(
         }
     }
 
+    let mut http_startup_rx = None;
     if config.http_port > 0 {
         let http_store = store.clone();
         let http_broker = broker.clone();
@@ -233,22 +431,56 @@ async fn server_main(
         let http_port = config.http_port;
         let max_rows = config.max_rows;
         let max_body = config.max_body;
+        let (startup_tx, startup_rx) = oneshot::channel();
+        http_startup_rx = Some(startup_rx);
+        let on_ready = config.on_info.clone().map(|on_info| {
+            Arc::new(move |addr| on_info(ServerInfoEvent::HttpReady { addr }))
+                as Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>
+        });
+        let on_error = config.on_error.clone();
         background_tasks.spawn(async move {
             if let Err(e) = http::start_http_server(
-                http_port, http_store, http_broker, http_cache, max_rows, max_body,
+                http_port,
+                http_store,
+                http_broker,
+                http_cache,
+                max_rows,
+                max_body,
+                on_ready,
+                Some(startup_tx),
             )
             .await
             {
-                eprintln!("http server error: {e}");
+                if let Some(on_error) = on_error {
+                    on_error(ServerErrorEvent::HttpServerFailed {
+                        error: e.to_string(),
+                    });
+                }
             }
         });
     }
 
     let mut conn_tasks = JoinSet::new();
+    // HTTP binds inside its task, so wait for its one-shot before reporting the
+    // whole runtime as ready to embedded callers.
+    if let Some(http_startup_rx) = http_startup_rx {
+        if let Err(e) = wait_for_startup(
+            http_startup_rx,
+            "http server startup failed before readiness signal",
+        )
+        .await
+        {
+            let ready_error = std::io::Error::new(e.kind(), e.to_string());
+            let _ = ready_tx.send(Err(ready_error));
+            return Err(e);
+        }
+    }
+    let _ = ready_tx.send(Ok(()));
 
-    if config.port == 0 {
+    if !config.enable_resp {
         let _ = shutdown_rx.changed().await;
     } else {
+        let listener = listener.expect("listener must exist when RESP is enabled");
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -260,6 +492,7 @@ async fn server_main(
                     let broker = broker.clone();
                     let script_engine = script_engine.clone();
                     let schema_cache = schema_cache.clone();
+                    let on_warn = config.on_warn.clone();
                     socket.set_nodelay(true).ok();
 
                     let require_auth = config.require_auth;
@@ -278,7 +511,12 @@ async fn server_main(
                         CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
                         if let Err(e) = result {
                             if e.kind() != std::io::ErrorKind::ConnectionReset {
-                                eprintln!("connection error {peer}: {e}");
+                                if let Some(on_warn) = on_warn {
+                                    on_warn(ServerWarnEvent::ConnectionFailed {
+                                        peer,
+                                        error: e.to_string(),
+                                    });
+                                }
                             }
                         }
                     });

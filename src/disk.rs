@@ -54,7 +54,9 @@ pub enum StorageMode {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StorageConfig {
+    /// Storage mode used by the runtime.
     pub mode: StorageMode,
+    /// Directory for tiered data files and WAL shards.
     pub dir: String,
 }
 
@@ -68,6 +70,7 @@ impl Default for StorageConfig {
 }
 
 impl StorageMode {
+    /// Stable lowercase name used in INFO output and diagnostics.
     pub fn as_str(self) -> &'static str {
         match self {
             StorageMode::Memory => "memory",
@@ -89,6 +92,21 @@ pub struct Wal {
     file: File,
     /// True if this WAL file starts with WAL_MAGIC (v2 checksummed format).
     has_checksums: bool,
+}
+
+/// Checksum details for one corrupted WAL frame skipped during replay.
+pub struct WalCorruptedFrame {
+    pub stored_crc: u32,
+    pub computed_crc: u32,
+}
+
+/// Result of scanning a WAL file for replay.
+///
+/// The low-level disk layer records corruption details here; the Store layer
+/// owns configuration and emits the corresponding warning events.
+pub struct WalReplay {
+    pub commands: Vec<Vec<Vec<u8>>>,
+    pub corrupted_frames: Vec<WalCorruptedFrame>,
 }
 
 impl Wal {
@@ -167,11 +185,14 @@ impl Wal {
 
     /// Read all commands from the WAL for replay. Partial/corrupt frames
     /// (from a crash mid-write) are safely skipped. Checksummed frames (v2)
-    /// are validated; frames with bad checksums are rejected with a warning.
-    pub fn replay(&mut self) -> io::Result<Vec<Vec<Vec<u8>>>> {
+    /// are validated; frames with bad checksums are rejected and counted.
+    pub fn replay(&mut self) -> io::Result<WalReplay> {
         let file_len = self.file.seek(SeekFrom::End(0))?;
         if file_len == 0 {
-            return Ok(Vec::new());
+            return Ok(WalReplay {
+                commands: Vec::new(),
+                corrupted_frames: Vec::new(),
+            });
         }
 
         // Skip past magic header if present.
@@ -182,7 +203,7 @@ impl Wal {
         }
 
         let mut commands = Vec::new();
-        let mut corrupted = 0usize;
+        let mut corrupted_frames = Vec::new();
 
         loop {
             let frame_len = match read_u32(&mut self.file) {
@@ -199,17 +220,16 @@ impl Wal {
 
             let payload = if self.has_checksums {
                 if buf.len() < 4 {
-                    corrupted += 1;
                     continue;
                 }
                 let stored_crc = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                 let data = &buf[4..];
                 let computed_crc = crc32(data);
                 if stored_crc != computed_crc {
-                    corrupted += 1;
-                    eprintln!(
-                        "WAL: corrupted frame detected (crc mismatch: stored={stored_crc:#010x} computed={computed_crc:#010x}), skipping"
-                    );
+                    corrupted_frames.push(WalCorruptedFrame {
+                        stored_crc,
+                        computed_crc,
+                    });
                     continue;
                 }
                 &buf[4..]
@@ -238,11 +258,11 @@ impl Wal {
                 commands.push(args);
             }
         }
-        if corrupted > 0 {
-            eprintln!("WAL: skipped {corrupted} corrupted frame(s) during replay");
-        }
         self.file.seek(SeekFrom::End(0))?;
-        Ok(commands)
+        Ok(WalReplay {
+            commands,
+            corrupted_frames,
+        })
     }
 
     pub fn truncate(&mut self) -> io::Result<()> {
@@ -311,6 +331,31 @@ pub struct DiskShard {
     total_bytes: usize,
     /// True if this data file uses the v2 checksummed envelope format.
     has_checksums: bool,
+    /// Corruption/parse details found during the last startup rebuild.
+    rebuild_report: DiskRebuildReport,
+}
+
+/// Corruption details collected while rebuilding a disk shard index.
+///
+/// `DiskShard` cannot emit runtime events directly because it has no access to
+/// `ServerConfig`; `Store::new_with_config` drains this report after opening.
+#[derive(Clone, Debug, Default)]
+pub struct DiskRebuildReport {
+    pub corrupted_entries: Vec<DiskCorruptedEntry>,
+    pub parse_errors: Vec<DiskEntryParseError>,
+}
+
+/// One disk entry rejected because its CRC did not match.
+#[derive(Clone, Debug)]
+pub struct DiskCorruptedEntry {
+    pub offset: u64,
+}
+
+/// One disk entry rejected because its payload could not be decoded.
+#[derive(Clone, Debug)]
+pub struct DiskEntryParseError {
+    pub offset: u64,
+    pub error: String,
 }
 
 impl DiskShard {
@@ -350,9 +395,15 @@ impl DiskShard {
             dead_bytes: 0,
             total_bytes: 0,
             has_checksums,
+            rebuild_report: DiskRebuildReport::default(),
         };
         ds.rebuild_index()?;
         Ok(ds)
+    }
+
+    /// Drain corruption details captured by `rebuild_index`.
+    pub fn take_rebuild_report(&mut self) -> DiskRebuildReport {
+        std::mem::take(&mut self.rebuild_report)
     }
 
     /// Serialize and append an entry to the data file. If the key already
@@ -599,8 +650,6 @@ impl DiskShard {
         self.data_file.seek(SeekFrom::Start(header_size))?;
         self.total_bytes = header_size as usize;
         let now = Instant::now();
-        let mut corrupted = 0usize;
-
         if self.has_checksums {
             // v2 format: [4B entry_len][4B crc32][entry_data...]
             loop {
@@ -628,8 +677,9 @@ impl DiskShard {
 
                 let computed_crc = crc32(&entry_data);
                 if stored_crc != computed_crc {
-                    corrupted += 1;
-                    eprintln!("disk: corrupted entry at offset {start} (crc mismatch), skipping");
+                    self.rebuild_report
+                        .corrupted_entries
+                        .push(DiskCorruptedEntry { offset: start });
                     let total_on_disk = 4 + 4 + entry_len;
                     self.dead_bytes += total_on_disk;
                     self.total_bytes += total_on_disk;
@@ -654,7 +704,10 @@ impl DiskShard {
                         self.total_bytes += total_on_disk;
                     }
                     Err(e) => {
-                        eprintln!("disk: failed to parse entry at offset {start}: {e}");
+                        self.rebuild_report.parse_errors.push(DiskEntryParseError {
+                            offset: start,
+                            error: e.to_string(),
+                        });
                         let total_on_disk = 4 + 4 + entry_len;
                         self.dead_bytes += total_on_disk;
                         self.total_bytes += total_on_disk;
@@ -692,9 +745,6 @@ impl DiskShard {
             }
         }
 
-        if corrupted > 0 {
-            eprintln!("disk: skipped {corrupted} corrupted entry/entries during index rebuild");
-        }
         self.data_file.seek(SeekFrom::End(0))?;
         Ok(())
     }
@@ -1005,22 +1055,27 @@ mod tests {
             ds.put("foo", &entry).unwrap();
         }
 
-        // Corrupt a byte in the data file (after the magic header + envelope header).
+        // Corrupt a byte inside the entry payload. The rebuild report records
+        // the start offset of the failed entry, not the specific damaged byte.
         let data_path = dir.path().join("shard_0/data.lux");
         let mut data = fs::read(&data_path).unwrap();
-        // Flip a byte in the entry data region (offset 4 magic + 4 len + 4 crc + some data).
-        if data.len() > 14 {
-            data[14] ^= 0xFF;
+        let entry_start_offset = DATA_MAGIC.len() as u64;
+        let corrupt_byte_offset = DATA_MAGIC.len() + 4 + 4 + 2;
+        if data.len() > corrupt_byte_offset {
+            data[corrupt_byte_offset] ^= 0xFF;
         }
         fs::write(&data_path, &data).unwrap();
 
         // Re-open: rebuild_index should skip the corrupted entry.
-        let ds = DiskShard::open(dir.path(), 0).unwrap();
+        let mut ds = DiskShard::open(dir.path(), 0).unwrap();
         assert_eq!(ds.len(), 0, "corrupted entry should have been skipped");
         assert!(
             ds.dead_bytes > 0,
             "corrupted entry should count as dead bytes"
         );
+        let report = ds.take_rebuild_report();
+        assert_eq!(report.corrupted_entries.len(), 1);
+        assert_eq!(report.corrupted_entries[0].offset, entry_start_offset);
     }
 
     #[test]
@@ -1037,7 +1092,8 @@ mod tests {
         {
             let mut wal = Wal::open(dir.path(), 0).unwrap();
             assert!(wal.has_checksums);
-            let commands = wal.replay().unwrap();
+            let replay = wal.replay().unwrap();
+            let commands = replay.commands;
             assert_eq!(commands.len(), 2);
             assert_eq!(commands[0][0], b"SET");
             assert_eq!(commands[0][1], b"key1");
@@ -1066,7 +1122,9 @@ mod tests {
 
         {
             let mut wal = Wal::open(dir.path(), 0).unwrap();
-            let commands = wal.replay().unwrap();
+            let replay = wal.replay().unwrap();
+            assert_eq!(replay.corrupted_frames.len(), 1);
+            let commands = replay.commands;
             // First frame corrupted, second should still be valid.
             assert_eq!(commands.len(), 1);
             assert_eq!(commands[0][1], b"k2");
@@ -1082,12 +1140,12 @@ mod tests {
         assert!(wal.has_checksums);
 
         // After truncate, replay should return empty.
-        let commands = wal.replay().unwrap();
+        let commands = wal.replay().unwrap().commands;
         assert!(commands.is_empty());
 
         // New appends should still be checksummed.
         wal.append_command(&[b"SET", b"a", b"b"]).unwrap();
-        let commands = wal.replay().unwrap();
+        let commands = wal.replay().unwrap().commands;
         assert_eq!(commands.len(), 1);
     }
 
@@ -1150,7 +1208,7 @@ mod tests {
 
         // Replay should recover the valid command and skip the partial frame.
         let mut wal = Wal::open(dir.path(), 0).unwrap();
-        let commands = wal.replay().unwrap();
+        let commands = wal.replay().unwrap().commands;
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0][0], b"SET");
         assert_eq!(commands[0][1], b"k1");
@@ -1354,7 +1412,7 @@ mod tests {
                 .unwrap();
 
             let mut wal = Wal::open(dir.path(), 0).unwrap();
-            let commands = wal.replay().unwrap();
+            let commands = wal.replay().unwrap().commands;
             prop_assert!(!commands.is_empty(), "valid command should survive garbage");
             prop_assert_eq!(&commands[0][0], b"SET");
         }
@@ -1431,7 +1489,7 @@ mod tests {
             }
 
             let mut wal = Wal::open(dir.path(), 0).unwrap();
-            let replayed = wal.replay().unwrap();
+            let replayed = wal.replay().unwrap().commands;
 
             prop_assert_eq!(replayed.len(), commands.len());
             for (original, recovered) in commands.iter().zip(replayed.iter()) {

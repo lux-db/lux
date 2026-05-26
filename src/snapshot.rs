@@ -474,10 +474,21 @@ pub async fn background_save_loop(store: Arc<Store>) {
         tokio::time::sleep(interval).await;
         match save(&store) {
             Ok(n) => {
-                println!("snapshot: saved {n} keys");
+                crate::emit_info(
+                    store.config(),
+                    crate::ServerInfoEvent::SnapshotSaved { keys: n },
+                );
                 store.truncate_wal();
             }
-            Err(e) => eprintln!("snapshot error: {e} (path: {})", snapshot_path(&store)),
+            Err(e) => {
+                crate::emit_error(
+                    store.config(),
+                    crate::ServerErrorEvent::SnapshotSaveFailed {
+                        error: e.to_string(),
+                        path: snapshot_path(&store),
+                    },
+                );
+            }
         }
     }
 }

@@ -78,6 +78,8 @@ pub enum CmdResult {
 }
 
 fn is_restricted(store: &Store) -> bool {
+    // Restricted mode is per-runtime so embedded servers in one process do not
+    // share command policy through global environment variables.
     store.config().restricted
 }
 

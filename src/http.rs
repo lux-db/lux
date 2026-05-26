@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpSocket;
+use tokio::sync::oneshot;
 
 use crate::cmd;
 use crate::pubsub::Broker;
@@ -25,6 +26,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Start the HTTP API listener and serve requests forever.
+///
+/// `startup_ready` is used by `run_with_config` to include the HTTP bind in
+/// the server readiness contract. `on_ready` remains the user-facing log hook.
 pub async fn start_http_server(
     port: u16,
     store: Arc<Store>,
@@ -32,13 +37,28 @@ pub async fn start_http_server(
     cache: SharedSchemaCache,
     max_rows: Option<usize>,
     max_body: usize,
+    on_ready: Option<Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>>,
+    startup_ready: Option<oneshot::Sender<std::io::Result<std::net::SocketAddr>>>,
 ) -> std::io::Result<()> {
     let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
-    let socket = TcpSocket::new_v4()?;
-    socket.set_reuseaddr(true)?;
-    socket.bind(addr)?;
-    let listener = socket.listen(1024)?;
-    println!("lux http api ready on 0.0.0.0:{port}");
+    // Bind before notifying either readiness channel so callers never observe
+    // a ready server with a missing HTTP listener.
+    let listener = match bind_listener(addr) {
+        Ok(listener) => listener,
+        Err(e) => {
+            if let Some(startup_ready) = startup_ready {
+                let _ = startup_ready.send(Err(std::io::Error::new(e.kind(), e.to_string())));
+            }
+            return Err(e);
+        }
+    };
+    let local_addr = listener.local_addr()?;
+    if let Some(startup_ready) = startup_ready {
+        let _ = startup_ready.send(Ok(local_addr));
+    }
+    if let Some(on_ready) = on_ready {
+        on_ready(local_addr);
+    }
 
     loop {
         let (socket, _) = listener.accept().await?;
@@ -54,6 +74,13 @@ pub async fn start_http_server(
             }
         });
     }
+}
+
+fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(1024)
 }
 
 async fn handle_request(

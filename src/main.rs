@@ -18,8 +18,8 @@ async fn main() -> std::io::Result<()> {
         .to_ascii_lowercase()
         .as_str()
     {
-        "tiered" => lux::disk::StorageMode::Tiered,
-        _ => lux::disk::StorageMode::Memory,
+        "tiered" => lux::StorageMode::Tiered,
+        _ => lux::StorageMode::Memory,
     };
     let storage_dir = std::env::var("LUX_STORAGE_DIR")
         .unwrap_or_else(|_| format!("{}/storage", data_dir.trim_end_matches('/')));
@@ -31,12 +31,12 @@ async fn main() -> std::io::Result<()> {
     let eviction_max_memory = std::env::var("LUX_MAXMEMORY")
         .ok()
         .as_deref()
-        .and_then(lux::eviction::parse_memory_size)
+        .and_then(lux::parse_memory_size)
         .unwrap_or(0);
     let eviction_policy = std::env::var("LUX_MAXMEMORY_POLICY")
         .ok()
-        .map(|s| lux::eviction::parse_eviction_policy(&s))
-        .unwrap_or(lux::eviction::EvictionPolicy::NoEviction);
+        .map(|s| lux::parse_eviction_policy(&s))
+        .unwrap_or(lux::EvictionPolicy::NoEviction);
     let eviction_sample_size = std::env::var("LUX_MAXMEMORY_SAMPLES")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -62,25 +62,132 @@ async fn main() -> std::io::Result<()> {
         password,
         require_auth,
         restricted,
+        enable_resp: std::env::var("LUX_ENABLE_RESP").map_or(true, |v| {
+            let v = v.to_ascii_lowercase();
+            !(v == "0" || v == "false")
+        }),
         shards,
         data_dir,
         save_interval: std::time::Duration::from_secs(save_interval_secs),
-        storage: lux::disk::StorageConfig {
+        storage: lux::StorageConfig {
             mode: storage_mode,
             dir: storage_dir,
         },
-        eviction: lux::eviction::EvictionConfig {
+        eviction: lux::EvictionConfig {
             max_memory: eviction_max_memory,
             policy: eviction_policy,
             sample_size: eviction_sample_size,
         },
+        // The library is quiet by default; the binary maps severity-specific
+        // callbacks back to the previous stdout/stderr behavior.
+        on_info: Some(std::sync::Arc::new(print_info_event)),
+        on_warn: Some(std::sync::Arc::new(print_warn_event)),
+        on_error: Some(std::sync::Arc::new(print_error_event)),
     };
 
     let handle = lux::run_with_config(config).await?;
-    println!(
-        "lux v{} ready on {}",
-        env!("CARGO_PKG_VERSION"),
-        handle.local_addr()
-    );
+    if let Some(addr) = handle.local_addr() {
+        println!("lux v{} ready on {}", env!("CARGO_PKG_VERSION"), addr);
+    } else {
+        println!("lux v{} ready", env!("CARGO_PKG_VERSION"));
+    }
     handle.wait().await
+}
+
+fn print_info_event(event: lux::ServerInfoEvent) {
+    match event {
+        lux::ServerInfoEvent::TieredStorageEnabled { dir } => {
+            println!("storage: tiered mode (dir: {dir})");
+        }
+        lux::ServerInfoEvent::NoSnapshotFound => {
+            println!("no snapshot found");
+        }
+        lux::ServerInfoEvent::SnapshotLoaded { keys } => {
+            println!("loaded {keys} keys from snapshot");
+        }
+        lux::ServerInfoEvent::SnapshotSaved { keys } => {
+            println!("snapshot: saved {keys} keys");
+        }
+        lux::ServerInfoEvent::WalReplayed { commands } => {
+            println!("wal: replayed {commands} commands");
+        }
+        lux::ServerInfoEvent::HttpReady { addr } => {
+            println!("lux http api ready on {addr}");
+        }
+    }
+}
+
+fn print_warn_event(event: lux::ServerWarnEvent) {
+    match event {
+        lux::ServerWarnEvent::WalCorruptedFrameSkipped {
+            stored_crc,
+            computed_crc,
+            ..
+        } => {
+            eprintln!(
+                "WAL: corrupted frame detected (crc mismatch: stored={stored_crc:#010x} computed={computed_crc:#010x}), skipping"
+            );
+        }
+        lux::ServerWarnEvent::WalCorruptedFramesSkipped { frames, .. } => {
+            eprintln!("WAL: skipped {frames} corrupted frame(s) during replay");
+        }
+        lux::ServerWarnEvent::DiskCorruptedEntrySkipped { offset, .. } => {
+            eprintln!("disk: corrupted entry at offset {offset} (crc mismatch), skipping");
+        }
+        lux::ServerWarnEvent::DiskEntryParseFailed { offset, error, .. } => {
+            eprintln!("disk: failed to parse entry at offset {offset}: {error}");
+        }
+        lux::ServerWarnEvent::DiskCorruptedEntriesSkipped { entries, .. } => {
+            eprintln!("disk: skipped {entries} corrupted entry/entries during index rebuild");
+        }
+        lux::ServerWarnEvent::ConnectionFailed { peer, error } => {
+            eprintln!("connection error {peer}: {error}");
+        }
+    }
+}
+
+fn print_error_event(event: lux::ServerErrorEvent) {
+    match event {
+        lux::ServerErrorEvent::SnapshotLoadFailed { error } => {
+            eprintln!("snapshot load error: {error}");
+        }
+        lux::ServerErrorEvent::SnapshotSaveFailed { error, path } => {
+            eprintln!("snapshot error: {error} (path: {path})");
+        }
+        lux::ServerErrorEvent::WalReplayFailed { shard, error } => {
+            eprintln!("WAL replay error (shard {shard}): {error}");
+        }
+        lux::ServerErrorEvent::WalTruncateFailed { error } => {
+            eprintln!("WAL truncate error: {error}");
+        }
+        lux::ServerErrorEvent::DiskEvictionWriteFailed { key, error } => {
+            eprintln!(
+                "CRITICAL: disk eviction write failed for key '{}', keeping in memory. \
+                 Data will be LOST on restart if not re-evicted successfully: {error}",
+                key
+            );
+        }
+        lux::ServerErrorEvent::InlineCompactionFailed { error } => {
+            eprintln!("inline compaction error: {error}");
+        }
+        lux::ServerErrorEvent::DiskCompactionFailed { shard, error } => {
+            eprintln!("compaction error (shard {shard}): {error}");
+        }
+        lux::ServerErrorEvent::WalAppendFailed { error } => {
+            eprintln!(
+                "CRITICAL: WAL append failed, in-memory mutation will not survive crash: {error}"
+            );
+        }
+        lux::ServerErrorEvent::SnapshotDiskDumpFailed { error } => {
+            eprintln!(
+                "CRITICAL: failed to dump disk shard during snapshot, cold data may be lost: {error}"
+            );
+        }
+        lux::ServerErrorEvent::WalFsyncFailed { error } => {
+            eprintln!("CRITICAL: WAL fsync failed, up to 1s of writes may not be durable: {error}");
+        }
+        lux::ServerErrorEvent::HttpServerFailed { error } => {
+            eprintln!("http server error: {error}");
+        }
+    }
 }

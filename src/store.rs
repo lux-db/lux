@@ -250,6 +250,54 @@ pub fn estimate_entry_memory(key: &str, value: &StoreValue) -> usize {
 }
 
 impl Store {
+    /// Emit a warning from places that only have access to `self`.
+    fn emit_warn(&self, event: crate::ServerWarnEvent) {
+        crate::emit_warn(&self.config, event);
+    }
+
+    /// Emit an error from places that only have access to `self`.
+    fn emit_error(&self, event: crate::ServerErrorEvent) {
+        crate::emit_error(&self.config, event);
+    }
+
+    /// Convert low-level disk rebuild reports into public warning events.
+    fn emit_disk_rebuild_report(
+        config: &crate::ServerConfig,
+        shard: usize,
+        report: crate::disk::DiskRebuildReport,
+    ) {
+        let corrupted_count = report.corrupted_entries.len();
+        for entry in report.corrupted_entries {
+            crate::emit_warn(
+                config,
+                crate::ServerWarnEvent::DiskCorruptedEntrySkipped {
+                    shard,
+                    offset: entry.offset,
+                },
+            );
+        }
+        for error in report.parse_errors {
+            crate::emit_warn(
+                config,
+                crate::ServerWarnEvent::DiskEntryParseFailed {
+                    shard,
+                    offset: error.offset,
+                    error: error.error,
+                },
+            );
+        }
+        if corrupted_count > 0 {
+            crate::emit_warn(
+                config,
+                crate::ServerWarnEvent::DiskCorruptedEntriesSkipped {
+                    shard,
+                    entries: corrupted_count,
+                },
+            );
+        }
+    }
+
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::new_with_config(Arc::new(crate::ServerConfig::default()))
     }
@@ -267,15 +315,16 @@ impl Store {
             .collect();
 
         let disk_shard_count = n.min(64);
-        let (disk_shards, wal_shards) = if config.storage.mode == crate::disk::StorageMode::Tiered
-        {
+        let (disk_shards, wal_shards) = if config.storage.mode == crate::disk::StorageMode::Tiered {
             let dir = std::path::Path::new(&config.storage.dir);
             let ds: Vec<parking_lot::Mutex<crate::disk::DiskShard>> = (0..disk_shard_count)
                 .map(|i| {
-                    parking_lot::Mutex::new(
-                        crate::disk::DiskShard::open(dir, i)
-                            .unwrap_or_else(|e| panic!("failed to open disk shard {i}: {e}")),
-                    )
+                    // DiskShard records rebuild corruption locally; surface it
+                    // through the configured callback while startup is still synchronous.
+                    let mut shard = crate::disk::DiskShard::open(dir, i)
+                        .unwrap_or_else(|e| panic!("failed to open disk shard {i}: {e}"));
+                    Self::emit_disk_rebuild_report(&config, i, shard.take_rebuild_report());
+                    parking_lot::Mutex::new(shard)
                 })
                 .collect();
             let ws: Vec<parking_lot::Mutex<crate::disk::Wal>> = (0..disk_shard_count)
@@ -378,16 +427,17 @@ impl Store {
                 let mut disk = disk_shards[disk_idx].lock();
                 if let Err(e) = disk.put(key, &dump) {
                     PERSISTENCE_ERR_DISK_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!(
-                        "CRITICAL: disk eviction write failed for key '{}', keeping in memory. \
-                         Data will be LOST on restart if not re-evicted successfully: {e}",
-                        key
-                    );
+                    self.emit_error(crate::ServerErrorEvent::DiskEvictionWriteFailed {
+                        key: key.to_string(),
+                        error: e.to_string(),
+                    });
                     return;
                 }
                 if disk.should_compact() {
                     if let Err(e) = disk.compact() {
-                        eprintln!("inline compaction error: {e}");
+                        self.emit_error(crate::ServerErrorEvent::InlineCompactionFailed {
+                            error: e.to_string(),
+                        });
                     }
                 }
                 drop(disk);
@@ -512,7 +562,10 @@ impl Store {
                 let mut disk = d.lock();
                 if disk.should_compact() {
                     if let Err(e) = disk.compact() {
-                        eprintln!("compaction error (shard {i}): {e}");
+                        self.emit_error(crate::ServerErrorEvent::DiskCompactionFailed {
+                            shard: i,
+                            error: e.to_string(),
+                        });
                     }
                 }
             }
@@ -544,9 +597,9 @@ impl Store {
                     if let Err(e) = wal.append_command(args) {
                         PERSISTENCE_ERR_WAL_APPEND
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        eprintln!(
-                            "CRITICAL: WAL append failed, in-memory mutation will not survive crash: {e}"
-                        );
+                        self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
+                            error: e.to_string(),
+                        });
                     }
                 }
             } else if args.len() >= 2 {
@@ -554,9 +607,9 @@ impl Store {
                 let mut wal = ws[idx].lock();
                 if let Err(e) = wal.append_command(args) {
                     PERSISTENCE_ERR_WAL_APPEND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!(
-                        "CRITICAL: WAL append failed, in-memory mutation will not survive crash: {e}"
-                    );
+                    self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
+                        error: e.to_string(),
+                    });
                 }
             }
         }
@@ -577,8 +630,22 @@ impl Store {
         for (i, w) in ws.iter().enumerate() {
             let mut wal = w.lock();
             match wal.replay() {
-                Ok(commands) => {
-                    for cmd_args in commands {
+                Ok(replay) => {
+                    let corrupted_count = replay.corrupted_frames.len();
+                    for frame in replay.corrupted_frames {
+                        self.emit_warn(crate::ServerWarnEvent::WalCorruptedFrameSkipped {
+                            shard: i,
+                            stored_crc: frame.stored_crc,
+                            computed_crc: frame.computed_crc,
+                        });
+                    }
+                    if corrupted_count > 0 {
+                        self.emit_warn(crate::ServerWarnEvent::WalCorruptedFramesSkipped {
+                            shard: i,
+                            frames: corrupted_count,
+                        });
+                    }
+                    for cmd_args in replay.commands {
                         let refs: Vec<&[u8]> = cmd_args.iter().map(|a| a.as_slice()).collect();
                         let mut out = bytes::BytesMut::new();
                         let now = Instant::now();
@@ -589,11 +656,17 @@ impl Store {
                         total += 1;
                     }
                 }
-                Err(e) => eprintln!("WAL replay error (shard {i}): {e}"),
+                Err(e) => self.emit_error(crate::ServerErrorEvent::WalReplayFailed {
+                    shard: i,
+                    error: e.to_string(),
+                }),
             }
         }
         if total > 0 {
-            println!("wal: replayed {total} commands");
+            crate::emit_info(
+                &self.config,
+                crate::ServerInfoEvent::WalReplayed { commands: total },
+            );
         }
         self.wal_suppress
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -604,7 +677,9 @@ impl Store {
             for w in ws.iter() {
                 let mut wal = w.lock();
                 if let Err(e) = wal.truncate() {
-                    eprintln!("WAL truncate error: {e}");
+                    self.emit_error(crate::ServerErrorEvent::WalTruncateFailed {
+                        error: e.to_string(),
+                    });
                 }
             }
         }
@@ -626,7 +701,11 @@ impl Store {
                     let mut disk = d.lock();
                     match disk.dump_all(now) {
                         Ok(mut de) => entries.append(&mut de),
-                        Err(e) => eprintln!("CRITICAL: failed to dump disk shard during snapshot, cold data may be lost: {e}"),
+                        Err(e) => {
+                            self.emit_error(crate::ServerErrorEvent::SnapshotDiskDumpFailed {
+                                error: e.to_string(),
+                            })
+                        }
                     }
                 }
                 entries
@@ -644,9 +723,9 @@ impl Store {
                 let mut wal = w.lock();
                 if let Err(e) = wal.fsync() {
                     PERSISTENCE_ERR_WAL_FSYNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!(
-                        "CRITICAL: WAL fsync failed, up to 1s of writes may not be durable: {e}"
-                    );
+                    self.emit_error(crate::ServerErrorEvent::WalFsyncFailed {
+                        error: e.to_string(),
+                    });
                 }
             }
         }

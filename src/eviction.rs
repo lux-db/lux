@@ -3,17 +3,26 @@ use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvictionPolicy {
+    /// Reject writes when memory exceeds maxmemory.
     NoEviction,
+    /// Evict least-recently-used keys from the full keyspace.
     AllKeysLru,
+    /// Evict least-recently-used keys that have TTLs.
     VolatileLru,
+    /// Evict random keys from the full keyspace.
     AllKeysRandom,
+    /// Evict random keys that have TTLs.
     VolatileRandom,
 }
 
+/// Memory pressure configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EvictionConfig {
+    /// Maximum memory in bytes. `0` disables eviction.
     pub max_memory: usize,
+    /// Eviction strategy used after `max_memory` is exceeded.
     pub policy: EvictionPolicy,
+    /// Number of entries sampled per eviction attempt for approximate LRU.
     pub sample_size: usize,
 }
 
@@ -48,6 +57,7 @@ pub fn parse_memory_size(s: &str) -> Option<usize> {
     s.parse::<usize>().ok()
 }
 
+/// Parse Redis-compatible maxmemory policy names.
 pub fn parse_eviction_policy(s: &str) -> EvictionPolicy {
     match s.to_lowercase().as_str() {
         "allkeys-lru" => EvictionPolicy::AllKeysLru,
