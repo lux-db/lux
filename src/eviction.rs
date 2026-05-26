@@ -1,56 +1,41 @@
-use crate::store::{num_shards, Store, USED_MEMORY};
-use std::sync::atomic::Ordering;
-use std::sync::OnceLock;
+use crate::store::Store;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvictionPolicy {
+    /// Reject writes when memory exceeds maxmemory.
     NoEviction,
+    /// Evict least-recently-used keys from the full keyspace.
     AllKeysLru,
+    /// Evict least-recently-used keys that have TTLs.
     VolatileLru,
+    /// Evict random keys from the full keyspace.
     AllKeysRandom,
+    /// Evict random keys that have TTLs.
     VolatileRandom,
 }
 
+/// Memory pressure configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EvictionConfig {
+    /// Maximum memory in bytes. `0` disables eviction.
     pub max_memory: usize,
+    /// Eviction strategy used after `max_memory` is exceeded.
     pub policy: EvictionPolicy,
+    /// Number of entries sampled per eviction attempt for approximate LRU.
     pub sample_size: usize,
 }
 
-pub fn eviction_config() -> &'static EvictionConfig {
-    static CONFIG: OnceLock<EvictionConfig> = OnceLock::new();
-    CONFIG.get_or_init(|| {
-        let max_memory = std::env::var("LUX_MAXMEMORY")
-            .ok()
-            .and_then(|s| parse_memory_size(&s))
-            .unwrap_or(0);
-
-        let policy = std::env::var("LUX_MAXMEMORY_POLICY")
-            .ok()
-            .map(|s| match s.to_lowercase().as_str() {
-                "allkeys-lru" => EvictionPolicy::AllKeysLru,
-                "volatile-lru" => EvictionPolicy::VolatileLru,
-                "allkeys-random" => EvictionPolicy::AllKeysRandom,
-                "volatile-random" => EvictionPolicy::VolatileRandom,
-                "noeviction" => EvictionPolicy::NoEviction,
-                _ => EvictionPolicy::NoEviction,
-            })
-            .unwrap_or(EvictionPolicy::NoEviction);
-
-        let sample_size = std::env::var("LUX_MAXMEMORY_SAMPLES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5usize);
-
-        EvictionConfig {
-            max_memory,
-            policy,
-            sample_size,
+impl Default for EvictionConfig {
+    fn default() -> Self {
+        Self {
+            max_memory: 0,
+            policy: EvictionPolicy::NoEviction,
+            sample_size: 5,
         }
-    })
+    }
 }
 
-fn parse_memory_size(s: &str) -> Option<usize> {
+pub fn parse_memory_size(s: &str) -> Option<usize> {
     let s = s.trim().to_lowercase();
     if s == "0" {
         return Some(0);
@@ -71,23 +56,35 @@ fn parse_memory_size(s: &str) -> Option<usize> {
     s.parse::<usize>().ok()
 }
 
+/// Parse Redis-compatible maxmemory policy names.
+pub fn parse_eviction_policy(s: &str) -> EvictionPolicy {
+    match s.to_lowercase().as_str() {
+        "allkeys-lru" => EvictionPolicy::AllKeysLru,
+        "volatile-lru" => EvictionPolicy::VolatileLru,
+        "allkeys-random" => EvictionPolicy::AllKeysRandom,
+        "volatile-random" => EvictionPolicy::VolatileRandom,
+        "noeviction" => EvictionPolicy::NoEviction,
+        _ => EvictionPolicy::NoEviction,
+    }
+}
+
 #[inline(always)]
-pub fn eviction_enabled() -> bool {
-    let cfg = eviction_config();
+pub fn eviction_enabled(store: &Store) -> bool {
+    let cfg = store.config().eviction;
     cfg.max_memory > 0 && cfg.policy != EvictionPolicy::NoEviction
 }
 
 pub fn evict_if_needed(store: &Store) -> Result<(), &'static str> {
-    if !eviction_enabled() {
+    if !eviction_enabled(store) {
         return Ok(());
     }
+    let cfg = store.config().eviction;
 
-    let cfg = eviction_config();
     let max = cfg.max_memory;
     let tiered = store.is_tiered();
 
     let mut iterations = 0;
-    while USED_MEMORY.load(Ordering::Relaxed) > max {
+    while store.approximate_memory() > max {
         iterations += 1;
         if iterations > 128 {
             if tiered {
@@ -116,8 +113,8 @@ pub fn evict_if_needed(store: &Store) -> Result<(), &'static str> {
 }
 
 fn evict_lru(store: &Store, sample_size: usize, volatile_only: bool) -> bool {
-    let n = num_shards();
-    let seed = USED_MEMORY.load(Ordering::Relaxed);
+    let n = store.shard_count();
+    let seed = store.approximate_memory();
     let start_shard = seed % n;
 
     let mut best_key: Option<String> = None;
@@ -161,8 +158,8 @@ fn evict_lru(store: &Store, sample_size: usize, volatile_only: bool) -> bool {
 }
 
 fn evict_random(store: &Store, volatile_only: bool) -> bool {
-    let n = num_shards();
-    let seed = USED_MEMORY.load(Ordering::Relaxed);
+    let n = store.shard_count();
+    let seed = store.approximate_memory();
     let start_shard = seed % n;
 
     for offset in 0..n {

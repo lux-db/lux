@@ -1,28 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::store::cosine_similarity;
-
-static RNG_STATE: AtomicU64 = AtomicU64::new(0);
-
-fn xorshift_random() -> f64 {
-    let mut s = RNG_STATE.load(Ordering::Relaxed);
-    if s == 0 {
-        s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        if s == 0 {
-            s = 1;
-        }
-    }
-    s ^= s << 13;
-    s ^= s >> 7;
-    s ^= s << 17;
-    RNG_STATE.store(s, Ordering::Relaxed);
-    (s as f64) / (u64::MAX as f64)
-}
 
 #[derive(Clone)]
 struct HnswNode {
@@ -38,6 +17,8 @@ pub struct HnswIndex {
     m: usize,
     m_max0: usize,
     dims: u32,
+    /// Per-index random state used for HNSW layer selection.
+    rng_state: u64,
 }
 
 #[derive(PartialEq)]
@@ -70,13 +51,30 @@ impl HnswIndex {
             m: 12,
             m_max0: 24,
             dims,
+            rng_state: 0,
         }
     }
 
-    fn random_level(&self) -> usize {
+    fn xorshift_random(&mut self) -> f64 {
+        if self.rng_state == 0 {
+            self.rng_state = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            if self.rng_state == 0 {
+                self.rng_state = 1;
+            }
+        }
+        self.rng_state ^= self.rng_state << 13;
+        self.rng_state ^= self.rng_state >> 7;
+        self.rng_state ^= self.rng_state << 17;
+        (self.rng_state as f64) / (u64::MAX as f64)
+    }
+
+    fn random_level(&mut self) -> usize {
         let mut level = 0;
         let ml = 1.0 / (self.m as f64).ln();
-        while xorshift_random() < (-1.0 / ml).exp() && level < 16 {
+        while self.xorshift_random() < (-1.0 / ml).exp() && level < 16 {
             level += 1;
         }
         level

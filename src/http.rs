@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpSocket;
+use tokio::sync::oneshot;
 
 use crate::cmd;
 use crate::pubsub::Broker;
@@ -25,20 +26,46 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Runtime options for the HTTP API listener.
+///
+/// `startup_ready` is used by `run_with_config` to include the HTTP bind in
+/// the server readiness contract. `on_ready` remains the user-facing log hook.
+pub struct HttpServerConfig {
+    pub http_port: u16,
+    pub max_rows: Option<usize>,
+    pub max_body: usize,
+    pub on_ready: Option<Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>>,
+    pub startup_ready: Option<oneshot::Sender<std::io::Result<std::net::SocketAddr>>>,
+}
+
+/// Start the HTTP API listener and serve requests forever.
 pub async fn start_http_server(
-    port: u16,
+    config: HttpServerConfig,
     store: Arc<Store>,
     broker: Broker,
     cache: SharedSchemaCache,
-    max_rows: Option<usize>,
-    max_body: usize,
 ) -> std::io::Result<()> {
-    let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
-    let socket = TcpSocket::new_v4()?;
-    socket.set_reuseaddr(true)?;
-    socket.bind(addr)?;
-    let listener = socket.listen(1024)?;
-    println!("lux http api ready on 0.0.0.0:{port}");
+    let addr: std::net::SocketAddr = format!("0.0.0.0:{}", config.http_port).parse().unwrap();
+    // Bind before notifying either readiness channel so callers never observe
+    // a ready server with a missing HTTP listener.
+    let listener = match bind_listener(addr) {
+        Ok(listener) => listener,
+        Err(e) => {
+            if let Some(startup_ready) = config.startup_ready {
+                let _ = startup_ready.send(Err(std::io::Error::new(e.kind(), e.to_string())));
+            }
+            return Err(e);
+        }
+    };
+    let local_addr = listener.local_addr()?;
+    if let Some(startup_ready) = config.startup_ready {
+        let _ = startup_ready.send(Ok(local_addr));
+    }
+    if let Some(on_ready) = config.on_ready {
+        on_ready(local_addr);
+    }
+    let max_rows = config.max_rows;
+    let max_body = config.max_body;
 
     loop {
         let (socket, _) = listener.accept().await?;
@@ -54,6 +81,13 @@ pub async fn start_http_server(
             }
         });
     }
+}
+
+fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(1024)
 }
 
 async fn handle_request(
@@ -126,7 +160,7 @@ async fn handle_request(
         return Ok(true);
     }
 
-    let password = std::env::var("LUX_PASSWORD").unwrap_or_default();
+    let password = &store.config().password;
     if !password.is_empty() {
         let auth = headers
             .iter()
@@ -1350,7 +1384,7 @@ fn exec_simple(
     let mut out = BytesMut::with_capacity(1024);
     let now = Instant::now();
 
-    let _guard = crate::SCRIPT_GATE.read();
+    let _guard = store.script_read_guard();
     let result = cmd::execute(store, cache, broker, &arg_bytes, &mut out, now);
 
     match result {

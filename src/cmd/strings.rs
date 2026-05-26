@@ -420,7 +420,7 @@ pub fn cmd_incrbyfloat(
         Entry {
             value: StoreValue::Str(Bytes::from(new_str.clone())),
             expires_at,
-            lru_clock: crate::store::LRU_CLOCK.load(std::sync::atomic::Ordering::Relaxed),
+            lru_clock: store.lru_clock(),
         },
     );
     resp::write_bulk(out, &new_str);
