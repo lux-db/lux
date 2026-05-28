@@ -110,11 +110,80 @@ pub struct TimeSeriesData {
     pub labels: Vec<(String, String)>,
 }
 
+pub struct SetData {
+    members: Vec<String>,
+    index: HashMap<String, usize>,
+}
+
+impl SetData {
+    pub fn new() -> Self {
+        Self {
+            members: Vec::new(),
+            index: HashMap::new(),
+        }
+    }
+
+    pub fn from_members<I>(members: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut set = Self::new();
+        for member in members {
+            set.insert(member);
+        }
+        set
+    }
+
+    pub fn insert(&mut self, member: String) -> bool {
+        if self.index.contains_key(&member) {
+            return false;
+        }
+        let idx = self.members.len();
+        self.members.push(member.clone());
+        self.index.insert(member, idx);
+        true
+    }
+
+    pub fn remove(&mut self, member: &str) -> bool {
+        let Some(idx) = self.index.remove(member) else {
+            return false;
+        };
+        self.members.swap_remove(idx);
+        if let Some(swapped) = self.members.get(idx) {
+            self.index.insert(swapped.clone(), idx);
+        }
+        true
+    }
+
+    pub fn pop(&mut self) -> Option<String> {
+        let member = self.members.pop()?;
+        self.index.remove(&member);
+        Some(member)
+    }
+
+    pub fn contains(&self, member: &str) -> bool {
+        self.index.contains_key(member)
+    }
+
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &String> {
+        self.members.iter()
+    }
+}
+
 pub enum StoreValue {
     Str(Bytes),
+    StrBuf(Vec<u8>),
     List(VecDeque<Bytes>),
     Hash(HashMap<String, Bytes>),
-    Set(HashSet<String>),
+    Set(SetData),
     SortedSet(
         BTreeMap<(OrderedFloat<f64>, String), ()>,
         HashMap<String, f64>,
@@ -128,7 +197,7 @@ pub enum StoreValue {
 impl StoreValue {
     pub fn type_name(&self) -> &'static str {
         match self {
-            StoreValue::Str(_) => "string",
+            StoreValue::Str(_) | StoreValue::StrBuf(_) => "string",
             StoreValue::List(_) => "list",
             StoreValue::Hash(_) => "hash",
             StoreValue::Set(_) => "set",
@@ -137,6 +206,24 @@ impl StoreValue {
             StoreValue::Vector(_) => "vector",
             StoreValue::HyperLogLog(..) => "string",
             StoreValue::TimeSeries(_) => "timeseries",
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn string_bytes(&self) -> Option<&[u8]> {
+        match self {
+            StoreValue::Str(s) => Some(s),
+            StoreValue::StrBuf(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn string_to_bytes(&self) -> Option<Bytes> {
+        match self {
+            StoreValue::Str(s) => Some(s.clone()),
+            StoreValue::StrBuf(s) => Some(Bytes::copy_from_slice(s)),
+            _ => None,
         }
     }
 }
@@ -171,6 +258,7 @@ pub(crate) struct StoreMetrics {
     lru_clock: AtomicU32,
     connected_clients: AtomicUsize,
     total_commands: AtomicUsize,
+    key_count: AtomicUsize,
     persistence_err_wal_append: AtomicUsize,
     persistence_err_wal_fsync: AtomicUsize,
     persistence_err_disk_write: AtomicUsize,
@@ -184,6 +272,7 @@ impl StoreMetrics {
             lru_clock: AtomicU32::new(0),
             connected_clients: AtomicUsize::new(0),
             total_commands: AtomicUsize::new(0),
+            key_count: AtomicUsize::new(0),
             persistence_err_wal_append: AtomicUsize::new(0),
             persistence_err_wal_fsync: AtomicUsize::new(0),
             persistence_err_disk_write: AtomicUsize::new(0),
@@ -235,6 +324,7 @@ pub fn estimate_entry_memory(key: &str, value: &StoreValue) -> usize {
     let key_overhead = key.len() + 64;
     let val_size = match value {
         StoreValue::Str(s) => s.len(),
+        StoreValue::StrBuf(s) => s.len(),
         StoreValue::List(l) => l.iter().map(|b| b.len() + 32).sum(),
         StoreValue::Hash(h) => h.iter().map(|(k, v)| k.len() + v.len() + 64).sum(),
         StoreValue::Set(s) => s.iter().map(|m| m.len() + 32).sum(),
@@ -421,6 +511,21 @@ impl Store {
             .fetch_add(amount, Ordering::Relaxed);
     }
 
+    #[inline(always)]
+    pub(crate) fn key_added(&self) {
+        self.metrics.key_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub(crate) fn key_removed(&self) {
+        self.metrics
+            .key_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            })
+            .ok();
+    }
+
     pub(crate) fn record_wal_append_error(&self) {
         self.metrics
             .persistence_err_wal_append
@@ -496,6 +601,10 @@ impl Store {
         self.disk_shards.is_some()
     }
 
+    pub(crate) fn wal_enabled(&self) -> bool {
+        self.wal_shards.is_some() && !self.wal_suppress.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn lock_read_shard(&self, idx: usize) -> parking_lot::RwLockReadGuard<'_, Shard> {
         self.shards[idx].read()
     }
@@ -515,6 +624,7 @@ impl Store {
                 if matches!(entry.value, StoreValue::Vector(_)) {
                     let mem = estimate_entry_memory(key, &entry.value);
                     shard.data.remove(key);
+                    self.key_removed();
                     shard.used_memory = shard.used_memory.saturating_sub(mem);
                     self.mem_sub(mem);
                     shard.version += 1;
@@ -555,6 +665,7 @@ impl Store {
 
                 let mut shard = self.shards[shard_idx].write();
                 if let Some(entry) = shard.data.remove(key) {
+                    self.key_removed();
                     let mem = estimate_entry_memory(key, &entry.value);
                     shard.used_memory = shard.used_memory.saturating_sub(mem);
                     self.mem_sub(mem);
@@ -564,6 +675,7 @@ impl Store {
         } else {
             let mut shard = self.shards[shard_idx].write();
             if let Some(entry) = shard.data.remove(key) {
+                self.key_removed();
                 let mem = estimate_entry_memory(key, &entry.value);
                 shard.used_memory = shard.used_memory.saturating_sub(mem);
                 self.mem_sub(mem);
@@ -575,6 +687,7 @@ impl Store {
     fn entry_to_dump(&self, key: &str, value: &StoreValue, ttl_ms: i64) -> DumpEntry {
         let dump_value = match value {
             StoreValue::Str(s) => DumpValue::Str(s.to_vec()),
+            StoreValue::StrBuf(s) => DumpValue::Str(s.clone()),
             StoreValue::List(l) => DumpValue::List(l.iter().map(|b| b.to_vec()).collect()),
             StoreValue::Hash(h) => {
                 DumpValue::Hash(h.iter().map(|(k, v)| (k.clone(), v.to_vec())).collect())
@@ -689,12 +802,12 @@ impl Store {
     ///
     /// Global commands (FLUSHDB, FLUSHALL) are written to ALL WAL shards
     /// since they affect the entire keyspace.
-    pub fn wal_log_command(&self, args: &[&[u8]]) {
+    pub fn wal_log_command(&self, args: &[&[u8]]) -> std::io::Result<()> {
         if self.wal_suppress.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
+            return Ok(());
         }
         if args.is_empty() {
-            return;
+            return Ok(());
         }
         if let Some(ref ws) = self.wal_shards {
             let cmd = args[0];
@@ -710,6 +823,7 @@ impl Store {
                         self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
                             error: e.to_string(),
                         });
+                        return Err(e);
                     }
                 }
             } else if args.len() >= 2 {
@@ -720,9 +834,11 @@ impl Store {
                     self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
                         error: e.to_string(),
                     });
+                    return Err(e);
                 }
             }
         }
+        Ok(())
     }
 
     /// Replay WAL entries by re-executing each command through the normal
@@ -854,10 +970,7 @@ impl Store {
                 if entry.is_expired_at(now) {
                     return None;
                 }
-                match &entry.value {
-                    StoreValue::Str(s) => Some(s.clone()),
-                    _ => None,
-                }
+                entry.value.string_to_bytes()
             })
     }
 
@@ -871,7 +984,7 @@ impl Store {
         let hash = fx_hash(key);
         match data.raw_entry().from_hash(hash, |k| k.as_bytes() == key) {
             Some((_, entry)) if !entry.is_expired_at(now) => {
-                if let StoreValue::Str(s) = &entry.value {
+                if let Some(s) = entry.value.string_bytes() {
                     crate::resp::write_bulk_raw(out, s);
                 } else {
                     crate::resp::write_null(out);
@@ -923,6 +1036,7 @@ impl Store {
                     |k| fx_hash(k.as_bytes()),
                 );
                 self.mem_add(new_size);
+                self.key_added();
             }
         }
     }
@@ -1023,6 +1137,47 @@ impl Store {
             }
         } else {
             self.mem_add(mem);
+            self.key_added();
+        }
+        true
+    }
+
+    /// SETNX variant for callers that already hold the correct shard write
+    /// lock. The caller owns shard versioning, WAL logging, key events, and
+    /// disk invalidation when the value changes.
+    pub(crate) fn set_nx_on_shard(
+        &self,
+        data: &mut HashMap<String, Entry, FxBuildHasher>,
+        key: &[u8],
+        value: &[u8],
+        now: Instant,
+    ) -> bool {
+        let ks = key_str(key);
+        if let Some(entry) = data.get(ks) {
+            if !entry.is_expired_at(now) {
+                return false;
+            }
+        }
+        let new_value = StoreValue::Str(Bytes::copy_from_slice(value));
+        let mem = estimate_entry_memory(ks, &new_value);
+        let old = data.insert(
+            key_string(key),
+            Entry {
+                value: new_value,
+                expires_at: None,
+                lru_clock: self.lru_clock(),
+            },
+        );
+        if let Some(old_entry) = old {
+            let old_mem = estimate_entry_memory(ks, &old_entry.value);
+            if mem >= old_mem {
+                self.mem_add(mem - old_mem);
+            } else {
+                self.mem_sub(old_mem - mem);
+            }
+        } else {
+            self.mem_add(mem);
+            self.key_added();
         }
         true
     }
@@ -1036,10 +1191,7 @@ impl Store {
             if e.is_expired_at(now) {
                 None
             } else {
-                match &e.value {
-                    StoreValue::Str(s) => Some(s.clone()),
-                    _ => None,
-                }
+                e.value.string_to_bytes()
             }
         });
         let new_value = StoreValue::Str(Bytes::copy_from_slice(value));
@@ -1061,6 +1213,49 @@ impl Store {
             }
         } else {
             self.mem_add(mem);
+            self.key_added();
+        }
+        old
+    }
+
+    /// GETSET variant for callers that already hold the correct shard write
+    /// lock. The caller owns shard versioning, WAL logging, key events, and
+    /// disk invalidation.
+    pub(crate) fn get_set_on_shard(
+        &self,
+        data: &mut HashMap<String, Entry, FxBuildHasher>,
+        key: &[u8],
+        value: &[u8],
+        now: Instant,
+    ) -> Option<Bytes> {
+        let ks = key_str(key);
+        let old = data.get(ks).and_then(|e| {
+            if e.is_expired_at(now) {
+                None
+            } else {
+                e.value.string_to_bytes()
+            }
+        });
+        let new_value = StoreValue::Str(Bytes::copy_from_slice(value));
+        let mem = estimate_entry_memory(ks, &new_value);
+        let old_entry = data.insert(
+            key_string(key),
+            Entry {
+                value: new_value,
+                expires_at: None,
+                lru_clock: self.lru_clock(),
+            },
+        );
+        if let Some(oe) = old_entry {
+            let old_mem = estimate_entry_memory(ks, &oe.value);
+            if mem >= old_mem {
+                self.mem_add(mem - old_mem);
+            } else {
+                self.mem_sub(old_mem - mem);
+            }
+        } else {
+            self.mem_add(mem);
+            self.key_added();
         }
         old
     }
@@ -1068,11 +1263,18 @@ impl Store {
     pub fn strlen(&self, key: &[u8], now: Instant) -> i64 {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
-            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Str(s) => s.len() as i64,
-                _ => 0,
-            },
+        Self::strlen_from_shard(&shard.data, key, now)
+    }
+
+    pub(crate) fn strlen_from_shard(
+        data: &HashMap<String, Entry, FxBuildHasher>,
+        key: &[u8],
+        now: Instant,
+    ) -> i64 {
+        match data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => {
+                entry.value.string_bytes().map_or(0, |s| s.len() as i64)
+            }
             _ => 0,
         }
     }
@@ -1086,6 +1288,7 @@ impl Store {
             let mut shard = self.shards[idx].write();
             shard.version += 1;
             if let Some(entry) = shard.data.remove(key_str(key)) {
+                self.key_removed();
                 let expired = entry.is_expired_at(now);
                 let is_vector = matches!(&entry.value, StoreValue::Vector(_));
                 let mem = estimate_entry_memory(key_str(key), &entry.value);
@@ -1114,6 +1317,22 @@ impl Store {
         count
     }
 
+    pub(crate) fn del_on_shard(&self, shard: &mut Shard, key: &[u8], now: Instant) -> i64 {
+        let Some(entry) = shard.data.remove(key_str(key)) else {
+            return 0;
+        };
+        self.key_removed();
+        let expired = entry.is_expired_at(now);
+        let is_vector = matches!(&entry.value, StoreValue::Vector(_));
+        let mem = estimate_entry_memory(key_str(key), &entry.value);
+        shard.used_memory = shard.used_memory.saturating_sub(mem);
+        self.mem_sub(mem);
+        if is_vector {
+            self.vector_index.write().remove(key_str(key));
+        }
+        i64::from(!expired)
+    }
+
     pub fn exists(&self, keys: &[&[u8]], now: Instant) -> i64 {
         let mut count = 0i64;
         for key in keys {
@@ -1133,14 +1352,23 @@ impl Store {
         count
     }
 
+    pub(crate) fn exists_on_shard(
+        data: &HashMap<String, Entry, FxBuildHasher>,
+        key: &[u8],
+        now: Instant,
+    ) -> bool {
+        data.get(key_str(key))
+            .is_some_and(|entry| !entry.is_expired_at(now))
+    }
+
     pub fn incr(&self, key: &[u8], delta: i64, now: Instant) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let ks = key_str(key);
         let (current, expires_at) = match shard.data.get(ks) {
-            Some(e) if !e.is_expired_at(now) => match &e.value {
-                StoreValue::Str(s) => {
+            Some(e) if !e.is_expired_at(now) => match e.value.string_bytes() {
+                Some(s) => {
                     let s = std::str::from_utf8(s)
                         .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
                     let n = s
@@ -1148,7 +1376,7 @@ impl Store {
                         .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
                     (n, e.expires_at)
                 }
-                _ => return Err(WRONGTYPE.to_string()),
+                None => return Err(WRONGTYPE.to_string()),
             },
             _ => (0, None),
         };
@@ -1174,6 +1402,58 @@ impl Store {
             }
         } else {
             self.mem_add(mem);
+            self.key_added();
+        }
+        Ok(new_val)
+    }
+
+    /// INCRBY primitive for callers that already hold the correct shard write
+    /// lock. The caller owns shard versioning, WAL logging, and key events.
+    pub(crate) fn incr_on_shard(
+        &self,
+        data: &mut HashMap<String, Entry, FxBuildHasher>,
+        key: &[u8],
+        delta: i64,
+        now: Instant,
+    ) -> Result<i64, String> {
+        let ks = key_str(key);
+        let (current, expires_at) = match data.get(ks) {
+            Some(e) if !e.is_expired_at(now) => match e.value.string_bytes() {
+                Some(s) => {
+                    let s = std::str::from_utf8(s)
+                        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+                    let n = s
+                        .parse::<i64>()
+                        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+                    (n, e.expires_at)
+                }
+                None => return Err(WRONGTYPE.to_string()),
+            },
+            _ => (0, None),
+        };
+        let new_val = current
+            .checked_add(delta)
+            .ok_or_else(|| "ERR increment or decrement would overflow".to_string())?;
+        let new_value = StoreValue::Str(Bytes::from(new_val.to_string()));
+        let mem = estimate_entry_memory(ks, &new_value);
+        let old_entry = data.insert(
+            key_string(key),
+            Entry {
+                value: new_value,
+                expires_at,
+                lru_clock: self.lru_clock(),
+            },
+        );
+        if let Some(oe) = old_entry {
+            let old_mem = estimate_entry_memory(ks, &oe.value);
+            if mem >= old_mem {
+                self.mem_add(mem - old_mem);
+            } else {
+                self.mem_sub(old_mem - mem);
+            }
+        } else {
+            self.mem_add(mem);
+            self.key_added();
         }
         Ok(new_val)
     }
@@ -1182,18 +1462,39 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
+        self.append_on_shard(&mut shard, key, value, now)
+    }
+
+    pub(crate) fn append_on_shard(
+        &self,
+        shard: &mut Shard,
+        key: &[u8],
+        value: &[u8],
+        now: Instant,
+    ) -> i64 {
         let ks = key_str(key);
         if let Some(entry) = shard.data.get_mut(ks) {
             if !entry.is_expired_at(now) {
-                if let StoreValue::Str(s) = &entry.value {
-                    let mut new_val = Vec::with_capacity(s.len() + value.len());
-                    new_val.extend_from_slice(s);
-                    new_val.extend_from_slice(value);
-                    let len = new_val.len() as i64;
-                    self.mem_add(value.len());
-                    entry.value = StoreValue::Str(Bytes::from(new_val));
-                    entry.lru_clock = self.lru_clock();
-                    return len;
+                match &mut entry.value {
+                    StoreValue::Str(s) => {
+                        let mut new_val =
+                            Vec::with_capacity((s.len() + value.len()).next_power_of_two());
+                        new_val.extend_from_slice(s);
+                        new_val.extend_from_slice(value);
+                        let len = new_val.len() as i64;
+                        self.mem_add(value.len());
+                        entry.value = StoreValue::StrBuf(new_val);
+                        entry.lru_clock = self.lru_clock();
+                        return len;
+                    }
+                    StoreValue::StrBuf(s) => {
+                        s.extend_from_slice(value);
+                        let len = s.len() as i64;
+                        self.mem_add(value.len());
+                        entry.lru_clock = self.lru_clock();
+                        return len;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1218,6 +1519,7 @@ impl Store {
             }
         } else {
             self.mem_add(mem);
+            self.key_added();
         }
         len
     }
@@ -1343,6 +1645,7 @@ impl Store {
             shard.version += 1;
             match shard.data.remove(key_str(key)) {
                 Some(e) if !e.is_expired_at(now) => {
+                    self.key_removed();
                     let mem = estimate_entry_memory(key_str(key), &e.value);
                     shard.used_memory = shard.used_memory.saturating_sub(mem);
                     self.mem_sub(mem);
@@ -1355,7 +1658,10 @@ impl Store {
         let mut shard = self.shards[new_idx].write();
         shard.version += 1;
         let mem = estimate_entry_memory(key_str(new_key), &entry.value);
-        shard.data.insert(key_string(new_key), entry);
+        let old = shard.data.insert(key_string(new_key), entry);
+        if old.is_none() {
+            self.key_added();
+        }
         shard.used_memory += mem;
         self.mem_add(mem);
         Ok(())
@@ -1379,6 +1685,7 @@ impl Store {
                     let ttl = entry.expires_at.map(|exp| exp.duration_since(now));
                     let dv = match &entry.value {
                         StoreValue::Str(s) => DumpValue::Str(s.to_vec()),
+                        StoreValue::StrBuf(s) => DumpValue::Str(s.clone()),
                         StoreValue::List(l) => {
                             DumpValue::List(l.iter().map(|b| b.to_vec()).collect())
                         }
@@ -1436,17 +1743,8 @@ impl Store {
     }
 
     pub fn dbsize(&self, now: Instant) -> i64 {
-        let mut total = 0i64;
-        for shard in self.shards.iter() {
-            let shard = shard.read();
-            total += shard
-                .data
-                .values()
-                .filter(|e| e.expires_at.is_none_or(|exp| now < exp))
-                .count() as i64;
-        }
-        total += self.disk_key_count() as i64;
-        total
+        let _ = now;
+        (self.metrics.key_count.load(Ordering::Relaxed) + self.disk_key_count()) as i64
     }
 
     pub fn flushdb(&self) {
@@ -1457,6 +1755,7 @@ impl Store {
             self.mem_sub(shard.used_memory);
             shard.used_memory = 0;
         }
+        self.metrics.key_count.store(0, Ordering::Relaxed);
         *self.vector_index.write() = crate::hnsw::HnswIndex::new(0);
         if let Some(ref ds) = self.disk_shards {
             for d in ds.iter() {
@@ -1475,11 +1774,15 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::List(VecDeque::new()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
+        if !existed {
+            self.key_added();
+        }
         if entry.is_expired_at(now) {
             entry.value = StoreValue::List(VecDeque::new());
             entry.expires_at = None;
@@ -1499,17 +1802,60 @@ impl Store {
         }
     }
 
+    /// LPUSH variant for callers that already hold the correct shard write
+    /// lock. The caller owns shard versioning, WAL logging, key events, disk
+    /// invalidation, and blocked-list waiter draining.
+    pub(crate) fn lpush_on_shard(
+        &self,
+        shard: &mut Shard,
+        key: &[u8],
+        values: &[&[u8]],
+        now: Instant,
+    ) -> Result<i64, String> {
+        let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
+        let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
+        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
+            value: StoreValue::List(VecDeque::new()),
+            expires_at: None,
+            lru_clock: self.lru_clock(),
+        });
+        if !existed {
+            self.key_added();
+        }
+        if entry.is_expired_at(now) {
+            entry.value = StoreValue::List(VecDeque::new());
+            entry.expires_at = None;
+        }
+        match &mut entry.value {
+            StoreValue::List(list) => {
+                for v in values {
+                    list.push_front(Bytes::copy_from_slice(v));
+                }
+                let len = list.len() as i64;
+                shard.used_memory += added_mem;
+                self.mem_add(added_mem);
+                Ok(len)
+            }
+            _ => Err(WRONGTYPE.to_string()),
+        }
+    }
+
     pub fn rpush(&self, key: &[u8], values: &[&[u8]], now: Instant) -> Result<i64, String> {
         let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::List(VecDeque::new()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
+        if !existed {
+            self.key_added();
+        }
         if entry.is_expired_at(now) {
             entry.value = StoreValue::List(VecDeque::new());
             entry.expires_at = None;
@@ -1521,6 +1867,45 @@ impl Store {
                 }
                 let len = list.len() as i64;
                 let _ = entry;
+                shard.used_memory += added_mem;
+                self.mem_add(added_mem);
+                Ok(len)
+            }
+            _ => Err(WRONGTYPE.to_string()),
+        }
+    }
+
+    /// RPUSH variant for callers that already hold the correct shard write
+    /// lock. The caller owns shard versioning, WAL logging, key events, disk
+    /// invalidation, and blocked-list waiter draining.
+    pub(crate) fn rpush_on_shard(
+        &self,
+        shard: &mut Shard,
+        key: &[u8],
+        values: &[&[u8]],
+        now: Instant,
+    ) -> Result<i64, String> {
+        let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
+        let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
+        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
+            value: StoreValue::List(VecDeque::new()),
+            expires_at: None,
+            lru_clock: self.lru_clock(),
+        });
+        if !existed {
+            self.key_added();
+        }
+        if entry.is_expired_at(now) {
+            entry.value = StoreValue::List(VecDeque::new());
+            entry.expires_at = None;
+        }
+        match &mut entry.value {
+            StoreValue::List(list) => {
+                for v in values {
+                    list.push_back(Bytes::copy_from_slice(v));
+                }
+                let len = list.len() as i64;
                 shard.used_memory += added_mem;
                 self.mem_add(added_mem);
                 Ok(len)
@@ -1548,10 +1933,58 @@ impl Store {
         }
     }
 
+    /// LPOP variant for callers that already hold the correct shard write lock.
+    /// The caller owns shard versioning, WAL logging, key events, and disk
+    /// invalidation.
+    pub(crate) fn lpop_on_shard(
+        &self,
+        shard: &mut Shard,
+        key: &[u8],
+        now: Instant,
+    ) -> Option<Bytes> {
+        match shard.data.get_mut(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+                StoreValue::List(list) => {
+                    let val = list.pop_front()?;
+                    let freed = val.len() + 32;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    self.mem_sub(freed);
+                    Some(val)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn rpop(&self, key: &[u8], now: Instant) -> Option<Bytes> {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
+        match shard.data.get_mut(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+                StoreValue::List(list) => {
+                    let val = list.pop_back()?;
+                    let freed = val.len() + 32;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    self.mem_sub(freed);
+                    Some(val)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// RPOP variant for callers that already hold the correct shard write lock.
+    /// The caller owns shard versioning, WAL logging, key events, and disk
+    /// invalidation.
+    pub(crate) fn rpop_on_shard(
+        &self,
+        shard: &mut Shard,
+        key: &[u8],
+        now: Instant,
+    ) -> Option<Bytes> {
         match shard.data.get_mut(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
@@ -1638,11 +2071,67 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Hash(HashMap::new()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
+        if !existed {
+            self.key_added();
+        }
+        if entry.is_expired_at(now) {
+            entry.value = StoreValue::Hash(HashMap::new());
+            entry.expires_at = None;
+        }
+        match &mut entry.value {
+            StoreValue::Hash(map) => {
+                let mut added = 0i64;
+                let mut mem_delta: isize = 0;
+                for (field, value) in pairs {
+                    let new_size = (field.len() + value.len() + 64) as isize;
+                    if let Some(old_val) =
+                        map.insert(key_string(field), Bytes::copy_from_slice(value))
+                    {
+                        mem_delta += value.len() as isize - old_val.len() as isize;
+                    } else {
+                        added += 1;
+                        mem_delta += new_size;
+                    }
+                }
+                if mem_delta > 0 {
+                    shard.used_memory += mem_delta as usize;
+                    self.mem_add(mem_delta as usize);
+                } else if mem_delta < 0 {
+                    let freed = (-mem_delta) as usize;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    self.mem_sub(freed);
+                }
+                Ok(added)
+            }
+            _ => Err(WRONGTYPE.to_string()),
+        }
+    }
+
+    /// HSET variant for callers that already hold the correct shard write lock.
+    /// The caller owns shard versioning, WAL logging, and key events.
+    pub(crate) fn hset_on_shard(
+        &self,
+        shard: &mut Shard,
+        key: &[u8],
+        pairs: &[(&[u8], &[u8])],
+        now: Instant,
+    ) -> Result<i64, String> {
+        let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
+        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
+            value: StoreValue::Hash(HashMap::new()),
+            expires_at: None,
+            lru_clock: self.lru_clock(),
+        });
+        if !existed {
+            self.key_added();
+        }
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Hash(HashMap::new());
             entry.expires_at = None;
@@ -1680,6 +2169,21 @@ impl Store {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Hash(map) => map.get(key_str(field)).cloned(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub(crate) fn hget_from_shard(
+        data: &HashMap<String, Entry, FxBuildHasher>,
+        key: &[u8],
+        field: &[u8],
+        now: Instant,
+    ) -> Option<Bytes> {
+        match data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => map.get(key_str(field)).cloned(),
                 _ => None,
@@ -1800,12 +2304,29 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
+        self.hincrby_on_shard(&mut shard, key, field, delta, now)
+    }
+
+    /// HINCRBY variant for callers that already hold the correct shard write
+    /// lock. The caller owns shard versioning, WAL logging, and key events.
+    pub(crate) fn hincrby_on_shard(
+        &self,
+        shard: &mut Shard,
+        key: &[u8],
+        field: &[u8],
+        delta: i64,
+        now: Instant,
+    ) -> Result<i64, String> {
         let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Hash(HashMap::new()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
+        if !existed {
+            self.key_added();
+        }
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Hash(HashMap::new());
             entry.expires_at = None;
@@ -1858,13 +2379,56 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::Set(HashSet::new()),
+            value: StoreValue::Set(SetData::new()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
+        if !existed {
+            self.key_added();
+        }
         if entry.is_expired_at(now) {
-            entry.value = StoreValue::Set(HashSet::new());
+            entry.value = StoreValue::Set(SetData::new());
+            entry.expires_at = None;
+        }
+        match &mut entry.value {
+            StoreValue::Set(set) => {
+                let mut added = 0i64;
+                let mut mem_added = 0usize;
+                for m in members {
+                    if set.insert(key_string(m)) {
+                        mem_added += m.len() + 32;
+                        added += 1;
+                    }
+                }
+                shard.used_memory += mem_added;
+                self.mem_add(mem_added);
+                Ok(added)
+            }
+            _ => Err(WRONGTYPE.to_string()),
+        }
+    }
+
+    pub(crate) fn sadd_on_shard(
+        &self,
+        shard: &mut Shard,
+        key: &[u8],
+        members: &[&[u8]],
+        now: Instant,
+    ) -> Result<i64, String> {
+        let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
+        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
+            value: StoreValue::Set(SetData::new()),
+            expires_at: None,
+            lru_clock: self.lru_clock(),
+        });
+        if !existed {
+            self.key_added();
+        }
+        if entry.is_expired_at(now) {
+            entry.value = StoreValue::Set(SetData::new());
             entry.expires_at = None;
         }
         match &mut entry.value {
@@ -1951,7 +2515,7 @@ impl Store {
         let shard = self.shards[idx].read();
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Set(set) => Ok(set.clone()),
+                StoreValue::Set(set) => Ok(set.iter().cloned().collect()),
                 _ => Err(WRONGTYPE.to_string()),
             },
             _ => Ok(HashSet::new()),
@@ -2001,7 +2565,22 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
+        self.xadd_on_shard(&mut shard, key, id_input, fields, maxlen, now)
+    }
+
+    /// XADD variant for callers that already hold the correct shard write lock.
+    /// The caller owns shard versioning, WAL logging, and stream waiter wakeups.
+    pub(crate) fn xadd_on_shard(
+        &self,
+        shard: &mut Shard,
+        key: &[u8],
+        id_input: &str,
+        fields: Vec<(String, Bytes)>,
+        maxlen: Option<usize>,
+        now: Instant,
+    ) -> Result<StreamId, String> {
         let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Stream(StreamData {
                 entries: BTreeMap::new(),
@@ -2011,6 +2590,9 @@ impl Store {
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
+        if !existed {
+            self.key_added();
+        }
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Stream(StreamData {
                 entries: BTreeMap::new(),
@@ -2225,6 +2807,7 @@ impl Store {
         let ks = key_string(key);
 
         if mkstream {
+            let existed = shard.data.contains_key(&ks);
             let entry = shard.data.entry(ks.clone()).or_insert_with(|| Entry {
                 value: StoreValue::Stream(StreamData {
                     entries: BTreeMap::new(),
@@ -2234,6 +2817,9 @@ impl Store {
                 expires_at: None,
                 lru_clock: self.lru_clock(),
             });
+            if !existed {
+                self.key_added();
+            }
             if entry.is_expired_at(now) {
                 entry.value = StoreValue::Stream(StreamData {
                     entries: BTreeMap::new(),
@@ -2795,6 +3381,7 @@ impl Store {
                     key: key.clone(),
                     value: match &entry.value {
                         StoreValue::Str(s) => DumpValue::Str(s.to_vec()),
+                        StoreValue::StrBuf(s) => DumpValue::Str(s.clone()),
                         StoreValue::List(l) => {
                             DumpValue::List(l.iter().map(|b| b.to_vec()).collect())
                         }
@@ -2840,6 +3427,79 @@ impl Store {
         entries
     }
 
+    pub(crate) fn with_write_barrier<R>(
+        &self,
+        f: impl FnOnce(&mut [parking_lot::RwLockWriteGuard<'_, Shard>]) -> R,
+    ) -> R {
+        let mut guards: Vec<_> = self.shards.iter().map(|shard| shard.write()).collect();
+        f(&mut guards)
+    }
+
+    pub(crate) fn dump_all_from_locked_shards(
+        &self,
+        shards: &[parking_lot::RwLockWriteGuard<'_, Shard>],
+        now: Instant,
+    ) -> Vec<DumpEntry> {
+        let mut entries = Vec::new();
+        for shard in shards {
+            for (key, entry) in shard.data.iter() {
+                if entry.is_expired_at(now) {
+                    continue;
+                }
+                let ttl_ms = entry
+                    .expires_at
+                    .map(|exp| exp.duration_since(now).as_millis() as i64)
+                    .unwrap_or(0);
+                entries.push(DumpEntry {
+                    key: key.clone(),
+                    value: match &entry.value {
+                        StoreValue::Str(s) => DumpValue::Str(s.to_vec()),
+                        StoreValue::StrBuf(s) => DumpValue::Str(s.clone()),
+                        StoreValue::List(l) => {
+                            DumpValue::List(l.iter().map(|b| b.to_vec()).collect())
+                        }
+                        StoreValue::Hash(h) => DumpValue::Hash(
+                            h.iter().map(|(k, v)| (k.clone(), v.to_vec())).collect(),
+                        ),
+                        StoreValue::Set(s) => DumpValue::Set(s.iter().cloned().collect()),
+                        StoreValue::SortedSet(_, scores) => DumpValue::SortedSet(
+                            scores.iter().map(|(m, s)| (m.clone(), *s)).collect(),
+                        ),
+                        StoreValue::Stream(s) => {
+                            let entries = s
+                                .entries
+                                .iter()
+                                .map(|(id, fields)| {
+                                    let flds = fields
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), v.to_vec()))
+                                        .collect();
+                                    (id.to_string(), flds)
+                                })
+                                .collect();
+                            DumpValue::Stream(entries, s.last_id.to_string())
+                        }
+                        StoreValue::Vector(v) => {
+                            DumpValue::Vector(v.data.clone(), v.metadata.clone())
+                        }
+                        StoreValue::HyperLogLog(regs, cached) => {
+                            DumpValue::HyperLogLog(regs.clone(), *cached)
+                        }
+                        StoreValue::TimeSeries(ts) => DumpValue::TimeSeries(
+                            ts.samples.clone(),
+                            ts.retention,
+                            ts.labels.clone(),
+                        ),
+                    },
+                    ttl_ms,
+                });
+            }
+        }
+        let mut disk_entries = self.dump_disk_entries(now);
+        entries.append(&mut disk_entries);
+        entries
+    }
+
     pub fn load_entry(&self, key: String, value: DumpValue, ttl: Option<Duration>) {
         let idx = self.shard_index(key.as_bytes());
         let mut shard = self.shards[idx].write();
@@ -2850,7 +3510,7 @@ impl Store {
             DumpValue::Hash(h) => {
                 StoreValue::Hash(h.into_iter().map(|(k, v)| (k, Bytes::from(v))).collect())
             }
-            DumpValue::Set(s) => StoreValue::Set(s.into_iter().collect()),
+            DumpValue::Set(s) => StoreValue::Set(SetData::from_members(s)),
             DumpValue::SortedSet(members) => {
                 let mut tree = BTreeMap::new();
                 let mut scores = HashMap::new();
@@ -2889,7 +3549,7 @@ impl Store {
                 });
                 let expires_at = ttl.map(|d| Instant::now() + d);
                 let mem = estimate_entry_memory(&key, &sv);
-                shard.data.insert(
+                let old = shard.data.insert(
                     key,
                     Entry {
                         value: sv,
@@ -2897,6 +3557,9 @@ impl Store {
                         lru_clock: self.lru_clock(),
                     },
                 );
+                if old.is_none() {
+                    self.key_added();
+                }
                 shard.used_memory += mem;
                 self.mem_add(mem);
                 drop(shard);
@@ -2914,7 +3577,7 @@ impl Store {
         };
         let expires_at = ttl.map(|d| Instant::now() + d);
         let mem = estimate_entry_memory(&key, &store_value);
-        shard.data.insert(
+        let old = shard.data.insert(
             key,
             Entry {
                 value: store_value,
@@ -2922,6 +3585,9 @@ impl Store {
                 lru_clock: self.lru_clock(),
             },
         );
+        if old.is_none() {
+            self.key_added();
+        }
         shard.used_memory += mem;
         self.mem_add(mem);
     }
@@ -2933,16 +3599,13 @@ impl Store {
         let ks = key_str(key);
         match shard.data.get(ks) {
             Some(entry) if !entry.is_expired_at(now) => {
-                if let StoreValue::Str(_) = &entry.value {
+                if entry.value.string_bytes().is_some() {
                     let entry = shard.data.remove(ks).unwrap();
+                    self.key_removed();
                     let freed = estimate_entry_memory(ks, &entry.value);
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
                     self.mem_sub(freed);
-                    if let StoreValue::Str(s) = entry.value {
-                        Some(s)
-                    } else {
-                        None
-                    }
+                    entry.value.string_to_bytes()
                 } else {
                     None
                 }
@@ -2969,10 +3632,7 @@ impl Store {
                 } else if let Some(d) = ttl {
                     entry.expires_at = Some(now + d);
                 }
-                match &entry.value {
-                    StoreValue::Str(s) => Some(s.clone()),
-                    _ => None,
-                }
+                entry.value.string_to_bytes()
             }
             _ => None,
         }
@@ -2983,7 +3643,7 @@ impl Store {
         let shard = self.shards[idx].read();
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => {
-                if let StoreValue::Str(s) = &entry.value {
+                if let Some(s) = entry.value.string_bytes() {
                     let len = s.len() as i64;
                     let s_i = if start < 0 {
                         (len + start).max(0) as usize
@@ -2998,7 +3658,7 @@ impl Store {
                     if s_i >= e_i {
                         Bytes::new()
                     } else {
-                        s.slice(s_i..e_i)
+                        Bytes::copy_from_slice(&s[s_i..e_i])
                     }
                 } else {
                     Bytes::new()
@@ -3013,16 +3673,20 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Str(Bytes::new()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
+        if !existed {
+            self.key_added();
+        }
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Str(Bytes::new());
             entry.expires_at = None;
         }
-        if let StoreValue::Str(s) = &entry.value {
+        if let Some(s) = entry.value.string_bytes() {
             let old_len = s.len();
             let mut buf = s.to_vec();
             let needed = offset + value.len();
@@ -3032,7 +3696,7 @@ impl Store {
             buf[offset..offset + value.len()].copy_from_slice(value);
             let new_len = buf.len();
             let len = new_len as i64;
-            entry.value = StoreValue::Str(Bytes::from(buf));
+            entry.value = StoreValue::StrBuf(buf);
             if new_len > old_len {
                 let added = new_len - old_len;
                 let _ = entry;
@@ -3064,17 +3728,21 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Str(Bytes::new()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
+        if !existed {
+            self.key_added();
+        }
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Str(Bytes::new());
             entry.expires_at = None;
         }
-        match &entry.value {
-            StoreValue::Str(s) => {
+        match entry.value.string_bytes() {
+            Some(s) => {
                 let old_len = s.len();
                 let mut buf = s.to_vec();
                 if buf.len() <= byte_idx {
@@ -3087,7 +3755,7 @@ impl Store {
                 } else {
                     buf[byte_idx] &= !(1 << bit_idx);
                 }
-                entry.value = StoreValue::Str(Bytes::from(buf));
+                entry.value = StoreValue::StrBuf(buf);
                 if new_len > old_len {
                     let added = new_len - old_len;
                     let _ = entry;
@@ -3096,7 +3764,7 @@ impl Store {
                 }
                 Ok(old)
             }
-            _ => Err(WRONGTYPE.to_string()),
+            None => Err(WRONGTYPE.to_string()),
         }
     }
 
@@ -3106,15 +3774,15 @@ impl Store {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key_str(key)) {
-            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Str(s) => {
+            Some(entry) if !entry.is_expired_at(now) => match entry.value.string_bytes() {
+                Some(s) => {
                     if byte_idx >= s.len() {
                         Ok(0)
                     } else {
                         Ok((s[byte_idx] >> bit_idx) & 1)
                     }
                 }
-                _ => Err(WRONGTYPE.to_string()),
+                None => Err(WRONGTYPE.to_string()),
             },
             _ => Ok(0),
         }
@@ -3131,8 +3799,8 @@ impl Store {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key_str(key)) {
-            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Str(s) => {
+            Some(entry) if !entry.is_expired_at(now) => match entry.value.string_bytes() {
+                Some(s) => {
                     if use_bit {
                         let bit_len = s.len() as i64 * 8;
                         let s_idx = if start < 0 {
@@ -3177,7 +3845,7 @@ impl Store {
                         Ok(count)
                     }
                 }
-                _ => Err(WRONGTYPE.to_string()),
+                None => Err(WRONGTYPE.to_string()),
             },
             _ => Ok(0),
         }
@@ -3197,8 +3865,8 @@ impl Store {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key_str(key)) {
-            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Str(s) => {
+            Some(entry) if !entry.is_expired_at(now) => match entry.value.string_bytes() {
+                Some(s) => {
                     if s.is_empty() {
                         return if bit == 1 { Ok(-1) } else { Ok(0) };
                     }
@@ -3253,9 +3921,9 @@ impl Store {
                         if s_byte > e_byte {
                             return Ok(-1);
                         }
-                        for i in s_byte..=e_byte {
+                        for (i, byte) in s.iter().enumerate().take(e_byte + 1).skip(s_byte) {
                             for b in 0..8u8 {
-                                let bit_val = (s[i] >> (7 - b)) & 1;
+                                let bit_val = (*byte >> (7 - b)) & 1;
                                 if bit_val == bit {
                                     return Ok((i * 8 + b as usize) as i64);
                                 }
@@ -3268,7 +3936,7 @@ impl Store {
                         }
                     }
                 }
-                _ => Err(WRONGTYPE.to_string()),
+                None => Err(WRONGTYPE.to_string()),
             },
             _ => {
                 if bit == 0 {
@@ -3293,12 +3961,12 @@ impl Store {
             let idx = self.shard_index(key);
             let shard = self.shards[idx].read();
             match shard.data.get(key_str(key)) {
-                Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                    StoreValue::Str(s) => {
+                Some(entry) if !entry.is_expired_at(now) => match entry.value.string_bytes() {
+                    Some(s) => {
                         max_len = max_len.max(s.len());
                         sources.push(s.to_vec());
                     }
-                    _ => return Err(WRONGTYPE.to_string()),
+                    None => return Err(WRONGTYPE.to_string()),
                 },
                 _ => {
                     sources.push(Vec::new());
@@ -3364,6 +4032,7 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::TimeSeries(TimeSeriesData {
                 samples: Vec::new(),
@@ -3373,6 +4042,9 @@ impl Store {
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
+        if !existed {
+            self.key_added();
+        }
         if entry.is_expired_at(now) {
             entry.value = StoreValue::TimeSeries(TimeSeriesData {
                 samples: Vec::new(),
@@ -3850,11 +4522,15 @@ impl Store {
             let mut shard = self.shards[dst_idx].write();
             shard.version += 1;
             let ks = key_string(dst);
+            let existed = shard.data.contains_key(&ks);
             let entry = shard.data.entry(ks).or_insert_with(|| Entry {
                 value: StoreValue::List(VecDeque::new()),
                 expires_at: None,
                 lru_clock: self.lru_clock(),
             });
+            if !existed {
+                self.key_added();
+            }
             if entry.is_expired_at(now) {
                 entry.value = StoreValue::List(VecDeque::new());
                 entry.expires_at = None;
@@ -3884,11 +4560,15 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Hash(HashMap::new()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
+        if !existed {
+            self.key_added();
+        }
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Hash(HashMap::new());
             entry.expires_at = None;
@@ -3921,11 +4601,15 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Hash(HashMap::new()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
+        if !existed {
+            self.key_added();
+        }
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Hash(HashMap::new());
             entry.expires_at = None;
@@ -3997,12 +4681,38 @@ impl Store {
                     let mut result = Vec::new();
                     let mut freed = 0usize;
                     for _ in 0..count {
-                        if set.is_empty() {
-                            break;
-                        }
-                        let member = set.iter().next().unwrap().clone();
+                        let Some(member) = set.pop() else { break };
                         freed += member.len() + 32;
-                        set.remove(&member);
+                        result.push(member);
+                    }
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    self.mem_sub(freed);
+                    Ok(result)
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Ok(vec![]),
+        }
+    }
+
+    /// SPOP variant for callers that already hold the correct shard write lock.
+    /// The caller owns shard versioning, WAL logging, key events, and disk
+    /// invalidation.
+    pub(crate) fn spop_on_shard(
+        &self,
+        shard: &mut Shard,
+        key: &[u8],
+        count: usize,
+        now: Instant,
+    ) -> Result<Vec<String>, String> {
+        match shard.data.get_mut(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+                StoreValue::Set(set) => {
+                    let mut result = Vec::new();
+                    let mut freed = 0usize;
+                    for _ in 0..count {
+                        let Some(member) = set.pop() else { break };
+                        freed += member.len() + 32;
                         result.push(member);
                     }
                     shard.used_memory = shard.used_memory.saturating_sub(freed);
@@ -4073,13 +4783,17 @@ impl Store {
         let mut shard = self.shards[dst_idx].write();
         shard.version += 1;
         let ks = key_string(dst);
+        let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::Set(HashSet::new()),
+            value: StoreValue::Set(SetData::new()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
+        if !existed {
+            self.key_added();
+        }
         if entry.is_expired_at(now) {
-            entry.value = StoreValue::Set(HashSet::new());
+            entry.value = StoreValue::Set(SetData::new());
             entry.expires_at = None;
         }
         match &mut entry.value {
@@ -4154,6 +4868,7 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
         let is_new = !shard.data.contains_key(&ks)
             || shard.data.get(&ks).is_some_and(|e| e.is_expired_at(now));
         if xx && is_new {
@@ -4164,6 +4879,87 @@ impl Store {
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
+        if !existed {
+            self.key_added();
+        }
+        if entry.is_expired_at(now) {
+            entry.value = StoreValue::SortedSet(BTreeMap::new(), HashMap::new());
+            entry.expires_at = None;
+        }
+        match &mut entry.value {
+            StoreValue::SortedSet(tree, scores) => {
+                let mut added = 0i64;
+                let mut changed = 0i64;
+                let mut mem_added = 0usize;
+                for &(member, score) in members {
+                    let ms = key_string(member);
+                    if let Some(&old_score) = scores.get(&ms) {
+                        if nx {
+                            continue;
+                        }
+                        let update = if gt && lt {
+                            score != old_score
+                        } else if gt {
+                            score > old_score
+                        } else if lt {
+                            score < old_score
+                        } else {
+                            true
+                        };
+                        if update && score != old_score {
+                            tree.remove(&(OrderedFloat(old_score), ms.clone()));
+                            tree.insert((OrderedFloat(score), ms.clone()), ());
+                            scores.insert(ms, score);
+                            changed += 1;
+                        }
+                    } else {
+                        if xx {
+                            continue;
+                        }
+                        tree.insert((OrderedFloat(score), ms.clone()), ());
+                        scores.insert(ms, score);
+                        mem_added += member.len() + 48;
+                        added += 1;
+                    }
+                }
+                shard.used_memory += mem_added;
+                self.mem_add(mem_added);
+                Ok(if ch { added + changed } else { added })
+            }
+            _ => Err(WRONGTYPE.to_string()),
+        }
+    }
+
+    /// ZADD variant for callers that already hold the correct shard write lock.
+    /// The caller owns shard versioning, WAL logging, and key events.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn zadd_on_shard(
+        &self,
+        shard: &mut Shard,
+        key: &[u8],
+        members: &[(&[u8], f64)],
+        nx: bool,
+        xx: bool,
+        gt: bool,
+        lt: bool,
+        ch: bool,
+        now: Instant,
+    ) -> Result<i64, String> {
+        let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
+        let is_new = !shard.data.contains_key(&ks)
+            || shard.data.get(&ks).is_some_and(|e| e.is_expired_at(now));
+        if xx && is_new {
+            return Ok(0);
+        }
+        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
+            value: StoreValue::SortedSet(BTreeMap::new(), HashMap::new()),
+            expires_at: None,
+            lru_clock: self.lru_clock(),
+        });
+        if !existed {
+            self.key_added();
+        }
         if entry.is_expired_at(now) {
             entry.value = StoreValue::SortedSet(BTreeMap::new(), HashMap::new());
             entry.expires_at = None;
@@ -4215,7 +5011,16 @@ impl Store {
     pub fn zscore(&self, key: &[u8], member: &[u8], now: Instant) -> Result<Option<f64>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        Self::zscore_from_shard(&shard.data, key, member, now)
+    }
+
+    pub(crate) fn zscore_from_shard(
+        data: &HashMap<String, Entry, FxBuildHasher>,
+        key: &[u8],
+        member: &[u8],
+        now: Instant,
+    ) -> Result<Option<f64>, String> {
+        match data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(_, scores) => Ok(scores.get(key_str(member)).copied()),
                 _ => Err(WRONGTYPE.to_string()),
@@ -4410,12 +5215,29 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
+        self.zincrby_on_shard(&mut shard, key, member, increment, now)
+    }
+
+    /// ZINCRBY variant for callers that already hold the correct shard write
+    /// lock. The caller owns shard versioning, WAL logging, and key events.
+    pub(crate) fn zincrby_on_shard(
+        &self,
+        shard: &mut Shard,
+        key: &[u8],
+        member: &[u8],
+        increment: f64,
+        now: Instant,
+    ) -> Result<f64, String> {
         let ks = key_string(key);
+        let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::SortedSet(BTreeMap::new(), HashMap::new()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
+        if !existed {
+            self.key_added();
+        }
         if entry.is_expired_at(now) {
             entry.value = StoreValue::SortedSet(BTreeMap::new(), HashMap::new());
             entry.expires_at = None;
@@ -4586,7 +5408,7 @@ impl Store {
                 tree.insert((OrderedFloat(score), member.clone()), ());
                 scores.insert(member, score);
             }
-            shard.data.insert(
+            let old = shard.data.insert(
                 key_string(dst),
                 Entry {
                     value: StoreValue::SortedSet(tree, scores),
@@ -4594,6 +5416,9 @@ impl Store {
                     lru_clock: self.lru_clock(),
                 },
             );
+            if old.is_none() {
+                self.key_added();
+            }
             shard.used_memory += mem;
             self.mem_add(mem);
         }
@@ -4647,7 +5472,7 @@ impl Store {
                 tree.insert((OrderedFloat(score), member.clone()), ());
                 scores.insert(member, score);
             }
-            shard.data.insert(
+            let old = shard.data.insert(
                 key_string(dst),
                 Entry {
                     value: StoreValue::SortedSet(tree, scores),
@@ -4655,6 +5480,9 @@ impl Store {
                     lru_clock: self.lru_clock(),
                 },
             );
+            if old.is_none() {
+                self.key_added();
+            }
             shard.used_memory += mem;
             self.mem_add(mem);
         }
@@ -4685,7 +5513,7 @@ impl Store {
                 tree.insert((OrderedFloat(score), member.clone()), ());
                 scores.insert(member, score);
             }
-            shard.data.insert(
+            let old = shard.data.insert(
                 key_string(dst),
                 Entry {
                     value: StoreValue::SortedSet(tree, scores),
@@ -4693,6 +5521,9 @@ impl Store {
                     lru_clock: self.lru_clock(),
                 },
             );
+            if old.is_none() {
+                self.key_added();
+            }
             shard.used_memory += mem;
             self.mem_add(mem);
         }
@@ -4806,6 +5637,7 @@ impl Store {
                 let should_remove = shard.data.get(&key).is_some_and(|e| e.is_expired_at(now));
                 if should_remove {
                     if let Some(entry) = shard.data.remove(&key) {
+                        self.key_removed();
                         let is_vector = matches!(&entry.value, StoreValue::Vector(_));
                         let mem = estimate_entry_memory(&key, &entry.value);
                         shard.used_memory = shard.used_memory.saturating_sub(mem);
@@ -4888,7 +5720,7 @@ impl Store {
                 let cached = crate::hll::hll_count(&regs);
                 let sv = StoreValue::HyperLogLog(regs, cached);
                 let mem = estimate_entry_memory(ks, &sv);
-                shard.data.insert(
+                let old = shard.data.insert(
                     key_string(key),
                     Entry {
                         value: sv,
@@ -4896,6 +5728,9 @@ impl Store {
                         lru_clock: self.lru_clock(),
                     },
                 );
+                if old.is_none() {
+                    self.key_added();
+                }
                 shard.used_memory += mem;
                 self.mem_add(mem);
                 Ok(if changed { 1 } else { 0 })
@@ -4989,7 +5824,7 @@ impl Store {
                 shard.used_memory += new_mem;
                 self.mem_add(new_mem);
             }
-            shard.data.insert(
+            let old = shard.data.insert(
                 key_string(dest),
                 Entry {
                     value: sv,
@@ -4997,6 +5832,9 @@ impl Store {
                     lru_clock: self.lru_clock(),
                 },
             );
+            if old.is_none() {
+                self.key_added();
+            }
         }
         Ok(())
     }
@@ -5041,6 +5879,7 @@ impl Store {
         } else {
             self.mem_add(new_mem);
             shard.used_memory += new_mem;
+            self.key_added();
         }
         drop(shard);
         self.vector_index.write().insert(ks, index_data);
@@ -5562,6 +6401,46 @@ mod tests {
         assert_eq!(store.append(b"key", b"hello", n), 5);
         assert_eq!(store.append(b"key", b" world", n), 11);
         assert_eq!(store.get(b"key", n).unwrap(), &b"hello world"[..]);
+        assert_eq!(store.strlen(b"key", n), 11);
+        assert_eq!(store.getrange(b"key", 6, -1, n), &b"world"[..]);
+    }
+
+    #[test]
+    fn dbsize_tracks_common_key_lifecycle() {
+        let store = Store::new();
+        let n = now();
+
+        store.set(b"string", b"1", None, n);
+        store.lpush(b"list", &[b"a"], n).unwrap();
+        store.hset(b"hash", &[(b"field", b"value")], n).unwrap();
+        store.sadd(b"set", &[b"member"], n).unwrap();
+        store
+            .zadd(
+                b"zset",
+                &[(b"member" as &[u8], 1.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        store
+            .xadd(
+                b"stream",
+                "*",
+                vec![("field".to_string(), Bytes::from_static(b"value"))],
+                None,
+                n,
+            )
+            .unwrap();
+
+        assert_eq!(store.dbsize(n), 6);
+        assert_eq!(store.del(&[b"string", b"list"]), 2);
+        assert_eq!(store.dbsize(n), 4);
+        store.flushdb();
+        assert_eq!(store.dbsize(n), 0);
     }
 
     #[test]

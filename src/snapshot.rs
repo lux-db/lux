@@ -64,19 +64,33 @@ fn read_string(r: &mut impl Read) -> io::Result<String> {
 }
 
 pub fn save(store: &Store) -> io::Result<usize> {
+    let now = Instant::now();
+    let entries = store.dump_all(now);
+    save_entries(store, &entries)
+}
+
+fn save_entries(store: &Store, entries: &[crate::store::DumpEntry]) -> io::Result<usize> {
     let path = snapshot_path(store);
     if let Some(parent) = Path::new(&path).parent() {
         fs::create_dir_all(parent)?;
     }
-    let now = Instant::now();
-    let entries = store.dump_all(now);
     let tmp = format!("{path}.{}.tmp", std::process::id());
     let file = fs::File::create(&tmp)?;
     let mut w = BufWriter::new(file);
-    save_binary(&mut w, &entries)?;
+    save_binary(&mut w, entries)?;
     w.into_inner().map_err(io::Error::other)?.sync_all()?;
     fs::rename(&tmp, &path)?;
     Ok(entries.len())
+}
+
+pub(crate) fn save_and_truncate_wal_consistent(store: &Store) -> io::Result<usize> {
+    store.with_write_barrier(|shards| {
+        let now = Instant::now();
+        let entries = store.dump_all_from_locked_shards(shards, now);
+        let saved = save_entries(store, &entries)?;
+        store.truncate_wal();
+        Ok(saved)
+    })
 }
 
 fn save_binary(w: &mut impl Write, entries: &[crate::store::DumpEntry]) -> io::Result<()> {
@@ -472,13 +486,12 @@ pub async fn background_save_loop(store: Arc<Store>) {
     }
     loop {
         tokio::time::sleep(interval).await;
-        match save(&store) {
+        match save_and_truncate_wal_consistent(&store) {
             Ok(n) => {
                 crate::emit_info(
                     store.config(),
                     crate::ServerInfoEvent::SnapshotSaved { keys: n },
                 );
-                store.truncate_wal();
             }
             Err(e) => {
                 crate::emit_error(

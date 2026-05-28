@@ -17,7 +17,6 @@ mod timeseries;
 mod vectors;
 
 use bytes::{Bytes, BytesMut};
-use std::collections::VecDeque;
 use std::time::Instant;
 
 use crate::pubsub::Broker;
@@ -845,7 +844,14 @@ pub fn execute_with_wal(
     now: Instant,
 ) -> CmdResult {
     if !args.is_empty() && crate::eviction::is_write_command(args[0]) {
-        store.wal_log_command(args);
+        if let Err(e) = crate::eviction::evict_if_needed(store) {
+            resp::write_error(out, e);
+            return CmdResult::Written;
+        }
+        if let Err(e) = store.wal_log_command(args) {
+            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+            return CmdResult::Written;
+        }
     }
     execute(store, cache, broker, args, out, now)
 }
@@ -853,9 +859,9 @@ pub fn execute_with_wal(
 pub(crate) type ShardData = hashbrown::HashMap<String, Entry, crate::store::FxBuildHasher>;
 
 pub(crate) fn execute_on_shard(
-    data: &mut ShardData,
+    shard: &mut crate::store::Shard,
     store: &Store,
-    _broker: &Broker,
+    broker: &Broker,
     args: &[&[u8]],
     out: &mut BytesMut,
     now: Instant,
@@ -918,89 +924,128 @@ pub(crate) fn execute_on_shard(
         }
         if !parse_err {
             if nx {
-                let exists = Store::get_from_shard(data, key, now).is_some();
+                let exists = Store::get_from_shard(&shard.data, key, now).is_some();
                 if !exists {
-                    store.set_on_shard(data, key, args[2], None, now);
+                    store.set_on_shard(&mut shard.data, key, args[2], None, now);
                     resp::write_ok(out);
                 } else {
                     resp::write_null(out);
                 }
             } else if xx {
-                let exists = Store::get_from_shard(data, key, now).is_some();
+                let exists = Store::get_from_shard(&shard.data, key, now).is_some();
                 if exists {
-                    store.set_on_shard(data, key, args[2], ttl, now);
+                    store.set_on_shard(&mut shard.data, key, args[2], ttl, now);
                     resp::write_ok(out);
                 } else {
                     resp::write_null(out);
                 }
             } else {
-                store.set_on_shard(data, key, args[2], ttl, now);
+                store.set_on_shard(&mut shard.data, key, args[2], ttl, now);
                 resp::write_ok(out);
             }
         }
     } else if cmd_eq(cmd, b"GET") {
-        Store::get_and_write(data, key, now, out);
+        Store::get_and_write(&shard.data, key, now, out);
     } else if cmd_eq(cmd, b"INCR") {
-        shard_incr(data, key, 1, store.lru_clock(), now, out);
+        write_int_result(out, store.incr_on_shard(&mut shard.data, key, 1, now));
     } else if cmd_eq(cmd, b"DECR") {
-        shard_incr(data, key, -1, store.lru_clock(), now, out);
+        write_int_result(out, store.incr_on_shard(&mut shard.data, key, -1, now));
     } else if cmd_eq(cmd, b"INCRBY") && args.len() >= 3 {
         match parse_i64(args[2]) {
-            Ok(delta) => shard_incr(data, key, delta, store.lru_clock(), now, out),
+            Ok(delta) => {
+                write_int_result(out, store.incr_on_shard(&mut shard.data, key, delta, now))
+            }
             Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
         }
     } else if cmd_eq(cmd, b"DECRBY") && args.len() >= 3 {
         match parse_i64(args[2]) {
-            Ok(delta) => shard_incr(data, key, -delta, store.lru_clock(), now, out),
+            Ok(delta) => {
+                write_int_result(out, store.incr_on_shard(&mut shard.data, key, -delta, now))
+            }
             Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
         }
     } else if cmd_eq(cmd, b"LPUSH") && args.len() >= 3 {
-        shard_list_push(data, key, &args[2..], true, store.lru_clock(), now, out);
+        write_int_result(out, store.lpush_on_shard(shard, key, &args[2..], now));
     } else if cmd_eq(cmd, b"RPUSH") && args.len() >= 3 {
-        shard_list_push(data, key, &args[2..], false, store.lru_clock(), now, out);
+        write_int_result(out, store.rpush_on_shard(shard, key, &args[2..], now));
     } else if cmd_eq(cmd, b"LPOP") && args.len() == 2 {
-        shard_list_pop(data, key, true, now, out);
+        let value = store.lpop_on_shard(shard, key, now);
+        resp::write_optional_bulk_raw(out, &value);
     } else if cmd_eq(cmd, b"RPOP") && args.len() == 2 {
-        shard_list_pop(data, key, false, now, out);
+        let value = store.rpop_on_shard(shard, key, now);
+        resp::write_optional_bulk_raw(out, &value);
     } else if cmd_eq(cmd, b"SADD") && args.len() >= 3 {
-        shard_sadd(data, key, &args[2..], store.lru_clock(), now, out);
+        write_int_result(out, store.sadd_on_shard(shard, key, &args[2..], now));
     } else if cmd_eq(cmd, b"HSET") && args.len() >= 4 {
-        shard_hset(data, key, &args[2..], store.lru_clock(), now, out);
+        let pairs = args[2..]
+            .chunks_exact(2)
+            .map(|pair| (pair[0], pair[1]))
+            .collect::<Vec<_>>();
+        if !args[2..].len().is_multiple_of(2) {
+            resp::write_error(out, "ERR wrong number of arguments for 'hset' command");
+        } else {
+            write_int_result(out, store.hset_on_shard(shard, key, &pairs, now));
+        }
+    } else if cmd_eq(cmd, b"HINCRBY") && args.len() >= 4 {
+        match parse_i64(args[3]) {
+            Ok(delta) => {
+                write_int_result(out, store.hincrby_on_shard(shard, key, args[2], delta, now))
+            }
+            Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
+        }
     } else if cmd_eq(cmd, b"SREM") && args.len() >= 3 {
-        shard_srem(data, key, &args[2..], now, out);
+        shard_srem(&mut shard.data, key, &args[2..], now, out);
     } else if cmd_eq(cmd, b"SPOP") {
-        shard_spop(
-            data,
-            key,
-            if args.len() > 2 {
-                parse_u64(args[2]).unwrap_or(1) as usize
-            } else {
-                1
+        let count = if args.len() > 2 {
+            parse_u64(args[2]).unwrap_or(1) as usize
+        } else {
+            1
+        };
+        match store.spop_on_shard(shard, key, count, now) {
+            Ok(result) if args.len() > 2 => {
+                resp::write_array_header(out, result.len());
+                for member in result {
+                    resp::write_bulk(out, &member);
+                }
+            }
+            Ok(mut result) => match result.pop() {
+                Some(member) => resp::write_bulk(out, &member),
+                None => resp::write_null(out),
             },
-            now,
-            out,
-            args.len() > 2,
-        );
+            Err(e) => resp::write_error(out, &e),
+        }
     } else if cmd_eq(cmd, b"HDEL") && args.len() >= 3 {
-        shard_hdel(data, key, &args[2..], now, out);
+        shard_hdel(&mut shard.data, key, &args[2..], now, out);
     } else if cmd_eq(cmd, b"ZADD") && args.len() >= 4 {
-        shard_zadd(data, key, &args[2..], store.lru_clock(), now, out);
+        shard_zadd(shard, store, key, &args[2..], now, out);
+    } else if cmd_eq(cmd, b"ZINCRBY") && args.len() == 4 {
+        match arg_str(args[2]).parse::<f64>() {
+            Ok(increment) if !increment.is_nan() => {
+                match store.zincrby_on_shard(shard, key, args[3], increment, now) {
+                    Ok(score) => resp::write_bulk(out, &format_float(score)),
+                    Err(e) => resp::write_error(out, &e),
+                }
+            }
+            _ => resp::write_error(out, "ERR value is not a valid float"),
+        }
     } else if cmd_eq(cmd, b"ZREM") && args.len() >= 3 {
-        shard_zrem(data, key, &args[2..], now, out);
+        shard_zrem(&mut shard.data, key, &args[2..], now, out);
     } else if cmd_eq(cmd, b"ZPOPMIN") {
         let count = if args.len() > 2 {
             parse_u64(args[2]).unwrap_or(1) as usize
         } else {
             1
         };
-        shard_zpop(data, key, count, true, now, out);
+        shard_zpop(&mut shard.data, key, count, true, now, out);
     } else if cmd_eq(cmd, b"ZPOPMAX") {
         let count = if args.len() > 2 {
             parse_u64(args[2]).unwrap_or(1) as usize
         } else {
             1
         };
-        shard_zpop(data, key, count, false, now, out);
+        shard_zpop(&mut shard.data, key, count, false, now, out);
+    } else if cmd_eq(cmd, b"XADD") {
+        shard_xadd(shard, store, broker, key, &args[2..], now, out);
     } else {
         resp::write_error(
             out,
@@ -1027,10 +1072,10 @@ pub(crate) fn execute_on_shard_read(
         Store::get_and_write(data, key, now, out);
     } else if cmd_eq(cmd, b"STRLEN") {
         match data.get(ks) {
-            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Str(s) => resp::write_integer(out, s.len() as i64),
-                _ => resp::write_integer(out, 0),
-            },
+            Some(entry) if !entry.is_expired_at(now) => resp::write_integer(
+                out,
+                entry.value.string_bytes().map_or(0, |s| s.len() as i64),
+            ),
             _ => resp::write_integer(out, 0),
         }
     } else if cmd_eq(cmd, b"LLEN") {
@@ -1136,184 +1181,10 @@ pub(crate) fn execute_on_shard_read(
     }
 }
 
-fn shard_incr(
-    data: &mut ShardData,
-    key: &[u8],
-    delta: i64,
-    lru_clock: u32,
-    now: Instant,
-    out: &mut BytesMut,
-) {
-    let ks = arg_str(key);
-    let (current, expires_at) = match data.get(ks) {
-        Some(e) if !e.is_expired_at(now) => match &e.value {
-            StoreValue::Str(s) => {
-                match std::str::from_utf8(s)
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                {
-                    Some(n) => (n, e.expires_at),
-                    None => {
-                        resp::write_error(out, "ERR value is not an integer or out of range");
-                        return;
-                    }
-                }
-            }
-            _ => {
-                resp::write_error(
-                    out,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                );
-                return;
-            }
-        },
-        _ => (0, None),
-    };
-    match current.checked_add(delta) {
-        Some(new_val) => {
-            data.insert(
-                key_string(key),
-                Entry {
-                    value: StoreValue::Str(Bytes::from(new_val.to_string())),
-                    expires_at,
-                    lru_clock,
-                },
-            );
-            resp::write_integer(out, new_val);
-        }
-        None => resp::write_error(out, "ERR increment or decrement would overflow"),
-    }
-}
-
-fn shard_list_push(
-    data: &mut ShardData,
-    key: &[u8],
-    values: &[&[u8]],
-    left: bool,
-    lru_clock: u32,
-    now: Instant,
-    out: &mut BytesMut,
-) {
-    let ks = key_string(key);
-    let entry = data.entry(ks).or_insert_with(|| Entry {
-        value: StoreValue::List(VecDeque::new()),
-        expires_at: None,
-        lru_clock,
-    });
-    if entry.is_expired_at(now) {
-        entry.value = StoreValue::List(VecDeque::new());
-        entry.expires_at = None;
-    }
-    match &mut entry.value {
-        StoreValue::List(list) => {
-            for v in values {
-                if left {
-                    list.push_front(Bytes::copy_from_slice(v));
-                } else {
-                    list.push_back(Bytes::copy_from_slice(v));
-                }
-            }
-            resp::write_integer(out, list.len() as i64);
-        }
-        _ => resp::write_error(
-            out,
-            "WRONGTYPE Operation against a key holding the wrong kind of value",
-        ),
-    }
-}
-
-fn shard_list_pop(data: &mut ShardData, key: &[u8], left: bool, now: Instant, out: &mut BytesMut) {
-    let ks = arg_str(key);
-    match data.get_mut(ks) {
-        Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
-            StoreValue::List(list) => {
-                let val = if left {
-                    list.pop_front()
-                } else {
-                    list.pop_back()
-                };
-                resp::write_optional_bulk_raw(out, &val);
-            }
-            _ => resp::write_null(out),
-        },
-        _ => resp::write_null(out),
-    }
-}
-
-fn shard_sadd(
-    data: &mut ShardData,
-    key: &[u8],
-    members: &[&[u8]],
-    lru_clock: u32,
-    now: Instant,
-    out: &mut BytesMut,
-) {
-    let ks = key_string(key);
-    let entry = data.entry(ks).or_insert_with(|| Entry {
-        value: StoreValue::Set(std::collections::HashSet::new()),
-        expires_at: None,
-        lru_clock,
-    });
-    if entry.is_expired_at(now) {
-        entry.value = StoreValue::Set(std::collections::HashSet::new());
-        entry.expires_at = None;
-    }
-    match &mut entry.value {
-        StoreValue::Set(set) => {
-            let mut added = 0i64;
-            for m in members {
-                if set.insert(key_string(m)) {
-                    added += 1;
-                }
-            }
-            resp::write_integer(out, added);
-        }
-        _ => resp::write_error(
-            out,
-            "WRONGTYPE Operation against a key holding the wrong kind of value",
-        ),
-    }
-}
-
-fn shard_hset(
-    data: &mut ShardData,
-    key: &[u8],
-    field_vals: &[&[u8]],
-    lru_clock: u32,
-    now: Instant,
-    out: &mut BytesMut,
-) {
-    if !field_vals.len().is_multiple_of(2) {
-        resp::write_error(out, "ERR wrong number of arguments for 'hset' command");
-        return;
-    }
-    let ks = key_string(key);
-    let entry = data.entry(ks).or_insert_with(|| Entry {
-        value: StoreValue::Hash(hashbrown::HashMap::new()),
-        expires_at: None,
-        lru_clock,
-    });
-    if entry.is_expired_at(now) {
-        entry.value = StoreValue::Hash(hashbrown::HashMap::new());
-        entry.expires_at = None;
-    }
-    match &mut entry.value {
-        StoreValue::Hash(map) => {
-            let mut added = 0i64;
-            for pair in field_vals.chunks(2) {
-                if map
-                    .insert(key_string(pair[0]), Bytes::copy_from_slice(pair[1]))
-                    .is_none()
-                {
-                    added += 1;
-                }
-            }
-            resp::write_integer(out, added);
-        }
-        _ => resp::write_error(
-            out,
-            "WRONGTYPE Operation against a key holding the wrong kind of value",
-        ),
+fn write_int_result(out: &mut BytesMut, result: Result<i64, String>) {
+    match result {
+        Ok(value) => resp::write_integer(out, value),
+        Err(error) => resp::write_error(out, &error),
     }
 }
 
@@ -1342,53 +1213,6 @@ fn shard_srem(
             ),
         },
         _ => resp::write_integer(out, 0),
-    }
-}
-
-fn shard_spop(
-    data: &mut ShardData,
-    key: &[u8],
-    count: usize,
-    now: Instant,
-    out: &mut BytesMut,
-    has_count: bool,
-) {
-    let ks = arg_str(key);
-    match data.get_mut(ks) {
-        Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
-            StoreValue::Set(set) => {
-                let mut result = Vec::new();
-                for _ in 0..count {
-                    if set.is_empty() {
-                        break;
-                    }
-                    let member = set.iter().next().unwrap().clone();
-                    set.remove(&member);
-                    result.push(member);
-                }
-                if has_count {
-                    resp::write_array_header(out, result.len());
-                    for m in &result {
-                        resp::write_bulk(out, m);
-                    }
-                } else if result.is_empty() {
-                    resp::write_null(out);
-                } else {
-                    resp::write_bulk(out, &result[0]);
-                }
-            }
-            _ => resp::write_error(
-                out,
-                "WRONGTYPE Operation against a key holding the wrong kind of value",
-            ),
-        },
-        _ => {
-            if has_count {
-                resp::write_array_header(out, 0);
-            } else {
-                resp::write_null(out);
-            }
-        }
     }
 }
 
@@ -1421,10 +1245,10 @@ fn shard_hdel(
 }
 
 fn shard_zadd(
-    data: &mut ShardData,
+    shard: &mut crate::store::Shard,
+    store: &Store,
     key: &[u8],
     rest: &[&[u8]],
-    lru_clock: u32,
     now: Instant,
     out: &mut BytesMut,
 ) {
@@ -1470,55 +1294,9 @@ fn shard_zadd(
         i += 2;
     }
 
-    let ks = key_string(key);
-    let entry = data.entry(ks).or_insert_with(|| Entry {
-        value: StoreValue::SortedSet(std::collections::BTreeMap::new(), hashbrown::HashMap::new()),
-        expires_at: None,
-        lru_clock,
-    });
-    if entry.is_expired_at(now) {
-        entry.value =
-            StoreValue::SortedSet(std::collections::BTreeMap::new(), hashbrown::HashMap::new());
-        entry.expires_at = None;
-    }
-    match &mut entry.value {
-        StoreValue::SortedSet(tree, scores) => {
-            let mut added = 0i64;
-            let mut changed = 0i64;
-            for (member_bytes, score) in &members {
-                let member = arg_str(member_bytes).to_string();
-                if let Some(&old_score) = scores.get(&member) {
-                    if nx {
-                        continue;
-                    }
-                    let new_score = *score;
-                    if gt && new_score <= old_score {
-                        continue;
-                    }
-                    if lt && new_score >= old_score {
-                        continue;
-                    }
-                    if new_score != old_score {
-                        tree.remove(&(ordered_float::OrderedFloat(old_score), member.clone()));
-                        tree.insert((ordered_float::OrderedFloat(new_score), member.clone()), ());
-                        scores.insert(member, new_score);
-                        changed += 1;
-                    }
-                } else {
-                    if xx {
-                        continue;
-                    }
-                    tree.insert((ordered_float::OrderedFloat(*score), member.clone()), ());
-                    scores.insert(member, *score);
-                    added += 1;
-                }
-            }
-            resp::write_integer(out, if ch { added + changed } else { added });
-        }
-        _ => resp::write_error(
-            out,
-            "WRONGTYPE Operation against a key holding the wrong kind of value",
-        ),
+    match store.zadd_on_shard(shard, key, &members, nx, xx, gt, lt, ch, now) {
+        Ok(count) => resp::write_integer(out, count),
+        Err(error) => resp::write_error(out, &error),
     }
 }
 
@@ -1549,6 +1327,62 @@ fn shard_zrem(
             ),
         },
         _ => resp::write_integer(out, 0),
+    }
+}
+
+fn shard_xadd(
+    shard: &mut crate::store::Shard,
+    store: &Store,
+    broker: &Broker,
+    key: &[u8],
+    rest: &[&[u8]],
+    now: Instant,
+    out: &mut BytesMut,
+) {
+    let mut i = 0;
+    let mut maxlen = None;
+    while i < rest.len() {
+        if cmd_eq(rest[i], b"MAXLEN") {
+            i += 1;
+            if i < rest.len() && rest[i] == b"~" {
+                i += 1;
+            }
+            if i < rest.len() {
+                maxlen = parse_u64(rest[i]).ok().map(|n| n as usize);
+            }
+            i += 1;
+        } else if cmd_eq(rest[i], b"NOMKSTREAM") {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if i >= rest.len() {
+        resp::write_error(out, "ERR wrong number of arguments for 'xadd' command");
+        return;
+    }
+    let id_input = arg_str(rest[i]);
+    i += 1;
+    if (rest.len() - i) < 2 || !(rest.len() - i).is_multiple_of(2) {
+        resp::write_error(out, "ERR wrong number of arguments for 'xadd' command");
+        return;
+    }
+
+    let mut fields = Vec::with_capacity((rest.len() - i) / 2);
+    while i + 1 < rest.len() {
+        fields.push((
+            arg_str(rest[i]).to_string(),
+            Bytes::copy_from_slice(rest[i + 1]),
+        ));
+        i += 2;
+    }
+
+    match store.xadd_on_shard(shard, key, id_input, fields, maxlen, now) {
+        Ok(id) => {
+            resp::write_bulk(out, &id.to_string());
+            broker.wake_stream_waiters(arg_str(key));
+        }
+        Err(error) => resp::write_error(out, &error),
     }
 }
 
@@ -1591,10 +1425,6 @@ fn shard_zpop(
         },
         _ => resp::write_array_header(out, 0),
     }
-}
-
-fn key_string(key: &[u8]) -> String {
-    String::from_utf8_lossy(key).into_owned()
 }
 
 pub fn is_known_command(cmd: &[u8]) -> bool {

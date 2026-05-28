@@ -113,11 +113,21 @@ pub fn write_optional_bulk_raw(buf: &mut BytesMut, val: &Option<bytes::Bytes>) {
 pub struct Parser<'a> {
     buf: &'a [u8],
     pos: usize,
+    max_bulk_len: usize,
 }
 
 impl<'a> Parser<'a> {
+    #[allow(dead_code)]
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self::with_max_bulk_len(buf, 64 * 1024 * 1024)
+    }
+
+    pub fn with_max_bulk_len(buf: &'a [u8], max_bulk_len: usize) -> Self {
+        Self {
+            buf,
+            pos: 0,
+            max_bulk_len,
+        }
     }
 
     pub fn pos(&self) -> usize {
@@ -180,7 +190,7 @@ impl<'a> Parser<'a> {
         }
         let mut args = Vec::with_capacity(count as usize);
         for _ in 0..count {
-            match self.parse_bulk_string() {
+            match self.parse_bulk_string()? {
                 Some(s) => args.push(s),
                 None => {
                     self.pos = saved;
@@ -191,22 +201,34 @@ impl<'a> Parser<'a> {
         Ok(Some(args))
     }
 
-    fn parse_bulk_string(&mut self) -> Option<&'a [u8]> {
+    fn parse_bulk_string(&mut self) -> Result<Option<&'a [u8]>, &'static str> {
         if self.pos >= self.buf.len() || self.buf[self.pos] != b'$' {
-            return None;
+            return Err("ERR expected bulk string");
         }
         self.pos += 1;
-        let len = self.read_line_int()?;
+        let len = match self.read_line_int() {
+            Some(len) => len,
+            None => return Ok(None),
+        };
         if len < 0 {
-            return Some(b"");
+            return Ok(Some(b""));
         }
         let len = len as usize;
-        if self.pos + len + 2 > self.buf.len() {
-            return None;
+        if len > self.max_bulk_len {
+            return Err("ERR RESP bulk length exceeds maximum");
+        }
+        let Some(end) = self.pos.checked_add(len).and_then(|p| p.checked_add(2)) else {
+            return Err("ERR RESP bulk length exceeds maximum");
+        };
+        if end > self.buf.len() {
+            return Ok(None);
+        }
+        if self.buf[self.pos + len..end] != *b"\r\n" {
+            return Err("ERR invalid bulk string terminator");
         }
         let data = &self.buf[self.pos..self.pos + len];
-        self.pos += len + 2;
-        Some(data)
+        self.pos = end;
+        Ok(Some(data))
     }
 
     fn read_line_int(&mut self) -> Option<i64> {

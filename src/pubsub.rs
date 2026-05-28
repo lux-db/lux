@@ -2,7 +2,7 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
@@ -64,6 +64,7 @@ pub struct Broker {
     key_sub_count: Arc<AtomicU64>,
     key_event_tx: mpsc::Sender<KeyEvent>,
     key_event_rx: Arc<parking_lot::Mutex<Option<mpsc::Receiver<KeyEvent>>>>,
+    key_event_started: Arc<AtomicBool>,
     key_worker_txs: Arc<Vec<mpsc::UnboundedSender<KeyEvent>>>,
     key_worker_rxs: Arc<parking_lot::Mutex<Option<Vec<mpsc::UnboundedReceiver<KeyEvent>>>>>,
     key_event_overflow: Arc<parking_lot::Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
@@ -109,6 +110,7 @@ impl Broker {
             key_sub_count: Arc::new(AtomicU64::new(0)),
             key_event_tx: tx,
             key_event_rx: Arc::new(parking_lot::Mutex::new(Some(rx))),
+            key_event_started: Arc::new(AtomicBool::new(false)),
             key_worker_txs: Arc::new(worker_txs),
             key_worker_rxs: Arc::new(parking_lot::Mutex::new(Some(worker_rxs))),
             key_event_overflow: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -221,12 +223,32 @@ impl Broker {
         tx.subscribe()
     }
 
+    pub fn unsubscribe_channel(&self, channel: &str) {
+        let mut channels = self.channels.write();
+        if channels
+            .get(channel)
+            .is_some_and(|tx| tx.receiver_count() == 0)
+        {
+            channels.remove(channel);
+        }
+    }
+
     pub fn psubscribe(&self, pattern: &str) -> broadcast::Receiver<Message> {
         let mut patterns = self.pattern_subs.write();
         let tx = patterns
             .entry(pattern.to_string())
             .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0);
         tx.subscribe()
+    }
+
+    pub fn punsubscribe_pattern(&self, pattern: &str) {
+        let mut patterns = self.pattern_subs.write();
+        if patterns
+            .get(pattern)
+            .is_some_and(|tx| tx.receiver_count() == 0)
+        {
+            patterns.remove(pattern);
+        }
     }
 
     pub fn publish(&self, channel: &str, payload: Bytes) -> i64 {
@@ -265,6 +287,7 @@ impl Broker {
             let mut subs = self.key_glob_subs.write();
             let inner = Arc::make_mut(&mut subs);
             if let Some((_, tx)) = inner.iter().find(|(p, _)| p == pattern) {
+                self.ensure_key_event_loop_started();
                 return tx.subscribe();
             }
             let (tx, rx) = broadcast::channel(CHANNEL_CAPACITY);
@@ -272,12 +295,14 @@ impl Broker {
             let exact_len = self.key_exact_subs.read().len();
             self.key_sub_count
                 .store((exact_len + inner.len()) as u64, Ordering::Release);
+            self.ensure_key_event_loop_started();
             return rx;
         }
 
         let mut subs = self.key_exact_subs.write();
         let inner = Arc::make_mut(&mut subs);
         if let Some(tx) = inner.get(pattern) {
+            self.ensure_key_event_loop_started();
             return tx.subscribe();
         }
         let (tx, rx) = broadcast::channel(CHANNEL_CAPACITY);
@@ -285,6 +310,7 @@ impl Broker {
         let glob_len = self.key_glob_subs.read().len();
         self.key_sub_count
             .store((inner.len() + glob_len) as u64, Ordering::Release);
+        self.ensure_key_event_loop_started();
         rx
     }
 
@@ -387,6 +413,24 @@ impl Broker {
 
     pub fn take_key_event_rx(&self) -> Option<mpsc::Receiver<KeyEvent>> {
         self.key_event_rx.lock().take()
+    }
+
+    fn ensure_key_event_loop_started(&self) {
+        if self.key_event_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Key events are cold for most embedded deployments, so the worker is
+        // started lazily on first key subscription instead of every runtime.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let broker = self.clone();
+            tokio::spawn(async move {
+                broker.run_key_event_loop().await;
+            });
+        } else {
+            // `ksubscribe` is synchronous; if it is called outside Tokio, let
+            // a later in-runtime subscription make another start attempt.
+            self.key_event_started.store(false, Ordering::Release);
+        }
     }
 
     fn emit_key_event(

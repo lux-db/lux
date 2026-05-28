@@ -43,7 +43,7 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or(5usize);
 
     let config = lux::ServerConfig {
-        bind_host: std::env::var("LUX_BIND_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
+        bind_host: std::env::var("LUX_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
         port: std::env::var("LUX_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -59,8 +59,16 @@ async fn main() -> std::io::Result<()> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(64 * 1024 * 1024),
+        max_resp_request: std::env::var("LUX_MAX_RESP_REQUEST_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64 * 1024 * 1024),
         password,
         require_auth,
+        allow_insecure_no_auth: std::env::var("LUX_ALLOW_INSECURE_NO_AUTH").is_ok_and(|v| {
+            let v = v.to_ascii_lowercase();
+            v == "1" || v == "true"
+        }),
         restricted,
         enable_resp: std::env::var("LUX_ENABLE_RESP").map_or(true, |v| {
             let v = v.to_ascii_lowercase();

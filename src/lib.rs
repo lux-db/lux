@@ -6,7 +6,9 @@
 //! pipeline.
 
 mod cmd;
+mod command;
 mod disk;
+mod embedded;
 mod eviction;
 mod geo;
 mod hll;
@@ -21,6 +23,7 @@ mod tables;
 
 use bytes::BytesMut;
 use cmd::CmdResult;
+use command::{Command, CommandKind, CommandOutput, PubSubCommand, SetOption, ShardAccess};
 use pubsub::Broker;
 use resp::Parser;
 use std::collections::HashMap;
@@ -34,9 +37,40 @@ use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 pub use disk::{StorageConfig, StorageMode};
+pub use embedded::{
+    EmbeddedPipeline, GeoMember, GeoPosition, GeoUnit, PreparedPipeline, RedisKeyType,
+    ScoredMember, SetOptions,
+};
 pub use eviction::{parse_eviction_policy, parse_memory_size, EvictionConfig, EvictionPolicy};
 
 const SUB_MODE_BATCH_MAX: usize = 64;
+
+#[derive(Debug, Clone)]
+pub enum LuxError {
+    Command(String),
+    InvalidCommand(String),
+    Protocol(String),
+    Unsupported(String),
+    SubscriptionClosed,
+    SubscriptionLagged(u64),
+}
+
+impl std::fmt::Display for LuxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LuxError::Command(msg) => write!(f, "{msg}"),
+            LuxError::InvalidCommand(msg) => write!(f, "{msg}"),
+            LuxError::Protocol(msg) => write!(f, "{msg}"),
+            LuxError::Unsupported(msg) => write!(f, "{msg}"),
+            LuxError::SubscriptionClosed => write!(f, "subscription closed"),
+            LuxError::SubscriptionLagged(skipped) => {
+                write!(f, "subscription lagged by {skipped} message(s)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LuxError {}
 
 /// Runtime configuration for an embedded Lux server.
 ///
@@ -55,10 +89,17 @@ pub struct ServerConfig {
     pub max_rows: Option<usize>,
     /// Maximum accepted HTTP request body size in bytes.
     pub max_body: usize,
+    /// Maximum buffered RESP request bytes accepted from one connection.
+    pub max_resp_request: usize,
     /// Password used by AUTH/HELLO and HTTP bearer auth.
     pub password: String,
     /// Whether RESP connections must authenticate before non-public commands.
     pub require_auth: bool,
+    /// Allows unauthenticated listeners on non-loopback interfaces.
+    ///
+    /// This is intentionally explicit because the safe default is to reject
+    /// remotely reachable unauthenticated deployments.
+    pub allow_insecure_no_auth: bool,
     /// Disables administrative commands such as SAVE/FLUSH/DEBUG.
     pub restricted: bool,
     /// Number of in-memory shards.
@@ -89,8 +130,10 @@ impl std::fmt::Debug for ServerConfig {
             .field("http_port", &self.http_port)
             .field("max_rows", &self.max_rows)
             .field("max_body", &self.max_body)
+            .field("max_resp_request", &self.max_resp_request)
             .field("password", &"<redacted>")
             .field("require_auth", &self.require_auth)
+            .field("allow_insecure_no_auth", &self.allow_insecure_no_auth)
             .field("restricted", &self.restricted)
             .field("shards", &self.shards)
             .field("data_dir", &self.data_dir)
@@ -108,13 +151,15 @@ impl std::fmt::Debug for ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_host: "0.0.0.0".to_string(),
+            bind_host: "127.0.0.1".to_string(),
             port: 6379,
             http_port: 0,
             max_rows: None,
             max_body: 64 * 1024 * 1024,
+            max_resp_request: 64 * 1024 * 1024,
             password: String::new(),
             require_auth: false,
+            allow_insecure_no_auth: false,
             restricted: false,
             shards: default_shard_count(),
             data_dir: ".".to_string(),
@@ -233,10 +278,99 @@ impl ServerConfig {
     }
 }
 
+fn is_loopback_bind_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|addr| addr.is_loopback())
+}
+
+fn validate_listener_security(config: &ServerConfig) -> std::io::Result<()> {
+    if config.allow_insecure_no_auth || is_loopback_bind_host(&config.bind_host) {
+        return Ok(());
+    }
+
+    let resp_exposed_without_auth =
+        config.enable_resp && (config.password.is_empty() || !config.require_auth);
+    let http_exposed_without_auth = config.http_port != 0 && config.password.is_empty();
+    if resp_exposed_without_auth || http_exposed_without_auth {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing unauthenticated non-loopback listener; set a password or explicitly enable allow_insecure_no_auth",
+        ));
+    }
+    Ok(())
+}
+
 pub struct ServerHandle {
+    #[allow(dead_code)]
+    runtime: Arc<Runtime>,
     shutdown_tx: watch::Sender<bool>,
     server_task: JoinHandle<std::io::Result<()>>,
     local_addr: Option<std::net::SocketAddr>,
+}
+
+/// Native client for executing Redis commands against an embedded Lux runtime.
+///
+/// `EmbeddedClient` has no public fields. Clone it when independent session
+/// state is needed; clones share the same runtime, store, pub/sub broker, WAL,
+/// and snapshot machinery.
+///
+/// Example:
+/// ```rust,ignore
+/// let client = handle.client();
+/// client.set("key", "value").await?;
+/// let value = client.get("key").await?;
+/// ```
+pub struct EmbeddedClient {
+    runtime: Arc<Runtime>,
+    // Clone semantics: clones share the runtime but get isolated session state.
+    session: tokio::sync::Mutex<CommandSession>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum EmbeddedValue {
+    Nil,
+    Int(i64),
+    Simple(String),
+    Bulk(bytes::Bytes),
+    Array(Vec<EmbeddedValue>),
+    Map(Vec<(EmbeddedValue, EmbeddedValue)>),
+    Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EmbeddedMessageKind {
+    PubSub,
+    KeyEvent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmbeddedMessage {
+    pub channel: String,
+    pub payload: bytes::Bytes,
+    pub pattern: Option<String>,
+    pub kind: EmbeddedMessageKind,
+}
+
+pub struct EmbeddedSubscription {
+    broker: Option<Broker>,
+    receiver: Option<broadcast::Receiver<pubsub::Message>>,
+    kind: EmbeddedSubscriptionKind,
+}
+
+enum EmbeddedSubscriptionKind {
+    Channel(String),
+    Pattern(String),
+    KeyPattern(String),
+}
+
+struct Runtime {
+    store: Arc<Store>,
+    broker: Broker,
+    schema_cache: SharedSchemaCache,
+    script_engine: Arc<lua::ScriptEngine>,
+    config: Arc<ServerConfig>,
 }
 
 pub fn default_shard_count() -> usize {
@@ -247,8 +381,17 @@ pub fn default_shard_count() -> usize {
 }
 
 impl ServerHandle {
+    #[allow(dead_code)]
+    pub(crate) fn runtime(&self) -> Arc<Runtime> {
+        self.runtime.clone()
+    }
+
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         self.local_addr
+    }
+
+    pub fn client(&self) -> EmbeddedClient {
+        EmbeddedClient::new(self.runtime())
     }
 
     pub fn shutdown(&self) {
@@ -266,6 +409,2469 @@ impl ServerHandle {
         self.shutdown();
         self.wait().await
     }
+}
+
+impl EmbeddedClient {
+    fn new(runtime: Arc<Runtime>) -> Self {
+        let mut session = CommandSession::new(false);
+        session.authenticated = true;
+        Self {
+            runtime,
+            session: tokio::sync::Mutex::new(session),
+        }
+    }
+
+    /// Executes an arbitrary Redis command by name and string arguments, returning raw RESP bytes.
+    ///
+    /// Commands: Any non-blocking Redis command accepted by the embedded runtime parser.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let resp = client.execute("SET", &["key", "value"]).await?;
+    /// ```
+    pub async fn execute(&self, command: &str, args: &[&str]) -> Result<bytes::Bytes, LuxError> {
+        let mut argv: Vec<Vec<u8>> = Vec::with_capacity(args.len() + 1);
+        argv.push(command.as_bytes().to_vec());
+        for arg in args {
+            argv.push(arg.as_bytes().to_vec());
+        }
+        self.execute_owned(argv).await
+    }
+
+    /// Executes an arbitrary Redis command by name and string arguments, returning one parsed embedded value.
+    ///
+    /// Commands: Any non-blocking Redis command accepted by the embedded runtime parser.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let value = client.execute_value("GET", &["key"]).await?;
+    /// ```
+    pub async fn execute_value(
+        &self,
+        command: &str,
+        args: &[&str],
+    ) -> Result<EmbeddedValue, LuxError> {
+        let resp = self.execute(command, args).await?;
+        parse_single_embedded_value(&resp)
+    }
+
+    /// Executes an arbitrary Redis argv command with byte arguments, returning raw RESP bytes.
+    ///
+    /// Commands: Any non-blocking Redis command accepted by the embedded runtime parser.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let resp = client.execute_bytes(&[b"SET", b"key", b"value"]).await?;
+    /// ```
+    pub async fn execute_bytes(&self, argv: &[&[u8]]) -> Result<bytes::Bytes, LuxError> {
+        let owned: Vec<Vec<u8>> = argv.iter().map(|a| a.to_vec()).collect();
+        self.execute_owned(owned).await
+    }
+
+    /// Executes an arbitrary Redis argv command with byte arguments, returning one parsed embedded value.
+    ///
+    /// Commands: Any non-blocking Redis command accepted by the embedded runtime parser.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let value = client.execute_bytes_value(&[b"GET", b"key"]).await?;
+    /// ```
+    pub async fn execute_bytes_value(&self, argv: &[&[u8]]) -> Result<EmbeddedValue, LuxError> {
+        let resp = self.execute_bytes(argv).await?;
+        parse_single_embedded_value(&resp)
+    }
+
+    pub(crate) async fn execute_command_output(
+        &self,
+        command: command::Command<'_>,
+    ) -> Result<CommandOutput, LuxError> {
+        if let Some(output) = self.execute_command_fast_path(&command).await? {
+            return Ok(output);
+        }
+        let resp = self.execute_owned(command.to_owned_argv()).await?;
+        let value = parse_single_embedded_value(&resp)?;
+        embedded_value_to_command_output(value)
+    }
+
+    pub(crate) async fn execute_command_pipeline_outputs(
+        &self,
+        commands: &[Command<'_>],
+    ) -> Result<Vec<CommandOutput>, LuxError> {
+        // Native pipelines batch only consecutive commands that hit the same
+        // shard. WAL logging happens before the locked mutation, and key-event
+        // argv is retained only when subscribers exist. Tiered storage falls
+        // back to the generic command path because cold-key promotion may need
+        // disk access outside the already-held shard lock.
+        if self.runtime.store.is_tiered() {
+            let mut outputs = Vec::with_capacity(commands.len());
+            for command in commands {
+                outputs.push(self.execute_command_output(command.clone()).await?);
+            }
+            return Ok(outputs);
+        }
+
+        let mut outputs = Vec::with_capacity(commands.len());
+        let now = Instant::now();
+        let mut i = 0usize;
+
+        while i < commands.len() {
+            // Adjacent MSETs can be flattened into one shard pass without
+            // changing per-command replies; this is a generic write batching
+            // optimization, not a command-specific benchmark shortcut.
+            if matches!(commands[i], Command::MSet { .. }) {
+                let mut batch_end = i + 1;
+                while batch_end < commands.len()
+                    && matches!(commands[batch_end], Command::MSet { .. })
+                {
+                    batch_end += 1;
+                }
+                let batch = &commands[i..batch_end];
+                self.execute_mset_pipeline_batch(batch, now)?;
+                outputs.extend((i..batch_end).map(|_| CommandOutput::Simple("OK")));
+                self.runtime.store.add_total_commands(batch.len());
+                i = batch_end;
+                continue;
+            }
+
+            let Some((key, access)) = native_pipeline_access(&commands[i]) else {
+                outputs.push(self.execute_command_output(commands[i].clone()).await?);
+                i += 1;
+                continue;
+            };
+
+            // Batch contiguous commands that route to the same shard. If any
+            // command writes, take the write lock for the whole batch so reads
+            // observe the preceding writes in pipeline order.
+            let shard_idx = self.runtime.store.shard_for_key(key);
+            let mut has_write = access == NativePipelineAccess::Write;
+            let mut batch_end = i + 1;
+            while batch_end < commands.len() {
+                let Some((next_key, next_access)) = native_pipeline_access(&commands[batch_end])
+                else {
+                    break;
+                };
+                if self.runtime.store.shard_for_key(next_key) != shard_idx {
+                    break;
+                }
+                has_write |= next_access == NativePipelineAccess::Write;
+                batch_end += 1;
+            }
+
+            let batch = &commands[i..batch_end];
+            let emit_key_events = self.runtime.broker.has_key_subs();
+            let mut write_argvs = Vec::new();
+            if has_write {
+                if emit_key_events {
+                    write_argvs.reserve(batch.len());
+                }
+                for command in batch {
+                    if command_is_fast_path_write(command) {
+                        ensure_write_allowed(&self.runtime.store)?;
+                        if emit_key_events {
+                            let argv = command.to_owned_argv();
+                            let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                            self.runtime
+                                .store
+                                .wal_log_command(&refs)
+                                .map_err(wal_lux_error)?;
+                            write_argvs.push(argv);
+                        } else {
+                            wal_log_native_command(&self.runtime.store, command)?;
+                        }
+                    }
+                }
+
+                let mut shard = self.runtime.store.lock_write_shard(shard_idx);
+                shard.version += 1;
+                for command in batch {
+                    outputs.push(self.execute_native_write_on_shard(command, &mut shard, now)?);
+                }
+            } else {
+                let shard = self.runtime.store.lock_read_shard(shard_idx);
+                for command in batch {
+                    outputs.push(self.execute_native_read_on_shard(command, &shard, now)?);
+                }
+            }
+
+            self.runtime.store.add_total_commands(batch.len());
+            if emit_key_events {
+                for argv in &write_argvs {
+                    let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                    fire_key_events(&self.runtime.broker, &refs);
+                }
+            }
+
+            i = batch_end;
+        }
+
+        Ok(outputs)
+    }
+
+    pub(crate) async fn execute_command_pipeline_discard(
+        &self,
+        commands: &[Command<'_>],
+    ) -> Result<(), LuxError> {
+        // Same execution semantics as `execute_command_pipeline_outputs`, but
+        // intentionally skips result materialization for write-heavy embedded
+        // workloads that only need success/failure.
+        if self.runtime.store.is_tiered() {
+            for command in commands {
+                self.execute_command_output(command.clone()).await?;
+            }
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        let mut i = 0usize;
+
+        while i < commands.len() {
+            // Keep discard and materializing pipelines semantically identical;
+            // only response allocation is skipped.
+            if matches!(commands[i], Command::MSet { .. }) {
+                let mut batch_end = i + 1;
+                while batch_end < commands.len()
+                    && matches!(commands[batch_end], Command::MSet { .. })
+                {
+                    batch_end += 1;
+                }
+                let batch = &commands[i..batch_end];
+                self.execute_mset_pipeline_batch(batch, now)?;
+                self.runtime.store.add_total_commands(batch.len());
+                i = batch_end;
+                continue;
+            }
+
+            let Some((key, access)) = native_pipeline_access(&commands[i]) else {
+                self.execute_command_output(commands[i].clone()).await?;
+                i += 1;
+                continue;
+            };
+
+            let shard_idx = self.runtime.store.shard_for_key(key);
+            let mut has_write = access == NativePipelineAccess::Write;
+            let mut batch_end = i + 1;
+            while batch_end < commands.len() {
+                let Some((next_key, next_access)) = native_pipeline_access(&commands[batch_end])
+                else {
+                    break;
+                };
+                if self.runtime.store.shard_for_key(next_key) != shard_idx {
+                    break;
+                }
+                has_write |= next_access == NativePipelineAccess::Write;
+                batch_end += 1;
+            }
+
+            let batch = &commands[i..batch_end];
+            let emit_key_events = self.runtime.broker.has_key_subs();
+            let mut write_argvs = Vec::new();
+            if has_write {
+                if emit_key_events {
+                    write_argvs.reserve(batch.len());
+                }
+                for command in batch {
+                    if command_is_fast_path_write(command) {
+                        ensure_write_allowed(&self.runtime.store)?;
+                        if emit_key_events {
+                            let argv = command.to_owned_argv();
+                            let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                            self.runtime
+                                .store
+                                .wal_log_command(&refs)
+                                .map_err(wal_lux_error)?;
+                            write_argvs.push(argv);
+                        } else {
+                            wal_log_native_command(&self.runtime.store, command)?;
+                        }
+                    }
+                }
+
+                let mut shard = self.runtime.store.lock_write_shard(shard_idx);
+                shard.version += 1;
+                for command in batch {
+                    self.execute_native_write_on_shard_discard(command, &mut shard, now)?;
+                }
+            } else {
+                for command in batch {
+                    self.execute_native_read_on_shard_discard(command)?;
+                }
+            }
+
+            self.runtime.store.add_total_commands(batch.len());
+            if emit_key_events {
+                for argv in &write_argvs {
+                    let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                    fire_key_events(&self.runtime.broker, &refs);
+                }
+            }
+
+            i = batch_end;
+        }
+
+        Ok(())
+    }
+
+    fn execute_mset_pipeline_batch(
+        &self,
+        commands: &[Command<'_>],
+        now: Instant,
+    ) -> Result<(), LuxError> {
+        let emit_key_events = self.runtime.broker.has_key_subs();
+        let mut shard_indices = Vec::new();
+
+        for command in commands {
+            ensure_write_allowed(&self.runtime.store)?;
+            wal_log_native_command(&self.runtime.store, command)?;
+            let Command::MSet { pairs } = command else {
+                return Err(LuxError::InvalidCommand(
+                    "MSET batch contained non-MSET command".to_string(),
+                ));
+            };
+            for (key, _) in pairs {
+                let idx = self.runtime.store.shard_for_key(key);
+                shard_indices.push(idx);
+            }
+        }
+
+        shard_indices.sort_unstable();
+        shard_indices.dedup();
+
+        for shard_idx in shard_indices {
+            let mut shard = self.runtime.store.lock_write_shard(shard_idx);
+            shard.version += 1;
+            for command in commands {
+                let Command::MSet { pairs } = command else {
+                    unreachable!("MSET batch was validated before shard mutation")
+                };
+                for (key, value) in pairs {
+                    if self.runtime.store.shard_for_key(key) == shard_idx {
+                        self.runtime
+                            .store
+                            .set_on_shard(&mut shard.data, key, value, None, now);
+                    }
+                }
+            }
+        }
+
+        if emit_key_events {
+            for command in commands {
+                let Command::MSet { pairs } = command else {
+                    unreachable!("MSET batch was validated before key events")
+                };
+                for (key, _) in pairs {
+                    self.runtime.broker.enqueue_key_event(key, b"MSET");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn execute_native_read_on_shard(
+        &self,
+        command: &Command<'_>,
+        shard: &store::Shard,
+        now: Instant,
+    ) -> Result<CommandOutput, LuxError> {
+        match command {
+            Command::Get { key } => Ok(optional_bulk_output(Store::get_from_shard(
+                &shard.data,
+                key,
+                now,
+            ))),
+            Command::StrLen { key } => Ok(CommandOutput::Int(Store::strlen_from_shard(
+                &shard.data,
+                key,
+                now,
+            ))),
+            Command::Exists { keys } if keys.len() == 1 => Ok(CommandOutput::Int(i64::from(
+                Store::exists_on_shard(&shard.data, keys[0], now),
+            ))),
+            Command::HGet { key, field } => Ok(optional_bulk_output(Store::hget_from_shard(
+                &shard.data,
+                key,
+                field,
+                now,
+            ))),
+            Command::GeoPos { key, members } => {
+                geopos_output_from_shard(&shard.data, key, members, now)
+            }
+            Command::GeoDist {
+                key,
+                member_a,
+                member_b,
+                unit,
+            } => geodist_output_from_shard(&shard.data, key, member_a, member_b, unit, now),
+            _ => unreachable!("native pipeline read command was classified before dispatch"),
+        }
+    }
+
+    fn execute_native_write_on_shard(
+        &self,
+        command: &Command<'_>,
+        shard: &mut store::Shard,
+        now: Instant,
+    ) -> Result<CommandOutput, LuxError> {
+        match command {
+            Command::Get { key } => Ok(optional_bulk_output(Store::get_from_shard(
+                &shard.data,
+                key,
+                now,
+            ))),
+            Command::StrLen { key } => Ok(CommandOutput::Int(Store::strlen_from_shard(
+                &shard.data,
+                key,
+                now,
+            ))),
+            Command::Exists { keys } if keys.len() == 1 => Ok(CommandOutput::Int(i64::from(
+                Store::exists_on_shard(&shard.data, keys[0], now),
+            ))),
+            Command::HGet { key, field } => Ok(optional_bulk_output(Store::hget_from_shard(
+                &shard.data,
+                key,
+                field,
+                now,
+            ))),
+            Command::GeoPos { key, members } => {
+                geopos_output_from_shard(&shard.data, key, members, now)
+            }
+            Command::GeoDist {
+                key,
+                member_a,
+                member_b,
+                unit,
+            } => geodist_output_from_shard(&shard.data, key, member_a, member_b, unit, now),
+            Command::Set {
+                key,
+                value,
+                options,
+            } if can_fast_path_set(options) => {
+                self.runtime
+                    .store
+                    .set_on_shard(&mut shard.data, key, value, set_ttl(options), now);
+                self.runtime.store.remove_from_disk(key);
+                Ok(CommandOutput::Simple("OK"))
+            }
+            Command::GetSet { key, value } => {
+                let old = self
+                    .runtime
+                    .store
+                    .get_set_on_shard(&mut shard.data, key, value, now);
+                self.runtime.store.remove_from_disk(key);
+                Ok(optional_bulk_output(old))
+            }
+            Command::SetNx { key, value } => {
+                let changed = self
+                    .runtime
+                    .store
+                    .set_nx_on_shard(&mut shard.data, key, value, now);
+                if changed {
+                    self.runtime.store.remove_from_disk(key);
+                }
+                Ok(CommandOutput::Int(i64::from(changed)))
+            }
+            Command::SetEx {
+                key,
+                seconds,
+                value,
+            } => {
+                if *seconds == 0 {
+                    return Err(LuxError::Command(
+                        "ERR invalid expire time in 'setex' command".to_string(),
+                    ));
+                }
+                self.runtime.store.set_on_shard(
+                    &mut shard.data,
+                    key,
+                    value,
+                    Some(Duration::from_secs(*seconds)),
+                    now,
+                );
+                self.runtime.store.remove_from_disk(key);
+                Ok(CommandOutput::Simple("OK"))
+            }
+            Command::PSetEx {
+                key,
+                milliseconds,
+                value,
+            } => {
+                let millis = u64::try_from(*milliseconds).map_err(|_| {
+                    LuxError::Command("ERR value is not an integer or out of range".to_string())
+                })?;
+                self.runtime.store.set_on_shard(
+                    &mut shard.data,
+                    key,
+                    value,
+                    Some(Duration::from_millis(millis)),
+                    now,
+                );
+                self.runtime.store.remove_from_disk(key);
+                Ok(CommandOutput::Simple("OK"))
+            }
+            Command::Append { key, value } => {
+                let len = self.runtime.store.append_on_shard(shard, key, value, now);
+                self.runtime.store.remove_from_disk(key);
+                Ok(CommandOutput::Int(len))
+            }
+            Command::Incr { key } => Ok(CommandOutput::Int(
+                self.runtime
+                    .store
+                    .incr_on_shard(&mut shard.data, key, 1, now)
+                    .map_err(LuxError::Command)?,
+            )),
+            Command::Decr { key } => Ok(CommandOutput::Int(
+                self.runtime
+                    .store
+                    .incr_on_shard(&mut shard.data, key, -1, now)
+                    .map_err(LuxError::Command)?,
+            )),
+            Command::IncrBy { key, increment } => Ok(CommandOutput::Int(
+                self.runtime
+                    .store
+                    .incr_on_shard(&mut shard.data, key, *increment, now)
+                    .map_err(LuxError::Command)?,
+            )),
+            Command::DecrBy { key, decrement } => Ok(CommandOutput::Int(
+                self.runtime
+                    .store
+                    .incr_on_shard(&mut shard.data, key, -*decrement, now)
+                    .map_err(LuxError::Command)?,
+            )),
+            Command::Del { keys } | Command::Unlink { keys } if keys.len() == 1 => Ok(
+                CommandOutput::Int(self.runtime.store.del_on_shard(shard, keys[0], now)),
+            ),
+            Command::LPush { key, values } => {
+                let n = self
+                    .runtime
+                    .store
+                    .lpush_on_shard(shard, key, values, now)
+                    .map_err(LuxError::Command)?;
+                self.runtime.store.remove_from_disk(key);
+                self.drain_list_waiters_on_shard(key, shard, now);
+                Ok(CommandOutput::Int(n))
+            }
+            Command::RPush { key, values } => {
+                let n = self
+                    .runtime
+                    .store
+                    .rpush_on_shard(shard, key, values, now)
+                    .map_err(LuxError::Command)?;
+                self.runtime.store.remove_from_disk(key);
+                self.drain_list_waiters_on_shard(key, shard, now);
+                Ok(CommandOutput::Int(n))
+            }
+            Command::LPop { key } => {
+                let value = self.runtime.store.lpop_on_shard(shard, key, now);
+                if value.is_some() {
+                    self.runtime.store.remove_from_disk(key);
+                }
+                Ok(optional_bulk_output(value))
+            }
+            Command::RPop { key } => {
+                let value = self.runtime.store.rpop_on_shard(shard, key, now);
+                if value.is_some() {
+                    self.runtime.store.remove_from_disk(key);
+                }
+                Ok(optional_bulk_output(value))
+            }
+            Command::HSet { key, field, value } => Ok(CommandOutput::Int(
+                self.runtime
+                    .store
+                    .hset_on_shard(shard, key, &[(*field, *value)], now)
+                    .map_err(LuxError::Command)?,
+            )),
+            Command::HIncrBy {
+                key,
+                field,
+                increment,
+            } => Ok(CommandOutput::Int(
+                self.runtime
+                    .store
+                    .hincrby_on_shard(shard, key, field, *increment, now)
+                    .map_err(LuxError::Command)?,
+            )),
+            Command::SAdd { key, members } => Ok(CommandOutput::Int(
+                self.runtime
+                    .store
+                    .sadd_on_shard(shard, key, members, now)
+                    .map_err(LuxError::Command)?,
+            )),
+            Command::SPop { key } => {
+                let mut values = self
+                    .runtime
+                    .store
+                    .spop_on_shard(shard, key, 1, now)
+                    .map_err(LuxError::Command)?;
+                if !values.is_empty() {
+                    self.runtime.store.remove_from_disk(key);
+                }
+                Ok(match values.pop() {
+                    Some(value) => CommandOutput::Bulk(bytes::Bytes::from(value)),
+                    None => CommandOutput::Nil,
+                })
+            }
+            Command::ZAdd { key, score, member } => Ok(CommandOutput::Int(
+                self.runtime
+                    .store
+                    .zadd_on_shard(
+                        shard,
+                        key,
+                        &[(*member, *score)],
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        now,
+                    )
+                    .map_err(LuxError::Command)?,
+            )),
+            Command::ZIncrBy {
+                key,
+                increment,
+                member,
+            } => Ok(score_output(
+                self.runtime
+                    .store
+                    .zincrby_on_shard(shard, key, member, *increment, now)
+                    .map_err(LuxError::Command)?,
+            )),
+            Command::XAdd { key, id, fields } => {
+                require_xadd_fields(fields)?;
+                let id = self
+                    .runtime
+                    .store
+                    .xadd_on_shard(shard, key, arg_str(id), xadd_fields(fields), None, now)
+                    .map_err(LuxError::Command)?;
+                self.runtime.broker.wake_stream_waiters(arg_str(key));
+                Ok(CommandOutput::Bulk(bytes::Bytes::from(id.to_string())))
+            }
+            _ => unreachable!("native pipeline write command was classified before dispatch"),
+        }
+    }
+
+    fn execute_native_read_on_shard_discard(&self, command: &Command<'_>) -> Result<(), LuxError> {
+        match command {
+            Command::Get { .. }
+            | Command::StrLen { .. }
+            | Command::Exists { .. }
+            | Command::HGet { .. }
+            | Command::GeoPos { .. }
+            | Command::GeoDist { .. } => Ok(()),
+            _ => unreachable!("native pipeline read command was classified before dispatch"),
+        }
+    }
+
+    fn execute_native_write_on_shard_discard(
+        &self,
+        command: &Command<'_>,
+        shard: &mut store::Shard,
+        now: Instant,
+    ) -> Result<(), LuxError> {
+        match command {
+            Command::Get { .. }
+            | Command::StrLen { .. }
+            | Command::Exists { .. }
+            | Command::HGet { .. } => Ok(()),
+            Command::Set {
+                key,
+                value,
+                options,
+            } if can_fast_path_set(options) => {
+                self.runtime
+                    .store
+                    .set_on_shard(&mut shard.data, key, value, set_ttl(options), now);
+                self.runtime.store.remove_from_disk(key);
+                Ok(())
+            }
+            Command::GetSet { key, value } => {
+                self.runtime
+                    .store
+                    .set_on_shard(&mut shard.data, key, value, None, now);
+                self.runtime.store.remove_from_disk(key);
+                Ok(())
+            }
+            Command::SetNx { key, value } => {
+                let changed = self
+                    .runtime
+                    .store
+                    .set_nx_on_shard(&mut shard.data, key, value, now);
+                if changed {
+                    self.runtime.store.remove_from_disk(key);
+                }
+                Ok(())
+            }
+            Command::SetEx {
+                key,
+                seconds,
+                value,
+            } => {
+                if *seconds == 0 {
+                    return Err(LuxError::Command(
+                        "ERR invalid expire time in 'setex' command".to_string(),
+                    ));
+                }
+                self.runtime.store.set_on_shard(
+                    &mut shard.data,
+                    key,
+                    value,
+                    Some(Duration::from_secs(*seconds)),
+                    now,
+                );
+                self.runtime.store.remove_from_disk(key);
+                Ok(())
+            }
+            Command::PSetEx {
+                key,
+                milliseconds,
+                value,
+            } => {
+                let millis = u64::try_from(*milliseconds).map_err(|_| {
+                    LuxError::Command("ERR value is not an integer or out of range".to_string())
+                })?;
+                self.runtime.store.set_on_shard(
+                    &mut shard.data,
+                    key,
+                    value,
+                    Some(Duration::from_millis(millis)),
+                    now,
+                );
+                self.runtime.store.remove_from_disk(key);
+                Ok(())
+            }
+            Command::Append { key, value } => {
+                self.runtime.store.append_on_shard(shard, key, value, now);
+                self.runtime.store.remove_from_disk(key);
+                Ok(())
+            }
+            Command::Incr { key } => {
+                self.runtime
+                    .store
+                    .incr_on_shard(&mut shard.data, key, 1, now)
+                    .map_err(LuxError::Command)?;
+                Ok(())
+            }
+            Command::Decr { key } => {
+                self.runtime
+                    .store
+                    .incr_on_shard(&mut shard.data, key, -1, now)
+                    .map_err(LuxError::Command)?;
+                Ok(())
+            }
+            Command::IncrBy { key, increment } => {
+                self.runtime
+                    .store
+                    .incr_on_shard(&mut shard.data, key, *increment, now)
+                    .map_err(LuxError::Command)?;
+                Ok(())
+            }
+            Command::DecrBy { key, decrement } => {
+                self.runtime
+                    .store
+                    .incr_on_shard(&mut shard.data, key, -*decrement, now)
+                    .map_err(LuxError::Command)?;
+                Ok(())
+            }
+            Command::Del { keys } | Command::Unlink { keys } if keys.len() == 1 => {
+                self.runtime.store.del_on_shard(shard, keys[0], now);
+                Ok(())
+            }
+            Command::LPush { key, values } => {
+                self.runtime
+                    .store
+                    .lpush_on_shard(shard, key, values, now)
+                    .map_err(LuxError::Command)?;
+                self.runtime.store.remove_from_disk(key);
+                self.drain_list_waiters_on_shard(key, shard, now);
+                Ok(())
+            }
+            Command::RPush { key, values } => {
+                self.runtime
+                    .store
+                    .rpush_on_shard(shard, key, values, now)
+                    .map_err(LuxError::Command)?;
+                self.runtime.store.remove_from_disk(key);
+                self.drain_list_waiters_on_shard(key, shard, now);
+                Ok(())
+            }
+            Command::LPop { key } => {
+                if self.runtime.store.lpop_on_shard(shard, key, now).is_some() {
+                    self.runtime.store.remove_from_disk(key);
+                }
+                Ok(())
+            }
+            Command::RPop { key } => {
+                if self.runtime.store.rpop_on_shard(shard, key, now).is_some() {
+                    self.runtime.store.remove_from_disk(key);
+                }
+                Ok(())
+            }
+            Command::HSet { key, field, value } => {
+                self.runtime
+                    .store
+                    .hset_on_shard(shard, key, &[(*field, *value)], now)
+                    .map_err(LuxError::Command)?;
+                Ok(())
+            }
+            Command::HIncrBy {
+                key,
+                field,
+                increment,
+            } => {
+                self.runtime
+                    .store
+                    .hincrby_on_shard(shard, key, field, *increment, now)
+                    .map_err(LuxError::Command)?;
+                Ok(())
+            }
+            Command::SAdd { key, members } => {
+                self.runtime
+                    .store
+                    .sadd_on_shard(shard, key, members, now)
+                    .map_err(LuxError::Command)?;
+                Ok(())
+            }
+            Command::SPop { key } => {
+                if !self
+                    .runtime
+                    .store
+                    .spop_on_shard(shard, key, 1, now)
+                    .map_err(LuxError::Command)?
+                    .is_empty()
+                {
+                    self.runtime.store.remove_from_disk(key);
+                }
+                Ok(())
+            }
+            Command::ZAdd { key, score, member } => {
+                self.runtime
+                    .store
+                    .zadd_on_shard(
+                        shard,
+                        key,
+                        &[(*member, *score)],
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        now,
+                    )
+                    .map_err(LuxError::Command)?;
+                Ok(())
+            }
+            Command::ZIncrBy {
+                key,
+                increment,
+                member,
+            } => {
+                self.runtime
+                    .store
+                    .zincrby_on_shard(shard, key, member, *increment, now)
+                    .map_err(LuxError::Command)?;
+                Ok(())
+            }
+            Command::XAdd { key, id, fields } => {
+                require_xadd_fields(fields)?;
+                self.runtime
+                    .store
+                    .xadd_on_shard(shard, key, arg_str(id), xadd_fields(fields), None, now)
+                    .map_err(LuxError::Command)?;
+                self.runtime.broker.wake_stream_waiters(arg_str(key));
+                Ok(())
+            }
+            _ => unreachable!("native pipeline write command was classified before dispatch"),
+        }
+    }
+
+    async fn execute_command_fast_path(
+        &self,
+        command: &Command<'_>,
+    ) -> Result<Option<CommandOutput>, LuxError> {
+        if matches!(command, Command::Raw { .. })
+            || matches!(command, Command::Set { options, .. } if !can_fast_path_set(options))
+        {
+            return Ok(None);
+        }
+
+        let now = Instant::now();
+        if command_is_fast_path_write(command) {
+            ensure_write_allowed(&self.runtime.store)?;
+        }
+        let mut write_argv = if command_is_fast_path_write(command)
+            && (self.runtime.store.wal_enabled() || self.runtime.broker.has_key_subs())
+            && !matches!(command, Command::MSet { .. })
+        {
+            Some(command.to_owned_argv())
+        } else {
+            None
+        };
+        if let Some(argv) = &write_argv {
+            let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            self.runtime
+                .store
+                .wal_log_command(&refs)
+                .map_err(wal_lux_error)?;
+        }
+
+        let output = match command {
+            Command::Ping => CommandOutput::Simple("PONG"),
+            Command::Publish { channel, message } => {
+                let channel = std::str::from_utf8(channel).unwrap_or("");
+                CommandOutput::Int(
+                    self.runtime
+                        .broker
+                        .publish(channel, bytes::Bytes::copy_from_slice(message)),
+                )
+            }
+            Command::DbSize => CommandOutput::Int(self.runtime.store.dbsize(now)),
+            Command::FlushDb | Command::FlushAll => {
+                self.runtime.store.flushdb();
+                CommandOutput::Simple("OK")
+            }
+            Command::Keys { pattern } => string_array(self.runtime.store.keys(pattern, now)),
+            Command::RandomKey => random_key_output(&self.runtime.store, now),
+            Command::Get { key } => optional_bulk_output(self.runtime.store.get(key, now)),
+            Command::Set {
+                key,
+                value,
+                options,
+            } if can_fast_path_set(options) => {
+                let ttl = set_ttl(options);
+                self.runtime.store.set(key, value, ttl, now);
+                CommandOutput::Simple("OK")
+            }
+            Command::GetSet { key, value } => {
+                optional_bulk_output(self.runtime.store.get_set(key, value, now))
+            }
+            Command::SetNx { key, value } => {
+                CommandOutput::Int(i64::from(self.runtime.store.set_nx(key, value, now)))
+            }
+            Command::SetEx {
+                key,
+                seconds,
+                value,
+            } => {
+                if *seconds == 0 {
+                    return Err(LuxError::Command(
+                        "ERR invalid expire time in 'setex' command".to_string(),
+                    ));
+                }
+                self.runtime
+                    .store
+                    .set(key, value, Some(Duration::from_secs(*seconds)), now);
+                CommandOutput::Simple("OK")
+            }
+            Command::PSetEx {
+                key,
+                milliseconds,
+                value,
+            } => {
+                let millis = u64::try_from(*milliseconds).map_err(|_| {
+                    LuxError::Command("ERR value is not an integer or out of range".to_string())
+                })?;
+                self.runtime
+                    .store
+                    .set(key, value, Some(Duration::from_millis(millis)), now);
+                CommandOutput::Simple("OK")
+            }
+            Command::MGet { keys } => CommandOutput::Array(
+                keys.iter()
+                    .map(|key| optional_bulk_output(self.runtime.store.get(key, now)))
+                    .collect(),
+            ),
+            Command::MSet { .. } => {
+                self.execute_mset_pipeline_batch(std::slice::from_ref(command), now)?;
+                CommandOutput::Simple("OK")
+            }
+            Command::MSetNx { pairs } => {
+                CommandOutput::Int(i64::from(self.runtime.store.msetnx(pairs, now)))
+            }
+            Command::Append { key, value } => {
+                CommandOutput::Int(self.runtime.store.append(key, value, now))
+            }
+            Command::StrLen { key } => CommandOutput::Int(self.runtime.store.strlen(key, now)),
+            Command::Incr { key } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .incr(key, 1, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::Decr { key } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .incr(key, -1, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::IncrBy { key, increment } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .incr(key, *increment, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::DecrBy { key, decrement } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .incr(key, -*decrement, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::Del { keys } => CommandOutput::Int(self.runtime.store.del(keys)),
+            Command::Unlink { keys } => CommandOutput::Int(self.runtime.store.unlink(keys)),
+            Command::Exists { keys } => CommandOutput::Int(self.runtime.store.exists(keys, now)),
+            Command::Expire { key, seconds } => {
+                CommandOutput::Int(i64::from(self.runtime.store.expire(key, *seconds, now)))
+            }
+            Command::Ttl { key } => CommandOutput::Int(self.runtime.store.ttl(key, now)),
+            Command::PTtl { key } => CommandOutput::Int(self.runtime.store.pttl(key, now)),
+            Command::Persist { key } => {
+                CommandOutput::Int(i64::from(self.runtime.store.persist(key, now)))
+            }
+            Command::Type { key } => CommandOutput::Simple(
+                self.runtime
+                    .store
+                    .get_entry_type(key, now)
+                    .unwrap_or("none"),
+            ),
+            Command::Rename { key, new_key } => {
+                self.runtime
+                    .store
+                    .rename(key, new_key, now)
+                    .map_err(LuxError::Command)?;
+                CommandOutput::Simple("OK")
+            }
+            Command::RenameNx { key, new_key } => {
+                if self.runtime.store.get(new_key, now).is_some() {
+                    CommandOutput::Int(0)
+                } else {
+                    self.runtime
+                        .store
+                        .rename(key, new_key, now)
+                        .map_err(LuxError::Command)?;
+                    CommandOutput::Int(1)
+                }
+            }
+            Command::LPush { key, values } => {
+                let n = self
+                    .runtime
+                    .store
+                    .lpush(key, values, now)
+                    .map_err(LuxError::Command)?;
+                self.drain_list_waiters(key, now);
+                CommandOutput::Int(n)
+            }
+            Command::RPush { key, values } => {
+                let n = self
+                    .runtime
+                    .store
+                    .rpush(key, values, now)
+                    .map_err(LuxError::Command)?;
+                self.drain_list_waiters(key, now);
+                CommandOutput::Int(n)
+            }
+            Command::LPop { key } => optional_bulk_output(self.runtime.store.lpop(key, now)),
+            Command::RPop { key } => optional_bulk_output(self.runtime.store.rpop(key, now)),
+            Command::LLen { key } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .llen(key, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::LIndex { key, index } => {
+                optional_bulk_output(self.runtime.store.lindex(key, *index, now))
+            }
+            Command::LRange { key, start, stop } => bytes_array(
+                self.runtime
+                    .store
+                    .lrange(key, *start, *stop, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::HSet { key, field, value } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .hset(key, &[(*field, *value)], now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::HIncrBy {
+                key,
+                field,
+                increment,
+            } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .hincrby(key, field, *increment, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::HGet { key, field } => {
+                optional_bulk_output(self.runtime.store.hget(key, field, now))
+            }
+            Command::HMGet { key, fields } => CommandOutput::Array(
+                self.runtime
+                    .store
+                    .hmget(key, fields, now)
+                    .into_iter()
+                    .map(optional_bulk_output)
+                    .collect(),
+            ),
+            Command::HDel { key, fields } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .hdel(key, fields, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::HExists { key, field } => CommandOutput::Int(i64::from(
+                self.runtime
+                    .store
+                    .hexists(key, field, now)
+                    .map_err(LuxError::Command)?,
+            )),
+            Command::HLen { key } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .hlen(key, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::HGetAll { key } => {
+                let mut values = Vec::new();
+                for (field, value) in self
+                    .runtime
+                    .store
+                    .hgetall(key, now)
+                    .map_err(LuxError::Command)?
+                {
+                    values.push(CommandOutput::Bulk(bytes::Bytes::from(field)));
+                    values.push(CommandOutput::Bulk(value));
+                }
+                CommandOutput::Array(values)
+            }
+            Command::SAdd { key, members } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .sadd(key, members, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::SRem { key, members } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .srem(key, members, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::SMembers { key } => string_array(
+                self.runtime
+                    .store
+                    .smembers(key, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::SIsMember { key, member } => CommandOutput::Int(i64::from(
+                self.runtime
+                    .store
+                    .sismember(key, member, now)
+                    .map_err(LuxError::Command)?,
+            )),
+            Command::SCard { key } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .scard(key, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::SPop { key } => {
+                let mut values = self
+                    .runtime
+                    .store
+                    .spop(key, 1, now)
+                    .map_err(LuxError::Command)?;
+                match values.pop() {
+                    Some(value) => CommandOutput::Bulk(bytes::Bytes::from(value)),
+                    None => CommandOutput::Nil,
+                }
+            }
+            Command::SUnion { keys } => string_array(
+                self.runtime
+                    .store
+                    .sunion(keys, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::SInter { keys } => string_array(
+                self.runtime
+                    .store
+                    .sinter(keys, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::SDiff { keys } => string_array(
+                self.runtime
+                    .store
+                    .sdiff(keys, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::ZAdd { key, score, member } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .zadd(
+                        key,
+                        &[(*member, *score)],
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        now,
+                    )
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::ZRem { key, members } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .zrem(key, members, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::ZCard { key } => CommandOutput::Int(
+                self.runtime
+                    .store
+                    .zcard(key, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::ZScore { key, member } => optional_score_output(
+                self.runtime
+                    .store
+                    .zscore(key, member, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::ZIncrBy {
+                key,
+                increment,
+                member,
+            } => score_output(
+                self.runtime
+                    .store
+                    .zincrby(key, member, *increment, now)
+                    .map_err(LuxError::Command)?,
+            ),
+            Command::ZCount { key, min, max } => {
+                let (min, min_exclusive) = parse_score_bound_bytes(min, false);
+                let (max, max_exclusive) = parse_score_bound_bytes(max, true);
+                CommandOutput::Int(
+                    self.runtime
+                        .store
+                        .zcount(key, min, max, min_exclusive, max_exclusive, now)
+                        .map_err(LuxError::Command)?,
+                )
+            }
+            Command::ZRange {
+                key,
+                start,
+                stop,
+                with_scores,
+            } => zrange_output(
+                self.runtime
+                    .store
+                    .zrange(key, *start, *stop, false, *with_scores, now)
+                    .map_err(LuxError::Command)?,
+                *with_scores,
+            ),
+            Command::GeoAdd { key, members } => {
+                if let [member] = members.as_slice() {
+                    crate::geo::validate_coords(member.longitude, member.latitude)
+                        .map_err(LuxError::Command)?;
+                    let scored = [(
+                        member.member,
+                        crate::geo::geohash_encode(member.longitude, member.latitude) as f64,
+                    )];
+                    CommandOutput::Int(
+                        self.runtime
+                            .store
+                            .zadd(key, &scored, false, false, false, false, false, now)
+                            .map_err(LuxError::Command)?,
+                    )
+                } else {
+                    let mut scored = Vec::with_capacity(members.len());
+                    for member in members {
+                        crate::geo::validate_coords(member.longitude, member.latitude)
+                            .map_err(LuxError::Command)?;
+                        scored.push((
+                            member.member,
+                            crate::geo::geohash_encode(member.longitude, member.latitude) as f64,
+                        ));
+                    }
+                    CommandOutput::Int(
+                        self.runtime
+                            .store
+                            .zadd(key, &scored, false, false, false, false, false, now)
+                            .map_err(LuxError::Command)?,
+                    )
+                }
+            }
+            Command::GeoPos { key, members } => {
+                let mut values = Vec::with_capacity(members.len());
+                for member in members {
+                    match self
+                        .runtime
+                        .store
+                        .zscore(key, member, now)
+                        .map_err(LuxError::Command)?
+                    {
+                        Some(score) => {
+                            let (lon, lat) = crate::geo::geohash_decode(score as u64);
+                            values.push(CommandOutput::Array(vec![
+                                CommandOutput::Bulk(bytes::Bytes::from(format_geo_coord(lon))),
+                                CommandOutput::Bulk(bytes::Bytes::from(format_geo_coord(lat))),
+                            ]));
+                        }
+                        None => values.push(CommandOutput::Nil),
+                    }
+                }
+                CommandOutput::Array(values)
+            }
+            Command::GeoDist {
+                key,
+                member_a,
+                member_b,
+                unit,
+            } => {
+                let unit = std::str::from_utf8(unit)
+                    .ok()
+                    .and_then(crate::geo::DistUnit::parse)
+                    .ok_or_else(|| {
+                        LuxError::Command(
+                            "ERR unsupported unit provided. please use M, KM, FT, MI".to_string(),
+                        )
+                    })?;
+                let Some(score_a) = self
+                    .runtime
+                    .store
+                    .zscore(key, member_a, now)
+                    .map_err(LuxError::Command)?
+                else {
+                    return Ok(Some(CommandOutput::Nil));
+                };
+                let Some(score_b) = self
+                    .runtime
+                    .store
+                    .zscore(key, member_b, now)
+                    .map_err(LuxError::Command)?
+                else {
+                    return Ok(Some(CommandOutput::Nil));
+                };
+                let (lon_a, lat_a) = crate::geo::geohash_decode(score_a as u64);
+                let (lon_b, lat_b) = crate::geo::geohash_decode(score_b as u64);
+                let distance = unit.from_meters(crate::geo::haversine(lon_a, lat_a, lon_b, lat_b));
+                CommandOutput::Bulk(bytes::Bytes::from(format!("{distance:.4}")))
+            }
+            Command::XAdd { key, id, fields } => {
+                require_xadd_fields(fields)?;
+                let id = self
+                    .runtime
+                    .store
+                    .xadd(key, arg_str(id), xadd_fields(fields), None, now)
+                    .map_err(LuxError::Command)?;
+                self.runtime.broker.wake_stream_waiters(arg_str(key));
+                CommandOutput::Bulk(bytes::Bytes::from(id.to_string()))
+            }
+            Command::Set { .. } | Command::Raw { .. } => unreachable!("handled before fast path"),
+        };
+
+        self.runtime.store.add_total_commands(1);
+        if let Some(argv) = write_argv.take() {
+            let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            fire_key_events(&self.runtime.broker, &refs);
+        }
+        Ok(Some(output))
+    }
+
+    fn drain_list_waiters(&self, key: &[u8], now: Instant) {
+        let key_s = std::str::from_utf8(key).unwrap_or("");
+        if self.runtime.broker.has_list_waiters(key_s) {
+            let shard_idx = self.runtime.store.shard_for_key(key);
+            let mut shard = self.runtime.store.lock_write_shard(shard_idx);
+            self.drain_list_waiters_on_shard(key, &mut shard, now);
+        }
+    }
+
+    fn drain_list_waiters_on_shard(&self, key: &[u8], shard: &mut store::Shard, now: Instant) {
+        let key_s = std::str::from_utf8(key).unwrap_or("");
+        if self.runtime.broker.has_list_waiters(key_s) {
+            self.runtime
+                .broker
+                .drain_list_waiters(key_s, &mut shard.data, now);
+        }
+    }
+
+    /// Executes a raw Redis command pipeline and returns raw RESP bytes for all replies.
+    ///
+    /// Commands: Any non-blocking Redis commands accepted by the embedded runtime parser.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let resp = client.pipeline(&vec![vec![b"PING".to_vec()]]).await?;
+    /// ```
+    pub async fn pipeline(&self, commands: &[Vec<Vec<u8>>]) -> Result<bytes::Bytes, LuxError> {
+        let mut write_buf = BytesMut::with_capacity(4096);
+        let mut session = self.session.lock().await;
+        let now = Instant::now();
+        let refs: Vec<Vec<&[u8]>> = commands
+            .iter()
+            .map(|cmd| cmd.iter().map(|arg| arg.as_slice()).collect())
+            .collect();
+        for args in &refs {
+            validate_embedded_command(args)?;
+        }
+        let executor = CommandExecutor::new(
+            self.runtime.store.clone(),
+            self.runtime.broker.clone(),
+            self.runtime.script_engine.clone(),
+            self.runtime.schema_cache.clone(),
+        );
+        if let Some(action) = executor.execute_pipeline(&refs, &mut session, &mut write_buf, now) {
+            let kind = match action {
+                CmdResult::BlockPop { .. } => "BLPOP/BRPOP",
+                CmdResult::BlockMove { .. } => "BLMOVE",
+                CmdResult::BlockStreamRead { .. } => "XREAD/XREADGROUP",
+                CmdResult::BlockZPop { .. } => "BZPOP*",
+                _ => "unsupported",
+            };
+            return Err(LuxError::Unsupported(format!(
+                "blocking command not supported in embedded pipeline: {kind}"
+            )));
+        }
+        Ok(write_buf.freeze())
+    }
+
+    /// Executes a raw Redis command pipeline and returns parsed embedded values for all replies.
+    ///
+    /// Commands: Any non-blocking Redis commands accepted by the embedded runtime parser.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let values = client.pipeline_values(&vec![vec![b"PING".to_vec()]]).await?;
+    /// ```
+    pub async fn pipeline_values(
+        &self,
+        commands: &[Vec<Vec<u8>>],
+    ) -> Result<Vec<EmbeddedValue>, LuxError> {
+        let resp = self.pipeline(commands).await?;
+        parse_embedded_values(&resp)
+    }
+
+    /// Executes `SET` and returns the parsed embedded value reply.
+    ///
+    /// Commands: Redis `SET`.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let value = client.set_value("key", "value").await?;
+    /// ```
+    pub async fn set_value(&self, key: &str, value: &str) -> Result<EmbeddedValue, LuxError> {
+        self.execute_value("SET", &[key, value]).await
+    }
+
+    /// Executes `GET` and returns the parsed embedded value reply.
+    ///
+    /// Commands: Redis `GET`.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let value = client.get_value("key").await?;
+    /// ```
+    pub async fn get_value(&self, key: &str) -> Result<EmbeddedValue, LuxError> {
+        self.execute_value("GET", &[key]).await
+    }
+
+    /// Executes `DEL` for one key and returns the parsed embedded value reply.
+    ///
+    /// Commands: Redis `DEL`.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let value = client.del_value("key").await?;
+    /// ```
+    pub async fn del_value(&self, key: &str) -> Result<EmbeddedValue, LuxError> {
+        self.execute_value("DEL", &[key]).await
+    }
+
+    /// Executes `INCR` and returns the parsed embedded value reply.
+    ///
+    /// Commands: Redis `INCR`.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let value = client.incr_value("counter").await?;
+    /// ```
+    pub async fn incr_value(&self, key: &str) -> Result<EmbeddedValue, LuxError> {
+        self.execute_value("INCR", &[key]).await
+    }
+
+    /// Creates an embedded channel subscription.
+    ///
+    /// Commands: Redis `SUBSCRIBE` semantics without sending the command through RESP.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let mut sub = client.subscribe("events");
+    /// ```
+    pub fn subscribe(&self, channel: &str) -> EmbeddedSubscription {
+        EmbeddedSubscription::new(
+            self.runtime.broker.clone(),
+            self.runtime.broker.subscribe(channel),
+            EmbeddedSubscriptionKind::Channel(channel.to_string()),
+        )
+    }
+
+    /// Creates an embedded pattern subscription.
+    ///
+    /// Commands: Redis `PSUBSCRIBE` semantics without sending the command through RESP.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let mut sub = client.psubscribe("events:*");
+    /// ```
+    pub fn psubscribe(&self, pattern: &str) -> EmbeddedSubscription {
+        EmbeddedSubscription::new(
+            self.runtime.broker.clone(),
+            self.runtime.broker.psubscribe(pattern),
+            EmbeddedSubscriptionKind::Pattern(pattern.to_string()),
+        )
+    }
+
+    /// Creates an embedded key-event pattern subscription.
+    ///
+    /// Commands: Lux key-event subscription semantics, equivalent to the embedded `KSUB` path.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let mut sub = client.ksubscribe("key:*");
+    /// ```
+    pub fn ksubscribe(&self, pattern: &str) -> EmbeddedSubscription {
+        EmbeddedSubscription::new(
+            self.runtime.broker.clone(),
+            self.runtime.broker.ksubscribe(pattern),
+            EmbeddedSubscriptionKind::KeyPattern(pattern.to_string()),
+        )
+    }
+
+    /// Blocks until a value can be popped from the left side of one of the lists, or until the timeout expires.
+    ///
+    /// Commands: Redis `BLPOP`.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let item = client.blpop(&["queue"], std::time::Duration::from_secs(1)).await?;
+    /// ```
+    pub async fn blpop(
+        &self,
+        keys: &[&str],
+        timeout: Duration,
+    ) -> Result<Option<(String, bytes::Bytes)>, LuxError> {
+        self.blocking_list_pop(keys, timeout, true).await
+    }
+
+    /// Blocks until a value can be popped from the right side of one of the lists, or until the timeout expires.
+    ///
+    /// Commands: Redis `BRPOP`.
+    ///
+    /// Example:
+    /// ```rust,ignore
+    /// let item = client.brpop(&["queue"], std::time::Duration::from_secs(1)).await?;
+    /// ```
+    pub async fn brpop(
+        &self,
+        keys: &[&str],
+        timeout: Duration,
+    ) -> Result<Option<(String, bytes::Bytes)>, LuxError> {
+        self.blocking_list_pop(keys, timeout, false).await
+    }
+
+    async fn blocking_list_pop(
+        &self,
+        keys: &[&str],
+        timeout: Duration,
+        pop_left: bool,
+    ) -> Result<Option<(String, bytes::Bytes)>, LuxError> {
+        if keys.is_empty() {
+            return Err(LuxError::InvalidCommand(
+                "blocking list pop requires at least one key".to_string(),
+            ));
+        }
+
+        let command = if pop_left { "BLPOP" } else { "BRPOP" };
+        let timeout_secs = timeout.as_secs_f64().to_string();
+        let mut argv: Vec<Vec<u8>> = Vec::with_capacity(keys.len() + 2);
+        argv.push(command.as_bytes().to_vec());
+        for key in keys {
+            argv.push(key.as_bytes().to_vec());
+        }
+        argv.push(timeout_secs.as_bytes().to_vec());
+
+        let mut write_buf = BytesMut::with_capacity(256);
+        let action = {
+            let mut session = self.session.lock().await;
+            let now = Instant::now();
+            let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
+            let executor = CommandExecutor::new(
+                self.runtime.store.clone(),
+                self.runtime.broker.clone(),
+                self.runtime.script_engine.clone(),
+                self.runtime.schema_cache.clone(),
+            );
+            self.runtime.store.add_total_commands(1);
+            executor.execute_command(&refs, &mut session, &mut write_buf, now)
+        };
+
+        if !write_buf.is_empty() {
+            return parse_blocking_pop_value(&write_buf);
+        }
+
+        let Some(CmdResult::BlockPop {
+            keys: owned_keys,
+            timeout,
+            pop_left,
+        }) = action
+        else {
+            return Err(LuxError::Protocol(
+                "blocking list pop returned an unexpected command result".to_string(),
+            ));
+        };
+
+        wait_for_blocking_pop(&self.runtime.broker, &owned_keys, timeout, pop_left).await
+    }
+
+    async fn execute_owned(&self, argv: Vec<Vec<u8>>) -> Result<bytes::Bytes, LuxError> {
+        let mut write_buf = BytesMut::with_capacity(4096);
+        let mut session = self.session.lock().await;
+        let now = Instant::now();
+        let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
+        validate_embedded_command(&refs)?;
+        let executor = CommandExecutor::new(
+            self.runtime.store.clone(),
+            self.runtime.broker.clone(),
+            self.runtime.script_engine.clone(),
+            self.runtime.schema_cache.clone(),
+        );
+        self.runtime.store.add_total_commands(1);
+        if let Some(action) = executor.execute_command(&refs, &mut session, &mut write_buf, now) {
+            let kind = match action {
+                CmdResult::BlockPop { .. } => "BLPOP/BRPOP",
+                CmdResult::BlockMove { .. } => "BLMOVE",
+                CmdResult::BlockStreamRead { .. } => "XREAD/XREADGROUP",
+                CmdResult::BlockZPop { .. } => "BZPOP*",
+                _ => "unsupported",
+            };
+            return Err(LuxError::Unsupported(format!(
+                "blocking command not supported in embedded execution: {kind}"
+            )));
+        }
+        Ok(write_buf.freeze())
+    }
+}
+
+fn validate_embedded_command(args: &[&[u8]]) -> Result<(), LuxError> {
+    let parsed = command::parse(args).map_err(|e| LuxError::InvalidCommand(e.to_string()))?;
+    match parsed.meta.kind {
+        CommandKind::PubSub(PubSubCommand::Subscribe)
+        | CommandKind::PubSub(PubSubCommand::Unsubscribe)
+        | CommandKind::PubSub(PubSubCommand::PSubscribe)
+        | CommandKind::PubSub(PubSubCommand::PUnsubscribe)
+        | CommandKind::PubSub(PubSubCommand::KSubscribe)
+        | CommandKind::PubSub(PubSubCommand::KUnsubscribe) => Err(LuxError::Unsupported(
+            "subscription commands use EmbeddedClient::subscribe, psubscribe, or ksubscribe"
+                .to_string(),
+        )),
+        CommandKind::Blocking => Err(LuxError::Unsupported(format!(
+            "blocking command not supported in embedded execution: {}",
+            String::from_utf8_lossy(parsed.name).to_ascii_uppercase()
+        ))),
+        CommandKind::PubSub(PubSubCommand::Publish)
+        | CommandKind::General
+        | CommandKind::Auth
+        | CommandKind::Transaction => Ok(()),
+    }
+}
+
+impl Clone for EmbeddedClient {
+    fn clone(&self) -> Self {
+        Self::new(self.runtime.clone())
+    }
+}
+
+fn embedded_value_to_command_output(value: EmbeddedValue) -> Result<CommandOutput, LuxError> {
+    match value {
+        EmbeddedValue::Nil => Ok(CommandOutput::Nil),
+        EmbeddedValue::Int(n) => Ok(CommandOutput::Int(n)),
+        EmbeddedValue::Simple(s) => Ok(CommandOutput::Bulk(bytes::Bytes::from(s))),
+        EmbeddedValue::Bulk(bytes) => Ok(CommandOutput::Bulk(bytes)),
+        EmbeddedValue::Array(items) => Ok(CommandOutput::Array(
+            items
+                .into_iter()
+                .map(embedded_value_to_command_output)
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        EmbeddedValue::Map(entries) => {
+            let mut out = Vec::with_capacity(entries.len() * 2);
+            for (key, value) in entries {
+                out.push(embedded_value_to_command_output(key)?);
+                out.push(embedded_value_to_command_output(value)?);
+            }
+            Ok(CommandOutput::Array(out))
+        }
+        EmbeddedValue::Error(msg) => Err(LuxError::Command(msg)),
+    }
+}
+
+fn optional_bulk_output(value: Option<bytes::Bytes>) -> CommandOutput {
+    match value {
+        Some(value) => CommandOutput::Bulk(value),
+        None => CommandOutput::Nil,
+    }
+}
+
+fn bytes_array(values: Vec<bytes::Bytes>) -> CommandOutput {
+    CommandOutput::Array(values.into_iter().map(CommandOutput::Bulk).collect())
+}
+
+fn string_array(values: Vec<String>) -> CommandOutput {
+    CommandOutput::Array(
+        values
+            .into_iter()
+            .map(|value| CommandOutput::Bulk(bytes::Bytes::from(value)))
+            .collect(),
+    )
+}
+
+fn optional_score_output(value: Option<f64>) -> CommandOutput {
+    match value {
+        Some(value) => score_output(value),
+        None => CommandOutput::Nil,
+    }
+}
+
+fn geopos_output_from_shard(
+    data: &hashbrown::HashMap<String, store::Entry, store::FxBuildHasher>,
+    key: &[u8],
+    members: &[&[u8]],
+    now: Instant,
+) -> Result<CommandOutput, LuxError> {
+    let mut values = Vec::with_capacity(members.len());
+    for member in members {
+        match Store::zscore_from_shard(data, key, member, now).map_err(LuxError::Command)? {
+            Some(score) => {
+                let (lon, lat) = crate::geo::geohash_decode(score as u64);
+                values.push(CommandOutput::Array(vec![
+                    CommandOutput::Bulk(bytes::Bytes::from(format_geo_coord(lon))),
+                    CommandOutput::Bulk(bytes::Bytes::from(format_geo_coord(lat))),
+                ]));
+            }
+            None => values.push(CommandOutput::Nil),
+        }
+    }
+    Ok(CommandOutput::Array(values))
+}
+
+fn geodist_output_from_shard(
+    data: &hashbrown::HashMap<String, store::Entry, store::FxBuildHasher>,
+    key: &[u8],
+    member_a: &[u8],
+    member_b: &[u8],
+    unit: &[u8],
+    now: Instant,
+) -> Result<CommandOutput, LuxError> {
+    let unit = std::str::from_utf8(unit)
+        .ok()
+        .and_then(crate::geo::DistUnit::parse)
+        .ok_or_else(|| {
+            LuxError::Command("ERR unsupported unit provided. please use M, KM, FT, MI".to_string())
+        })?;
+    let Some(score_a) =
+        Store::zscore_from_shard(data, key, member_a, now).map_err(LuxError::Command)?
+    else {
+        return Ok(CommandOutput::Nil);
+    };
+    let Some(score_b) =
+        Store::zscore_from_shard(data, key, member_b, now).map_err(LuxError::Command)?
+    else {
+        return Ok(CommandOutput::Nil);
+    };
+    let (lon_a, lat_a) = crate::geo::geohash_decode(score_a as u64);
+    let (lon_b, lat_b) = crate::geo::geohash_decode(score_b as u64);
+    let distance = unit.from_meters(crate::geo::haversine(lon_a, lat_a, lon_b, lat_b));
+    Ok(CommandOutput::Bulk(bytes::Bytes::from(format!(
+        "{distance:.4}"
+    ))))
+}
+
+fn score_output(value: f64) -> CommandOutput {
+    CommandOutput::Bulk(bytes::Bytes::from(format_float(value)))
+}
+
+fn zrange_output(items: Vec<(String, f64)>, with_scores: bool) -> CommandOutput {
+    let mut values = Vec::with_capacity(if with_scores {
+        items.len() * 2
+    } else {
+        items.len()
+    });
+    for (member, score) in items {
+        values.push(CommandOutput::Bulk(bytes::Bytes::from(member)));
+        if with_scores {
+            values.push(score_output(score));
+        }
+    }
+    CommandOutput::Array(values)
+}
+
+fn random_key_output(store: &Store, now: Instant) -> CommandOutput {
+    for i in 0..store.shard_count() {
+        let shard = store.lock_read_shard(i);
+        if let Some((key, _)) = shard
+            .data
+            .iter()
+            .find(|(_, entry)| !entry.is_expired_at(now))
+        {
+            return CommandOutput::Bulk(bytes::Bytes::from(key.clone()));
+        }
+    }
+    CommandOutput::Nil
+}
+
+fn arg_str(arg: &[u8]) -> &str {
+    std::str::from_utf8(arg).unwrap_or("")
+}
+
+fn xadd_fields(fields: &[(&[u8], &[u8])]) -> Vec<(String, bytes::Bytes)> {
+    fields
+        .iter()
+        .map(|(field, value)| {
+            (
+                arg_str(field).to_string(),
+                bytes::Bytes::copy_from_slice(value),
+            )
+        })
+        .collect()
+}
+
+fn require_xadd_fields(fields: &[(&[u8], &[u8])]) -> Result<(), LuxError> {
+    if fields.is_empty() {
+        return Err(LuxError::Command(
+            "ERR wrong number of arguments for 'xadd' command".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn command_is_fast_path_write(command: &Command<'_>) -> bool {
+    matches!(
+        command,
+        Command::FlushDb
+            | Command::FlushAll
+            | Command::Set { .. }
+            | Command::GetSet { .. }
+            | Command::SetNx { .. }
+            | Command::SetEx { .. }
+            | Command::PSetEx { .. }
+            | Command::MSet { .. }
+            | Command::MSetNx { .. }
+            | Command::Append { .. }
+            | Command::Incr { .. }
+            | Command::Decr { .. }
+            | Command::IncrBy { .. }
+            | Command::DecrBy { .. }
+            | Command::Del { .. }
+            | Command::Unlink { .. }
+            | Command::Expire { .. }
+            | Command::Persist { .. }
+            | Command::Rename { .. }
+            | Command::RenameNx { .. }
+            | Command::LPush { .. }
+            | Command::RPush { .. }
+            | Command::LPop { .. }
+            | Command::RPop { .. }
+            | Command::HSet { .. }
+            | Command::HIncrBy { .. }
+            | Command::HDel { .. }
+            | Command::SAdd { .. }
+            | Command::SRem { .. }
+            | Command::SPop { .. }
+            | Command::ZAdd { .. }
+            | Command::ZRem { .. }
+            | Command::ZIncrBy { .. }
+            | Command::GeoAdd { .. }
+            | Command::XAdd { .. }
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativePipelineAccess {
+    Read,
+    Write,
+}
+
+fn native_pipeline_access<'a>(command: &Command<'a>) -> Option<(&'a [u8], NativePipelineAccess)> {
+    // Only simple single-shard commands are eligible for native batching.
+    // Commands with multi-key routing, transaction/session behavior, or side
+    // effects outside the shard lock stay on the generic path.
+    match command {
+        Command::Get { key }
+        | Command::StrLen { key }
+        | Command::HGet { key, .. }
+        | Command::GeoPos { key, .. }
+        | Command::GeoDist { key, .. } => Some((key, NativePipelineAccess::Read)),
+        Command::Exists { keys } if keys.len() == 1 => Some((keys[0], NativePipelineAccess::Read)),
+        Command::Set { key, options, .. } if can_fast_path_set(options) => {
+            Some((key, NativePipelineAccess::Write))
+        }
+        Command::GetSet { key, .. }
+        | Command::SetNx { key, .. }
+        | Command::SetEx { key, .. }
+        | Command::PSetEx { key, .. }
+        | Command::Append { key, .. }
+        | Command::Incr { key }
+        | Command::Decr { key }
+        | Command::IncrBy { key, .. }
+        | Command::DecrBy { key, .. }
+        | Command::LPush { key, .. }
+        | Command::RPush { key, .. }
+        | Command::LPop { key }
+        | Command::RPop { key }
+        | Command::HSet { key, .. }
+        | Command::HIncrBy { key, .. }
+        | Command::SAdd { key, .. }
+        | Command::SPop { key }
+        | Command::ZAdd { key, .. }
+        | Command::ZIncrBy { key, .. }
+        | Command::XAdd { key, .. } => Some((key, NativePipelineAccess::Write)),
+        Command::Del { keys } | Command::Unlink { keys } if keys.len() == 1 => {
+            Some((keys[0], NativePipelineAccess::Write))
+        }
+        _ => None,
+    }
+}
+
+fn wal_log_native_command(store: &Store, command: &Command<'_>) -> Result<(), LuxError> {
+    if !store.wal_enabled() {
+        return Ok(());
+    }
+
+    // Borrowed-argv WAL fast path. Each arm must encode the exact argv that
+    // `Command::to_owned_argv` would produce so crash replay sees identical
+    // command semantics without allocating owned argument vectors.
+    match command {
+        Command::Set {
+            key,
+            value,
+            options,
+        } => match options.as_slice() {
+            [] => {
+                let args = [b"SET".as_slice(), *key, *value];
+                store.wal_log_command(&args).map_err(wal_lux_error)?;
+            }
+            [SetOption::Ex(seconds)] => {
+                let seconds = seconds.to_string();
+                let args = [
+                    b"SET".as_slice(),
+                    *key,
+                    *value,
+                    b"EX".as_slice(),
+                    seconds.as_bytes(),
+                ];
+                store.wal_log_command(&args).map_err(wal_lux_error)?;
+            }
+            [SetOption::Px(milliseconds)] => {
+                let milliseconds = milliseconds.to_string();
+                let args = [
+                    b"SET".as_slice(),
+                    *key,
+                    *value,
+                    b"PX".as_slice(),
+                    milliseconds.as_bytes(),
+                ];
+                store.wal_log_command(&args).map_err(wal_lux_error)?;
+            }
+            _ => wal_log_owned_command(store, command)?,
+        },
+        Command::GetSet { key, value } => {
+            let args = [b"GETSET".as_slice(), *key, *value];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::SetNx { key, value } => {
+            let args = [b"SETNX".as_slice(), *key, *value];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::SetEx {
+            key,
+            seconds,
+            value,
+        } => {
+            let seconds = seconds.to_string();
+            let args = [b"SETEX".as_slice(), *key, seconds.as_bytes(), *value];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::PSetEx {
+            key,
+            milliseconds,
+            value,
+        } => {
+            let milliseconds = milliseconds.to_string();
+            let args = [b"PSETEX".as_slice(), *key, milliseconds.as_bytes(), *value];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::MSet { pairs } => {
+            let mut args = Vec::with_capacity(1 + pairs.len() * 2);
+            args.push(b"MSET".as_slice());
+            for (key, value) in pairs {
+                args.push(*key);
+                args.push(*value);
+            }
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::Append { key, value } => {
+            let args = [b"APPEND".as_slice(), *key, *value];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::Incr { key } => {
+            let args = [b"INCR".as_slice(), *key];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::Decr { key } => {
+            let args = [b"DECR".as_slice(), *key];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::IncrBy { key, increment } => {
+            let increment = increment.to_string();
+            let args = [b"INCRBY".as_slice(), *key, increment.as_bytes()];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::DecrBy { key, decrement } => {
+            let decrement = decrement.to_string();
+            let args = [b"DECRBY".as_slice(), *key, decrement.as_bytes()];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::Del { keys } if keys.len() == 1 => {
+            let args = [b"DEL".as_slice(), keys[0]];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::Unlink { keys } if keys.len() == 1 => {
+            let args = [b"UNLINK".as_slice(), keys[0]];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::LPush { key, values } => {
+            let mut args = Vec::with_capacity(values.len() + 2);
+            args.push(b"LPUSH".as_slice());
+            args.push(*key);
+            args.extend(values.iter().copied());
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::RPush { key, values } => {
+            let mut args = Vec::with_capacity(values.len() + 2);
+            args.push(b"RPUSH".as_slice());
+            args.push(*key);
+            args.extend(values.iter().copied());
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::LPop { key } => {
+            let args = [b"LPOP".as_slice(), *key];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::RPop { key } => {
+            let args = [b"RPOP".as_slice(), *key];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::HSet { key, field, value } => {
+            let args = [b"HSET".as_slice(), *key, *field, *value];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::HIncrBy {
+            key,
+            field,
+            increment,
+        } => {
+            let increment = increment.to_string();
+            let args = [b"HINCRBY".as_slice(), *key, *field, increment.as_bytes()];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::SAdd { key, members } => {
+            let mut args = Vec::with_capacity(members.len() + 2);
+            args.push(b"SADD".as_slice());
+            args.push(*key);
+            args.extend(members.iter().copied());
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::SPop { key } => {
+            let args = [b"SPOP".as_slice(), *key];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::ZAdd { key, score, member } => {
+            let score = score.to_string();
+            let args = [b"ZADD".as_slice(), *key, score.as_bytes(), *member];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::ZIncrBy {
+            key,
+            increment,
+            member,
+        } => {
+            let increment = increment.to_string();
+            let args = [b"ZINCRBY".as_slice(), *key, increment.as_bytes(), *member];
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        Command::XAdd { key, id, fields } => {
+            let mut args = Vec::with_capacity(fields.len() * 2 + 3);
+            args.push(b"XADD".as_slice());
+            args.push(*key);
+            args.push(*id);
+            for (field, value) in fields {
+                args.push(*field);
+                args.push(*value);
+            }
+            store.wal_log_command(&args).map_err(wal_lux_error)?;
+        }
+        _ => wal_log_owned_command(store, command)?,
+    }
+    Ok(())
+}
+
+fn wal_lux_error(error: std::io::Error) -> LuxError {
+    LuxError::Command(format!("ERR WAL append failed: {error}"))
+}
+
+fn ensure_write_allowed(store: &Store) -> Result<(), LuxError> {
+    crate::eviction::evict_if_needed(store).map_err(|e| LuxError::Command(e.to_string()))
+}
+
+fn wal_log_owned_command(store: &Store, command: &Command<'_>) -> Result<(), LuxError> {
+    let argv = command.to_owned_argv();
+    let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    store.wal_log_command(&refs).map_err(wal_lux_error)?;
+    Ok(())
+}
+
+fn can_fast_path_set(options: &[SetOption]) -> bool {
+    options
+        .iter()
+        .all(|option| matches!(option, SetOption::Ex(_) | SetOption::Px(_)))
+}
+
+fn set_ttl(options: &[SetOption]) -> Option<Duration> {
+    options.iter().find_map(|option| match option {
+        SetOption::Ex(seconds) => Some(Duration::from_secs(*seconds)),
+        SetOption::Px(milliseconds) => u64::try_from(*milliseconds).ok().map(Duration::from_millis),
+        SetOption::Nx | SetOption::Xx | SetOption::KeepTtl => None,
+    })
+}
+
+fn parse_score_bound_bytes(input: &[u8], is_max: bool) -> (f64, bool) {
+    let s = std::str::from_utf8(input).unwrap_or("");
+    if s == "-inf" || s == "-" {
+        (f64::NEG_INFINITY, false)
+    } else if s == "+inf" || s == "+" {
+        (f64::INFINITY, false)
+    } else if let Some(rest) = s.strip_prefix('(') {
+        (
+            rest.parse::<f64>().unwrap_or(if is_max {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            }),
+            true,
+        )
+    } else {
+        (
+            s.parse::<f64>().unwrap_or(if is_max {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            }),
+            false,
+        )
+    }
+}
+
+fn format_float(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
+}
+
+fn format_geo_coord(v: f64) -> String {
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    let magnitude = v.abs().log10().floor() as usize + 1;
+    let decimals = 17usize.saturating_sub(magnitude);
+    let s = format!("{v:.decimals$}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+impl EmbeddedSubscription {
+    fn new(
+        broker: Broker,
+        receiver: broadcast::Receiver<pubsub::Message>,
+        kind: EmbeddedSubscriptionKind,
+    ) -> Self {
+        Self {
+            broker: Some(broker),
+            receiver: Some(receiver),
+            kind,
+        }
+    }
+
+    pub async fn recv(&mut self) -> Result<EmbeddedMessage, LuxError> {
+        let receiver = self.receiver.as_mut().ok_or(LuxError::SubscriptionClosed)?;
+        match receiver.recv().await {
+            Ok(message) => Ok(message.into()),
+            Err(broadcast::error::RecvError::Closed) => Err(LuxError::SubscriptionClosed),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                Err(LuxError::SubscriptionLagged(skipped))
+            }
+        }
+    }
+
+    pub fn try_recv(&mut self) -> Result<Option<EmbeddedMessage>, LuxError> {
+        let receiver = self.receiver.as_mut().ok_or(LuxError::SubscriptionClosed)?;
+        match receiver.try_recv() {
+            Ok(message) => Ok(Some(message.into())),
+            Err(broadcast::error::TryRecvError::Empty) => Ok(None),
+            Err(broadcast::error::TryRecvError::Closed) => Err(LuxError::SubscriptionClosed),
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                Err(LuxError::SubscriptionLagged(skipped))
+            }
+        }
+    }
+
+    pub fn close(mut self) {
+        self.close_inner();
+    }
+
+    fn close_inner(&mut self) {
+        self.receiver.take();
+        if let Some(broker) = self.broker.as_ref() {
+            match &self.kind {
+                EmbeddedSubscriptionKind::Channel(channel) => broker.unsubscribe_channel(channel),
+                EmbeddedSubscriptionKind::Pattern(pattern) => broker.punsubscribe_pattern(pattern),
+                EmbeddedSubscriptionKind::KeyPattern(pattern) => broker.kunsub(pattern),
+            }
+        }
+        self.broker.take();
+    }
+}
+
+impl Drop for EmbeddedSubscription {
+    fn drop(&mut self) {
+        self.close_inner();
+    }
+}
+
+impl From<pubsub::Message> for EmbeddedMessage {
+    fn from(message: pubsub::Message) -> Self {
+        let kind = match message.kind {
+            pubsub::MessageKind::PubSub => EmbeddedMessageKind::PubSub,
+            pubsub::MessageKind::KeyEvent => EmbeddedMessageKind::KeyEvent,
+        };
+        Self {
+            channel: message.channel,
+            payload: message.payload,
+            pattern: message.pattern,
+            kind,
+        }
+    }
+}
+
+fn parse_single_embedded_value(buf: &[u8]) -> Result<EmbeddedValue, LuxError> {
+    let mut parser = RespValueParser::new(buf);
+    let value = parser.parse_value()?;
+    if parser.pos != buf.len() {
+        return Err(LuxError::Protocol(
+            "trailing bytes after RESP value".to_string(),
+        ));
+    }
+    match value {
+        EmbeddedValue::Error(msg) => Err(LuxError::Command(msg)),
+        value => Ok(value),
+    }
+}
+
+fn parse_embedded_values(buf: &[u8]) -> Result<Vec<EmbeddedValue>, LuxError> {
+    let mut parser = RespValueParser::new(buf);
+    let mut values = Vec::new();
+    while parser.pos < buf.len() {
+        values.push(parser.parse_value()?);
+    }
+    Ok(values)
+}
+
+fn parse_blocking_pop_value(buf: &[u8]) -> Result<Option<(String, bytes::Bytes)>, LuxError> {
+    match parse_single_embedded_value(buf)? {
+        EmbeddedValue::Nil => Ok(None),
+        EmbeddedValue::Array(items) if items.len() == 2 => {
+            let mut iter = items.into_iter();
+            let key = match iter.next().unwrap() {
+                EmbeddedValue::Bulk(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                EmbeddedValue::Simple(value) => value,
+                other => {
+                    return Err(LuxError::Protocol(format!(
+                        "expected blocking pop key, got {other:?}"
+                    )))
+                }
+            };
+            let value = match iter.next().unwrap() {
+                EmbeddedValue::Bulk(bytes) => bytes,
+                other => {
+                    return Err(LuxError::Protocol(format!(
+                        "expected blocking pop value, got {other:?}"
+                    )))
+                }
+            };
+            Ok(Some((key, value)))
+        }
+        other => Err(LuxError::Protocol(format!(
+            "expected blocking pop array, got {other:?}"
+        ))),
+    }
+}
+
+async fn wait_for_blocking_pop(
+    broker: &Broker,
+    keys: &[String],
+    timeout: Duration,
+    pop_left: bool,
+) -> Result<Option<(String, bytes::Bytes)>, LuxError> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, bytes::Bytes)>(1);
+    let waiter_id = broker.next_waiter_id();
+
+    for key in keys {
+        broker.register_list_waiter(
+            key,
+            pubsub::BlockedPopRequest {
+                tx: tx.clone(),
+                pop_left,
+                waiter_id,
+            },
+        );
+    }
+    drop(tx);
+
+    let result = tokio::select! {
+        val = rx.recv() => val,
+        _ = tokio::time::sleep(timeout) => None,
+    };
+
+    broker.remove_list_waiters_by_id(keys, waiter_id);
+    Ok(result)
+}
+
+struct RespValueParser<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> RespValueParser<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn parse_value(&mut self) -> Result<EmbeddedValue, LuxError> {
+        let Some(prefix) = self.take_byte() else {
+            return Err(LuxError::Protocol("empty RESP value".to_string()));
+        };
+        match prefix {
+            b'+' => Ok(EmbeddedValue::Simple(self.read_line_string()?)),
+            b'-' => Ok(EmbeddedValue::Error(self.read_line_string()?)),
+            b':' => {
+                let line = self.read_line()?;
+                let n = parse_i64_ascii(line)?;
+                Ok(EmbeddedValue::Int(n))
+            }
+            b'$' => self.parse_bulk(),
+            b'*' => self.parse_array(),
+            b'%' => self.parse_map(),
+            _ => Err(LuxError::Protocol(format!(
+                "unsupported RESP prefix byte: {prefix}"
+            ))),
+        }
+    }
+
+    fn parse_bulk(&mut self) -> Result<EmbeddedValue, LuxError> {
+        let len = parse_i64_ascii(self.read_line()?)?;
+        if len < 0 {
+            return Ok(EmbeddedValue::Nil);
+        }
+        let len = len as usize;
+        if self.pos + len + 2 > self.buf.len() {
+            return Err(LuxError::Protocol("truncated RESP bulk string".to_string()));
+        }
+        let data = bytes::Bytes::copy_from_slice(&self.buf[self.pos..self.pos + len]);
+        self.pos += len;
+        self.expect_crlf()?;
+        Ok(EmbeddedValue::Bulk(data))
+    }
+
+    fn parse_array(&mut self) -> Result<EmbeddedValue, LuxError> {
+        let len = parse_i64_ascii(self.read_line()?)?;
+        if len < 0 {
+            return Ok(EmbeddedValue::Nil);
+        }
+        let mut values = Vec::with_capacity(len as usize);
+        for _ in 0..len {
+            values.push(self.parse_value()?);
+        }
+        Ok(EmbeddedValue::Array(values))
+    }
+
+    fn parse_map(&mut self) -> Result<EmbeddedValue, LuxError> {
+        let len = parse_i64_ascii(self.read_line()?)?;
+        if len < 0 {
+            return Ok(EmbeddedValue::Nil);
+        }
+        let mut values = Vec::with_capacity(len as usize);
+        for _ in 0..len {
+            let key = self.parse_value()?;
+            let value = self.parse_value()?;
+            values.push((key, value));
+        }
+        Ok(EmbeddedValue::Map(values))
+    }
+
+    fn take_byte(&mut self) -> Option<u8> {
+        let byte = *self.buf.get(self.pos)?;
+        self.pos += 1;
+        Some(byte)
+    }
+
+    fn read_line_string(&mut self) -> Result<String, LuxError> {
+        Ok(String::from_utf8_lossy(self.read_line()?).into_owned())
+    }
+
+    fn read_line(&mut self) -> Result<&'a [u8], LuxError> {
+        let start = self.pos;
+        while self.pos + 1 < self.buf.len() {
+            if self.buf[self.pos] == b'\r' && self.buf[self.pos + 1] == b'\n' {
+                let line = &self.buf[start..self.pos];
+                self.pos += 2;
+                return Ok(line);
+            }
+            self.pos += 1;
+        }
+        Err(LuxError::Protocol(
+            "missing RESP line terminator".to_string(),
+        ))
+    }
+
+    fn expect_crlf(&mut self) -> Result<(), LuxError> {
+        if self.pos + 1 >= self.buf.len()
+            || self.buf[self.pos] != b'\r'
+            || self.buf[self.pos + 1] != b'\n'
+        {
+            return Err(LuxError::Protocol(
+                "missing RESP bulk terminator".to_string(),
+            ));
+        }
+        self.pos += 2;
+        Ok(())
+    }
+}
+
+fn parse_i64_ascii(input: &[u8]) -> Result<i64, LuxError> {
+    let value = std::str::from_utf8(input)
+        .map_err(|_| LuxError::Protocol("RESP integer is not UTF-8".to_string()))?;
+    value
+        .parse::<i64>()
+        .map_err(|_| LuxError::Protocol("invalid RESP integer".to_string()))
 }
 
 async fn recv_broadcast_batch(
@@ -313,6 +2919,7 @@ pub async fn run() -> std::io::Result<()> {
 /// Readiness means storage has initialized, any snapshot has loaded, WAL replay
 /// has completed, and configured listeners have bound successfully.
 pub async fn run_with_config(config: ServerConfig) -> std::io::Result<ServerHandle> {
+    validate_listener_security(&config)?;
     let listener = if config.enable_resp {
         let addr = config.listen_addr();
         Some(TcpListener::bind(&addr).await?)
@@ -327,8 +2934,10 @@ pub async fn run_with_config(config: ServerConfig) -> std::io::Result<ServerHand
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (ready_tx, ready_rx) = oneshot::channel();
     let server_task = tokio::spawn(server_main(listener, config, shutdown_rx, ready_tx));
-    wait_for_startup(ready_rx, "server startup failed before readiness signal").await?;
+    let runtime =
+        wait_for_startup(ready_rx, "server startup failed before readiness signal").await?;
     Ok(ServerHandle {
+        runtime,
         shutdown_tx,
         server_task,
         local_addr,
@@ -339,121 +2948,12 @@ async fn server_main(
     listener: Option<TcpListener>,
     config: ServerConfig,
     mut shutdown_rx: watch::Receiver<bool>,
-    ready_tx: oneshot::Sender<std::io::Result<()>>,
+    ready_tx: oneshot::Sender<std::io::Result<Arc<Runtime>>>,
 ) -> std::io::Result<()> {
-    let config = Arc::new(config);
-    let store = Arc::new(Store::new_with_config(config.clone()));
-    let schema_cache: SharedSchemaCache =
-        std::sync::Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
-    if config.storage.mode == StorageMode::Tiered {
-        emit_info(
-            &config,
-            ServerInfoEvent::TieredStorageEnabled {
-                dir: config.storage.dir.clone(),
-            },
-        );
-    }
-    let broker = Broker::new();
-    let script_engine = Arc::new(lua::ScriptEngine::new());
-
-    store
-        .wal_suppress
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    match snapshot::load(&store) {
-        Ok(0) => emit_info(&config, ServerInfoEvent::NoSnapshotFound),
-        Ok(n) => emit_info(&config, ServerInfoEvent::SnapshotLoaded { keys: n }),
-        Err(e) => emit_error(
-            &config,
-            ServerErrorEvent::SnapshotLoadFailed {
-                error: e.to_string(),
-            },
-        ),
-    }
-    store
-        .wal_suppress
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-    store.replay_wal(&broker);
-
     let mut background_tasks = JoinSet::new();
-    background_tasks.spawn(snapshot::background_save_loop(store.clone()));
-    background_tasks.spawn(broker.clone().run_key_event_loop());
+    let runtime = Runtime::start(config, &mut background_tasks).await?;
 
-    {
-        let store = store.clone();
-        background_tasks.spawn(async move {
-            let start = Instant::now();
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let now = Instant::now();
-                let secs = now.duration_since(start).as_secs() as u32;
-                // Keep LRU aging scoped to this runtime; eviction decisions
-                // should not depend on other embedded instances.
-                store.set_lru_clock(secs & 0x00FF_FFFF);
-                store.expire_sweep(now);
-            }
-        });
-    }
-
-    if config.storage.mode == StorageMode::Tiered {
-        {
-            let store = store.clone();
-            background_tasks.spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    store.fsync_wal();
-                }
-            });
-        }
-        {
-            let store = store.clone();
-            background_tasks.spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    store.compact_disk_shards();
-                }
-            });
-        }
-    }
-
-    let mut http_startup_rx = None;
-    if config.http_port > 0 {
-        let http_store = store.clone();
-        let http_broker = broker.clone();
-        let http_cache = schema_cache.clone();
-        let http_port = config.http_port;
-        let max_rows = config.max_rows;
-        let max_body = config.max_body;
-        let (startup_tx, startup_rx) = oneshot::channel();
-        http_startup_rx = Some(startup_rx);
-        let on_ready = config.on_info.clone().map(|on_info| {
-            Arc::new(move |addr| on_info(ServerInfoEvent::HttpReady { addr }))
-                as Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>
-        });
-        let on_error = config.on_error.clone();
-        background_tasks.spawn(async move {
-            let http_config = http::HttpServerConfig {
-                http_port,
-                max_rows,
-                max_body,
-                on_ready,
-                startup_ready: Some(startup_tx),
-            };
-            if let Err(e) =
-                http::start_http_server(http_config, http_store, http_broker, http_cache).await
-            {
-                if let Some(on_error) = on_error {
-                    on_error(ServerErrorEvent::HttpServerFailed {
-                        error: e.to_string(),
-                    });
-                }
-            }
-        });
-    }
-
-    let mut conn_tasks = JoinSet::new();
-    // HTTP binds inside its task, so wait for its one-shot before reporting the
-    // whole runtime as ready to embedded callers.
-    if let Some(http_startup_rx) = http_startup_rx {
+    if let Some(http_startup_rx) = runtime.start_http_if_enabled(&mut background_tasks) {
         if let Err(e) = wait_for_startup(
             http_startup_rx,
             "http server startup failed before readiness signal",
@@ -465,9 +2965,12 @@ async fn server_main(
             return Err(e);
         }
     }
-    let _ = ready_tx.send(Ok(()));
+    let _ = ready_tx.send(Ok(runtime.clone()));
 
-    if !config.enable_resp {
+    let mut conn_tasks = JoinSet::new();
+    // HTTP binds inside its task, so wait for its one-shot before reporting the
+    // whole runtime as ready to embedded callers.
+    if !runtime.config.enable_resp {
         let _ = shutdown_rx.changed().await;
     } else {
         let listener = listener.expect("listener must exist when RESP is enabled");
@@ -478,27 +2981,14 @@ async fn server_main(
                 }
                 accepted = listener.accept() => {
                     let (socket, peer) = accepted?;
-                    let store = store.clone();
-                    let broker = broker.clone();
-                    let script_engine = script_engine.clone();
-                    let schema_cache = schema_cache.clone();
-                    let on_warn = config.on_warn.clone();
+                    let runtime = runtime.clone();
+                    let on_warn = runtime.config.on_warn.clone();
                     socket.set_nodelay(true).ok();
 
-                    let require_auth = config.require_auth;
                     conn_tasks.spawn(async move {
-                        store.client_connected();
-                        let result = handle_connection(
-                            socket,
-                            peer,
-                            store.clone(),
-                            broker,
-                            require_auth,
-                            script_engine,
-                            schema_cache,
-                        )
-                        .await;
-                        store.client_disconnected();
+                        runtime.store.client_connected();
+                        let result = handle_connection(socket, peer, runtime.clone()).await;
+                        runtime.store.client_disconnected();
                         if let Err(e) = result {
                             if e.kind() != std::io::ErrorKind::ConnectionReset {
                                 if let Some(on_warn) = on_warn {
@@ -524,6 +3014,147 @@ async fn server_main(
     Ok(())
 }
 
+impl Runtime {
+    async fn start(
+        config: ServerConfig,
+        background_tasks: &mut JoinSet<()>,
+    ) -> std::io::Result<Arc<Self>> {
+        let config = Arc::new(config);
+        let store = Arc::new(Store::new_with_config(config.clone()));
+        let schema_cache: SharedSchemaCache =
+            std::sync::Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
+        let broker = Broker::new();
+        let script_engine = Arc::new(lua::ScriptEngine::new());
+
+        let runtime = Arc::new(Self {
+            store,
+            broker,
+            schema_cache,
+            script_engine,
+            config,
+        });
+
+        if runtime.config.storage.mode == StorageMode::Tiered {
+            emit_info(
+                &runtime.config,
+                ServerInfoEvent::TieredStorageEnabled {
+                    dir: runtime.config.storage.dir.clone(),
+                },
+            );
+        }
+
+        runtime
+            .store
+            .wal_suppress
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        match snapshot::load(&runtime.store) {
+            Ok(0) => emit_info(&runtime.config, ServerInfoEvent::NoSnapshotFound),
+            Ok(n) => emit_info(&runtime.config, ServerInfoEvent::SnapshotLoaded { keys: n }),
+            Err(e) => emit_error(
+                &runtime.config,
+                ServerErrorEvent::SnapshotLoadFailed {
+                    error: e.to_string(),
+                },
+            ),
+        }
+        runtime
+            .store
+            .wal_suppress
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        runtime.store.replay_wal(&runtime.broker);
+
+        background_tasks.spawn(snapshot::background_save_loop(runtime.store.clone()));
+
+        {
+            let store = runtime.store.clone();
+            background_tasks.spawn(async move {
+                let start = Instant::now();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let now = Instant::now();
+                    let secs = now.duration_since(start).as_secs() as u32;
+                    // Keep LRU aging scoped to this runtime; eviction decisions
+                    // should not depend on other embedded instances.
+                    store.set_lru_clock(secs & 0x00FF_FFFF);
+                    store.expire_sweep(now);
+                }
+            });
+        }
+
+        if runtime.config.storage.mode == StorageMode::Tiered {
+            {
+                let store = runtime.store.clone();
+                background_tasks.spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        store.fsync_wal();
+                    }
+                });
+            }
+            {
+                let store = runtime.store.clone();
+                background_tasks.spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        store.compact_disk_shards();
+                    }
+                });
+            }
+        }
+
+        Ok(runtime)
+    }
+
+    fn start_http_if_enabled(
+        self: &Arc<Self>,
+        background_tasks: &mut JoinSet<()>,
+    ) -> Option<oneshot::Receiver<std::io::Result<std::net::SocketAddr>>> {
+        if self.config.http_port == 0 {
+            return None;
+        }
+        let http_store = self.store.clone();
+        let http_broker = self.broker.clone();
+        let http_cache = self.schema_cache.clone();
+        let http_script_engine = self.script_engine.clone();
+        let http_port = self.config.http_port;
+        let bind_host = self.config.bind_host.clone();
+        let max_rows = self.config.max_rows;
+        let max_body = self.config.max_body;
+        let (startup_tx, startup_rx) = oneshot::channel();
+        let on_ready = self.config.on_info.clone().map(|on_info| {
+            Arc::new(move |addr| on_info(ServerInfoEvent::HttpReady { addr }))
+                as Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>
+        });
+        let on_error = self.config.on_error.clone();
+        background_tasks.spawn(async move {
+            let http_config = http::HttpServerConfig {
+                bind_host,
+                http_port,
+                max_rows,
+                max_body,
+                on_ready,
+                startup_ready: Some(startup_tx),
+            };
+            if let Err(e) = http::start_http_server(
+                http_config,
+                http_store,
+                http_broker,
+                http_cache,
+                http_script_engine,
+            )
+            .await
+            {
+                if let Some(on_error) = on_error {
+                    on_error(ServerErrorEvent::HttpServerFailed {
+                        error: e.to_string(),
+                    });
+                }
+            }
+        });
+        Some(startup_rx)
+    }
+}
+
 #[inline(always)]
 fn cmd_eq_fast(input: &[u8], expected: &[u8]) -> bool {
     input.len() == expected.len()
@@ -531,15 +3162,6 @@ fn cmd_eq_fast(input: &[u8], expected: &[u8]) -> bool {
             .iter()
             .zip(expected)
             .all(|(a, b)| a.to_ascii_uppercase() == *b)
-}
-
-#[inline(always)]
-fn is_tx_cmd(cmd: &[u8]) -> bool {
-    cmd_eq_fast(cmd, b"MULTI")
-        || cmd_eq_fast(cmd, b"EXEC")
-        || cmd_eq_fast(cmd, b"DISCARD")
-        || cmd_eq_fast(cmd, b"WATCH")
-        || cmd_eq_fast(cmd, b"UNWATCH")
 }
 
 #[inline(always)]
@@ -579,7 +3201,7 @@ fn fire_key_events_slow(broker: &Broker, args: &[&[u8]]) {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_tx_cmd(
+fn handle_tx_cmd(
     args: &[&[u8]],
     in_multi: &mut bool,
     tx_error: &mut bool,
@@ -780,30 +3402,408 @@ fn is_blocking_cmd(cmd: &[u8]) -> bool {
         || cmd_eq_fast(cmd, b"SCRIPT")
 }
 
+pub(crate) struct CommandSession {
+    authenticated: bool,
+    in_multi: bool,
+    tx_queue: Vec<Vec<Vec<u8>>>,
+    watched: Vec<(String, usize, u64)>,
+    tx_error: bool,
+    subscriptions: HashMap<String, broadcast::Receiver<pubsub::Message>>,
+    pattern_subs: HashMap<String, broadcast::Receiver<pubsub::Message>>,
+    key_subs: HashMap<String, broadcast::Receiver<pubsub::Message>>,
+    sub_mode: bool,
+}
+
+impl CommandSession {
+    pub(crate) fn new(require_auth: bool) -> Self {
+        Self {
+            authenticated: !require_auth,
+            in_multi: false,
+            tx_queue: Vec::new(),
+            watched: Vec::new(),
+            tx_error: false,
+            subscriptions: HashMap::new(),
+            pattern_subs: HashMap::new(),
+            key_subs: HashMap::new(),
+            sub_mode: false,
+        }
+    }
+
+    fn total_subscriptions(&self) -> i64 {
+        (self.subscriptions.len() + self.pattern_subs.len() + self.key_subs.len()) as i64
+    }
+}
+
+pub(crate) struct CommandExecutor {
+    store: Arc<Store>,
+    broker: Broker,
+    script_engine: Arc<lua::ScriptEngine>,
+    schema_cache: SharedSchemaCache,
+}
+
+impl CommandExecutor {
+    pub(crate) fn new(
+        store: Arc<Store>,
+        broker: Broker,
+        script_engine: Arc<lua::ScriptEngine>,
+        schema_cache: SharedSchemaCache,
+    ) -> Self {
+        Self {
+            store,
+            broker,
+            script_engine,
+            schema_cache,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_command(
+        &self,
+        args: &[&[u8]],
+        session: &mut CommandSession,
+        write_buf: &mut BytesMut,
+        now: Instant,
+    ) -> Option<CmdResult> {
+        let parsed = match command::parse(args) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                resp::write_error(write_buf, &format!("ERR {e}"));
+                return None;
+            }
+        };
+        if !session.authenticated && !parsed.meta.public_without_auth {
+            resp::write_error(write_buf, "NOAUTH Authentication required");
+            return None;
+        }
+
+        if handle_tx_cmd(
+            args,
+            &mut session.in_multi,
+            &mut session.tx_error,
+            &mut session.tx_queue,
+            &mut session.watched,
+            &mut session.authenticated,
+            &self.store,
+            &self.broker,
+            &self.schema_cache,
+            write_buf,
+            now,
+        ) {
+            return None;
+        }
+
+        let cmd_result = {
+            let _guard = self.store.script_read_guard();
+            cmd::execute_with_wal(
+                &self.store,
+                &self.schema_cache,
+                &self.broker,
+                parsed.args,
+                write_buf,
+                now,
+            )
+        };
+        self.apply_cmd_result(cmd_result, parsed.args, session, write_buf, now)
+    }
+
+    pub(crate) fn execute_pipeline(
+        &self,
+        commands: &[Vec<&[u8]>],
+        session: &mut CommandSession,
+        write_buf: &mut BytesMut,
+        now: Instant,
+    ) -> Option<CmdResult> {
+        let mut parsed_commands = Vec::with_capacity(commands.len());
+        for args in commands {
+            match command::parse(args) {
+                Ok(parsed) => parsed_commands.push(parsed),
+                Err(e) => {
+                    resp::write_error(write_buf, &format!("ERR {e}"));
+                    return None;
+                }
+            }
+        }
+        let cmd_count = commands.len();
+        self.store.add_total_commands(cmd_count);
+
+        let mut has_special = session.in_multi;
+        let mut all_single_key_rw = true;
+        for parsed in &parsed_commands {
+            if !session.authenticated && !parsed.meta.public_without_auth {
+                has_special = true;
+                break;
+            }
+            if !matches!(parsed.meta.kind, CommandKind::General) {
+                has_special = true;
+                break;
+            }
+            if parsed.args.len() < 2 || parsed.meta.access == ShardAccess::General {
+                all_single_key_rw = false;
+            }
+        }
+
+        if has_special || !all_single_key_rw {
+            for parsed in &parsed_commands {
+                let args = parsed.args;
+                if !session.authenticated && !parsed.meta.public_without_auth {
+                    resp::write_error(write_buf, "NOAUTH Authentication required");
+                    continue;
+                }
+                if handle_tx_cmd(
+                    args,
+                    &mut session.in_multi,
+                    &mut session.tx_error,
+                    &mut session.tx_queue,
+                    &mut session.watched,
+                    &mut session.authenticated,
+                    &self.store,
+                    &self.broker,
+                    &self.schema_cache,
+                    write_buf,
+                    now,
+                ) {
+                    continue;
+                }
+
+                let cmd_result = {
+                    let _guard = self.store.script_read_guard();
+                    cmd::execute_with_wal(
+                        &self.store,
+                        &self.schema_cache,
+                        &self.broker,
+                        args,
+                        write_buf,
+                        now,
+                    )
+                };
+                if let Some(action) =
+                    self.apply_cmd_result(cmd_result, args, session, write_buf, now)
+                {
+                    return Some(action);
+                }
+            }
+            return None;
+        }
+
+        const FL_NONE: u8 = 0;
+        const FL_READ: u8 = 1;
+        const FL_WRITE: u8 = 2;
+
+        let mut shards: Vec<u32> = Vec::with_capacity(cmd_count);
+        let mut flags: Vec<u8> = Vec::with_capacity(cmd_count);
+        for parsed in &parsed_commands {
+            shards.push(self.store.shard_for_key(parsed.args[1]) as u32);
+            flags.push(match parsed.meta.access {
+                ShardAccess::SingleRead => FL_READ,
+                ShardAccess::SingleWrite => FL_WRITE,
+                ShardAccess::General => FL_NONE,
+            });
+        }
+
+        let mut i = 0usize;
+        while i < cmd_count {
+            let shard_idx = shards[i];
+            let mut batch_end = i + 1;
+            while batch_end < cmd_count && shards[batch_end] == shard_idx {
+                batch_end += 1;
+            }
+
+            let batch_flags = &flags[i..batch_end];
+            let all_classified = batch_flags.iter().all(|&f| f != FL_NONE);
+
+            if all_classified {
+                let has_writes = batch_flags.contains(&FL_WRITE);
+                if has_writes {
+                    for args in &commands[i..batch_end] {
+                        if args.len() > 1 {
+                            self.store.try_promote(args[1], now);
+                        }
+                        if args.len() > 1 && crate::eviction::is_write_command(args[0]) {
+                            if let Err(e) = crate::eviction::evict_if_needed(&self.store) {
+                                resp::write_error(write_buf, e);
+                                return None;
+                            }
+                            if let Err(e) = self.store.wal_log_command(args) {
+                                resp::write_error(
+                                    write_buf,
+                                    &format!("ERR WAL append failed: {e}"),
+                                );
+                                return None;
+                            }
+                        }
+                    }
+                    {
+                        let mut shard = self.store.lock_write_shard(shard_idx as usize);
+                        shard.version += 1;
+                        for args in &commands[i..batch_end] {
+                            cmd::execute_on_shard(
+                                &mut shard,
+                                &self.store,
+                                &self.broker,
+                                args,
+                                write_buf,
+                                now,
+                            );
+                        }
+                    }
+                    if self.broker.has_key_subs() {
+                        for idx in i..batch_end {
+                            if batch_flags[idx - i] == FL_WRITE {
+                                let cmd_args = &commands[idx];
+                                self.broker.enqueue_key_event(cmd_args[1], cmd_args[0]);
+                            }
+                        }
+                    }
+                } else {
+                    let shard = self.store.lock_read_shard(shard_idx as usize);
+                    for args in &commands[i..batch_end] {
+                        cmd::execute_on_shard_read(&shard.data, args, write_buf, now);
+                    }
+                }
+            } else {
+                for args in &commands[i..batch_end] {
+                    cmd::execute_with_wal(
+                        &self.store,
+                        &self.schema_cache,
+                        &self.broker,
+                        args,
+                        write_buf,
+                        now,
+                    );
+                    fire_key_events(&self.broker, args);
+                }
+            }
+
+            i = batch_end;
+        }
+        None
+    }
+
+    fn apply_cmd_result(
+        &self,
+        cmd_result: CmdResult,
+        args: &[&[u8]],
+        session: &mut CommandSession,
+        write_buf: &mut BytesMut,
+        now: Instant,
+    ) -> Option<CmdResult> {
+        match cmd_result {
+            CmdResult::Written => {
+                fire_key_events(&self.broker, args);
+                None
+            }
+            CmdResult::Authenticated => {
+                session.authenticated = true;
+                None
+            }
+            CmdResult::Subscribe { channels } => {
+                for ch in &channels {
+                    let rx = self.broker.subscribe(ch);
+                    session.subscriptions.insert(ch.clone(), rx);
+                    resp::write_array_header(write_buf, 3);
+                    resp::write_bulk(write_buf, "subscribe");
+                    resp::write_bulk(write_buf, ch);
+                    resp::write_integer(write_buf, session.total_subscriptions());
+                }
+                session.sub_mode = true;
+                None
+            }
+            CmdResult::PSubscribe { patterns } => {
+                for pat in &patterns {
+                    let rx = self.broker.psubscribe(pat);
+                    session.pattern_subs.insert(pat.clone(), rx);
+                    resp::write_array_header(write_buf, 3);
+                    resp::write_bulk(write_buf, "psubscribe");
+                    resp::write_bulk(write_buf, pat);
+                    resp::write_integer(write_buf, session.total_subscriptions());
+                }
+                session.sub_mode = true;
+                None
+            }
+            CmdResult::KSubscribe { patterns } => {
+                for pat in &patterns {
+                    if !session.key_subs.contains_key(pat) {
+                        let rx = self.broker.ksubscribe(pat);
+                        session.key_subs.insert(pat.clone(), rx);
+                    }
+                    resp::write_array_header(write_buf, 3);
+                    resp::write_bulk(write_buf, "ksub");
+                    resp::write_bulk(write_buf, pat);
+                    resp::write_integer(write_buf, session.total_subscriptions());
+                }
+                session.sub_mode = true;
+                None
+            }
+            CmdResult::KUnsubscribe { patterns } => {
+                let pats: Vec<String> = if patterns.is_empty() {
+                    session.key_subs.keys().cloned().collect()
+                } else {
+                    patterns
+                };
+                for pat in &pats {
+                    if session.key_subs.remove(pat).is_some() {
+                        self.broker.kunsub(pat);
+                    }
+                    resp::write_array_header(write_buf, 3);
+                    resp::write_bulk(write_buf, "kunsub");
+                    resp::write_bulk(write_buf, pat);
+                    resp::write_integer(write_buf, session.total_subscriptions());
+                }
+                None
+            }
+            CmdResult::Publish { channel, message } => {
+                let count = self.broker.publish(&channel, message);
+                resp::write_integer(write_buf, count);
+                None
+            }
+            CmdResult::BlockPop { .. }
+            | CmdResult::BlockMove { .. }
+            | CmdResult::BlockStreamRead { .. }
+            | CmdResult::BlockZPop { .. } => Some(cmd_result),
+            CmdResult::Eval { script, keys, argv } => {
+                handle_eval(
+                    write_buf,
+                    &self.store,
+                    &self.broker,
+                    &self.script_engine,
+                    &script,
+                    &keys,
+                    &argv,
+                    now,
+                );
+                None
+            }
+            CmdResult::ScriptOp => {
+                let owned_args: Vec<Vec<u8>> = args.iter().map(|a| a.to_vec()).collect();
+                let refs: Vec<&[u8]> = owned_args.iter().map(|v| v.as_slice()).collect();
+                handle_script_op(write_buf, &self.script_engine, &refs);
+                None
+            }
+        }
+    }
+}
+
 async fn handle_connection(
     mut socket: tokio::net::TcpStream,
     _peer: std::net::SocketAddr,
-    store: Arc<Store>,
-    broker: Broker,
-    require_auth: bool,
-    script_engine: Arc<lua::ScriptEngine>,
-    schema_cache: SharedSchemaCache,
+    runtime: Arc<Runtime>,
 ) -> std::io::Result<()> {
+    let store = runtime.store.clone();
+    let broker = runtime.broker.clone();
     let mut read_buf = vec![0u8; 65536];
     let mut write_buf = BytesMut::with_capacity(65536);
     let mut pending = BytesMut::new();
-    let mut subscriptions: HashMap<String, broadcast::Receiver<pubsub::Message>> = HashMap::new();
-    let mut pattern_subs: HashMap<String, broadcast::Receiver<pubsub::Message>> = HashMap::new();
-    let mut key_subs: HashMap<String, broadcast::Receiver<pubsub::Message>> = HashMap::new();
-    let mut sub_mode = false;
-    let mut authenticated = !require_auth;
-    let mut in_multi = false;
-    let mut tx_queue: Vec<Vec<Vec<u8>>> = Vec::new();
-    let mut watched: Vec<(String, usize, u64)> = Vec::new();
-    let mut tx_error = false;
+    let max_resp_request = runtime.config.max_resp_request;
+    let mut session = CommandSession::new(runtime.config.require_auth);
+    let executor = CommandExecutor::new(
+        runtime.store.clone(),
+        runtime.broker.clone(),
+        runtime.script_engine.clone(),
+        runtime.schema_cache.clone(),
+    );
 
     loop {
-        if sub_mode {
+        if session.sub_mode {
             tokio::select! {
                 result = socket.read(&mut read_buf) => {
                     let n = match result {
@@ -812,65 +3812,79 @@ async fn handle_connection(
                         Err(e) => return Err(e),
                     };
                     pending.extend_from_slice(&read_buf[..n]);
+                    if pending.len() > max_resp_request {
+                        resp::write_error(&mut write_buf, "ERR RESP request exceeds maximum");
+                        socket.write_all(&write_buf).await?;
+                        return Ok(());
+                    }
                     let now = Instant::now();
-                    let mut parser = Parser::new(&pending);
-                    while let Ok(Some(args)) = parser.parse_command() {
+                    let mut parser = Parser::with_max_bulk_len(&pending, max_resp_request);
+                    loop {
+                        let args = match parser.parse_command() {
+                            Ok(Some(args)) => args,
+                            Ok(None) => break,
+                            Err(e) => {
+                                resp::write_error(&mut write_buf, e);
+                                socket.write_all(&write_buf).await?;
+                                return Ok(());
+                            }
+                        };
                         if args.is_empty() { continue; }
                         if cmd_eq_fast(args[0], b"SUBSCRIBE") {
                             for ch_bytes in &args[1..] {
                                 let ch = std::str::from_utf8(ch_bytes).unwrap_or("").to_string();
-                                if !subscriptions.contains_key(&ch) {
+                                if !session.subscriptions.contains_key(&ch) {
                                     let rx = broker.subscribe(&ch);
-                                    subscriptions.insert(ch.clone(), rx);
+                                    session.subscriptions.insert(ch.clone(), rx);
                                 }
                                 resp::write_array_header(&mut write_buf, 3);
                                 resp::write_bulk(&mut write_buf, "subscribe");
                                 resp::write_bulk(&mut write_buf, &ch);
-                                resp::write_integer(&mut write_buf, (subscriptions.len() + pattern_subs.len() + key_subs.len()) as i64);
+                                resp::write_integer(&mut write_buf, session.total_subscriptions());
                             }
                         } else if cmd_eq_fast(args[0], b"UNSUBSCRIBE") {
                             let channels: Vec<String> = if args.len() > 1 {
                                 args[1..].iter().map(|a| std::str::from_utf8(a).unwrap_or("").to_string()).collect()
                             } else {
-                                subscriptions.keys().cloned().collect()
+                                session.subscriptions.keys().cloned().collect()
                             };
                             for ch in &channels {
-                                subscriptions.remove(ch);
+                                session.subscriptions.remove(ch);
                                 resp::write_array_header(&mut write_buf, 3);
                                 resp::write_bulk(&mut write_buf, "unsubscribe");
                                 resp::write_bulk(&mut write_buf, ch);
-                                resp::write_integer(&mut write_buf, (subscriptions.len() + pattern_subs.len() + key_subs.len()) as i64);
+                                resp::write_integer(&mut write_buf, session.total_subscriptions());
                             }
-                            if subscriptions.is_empty() && pattern_subs.is_empty() {
-                                sub_mode = false;
+                            if session.subscriptions.is_empty() && session.pattern_subs.is_empty() && session.key_subs.is_empty() {
+                                session.sub_mode = false;
                             }
                         } else if cmd_eq_fast(args[0], b"PSUBSCRIBE") {
                             for pat_bytes in &args[1..] {
                                 let pat = std::str::from_utf8(pat_bytes).unwrap_or("").to_string();
-                                if !pattern_subs.contains_key(&pat) {
+                                if !session.pattern_subs.contains_key(&pat) {
                                     let rx = broker.psubscribe(&pat);
-                                    pattern_subs.insert(pat.clone(), rx);
+                                    session.pattern_subs.insert(pat.clone(), rx);
                                 }
                                 resp::write_array_header(&mut write_buf, 3);
                                 resp::write_bulk(&mut write_buf, "psubscribe");
                                 resp::write_bulk(&mut write_buf, &pat);
-                                resp::write_integer(&mut write_buf, (subscriptions.len() + pattern_subs.len() + key_subs.len()) as i64);
+                                resp::write_integer(&mut write_buf, session.total_subscriptions());
                             }
                         } else if cmd_eq_fast(args[0], b"PUNSUBSCRIBE") {
                             let patterns: Vec<String> = if args.len() > 1 {
                                 args[1..].iter().map(|a| std::str::from_utf8(a).unwrap_or("").to_string()).collect()
                             } else {
-                                pattern_subs.keys().cloned().collect()
+                                session.pattern_subs.keys().cloned().collect()
                             };
                             for pat in &patterns {
-                                pattern_subs.remove(pat);
+                                session.pattern_subs.remove(pat);
                                 resp::write_array_header(&mut write_buf, 3);
                                 resp::write_bulk(&mut write_buf, "punsubscribe");
                                 resp::write_bulk(&mut write_buf, pat);
-                                resp::write_integer(&mut write_buf, (subscriptions.len() + pattern_subs.len() + key_subs.len()) as i64);
+                                resp::write_integer(&mut write_buf, session.total_subscriptions());
                             }
-                            if subscriptions.is_empty() && pattern_subs.is_empty() && key_subs.is_empty() {
-                                sub_mode = false;
+                            if session.subscriptions.is_empty() && session.pattern_subs.is_empty() && session.key_subs.is_empty() {
+                                session.sub_mode = false;
                             }
                         } else if cmd_eq_fast(args[0], b"KSUB") {
                             if args.len() < 2 {
@@ -878,33 +3892,33 @@ async fn handle_connection(
                             } else {
                                 for pat_bytes in &args[1..] {
                                     let pat = std::str::from_utf8(pat_bytes).unwrap_or("").to_string();
-                                    if !key_subs.contains_key(&pat) {
+                                    if !session.key_subs.contains_key(&pat) {
                                         let rx = broker.ksubscribe(&pat);
-                                        key_subs.insert(pat.clone(), rx);
+                                        session.key_subs.insert(pat.clone(), rx);
                                     }
                                     resp::write_array_header(&mut write_buf, 3);
                                     resp::write_bulk(&mut write_buf, "ksub");
                                     resp::write_bulk(&mut write_buf, &pat);
-                                    resp::write_integer(&mut write_buf, (subscriptions.len() + pattern_subs.len() + key_subs.len()) as i64);
+                                    resp::write_integer(&mut write_buf, session.total_subscriptions());
                                 }
                             }
                         } else if cmd_eq_fast(args[0], b"KUNSUB") {
                             let patterns: Vec<String> = if args.len() > 1 {
                                 args[1..].iter().map(|a| std::str::from_utf8(a).unwrap_or("").to_string()).collect()
                             } else {
-                                key_subs.keys().cloned().collect()
+                                session.key_subs.keys().cloned().collect()
                             };
                             for pat in &patterns {
-                                if key_subs.remove(pat).is_some() {
+                                if session.key_subs.remove(pat).is_some() {
                                     broker.kunsub(pat);
                                 }
                                 resp::write_array_header(&mut write_buf, 3);
                                 resp::write_bulk(&mut write_buf, "kunsub");
                                 resp::write_bulk(&mut write_buf, pat);
-                                resp::write_integer(&mut write_buf, (subscriptions.len() + pattern_subs.len() + key_subs.len()) as i64);
+                                resp::write_integer(&mut write_buf, session.total_subscriptions());
                             }
-                            if subscriptions.is_empty() && pattern_subs.is_empty() && key_subs.is_empty() {
-                                sub_mode = false;
+                            if session.subscriptions.is_empty() && session.pattern_subs.is_empty() && session.key_subs.is_empty() {
+                                session.sub_mode = false;
                             }
                         } else if cmd_eq_fast(args[0], b"PING") {
                             if args.len() > 1 {
@@ -925,46 +3939,46 @@ async fn handle_connection(
                     }
                 }
                 msg = async {
-                    let total_subs = subscriptions.len() + pattern_subs.len() + key_subs.len();
+                    let total_subs = session.subscriptions.len() + session.pattern_subs.len() + session.key_subs.len();
                     if total_subs == 1 {
-                        if let Some((_ch, rx)) = subscriptions.iter_mut().next() {
+                        if let Some((_ch, rx)) = session.subscriptions.iter_mut().next() {
                             return recv_broadcast_batch(rx, SUB_MODE_BATCH_MAX).await;
                         }
-                        if let Some((_pat, rx)) = pattern_subs.iter_mut().next() {
+                        if let Some((_pat, rx)) = session.pattern_subs.iter_mut().next() {
                             return recv_broadcast_batch(rx, SUB_MODE_BATCH_MAX).await;
                         }
-                        if let Some((_pat, rx)) = key_subs.iter_mut().next() {
+                        if let Some((_pat, rx)) = session.key_subs.iter_mut().next() {
                             return recv_broadcast_batch(rx, SUB_MODE_BATCH_MAX).await;
                         }
                     }
 
-                    for (_ch, rx) in subscriptions.iter_mut() {
+                    for (_ch, rx) in session.subscriptions.iter_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
-                    for (_pat, rx) in pattern_subs.iter_mut() {
+                    for (_pat, rx) in session.pattern_subs.iter_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
-                    for (_pat, rx) in key_subs.iter_mut() {
+                    for (_pat, rx) in session.key_subs.iter_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    for (_ch, rx) in subscriptions.iter_mut() {
+                    for (_ch, rx) in session.subscriptions.iter_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
-                    for (_pat, rx) in pattern_subs.iter_mut() {
+                    for (_pat, rx) in session.pattern_subs.iter_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
-                    for (_pat, rx) in key_subs.iter_mut() {
+                    for (_pat, rx) in session.key_subs.iter_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
@@ -1010,15 +4024,29 @@ async fn handle_connection(
             };
 
             pending.extend_from_slice(&read_buf[..n]);
+            if pending.len() > max_resp_request {
+                resp::write_error(&mut write_buf, "ERR RESP request exceeds maximum");
+                socket.write_all(&write_buf).await?;
+                return Ok(());
+            }
             let now = Instant::now();
-            let mut parser = Parser::new(&pending);
+            let mut parser = Parser::with_max_bulk_len(&pending, max_resp_request);
 
             let mut commands: Vec<Vec<&[u8]>> = Vec::new();
-            while let Ok(Some(args)) = parser.parse_command() {
-                if args.is_empty() {
-                    continue;
+            loop {
+                match parser.parse_command() {
+                    Ok(Some(args)) => {
+                        if !args.is_empty() {
+                            commands.push(args);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        resp::write_error(&mut write_buf, e);
+                        socket.write_all(&write_buf).await?;
+                        return Ok(());
+                    }
                 }
-                commands.push(args);
             }
             let consumed = parser.pos();
 
@@ -1026,475 +4054,17 @@ async fn handle_connection(
 
             if commands.len() <= 1 {
                 for args in &commands {
-                    if !authenticated
-                        && !cmd_eq_fast(args[0], b"AUTH")
-                        && !cmd_eq_fast(args[0], b"HELLO")
-                        && !cmd_eq_fast(args[0], b"PING")
-                        && !cmd_eq_fast(args[0], b"QUIT")
-                    {
-                        resp::write_error(&mut write_buf, "NOAUTH Authentication required");
-                        continue;
-                    }
                     store.add_total_commands(1);
-
-                    if handle_tx_cmd(
-                        args,
-                        &mut in_multi,
-                        &mut tx_error,
-                        &mut tx_queue,
-                        &mut watched,
-                        &mut authenticated,
-                        &store,
-                        &broker,
-                        &schema_cache,
-                        &mut write_buf,
-                        now,
-                    )
-                    .await
+                    if let Some(action) =
+                        executor.execute_command(args, &mut session, &mut write_buf, now)
                     {
-                        continue;
-                    }
-
-                    let cmd_result = {
-                        let _guard = store.script_read_guard();
-                        cmd::execute_with_wal(
-                            &store,
-                            &schema_cache,
-                            &broker,
-                            args,
-                            &mut write_buf,
-                            now,
-                        )
-                    };
-                    match cmd_result {
-                        CmdResult::Written => {
-                            fire_key_events(&broker, args);
-                        }
-                        CmdResult::Authenticated => {
-                            authenticated = true;
-                        }
-                        CmdResult::Subscribe { channels } => {
-                            for ch in &channels {
-                                let rx = broker.subscribe(ch);
-                                subscriptions.insert(ch.clone(), rx);
-                                resp::write_array_header(&mut write_buf, 3);
-                                resp::write_bulk(&mut write_buf, "subscribe");
-                                resp::write_bulk(&mut write_buf, ch);
-                                resp::write_integer(
-                                    &mut write_buf,
-                                    (subscriptions.len() + pattern_subs.len()) as i64,
-                                );
-                            }
-                            sub_mode = true;
-                            break;
-                        }
-                        CmdResult::PSubscribe { patterns } => {
-                            for pat in &patterns {
-                                let rx = broker.psubscribe(pat);
-                                pattern_subs.insert(pat.clone(), rx);
-                                resp::write_array_header(&mut write_buf, 3);
-                                resp::write_bulk(&mut write_buf, "psubscribe");
-                                resp::write_bulk(&mut write_buf, pat);
-                                resp::write_integer(
-                                    &mut write_buf,
-                                    (subscriptions.len() + pattern_subs.len()) as i64,
-                                );
-                            }
-                            sub_mode = true;
-                            break;
-                        }
-                        CmdResult::KSubscribe { patterns } => {
-                            for pat in &patterns {
-                                if !key_subs.contains_key(pat) {
-                                    let rx = broker.ksubscribe(pat);
-                                    key_subs.insert(pat.clone(), rx);
-                                }
-                                resp::write_array_header(&mut write_buf, 3);
-                                resp::write_bulk(&mut write_buf, "ksub");
-                                resp::write_bulk(&mut write_buf, pat);
-                                resp::write_integer(
-                                    &mut write_buf,
-                                    (subscriptions.len() + pattern_subs.len() + key_subs.len())
-                                        as i64,
-                                );
-                            }
-                            sub_mode = true;
-                            break;
-                        }
-                        CmdResult::KUnsubscribe { patterns } => {
-                            let pats: Vec<String> = if patterns.is_empty() {
-                                key_subs.keys().cloned().collect()
-                            } else {
-                                patterns
-                            };
-                            for pat in &pats {
-                                if key_subs.remove(pat).is_some() {
-                                    broker.kunsub(pat);
-                                }
-                                resp::write_array_header(&mut write_buf, 3);
-                                resp::write_bulk(&mut write_buf, "kunsub");
-                                resp::write_bulk(&mut write_buf, pat);
-                                resp::write_integer(
-                                    &mut write_buf,
-                                    (subscriptions.len() + pattern_subs.len() + key_subs.len())
-                                        as i64,
-                                );
-                            }
-                        }
-                        CmdResult::Publish { channel, message } => {
-                            let count = broker.publish(&channel, message);
-                            resp::write_integer(&mut write_buf, count);
-                        }
-                        CmdResult::BlockPop { .. }
-                        | CmdResult::BlockMove { .. }
-                        | CmdResult::BlockStreamRead { .. }
-                        | CmdResult::BlockZPop { .. } => {
-                            deferred_action = Some(cmd_result);
-                            break;
-                        }
-                        CmdResult::Eval { script, keys, argv } => {
-                            handle_eval(
-                                &mut write_buf,
-                                &store,
-                                &broker,
-                                &script_engine,
-                                &script,
-                                &keys,
-                                &argv,
-                                now,
-                            );
-                        }
-                        CmdResult::ScriptOp => {
-                            let owned_args: Vec<Vec<u8>> =
-                                args.iter().map(|a| a.to_vec()).collect();
-                            let refs: Vec<&[u8]> =
-                                owned_args.iter().map(|v| v.as_slice()).collect();
-                            handle_script_op(&mut write_buf, &script_engine, &refs);
-                        }
+                        deferred_action = Some(action);
+                        break;
                     }
                 }
             } else {
-                let cmd_count = commands.len();
-                store.add_total_commands(cmd_count);
-
-                let mut has_special = in_multi;
-                let mut all_single_key_rw = true;
-                for args in &commands {
-                    if !authenticated
-                        && !cmd_eq_fast(args[0], b"AUTH")
-                        && !cmd_eq_fast(args[0], b"HELLO")
-                        && !cmd_eq_fast(args[0], b"PING")
-                        && !cmd_eq_fast(args[0], b"QUIT")
-                    {
-                        has_special = true;
-                        break;
-                    }
-                    if cmd_eq_fast(args[0], b"SUBSCRIBE")
-                        || cmd_eq_fast(args[0], b"PSUBSCRIBE")
-                        || cmd_eq_fast(args[0], b"KSUB")
-                        || cmd_eq_fast(args[0], b"KUNSUB")
-                        || cmd_eq_fast(args[0], b"PUBLISH")
-                        || cmd_eq_fast(args[0], b"AUTH")
-                        || is_tx_cmd(args[0])
-                        || is_blocking_cmd(args[0])
-                    {
-                        has_special = true;
-                        break;
-                    }
-                    if args.len() < 2
-                        || cmd_eq_fast(args[0], b"MGET")
-                        || cmd_eq_fast(args[0], b"MSET")
-                        || cmd_eq_fast(args[0], b"DEL")
-                        || cmd_eq_fast(args[0], b"EXISTS")
-                        || cmd_eq_fast(args[0], b"KEYS")
-                        || cmd_eq_fast(args[0], b"SCAN")
-                        || cmd_eq_fast(args[0], b"FLUSHDB")
-                        || cmd_eq_fast(args[0], b"FLUSHALL")
-                        || cmd_eq_fast(args[0], b"DBSIZE")
-                        || cmd_eq_fast(args[0], b"SAVE")
-                        || cmd_eq_fast(args[0], b"INFO")
-                        || cmd_eq_fast(args[0], b"RENAME")
-                        || cmd_eq_fast(args[0], b"SUNION")
-                        || cmd_eq_fast(args[0], b"SINTER")
-                        || cmd_eq_fast(args[0], b"SDIFF")
-                        || cmd_eq_fast(args[0], b"ZUNIONSTORE")
-                        || cmd_eq_fast(args[0], b"ZINTERSTORE")
-                        || cmd_eq_fast(args[0], b"ZDIFFSTORE")
-                    {
-                        all_single_key_rw = false;
-                    }
-                }
-
-                if has_special || !all_single_key_rw {
-                    for args in &commands {
-                        if !authenticated
-                            && !cmd_eq_fast(args[0], b"AUTH")
-                            && !cmd_eq_fast(args[0], b"PING")
-                            && !cmd_eq_fast(args[0], b"QUIT")
-                        {
-                            resp::write_error(&mut write_buf, "NOAUTH Authentication required");
-                            continue;
-                        }
-
-                        if handle_tx_cmd(
-                            args,
-                            &mut in_multi,
-                            &mut tx_error,
-                            &mut tx_queue,
-                            &mut watched,
-                            &mut authenticated,
-                            &store,
-                            &broker,
-                            &schema_cache,
-                            &mut write_buf,
-                            now,
-                        )
-                        .await
-                        {
-                            continue;
-                        }
-
-                        let cmd_result = {
-                            let _guard = store.script_read_guard();
-                            cmd::execute_with_wal(
-                                &store,
-                                &schema_cache,
-                                &broker,
-                                args,
-                                &mut write_buf,
-                                now,
-                            )
-                        };
-                        match cmd_result {
-                            CmdResult::Written => {
-                                fire_key_events(&broker, args);
-                            }
-                            CmdResult::Authenticated => {
-                                authenticated = true;
-                            }
-                            CmdResult::Subscribe { channels } => {
-                                for ch in &channels {
-                                    let rx = broker.subscribe(ch);
-                                    subscriptions.insert(ch.clone(), rx);
-                                    resp::write_array_header(&mut write_buf, 3);
-                                    resp::write_bulk(&mut write_buf, "subscribe");
-                                    resp::write_bulk(&mut write_buf, ch);
-                                    resp::write_integer(
-                                        &mut write_buf,
-                                        (subscriptions.len() + pattern_subs.len()) as i64,
-                                    );
-                                }
-                                sub_mode = true;
-                                break;
-                            }
-                            CmdResult::PSubscribe { patterns } => {
-                                for pat in &patterns {
-                                    let rx = broker.psubscribe(pat);
-                                    pattern_subs.insert(pat.clone(), rx);
-                                    resp::write_array_header(&mut write_buf, 3);
-                                    resp::write_bulk(&mut write_buf, "psubscribe");
-                                    resp::write_bulk(&mut write_buf, pat);
-                                    resp::write_integer(
-                                        &mut write_buf,
-                                        (subscriptions.len() + pattern_subs.len()) as i64,
-                                    );
-                                }
-                                sub_mode = true;
-                                break;
-                            }
-                            CmdResult::KSubscribe { patterns } => {
-                                for pat in &patterns {
-                                    if !key_subs.contains_key(pat) {
-                                        let rx = broker.ksubscribe(pat);
-                                        key_subs.insert(pat.clone(), rx);
-                                    }
-                                    resp::write_array_header(&mut write_buf, 3);
-                                    resp::write_bulk(&mut write_buf, "ksub");
-                                    resp::write_bulk(&mut write_buf, pat);
-                                    resp::write_integer(
-                                        &mut write_buf,
-                                        (subscriptions.len() + pattern_subs.len() + key_subs.len())
-                                            as i64,
-                                    );
-                                }
-                                sub_mode = true;
-                                break;
-                            }
-                            CmdResult::KUnsubscribe { patterns } => {
-                                let pats: Vec<String> = if patterns.is_empty() {
-                                    key_subs.keys().cloned().collect()
-                                } else {
-                                    patterns
-                                };
-                                for pat in &pats {
-                                    if key_subs.remove(pat).is_some() {
-                                        broker.kunsub(pat);
-                                    }
-                                    resp::write_array_header(&mut write_buf, 3);
-                                    resp::write_bulk(&mut write_buf, "kunsub");
-                                    resp::write_bulk(&mut write_buf, pat);
-                                    resp::write_integer(
-                                        &mut write_buf,
-                                        (subscriptions.len() + pattern_subs.len() + key_subs.len())
-                                            as i64,
-                                    );
-                                }
-                            }
-                            CmdResult::Publish { channel, message } => {
-                                let count = broker.publish(&channel, message);
-                                resp::write_integer(&mut write_buf, count);
-                            }
-                            CmdResult::BlockPop { .. }
-                            | CmdResult::BlockMove { .. }
-                            | CmdResult::BlockStreamRead { .. }
-                            | CmdResult::BlockZPop { .. } => {
-                                deferred_action = Some(cmd_result);
-                                break;
-                            }
-                            CmdResult::Eval { script, keys, argv } => {
-                                handle_eval(
-                                    &mut write_buf,
-                                    &store,
-                                    &broker,
-                                    &script_engine,
-                                    &script,
-                                    &keys,
-                                    &argv,
-                                    now,
-                                );
-                            }
-                            CmdResult::ScriptOp => {
-                                let owned_args: Vec<Vec<u8>> =
-                                    args.iter().map(|a| a.to_vec()).collect();
-                                let refs: Vec<&[u8]> =
-                                    owned_args.iter().map(|v| v.as_slice()).collect();
-                                handle_script_op(&mut write_buf, &script_engine, &refs);
-                            }
-                        }
-                    }
-                } else {
-                    const FL_NONE: u8 = 0;
-                    const FL_READ: u8 = 1;
-                    const FL_WRITE: u8 = 2;
-
-                    let mut shards: Vec<u32> = Vec::with_capacity(cmd_count);
-                    let mut flags: Vec<u8> = Vec::with_capacity(cmd_count);
-                    for args in &commands {
-                        shards.push(store.shard_for_key(args[1]) as u32);
-                        let cmd = args[0];
-                        flags.push(
-                            if cmd_eq_fast(cmd, b"GET")
-                                || cmd_eq_fast(cmd, b"STRLEN")
-                                || cmd_eq_fast(cmd, b"LLEN")
-                                || cmd_eq_fast(cmd, b"SCARD")
-                                || cmd_eq_fast(cmd, b"HGET")
-                                || cmd_eq_fast(cmd, b"HLEN")
-                                || cmd_eq_fast(cmd, b"ZCARD")
-                                || cmd_eq_fast(cmd, b"ZSCORE")
-                                || cmd_eq_fast(cmd, b"TTL")
-                                || cmd_eq_fast(cmd, b"PTTL")
-                                || cmd_eq_fast(cmd, b"TYPE")
-                            {
-                                FL_READ
-                            } else if cmd_eq_fast(cmd, b"SET")
-                                || cmd_eq_fast(cmd, b"INCR")
-                                || cmd_eq_fast(cmd, b"DECR")
-                                || cmd_eq_fast(cmd, b"INCRBY")
-                                || cmd_eq_fast(cmd, b"DECRBY")
-                                || cmd_eq_fast(cmd, b"LPUSH")
-                                || cmd_eq_fast(cmd, b"RPUSH")
-                                || cmd_eq_fast(cmd, b"LPOP")
-                                || cmd_eq_fast(cmd, b"RPOP")
-                                || cmd_eq_fast(cmd, b"SADD")
-                                || cmd_eq_fast(cmd, b"SREM")
-                                || cmd_eq_fast(cmd, b"SPOP")
-                                || cmd_eq_fast(cmd, b"HSET")
-                                || cmd_eq_fast(cmd, b"HDEL")
-                                || cmd_eq_fast(cmd, b"ZADD")
-                                || cmd_eq_fast(cmd, b"ZREM")
-                                || cmd_eq_fast(cmd, b"ZPOPMIN")
-                                || cmd_eq_fast(cmd, b"ZPOPMAX")
-                            {
-                                FL_WRITE
-                            } else {
-                                FL_NONE
-                            },
-                        );
-                    }
-
-                    let mut i = 0usize;
-                    while i < cmd_count {
-                        let shard_idx = shards[i];
-                        let mut batch_end = i + 1;
-                        while batch_end < cmd_count && shards[batch_end] == shard_idx {
-                            batch_end += 1;
-                        }
-
-                        let batch_flags = &flags[i..batch_end];
-                        let all_classified = batch_flags.iter().all(|&f| f != FL_NONE);
-
-                        if all_classified {
-                            let has_writes = batch_flags.contains(&FL_WRITE);
-                            if has_writes {
-                                for args in &commands[i..batch_end] {
-                                    if args.len() > 1 {
-                                        store.try_promote(args[1], now);
-                                    }
-                                    if args.len() > 1 && crate::eviction::is_write_command(args[0])
-                                    {
-                                        store.wal_log_command(args);
-                                    }
-                                }
-                                {
-                                    let mut shard = store.lock_write_shard(shard_idx as usize);
-                                    shard.version += 1;
-                                    for args in &commands[i..batch_end] {
-                                        cmd::execute_on_shard(
-                                            &mut shard.data,
-                                            &store,
-                                            &broker,
-                                            args,
-                                            &mut write_buf,
-                                            now,
-                                        );
-                                    }
-                                }
-                                if broker.has_key_subs() {
-                                    for idx in i..batch_end {
-                                        if batch_flags[idx - i] == FL_WRITE {
-                                            let cmd_args = &commands[idx];
-                                            broker.enqueue_key_event(cmd_args[1], cmd_args[0]);
-                                        }
-                                    }
-                                }
-                            } else {
-                                let shard = store.lock_read_shard(shard_idx as usize);
-                                for args in &commands[i..batch_end] {
-                                    cmd::execute_on_shard_read(
-                                        &shard.data,
-                                        args,
-                                        &mut write_buf,
-                                        now,
-                                    );
-                                }
-                            }
-                        } else {
-                            for args in &commands[i..batch_end] {
-                                cmd::execute_with_wal(
-                                    &store,
-                                    &schema_cache,
-                                    &broker,
-                                    args,
-                                    &mut write_buf,
-                                    now,
-                                );
-                                fire_key_events(&broker, args);
-                            }
-                        }
-
-                        i = batch_end;
-                    }
-                }
+                deferred_action =
+                    executor.execute_pipeline(&commands, &mut session, &mut write_buf, now);
             }
 
             drop(commands);

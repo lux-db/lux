@@ -5,10 +5,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpSocket;
 use tokio::sync::oneshot;
 
-use crate::cmd;
+use crate::lua;
 use crate::pubsub::Broker;
 use crate::store::Store;
 use crate::tables::SharedSchemaCache;
+use crate::{CommandExecutor, CommandSession, LuxError};
 
 /// Constant-time byte comparison to prevent timing attacks on auth tokens.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -31,6 +32,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// `startup_ready` is used by `run_with_config` to include the HTTP bind in
 /// the server readiness contract. `on_ready` remains the user-facing log hook.
 pub struct HttpServerConfig {
+    pub bind_host: String,
     pub http_port: u16,
     pub max_rows: Option<usize>,
     pub max_body: usize,
@@ -44,8 +46,11 @@ pub async fn start_http_server(
     store: Arc<Store>,
     broker: Broker,
     cache: SharedSchemaCache,
+    script_engine: Arc<lua::ScriptEngine>,
 ) -> std::io::Result<()> {
-    let addr: std::net::SocketAddr = format!("0.0.0.0:{}", config.http_port).parse().unwrap();
+    let addr: std::net::SocketAddr = format!("{}:{}", config.bind_host, config.http_port)
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     // Bind before notifying either readiness channel so callers never observe
     // a ready server with a missing HTTP listener.
     let listener = match bind_listener(addr) {
@@ -72,13 +77,21 @@ pub async fn start_http_server(
         let store = store.clone();
         let broker = broker.clone();
         let cache = cache.clone();
+        let script_engine = script_engine.clone();
 
         tokio::spawn(async move {
             let mut stream = socket;
-            while let Ok(true) =
-                handle_request(&mut stream, &store, &broker, &cache, max_rows, max_body).await
-            {
-            }
+            while let Ok(true) = handle_request(
+                &mut stream,
+                &store,
+                &broker,
+                &cache,
+                &script_engine,
+                max_rows,
+                max_body,
+            )
+            .await
+            {}
         });
     }
 }
@@ -95,6 +108,7 @@ async fn handle_request(
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
     max_rows: Option<usize>,
     max_body: usize,
 ) -> std::io::Result<bool> {
@@ -234,8 +248,13 @@ async fn handle_request(
         }
     }
 
-    let (status, status_text, result) =
-        route_request(&method, &path, &body, &params, store, broker, cache);
+    let deps = RouteDeps {
+        store,
+        broker,
+        cache,
+        script_engine,
+    };
+    let (status, status_text, result) = route_request(&method, &path, &body, &params, deps);
 
     send_json(socket, status, status_text, &result).await
 }
@@ -256,58 +275,17 @@ async fn stream_table_query(
 
     let now = std::time::Instant::now();
 
-    let has_where = get_param(params, "where").is_some();
-    let client_limit: Option<usize> = get_param(params, "limit").and_then(|s| s.parse().ok());
-    let offset: usize = get_param(params, "offset")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let count_exact = prefer.contains("count=exact");
-
-    // Effective limit: client limit capped by LUX_MAX_ROWS (server always wins when set)
-    let effective_limit = match (client_limit, max_rows) {
-        (Some(c), Some(m)) => Some(c.min(m)),
-        (Some(c), None) => Some(c),
-        (None, Some(m)) => Some(m),
-        (None, None) => None,
-    };
-
-    // Build select tokens
-    let mut tokens: Vec<String> = vec!["*".to_string(), "FROM".to_string(), table.to_string()];
-    if let Some(w) = get_param(params, "where") {
-        tokens.push("WHERE".to_string());
-        for p in w.split_whitespace() {
-            tokens.push(p.to_string());
-        }
-    }
-    if let Some(j) = get_param(params, "join") {
-        tokens.push("JOIN".to_string());
-        tokens.push(j.to_string());
-    }
-    if let Some(o) = get_param(params, "order") {
-        tokens.push("ORDER".to_string());
-        tokens.push("BY".to_string());
-        for p in o.split_whitespace() {
-            tokens.push(p.to_string());
-        }
-    }
-    if let Some(lim) = effective_limit {
-        tokens.push("LIMIT".to_string());
-        tokens.push(lim.to_string());
-    }
-    if offset > 0 {
-        tokens.push("OFFSET".to_string());
-        tokens.push(offset.to_string());
-    }
-
-    let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-
-    let result = match crate::tables::parse_select(&refs) {
-        Ok(plan) => crate::tables::table_select(store, cache, &plan, now),
+    let (parsed, plan) = match parse_http_table_query(params, table, max_rows) {
+        Ok(v) => v,
         Err(e) => {
             let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
             return send_json(socket, 400, "Bad Request", &body).await;
         }
     };
+    let has_where = parsed.has_where;
+    let offset = parsed.offset;
+    let count_exact = prefer.contains("count=exact");
+    let result = crate::tables::table_select(store, cache, &plan, now);
 
     match result {
         Err(e) => {
@@ -364,11 +342,9 @@ async fn stream_table_query(
                     "FROM".to_string(),
                     table.to_string(),
                 ];
-                if let Some(w) = get_param(params, "where") {
+                if !parsed.where_tokens.is_empty() {
                     count_tokens.push("WHERE".to_string());
-                    for p in w.split_whitespace() {
-                        count_tokens.push(p.to_string());
-                    }
+                    count_tokens.extend(parsed.where_tokens.iter().cloned());
                 }
                 let count_refs: Vec<&str> = count_tokens.iter().map(|s| s.as_str()).collect();
                 let total = crate::tables::parse_select(&count_refs)
@@ -544,15 +520,120 @@ fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+struct HttpTableQueryParams {
+    has_where: bool,
+    where_tokens: Vec<String>,
+    offset: usize,
+}
+
+fn parse_http_where_tokens(where_clause: &str) -> Result<Vec<String>, String> {
+    let tokens: Vec<String> = where_clause
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect();
+    if tokens.is_empty() {
+        return Err("invalid where parameter".to_string());
+    }
+    Ok(tokens)
+}
+
+fn parse_http_table_query(
+    params: &[(String, String)],
+    table: &str,
+    max_rows: Option<usize>,
+) -> Result<(HttpTableQueryParams, crate::tables::SelectPlan), String> {
+    let has_where = get_param(params, "where").is_some();
+    let where_tokens = match get_param(params, "where") {
+        Some(w) => parse_http_where_tokens(w)?,
+        None => Vec::new(),
+    };
+
+    let order_tokens = match get_param(params, "order") {
+        Some(o) => {
+            let tokens: Vec<String> = o.split_whitespace().map(ToString::to_string).collect();
+            if tokens.is_empty() {
+                return Err("invalid order parameter".to_string());
+            }
+            tokens
+        }
+        None => Vec::new(),
+    };
+
+    let client_limit = match get_param(params, "limit") {
+        Some(v) => Some(
+            v.parse::<usize>()
+                .map_err(|_| "invalid limit parameter".to_string())?,
+        ),
+        None => None,
+    };
+    let offset = match get_param(params, "offset") {
+        Some(v) => v
+            .parse::<usize>()
+            .map_err(|_| "invalid offset parameter".to_string())?,
+        None => 0,
+    };
+    let limit = match (client_limit, max_rows) {
+        (Some(c), Some(m)) => Some(c.min(m)),
+        (Some(c), None) => Some(c),
+        (None, Some(m)) => Some(m),
+        (None, None) => None,
+    };
+
+    let mut tokens: Vec<String> = vec!["*".to_string(), "FROM".to_string(), table.to_string()];
+    if !where_tokens.is_empty() {
+        tokens.push("WHERE".to_string());
+        tokens.extend(where_tokens.iter().cloned());
+    }
+    if let Some(join) = get_param(params, "join") {
+        tokens.push("JOIN".to_string());
+        tokens.push(join.to_string());
+    }
+    if !order_tokens.is_empty() {
+        tokens.push("ORDER".to_string());
+        tokens.push("BY".to_string());
+        tokens.extend(order_tokens.iter().cloned());
+    }
+    if let Some(lim) = limit {
+        tokens.push("LIMIT".to_string());
+        tokens.push(lim.to_string());
+    }
+    if offset > 0 {
+        tokens.push("OFFSET".to_string());
+        tokens.push(offset.to_string());
+    }
+
+    let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+    let plan = crate::tables::parse_select(&refs)?;
+    Ok((
+        HttpTableQueryParams {
+            has_where,
+            where_tokens,
+            offset,
+        },
+        plan,
+    ))
+}
+
+struct RouteDeps<'a> {
+    store: &'a Arc<Store>,
+    broker: &'a Broker,
+    cache: &'a SharedSchemaCache,
+    script_engine: &'a Arc<lua::ScriptEngine>,
+}
+
 fn route_request(
     method: &str,
     path: &str,
     body: &str,
     params: &[(String, String)],
-    store: &Arc<Store>,
-    broker: &Broker,
-    cache: &SharedSchemaCache,
+    deps: RouteDeps<'_>,
 ) -> (u16, &'static str, String) {
+    let RouteDeps {
+        store,
+        broker,
+        cache,
+        script_engine,
+    } = deps;
     let path = path.trim_start_matches('/');
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
@@ -572,59 +653,110 @@ fn route_request(
 
     match (method, base) {
         // ── exec (escape hatch) ──
-        ("POST", ["exec"]) => ok(handle_exec(body, store, broker, cache)),
+        ("POST", ["exec"]) => ok(handle_exec(body, store, broker, cache, script_engine)),
 
         // ── KV routes ──
-        ("GET", ["kv", key]) => ok(exec_simple(store, broker, cache, &["GET", key])),
+        ("GET", ["kv", key]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["GET", key],
+        )),
         ("PUT", ["kv", key]) => {
             let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
             let value = parsed["value"].as_str().unwrap_or("");
             if let Some(ex) = parsed["ex"].as_u64() {
-                ok(exec_simple(
+                ok(exec_json(
                     store,
                     broker,
                     cache,
+                    script_engine,
                     &["SET", key, value, "EX", &ex.to_string()],
                 ))
             } else {
-                ok(exec_simple(store, broker, cache, &["SET", key, value]))
+                ok(exec_json(
+                    store,
+                    broker,
+                    cache,
+                    script_engine,
+                    &["SET", key, value],
+                ))
             }
         }
-        ("DELETE", ["kv", key]) => ok(exec_simple(store, broker, cache, &["DEL", key])),
-        ("POST", ["kv", key, "incr"]) => ok(exec_simple(store, broker, cache, &["INCR", key])),
-        ("POST", ["kv", key, "decr"]) => ok(exec_simple(store, broker, cache, &["DECR", key])),
-        ("GET", ["kv", key, "hash"]) => ok(exec_simple(store, broker, cache, &["HGETALL", key])),
+        ("DELETE", ["kv", key]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["DEL", key],
+        )),
+        ("POST", ["kv", key, "incr"]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["INCR", key],
+        )),
+        ("POST", ["kv", key, "decr"]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["DECR", key],
+        )),
+        ("GET", ["kv", key, "hash"]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["HGETALL", key],
+        )),
         ("GET", ["kv", key, "list"]) => {
             let start = get_param(params, "start").unwrap_or("0");
             let stop = get_param(params, "stop").unwrap_or("-1");
-            ok(exec_simple(
+            ok(exec_json(
                 store,
                 broker,
                 cache,
+                script_engine,
                 &["LRANGE", key, start, stop],
             ))
         }
-        ("GET", ["kv", key, "set"]) => ok(exec_simple(store, broker, cache, &["SMEMBERS", key])),
+        ("GET", ["kv", key, "set"]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["SMEMBERS", key],
+        )),
         ("GET", ["kv", key, "zset"]) => {
             let min = get_param(params, "min").unwrap_or("-inf");
             let max = get_param(params, "max").unwrap_or("+inf");
-            ok(exec_simple(
+            ok(exec_json(
                 store,
                 broker,
                 cache,
+                script_engine,
                 &["ZRANGEBYSCORE", key, min, max, "WITHSCORES"],
             ))
         }
         ("GET", ["keys"]) => {
             let pattern = get_param(params, "pattern").unwrap_or("*");
-            ok(exec_simple(store, broker, cache, &["KEYS", pattern]))
+            ok(exec_json(
+                store,
+                broker,
+                cache,
+                script_engine,
+                &["KEYS", pattern],
+            ))
         }
-        ("GET", ["dbsize"]) => ok(exec_simple(store, broker, cache, &["DBSIZE"])),
-        ("GET", ["ping"]) => ok(exec_simple(store, broker, cache, &["PING"])),
+        ("GET", ["dbsize"]) => ok(exec_json(store, broker, cache, script_engine, &["DBSIZE"])),
+        ("GET", ["ping"]) => ok(exec_json(store, broker, cache, script_engine, &["PING"])),
 
         // ── Table routes (PostgREST-style) ──
-        ("GET", ["tables"]) => ok(exec_simple(store, broker, cache, &["TLIST"])),
-        ("POST", ["tables"]) => route_table_create(body, store, broker, cache),
+        ("GET", ["tables"]) => ok(exec_json(store, broker, cache, script_engine, &["TLIST"])),
+        ("POST", ["tables"]) => route_table_create(body, store, broker, cache, script_engine),
         ("GET", ["tables", table]) => route_table_query(table, params, store, broker, cache),
         ("GET", ["tables", table, "schema"]) => {
             let now = std::time::Instant::now();
@@ -657,10 +789,12 @@ fn route_request(
         ("POST", ["tables", table]) => route_table_insert(table, body, store, broker, cache),
         // Bulk update via PATCH (requires where parameter for safety)
         ("PATCH", ["tables", table]) => {
-            route_table_update(table, params, body, store, broker, cache)
+            route_table_update(table, params, body, store, broker, cache, script_engine)
         }
         // Bulk delete via DELETE with where parameter (TDROP is separate)
-        ("DELETE", ["tables", table]) => route_table_delete(table, params, store, broker, cache),
+        ("DELETE", ["tables", table]) => {
+            route_table_delete(table, params, store, broker, cache, script_engine)
+        }
 
         // ── Time Series routes ──
         ("GET", ["ts"]) => {
@@ -680,42 +814,113 @@ fn route_request(
                         args.push(bucket);
                     }
                 }
-                ok(exec_simple(store, broker, cache, &args))
+                ok(exec_json(store, broker, cache, script_engine, &args))
             }
         }
-        ("GET", ["ts", key]) => route_ts_range(key, params, store, broker, cache),
-        ("POST", ["ts", key]) => route_ts_add(key, body, store, broker, cache),
-        ("GET", ["ts", key, "info"]) => ok(exec_simple(store, broker, cache, &["TSINFO", key])),
-        ("GET", ["ts", key, "latest"]) => ok(exec_simple(store, broker, cache, &["TSGET", key])),
+        ("GET", ["ts", key]) => route_ts_range(key, params, store, broker, cache, script_engine),
+        ("POST", ["ts", key]) => route_ts_add(key, body, store, broker, cache, script_engine),
+        ("GET", ["ts", key, "info"]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["TSINFO", key],
+        )),
+        ("GET", ["ts", key, "latest"]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["TSGET", key],
+        )),
 
         // ── Vector routes ──
-        ("POST", ["vectors", "search"]) => route_vector_search(body, store, broker, cache),
-        ("POST", ["vectors", key]) => route_vector_set(key, body, store, broker, cache),
-        ("GET", ["vectors", key]) => ok(exec_simple(store, broker, cache, &["VGET", key])),
-        ("DELETE", ["vectors", key]) => ok(exec_simple(store, broker, cache, &["DEL", key])),
-        ("GET", ["vectors"]) => ok(exec_simple(store, broker, cache, &["VCARD"])),
+        ("POST", ["vectors", "search"]) => {
+            route_vector_search(body, store, broker, cache, script_engine)
+        }
+        ("POST", ["vectors", key]) => {
+            route_vector_set(key, body, store, broker, cache, script_engine)
+        }
+        ("GET", ["vectors", key]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["VGET", key],
+        )),
+        ("DELETE", ["vectors", key]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["DEL", key],
+        )),
+        ("GET", ["vectors"]) => ok(exec_json(store, broker, cache, script_engine, &["VCARD"])),
 
         // ── Legacy flat routes (backwards compat) ──
-        ("GET", ["get", key]) => ok(exec_simple(store, broker, cache, &["GET", key])),
+        ("GET", ["get", key]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["GET", key],
+        )),
         ("POST", ["set", key]) => {
             let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
             let value = parsed["value"].as_str().unwrap_or("");
             if let Some(ex) = parsed["ex"].as_u64() {
-                ok(exec_simple(
+                ok(exec_json(
                     store,
                     broker,
                     cache,
+                    script_engine,
                     &["SET", key, value, "EX", &ex.to_string()],
                 ))
             } else {
-                ok(exec_simple(store, broker, cache, &["SET", key, value]))
+                ok(exec_json(
+                    store,
+                    broker,
+                    cache,
+                    script_engine,
+                    &["SET", key, value],
+                ))
             }
         }
-        ("POST", ["del", key]) => ok(exec_simple(store, broker, cache, &["DEL", key])),
-        ("POST", ["incr", key]) => ok(exec_simple(store, broker, cache, &["INCR", key])),
-        ("POST", ["decr", key]) => ok(exec_simple(store, broker, cache, &["DECR", key])),
-        ("GET", ["hgetall", key]) => ok(exec_simple(store, broker, cache, &["HGETALL", key])),
-        ("GET", ["keys", pattern]) => ok(exec_simple(store, broker, cache, &["KEYS", pattern])),
+        ("POST", ["del", key]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["DEL", key],
+        )),
+        ("POST", ["incr", key]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["INCR", key],
+        )),
+        ("POST", ["decr", key]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["DECR", key],
+        )),
+        ("GET", ["hgetall", key]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["HGETALL", key],
+        )),
+        ("GET", ["keys", pattern]) => ok(exec_json(
+            store,
+            broker,
+            cache,
+            script_engine,
+            &["KEYS", pattern],
+        )),
 
         _ => (404, "Not Found", r#"{"error":"not found"}"#.to_string()),
     }
@@ -732,6 +937,7 @@ fn route_table_create(
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
 ) -> (u16, &'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -811,7 +1017,7 @@ fn route_table_create(
     args.extend(combined.split_whitespace().map(|s| s.to_string()));
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, cache, &refs))
+    ok(exec_json(store, broker, cache, script_engine, &refs))
 }
 
 fn route_table_query(
@@ -823,46 +1029,8 @@ fn route_table_query(
 ) -> (u16, &'static str, String) {
     let now = std::time::Instant::now();
 
-    // Build a TSELECT plan directly from query params - no RESP round-trip
-    let mut select_tokens: Vec<String> =
-        vec!["*".to_string(), "FROM".to_string(), table.to_string()];
-
-    if let Some(where_clause) = get_param(params, "where") {
-        select_tokens.push("WHERE".to_string());
-        for part in where_clause.split_whitespace() {
-            select_tokens.push(part.to_string());
-        }
-    }
-
-    if let Some(join) = get_param(params, "join") {
-        // Legacy single-field join shorthand: join=field_name
-        // Translate to TSELECT JOIN syntax using the FK field
-        select_tokens.push("JOIN".to_string());
-        select_tokens.push(join.to_string());
-    }
-
-    if let Some(order) = get_param(params, "order") {
-        select_tokens.push("ORDER".to_string());
-        select_tokens.push("BY".to_string());
-        for part in order.split_whitespace() {
-            select_tokens.push(part.to_string());
-        }
-    }
-
-    if let Some(limit) = get_param(params, "limit") {
-        select_tokens.push("LIMIT".to_string());
-        select_tokens.push(limit.to_string());
-    }
-
-    if let Some(offset) = get_param(params, "offset") {
-        select_tokens.push("OFFSET".to_string());
-        select_tokens.push(offset.to_string());
-    }
-
-    let refs: Vec<&str> = select_tokens.iter().map(|s| s.as_str()).collect();
-
-    match crate::tables::parse_select(&refs) {
-        Ok(plan) => match crate::tables::table_select(store, cache, &plan, now) {
+    match parse_http_table_query(params, table, None) {
+        Ok((_, plan)) => match crate::tables::table_select(store, cache, &plan, now) {
             Ok(result) => ok(select_result_to_json(result)),
             Err(e) => (
                 400,
@@ -945,6 +1113,7 @@ fn route_table_update(
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
 ) -> (u16, &'static str, String) {
     // Require where parameter for safety (prevents accidental full table updates)
     let where_clause = match get_param(params, "where") {
@@ -992,12 +1161,20 @@ fn route_table_update(
         }
     }
     args.push("WHERE".to_string());
-    for part in where_clause.split_whitespace() {
-        args.push(part.to_string());
-    }
+    let where_tokens = match parse_http_where_tokens(where_clause) {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            return (
+                400,
+                "Bad Request",
+                format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+            )
+        }
+    };
+    args.extend(where_tokens);
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, cache, &refs))
+    ok(exec_json(store, broker, cache, script_engine, &refs))
 }
 
 fn route_table_delete(
@@ -1006,11 +1183,18 @@ fn route_table_delete(
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
 ) -> (u16, &'static str, String) {
     // Check for drop=true parameter to distinguish from delete
     if let Some(val) = get_param(params, "drop") {
         if val == "true" {
-            return ok(exec_simple(store, broker, cache, &["TDROP", table]));
+            return ok(exec_json(
+                store,
+                broker,
+                cache,
+                script_engine,
+                &["TDROP", table],
+            ));
         }
     }
 
@@ -1029,12 +1213,20 @@ fn route_table_delete(
     // Build TDELETE command: TDELETE FROM <table> WHERE <conditions>
     let mut args: Vec<String> = vec!["TDELETE".to_string(), "FROM".to_string(), table.to_string()];
     args.push("WHERE".to_string());
-    for part in where_clause.split_whitespace() {
-        args.push(part.to_string());
-    }
+    let where_tokens = match parse_http_where_tokens(where_clause) {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            return (
+                400,
+                "Bad Request",
+                format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+            )
+        }
+    };
+    args.extend(where_tokens);
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, cache, &refs))
+    ok(exec_json(store, broker, cache, script_engine, &refs))
 }
 
 // ── Time Series handlers ──
@@ -1045,6 +1237,7 @@ fn route_ts_range(
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
 ) -> (u16, &'static str, String) {
     let from = get_param(params, "from").unwrap_or("-");
     let to = get_param(params, "to").unwrap_or("+");
@@ -1070,7 +1263,7 @@ fn route_ts_range(
     }
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, cache, &refs))
+    ok(exec_json(store, broker, cache, script_engine, &refs))
 }
 
 fn route_ts_add(
@@ -1079,6 +1272,7 @@ fn route_ts_add(
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
 ) -> (u16, &'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -1120,7 +1314,7 @@ fn route_ts_add(
     }
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, cache, &refs))
+    ok(exec_json(store, broker, cache, script_engine, &refs))
 }
 
 // ── Vector handlers ──
@@ -1131,6 +1325,7 @@ fn route_vector_set(
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
 ) -> (u16, &'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -1166,7 +1361,7 @@ fn route_vector_set(
     }
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, cache, &refs))
+    ok(exec_json(store, broker, cache, script_engine, &refs))
 }
 
 fn route_vector_search(
@@ -1174,6 +1369,7 @@ fn route_vector_search(
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
 ) -> (u16, &'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -1218,7 +1414,7 @@ fn route_vector_search(
     args.push("META".to_string());
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, cache, &refs))
+    ok(exec_json(store, broker, cache, script_engine, &refs))
 }
 
 // ── Command execution ──
@@ -1228,6 +1424,7 @@ fn handle_exec(
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
 ) -> String {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -1247,10 +1444,11 @@ fn handle_exec(
         return r#"{"error":"empty command"}"#.to_string();
     }
 
-    exec_simple(
+    exec_json(
         store,
         broker,
         cache,
+        script_engine,
         &command.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
     )
 }
@@ -1374,28 +1572,54 @@ fn looks_numeric(s: &str) -> bool {
     s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok()
 }
 
-fn exec_simple(
+fn exec_json(
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
     args: &[&str],
 ) -> String {
-    let arg_bytes: Vec<&[u8]> = args.iter().map(|s| s.as_bytes() as &[u8]).collect();
+    match exec_resp(store, broker, cache, script_engine, args) {
+        Ok(resp) => resp_to_json(&resp),
+        Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e.to_string())),
+    }
+}
+
+fn exec_resp(
+    store: &Arc<Store>,
+    broker: &Broker,
+    cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
+    args: &[&str],
+) -> Result<bytes::Bytes, LuxError> {
+    if args.is_empty() {
+        return Err(LuxError::Unsupported("empty command".to_string()));
+    }
+    let argv: Vec<Vec<u8>> = args.iter().map(|s| s.as_bytes().to_vec()).collect();
+    let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
     let mut out = BytesMut::with_capacity(1024);
     let now = Instant::now();
-
-    let _guard = store.script_read_guard();
-    let result = cmd::execute(store, cache, broker, &arg_bytes, &mut out, now);
-
-    match result {
-        cmd::CmdResult::Written => resp_to_json(&out),
-        cmd::CmdResult::Authenticated => r#"{"result":"OK"}"#.to_string(),
-        cmd::CmdResult::Publish { channel, message } => {
-            let count = broker.publish(&channel, message);
-            format!(r#"{{"result":{count}}}"#)
-        }
-        _ => r#"{"result":"OK"}"#.to_string(),
+    let executor = CommandExecutor::new(
+        store.clone(),
+        broker.clone(),
+        script_engine.clone(),
+        cache.clone(),
+    );
+    let mut session = CommandSession::new(false);
+    store.add_total_commands(1);
+    if let Some(action) = executor.execute_command(&refs, &mut session, &mut out, now) {
+        let kind = match action {
+            crate::cmd::CmdResult::BlockPop { .. } => "BLPOP/BRPOP",
+            crate::cmd::CmdResult::BlockMove { .. } => "BLMOVE",
+            crate::cmd::CmdResult::BlockStreamRead { .. } => "XREAD/XREADGROUP",
+            crate::cmd::CmdResult::BlockZPop { .. } => "BZPOP*",
+            _ => "unsupported",
+        };
+        return Err(LuxError::Unsupported(format!(
+            "blocking command not supported in HTTP execution: {kind}"
+        )));
     }
+    Ok(out.freeze())
 }
 
 // ── RESP to JSON translation ──

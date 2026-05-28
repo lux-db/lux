@@ -71,7 +71,7 @@ pub fn parse_eviction_policy(s: &str) -> EvictionPolicy {
 #[inline(always)]
 pub fn eviction_enabled(store: &Store) -> bool {
     let cfg = store.config().eviction;
-    cfg.max_memory > 0 && cfg.policy != EvictionPolicy::NoEviction
+    cfg.max_memory > 0
 }
 
 pub fn evict_if_needed(store: &Store) -> Result<(), &'static str> {

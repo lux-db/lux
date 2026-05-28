@@ -111,6 +111,50 @@ OK
 "world"
 ```
 
+### Embedded Rust API
+
+Lux can run inside a Rust process without opening a RESP socket or going through
+HTTP routing. The embedded client shares the same store, WAL, snapshots, Lua
+engine, pub/sub broker, and command execution path as the server.
+
+```rust
+use std::time::Duration;
+
+let cfg = lux::ServerConfig {
+    enable_resp: false,
+    ..Default::default()
+};
+let handle = lux::run_with_config(cfg).await?;
+let client = handle.client();
+
+client.set("hello", "world").await?;
+let value = client.get("hello").await?;
+assert_eq!(value, Some(bytes::Bytes::from_static(b"world")));
+
+let mut sub = client.subscribe("events");
+client.publish("events", "ready").await?;
+let message = sub.recv().await?;
+assert_eq!(&message.payload[..], b"ready");
+
+let blocked = handle.client();
+let producer = handle.client();
+let waiter = tokio::spawn(async move {
+    blocked.blpop(&["jobs"], Duration::from_secs(5)).await
+});
+producer.rpush("jobs", &["job-1"]).await?;
+assert_eq!(&waiter.await??.unwrap().1[..], b"job-1");
+
+handle.shutdown_and_wait().await?;
+```
+
+Native methods like `get`, `set`, `hget`, `zadd`, `publish`, and `blpop` avoid
+RESP encoding/parsing on the hot path. `EmbeddedPipeline` provides the same
+native path for batched common commands. Use
+`execute_embedded_pipeline_discard` for write-heavy batches that do not need
+per-command replies. `execute`, `execute_bytes`, and `pipeline` remain
+available as raw RESP-byte escape hatches. Embedded clients start authenticated
+because they already run inside the trusted process boundary.
+
 ### Docker
 
 ```bash
