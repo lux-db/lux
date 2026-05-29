@@ -11,8 +11,7 @@ pub fn cmd_del(args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'del' command");
         return CmdResult::Written;
     }
-    let keys: Vec<&[u8]> = args[1..].to_vec();
-    resp::write_integer(out, store.del(&keys));
+    resp::write_integer(out, store.del(&args[1..]));
     CmdResult::Written
 }
 
@@ -30,8 +29,7 @@ pub fn cmd_exists(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'exists' command");
         return CmdResult::Written;
     }
-    let keys: Vec<&[u8]> = args[1..].to_vec();
-    resp::write_integer(out, store.exists(&keys, now));
+    resp::write_integer(out, store.exists(&args[1..], now));
     CmdResult::Written
 }
 

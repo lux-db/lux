@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use crate::pubsub::Broker;
 use crate::resp;
-use crate::store::{Entry, Store, StoreValue};
+use crate::store::{Entry, Store, StoreValue, StreamId};
 use crate::tables::SharedSchemaCache;
 
 pub enum CmdResult {
@@ -84,11 +84,1198 @@ fn is_restricted(store: &Store) -> bool {
 
 #[inline(always)]
 fn cmd_eq(input: &[u8], expected: &[u8]) -> bool {
-    input.len() == expected.len()
-        && input
-            .iter()
-            .zip(expected)
-            .all(|(a, b)| a.to_ascii_uppercase() == *b)
+    if input == expected {
+        return true;
+    }
+    if input.len() != expected.len() {
+        return false;
+    }
+    for i in 0..input.len() {
+        let b = input[i];
+        let upper = if b.is_ascii_lowercase() { b - 32 } else { b };
+        if upper != expected[i] {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline(always)]
+pub(crate) fn cmd_eq_ci(input: &[u8], expected: &[u8]) -> bool {
+    cmd_eq(input, expected)
+}
+
+struct CommandSpec {
+    name: &'static [u8],
+    min_arity: usize,
+}
+
+const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        name: b"SET",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"GET",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"DEL",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"PING",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"ECHO",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"QUIT",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"SETNX",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"SETEX",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"PSETEX",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"GETSET",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"MGET",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"MSET",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"STRLEN",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"EXISTS",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"INCR",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"DECR",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"INCRBY",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"DECRBY",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"APPEND",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"KEYS",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"SCAN",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"TTL",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"PTTL",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"EXPIRE",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"PEXPIRE",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"PERSIST",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"TYPE",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"RENAME",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"DBSIZE",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"FLUSHDB",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"FLUSHALL",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"LPUSH",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"RPUSH",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"LPOP",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"RPOP",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"LLEN",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"LRANGE",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"LINDEX",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"HSET",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"HMSET",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"HGET",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"HMGET",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"HDEL",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"HGETALL",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"HKEYS",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"HVALS",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"HLEN",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"HEXISTS",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"HINCRBY",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"SADD",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"SREM",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"SMEMBERS",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"SISMEMBER",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"SCARD",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"SUNION",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"SINTER",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"SDIFF",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"SAVE",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"INFO",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"CONFIG",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"CLIENT",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"SELECT",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"COMMAND",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"MULTI",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"EXEC",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"DISCARD",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"WATCH",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"UNWATCH",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"GETDEL",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"GETEX",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"GETRANGE",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"GEOADD",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"GEODIST",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"GEOPOS",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"GEOHASH",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"GEOSEARCH",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"GEOSEARCH_RO",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"GEOSEARCHSTORE",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"GEORADIUS",
+        min_arity: 6,
+    },
+    CommandSpec {
+        name: b"GEORADIUS_RO",
+        min_arity: 6,
+    },
+    CommandSpec {
+        name: b"GEORADIUSBYMEMBER",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"GEORADIUSBYMEMBER_RO",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"SUBSTR",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"SETRANGE",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"MSETNX",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"UNLINK",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"EXPIREAT",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"PEXPIREAT",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"EXPIRETIME",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"PEXPIRETIME",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"LSET",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"LINSERT",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"LREM",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"LTRIM",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"LPUSHX",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"RPUSHX",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"LPOS",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"LMOVE",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"RPOPLPUSH",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"HSETNX",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"HINCRBYFLOAT",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"HSTRLEN",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"SPOP",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"SRANDMEMBER",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"SMOVE",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"SMISMEMBER",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"SDIFFSTORE",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"SINTERSTORE",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"SUNIONSTORE",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"SINTERCARD",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"HRANDFIELD",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"HSCAN",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"SSCAN",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"INCRBYFLOAT",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"TIME",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"RENAMENX",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"RANDOMKEY",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"HELLO",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"PSUBSCRIBE",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"PUNSUBSCRIBE",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"COPY",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"FUNCTION",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"DEBUG",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"DUMP",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"WAIT",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"RESET",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"LATENCY",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"SWAPDB",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"OBJECT",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"MEMORY",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"BGSAVE",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"LASTSAVE",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"PUBLISH",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"SUBSCRIBE",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"UNSUBSCRIBE",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"ZADD",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZSCORE",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"ZRANK",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"ZREVRANK",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"ZREVRANGE",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZREM",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"ZCARD",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"ZRANGE",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZINCRBY",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZCOUNT",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZPOPMIN",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"ZPOPMAX",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"ZUNIONSTORE",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZINTERSTORE",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZDIFFSTORE",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZSCAN",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"ZMSCORE",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"ZLEXCOUNT",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZRANGEBYSCORE",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZREVRANGEBYSCORE",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZRANGEBYLEX",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZREVRANGEBYLEX",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZREMRANGEBYRANK",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZREMRANGEBYSCORE",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"ZREMRANGEBYLEX",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"AUTH",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"BLPOP",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"BRPOP",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"BLMOVE",
+        min_arity: 6,
+    },
+    CommandSpec {
+        name: b"BZPOPMIN",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"BZPOPMAX",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"XADD",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"XLEN",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"XRANGE",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"XREVRANGE",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"XREAD",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"XREADGROUP",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"XGROUP",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"XACK",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"XPENDING",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"XCLAIM",
+        min_arity: 6,
+    },
+    CommandSpec {
+        name: b"XAUTOCLAIM",
+        min_arity: 6,
+    },
+    CommandSpec {
+        name: b"XDEL",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"XTRIM",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"XINFO",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"EVAL",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"EVALSHA",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"SCRIPT",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"VSET",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"VGET",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"VSEARCH",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"VCARD",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"PFADD",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"PFCOUNT",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"PFMERGE",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"PFDEBUG",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"SORT",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"SORT_RO",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"TSADD",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"TSMADD",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"TSGET",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"TSRANGE",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"TSMRANGE",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"TSINFO",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"SETBIT",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"GETBIT",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"BITCOUNT",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"BITPOS",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"BITOP",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"KSUB",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"KUNSUB",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"TCREATE",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"TINSERT",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"TUPDATE",
+        min_arity: 7,
+    },
+    CommandSpec {
+        name: b"TDELETE",
+        min_arity: 6,
+    },
+    CommandSpec {
+        name: b"TDROP",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"TCOUNT",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"TSCHEMA",
+        min_arity: 2,
+    },
+    CommandSpec {
+        name: b"TLIST",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"TALTER",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"TSELECT",
+        min_arity: 4,
+    },
+];
+
+fn command_spec(cmd: &[u8]) -> Option<&'static CommandSpec> {
+    COMMAND_SPECS.iter().find(|spec| cmd_eq(cmd, spec.name))
+}
+
+#[inline(always)]
+pub(crate) fn is_public_without_auth_command(cmd: &[u8]) -> bool {
+    command_spec(cmd).is_some()
+        && (cmd_eq(cmd, b"AUTH")
+            || cmd_eq(cmd, b"HELLO")
+            || cmd_eq(cmd, b"PING")
+            || cmd_eq(cmd, b"QUIT"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PipelineAccess {
+    General,
+    Read,
+    Write,
+}
+
+#[inline(always)]
+pub(crate) fn is_blocking_command(cmd: &[u8]) -> bool {
+    cmd_eq(cmd, b"BLPOP")
+        || cmd_eq(cmd, b"BRPOP")
+        || cmd_eq(cmd, b"BLMOVE")
+        || cmd_eq(cmd, b"BZPOPMIN")
+        || cmd_eq(cmd, b"BZPOPMAX")
+        || cmd_eq(cmd, b"EVAL")
+        || cmd_eq(cmd, b"EVALSHA")
+        || cmd_eq(cmd, b"SCRIPT")
+}
+
+#[inline(always)]
+pub(crate) fn is_pipeline_special_command(cmd: &[u8]) -> bool {
+    cmd_eq(cmd, b"SUBSCRIBE")
+        || cmd_eq(cmd, b"UNSUBSCRIBE")
+        || cmd_eq(cmd, b"PSUBSCRIBE")
+        || cmd_eq(cmd, b"PUNSUBSCRIBE")
+        || cmd_eq(cmd, b"KSUB")
+        || cmd_eq(cmd, b"KUNSUB")
+        || cmd_eq(cmd, b"PUBLISH")
+        || cmd_eq(cmd, b"AUTH")
+        || cmd_eq(cmd, b"MULTI")
+        || cmd_eq(cmd, b"EXEC")
+        || cmd_eq(cmd, b"DISCARD")
+        || cmd_eq(cmd, b"WATCH")
+        || cmd_eq(cmd, b"UNWATCH")
+        || is_blocking_command(cmd)
+        || cmd_eq(cmd, b"XREAD")
+        || cmd_eq(cmd, b"XREADGROUP")
+}
+
+#[inline(always)]
+pub(crate) fn pipeline_access(cmd: &[u8]) -> PipelineAccess {
+    if cmd.is_empty() {
+        return PipelineAccess::General;
+    }
+    match cmd[0].to_ascii_uppercase() {
+        b'A' => {
+            if cmd_eq(cmd, b"APPEND") {
+                return PipelineAccess::Write;
+            }
+        }
+        b'D' => {
+            if cmd_eq(cmd, b"DECR") || cmd_eq(cmd, b"DECRBY") {
+                return PipelineAccess::Write;
+            }
+        }
+        b'E' => {
+            if cmd_eq(cmd, b"EXISTS") {
+                return PipelineAccess::Read;
+            }
+            if cmd_eq(cmd, b"EXPIRE") {
+                return PipelineAccess::Write;
+            }
+        }
+        b'G' => {
+            if cmd_eq(cmd, b"GET") || cmd_eq(cmd, b"GEODIST") || cmd_eq(cmd, b"GEOPOS") {
+                return PipelineAccess::Read;
+            }
+            if cmd_eq(cmd, b"GETSET") || cmd_eq(cmd, b"GEOADD") {
+                return PipelineAccess::Write;
+            }
+        }
+        b'H' => {
+            if cmd_eq(cmd, b"HGET")
+                || cmd_eq(cmd, b"HLEN")
+                || cmd_eq(cmd, b"HMGET")
+                || cmd_eq(cmd, b"HEXISTS")
+                || cmd_eq(cmd, b"HGETALL")
+            {
+                return PipelineAccess::Read;
+            }
+            if cmd_eq(cmd, b"HSET") || cmd_eq(cmd, b"HINCRBY") || cmd_eq(cmd, b"HDEL") {
+                return PipelineAccess::Write;
+            }
+        }
+        b'I' => {
+            if cmd_eq(cmd, b"INCR") || cmd_eq(cmd, b"INCRBY") {
+                return PipelineAccess::Write;
+            }
+        }
+        b'L' => {
+            if cmd_eq(cmd, b"LLEN") || cmd_eq(cmd, b"LINDEX") || cmd_eq(cmd, b"LRANGE") {
+                return PipelineAccess::Read;
+            }
+            if cmd_eq(cmd, b"LPUSH") || cmd_eq(cmd, b"LPOP") {
+                return PipelineAccess::Write;
+            }
+        }
+        b'P' => {
+            if cmd_eq(cmd, b"PTTL") {
+                return PipelineAccess::Read;
+            }
+            if cmd_eq(cmd, b"PERSIST") || cmd_eq(cmd, b"PSETEX") {
+                return PipelineAccess::Write;
+            }
+        }
+        b'R' => {
+            if cmd_eq(cmd, b"RPOP") || cmd_eq(cmd, b"RPUSH") {
+                return PipelineAccess::Write;
+            }
+        }
+        b'S' => {
+            if cmd_eq(cmd, b"STRLEN")
+                || cmd_eq(cmd, b"SCARD")
+                || cmd_eq(cmd, b"SMEMBERS")
+                || cmd_eq(cmd, b"SISMEMBER")
+                || cmd_eq(cmd, b"SRANDMEMBER")
+            {
+                return PipelineAccess::Read;
+            }
+            if cmd_eq(cmd, b"SET")
+                || cmd_eq(cmd, b"SETNX")
+                || cmd_eq(cmd, b"SETEX")
+                || cmd_eq(cmd, b"SADD")
+                || cmd_eq(cmd, b"SREM")
+                || cmd_eq(cmd, b"SPOP")
+            {
+                return PipelineAccess::Write;
+            }
+        }
+        b'T' => {
+            if cmd_eq(cmd, b"TTL") || cmd_eq(cmd, b"TYPE") {
+                return PipelineAccess::Read;
+            }
+        }
+        b'X' => {
+            if cmd_eq(cmd, b"XLEN") || cmd_eq(cmd, b"XRANGE") {
+                return PipelineAccess::Read;
+            }
+            if cmd_eq(cmd, b"XADD") {
+                return PipelineAccess::Write;
+            }
+        }
+        b'Z' => {
+            if cmd_eq(cmd, b"ZCARD") || cmd_eq(cmd, b"ZSCORE") || cmd_eq(cmd, b"ZCOUNT") {
+                return PipelineAccess::Read;
+            }
+            if cmd_eq(cmd, b"ZADD")
+                || cmd_eq(cmd, b"ZINCRBY")
+                || cmd_eq(cmd, b"ZREM")
+                || cmd_eq(cmd, b"ZPOPMIN")
+                || cmd_eq(cmd, b"ZPOPMAX")
+            {
+                return PipelineAccess::Write;
+            }
+        }
+        _ => {}
+    }
+    PipelineAccess::General
+}
+
+pub(crate) fn pipeline_access_for_args(args: &[&[u8]]) -> PipelineAccess {
+    if args.is_empty() || args[0].is_empty() {
+        return PipelineAccess::General;
+    }
+
+    let cmd = args[0];
+    if cmd[0].eq_ignore_ascii_case(&b'Z') {
+        if cmd_eq(cmd, b"ZCARD") {
+            return if args.len() == 2 {
+                PipelineAccess::Read
+            } else {
+                PipelineAccess::General
+            };
+        }
+        if cmd_eq(cmd, b"ZSCORE") {
+            return if args.len() == 3 {
+                PipelineAccess::Read
+            } else {
+                PipelineAccess::General
+            };
+        }
+        if cmd_eq(cmd, b"ZCOUNT") {
+            return if args.len() == 4 {
+                PipelineAccess::Read
+            } else {
+                PipelineAccess::General
+            };
+        }
+        if cmd_eq(cmd, b"ZADD")
+            || cmd_eq(cmd, b"ZINCRBY")
+            || cmd_eq(cmd, b"ZREM")
+            || cmd_eq(cmd, b"ZPOPMIN")
+            || cmd_eq(cmd, b"ZPOPMAX")
+        {
+            return if pipeline_fast_path_arity(args) {
+                PipelineAccess::Write
+            } else {
+                PipelineAccess::General
+            };
+        }
+    }
+
+    if !pipeline_fast_path_arity(args) {
+        return PipelineAccess::General;
+    }
+    pipeline_access(cmd)
+}
+
+fn pipeline_fast_path_arity(args: &[&[u8]]) -> bool {
+    let cmd = args[0];
+    match cmd[0].to_ascii_uppercase() {
+        b'A' => cmd_eq(cmd, b"APPEND") && args.len() == 3,
+        b'D' => {
+            (cmd_eq(cmd, b"DECR") && args.len() == 2) || (cmd_eq(cmd, b"DECRBY") && args.len() == 3)
+        }
+        b'E' => {
+            (cmd_eq(cmd, b"EXISTS") && args.len() == 2)
+                || (cmd_eq(cmd, b"EXPIRE") && args.len() == 3)
+        }
+        b'G' => {
+            (cmd_eq(cmd, b"GET") && args.len() == 2)
+                || (cmd_eq(cmd, b"GEODIST") && (args.len() == 4 || args.len() == 5))
+                || (cmd_eq(cmd, b"GEOPOS") && args.len() >= 3)
+                || (cmd_eq(cmd, b"GETSET") && args.len() == 3)
+                || (cmd_eq(cmd, b"GEOADD") && args.len() >= 5)
+        }
+        b'H' => {
+            (cmd_eq(cmd, b"HGET") && args.len() == 3)
+                || (cmd_eq(cmd, b"HLEN") && args.len() == 2)
+                || (cmd_eq(cmd, b"HMGET") && args.len() >= 3)
+                || (cmd_eq(cmd, b"HEXISTS") && args.len() == 3)
+                || (cmd_eq(cmd, b"HGETALL") && args.len() == 2)
+                || (cmd_eq(cmd, b"HSET") && args.len() >= 4)
+                || (cmd_eq(cmd, b"HINCRBY") && args.len() == 4)
+                || (cmd_eq(cmd, b"HDEL") && args.len() >= 3)
+        }
+        b'I' => {
+            (cmd_eq(cmd, b"INCR") && args.len() == 2) || (cmd_eq(cmd, b"INCRBY") && args.len() == 3)
+        }
+        b'L' => {
+            (cmd_eq(cmd, b"LLEN") && args.len() == 2)
+                || (cmd_eq(cmd, b"LINDEX") && args.len() == 3)
+                || (cmd_eq(cmd, b"LRANGE") && args.len() == 4)
+                || (cmd_eq(cmd, b"LPUSH") && args.len() >= 3)
+                || (cmd_eq(cmd, b"LPOP") && args.len() == 2)
+        }
+        b'P' => {
+            (cmd_eq(cmd, b"PTTL") && args.len() == 2)
+                || (cmd_eq(cmd, b"PERSIST") && args.len() == 2)
+                || (cmd_eq(cmd, b"PSETEX") && args.len() == 4)
+        }
+        b'R' => {
+            (cmd_eq(cmd, b"RPOP") && args.len() == 2) || (cmd_eq(cmd, b"RPUSH") && args.len() >= 3)
+        }
+        b'S' => {
+            (cmd_eq(cmd, b"STRLEN") && args.len() == 2)
+                || (cmd_eq(cmd, b"SCARD") && args.len() == 2)
+                || (cmd_eq(cmd, b"SMEMBERS") && args.len() == 2)
+                || (cmd_eq(cmd, b"SISMEMBER") && args.len() == 3)
+                || (cmd_eq(cmd, b"SRANDMEMBER") && args.len() == 2)
+                || (cmd_eq(cmd, b"SET") && args.len() >= 3)
+                || (cmd_eq(cmd, b"SETNX") && args.len() == 3)
+                || (cmd_eq(cmd, b"SETEX") && args.len() == 4)
+                || (cmd_eq(cmd, b"SADD") && args.len() >= 3)
+                || (cmd_eq(cmd, b"SREM") && args.len() >= 3)
+                || (cmd_eq(cmd, b"SPOP") && args.len() >= 2)
+        }
+        b'T' => (cmd_eq(cmd, b"TTL") || cmd_eq(cmd, b"TYPE")) && args.len() == 2,
+        b'X' => {
+            (cmd_eq(cmd, b"XLEN") && args.len() == 2)
+                || (cmd_eq(cmd, b"XRANGE")
+                    && (args.len() == 4 || (args.len() == 6 && cmd_eq(args[4], b"COUNT"))))
+                || (cmd_eq(cmd, b"XADD") && args.len() >= 5)
+        }
+        b'Z' => {
+            (cmd_eq(cmd, b"ZCARD") && args.len() == 2)
+                || (cmd_eq(cmd, b"ZSCORE") && args.len() == 3)
+                || (cmd_eq(cmd, b"ZCOUNT") && args.len() == 4)
+                || (cmd_eq(cmd, b"ZADD") && args.len() >= 4)
+                || (cmd_eq(cmd, b"ZINCRBY") && args.len() == 4)
+                || (cmd_eq(cmd, b"ZREM") && args.len() >= 3)
+                || (cmd_eq(cmd, b"ZPOPMIN") && args.len() >= 2)
+                || (cmd_eq(cmd, b"ZPOPMAX") && args.len() >= 2)
+        }
+        _ => false,
+    }
 }
 
 #[inline(always)]
@@ -110,6 +1297,68 @@ fn format_float(v: f64) -> String {
     } else {
         format!("{}", v)
     }
+}
+
+#[inline(always)]
+fn parse_score_bound_fast(s: &str, is_max: bool) -> (f64, bool) {
+    if s == "-inf" || s == "-" {
+        (f64::NEG_INFINITY, false)
+    } else if s == "+inf" || s == "+" {
+        (f64::INFINITY, false)
+    } else if let Some(rest) = s.strip_prefix('(') {
+        (
+            rest.parse::<f64>().unwrap_or(if is_max {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            }),
+            true,
+        )
+    } else {
+        (
+            s.parse::<f64>().unwrap_or(if is_max {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            }),
+            false,
+        )
+    }
+}
+
+fn write_stream_entries_fast(
+    out: &mut BytesMut,
+    entries: &std::collections::BTreeMap<StreamId, Vec<(String, Bytes)>>,
+    start: StreamId,
+    end: StreamId,
+    count: Option<usize>,
+) {
+    let take_n = count.unwrap_or(usize::MAX);
+    let items = entries
+        .range(start..=end)
+        .take(take_n)
+        .collect::<Vec<(&StreamId, &Vec<(String, Bytes)>)>>();
+    resp::write_array_header(out, items.len());
+    for (id, fields) in items {
+        resp::write_array_header(out, 2);
+        resp::write_bulk(out, &id.to_string());
+        resp::write_array_header(out, fields.len() * 2);
+        for (k, v) in fields {
+            resp::write_bulk(out, k);
+            resp::write_bulk_raw(out, v);
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn format_geo_coord(v: f64) -> String {
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    let magnitude = v.abs().log10().floor() as usize + 1;
+    let decimals = 17usize.saturating_sub(magnitude);
+    let s = format!("{:.prec$}", v, prec = decimals);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 pub fn execute(
@@ -844,10 +2093,6 @@ pub fn execute_with_wal(
     now: Instant,
 ) -> CmdResult {
     if !args.is_empty() && crate::eviction::is_write_command(args[0]) {
-        if let Err(e) = crate::eviction::evict_if_needed(store) {
-            resp::write_error(out, e);
-            return CmdResult::Written;
-        }
         if let Err(e) = store.wal_log_command(args) {
             resp::write_error(out, &format!("ERR WAL append failed: {e}"));
             return CmdResult::Written;
@@ -856,8 +2101,10 @@ pub fn execute_with_wal(
     execute(store, cache, broker, args, out, now)
 }
 
+#[allow(dead_code)]
 pub(crate) type ShardData = hashbrown::HashMap<String, Entry, crate::store::FxBuildHasher>;
 
+#[allow(dead_code)]
 pub(crate) fn execute_on_shard(
     shard: &mut crate::store::Shard,
     store: &Store,
@@ -872,6 +2119,7 @@ pub(crate) fn execute_on_shard(
     }
     let cmd = args[0];
     let key = args[1];
+    let ks = arg_str(key);
 
     if cmd_eq(cmd, b"SET") && args.len() >= 3 {
         let mut ttl = None;
@@ -946,28 +2194,98 @@ pub(crate) fn execute_on_shard(
         }
     } else if cmd_eq(cmd, b"GET") {
         Store::get_and_write(&shard.data, key, now, out);
+    } else if cmd_eq(cmd, b"GETSET") && args.len() >= 3 {
+        let old = store.get_set_on_shard(&mut shard.data, key, args[2], now);
+        resp::write_optional_bulk_raw(out, &old);
+    } else if cmd_eq(cmd, b"SETNX") && args.len() >= 3 {
+        let changed = store.set_nx_on_shard(&mut shard.data, key, args[2], now);
+        resp::write_integer(out, i64::from(changed));
+    } else if cmd_eq(cmd, b"SETEX") && args.len() >= 4 {
+        match parse_i64(args[2]) {
+            Ok(secs) if secs <= 0 => {
+                resp::write_error(out, "ERR invalid expire time in 'setex' command")
+            }
+            Ok(secs) => {
+                store.set_on_shard(
+                    &mut shard.data,
+                    key,
+                    args[3],
+                    Some(std::time::Duration::from_secs(secs as u64)),
+                    now,
+                );
+                resp::write_ok(out);
+            }
+            Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
+        }
+    } else if cmd_eq(cmd, b"PSETEX") && args.len() >= 4 {
+        match parse_u64(args[2]) {
+            Ok(ms) => {
+                store.set_on_shard(
+                    &mut shard.data,
+                    key,
+                    args[3],
+                    Some(std::time::Duration::from_millis(ms)),
+                    now,
+                );
+                resp::write_ok(out);
+            }
+            Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
+        }
+    } else if cmd_eq(cmd, b"APPEND") && args.len() >= 3 {
+        resp::write_integer(out, store.append_on_shard(shard, key, args[2], now));
+    } else if cmd_eq(cmd, b"EXPIRE") && args.len() >= 3 {
+        match parse_u64(args[2]) {
+            Ok(secs) => match shard.data.get_mut(ks) {
+                Some(entry) if !entry.is_expired_at(now) => {
+                    entry.expires_at = Some(now + std::time::Duration::from_secs(secs));
+                    resp::write_integer(out, 1);
+                }
+                _ => resp::write_integer(out, 0),
+            },
+            Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
+        }
+    } else if cmd_eq(cmd, b"PERSIST") {
+        match shard.data.get_mut(ks) {
+            Some(entry) if !entry.is_expired_at(now) && entry.expires_at.is_some() => {
+                entry.expires_at = None;
+                resp::write_integer(out, 1);
+            }
+            _ => resp::write_integer(out, 0),
+        }
     } else if cmd_eq(cmd, b"INCR") {
-        write_int_result(out, store.incr_on_shard(&mut shard.data, key, 1, now));
+        shard_incr_fast(&mut shard.data, key, 1, store.lru_clock(), now, out);
     } else if cmd_eq(cmd, b"DECR") {
-        write_int_result(out, store.incr_on_shard(&mut shard.data, key, -1, now));
+        shard_incr_fast(&mut shard.data, key, -1, store.lru_clock(), now, out);
     } else if cmd_eq(cmd, b"INCRBY") && args.len() >= 3 {
         match parse_i64(args[2]) {
-            Ok(delta) => {
-                write_int_result(out, store.incr_on_shard(&mut shard.data, key, delta, now))
-            }
+            Ok(delta) => shard_incr_fast(&mut shard.data, key, delta, store.lru_clock(), now, out),
             Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
         }
     } else if cmd_eq(cmd, b"DECRBY") && args.len() >= 3 {
         match parse_i64(args[2]) {
-            Ok(delta) => {
-                write_int_result(out, store.incr_on_shard(&mut shard.data, key, -delta, now))
-            }
+            Ok(delta) => shard_incr_fast(&mut shard.data, key, -delta, store.lru_clock(), now, out),
             Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
         }
     } else if cmd_eq(cmd, b"LPUSH") && args.len() >= 3 {
-        write_int_result(out, store.lpush_on_shard(shard, key, &args[2..], now));
+        shard_list_push_fast(
+            &mut shard.data,
+            key,
+            &args[2..],
+            true,
+            store.lru_clock(),
+            now,
+            out,
+        );
     } else if cmd_eq(cmd, b"RPUSH") && args.len() >= 3 {
-        write_int_result(out, store.rpush_on_shard(shard, key, &args[2..], now));
+        shard_list_push_fast(
+            &mut shard.data,
+            key,
+            &args[2..],
+            false,
+            store.lru_clock(),
+            now,
+            out,
+        );
     } else if cmd_eq(cmd, b"LPOP") && args.len() == 2 {
         let value = store.lpop_on_shard(shard, key, now);
         resp::write_optional_bulk_raw(out, &value);
@@ -975,15 +2293,24 @@ pub(crate) fn execute_on_shard(
         let value = store.rpop_on_shard(shard, key, now);
         resp::write_optional_bulk_raw(out, &value);
     } else if cmd_eq(cmd, b"SADD") && args.len() >= 3 {
-        write_int_result(out, store.sadd_on_shard(shard, key, &args[2..], now));
+        shard_sadd_fast(
+            &mut shard.data,
+            key,
+            &args[2..],
+            store.lru_clock(),
+            now,
+            out,
+        );
     } else if cmd_eq(cmd, b"HSET") && args.len() >= 4 {
-        let pairs = args[2..]
-            .chunks_exact(2)
-            .map(|pair| (pair[0], pair[1]))
-            .collect::<Vec<_>>();
         if !args[2..].len().is_multiple_of(2) {
             resp::write_error(out, "ERR wrong number of arguments for 'hset' command");
+        } else if args.len() == 4 {
+            shard_hset_one_fast(shard, store, key, args[2], args[3], now, out);
         } else {
+            let pairs = args[2..]
+                .chunks_exact(2)
+                .map(|pair| (pair[0], pair[1]))
+                .collect::<Vec<_>>();
             write_int_result(out, store.hset_on_shard(shard, key, &pairs, now));
         }
     } else if cmd_eq(cmd, b"HINCRBY") && args.len() >= 4 {
@@ -1046,6 +2373,91 @@ pub(crate) fn execute_on_shard(
         shard_zpop(&mut shard.data, key, count, false, now, out);
     } else if cmd_eq(cmd, b"XADD") {
         shard_xadd(shard, store, broker, key, &args[2..], now, out);
+    } else if cmd_eq(cmd, b"GEOADD") {
+        if args.len() < 5 {
+            resp::write_error(out, "ERR wrong number of arguments for 'geoadd' command");
+            return;
+        }
+        let mut nx = false;
+        let mut xx = false;
+        let mut ch = false;
+        let mut i = 2;
+        while i < args.len() {
+            if cmd_eq(args[i], b"NX") {
+                nx = true;
+                i += 1;
+            } else if cmd_eq(args[i], b"XX") {
+                xx = true;
+                i += 1;
+            } else if cmd_eq(args[i], b"CH") {
+                ch = true;
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if nx && xx {
+            resp::write_error(out, "ERR syntax error");
+            return;
+        }
+        let remaining = args.len() - i;
+        if remaining < 3 || !remaining.is_multiple_of(3) {
+            resp::write_error(out, "ERR syntax error");
+            return;
+        }
+        if remaining == 3 {
+            let lon: f64 = match arg_str(args[i]).parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    resp::write_error(out, "ERR value is not a valid float");
+                    return;
+                }
+            };
+            let lat: f64 = match arg_str(args[i + 1]).parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    resp::write_error(out, "ERR value is not a valid float");
+                    return;
+                }
+            };
+            if let Err(e) = crate::geo::validate_coords(lon, lat) {
+                resp::write_error(out, &e);
+                return;
+            }
+            let single = [(args[i + 2], crate::geo::geohash_encode(lon, lat) as f64)];
+            match store.zadd_on_shard(shard, key, &single, nx, xx, false, false, ch, now) {
+                Ok(n) => resp::write_integer(out, n),
+                Err(e) => resp::write_error(out, &e),
+            }
+        } else {
+            let mut members: Vec<(&[u8], f64)> = Vec::new();
+            while i + 2 < args.len() {
+                let lon: f64 = match arg_str(args[i]).parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        resp::write_error(out, "ERR value is not a valid float");
+                        return;
+                    }
+                };
+                let lat: f64 = match arg_str(args[i + 1]).parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        resp::write_error(out, "ERR value is not a valid float");
+                        return;
+                    }
+                };
+                if let Err(e) = crate::geo::validate_coords(lon, lat) {
+                    resp::write_error(out, &e);
+                    return;
+                }
+                members.push((args[i + 2], crate::geo::geohash_encode(lon, lat) as f64));
+                i += 3;
+            }
+            match store.zadd_on_shard(shard, key, &members, nx, xx, false, false, ch, now) {
+                Ok(n) => resp::write_integer(out, n),
+                Err(e) => resp::write_error(out, &e),
+            }
+        }
     } else {
         resp::write_error(
             out,
@@ -1054,6 +2466,7 @@ pub(crate) fn execute_on_shard(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn execute_on_shard_read(
     data: &ShardData,
     args: &[&[u8]],
@@ -1068,14 +2481,76 @@ pub(crate) fn execute_on_shard_read(
     let key = args[1];
     let ks = arg_str(key);
 
+    if cmd[0].eq_ignore_ascii_case(&b'Z') {
+        if cmd_eq(cmd, b"ZCARD") {
+            match data.get(ks) {
+                Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                    StoreValue::SortedSet(_, scores) => {
+                        resp::write_integer(out, scores.len() as i64)
+                    }
+                    _ => resp::write_error(
+                        out,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ),
+                },
+                _ => resp::write_integer(out, 0),
+            }
+            return;
+        }
+        if cmd_eq(cmd, b"ZCOUNT") && args.len() >= 4 {
+            let (min, min_ex) = parse_score_bound_fast(arg_str(args[2]), false);
+            let (max, max_ex) = parse_score_bound_fast(arg_str(args[3]), true);
+            match data.get(ks) {
+                Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                    StoreValue::SortedSet(_, scores) => {
+                        let mut count = 0i64;
+                        for score in scores.values() {
+                            let ge_min = if min_ex { *score > min } else { *score >= min };
+                            let le_max = if max_ex { *score < max } else { *score <= max };
+                            if ge_min && le_max {
+                                count += 1;
+                            }
+                        }
+                        resp::write_integer(out, count);
+                    }
+                    _ => resp::write_error(
+                        out,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ),
+                },
+                _ => resp::write_integer(out, 0),
+            }
+            return;
+        }
+        if cmd_eq(cmd, b"ZSCORE") && args.len() >= 3 {
+            match data.get(ks) {
+                Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                    StoreValue::SortedSet(_, scores) => match scores.get(arg_str(args[2])) {
+                        Some(s) => resp::write_bulk(out, &format_float(*s)),
+                        None => resp::write_null(out),
+                    },
+                    _ => resp::write_error(
+                        out,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ),
+                },
+                _ => resp::write_null(out),
+            }
+            return;
+        }
+    }
+
     if cmd_eq(cmd, b"GET") {
         Store::get_and_write(data, key, now, out);
+    } else if cmd_eq(cmd, b"EXISTS") {
+        resp::write_integer(out, i64::from(Store::exists_on_shard(data, key, now)));
     } else if cmd_eq(cmd, b"STRLEN") {
         match data.get(ks) {
-            Some(entry) if !entry.is_expired_at(now) => resp::write_integer(
-                out,
-                entry.value.string_bytes().map_or(0, |s| s.len() as i64),
-            ),
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Str(s) => resp::write_integer(out, s.len() as i64),
+                StoreValue::StrBuf(s) => resp::write_integer(out, s.len() as i64),
+                _ => resp::write_integer(out, 0),
+            },
             _ => resp::write_integer(out, 0),
         }
     } else if cmd_eq(cmd, b"LLEN") {
@@ -1088,6 +2563,71 @@ pub(crate) fn execute_on_shard_read(
                 ),
             },
             _ => resp::write_integer(out, 0),
+        }
+    } else if cmd_eq(cmd, b"LINDEX") && args.len() >= 3 {
+        match parse_i64(args[2]) {
+            Ok(index) => match data.get(ks) {
+                Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                    StoreValue::List(list) => {
+                        let i = if index < 0 {
+                            (list.len() as i64 + index) as usize
+                        } else {
+                            index as usize
+                        };
+                        resp::write_optional_bulk_raw(out, &list.get(i).cloned());
+                    }
+                    _ => resp::write_null(out),
+                },
+                _ => resp::write_null(out),
+            },
+            Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
+        }
+    } else if cmd_eq(cmd, b"LRANGE") && args.len() >= 4 {
+        let start = match parse_i64(args[2]) {
+            Ok(v) => v,
+            Err(_) => {
+                resp::write_error(out, "ERR value is not an integer or out of range");
+                return;
+            }
+        };
+        let stop = match parse_i64(args[3]) {
+            Ok(v) => v,
+            Err(_) => {
+                resp::write_error(out, "ERR value is not an integer or out of range");
+                return;
+            }
+        };
+        match data.get(ks) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::List(list) => {
+                    let len = list.len() as i64;
+                    let s = if start < 0 {
+                        (len + start).max(0) as usize
+                    } else {
+                        start.min(len) as usize
+                    };
+                    let e = if stop < 0 {
+                        (len + stop + 1).max(0) as usize
+                    } else {
+                        (stop + 1).min(len) as usize
+                    };
+                    if s >= e {
+                        resp::write_array_header(out, 0);
+                    } else {
+                        resp::write_array_header(out, e - s);
+                        for idx in s..e {
+                            if let Some(value) = list.get(idx) {
+                                resp::write_bulk_raw(out, value);
+                            }
+                        }
+                    }
+                }
+                _ => resp::write_error(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                ),
+            },
+            _ => resp::write_array_header(out, 0),
         }
     } else if cmd_eq(cmd, b"SCARD") {
         match data.get(ks) {
@@ -1111,20 +2651,65 @@ pub(crate) fn execute_on_shard_read(
             },
             _ => resp::write_integer(out, 0),
         }
+    } else if cmd_eq(cmd, b"SMEMBERS") {
+        match data.get(ks) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Set(set) => {
+                    resp::write_array_header(out, set.len());
+                    for member in set.iter() {
+                        resp::write_bulk(out, member);
+                    }
+                }
+                _ => resp::write_error(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                ),
+            },
+            _ => resp::write_array_header(out, 0),
+        }
     } else if cmd_eq(cmd, b"HGET") && args.len() >= 3 {
         match data.get(ks) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Hash(map) => {
-                    resp::write_optional_bulk_raw(out, &map.get(arg_str(args[2])).cloned())
-                }
+                StoreValue::Hash(map) => match map.get(arg_str(args[2])) {
+                    Some(value) => resp::write_bulk_raw(out, value),
+                    None => resp::write_null(out),
+                },
                 _ => resp::write_null(out),
             },
             _ => resp::write_null(out),
         }
-    } else if cmd_eq(cmd, b"ZCARD") {
+    } else if cmd_eq(cmd, b"HMGET") && args.len() >= 3 {
+        resp::write_array_header(out, args.len() - 2);
         match data.get(ks) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::SortedSet(_, scores) => resp::write_integer(out, scores.len() as i64),
+                StoreValue::Hash(map) => {
+                    for field in &args[2..] {
+                        resp::write_optional_bulk_raw(out, &map.get(arg_str(field)).cloned());
+                    }
+                }
+                _ => {
+                    for _ in &args[2..] {
+                        resp::write_null(out);
+                    }
+                }
+            },
+            _ => {
+                for _ in &args[2..] {
+                    resp::write_null(out);
+                }
+            }
+        }
+    } else if cmd_eq(cmd, b"HEXISTS") && args.len() >= 3 {
+        match data.get(ks) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Hash(map) => resp::write_integer(
+                    out,
+                    if map.contains_key(arg_str(args[2])) {
+                        1
+                    } else {
+                        0
+                    },
+                ),
                 _ => resp::write_error(
                     out,
                     "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -1132,11 +2717,41 @@ pub(crate) fn execute_on_shard_read(
             },
             _ => resp::write_integer(out, 0),
         }
-    } else if cmd_eq(cmd, b"ZSCORE") && args.len() >= 3 {
+    } else if cmd_eq(cmd, b"HGETALL") {
         match data.get(ks) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::SortedSet(_, scores) => match scores.get(arg_str(args[2])) {
-                    Some(s) => resp::write_bulk(out, &format_float(*s)),
+                StoreValue::Hash(map) => {
+                    resp::write_array_header(out, map.len() * 2);
+                    for (field, value) in map {
+                        resp::write_bulk(out, field);
+                        resp::write_bulk_raw(out, value);
+                    }
+                }
+                _ => resp::write_error(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                ),
+            },
+            _ => resp::write_array_header(out, 0),
+        }
+    } else if cmd_eq(cmd, b"SISMEMBER") && args.len() >= 3 {
+        match data.get(ks) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Set(set) => {
+                    resp::write_integer(out, if set.contains(arg_str(args[2])) { 1 } else { 0 })
+                }
+                _ => resp::write_error(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                ),
+            },
+            _ => resp::write_integer(out, 0),
+        }
+    } else if cmd_eq(cmd, b"SRANDMEMBER") {
+        match data.get(ks) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Set(set) => match set.iter().next() {
+                    Some(member) => resp::write_bulk(out, member),
                     None => resp::write_null(out),
                 },
                 _ => resp::write_error(
@@ -1176,11 +2791,130 @@ pub(crate) fn execute_on_shard_read(
                 }
             },
         }
+    } else if cmd_eq(cmd, b"GEODIST") && (args.len() == 4 || args.len() == 5) {
+        let unit = if args.len() == 5 {
+            match crate::geo::DistUnit::parse(arg_str(args[4])) {
+                Some(u) => u,
+                None => {
+                    resp::write_error(
+                        out,
+                        "ERR unsupported unit provided. please use M, KM, FT, MI",
+                    );
+                    return;
+                }
+            }
+        } else {
+            crate::geo::DistUnit::M
+        };
+        match data.get(ks) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(_, scores) => {
+                    let s1 = match scores.get(arg_str(args[2])) {
+                        Some(s) => *s,
+                        None => {
+                            resp::write_null(out);
+                            return;
+                        }
+                    };
+                    let s2 = match scores.get(arg_str(args[3])) {
+                        Some(s) => *s,
+                        None => {
+                            resp::write_null(out);
+                            return;
+                        }
+                    };
+                    let (lon1, lat1) = crate::geo::geohash_decode(s1 as u64);
+                    let (lon2, lat2) = crate::geo::geohash_decode(s2 as u64);
+                    let dist = unit.from_meters(crate::geo::haversine(lon1, lat1, lon2, lat2));
+                    resp::write_bulk(out, &format!("{:.4}", dist));
+                }
+                _ => resp::write_error(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                ),
+            },
+            _ => resp::write_null(out),
+        }
+    } else if cmd_eq(cmd, b"GEOPOS") && args.len() >= 2 {
+        let members = args.get(2..).unwrap_or(&[]);
+        resp::write_array_header(out, members.len());
+        match data.get(ks) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(_, scores) => {
+                    for member in members {
+                        match scores.get(arg_str(member)) {
+                            Some(score) => {
+                                let (lon, lat) = crate::geo::geohash_decode(*score as u64);
+                                resp::write_array_header(out, 2);
+                                resp::write_bulk(out, &format_geo_coord(lon));
+                                resp::write_bulk(out, &format_geo_coord(lat));
+                            }
+                            None => resp::write_null_array(out),
+                        }
+                    }
+                }
+                _ => resp::write_error(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                ),
+            },
+            _ => {
+                for _ in members {
+                    resp::write_null_array(out);
+                }
+            }
+        }
+    } else if cmd_eq(cmd, b"XLEN") {
+        match data.get(ks) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Stream(stream) => resp::write_integer(out, stream.entries.len() as i64),
+                _ => resp::write_error(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                ),
+            },
+            _ => resp::write_integer(out, 0),
+        }
+    } else if cmd_eq(cmd, b"XRANGE") && args.len() >= 4 {
+        let start = if arg_str(args[2]) == "-" {
+            StreamId { ms: 0, seq: 0 }
+        } else {
+            StreamId::parse(arg_str(args[2])).unwrap_or(StreamId { ms: 0, seq: 0 })
+        };
+        let end = if arg_str(args[3]) == "+" {
+            StreamId {
+                ms: u64::MAX,
+                seq: u64::MAX,
+            }
+        } else {
+            StreamId::parse(arg_str(args[3])).unwrap_or(StreamId {
+                ms: u64::MAX,
+                seq: u64::MAX,
+            })
+        };
+        let count = if args.len() > 5 && cmd_eq(args[4], b"COUNT") {
+            parse_u64(args[5]).ok().map(|n| n as usize)
+        } else {
+            None
+        };
+        match data.get(ks) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Stream(stream) => {
+                    write_stream_entries_fast(out, &stream.entries, start, end, count)
+                }
+                _ => resp::write_error(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                ),
+            },
+            _ => resp::write_array_header(out, 0),
+        }
     } else {
         resp::write_error(out, &format!("ERR unknown command '{}'", arg_str(cmd)));
     }
 }
 
+#[allow(dead_code)]
 fn write_int_result(out: &mut BytesMut, result: Result<i64, String>) {
     match result {
         Ok(value) => resp::write_integer(out, value),
@@ -1188,6 +2922,162 @@ fn write_int_result(out: &mut BytesMut, result: Result<i64, String>) {
     }
 }
 
+fn shard_incr_fast(
+    data: &mut ShardData,
+    key: &[u8],
+    delta: i64,
+    lru_clock: u32,
+    now: Instant,
+    out: &mut BytesMut,
+) {
+    let ks = arg_str(key);
+    if let Some(entry) = data.get_mut(ks) {
+        if entry.is_expired_at(now) {
+            match 0i64.checked_add(delta) {
+                Some(new_val) => {
+                    entry.value = StoreValue::Str(Bytes::from(new_val.to_string()));
+                    entry.expires_at = None;
+                    entry.lru_clock = lru_clock;
+                    resp::write_integer(out, new_val);
+                }
+                None => resp::write_error(out, "ERR increment or decrement would overflow"),
+            }
+            return;
+        }
+        let current = match entry.value.string_bytes() {
+            Some(bytes) => match std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                Some(n) => n,
+                None => {
+                    resp::write_error(out, "ERR value is not an integer or out of range");
+                    return;
+                }
+            },
+            None => {
+                resp::write_error(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                );
+                return;
+            }
+        };
+        match current.checked_add(delta) {
+            Some(new_val) => {
+                let expires_at = entry.expires_at;
+                entry.value = StoreValue::Str(Bytes::from(new_val.to_string()));
+                entry.expires_at = expires_at;
+                entry.lru_clock = lru_clock;
+                resp::write_integer(out, new_val);
+            }
+            None => resp::write_error(out, "ERR increment or decrement would overflow"),
+        }
+        return;
+    }
+
+    match 0i64.checked_add(delta) {
+        Some(new_val) => {
+            data.insert(
+                ks.to_string(),
+                Entry {
+                    value: StoreValue::Str(Bytes::from(new_val.to_string())),
+                    expires_at: None,
+                    lru_clock,
+                },
+            );
+            resp::write_integer(out, new_val);
+        }
+        None => resp::write_error(out, "ERR increment or decrement would overflow"),
+    }
+}
+
+fn shard_list_push_fast(
+    data: &mut ShardData,
+    key: &[u8],
+    values: &[&[u8]],
+    left: bool,
+    lru_clock: u32,
+    now: Instant,
+    out: &mut BytesMut,
+) {
+    let ks = arg_str(key).to_string();
+    let entry = data.entry(ks).or_insert_with(|| Entry {
+        value: StoreValue::List(std::collections::VecDeque::new()),
+        expires_at: None,
+        lru_clock,
+    });
+    if entry.is_expired_at(now) {
+        entry.value = StoreValue::List(std::collections::VecDeque::new());
+        entry.expires_at = None;
+    }
+    match &mut entry.value {
+        StoreValue::List(list) => {
+            for v in values {
+                if left {
+                    list.push_front(Bytes::copy_from_slice(v));
+                } else {
+                    list.push_back(Bytes::copy_from_slice(v));
+                }
+            }
+            resp::write_integer(out, list.len() as i64);
+        }
+        _ => resp::write_error(
+            out,
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
+        ),
+    }
+}
+
+fn shard_sadd_fast(
+    data: &mut ShardData,
+    key: &[u8],
+    members: &[&[u8]],
+    lru_clock: u32,
+    now: Instant,
+    out: &mut BytesMut,
+) {
+    let ks = arg_str(key).to_string();
+    let entry = data.entry(ks).or_insert_with(|| Entry {
+        value: StoreValue::Set(crate::store::SetData::new()),
+        expires_at: None,
+        lru_clock,
+    });
+    if entry.is_expired_at(now) {
+        entry.value = StoreValue::Set(crate::store::SetData::new());
+        entry.expires_at = None;
+    }
+    match &mut entry.value {
+        StoreValue::Set(set) => {
+            let mut added = 0i64;
+            for m in members {
+                if set.insert(arg_str(m).to_string()) {
+                    added += 1;
+                }
+            }
+            resp::write_integer(out, added);
+        }
+        _ => resp::write_error(
+            out,
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
+        ),
+    }
+}
+
+fn shard_hset_one_fast(
+    shard: &mut crate::store::Shard,
+    store: &Store,
+    key: &[u8],
+    field: &[u8],
+    value: &[u8],
+    now: Instant,
+    out: &mut BytesMut,
+) {
+    let pairs = [(field, value)];
+    write_int_result(out, store.hset_on_shard(shard, key, &pairs, now));
+}
+
+#[allow(dead_code)]
 fn shard_srem(
     data: &mut ShardData,
     key: &[u8],
@@ -1216,6 +3106,7 @@ fn shard_srem(
     }
 }
 
+#[allow(dead_code)]
 fn shard_hdel(
     data: &mut ShardData,
     key: &[u8],
@@ -1244,6 +3135,7 @@ fn shard_hdel(
     }
 }
 
+#[allow(dead_code)]
 fn shard_zadd(
     shard: &mut crate::store::Shard,
     store: &Store,
@@ -1252,6 +3144,19 @@ fn shard_zadd(
     now: Instant,
     out: &mut BytesMut,
 ) {
+    if rest.len() == 2 {
+        match arg_str(rest[0]).parse::<f64>() {
+            Ok(score) if !score.is_nan() => {
+                match store.zadd_single_default_on_shard(shard, key, rest[1], score, now) {
+                    Ok(count) => resp::write_integer(out, count),
+                    Err(error) => resp::write_error(out, &error),
+                }
+            }
+            _ => resp::write_error(out, "ERR value is not a valid float"),
+        }
+        return;
+    }
+
     let mut nx = false;
     let mut xx = false;
     let mut gt = false;
@@ -1282,7 +3187,21 @@ fn shard_zadd(
         resp::write_error(out, "ERR syntax error");
         return;
     }
-    let mut members = Vec::new();
+    if rest.len() - i == 2 {
+        match arg_str(rest[i]).parse::<f64>() {
+            Ok(score) => {
+                let single = [(rest[i + 1], score)];
+                match store.zadd_on_shard(shard, key, &single, nx, xx, gt, lt, ch, now) {
+                    Ok(count) => resp::write_integer(out, count),
+                    Err(error) => resp::write_error(out, &error),
+                }
+            }
+            Err(_) => resp::write_error(out, "ERR value is not a valid float"),
+        }
+        return;
+    }
+
+    let mut members = Vec::with_capacity((rest.len() - i) / 2);
     while i + 1 < rest.len() {
         match arg_str(rest[i]).parse::<f64>() {
             Ok(s) => members.push((rest[i + 1], s)),
@@ -1300,6 +3219,7 @@ fn shard_zadd(
     }
 }
 
+#[allow(dead_code)]
 fn shard_zrem(
     data: &mut ShardData,
     key: &[u8],
@@ -1330,6 +3250,7 @@ fn shard_zrem(
     }
 }
 
+#[allow(dead_code)]
 fn shard_xadd(
     shard: &mut crate::store::Shard,
     store: &Store,
@@ -1386,6 +3307,7 @@ fn shard_xadd(
     }
 }
 
+#[allow(dead_code)]
 fn shard_zpop(
     data: &mut ShardData,
     key: &[u8],
@@ -1398,7 +3320,24 @@ fn shard_zpop(
     match data.get_mut(ks) {
         Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
             StoreValue::SortedSet(tree, scores) => {
-                let mut result = Vec::new();
+                if count == 1 {
+                    let popped = if is_min {
+                        tree.pop_first()
+                    } else {
+                        tree.pop_last()
+                    };
+                    if let Some(((score, member), _)) = popped {
+                        scores.remove(&member);
+                        resp::write_array_header(out, 2);
+                        resp::write_bulk(out, &member);
+                        resp::write_bulk(out, &format_float(score.0));
+                    } else {
+                        resp::write_array_header(out, 0);
+                    }
+                    return;
+                }
+
+                let mut result = Vec::with_capacity(count.min(tree.len()));
                 for _ in 0..count {
                     let popped = if is_min {
                         tree.pop_first()
@@ -1428,202 +3367,7 @@ fn shard_zpop(
 }
 
 pub fn is_known_command(cmd: &[u8]) -> bool {
-    cmd_eq(cmd, b"SET")
-        || cmd_eq(cmd, b"GET")
-        || cmd_eq(cmd, b"DEL")
-        || cmd_eq(cmd, b"PING")
-        || cmd_eq(cmd, b"ECHO")
-        || cmd_eq(cmd, b"QUIT")
-        || cmd_eq(cmd, b"SETNX")
-        || cmd_eq(cmd, b"SETEX")
-        || cmd_eq(cmd, b"PSETEX")
-        || cmd_eq(cmd, b"GETSET")
-        || cmd_eq(cmd, b"MGET")
-        || cmd_eq(cmd, b"MSET")
-        || cmd_eq(cmd, b"STRLEN")
-        || cmd_eq(cmd, b"EXISTS")
-        || cmd_eq(cmd, b"INCR")
-        || cmd_eq(cmd, b"DECR")
-        || cmd_eq(cmd, b"INCRBY")
-        || cmd_eq(cmd, b"DECRBY")
-        || cmd_eq(cmd, b"APPEND")
-        || cmd_eq(cmd, b"KEYS")
-        || cmd_eq(cmd, b"SCAN")
-        || cmd_eq(cmd, b"TTL")
-        || cmd_eq(cmd, b"PTTL")
-        || cmd_eq(cmd, b"EXPIRE")
-        || cmd_eq(cmd, b"PEXPIRE")
-        || cmd_eq(cmd, b"PERSIST")
-        || cmd_eq(cmd, b"TYPE")
-        || cmd_eq(cmd, b"RENAME")
-        || cmd_eq(cmd, b"DBSIZE")
-        || cmd_eq(cmd, b"FLUSHDB")
-        || cmd_eq(cmd, b"FLUSHALL")
-        || cmd_eq(cmd, b"LPUSH")
-        || cmd_eq(cmd, b"RPUSH")
-        || cmd_eq(cmd, b"LPOP")
-        || cmd_eq(cmd, b"RPOP")
-        || cmd_eq(cmd, b"LLEN")
-        || cmd_eq(cmd, b"LRANGE")
-        || cmd_eq(cmd, b"LINDEX")
-        || cmd_eq(cmd, b"HSET")
-        || cmd_eq(cmd, b"HMSET")
-        || cmd_eq(cmd, b"HGET")
-        || cmd_eq(cmd, b"HMGET")
-        || cmd_eq(cmd, b"HDEL")
-        || cmd_eq(cmd, b"HGETALL")
-        || cmd_eq(cmd, b"HKEYS")
-        || cmd_eq(cmd, b"HVALS")
-        || cmd_eq(cmd, b"HLEN")
-        || cmd_eq(cmd, b"HEXISTS")
-        || cmd_eq(cmd, b"HINCRBY")
-        || cmd_eq(cmd, b"SADD")
-        || cmd_eq(cmd, b"SREM")
-        || cmd_eq(cmd, b"SMEMBERS")
-        || cmd_eq(cmd, b"SISMEMBER")
-        || cmd_eq(cmd, b"SCARD")
-        || cmd_eq(cmd, b"SUNION")
-        || cmd_eq(cmd, b"SINTER")
-        || cmd_eq(cmd, b"SDIFF")
-        || cmd_eq(cmd, b"SAVE")
-        || cmd_eq(cmd, b"INFO")
-        || cmd_eq(cmd, b"CONFIG")
-        || cmd_eq(cmd, b"CLIENT")
-        || cmd_eq(cmd, b"SELECT")
-        || cmd_eq(cmd, b"COMMAND")
-        || cmd_eq(cmd, b"GETDEL")
-        || cmd_eq(cmd, b"GETEX")
-        || cmd_eq(cmd, b"GETRANGE")
-        || cmd_eq(cmd, b"SUBSTR")
-        || cmd_eq(cmd, b"SETRANGE")
-        || cmd_eq(cmd, b"MSETNX")
-        || cmd_eq(cmd, b"UNLINK")
-        || cmd_eq(cmd, b"EXPIREAT")
-        || cmd_eq(cmd, b"PEXPIREAT")
-        || cmd_eq(cmd, b"EXPIRETIME")
-        || cmd_eq(cmd, b"PEXPIRETIME")
-        || cmd_eq(cmd, b"LSET")
-        || cmd_eq(cmd, b"LINSERT")
-        || cmd_eq(cmd, b"LREM")
-        || cmd_eq(cmd, b"LTRIM")
-        || cmd_eq(cmd, b"LPUSHX")
-        || cmd_eq(cmd, b"RPUSHX")
-        || cmd_eq(cmd, b"LPOS")
-        || cmd_eq(cmd, b"LMOVE")
-        || cmd_eq(cmd, b"RPOPLPUSH")
-        || cmd_eq(cmd, b"HSETNX")
-        || cmd_eq(cmd, b"HINCRBYFLOAT")
-        || cmd_eq(cmd, b"HSTRLEN")
-        || cmd_eq(cmd, b"SPOP")
-        || cmd_eq(cmd, b"SRANDMEMBER")
-        || cmd_eq(cmd, b"SMOVE")
-        || cmd_eq(cmd, b"SMISMEMBER")
-        || cmd_eq(cmd, b"SDIFFSTORE")
-        || cmd_eq(cmd, b"SINTERSTORE")
-        || cmd_eq(cmd, b"SUNIONSTORE")
-        || cmd_eq(cmd, b"SINTERCARD")
-        || cmd_eq(cmd, b"HRANDFIELD")
-        || cmd_eq(cmd, b"HSCAN")
-        || cmd_eq(cmd, b"SSCAN")
-        || cmd_eq(cmd, b"INCRBYFLOAT")
-        || cmd_eq(cmd, b"TIME")
-        || cmd_eq(cmd, b"RENAMENX")
-        || cmd_eq(cmd, b"RANDOMKEY")
-        || cmd_eq(cmd, b"HELLO")
-        || cmd_eq(cmd, b"PSUBSCRIBE")
-        || cmd_eq(cmd, b"PUNSUBSCRIBE")
-        || cmd_eq(cmd, b"COPY")
-        || cmd_eq(cmd, b"FUNCTION")
-        || cmd_eq(cmd, b"DEBUG")
-        || cmd_eq(cmd, b"WAIT")
-        || cmd_eq(cmd, b"RESET")
-        || cmd_eq(cmd, b"LATENCY")
-        || cmd_eq(cmd, b"SWAPDB")
-        || cmd_eq(cmd, b"OBJECT")
-        || cmd_eq(cmd, b"MEMORY")
-        || cmd_eq(cmd, b"BGSAVE")
-        || cmd_eq(cmd, b"LASTSAVE")
-        || cmd_eq(cmd, b"PUBLISH")
-        || cmd_eq(cmd, b"SUBSCRIBE")
-        || cmd_eq(cmd, b"ZADD")
-        || cmd_eq(cmd, b"ZSCORE")
-        || cmd_eq(cmd, b"ZRANK")
-        || cmd_eq(cmd, b"ZREVRANK")
-        || cmd_eq(cmd, b"ZREM")
-        || cmd_eq(cmd, b"ZCARD")
-        || cmd_eq(cmd, b"ZRANGE")
-        || cmd_eq(cmd, b"ZINCRBY")
-        || cmd_eq(cmd, b"ZCOUNT")
-        || cmd_eq(cmd, b"ZPOPMIN")
-        || cmd_eq(cmd, b"ZPOPMAX")
-        || cmd_eq(cmd, b"ZUNIONSTORE")
-        || cmd_eq(cmd, b"ZINTERSTORE")
-        || cmd_eq(cmd, b"ZDIFFSTORE")
-        || cmd_eq(cmd, b"ZSCAN")
-        || cmd_eq(cmd, b"ZMSCORE")
-        || cmd_eq(cmd, b"ZLEXCOUNT")
-        || cmd_eq(cmd, b"ZRANGEBYSCORE")
-        || cmd_eq(cmd, b"ZREVRANGEBYSCORE")
-        || cmd_eq(cmd, b"ZRANGEBYLEX")
-        || cmd_eq(cmd, b"ZREVRANGEBYLEX")
-        || cmd_eq(cmd, b"ZREMRANGEBYRANK")
-        || cmd_eq(cmd, b"ZREMRANGEBYSCORE")
-        || cmd_eq(cmd, b"ZREMRANGEBYLEX")
-        || cmd_eq(cmd, b"AUTH")
-        || cmd_eq(cmd, b"BLPOP")
-        || cmd_eq(cmd, b"BRPOP")
-        || cmd_eq(cmd, b"BLMOVE")
-        || cmd_eq(cmd, b"BZPOPMIN")
-        || cmd_eq(cmd, b"BZPOPMAX")
-        || cmd_eq(cmd, b"XADD")
-        || cmd_eq(cmd, b"XLEN")
-        || cmd_eq(cmd, b"XRANGE")
-        || cmd_eq(cmd, b"XREVRANGE")
-        || cmd_eq(cmd, b"XREAD")
-        || cmd_eq(cmd, b"XREADGROUP")
-        || cmd_eq(cmd, b"XGROUP")
-        || cmd_eq(cmd, b"XACK")
-        || cmd_eq(cmd, b"XPENDING")
-        || cmd_eq(cmd, b"XCLAIM")
-        || cmd_eq(cmd, b"XAUTOCLAIM")
-        || cmd_eq(cmd, b"XDEL")
-        || cmd_eq(cmd, b"XTRIM")
-        || cmd_eq(cmd, b"XINFO")
-        || cmd_eq(cmd, b"EVAL")
-        || cmd_eq(cmd, b"EVALSHA")
-        || cmd_eq(cmd, b"SCRIPT")
-        || cmd_eq(cmd, b"VSET")
-        || cmd_eq(cmd, b"VGET")
-        || cmd_eq(cmd, b"VSEARCH")
-        || cmd_eq(cmd, b"VCARD")
-        || cmd_eq(cmd, b"PFADD")
-        || cmd_eq(cmd, b"PFCOUNT")
-        || cmd_eq(cmd, b"PFMERGE")
-        || cmd_eq(cmd, b"PFDEBUG")
-        || cmd_eq(cmd, b"SORT")
-        || cmd_eq(cmd, b"SORT_RO")
-        || cmd_eq(cmd, b"TSADD")
-        || cmd_eq(cmd, b"TSMADD")
-        || cmd_eq(cmd, b"TSGET")
-        || cmd_eq(cmd, b"TSRANGE")
-        || cmd_eq(cmd, b"TSMRANGE")
-        || cmd_eq(cmd, b"TSINFO")
-        || cmd_eq(cmd, b"SETBIT")
-        || cmd_eq(cmd, b"GETBIT")
-        || cmd_eq(cmd, b"BITCOUNT")
-        || cmd_eq(cmd, b"BITPOS")
-        || cmd_eq(cmd, b"BITOP")
-        || cmd_eq(cmd, b"KSUB")
-        || cmd_eq(cmd, b"KUNSUB")
-        || cmd_eq(cmd, b"TCREATE")
-        || cmd_eq(cmd, b"TINSERT")
-        || cmd_eq(cmd, b"TUPDATE")
-        || cmd_eq(cmd, b"TDELETE")
-        || cmd_eq(cmd, b"TDROP")
-        || cmd_eq(cmd, b"TCOUNT")
-        || cmd_eq(cmd, b"TSCHEMA")
-        || cmd_eq(cmd, b"TLIST")
-        || cmd_eq(cmd, b"TALTER")
+    command_spec(cmd).is_some()
 }
 
 pub fn validate_args(args: &[&[u8]]) -> Result<(), String> {
@@ -1631,152 +3375,10 @@ pub fn validate_args(args: &[&[u8]]) -> Result<(), String> {
         return Err("ERR no command".to_string());
     }
     let cmd = args[0];
-    let min = if cmd_eq(cmd, b"SET")
-        || cmd_eq(cmd, b"GETSET")
-        || cmd_eq(cmd, b"SETNX")
-        || cmd_eq(cmd, b"APPEND")
-        || cmd_eq(cmd, b"EXPIRE")
-        || cmd_eq(cmd, b"PEXPIRE")
-        || cmd_eq(cmd, b"HGET")
-        || cmd_eq(cmd, b"HEXISTS")
-        || cmd_eq(cmd, b"SISMEMBER")
-        || cmd_eq(cmd, b"LINDEX")
-        || cmd_eq(cmd, b"GETRANGE")
-        || cmd_eq(cmd, b"SUBSTR")
-        || cmd_eq(cmd, b"GETBIT")
-    {
-        3
-    } else if cmd_eq(cmd, b"GET")
-        || cmd_eq(cmd, b"DEL")
-        || cmd_eq(cmd, b"EXISTS")
-        || cmd_eq(cmd, b"INCR")
-        || cmd_eq(cmd, b"DECR")
-        || cmd_eq(cmd, b"STRLEN")
-        || cmd_eq(cmd, b"TTL")
-        || cmd_eq(cmd, b"PTTL")
-        || cmd_eq(cmd, b"TYPE")
-        || cmd_eq(cmd, b"PERSIST")
-        || cmd_eq(cmd, b"KEYS")
-        || cmd_eq(cmd, b"LLEN")
-        || cmd_eq(cmd, b"LPOP")
-        || cmd_eq(cmd, b"RPOP")
-        || cmd_eq(cmd, b"HGETALL")
-        || cmd_eq(cmd, b"HKEYS")
-        || cmd_eq(cmd, b"HVALS")
-        || cmd_eq(cmd, b"HLEN")
-        || cmd_eq(cmd, b"SMEMBERS")
-        || cmd_eq(cmd, b"SCARD")
-        || cmd_eq(cmd, b"ZCARD")
-        || cmd_eq(cmd, b"SCAN")
-        || cmd_eq(cmd, b"ECHO")
-        || cmd_eq(cmd, b"GETDEL")
-        || cmd_eq(cmd, b"GETEX")
-    {
-        2
-    } else if cmd_eq(cmd, b"LPUSH")
-        || cmd_eq(cmd, b"RPUSH")
-        || cmd_eq(cmd, b"SADD")
-        || cmd_eq(cmd, b"SREM")
-        || cmd_eq(cmd, b"INCRBY")
-        || cmd_eq(cmd, b"DECRBY")
-        || cmd_eq(cmd, b"MSET")
-        || cmd_eq(cmd, b"MGET")
-        || cmd_eq(cmd, b"RENAME")
-        || cmd_eq(cmd, b"INCRBYFLOAT")
-        || cmd_eq(cmd, b"HDEL")
-        || cmd_eq(cmd, b"HMGET")
-        || cmd_eq(cmd, b"COPY")
-        || cmd_eq(cmd, b"LRANGE")
-        || cmd_eq(cmd, b"SUNION")
-        || cmd_eq(cmd, b"SINTER")
-        || cmd_eq(cmd, b"SDIFF")
-    {
-        3
-    } else if cmd_eq(cmd, b"SETEX")
-        || cmd_eq(cmd, b"PSETEX")
-        || cmd_eq(cmd, b"HSET")
-        || cmd_eq(cmd, b"HMSET")
-        || cmd_eq(cmd, b"HINCRBY")
-        || cmd_eq(cmd, b"HSETNX")
-        || cmd_eq(cmd, b"HINCRBYFLOAT")
-        || cmd_eq(cmd, b"ZADD")
-        || cmd_eq(cmd, b"LSET")
-        || cmd_eq(cmd, b"SETRANGE")
-        || cmd_eq(cmd, b"LINSERT")
-        || cmd_eq(cmd, b"LREM")
-        || cmd_eq(cmd, b"LTRIM")
-        || cmd_eq(cmd, b"ZUNIONSTORE")
-        || cmd_eq(cmd, b"ZINTERSTORE")
-        || cmd_eq(cmd, b"ZDIFFSTORE")
-        || cmd_eq(cmd, b"ZSCORE")
-        || cmd_eq(cmd, b"ZRANK")
-        || cmd_eq(cmd, b"ZREVRANK")
-        || cmd_eq(cmd, b"ZREM")
-        || cmd_eq(cmd, b"ZINCRBY")
-        || cmd_eq(cmd, b"SMOVE")
-        || cmd_eq(cmd, b"HSTRLEN")
-        || cmd_eq(cmd, b"SETBIT")
-        || cmd_eq(cmd, b"BITOP")
-    {
-        4
-    } else if cmd_eq(cmd, b"XADD") || cmd_eq(cmd, b"XREADGROUP") {
-        5
-    } else if cmd_eq(cmd, b"BLPOP")
-        || cmd_eq(cmd, b"BRPOP")
-        || cmd_eq(cmd, b"BZPOPMIN")
-        || cmd_eq(cmd, b"BZPOPMAX")
-        || cmd_eq(cmd, b"XRANGE")
-        || cmd_eq(cmd, b"XREVRANGE")
-        || cmd_eq(cmd, b"EVAL")
-        || cmd_eq(cmd, b"EVALSHA")
-        || cmd_eq(cmd, b"XACK")
-        || cmd_eq(cmd, b"XPENDING")
-    {
-        3
-    } else if cmd_eq(cmd, b"XLEN")
-        || cmd_eq(cmd, b"XREAD")
-        || cmd_eq(cmd, b"XGROUP")
-        || cmd_eq(cmd, b"XDEL")
-        || cmd_eq(cmd, b"XINFO")
-        || cmd_eq(cmd, b"XTRIM")
-        || cmd_eq(cmd, b"SCRIPT")
-        || cmd_eq(cmd, b"PFADD")
-        || cmd_eq(cmd, b"PFCOUNT")
-        || cmd_eq(cmd, b"PFMERGE")
-        || cmd_eq(cmd, b"BITCOUNT")
-        || cmd_eq(cmd, b"BITPOS")
-        || cmd_eq(cmd, b"SORT")
-        || cmd_eq(cmd, b"SORT_RO")
-    {
-        2
-    } else if cmd_eq(cmd, b"BLMOVE") || cmd_eq(cmd, b"XCLAIM") || cmd_eq(cmd, b"XAUTOCLAIM") {
-        6
-    } else if cmd_eq(cmd, b"PING")
-        || cmd_eq(cmd, b"DBSIZE")
-        || cmd_eq(cmd, b"FLUSHDB")
-        || cmd_eq(cmd, b"FLUSHALL")
-        || cmd_eq(cmd, b"SAVE")
-        || cmd_eq(cmd, b"INFO")
-        || cmd_eq(cmd, b"TIME")
-        || cmd_eq(cmd, b"RANDOMKEY")
-        || cmd_eq(cmd, b"BGSAVE")
-        || cmd_eq(cmd, b"LASTSAVE")
-        || cmd_eq(cmd, b"HELLO")
-        || cmd_eq(cmd, b"QUIT")
-        || cmd_eq(cmd, b"COMMAND")
-        || cmd_eq(cmd, b"CONFIG")
-        || cmd_eq(cmd, b"CLIENT")
-        || cmd_eq(cmd, b"SELECT")
-        || cmd_eq(cmd, b"VCARD")
-    {
-        1
-    } else if cmd_eq(cmd, b"VGET") {
-        2
-    } else if cmd_eq(cmd, b"VSET") || cmd_eq(cmd, b"VSEARCH") {
-        4
-    } else {
+    let Some(spec) = command_spec(cmd) else {
         return Ok(());
     };
+    let min = spec.min_arity;
     if args.len() < min {
         let cmd_name = std::str::from_utf8(cmd).unwrap_or("unknown").to_lowercase();
         return Err(format!(
@@ -1860,6 +3462,69 @@ mod tests {
         let store = Store::new();
         let out = exec_str(&store, &[b"GETEX", b"key", b"BADOPT"]);
         assert!(out.contains("ERR syntax error"));
+    }
+
+    #[test]
+    fn command_specs_cover_dispatched_commands() {
+        for cmd in [
+            b"GEOADD" as &[u8],
+            b"GEODIST",
+            b"GEOPOS",
+            b"GEOHASH",
+            b"GEOSEARCH",
+            b"GEOSEARCHSTORE",
+            b"GEORADIUS",
+            b"GEORADIUSBYMEMBER",
+            b"TSELECT",
+            b"UNSUBSCRIBE",
+            b"ZREVRANGE",
+        ] {
+            assert!(is_known_command(cmd), "missing command spec for {cmd:?}");
+        }
+    }
+
+    #[test]
+    fn validate_args_matches_supported_minimums() {
+        assert!(validate_args(&[b"SUNION" as &[u8], b"key"]).is_ok());
+        assert!(validate_args(&[b"SINTER" as &[u8], b"key"]).is_ok());
+        assert!(validate_args(&[b"SDIFF" as &[u8], b"key"]).is_ok());
+        assert!(validate_args(&[b"GETRANGE" as &[u8], b"key", b"0"]).is_err());
+        assert!(validate_args(&[b"XRANGE" as &[u8], b"s", b"-"]).is_err());
+        assert!(validate_args(&[b"XDEL" as &[u8], b"s"]).is_err());
+        assert!(validate_args(&[b"GEOPOS" as &[u8], b"geo"]).is_err());
+    }
+
+    #[test]
+    fn pipeline_access_requires_fast_path_safe_arity() {
+        assert_eq!(
+            pipeline_access_for_args(&[b"GET" as &[u8], b"k"]),
+            PipelineAccess::Read
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"GET" as &[u8], b"k", b"extra"]),
+            PipelineAccess::General
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"LRANGE" as &[u8], b"k"]),
+            PipelineAccess::General
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"EXISTS" as &[u8], b"a", b"b"]),
+            PipelineAccess::General
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"EXISTS" as &[u8], b"a"]),
+            PipelineAccess::Read
+        );
+    }
+
+    #[test]
+    fn geo_member_commands_require_a_member() {
+        let store = Store::new();
+        let geopos = exec_str(&store, &[b"GEOPOS", b"geo"]);
+        assert!(geopos.contains("ERR wrong number of arguments"));
+        let geohash = exec_str(&store, &[b"GEOHASH", b"geo"]);
+        assert!(geohash.contains("ERR wrong number of arguments"));
     }
 
     #[test]
@@ -2331,6 +3996,14 @@ mod tests {
         let out = exec_str(&store, &[b"INFO"]);
         assert!(out.contains("lux_version"), "contains version: {out}");
         assert!(out.contains("connected_clients"), "contains clients: {out}");
+        assert!(
+            out.contains("tracked_key_count:"),
+            "contains tracked key count: {out}"
+        );
+        assert!(
+            out.contains("tracked_total_key_count:"),
+            "contains tracked total key count: {out}"
+        );
     }
 
     #[test]

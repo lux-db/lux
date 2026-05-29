@@ -23,7 +23,7 @@ mod tables;
 
 use bytes::BytesMut;
 use cmd::CmdResult;
-use command::{Command, CommandKind, CommandOutput, PubSubCommand, SetOption, ShardAccess};
+use command::{Command, CommandKind, CommandOutput, PubSubCommand, SetOption};
 use pubsub::Broker;
 use resp::Parser;
 use std::collections::HashMap;
@@ -497,136 +497,64 @@ impl EmbeddedClient {
         &self,
         commands: &[Command<'_>],
     ) -> Result<Vec<CommandOutput>, LuxError> {
-        // Native pipelines batch only consecutive commands that hit the same
-        // shard. WAL logging happens before the locked mutation, and key-event
-        // argv is retained only when subscribers exist. Tiered storage falls
-        // back to the generic command path because cold-key promotion may need
-        // disk access outside the already-held shard lock.
-        if self.runtime.store.is_tiered() {
-            let mut outputs = Vec::with_capacity(commands.len());
-            for command in commands {
-                outputs.push(self.execute_command_output(command.clone()).await?);
-            }
-            return Ok(outputs);
-        }
-
-        let mut outputs = Vec::with_capacity(commands.len());
-        let now = Instant::now();
-        let mut i = 0usize;
-
-        while i < commands.len() {
-            // Adjacent MSETs can be flattened into one shard pass without
-            // changing per-command replies; this is a generic write batching
-            // optimization, not a command-specific benchmark shortcut.
-            if matches!(commands[i], Command::MSet { .. }) {
-                let mut batch_end = i + 1;
-                while batch_end < commands.len()
-                    && matches!(commands[batch_end], Command::MSet { .. })
-                {
-                    batch_end += 1;
-                }
-                let batch = &commands[i..batch_end];
-                self.execute_mset_pipeline_batch(batch, now)?;
-                outputs.extend((i..batch_end).map(|_| CommandOutput::Simple("OK")));
-                self.runtime.store.add_total_commands(batch.len());
-                i = batch_end;
-                continue;
-            }
-
-            let Some((key, access)) = native_pipeline_access(&commands[i]) else {
-                outputs.push(self.execute_command_output(commands[i].clone()).await?);
-                i += 1;
-                continue;
-            };
-
-            // Batch contiguous commands that route to the same shard. If any
-            // command writes, take the write lock for the whole batch so reads
-            // observe the preceding writes in pipeline order.
-            let shard_idx = self.runtime.store.shard_for_key(key);
-            let mut has_write = access == NativePipelineAccess::Write;
-            let mut batch_end = i + 1;
-            while batch_end < commands.len() {
-                let Some((next_key, next_access)) = native_pipeline_access(&commands[batch_end])
-                else {
-                    break;
-                };
-                if self.runtime.store.shard_for_key(next_key) != shard_idx {
-                    break;
-                }
-                has_write |= next_access == NativePipelineAccess::Write;
-                batch_end += 1;
-            }
-
-            let batch = &commands[i..batch_end];
-            let emit_key_events = self.runtime.broker.has_key_subs();
-            let mut write_argvs = Vec::new();
-            if has_write {
-                if emit_key_events {
-                    write_argvs.reserve(batch.len());
-                }
-                for command in batch {
-                    if command_is_fast_path_write(command) {
-                        ensure_write_allowed(&self.runtime.store)?;
-                        if emit_key_events {
-                            let argv = command.to_owned_argv();
-                            let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                            self.runtime
-                                .store
-                                .wal_log_command(&refs)
-                                .map_err(wal_lux_error)?;
-                            write_argvs.push(argv);
-                        } else {
-                            wal_log_native_command(&self.runtime.store, command)?;
-                        }
-                    }
-                }
-
-                let mut shard = self.runtime.store.lock_write_shard(shard_idx);
-                shard.version += 1;
-                for command in batch {
-                    outputs.push(self.execute_native_write_on_shard(command, &mut shard, now)?);
-                }
-            } else {
-                let shard = self.runtime.store.lock_read_shard(shard_idx);
-                for command in batch {
-                    outputs.push(self.execute_native_read_on_shard(command, &shard, now)?);
-                }
-            }
-
-            self.runtime.store.add_total_commands(batch.len());
-            if emit_key_events {
-                for argv in &write_argvs {
-                    let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                    fire_key_events(&self.runtime.broker, &refs);
-                }
-            }
-
-            i = batch_end;
-        }
-
-        Ok(outputs)
+        self.execute_command_pipeline_internal(commands, true).await
     }
 
     pub(crate) async fn execute_command_pipeline_discard(
         &self,
         commands: &[Command<'_>],
     ) -> Result<(), LuxError> {
-        // Same execution semantics as `execute_command_pipeline_outputs`, but
-        // intentionally skips result materialization for write-heavy embedded
-        // workloads that only need success/failure.
+        self.execute_command_pipeline_internal(commands, false)
+            .await
+            .map(|_| ())
+    }
+
+    async fn execute_command_pipeline_internal(
+        &self,
+        commands: &[Command<'_>],
+        collect_outputs: bool,
+    ) -> Result<Vec<CommandOutput>, LuxError> {
         if self.runtime.store.is_tiered() {
+            let mut outputs = if collect_outputs {
+                Vec::with_capacity(commands.len())
+            } else {
+                Vec::new()
+            };
             for command in commands {
-                self.execute_command_output(command.clone()).await?;
+                let out = self.execute_command_output(command.clone()).await?;
+                if collect_outputs {
+                    outputs.push(out);
+                }
             }
-            return Ok(());
+            return Ok(outputs);
         }
 
         let now = Instant::now();
+        if !collect_outputs
+            && commands
+                .iter()
+                .all(|command| matches!(command, Command::Publish { .. }))
+        {
+            for command in commands {
+                if let Command::Publish { channel, message } = command {
+                    let channel = std::str::from_utf8(channel).unwrap_or("");
+                    self.runtime
+                        .broker
+                        .publish(channel, bytes::Bytes::copy_from_slice(message));
+                }
+            }
+            self.runtime.store.add_total_commands(commands.len());
+            return Ok(Vec::new());
+        }
+
+        let mut outputs = if collect_outputs {
+            Vec::with_capacity(commands.len())
+        } else {
+            Vec::new()
+        };
         let mut i = 0usize;
 
         while i < commands.len() {
-            // Keep discard and materializing pipelines semantically identical;
-            // only response allocation is skipped.
             if matches!(commands[i], Command::MSet { .. }) {
                 let mut batch_end = i + 1;
                 while batch_end < commands.len()
@@ -636,13 +564,30 @@ impl EmbeddedClient {
                 }
                 let batch = &commands[i..batch_end];
                 self.execute_mset_pipeline_batch(batch, now)?;
+                if collect_outputs {
+                    outputs.extend((i..batch_end).map(|_| CommandOutput::Simple("OK")));
+                }
                 self.runtime.store.add_total_commands(batch.len());
                 i = batch_end;
                 continue;
             }
 
             let Some((key, access)) = native_pipeline_access(&commands[i]) else {
-                self.execute_command_output(commands[i].clone()).await?;
+                if !collect_outputs {
+                    if let Command::Publish { channel, message } = &commands[i] {
+                        let channel = std::str::from_utf8(channel).unwrap_or("");
+                        self.runtime
+                            .broker
+                            .publish(channel, bytes::Bytes::copy_from_slice(message));
+                        self.runtime.store.add_total_commands(1);
+                        i += 1;
+                        continue;
+                    }
+                }
+                let out = self.execute_command_output(commands[i].clone()).await?;
+                if collect_outputs {
+                    outputs.push(out);
+                }
                 i += 1;
                 continue;
             };
@@ -689,7 +634,16 @@ impl EmbeddedClient {
                 let mut shard = self.runtime.store.lock_write_shard(shard_idx);
                 shard.version += 1;
                 for command in batch {
-                    self.execute_native_write_on_shard_discard(command, &mut shard, now)?;
+                    if collect_outputs {
+                        outputs.push(self.execute_native_write_on_shard(command, &mut shard, now)?);
+                    } else {
+                        self.execute_native_write_on_shard_discard(command, &mut shard, now)?;
+                    }
+                }
+            } else if collect_outputs {
+                let shard = self.runtime.store.lock_read_shard(shard_idx);
+                for command in batch {
+                    outputs.push(self.execute_native_read_on_shard(command, &shard, now)?);
                 }
             } else {
                 for command in batch {
@@ -708,7 +662,7 @@ impl EmbeddedClient {
             i = batch_end;
         }
 
-        Ok(())
+        Ok(outputs)
     }
 
     fn execute_mset_pipeline_batch(
@@ -717,50 +671,44 @@ impl EmbeddedClient {
         now: Instant,
     ) -> Result<(), LuxError> {
         let emit_key_events = self.runtime.broker.has_key_subs();
-        let mut shard_indices = Vec::new();
+        let store = &self.runtime.store;
+        let mut pairs_by_shard: Vec<Vec<(&[u8], &[u8])>> = vec![Vec::new(); store.shard_count()];
+        let mut event_keys = Vec::new();
 
         for command in commands {
-            ensure_write_allowed(&self.runtime.store)?;
-            wal_log_native_command(&self.runtime.store, command)?;
+            ensure_write_allowed(store)?;
+            wal_log_native_command(store, command)?;
             let Command::MSet { pairs } = command else {
                 return Err(LuxError::InvalidCommand(
                     "MSET batch contained non-MSET command".to_string(),
                 ));
             };
-            for (key, _) in pairs {
-                let idx = self.runtime.store.shard_for_key(key);
-                shard_indices.push(idx);
+            if emit_key_events {
+                event_keys.reserve(pairs.len());
+            }
+            for &(key, value) in pairs {
+                let idx = store.shard_for_key(key);
+                pairs_by_shard[idx].push((key, value));
+                if emit_key_events {
+                    event_keys.push(key);
+                }
             }
         }
 
-        shard_indices.sort_unstable();
-        shard_indices.dedup();
-
-        for shard_idx in shard_indices {
-            let mut shard = self.runtime.store.lock_write_shard(shard_idx);
+        for (shard_idx, pairs) in pairs_by_shard.into_iter().enumerate() {
+            if pairs.is_empty() {
+                continue;
+            }
+            let mut shard = store.lock_write_shard(shard_idx);
             shard.version += 1;
-            for command in commands {
-                let Command::MSet { pairs } = command else {
-                    unreachable!("MSET batch was validated before shard mutation")
-                };
-                for (key, value) in pairs {
-                    if self.runtime.store.shard_for_key(key) == shard_idx {
-                        self.runtime
-                            .store
-                            .set_on_shard(&mut shard.data, key, value, None, now);
-                    }
-                }
+            for (key, value) in pairs {
+                store.set_on_shard(&mut shard.data, key, value, None, now);
             }
         }
 
         if emit_key_events {
-            for command in commands {
-                let Command::MSet { pairs } = command else {
-                    unreachable!("MSET batch was validated before key events")
-                };
-                for (key, _) in pairs {
-                    self.runtime.broker.enqueue_key_event(key, b"MSET");
-                }
+            for key in event_keys {
+                self.runtime.broker.enqueue_key_event(key, b"MSET");
             }
         }
 
@@ -1036,6 +984,42 @@ impl EmbeddedClient {
                     .zincrby_on_shard(shard, key, member, *increment, now)
                     .map_err(LuxError::Command)?,
             )),
+            Command::GeoAdd { key, members } => {
+                if let [member] = members.as_slice() {
+                    crate::geo::validate_coords(member.longitude, member.latitude)
+                        .map_err(LuxError::Command)?;
+                    let scored = [(
+                        member.member,
+                        crate::geo::geohash_encode(member.longitude, member.latitude) as f64,
+                    )];
+                    Ok(CommandOutput::Int(
+                        self.runtime
+                            .store
+                            .zadd_on_shard(
+                                shard, key, &scored, false, false, false, false, false, now,
+                            )
+                            .map_err(LuxError::Command)?,
+                    ))
+                } else {
+                    let mut scored = Vec::with_capacity(members.len());
+                    for member in members {
+                        crate::geo::validate_coords(member.longitude, member.latitude)
+                            .map_err(LuxError::Command)?;
+                        scored.push((
+                            member.member,
+                            crate::geo::geohash_encode(member.longitude, member.latitude) as f64,
+                        ));
+                    }
+                    Ok(CommandOutput::Int(
+                        self.runtime
+                            .store
+                            .zadd_on_shard(
+                                shard, key, &scored, false, false, false, false, false, now,
+                            )
+                            .map_err(LuxError::Command)?,
+                    ))
+                }
+            }
             Command::XAdd { key, id, fields } => {
                 require_xadd_fields(fields)?;
                 let id = self
@@ -1068,220 +1052,8 @@ impl EmbeddedClient {
         shard: &mut store::Shard,
         now: Instant,
     ) -> Result<(), LuxError> {
-        match command {
-            Command::Get { .. }
-            | Command::StrLen { .. }
-            | Command::Exists { .. }
-            | Command::HGet { .. } => Ok(()),
-            Command::Set {
-                key,
-                value,
-                options,
-            } if can_fast_path_set(options) => {
-                self.runtime
-                    .store
-                    .set_on_shard(&mut shard.data, key, value, set_ttl(options), now);
-                self.runtime.store.remove_from_disk(key);
-                Ok(())
-            }
-            Command::GetSet { key, value } => {
-                self.runtime
-                    .store
-                    .set_on_shard(&mut shard.data, key, value, None, now);
-                self.runtime.store.remove_from_disk(key);
-                Ok(())
-            }
-            Command::SetNx { key, value } => {
-                let changed = self
-                    .runtime
-                    .store
-                    .set_nx_on_shard(&mut shard.data, key, value, now);
-                if changed {
-                    self.runtime.store.remove_from_disk(key);
-                }
-                Ok(())
-            }
-            Command::SetEx {
-                key,
-                seconds,
-                value,
-            } => {
-                if *seconds == 0 {
-                    return Err(LuxError::Command(
-                        "ERR invalid expire time in 'setex' command".to_string(),
-                    ));
-                }
-                self.runtime.store.set_on_shard(
-                    &mut shard.data,
-                    key,
-                    value,
-                    Some(Duration::from_secs(*seconds)),
-                    now,
-                );
-                self.runtime.store.remove_from_disk(key);
-                Ok(())
-            }
-            Command::PSetEx {
-                key,
-                milliseconds,
-                value,
-            } => {
-                let millis = u64::try_from(*milliseconds).map_err(|_| {
-                    LuxError::Command("ERR value is not an integer or out of range".to_string())
-                })?;
-                self.runtime.store.set_on_shard(
-                    &mut shard.data,
-                    key,
-                    value,
-                    Some(Duration::from_millis(millis)),
-                    now,
-                );
-                self.runtime.store.remove_from_disk(key);
-                Ok(())
-            }
-            Command::Append { key, value } => {
-                self.runtime.store.append_on_shard(shard, key, value, now);
-                self.runtime.store.remove_from_disk(key);
-                Ok(())
-            }
-            Command::Incr { key } => {
-                self.runtime
-                    .store
-                    .incr_on_shard(&mut shard.data, key, 1, now)
-                    .map_err(LuxError::Command)?;
-                Ok(())
-            }
-            Command::Decr { key } => {
-                self.runtime
-                    .store
-                    .incr_on_shard(&mut shard.data, key, -1, now)
-                    .map_err(LuxError::Command)?;
-                Ok(())
-            }
-            Command::IncrBy { key, increment } => {
-                self.runtime
-                    .store
-                    .incr_on_shard(&mut shard.data, key, *increment, now)
-                    .map_err(LuxError::Command)?;
-                Ok(())
-            }
-            Command::DecrBy { key, decrement } => {
-                self.runtime
-                    .store
-                    .incr_on_shard(&mut shard.data, key, -*decrement, now)
-                    .map_err(LuxError::Command)?;
-                Ok(())
-            }
-            Command::Del { keys } | Command::Unlink { keys } if keys.len() == 1 => {
-                self.runtime.store.del_on_shard(shard, keys[0], now);
-                Ok(())
-            }
-            Command::LPush { key, values } => {
-                self.runtime
-                    .store
-                    .lpush_on_shard(shard, key, values, now)
-                    .map_err(LuxError::Command)?;
-                self.runtime.store.remove_from_disk(key);
-                self.drain_list_waiters_on_shard(key, shard, now);
-                Ok(())
-            }
-            Command::RPush { key, values } => {
-                self.runtime
-                    .store
-                    .rpush_on_shard(shard, key, values, now)
-                    .map_err(LuxError::Command)?;
-                self.runtime.store.remove_from_disk(key);
-                self.drain_list_waiters_on_shard(key, shard, now);
-                Ok(())
-            }
-            Command::LPop { key } => {
-                if self.runtime.store.lpop_on_shard(shard, key, now).is_some() {
-                    self.runtime.store.remove_from_disk(key);
-                }
-                Ok(())
-            }
-            Command::RPop { key } => {
-                if self.runtime.store.rpop_on_shard(shard, key, now).is_some() {
-                    self.runtime.store.remove_from_disk(key);
-                }
-                Ok(())
-            }
-            Command::HSet { key, field, value } => {
-                self.runtime
-                    .store
-                    .hset_on_shard(shard, key, &[(*field, *value)], now)
-                    .map_err(LuxError::Command)?;
-                Ok(())
-            }
-            Command::HIncrBy {
-                key,
-                field,
-                increment,
-            } => {
-                self.runtime
-                    .store
-                    .hincrby_on_shard(shard, key, field, *increment, now)
-                    .map_err(LuxError::Command)?;
-                Ok(())
-            }
-            Command::SAdd { key, members } => {
-                self.runtime
-                    .store
-                    .sadd_on_shard(shard, key, members, now)
-                    .map_err(LuxError::Command)?;
-                Ok(())
-            }
-            Command::SPop { key } => {
-                if !self
-                    .runtime
-                    .store
-                    .spop_on_shard(shard, key, 1, now)
-                    .map_err(LuxError::Command)?
-                    .is_empty()
-                {
-                    self.runtime.store.remove_from_disk(key);
-                }
-                Ok(())
-            }
-            Command::ZAdd { key, score, member } => {
-                self.runtime
-                    .store
-                    .zadd_on_shard(
-                        shard,
-                        key,
-                        &[(*member, *score)],
-                        false,
-                        false,
-                        false,
-                        false,
-                        false,
-                        now,
-                    )
-                    .map_err(LuxError::Command)?;
-                Ok(())
-            }
-            Command::ZIncrBy {
-                key,
-                increment,
-                member,
-            } => {
-                self.runtime
-                    .store
-                    .zincrby_on_shard(shard, key, member, *increment, now)
-                    .map_err(LuxError::Command)?;
-                Ok(())
-            }
-            Command::XAdd { key, id, fields } => {
-                require_xadd_fields(fields)?;
-                self.runtime
-                    .store
-                    .xadd_on_shard(shard, key, arg_str(id), xadd_fields(fields), None, now)
-                    .map_err(LuxError::Command)?;
-                self.runtime.broker.wake_stream_waiters(arg_str(key));
-                Ok(())
-            }
-            _ => unreachable!("native pipeline write command was classified before dispatch"),
-        }
+        self.execute_native_write_on_shard(command, shard, now)
+            .map(|_| ())
     }
 
     async fn execute_command_fast_path(
@@ -1777,6 +1549,9 @@ impl EmbeddedClient {
     }
 
     fn drain_list_waiters(&self, key: &[u8], now: Instant) {
+        if !self.runtime.broker.has_list_waiters("") {
+            return;
+        }
         let key_s = std::str::from_utf8(key).unwrap_or("");
         if self.runtime.broker.has_list_waiters(key_s) {
             let shard_idx = self.runtime.store.shard_for_key(key);
@@ -1786,6 +1561,9 @@ impl EmbeddedClient {
     }
 
     fn drain_list_waiters_on_shard(&self, key: &[u8], shard: &mut store::Shard, now: Instant) {
+        if !self.runtime.broker.has_list_waiters("") {
+            return;
+        }
         let key_s = std::str::from_utf8(key).unwrap_or("");
         if self.runtime.broker.has_list_waiters(key_s) {
             self.runtime
@@ -2304,40 +2082,47 @@ fn native_pipeline_access<'a>(command: &Command<'a>) -> Option<(&'a [u8], Native
     // Only simple single-shard commands are eligible for native batching.
     // Commands with multi-key routing, transaction/session behavior, or side
     // effects outside the shard lock stay on the generic path.
-    match command {
-        Command::Get { key }
-        | Command::StrLen { key }
-        | Command::HGet { key, .. }
-        | Command::GeoPos { key, .. }
-        | Command::GeoDist { key, .. } => Some((key, NativePipelineAccess::Read)),
-        Command::Exists { keys } if keys.len() == 1 => Some((keys[0], NativePipelineAccess::Read)),
+    let (key, op) = match command {
+        Command::Get { key } => (*key, b"GET".as_slice()),
+        Command::StrLen { key } => (*key, b"STRLEN".as_slice()),
+        Command::HGet { key, .. } => (*key, b"HGET".as_slice()),
+        Command::GeoPos { key, .. } => (*key, b"GEOPOS".as_slice()),
+        Command::GeoDist { key, .. } => (*key, b"GEODIST".as_slice()),
+        Command::Exists { keys } if keys.len() == 1 => (keys[0], b"EXISTS".as_slice()),
         Command::Set { key, options, .. } if can_fast_path_set(options) => {
-            Some((key, NativePipelineAccess::Write))
+            (*key, b"SET".as_slice())
         }
-        Command::GetSet { key, .. }
-        | Command::SetNx { key, .. }
-        | Command::SetEx { key, .. }
-        | Command::PSetEx { key, .. }
-        | Command::Append { key, .. }
-        | Command::Incr { key }
-        | Command::Decr { key }
-        | Command::IncrBy { key, .. }
-        | Command::DecrBy { key, .. }
-        | Command::LPush { key, .. }
-        | Command::RPush { key, .. }
-        | Command::LPop { key }
-        | Command::RPop { key }
-        | Command::HSet { key, .. }
-        | Command::HIncrBy { key, .. }
-        | Command::SAdd { key, .. }
-        | Command::SPop { key }
-        | Command::ZAdd { key, .. }
-        | Command::ZIncrBy { key, .. }
-        | Command::XAdd { key, .. } => Some((key, NativePipelineAccess::Write)),
+        Command::GetSet { key, .. } => (*key, b"GETSET".as_slice()),
+        Command::SetNx { key, .. } => (*key, b"SETNX".as_slice()),
+        Command::SetEx { key, .. } => (*key, b"SETEX".as_slice()),
+        Command::PSetEx { key, .. } => (*key, b"PSETEX".as_slice()),
+        Command::Append { key, .. } => (*key, b"APPEND".as_slice()),
+        Command::Incr { key } => (*key, b"INCR".as_slice()),
+        Command::Decr { key } => (*key, b"DECR".as_slice()),
+        Command::IncrBy { key, .. } => (*key, b"INCRBY".as_slice()),
+        Command::DecrBy { key, .. } => (*key, b"DECRBY".as_slice()),
+        Command::LPush { key, .. } => (*key, b"LPUSH".as_slice()),
+        Command::RPush { key, .. } => (*key, b"RPUSH".as_slice()),
+        Command::LPop { key } => (*key, b"LPOP".as_slice()),
+        Command::RPop { key } => (*key, b"RPOP".as_slice()),
+        Command::HSet { key, .. } => (*key, b"HSET".as_slice()),
+        Command::HIncrBy { key, .. } => (*key, b"HINCRBY".as_slice()),
+        Command::SAdd { key, .. } => (*key, b"SADD".as_slice()),
+        Command::SPop { key } => (*key, b"SPOP".as_slice()),
+        Command::ZAdd { key, .. } => (*key, b"ZADD".as_slice()),
+        Command::ZIncrBy { key, .. } => (*key, b"ZINCRBY".as_slice()),
+        Command::GeoAdd { key, .. } => (*key, b"GEOADD".as_slice()),
+        Command::XAdd { key, .. } => (*key, b"XADD".as_slice()),
         Command::Del { keys } | Command::Unlink { keys } if keys.len() == 1 => {
-            Some((keys[0], NativePipelineAccess::Write))
+            (keys[0], b"DEL".as_slice())
         }
-        _ => None,
+        _ => return None,
+    };
+
+    match cmd::pipeline_access(op) {
+        cmd::PipelineAccess::Read => Some((key, NativePipelineAccess::Read)),
+        cmd::PipelineAccess::Write => Some((key, NativePipelineAccess::Write)),
+        cmd::PipelineAccess::General => None,
     }
 }
 
@@ -3157,11 +2942,7 @@ impl Runtime {
 
 #[inline(always)]
 fn cmd_eq_fast(input: &[u8], expected: &[u8]) -> bool {
-    input.len() == expected.len()
-        && input
-            .iter()
-            .zip(expected)
-            .all(|(a, b)| a.to_ascii_uppercase() == *b)
+    cmd::cmd_eq_ci(input, expected)
 }
 
 #[inline(always)]
@@ -3340,7 +3121,9 @@ fn handle_tx_cmd(
 
     if *in_multi {
         if cmd_eq_fast(args[0], b"SUBSCRIBE")
+            || cmd_eq_fast(args[0], b"UNSUBSCRIBE")
             || cmd_eq_fast(args[0], b"PSUBSCRIBE")
+            || cmd_eq_fast(args[0], b"PUNSUBSCRIBE")
             || cmd_eq_fast(args[0], b"KSUB")
             || cmd_eq_fast(args[0], b"KUNSUB")
         {
@@ -3391,15 +3174,12 @@ fn handle_tx_cmd(
 }
 
 #[inline(always)]
+fn is_public_without_auth_cmd(cmd: &[u8]) -> bool {
+    cmd::is_public_without_auth_command(cmd)
+}
+
 fn is_blocking_cmd(cmd: &[u8]) -> bool {
-    cmd_eq_fast(cmd, b"BLPOP")
-        || cmd_eq_fast(cmd, b"BRPOP")
-        || cmd_eq_fast(cmd, b"BLMOVE")
-        || cmd_eq_fast(cmd, b"BZPOPMIN")
-        || cmd_eq_fast(cmd, b"BZPOPMAX")
-        || cmd_eq_fast(cmd, b"EVAL")
-        || cmd_eq_fast(cmd, b"EVALSHA")
-        || cmd_eq_fast(cmd, b"SCRIPT")
+    cmd::is_blocking_command(cmd)
 }
 
 pub(crate) struct CommandSession {
@@ -3434,6 +3214,22 @@ impl CommandSession {
     }
 }
 
+pub(crate) trait ArgvSlice {
+    fn argv(&self) -> &[&[u8]];
+}
+
+impl ArgvSlice for Vec<&[u8]> {
+    fn argv(&self) -> &[&[u8]] {
+        self.as_slice()
+    }
+}
+
+impl<'a> ArgvSlice for resp::CommandArgs<'a> {
+    fn argv(&self) -> &[&[u8]] {
+        self.as_slice()
+    }
+}
+
 pub(crate) struct CommandExecutor {
     store: Arc<Store>,
     broker: Broker,
@@ -3464,14 +3260,11 @@ impl CommandExecutor {
         write_buf: &mut BytesMut,
         now: Instant,
     ) -> Option<CmdResult> {
-        let parsed = match command::parse(args) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                resp::write_error(write_buf, &format!("ERR {e}"));
-                return None;
-            }
-        };
-        if !session.authenticated && !parsed.meta.public_without_auth {
+        if args.is_empty() || args[0].is_empty() {
+            resp::write_error(write_buf, "ERR empty command");
+            return None;
+        }
+        if !session.authenticated && !is_public_without_auth_cmd(args[0]) {
             resp::write_error(write_buf, "NOAUTH Authentication required");
             return None;
         }
@@ -3498,54 +3291,75 @@ impl CommandExecutor {
                 &self.store,
                 &self.schema_cache,
                 &self.broker,
-                parsed.args,
+                args,
                 write_buf,
                 now,
             )
         };
-        self.apply_cmd_result(cmd_result, parsed.args, session, write_buf, now)
+        self.apply_cmd_result(cmd_result, args, session, write_buf, now)
     }
 
-    pub(crate) fn execute_pipeline(
+    pub(crate) fn execute_pipeline<A: ArgvSlice>(
         &self,
-        commands: &[Vec<&[u8]>],
+        commands: &[A],
         session: &mut CommandSession,
         write_buf: &mut BytesMut,
         now: Instant,
     ) -> Option<CmdResult> {
-        let mut parsed_commands = Vec::with_capacity(commands.len());
-        for args in commands {
-            match command::parse(args) {
-                Ok(parsed) => parsed_commands.push(parsed),
-                Err(e) => {
-                    resp::write_error(write_buf, &format!("ERR {e}"));
-                    return None;
-                }
+        for command in commands {
+            let args = command.argv();
+            if args.is_empty() || args[0].is_empty() {
+                resp::write_error(write_buf, "ERR empty command");
+                return None;
             }
         }
+
         let cmd_count = commands.len();
         self.store.add_total_commands(cmd_count);
 
+        if !session.in_multi
+            && session.authenticated
+            && commands.iter().all(|command| {
+                let args = command.argv();
+                args.len() >= 3 && cmd_eq_fast(args[0], b"PUBLISH")
+            })
+        {
+            for command in commands {
+                let args = command.argv();
+                let channel = String::from_utf8_lossy(args[1]).into_owned();
+                let message = bytes::Bytes::copy_from_slice(args[2]);
+                let count = self.broker.publish(&channel, message);
+                resp::write_integer(write_buf, count);
+            }
+            return None;
+        }
+
         let mut has_special = session.in_multi;
         let mut all_single_key_rw = true;
-        for parsed in &parsed_commands {
-            if !session.authenticated && !parsed.meta.public_without_auth {
+        let mut flags: Vec<cmd::PipelineAccess> = Vec::with_capacity(cmd_count);
+        for command in commands {
+            let args = command.argv();
+            let cmd = args[0];
+            if !session.authenticated && !is_public_without_auth_cmd(cmd) {
                 has_special = true;
                 break;
             }
-            if !matches!(parsed.meta.kind, CommandKind::General) {
+            if cmd::is_pipeline_special_command(cmd) {
                 has_special = true;
                 break;
             }
-            if parsed.args.len() < 2 || parsed.meta.access == ShardAccess::General {
+            let access = cmd::pipeline_access_for_args(args);
+            flags.push(access);
+            if access == cmd::PipelineAccess::General {
                 all_single_key_rw = false;
             }
         }
 
         if has_special || !all_single_key_rw {
-            for parsed in &parsed_commands {
-                let args = parsed.args;
-                if !session.authenticated && !parsed.meta.public_without_auth {
+            let script_guard = self.store.script_read_guard();
+            for command in commands {
+                let args = command.argv();
+                if !session.authenticated && !is_public_without_auth_cmd(args[0]) {
                     resp::write_error(write_buf, "NOAUTH Authentication required");
                     continue;
                 }
@@ -3565,112 +3379,93 @@ impl CommandExecutor {
                     continue;
                 }
 
-                let cmd_result = {
-                    let _guard = self.store.script_read_guard();
-                    cmd::execute_with_wal(
-                        &self.store,
-                        &self.schema_cache,
-                        &self.broker,
-                        args,
-                        write_buf,
-                        now,
-                    )
-                };
+                let cmd_result = cmd::execute_with_wal(
+                    &self.store,
+                    &self.schema_cache,
+                    &self.broker,
+                    args,
+                    write_buf,
+                    now,
+                );
                 if let Some(action) =
                     self.apply_cmd_result(cmd_result, args, session, write_buf, now)
                 {
+                    drop(script_guard);
                     return Some(action);
                 }
             }
+            drop(script_guard);
             return None;
         }
 
-        const FL_NONE: u8 = 0;
-        const FL_READ: u8 = 1;
-        const FL_WRITE: u8 = 2;
-
         let mut shards: Vec<u32> = Vec::with_capacity(cmd_count);
-        let mut flags: Vec<u8> = Vec::with_capacity(cmd_count);
-        for parsed in &parsed_commands {
-            shards.push(self.store.shard_for_key(parsed.args[1]) as u32);
-            flags.push(match parsed.meta.access {
-                ShardAccess::SingleRead => FL_READ,
-                ShardAccess::SingleWrite => FL_WRITE,
-                ShardAccess::General => FL_NONE,
-            });
+        for (idx, command) in commands.iter().enumerate() {
+            let args = command.argv();
+            shards.push(self.store.shard_for_key(args[1]) as u32);
+            if idx >= flags.len() {
+                flags.push(cmd::pipeline_access_for_args(args));
+            }
         }
 
         let mut i = 0usize;
         while i < cmd_count {
-            let shard_idx = shards[i];
+            let shard_idx = shards[i] as usize;
             let mut batch_end = i + 1;
-            while batch_end < cmd_count && shards[batch_end] == shard_idx {
+            while batch_end < cmd_count && shards[batch_end] == shards[i] {
                 batch_end += 1;
             }
 
             let batch_flags = &flags[i..batch_end];
-            let all_classified = batch_flags.iter().all(|&f| f != FL_NONE);
-
-            if all_classified {
-                let has_writes = batch_flags.contains(&FL_WRITE);
-                if has_writes {
-                    for args in &commands[i..batch_end] {
-                        if args.len() > 1 {
-                            self.store.try_promote(args[1], now);
-                        }
-                        if args.len() > 1 && crate::eviction::is_write_command(args[0]) {
+            if batch_flags.contains(&cmd::PipelineAccess::Write) {
+                let eviction_enabled = crate::eviction::eviction_enabled(&self.store);
+                for command in &commands[i..batch_end] {
+                    let args = command.argv();
+                    self.store.try_promote(args[1], now);
+                    if crate::eviction::is_write_command(args[0]) {
+                        if eviction_enabled {
                             if let Err(e) = crate::eviction::evict_if_needed(&self.store) {
                                 resp::write_error(write_buf, e);
                                 return None;
                             }
-                            if let Err(e) = self.store.wal_log_command(args) {
-                                resp::write_error(
-                                    write_buf,
-                                    &format!("ERR WAL append failed: {e}"),
-                                );
-                                return None;
-                            }
                         }
-                    }
-                    {
-                        let mut shard = self.store.lock_write_shard(shard_idx as usize);
-                        shard.version += 1;
-                        for args in &commands[i..batch_end] {
-                            cmd::execute_on_shard(
-                                &mut shard,
-                                &self.store,
-                                &self.broker,
-                                args,
-                                write_buf,
-                                now,
-                            );
+                        if let Err(e) = self.store.wal_log_command(args) {
+                            resp::write_error(write_buf, &format!("ERR WAL append failed: {e}"));
+                            return None;
                         }
+                    } else {
+                        continue;
                     }
-                    if self.broker.has_key_subs() {
-                        for idx in i..batch_end {
-                            if batch_flags[idx - i] == FL_WRITE {
-                                let cmd_args = &commands[idx];
-                                self.broker.enqueue_key_event(cmd_args[1], cmd_args[0]);
-                            }
+                }
+
+                {
+                    let mut shard = self.store.lock_write_shard(shard_idx);
+                    shard.version += 1;
+                    for command in &commands[i..batch_end] {
+                        let args = command.argv();
+                        cmd::execute_on_shard(
+                            &mut shard,
+                            &self.store,
+                            &self.broker,
+                            args,
+                            write_buf,
+                            now,
+                        );
+                    }
+                }
+
+                if self.broker.has_key_subs() {
+                    for (offset, command) in commands[i..batch_end].iter().enumerate() {
+                        if batch_flags[offset] == cmd::PipelineAccess::Write {
+                            let args = command.argv();
+                            self.broker.enqueue_key_event(args[1], args[0]);
                         }
-                    }
-                } else {
-                    let shard = self.store.lock_read_shard(shard_idx as usize);
-                    for args in &commands[i..batch_end] {
-                        cmd::execute_on_shard_read(&shard.data, args, write_buf, now);
                     }
                 }
             } else {
-                for args in &commands[i..batch_end] {
-                    cmd::execute_with_wal(
-                        &self.store,
-                        &self.schema_cache,
-                        &self.broker,
-                        args,
-                        write_buf,
-                        now,
-                    );
-                    fire_key_events(&self.broker, args);
+                let shard = self.store.lock_read_shard(shard_idx);
+                for command in &commands[i..batch_end] {
+                    let args = command.argv();
+                    cmd::execute_on_shard_read(&shard.data, args, write_buf, now);
                 }
             }
 
@@ -4029,45 +3824,56 @@ async fn handle_connection(
                 socket.write_all(&write_buf).await?;
                 return Ok(());
             }
-            let now = Instant::now();
-            let mut parser = Parser::with_max_bulk_len(&pending, max_resp_request);
+            let execution_result = (|| {
+                let now = Instant::now();
+                let mut parser = Parser::with_max_bulk_len(&pending, max_resp_request);
 
-            let mut commands: Vec<Vec<&[u8]>> = Vec::new();
-            loop {
-                match parser.parse_command() {
-                    Ok(Some(args)) => {
-                        if !args.is_empty() {
-                            commands.push(args);
+                let mut commands: Vec<resp::CommandArgs<'_>> = Vec::new();
+                loop {
+                    match parser.parse_command_args() {
+                        Ok(Some(args)) => {
+                            if !args.is_empty() {
+                                commands.push(args);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            resp::write_error(&mut write_buf, e);
+                            return Err(());
                         }
                     }
-                    Ok(None) => break,
-                    Err(e) => {
-                        resp::write_error(&mut write_buf, e);
-                        socket.write_all(&write_buf).await?;
-                        return Ok(());
-                    }
                 }
-            }
-            let consumed = parser.pos();
+                let consumed = parser.pos();
 
-            let mut deferred_action: Option<CmdResult> = None;
+                let mut deferred_action: Option<CmdResult> = None;
 
-            if commands.len() <= 1 {
-                for args in &commands {
-                    store.add_total_commands(1);
-                    if let Some(action) =
-                        executor.execute_command(args, &mut session, &mut write_buf, now)
-                    {
-                        deferred_action = Some(action);
-                        break;
+                if commands.len() <= 1 {
+                    for command in &commands {
+                        let args = command.argv();
+                        store.add_total_commands(1);
+                        if let Some(action) =
+                            executor.execute_command(args, &mut session, &mut write_buf, now)
+                        {
+                            deferred_action = Some(action);
+                            break;
+                        }
                     }
+                } else {
+                    deferred_action =
+                        executor.execute_pipeline(&commands, &mut session, &mut write_buf, now);
                 }
-            } else {
-                deferred_action =
-                    executor.execute_pipeline(&commands, &mut session, &mut write_buf, now);
-            }
 
-            drop(commands);
+                drop(commands);
+                Ok((consumed, deferred_action))
+            })();
+
+            let (consumed, deferred_action) = match execution_result {
+                Ok(result) => result,
+                Err(()) => {
+                    socket.write_all(&write_buf).await?;
+                    return Ok(());
+                }
+            };
             let _ = pending.split_to(consumed);
 
             if !write_buf.is_empty() {
@@ -4436,6 +4242,54 @@ fn handle_script_op(out: &mut BytesMut, script_engine: &lua::ScriptEngine, args:
         }
         _ => {
             resp::write_error(out, &format!("ERR unknown subcommand '{}'", sub));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tx_tests {
+    use super::*;
+
+    #[test]
+    fn pubsub_commands_are_rejected_inside_multi() {
+        let store = Arc::new(Store::new());
+        let broker = Broker::new();
+        let schema_cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
+
+        for command in ["SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE"] {
+            let mut in_multi = true;
+            let mut tx_error = false;
+            let mut tx_queue = Vec::new();
+            let mut watched = Vec::new();
+            let mut authenticated = true;
+            let mut out = BytesMut::new();
+            let args: [&[u8]; 2] = [command.as_bytes(), b"chan"];
+
+            assert!(handle_tx_cmd(
+                &args,
+                &mut in_multi,
+                &mut tx_error,
+                &mut tx_queue,
+                &mut watched,
+                &mut authenticated,
+                &store,
+                &broker,
+                &schema_cache,
+                &mut out,
+                Instant::now(),
+            ));
+
+            let response = String::from_utf8_lossy(&out);
+            assert!(
+                response.contains(&format!(
+                    "ERR Command '{}' not allowed inside a transaction",
+                    command.to_ascii_lowercase()
+                )),
+                "{command} should be rejected, got {response}"
+            );
+            assert!(tx_error, "{command} should mark the transaction dirty");
+            assert!(tx_queue.is_empty(), "{command} should not be queued");
         }
     }
 }

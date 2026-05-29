@@ -41,6 +41,33 @@ fn send_and_read(stream: &mut TcpStream, args: &[&str]) -> String {
     String::from_utf8_lossy(&data).to_string()
 }
 
+fn send_only(stream: &mut TcpStream, args: &[&str]) {
+    stream.write_all(&resp_cmd(args)).unwrap();
+}
+
+fn read_with_timeout(stream: &mut TcpStream, timeout_ms: u64) -> String {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(timeout_ms)))
+        .unwrap();
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                data.extend_from_slice(&buf[..n]);
+                if data.ends_with(b"\r\n") {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(e) => panic!("failed reading RESP response: {e}"),
+        }
+    }
+    String::from_utf8_lossy(&data).to_string()
+}
+
 fn read_exact_responses(stream: &mut TcpStream, expected: usize) -> Vec<u8> {
     let mut data = Vec::new();
     let mut buf = [0u8; 4096];
@@ -254,6 +281,185 @@ async fn embedded_pubsub_receives_published_messages() {
     assert_eq!(message.pattern, None);
 
     drop(sub);
+    drop(client);
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn embedded_write_resp_read_and_inverse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = lux::ServerConfig {
+        port: 0,
+        shards: 4,
+        data_dir: tmp.path().display().to_string(),
+        ..Default::default()
+    };
+    let handle = lux::run_with_config(cfg).await.unwrap();
+    let client = handle.client();
+    let addr = handle.local_addr().unwrap();
+
+    client.set("cross:key:a", "from-embedded").await.unwrap();
+
+    tokio::task::spawn_blocking(move || {
+        let mut conn = connect(addr);
+        let resp = send_and_read(&mut conn, &["GET", "cross:key:a"]);
+        assert_eq!(resp, "$13\r\nfrom-embedded\r\n");
+        let set_resp = send_and_read(&mut conn, &["SET", "cross:key:b", "from-resp"]);
+        assert_eq!(set_resp, "+OK\r\n");
+    })
+    .await
+    .unwrap();
+
+    let val = client.get("cross:key:b").await.unwrap();
+    assert_eq!(val, Some(bytes::Bytes::from_static(b"from-resp")));
+
+    drop(client);
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn embedded_expire_resp_ttl_and_inverse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = lux::ServerConfig {
+        port: 0,
+        shards: 4,
+        data_dir: tmp.path().display().to_string(),
+        ..Default::default()
+    };
+    let handle = lux::run_with_config(cfg).await.unwrap();
+    let client = handle.client();
+    let addr = handle.local_addr().unwrap();
+
+    client.set("cross:ttl:a", "v").await.unwrap();
+    client
+        .expire("cross:ttl:a", Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    tokio::task::spawn_blocking(move || {
+        let mut conn = connect(addr);
+        let ttl = send_and_read(&mut conn, &["TTL", "cross:ttl:a"]);
+        assert!(ttl.starts_with(':'), "unexpected TTL response: {ttl:?}");
+        let pexpire = send_and_read(&mut conn, &["PEXPIRE", "cross:ttl:a", "2000"]);
+        assert_eq!(pexpire, ":1\r\n");
+    })
+    .await
+    .unwrap();
+
+    let pttl = client.pttl("cross:ttl:a").await.unwrap();
+    assert!(
+        (1..=2000).contains(&pttl),
+        "unexpected PTTL after PEXPIRE: {pttl}"
+    );
+
+    drop(client);
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn embedded_publish_resp_subscribe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = lux::ServerConfig {
+        port: 0,
+        shards: 4,
+        data_dir: tmp.path().display().to_string(),
+        ..Default::default()
+    };
+    let handle = lux::run_with_config(cfg).await.unwrap();
+    let client = handle.client();
+    let addr = handle.local_addr().unwrap();
+
+    let resp_side = tokio::task::spawn_blocking(move || {
+        let mut sub = connect(addr);
+        send_only(&mut sub, &["SUBSCRIBE", "cross:events"]);
+        let _confirm = read_with_timeout(&mut sub, 500);
+        read_with_timeout(&mut sub, 1500)
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let published = client
+        .execute("PUBLISH", &["cross:events", "hello-from-embedded"])
+        .await
+        .unwrap();
+    assert_eq!(&published[..], b":1\r\n");
+
+    let pushed = resp_side.await.unwrap();
+    assert!(
+        pushed.contains("hello-from-embedded"),
+        "RESP subscriber did not receive embedded publish: {pushed:?}"
+    );
+
+    drop(client);
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn resp_publish_embedded_subscribe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = lux::ServerConfig {
+        port: 0,
+        shards: 4,
+        data_dir: tmp.path().display().to_string(),
+        ..Default::default()
+    };
+    let handle = lux::run_with_config(cfg).await.unwrap();
+    let client = handle.client();
+    let mut sub = client.subscribe("cross:events2");
+    let addr = handle.local_addr().unwrap();
+
+    let published = tokio::task::spawn_blocking(move || {
+        let mut conn = connect(addr);
+        send_and_read(&mut conn, &["PUBLISH", "cross:events2", "hello-from-resp"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(published, ":1\r\n");
+
+    let message = tokio::time::timeout(Duration::from_secs(1), sub.recv())
+        .await
+        .expect("embedded subscriber should receive RESP publish")
+        .unwrap();
+    assert_eq!(message.channel, "cross:events2");
+    assert_eq!(&message.payload[..], b"hello-from-resp");
+
+    drop(sub);
+    drop(client);
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn embedded_stream_write_resp_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = lux::ServerConfig {
+        port: 0,
+        shards: 4,
+        data_dir: tmp.path().display().to_string(),
+        ..Default::default()
+    };
+    let handle = lux::run_with_config(cfg).await.unwrap();
+    let client = handle.client();
+    let addr = handle.local_addr().unwrap();
+
+    let add = client
+        .execute(
+            "XADD",
+            &["cross:stream", "*", "field", "value-from-embedded"],
+        )
+        .await
+        .unwrap();
+    assert!(add.starts_with(b"$"), "unexpected XADD response: {add:?}");
+
+    tokio::task::spawn_blocking(move || {
+        let mut conn = connect(addr);
+        let xrange = send_and_read(&mut conn, &["XRANGE", "cross:stream", "-", "+"]);
+        assert!(
+            xrange.contains("value-from-embedded"),
+            "RESP XRANGE missing embedded entry: {xrange:?}"
+        );
+    })
+    .await
+    .unwrap();
+
     drop(client);
     handle.shutdown_and_wait().await.unwrap();
 }

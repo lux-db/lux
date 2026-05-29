@@ -16,8 +16,14 @@ pub fn cmd_hset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         );
         return CmdResult::Written;
     }
-    let pairs: Vec<(&[u8], &[u8])> = args[2..].chunks(2).map(|c| (c[0], c[1])).collect();
-    match store.hset(args[1], &pairs, now) {
+    let result = if args.len() == 4 {
+        let pair = [(args[2], args[3])];
+        store.hset(args[1], &pair, now)
+    } else {
+        let pairs: Vec<(&[u8], &[u8])> = args[2..].chunks(2).map(|c| (c[0], c[1])).collect();
+        store.hset(args[1], &pairs, now)
+    };
+    match result {
         Ok(n) => {
             if is_hmset {
                 resp::write_ok(out);
@@ -56,8 +62,7 @@ pub fn cmd_hmget(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         resp::write_error(out, "ERR wrong number of arguments for 'hmget' command");
         return CmdResult::Written;
     }
-    let fields: Vec<&[u8]> = args[2..].to_vec();
-    let results = store.hmget(args[1], &fields, now);
+    let results = store.hmget(args[1], &args[2..], now);
     resp::write_array_header(out, results.len());
     for val in &results {
         resp::write_optional_bulk_raw(out, val);
@@ -70,8 +75,7 @@ pub fn cmd_hdel(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'hdel' command");
         return CmdResult::Written;
     }
-    let fields: Vec<&[u8]> = args[2..].to_vec();
-    match store.hdel(args[1], &fields, now) {
+    match store.hdel(args[1], &args[2..], now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
     }

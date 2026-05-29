@@ -32,9 +32,9 @@ fn parse_score_bound(s: &str, is_max: bool) -> (f64, bool) {
     }
 }
 
-fn parse_zstore_options(args: &[&[u8]]) -> (Vec<f64>, String) {
+fn parse_zstore_options(args: &[&[u8]]) -> (Vec<f64>, &'static str) {
     let mut weights = Vec::new();
-    let mut aggregate = "SUM".to_string();
+    let mut aggregate = "SUM";
     let mut i = 0;
     while i < args.len() {
         if cmd_eq(args[i], b"WEIGHTS") {
@@ -44,7 +44,13 @@ fn parse_zstore_options(args: &[&[u8]]) -> (Vec<f64>, String) {
                 i += 1;
             }
         } else if cmd_eq(args[i], b"AGGREGATE") && i + 1 < args.len() {
-            aggregate = arg_str(args[i + 1]).to_uppercase();
+            aggregate = if cmd_eq(args[i + 1], b"MIN") {
+                "MIN"
+            } else if cmd_eq(args[i + 1], b"MAX") {
+                "MAX"
+            } else {
+                "SUM"
+            };
             i += 2;
         } else {
             i += 1;
@@ -71,6 +77,24 @@ fn write_zset_result(out: &mut BytesMut, items: &[(String, f64)], with_scores: b
 pub fn cmd_zadd(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 4 {
         resp::write_error(out, "ERR wrong number of arguments for 'zadd' command");
+        return CmdResult::Written;
+    }
+    if args.len() == 4 {
+        let score: f64 = match arg_str(args[2]).parse::<f64>() {
+            Ok(s) if s.is_nan() => {
+                resp::write_error(out, "ERR value is not a valid float");
+                return CmdResult::Written;
+            }
+            Ok(s) => s,
+            Err(_) => {
+                resp::write_error(out, "ERR value is not a valid float");
+                return CmdResult::Written;
+            }
+        };
+        match store.zadd_single_default(args[1], args[3], score, now) {
+            Ok(count) => resp::write_integer(out, count),
+            Err(error) => resp::write_error(out, &error),
+        };
         return CmdResult::Written;
     }
     let mut nx = false;
@@ -106,14 +130,7 @@ pub fn cmd_zadd(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         );
         return CmdResult::Written;
     }
-    if nx && gt {
-        resp::write_error(
-            out,
-            "ERR GT, LT, and NX options at the same time are not compatible",
-        );
-        return CmdResult::Written;
-    }
-    if nx && lt {
+    if nx && (gt || lt) {
         resp::write_error(
             out,
             "ERR GT, LT, and NX options at the same time are not compatible",
@@ -131,7 +148,7 @@ pub fn cmd_zadd(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
-    let mut members = Vec::new();
+    let mut members = Vec::with_capacity((args.len() - i) / 2);
     while i + 1 < args.len() {
         let score: f64 = match arg_str(args[i]).parse::<f64>() {
             Ok(s) if s.is_nan() => {
@@ -175,8 +192,7 @@ pub fn cmd_zmscore(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
         resp::write_error(out, "ERR wrong number of arguments for 'zmscore' command");
         return CmdResult::Written;
     }
-    let members: Vec<&[u8]> = args[2..].to_vec();
-    match store.zmscore(args[1], &members, now) {
+    match store.zmscore(args[1], &args[2..], now) {
         Ok(scores) => {
             resp::write_array_header(out, scores.len());
             for s in &scores {
@@ -222,8 +238,7 @@ pub fn cmd_zrem(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'zrem' command");
         return CmdResult::Written;
     }
-    let members: Vec<&[u8]> = args[2..].to_vec();
-    match store.zrem(args[1], &members, now) {
+    match store.zrem(args[1], &args[2..], now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
     }
@@ -305,6 +320,15 @@ pub fn cmd_zincrby(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
 pub fn cmd_zrange(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 4 {
         resp::write_error(out, "ERR wrong number of arguments for 'zrange' command");
+        return CmdResult::Written;
+    }
+    if args.len() == 4 {
+        let start = parse_i64(args[2]).unwrap_or(0);
+        let stop = parse_i64(args[3]).unwrap_or(-1);
+        match store.zrange(args[1], start, stop, false, false, now) {
+            Ok(items) => write_zset_result(out, &items, false),
+            Err(e) => resp::write_error(out, &e),
+        }
         return CmdResult::Written;
     }
     let mut reverse = false;
@@ -669,9 +693,8 @@ pub fn cmd_zunionstore(
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
-    let keys: Vec<&[u8]> = args[3..3 + numkeys].to_vec();
     let (weights, aggregate) = parse_zstore_options(&args[3 + numkeys..]);
-    match store.zunionstore(args[1], &keys, &weights, &aggregate, now) {
+    match store.zunionstore(args[1], &args[3..3 + numkeys], &weights, aggregate, now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
     }
@@ -696,9 +719,8 @@ pub fn cmd_zinterstore(
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
-    let keys: Vec<&[u8]> = args[3..3 + numkeys].to_vec();
     let (weights, aggregate) = parse_zstore_options(&args[3 + numkeys..]);
-    match store.zinterstore(args[1], &keys, &weights, &aggregate, now) {
+    match store.zinterstore(args[1], &args[3..3 + numkeys], &weights, aggregate, now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
     }
@@ -723,8 +745,7 @@ pub fn cmd_zdiffstore(
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
-    let keys: Vec<&[u8]> = args[3..3 + numkeys].to_vec();
-    match store.zdiffstore(args[1], &keys, now) {
+    match store.zdiffstore(args[1], &args[3..3 + numkeys], now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
     }
@@ -885,9 +906,8 @@ pub fn cmd_bzpopmin(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
     }
     let is_min = cmd_eq(args[0], b"BZPOPMIN");
     let timeout_secs: f64 = arg_str(args[args.len() - 1]).parse().unwrap_or(0.0);
-    let keys: Vec<&[u8]> = args[1..args.len() - 1].to_vec();
-
-    for key in &keys {
+    let keys = &args[1..args.len() - 1];
+    for key in keys {
         let result = if is_min {
             store.zpopmin(key, 1, now)
         } else {

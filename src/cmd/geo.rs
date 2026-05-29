@@ -29,13 +29,13 @@ fn lookup_member_coords(
     member: &[u8],
     now: Instant,
 ) -> Result<MemberLookup, String> {
-    match store.zscore(key, member, now) {
-        Ok(Some(s)) => {
+    match store.zscore_with_key_state(key, member, now) {
+        Ok((Some(s), _)) => {
             let (lon, lat) = geo::geohash_decode(s as u64);
             Ok(MemberLookup::Found(lon, lat))
         }
-        Ok(None) => {
-            if store.exists(&[key], now) == 0 {
+        Ok((None, key_exists)) => {
+            if !key_exists {
                 Ok(MemberLookup::KeyMissing)
             } else {
                 Ok(MemberLookup::MemberMissing)
@@ -157,31 +157,34 @@ pub fn cmd_geodist(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
 }
 
 pub fn cmd_geopos(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
-    if args.len() < 2 {
+    if args.len() < 3 {
         resp::write_error(out, "ERR wrong number of arguments for 'geopos' command");
         return CmdResult::Written;
     }
-    resp::write_array_header(out, args.len().saturating_sub(2));
-    for member in args.get(2..).unwrap_or(&[]) {
-        match store.zscore(args[1], member, now) {
-            Ok(Some(s)) => {
-                let (lon, lat) = geo::geohash_decode(s as u64);
-                resp::write_array_header(out, 2);
-                resp::write_bulk(out, &format_geo_coord(lon));
-                resp::write_bulk(out, &format_geo_coord(lat));
-            }
-            Ok(None) => resp::write_null_array(out),
-            Err(e) => {
-                resp::write_error(out, &e);
-                return CmdResult::Written;
-            }
+    let members = args.get(2..).unwrap_or(&[]);
+    let scores = match store.zscores(args[1], members, now) {
+        Ok(scores) => scores,
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
+    };
+    resp::write_array_header(out, members.len());
+    for score in scores {
+        if let Some(s) = score {
+            let (lon, lat) = geo::geohash_decode(s as u64);
+            resp::write_array_header(out, 2);
+            resp::write_bulk(out, &format_geo_coord(lon));
+            resp::write_bulk(out, &format_geo_coord(lat));
+        } else {
+            resp::write_null_array(out);
         }
     }
     CmdResult::Written
 }
 
 pub fn cmd_geohash(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
-    if args.len() < 2 {
+    if args.len() < 3 {
         resp::write_error(out, "ERR wrong number of arguments for 'geohash' command");
         return CmdResult::Written;
     }
@@ -230,7 +233,75 @@ fn execute_geosearch(
     params: &GeoSearchParams,
     now: Instant,
 ) -> Result<Vec<GeoResult>, String> {
-    let items = if let Some(radius) = params.radius_m {
+    let radius_bounds = params.radius_m.map(|radius| {
+        let lat_delta = (radius / 6372797.560856).to_degrees();
+        let lon_delta = if params.center_lat.abs() < 89.0 {
+            (radius / (6372797.560856 * params.center_lat.to_radians().cos())).to_degrees()
+        } else {
+            360.0
+        };
+        (
+            (params.center_lon - lon_delta).max(-180.0),
+            (params.center_lon + lon_delta).min(180.0),
+            (params.center_lat - lat_delta).max(-85.05112878),
+            (params.center_lat + lat_delta).min(85.05112878),
+        )
+    });
+    let mut results: Vec<GeoResult> = Vec::new();
+    let topk_asc_radius = params.radius_m.is_some()
+        && params.sort == Some(true)
+        && params.count.is_some()
+        && !params.count_any;
+    let topk_limit = params.count.unwrap_or(0);
+    let mut process = |member: &str, score: f64| {
+        let hash = score as u64;
+        let (lon, lat) = geo::geohash_decode(hash);
+        if let Some((min_lon, max_lon, min_lat, max_lat)) = radius_bounds {
+            if lon < min_lon || lon > max_lon || lat < min_lat || lat > max_lat {
+                return;
+            }
+        }
+        let dist = geo::haversine(params.center_lon, params.center_lat, lon, lat);
+
+        let in_area = if let Some(radius) = params.radius_m {
+            dist <= radius
+        } else if let (Some(w), Some(h)) = (params.box_width_m, params.box_height_m) {
+            geo::in_box(params.center_lon, params.center_lat, w, h, lon, lat)
+        } else {
+            false
+        };
+
+        if in_area {
+            let candidate = GeoResult {
+                member: member.to_string(),
+                dist,
+                hash,
+                lon,
+                lat,
+            };
+            if topk_asc_radius && topk_limit > 0 {
+                if results.len() < topk_limit {
+                    results.push(candidate);
+                } else {
+                    let mut worst_idx = 0usize;
+                    let mut worst_dist = results[0].dist;
+                    for (i, r) in results.iter().enumerate().skip(1) {
+                        if r.dist > worst_dist {
+                            worst_dist = r.dist;
+                            worst_idx = i;
+                        }
+                    }
+                    if candidate.dist < worst_dist {
+                        results[worst_idx] = candidate;
+                    }
+                }
+            } else {
+                results.push(candidate);
+            }
+        }
+    };
+
+    if let Some(radius) = params.radius_m {
         let padded = radius * 2.0;
         let lat_delta = (padded / 6372797.560856).to_degrees();
         let lon_delta = if params.center_lat.abs() < 89.0 {
@@ -249,40 +320,14 @@ fn execute_geosearch(
                 geo::geohash_encode(min_lon, max_lat),
                 geo::geohash_encode(max_lon, min_lat),
             ];
-            let lo = *hashes.iter().min().unwrap();
-            let hi = *hashes.iter().max().unwrap();
-            store.zrangebyscore(
-                key, lo as f64, hi as f64, false, false, false, None, None, true, now,
-            )?
+            let lo = *hashes.iter().min().unwrap() as f64;
+            let hi = *hashes.iter().max().unwrap() as f64;
+            store.zvisit_scores_inclusive(key, lo, hi, now, &mut process)?;
         } else {
-            store.zrange(key, 0, -1, false, true, now)?
+            store.zvisit_all_scores(key, now, &mut process)?;
         }
     } else {
-        store.zrange(key, 0, -1, false, true, now)?
-    };
-    let mut results: Vec<GeoResult> = Vec::new();
-    for (member, score) in &items {
-        let hash = *score as u64;
-        let (lon, lat) = geo::geohash_decode(hash);
-        let dist = geo::haversine(params.center_lon, params.center_lat, lon, lat);
-
-        let in_area = if let Some(radius) = params.radius_m {
-            dist <= radius
-        } else if let (Some(w), Some(h)) = (params.box_width_m, params.box_height_m) {
-            geo::in_box(params.center_lon, params.center_lat, w, h, lon, lat)
-        } else {
-            false
-        };
-
-        if in_area {
-            results.push(GeoResult {
-                member: member.clone(),
-                dist,
-                hash,
-                lon,
-                lat,
-            });
-        }
+        store.zvisit_all_scores(key, now, &mut process)?;
     }
 
     if params.count_any {

@@ -1,5 +1,6 @@
 use bytes::{BufMut, BytesMut};
 
+// Pre-encoded RESP fragments reused across hot paths to avoid reformatting.
 pub static OK: &[u8] = b"+OK\r\n";
 pub static PONG: &[u8] = b"+PONG\r\n";
 pub static NULL: &[u8] = b"$-1\r\n";
@@ -11,38 +12,46 @@ pub static EMPTY_ARRAY: &[u8] = b"*0\r\n";
 pub static QUEUED: &[u8] = b"+QUEUED\r\n";
 pub static NULL_ARRAY: &[u8] = b"*-1\r\n";
 
+/// Writes a pre-encoded `+OK` simple string.
 pub fn write_ok(buf: &mut BytesMut) {
     buf.extend_from_slice(OK);
 }
 
+/// Writes a pre-encoded `+PONG` simple string.
 pub fn write_pong(buf: &mut BytesMut) {
     buf.extend_from_slice(PONG);
 }
 
+/// Writes a RESP null bulk (`$-1`).
 pub fn write_null(buf: &mut BytesMut) {
     buf.extend_from_slice(NULL);
 }
 
+/// Writes the transaction `+QUEUED` marker.
 pub fn write_queued(buf: &mut BytesMut) {
     buf.extend_from_slice(QUEUED);
 }
 
+/// Writes a RESP null array (`*-1`).
 pub fn write_null_array(buf: &mut BytesMut) {
     buf.extend_from_slice(NULL_ARRAY);
 }
 
+/// Writes a RESP simple string (`+...`).
 pub fn write_simple(buf: &mut BytesMut, s: &str) {
     buf.put_u8(b'+');
     buf.extend_from_slice(s.as_bytes());
     buf.extend_from_slice(b"\r\n");
 }
 
+/// Writes a RESP error (`-...`).
 pub fn write_error(buf: &mut BytesMut, s: &str) {
     buf.put_u8(b'-');
     buf.extend_from_slice(s.as_bytes());
     buf.extend_from_slice(b"\r\n");
 }
 
+/// Writes a RESP integer (`:...`), using cached common values on hot paths.
 pub fn write_integer(buf: &mut BytesMut, n: i64) {
     match n {
         0 => buf.extend_from_slice(ZERO),
@@ -58,10 +67,12 @@ pub fn write_integer(buf: &mut BytesMut, n: i64) {
     }
 }
 
+/// Writes a UTF-8 RESP bulk string.
 pub fn write_bulk(buf: &mut BytesMut, s: &str) {
     write_bulk_raw(buf, s.as_bytes());
 }
 
+/// Writes a raw RESP bulk string payload.
 pub fn write_bulk_raw(buf: &mut BytesMut, data: &[u8]) {
     buf.put_u8(b'$');
     let mut tmp = itoa::Buffer::new();
@@ -71,6 +82,7 @@ pub fn write_bulk_raw(buf: &mut BytesMut, data: &[u8]) {
     buf.extend_from_slice(b"\r\n");
 }
 
+/// Writes a RESP array header (`*len`).
 pub fn write_array_header(buf: &mut BytesMut, len: usize) {
     if len == 0 {
         buf.extend_from_slice(EMPTY_ARRAY);
@@ -82,6 +94,7 @@ pub fn write_array_header(buf: &mut BytesMut, len: usize) {
     }
 }
 
+/// Writes a RESP3 map header (`%len`).
 pub fn write_map_header(buf: &mut BytesMut, len: usize) {
     buf.put_u8(b'%');
     let mut tmp = itoa::Buffer::new();
@@ -89,6 +102,7 @@ pub fn write_map_header(buf: &mut BytesMut, len: usize) {
     buf.extend_from_slice(b"\r\n");
 }
 
+/// Writes an array of bulk strings from owned `String` values.
 pub fn write_bulk_array(buf: &mut BytesMut, items: &[String]) {
     write_array_header(buf, items.len());
     for item in items {
@@ -96,6 +110,7 @@ pub fn write_bulk_array(buf: &mut BytesMut, items: &[String]) {
     }
 }
 
+/// Writes an array of bulk strings from byte buffers.
 pub fn write_bulk_array_raw(buf: &mut BytesMut, items: &[bytes::Bytes]) {
     write_array_header(buf, items.len());
     for item in items {
@@ -103,6 +118,7 @@ pub fn write_bulk_array_raw(buf: &mut BytesMut, items: &[bytes::Bytes]) {
     }
 }
 
+/// Writes an optional bulk value (`$-1` when absent).
 pub fn write_optional_bulk_raw(buf: &mut BytesMut, val: &Option<bytes::Bytes>) {
     match val {
         Some(s) => write_bulk_raw(buf, s),
@@ -110,10 +126,68 @@ pub fn write_optional_bulk_raw(buf: &mut BytesMut, val: &Option<bytes::Bytes>) {
     }
 }
 
+/// Incremental RESP parser over a borrowed read buffer.
 pub struct Parser<'a> {
     buf: &'a [u8],
     pos: usize,
     max_bulk_len: usize,
+}
+
+const INLINE_ARG_COUNT: usize = 8;
+
+/// Small-vector command argument holder optimized for common tiny argv lists.
+pub(crate) struct CommandArgs<'a> {
+    inline: [&'a [u8]; INLINE_ARG_COUNT],
+    len: usize,
+    heap: Vec<&'a [u8]>,
+}
+
+impl<'a> CommandArgs<'a> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inline: [b"" as &'a [u8]; INLINE_ARG_COUNT],
+            len: 0,
+            heap: if capacity > INLINE_ARG_COUNT {
+                Vec::with_capacity(capacity)
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn push(&mut self, arg: &'a [u8]) {
+        // Stay stack-only for small commands, spill once to heap for larger ones.
+        if !self.heap.is_empty() || self.heap.capacity() > 0 {
+            self.heap.push(arg);
+        } else if self.len < INLINE_ARG_COUNT {
+            self.inline[self.len] = arg;
+            self.len += 1;
+        } else {
+            self.heap = Vec::with_capacity(INLINE_ARG_COUNT * 2);
+            self.heap.extend_from_slice(&self.inline[..self.len]);
+            self.heap.push(arg);
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[&'a [u8]] {
+        if self.heap.is_empty() {
+            &self.inline[..self.len]
+        } else {
+            self.heap.as_slice()
+        }
+    }
+
+    fn into_vec(self) -> Vec<&'a [u8]> {
+        if self.heap.is_empty() {
+            self.inline[..self.len].to_vec()
+        } else {
+            self.heap
+        }
+    }
 }
 
 impl<'a> Parser<'a> {
@@ -135,16 +209,21 @@ impl<'a> Parser<'a> {
     }
 
     pub fn parse_command(&mut self) -> Result<Option<Vec<&'a [u8]>>, &'static str> {
+        Ok(self.parse_command_args()?.map(CommandArgs::into_vec))
+    }
+
+    pub(crate) fn parse_command_args(&mut self) -> Result<Option<CommandArgs<'a>>, &'static str> {
+        // Return None for "need more bytes", Err for protocol violations.
         if self.pos >= self.buf.len() {
             return Ok(None);
         }
         match self.buf[self.pos] {
-            b'*' => self.parse_multibulk(),
-            _ => self.parse_inline(),
+            b'*' => self.parse_multibulk_args(),
+            _ => self.parse_inline_args(),
         }
     }
 
-    fn parse_inline(&mut self) -> Result<Option<Vec<&'a [u8]>>, &'static str> {
+    fn parse_inline_args(&mut self) -> Result<Option<CommandArgs<'a>>, &'static str> {
         let start = self.pos;
         while self.pos < self.buf.len() {
             if self.buf[self.pos] == b'\n' {
@@ -155,22 +234,25 @@ impl<'a> Parser<'a> {
                 };
                 self.pos += 1;
                 let line = &self.buf[start..end];
-                let parts: Vec<&'a [u8]> = line
-                    .split(|&b| b == b' ')
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if parts.is_empty() {
+                let mut args = CommandArgs::new(0);
+                for part in line.split(|&b| b == b' ') {
+                    if !part.is_empty() {
+                        args.push(part);
+                    }
+                }
+                if args.is_empty() {
                     return Ok(None);
                 }
-                return Ok(Some(parts));
+                return Ok(Some(args));
             }
             self.pos += 1;
         }
+        // Incomplete line: restore cursor so caller can retry with more input.
         self.pos = start;
         Ok(None)
     }
 
-    fn parse_multibulk(&mut self) -> Result<Option<Vec<&'a [u8]>>, &'static str> {
+    fn parse_multibulk_args(&mut self) -> Result<Option<CommandArgs<'a>>, &'static str> {
         let saved = self.pos;
         self.pos += 1;
         let count = match self.read_line_int() {
@@ -188,11 +270,12 @@ impl<'a> Parser<'a> {
         if count > 1_048_576 {
             return Err("ERR RESP array count exceeds maximum");
         }
-        let mut args = Vec::with_capacity(count as usize);
+        let mut args = CommandArgs::new(count as usize);
         for _ in 0..count {
             match self.parse_bulk_string()? {
                 Some(s) => args.push(s),
                 None => {
+                    // Roll back full frame on partial command for incremental parsing.
                     self.pos = saved;
                     return Ok(None);
                 }
@@ -202,7 +285,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_bulk_string(&mut self) -> Result<Option<&'a [u8]>, &'static str> {
-        if self.pos >= self.buf.len() || self.buf[self.pos] != b'$' {
+        if self.pos >= self.buf.len() {
+            return Ok(None);
+        }
+        if self.buf[self.pos] != b'$' {
             return Err("ERR expected bulk string");
         }
         self.pos += 1;
@@ -211,6 +297,7 @@ impl<'a> Parser<'a> {
             None => return Ok(None),
         };
         if len < 0 {
+            // Redis uses `$-1` for null bulk; command parser normalizes to empty here.
             return Ok(Some(b""));
         }
         let len = len as usize;
@@ -245,12 +332,14 @@ impl<'a> Parser<'a> {
             }
             self.pos += 1;
         }
+        // Incomplete line: keep parser retry-safe by restoring cursor.
         self.pos = start;
         None
     }
 }
 
 pub mod itoa {
+    /// Tiny integer formatter used to avoid pulling in std formatting in hot paths.
     pub struct Buffer {
         buf: [u8; 20],
         pos: usize,

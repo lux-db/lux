@@ -18,8 +18,7 @@ pub fn cmd_lpush(
         resp::write_error(out, "ERR wrong number of arguments for 'lpush' command");
         return CmdResult::Written;
     }
-    let vals: Vec<&[u8]> = args[2..].to_vec();
-    match store.lpush(args[1], &vals, now) {
+    match store.lpush(args[1], &args[2..], now) {
         Ok(n) => {
             resp::write_integer(out, n);
             let key_s = arg_str(args[1]);
@@ -45,8 +44,7 @@ pub fn cmd_rpush(
         resp::write_error(out, "ERR wrong number of arguments for 'rpush' command");
         return CmdResult::Written;
     }
-    let vals: Vec<&[u8]> = args[2..].to_vec();
-    match store.rpush(args[1], &vals, now) {
+    match store.rpush(args[1], &args[2..], now) {
         Ok(n) => {
             resp::write_integer(out, n);
             let key_s = arg_str(args[1]);

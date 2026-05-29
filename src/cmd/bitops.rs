@@ -139,16 +139,26 @@ pub fn cmd_bitop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         resp::write_error(out, "ERR wrong number of arguments for 'bitop' command");
         return CmdResult::Written;
     }
-    let op = arg_str(args[1]).to_uppercase();
+    let op = if cmd_eq(args[1], b"AND") {
+        "AND"
+    } else if cmd_eq(args[1], b"OR") {
+        "OR"
+    } else if cmd_eq(args[1], b"XOR") {
+        "XOR"
+    } else if cmd_eq(args[1], b"NOT") {
+        "NOT"
+    } else {
+        arg_str(args[1])
+    };
     let dest = args[2];
-    let src_keys: Vec<&[u8]> = args[3..].to_vec();
+    let src_keys = &args[3..];
 
     if op == "NOT" && src_keys.len() != 1 {
         resp::write_error(out, "ERR BITOP NOT requires one and only one key");
         return CmdResult::Written;
     }
 
-    match store.bitop(&op, dest, &src_keys, now) {
+    match store.bitop(op, dest, src_keys, now) {
         Ok(len) => resp::write_integer(out, len as i64),
         Err(e) => resp::write_error(out, &e),
     }

@@ -132,7 +132,9 @@ pub fn cmd_get(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
         resp::write_error(out, "ERR wrong number of arguments for 'get' command");
         return CmdResult::Written;
     }
-    resp::write_optional_bulk_raw(out, &store.get(args[1], now));
+    let idx = store.shard_for_key(args[1]);
+    let shard = store.lock_read_shard(idx);
+    Store::get_and_write(&shard.data, args[1], now, out);
     CmdResult::Written
 }
 
@@ -240,7 +242,9 @@ pub fn cmd_mget(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     }
     resp::write_array_header(out, args.len() - 1);
     for key in &args[1..] {
-        resp::write_optional_bulk_raw(out, &store.get(key, now));
+        let idx = store.shard_for_key(key);
+        let shard = store.lock_read_shard(idx);
+        Store::get_and_write(&shard.data, key, now, out);
     }
     CmdResult::Written
 }
@@ -250,11 +254,7 @@ pub fn cmd_mset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'mset' command");
         return CmdResult::Written;
     }
-    let mut i = 1;
-    while i < args.len() {
-        store.set(args[i], args[i + 1], None, now);
-        i += 2;
-    }
+    store.mset_from_args(&args[1..], now);
     resp::write_ok(out);
     CmdResult::Written
 }

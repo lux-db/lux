@@ -8,6 +8,7 @@ use bytes::Bytes;
 
 use crate::LuxError;
 
+/// Canonical command reply model used by embedded execution surfaces.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CommandOutput {
     Nil,
@@ -17,6 +18,7 @@ pub(crate) enum CommandOutput {
     Array(Vec<CommandOutput>),
 }
 
+/// Coarse-grained command behavior class used by routing/validation logic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommandKind {
     General,
@@ -26,6 +28,7 @@ pub(crate) enum CommandKind {
     Blocking,
 }
 
+/// Pub/Sub sub-classification for command behavior metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PubSubCommand {
     Subscribe,
@@ -37,13 +40,7 @@ pub(crate) enum PubSubCommand {
     Publish,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ShardAccess {
-    General,
-    SingleRead,
-    SingleWrite,
-}
-
+/// Parsed `SET` options in normalized typed form.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SetOption {
     Ex(u64),
@@ -53,6 +50,7 @@ pub(crate) enum SetOption {
     KeepTtl,
 }
 
+/// Borrowed GEOADD member tuple used in typed command dispatch.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GeoAddMember<'a> {
     pub longitude: f64,
@@ -60,6 +58,7 @@ pub(crate) struct GeoAddMember<'a> {
     pub member: &'a [u8],
 }
 
+/// Owned command representation produced from argv parsing/preparation.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum OwnedCommand {
     Ping,
@@ -273,6 +272,7 @@ pub(crate) enum OwnedCommand {
     },
 }
 
+/// Owned GEOADD member tuple for `OwnedCommand::GeoAdd`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct OwnedGeoAddMember {
     longitude: f64,
@@ -280,6 +280,7 @@ pub(crate) struct OwnedGeoAddMember {
     member: Vec<u8>,
 }
 
+/// Owned-command helper methods for borrowing, introspection, and conversions.
 impl OwnedCommand {
     pub(crate) fn as_borrowed(&self) -> Command<'_> {
         match self {
@@ -551,6 +552,7 @@ impl OwnedCommand {
     }
 }
 
+/// Parses RESP/HTTP argv into a normalized owned command.
 pub(crate) fn prepare_owned_argv(argv: Vec<Vec<u8>>) -> Result<OwnedCommand, LuxError> {
     let Some(name) = argv.first() else {
         return Err(LuxError::InvalidCommand("empty command".to_string()));
@@ -855,11 +857,13 @@ pub(crate) fn prepare_owned_argv(argv: Vec<Vec<u8>>) -> Result<OwnedCommand, Lux
     Ok(command)
 }
 
+/// Converts a full argv vector into a fallback raw command variant.
 fn owned_raw(mut argv: Vec<Vec<u8>>) -> OwnedCommand {
     let name = argv.remove(0);
     OwnedCommand::Raw { name, args: argv }
 }
 
+/// Parses the optional tail of `SET` arguments into typed options.
 fn parse_set_options(args: &[Vec<u8>]) -> Option<Vec<SetOption>> {
     let mut options = Vec::new();
     let mut i = 0;
@@ -886,6 +890,7 @@ fn parse_set_options(args: &[Vec<u8>]) -> Option<Vec<SetOption>> {
     Some(options)
 }
 
+/// Normalizes a GEODIST unit token to its canonical lowercase representation.
 fn parse_geo_unit(unit: &[u8]) -> Option<&'static [u8]> {
     if eq(unit, b"M") {
         Some(b"m")
@@ -900,10 +905,12 @@ fn parse_geo_unit(unit: &[u8]) -> Option<&'static [u8]> {
     }
 }
 
+/// Returns true when the token is an XADD stream option keyword.
 fn is_xadd_option(arg: &[u8]) -> bool {
     eq(arg, b"NOMKSTREAM") || eq(arg, b"MAXLEN") || eq(arg, b"MINID")
 }
 
+/// Parses a UTF-8 argv token into a typed value with command-aware error text.
 fn parse_arg<T>(arg: &[u8], label: &str) -> Result<T, LuxError>
 where
     T: std::str::FromStr,
@@ -914,16 +921,19 @@ where
         .map_err(|_| LuxError::InvalidCommand(format!("invalid {label}: {text}")))
 }
 
+/// Builds owned key/value pairs from alternating argv tokens.
 fn pairs_from_args(args: &[Vec<u8>]) -> Vec<(Vec<u8>, Vec<u8>)> {
     args.chunks_exact(2)
         .map(|pair| (pair[0].clone(), pair[1].clone()))
         .collect()
 }
 
+/// Converts owned byte vectors into borrowed byte-slice references.
 fn bytes_vec_refs(values: &[Vec<u8>]) -> Vec<&[u8]> {
     values.iter().map(Vec::as_slice).collect()
 }
 
+/// Converts owned key/value pairs into borrowed key/value pair references.
 fn pair_vec_refs(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<(&[u8], &[u8])> {
     pairs
         .iter()
@@ -1488,33 +1498,40 @@ impl<'a> Command<'a> {
     }
 }
 
+/// Pushes a static command name into an argv buffer.
 fn push_name(out: &mut Vec<Vec<u8>>, name: &'static [u8]) {
     out.push(name.to_vec());
 }
 
+/// Pushes a borrowed argument as an owned argv token.
 fn push_arg(out: &mut Vec<Vec<u8>>, arg: &[u8]) {
     out.push(arg.to_vec());
 }
 
+/// Pushes an integer-like value rendered as UTF-8 bytes.
 fn push_int<T: std::fmt::Display>(out: &mut Vec<Vec<u8>>, n: T) {
     out.push(n.to_string().into_bytes());
 }
 
+/// Pushes a floating-point value rendered as UTF-8 bytes.
 fn push_float(out: &mut Vec<Vec<u8>>, n: f64) {
     out.push(n.to_string().into_bytes());
 }
 
+/// Appends a command name followed by a single key argument.
 fn push_key(out: &mut Vec<Vec<u8>>, name: &'static [u8], key: &[u8]) {
     push_name(out, name);
     push_arg(out, key);
 }
 
+/// Appends a command name followed by key and value arguments.
 fn push_key_value(out: &mut Vec<Vec<u8>>, name: &'static [u8], key: &[u8], value: &[u8]) {
     push_name(out, name);
     push_arg(out, key);
     push_arg(out, value);
 }
 
+/// Appends a command name followed by a variadic value list.
 fn push_many(out: &mut Vec<Vec<u8>>, name: &'static [u8], values: &[&[u8]]) {
     push_name(out, name);
     for value in values {
@@ -1522,6 +1539,7 @@ fn push_many(out: &mut Vec<Vec<u8>>, name: &'static [u8], values: &[&[u8]]) {
     }
 }
 
+/// Appends a command name, key, and variadic value list.
 fn push_key_many(out: &mut Vec<Vec<u8>>, name: &'static [u8], key: &[u8], values: &[&[u8]]) {
     push_name(out, name);
     push_arg(out, key);
@@ -1530,6 +1548,7 @@ fn push_key_many(out: &mut Vec<Vec<u8>>, name: &'static [u8], key: &[u8], values
     }
 }
 
+/// Appends a command name followed by alternating key/value tokens.
 fn push_pairs(out: &mut Vec<Vec<u8>>, name: &'static [u8], pairs: &[(&[u8], &[u8])]) {
     push_name(out, name);
     for (key, value) in pairs {
@@ -1538,20 +1557,22 @@ fn push_pairs(out: &mut Vec<Vec<u8>>, name: &'static [u8], pairs: &[(&[u8], &[u8
     }
 }
 
+/// Metadata attached to a parsed command for scheduler/routing decisions.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CommandMeta {
     pub kind: CommandKind,
-    pub access: ShardAccess,
-    pub public_without_auth: bool,
 }
 
+/// Parsed argv view with precomputed command metadata.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ParsedCommand<'a> {
+    #[allow(dead_code)]
     pub args: &'a [&'a [u8]],
     pub name: &'a [u8],
     pub meta: CommandMeta,
 }
 
+/// Errors returned by the command parser front-door.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CommandParseError {
     Empty,
@@ -1572,6 +1593,7 @@ impl std::fmt::Display for CommandParseError {
     }
 }
 
+/// Fully parses and validates an argv slice into a typed parsed command view.
 pub(crate) fn parse<'a>(args: &'a [&'a [u8]]) -> Result<ParsedCommand<'a>, CommandParseError> {
     let name = args.first().copied().ok_or(CommandParseError::Empty)?;
     if name.is_empty() {
@@ -1585,6 +1607,23 @@ pub(crate) fn parse<'a>(args: &'a [&'a [u8]]) -> Result<ParsedCommand<'a>, Comma
     })
 }
 
+/// Parses argv and computes metadata without UTF-8 identity validation.
+#[allow(dead_code)]
+pub(crate) fn parse_shallow<'a>(
+    args: &'a [&'a [u8]],
+) -> Result<ParsedCommand<'a>, CommandParseError> {
+    let name = args.first().copied().ok_or(CommandParseError::Empty)?;
+    if name.is_empty() {
+        return Err(CommandParseError::Empty);
+    }
+    Ok(ParsedCommand {
+        args,
+        name,
+        meta: meta(name),
+    })
+}
+
+/// Validates UTF-8 identity-bearing arguments for command families.
 fn validate_utf8_identity_args(args: &[&[u8]]) -> Result<(), CommandParseError> {
     let Some(cmd) = args.first().copied() else {
         return Err(CommandParseError::Empty);
@@ -1715,113 +1754,112 @@ fn validate_utf8_identity_args(args: &[&[u8]]) -> Result<(), CommandParseError> 
     key_only(args)
 }
 
+/// Case-insensitive ASCII command token equality helper.
 pub(crate) fn eq(input: &[u8], expected: &[u8]) -> bool {
-    input.len() == expected.len()
-        && input
-            .iter()
-            .zip(expected)
-            .all(|(a, b)| a.to_ascii_uppercase() == *b)
+    if input == expected {
+        return true;
+    }
+    if input.len() != expected.len() {
+        return false;
+    }
+    for i in 0..input.len() {
+        let b = input[i];
+        let upper = if b.is_ascii_lowercase() { b - 32 } else { b };
+        if upper != expected[i] {
+            return false;
+        }
+    }
+    true
 }
 
+/// Builds command metadata for a parsed command name.
 fn meta(cmd: &[u8]) -> CommandMeta {
-    let kind = command_kind(cmd);
     CommandMeta {
-        kind,
-        access: shard_access(cmd),
-        public_without_auth: public_without_auth(cmd),
+        kind: command_kind(cmd),
     }
 }
 
+/// Classifies a command name into behavior groups.
 fn command_kind(cmd: &[u8]) -> CommandKind {
-    if eq(cmd, b"AUTH") {
-        return CommandKind::Auth;
+    if cmd.is_empty() {
+        return CommandKind::General;
     }
-    if eq(cmd, b"MULTI")
-        || eq(cmd, b"EXEC")
-        || eq(cmd, b"DISCARD")
-        || eq(cmd, b"WATCH")
-        || eq(cmd, b"UNWATCH")
-    {
-        return CommandKind::Transaction;
-    }
-    if eq(cmd, b"SUBSCRIBE") {
-        return CommandKind::PubSub(PubSubCommand::Subscribe);
-    }
-    if eq(cmd, b"UNSUBSCRIBE") {
-        return CommandKind::PubSub(PubSubCommand::Unsubscribe);
-    }
-    if eq(cmd, b"PSUBSCRIBE") {
-        return CommandKind::PubSub(PubSubCommand::PSubscribe);
-    }
-    if eq(cmd, b"PUNSUBSCRIBE") {
-        return CommandKind::PubSub(PubSubCommand::PUnsubscribe);
-    }
-    if eq(cmd, b"KSUB") {
-        return CommandKind::PubSub(PubSubCommand::KSubscribe);
-    }
-    if eq(cmd, b"KUNSUB") {
-        return CommandKind::PubSub(PubSubCommand::KUnsubscribe);
-    }
-    if eq(cmd, b"PUBLISH") {
-        return CommandKind::PubSub(PubSubCommand::Publish);
-    }
-    if eq(cmd, b"BLPOP")
-        || eq(cmd, b"BRPOP")
-        || eq(cmd, b"BLMOVE")
-        || eq(cmd, b"BZPOPMIN")
-        || eq(cmd, b"BZPOPMAX")
-        || eq(cmd, b"XREAD")
-        || eq(cmd, b"XREADGROUP")
-    {
-        return CommandKind::Blocking;
+    match cmd[0].to_ascii_uppercase() {
+        b'A' => {
+            if eq(cmd, b"AUTH") {
+                return CommandKind::Auth;
+            }
+        }
+        b'B' => {
+            if eq(cmd, b"BLPOP")
+                || eq(cmd, b"BRPOP")
+                || eq(cmd, b"BLMOVE")
+                || eq(cmd, b"BZPOPMIN")
+                || eq(cmd, b"BZPOPMAX")
+            {
+                return CommandKind::Blocking;
+            }
+        }
+        b'D' => {
+            if eq(cmd, b"DISCARD") {
+                return CommandKind::Transaction;
+            }
+        }
+        b'E' => {
+            if eq(cmd, b"EXEC") {
+                return CommandKind::Transaction;
+            }
+        }
+        b'K' => {
+            if eq(cmd, b"KSUB") {
+                return CommandKind::PubSub(PubSubCommand::KSubscribe);
+            }
+            if eq(cmd, b"KUNSUB") {
+                return CommandKind::PubSub(PubSubCommand::KUnsubscribe);
+            }
+        }
+        b'M' => {
+            if eq(cmd, b"MULTI") {
+                return CommandKind::Transaction;
+            }
+        }
+        b'P' => {
+            if eq(cmd, b"PSUBSCRIBE") {
+                return CommandKind::PubSub(PubSubCommand::PSubscribe);
+            }
+            if eq(cmd, b"PUNSUBSCRIBE") {
+                return CommandKind::PubSub(PubSubCommand::PUnsubscribe);
+            }
+            if eq(cmd, b"PUBLISH") {
+                return CommandKind::PubSub(PubSubCommand::Publish);
+            }
+        }
+        b'S' => {
+            if eq(cmd, b"SUBSCRIBE") {
+                return CommandKind::PubSub(PubSubCommand::Subscribe);
+            }
+        }
+        b'U' => {
+            if eq(cmd, b"UNSUBSCRIBE") {
+                return CommandKind::PubSub(PubSubCommand::Unsubscribe);
+            }
+            if eq(cmd, b"UNWATCH") {
+                return CommandKind::Transaction;
+            }
+        }
+        b'W' => {
+            if eq(cmd, b"WATCH") {
+                return CommandKind::Transaction;
+            }
+        }
+        b'X' => {
+            if eq(cmd, b"XREAD") || eq(cmd, b"XREADGROUP") {
+                return CommandKind::Blocking;
+            }
+        }
+        _ => {}
     }
     CommandKind::General
-}
-
-fn public_without_auth(cmd: &[u8]) -> bool {
-    eq(cmd, b"AUTH") || eq(cmd, b"HELLO") || eq(cmd, b"PING") || eq(cmd, b"QUIT")
-}
-
-fn shard_access(cmd: &[u8]) -> ShardAccess {
-    if eq(cmd, b"GET")
-        || eq(cmd, b"STRLEN")
-        || eq(cmd, b"LLEN")
-        || eq(cmd, b"SCARD")
-        || eq(cmd, b"HGET")
-        || eq(cmd, b"HLEN")
-        || eq(cmd, b"ZCARD")
-        || eq(cmd, b"ZSCORE")
-        || eq(cmd, b"TTL")
-        || eq(cmd, b"PTTL")
-        || eq(cmd, b"TYPE")
-    {
-        return ShardAccess::SingleRead;
-    }
-    if eq(cmd, b"SET")
-        || eq(cmd, b"INCR")
-        || eq(cmd, b"DECR")
-        || eq(cmd, b"INCRBY")
-        || eq(cmd, b"DECRBY")
-        || eq(cmd, b"LPUSH")
-        || eq(cmd, b"RPUSH")
-        || eq(cmd, b"LPOP")
-        || eq(cmd, b"RPOP")
-        || eq(cmd, b"SADD")
-        || eq(cmd, b"SREM")
-        || eq(cmd, b"SPOP")
-        || eq(cmd, b"HSET")
-        || eq(cmd, b"HINCRBY")
-        || eq(cmd, b"HDEL")
-        || eq(cmd, b"ZADD")
-        || eq(cmd, b"ZINCRBY")
-        || eq(cmd, b"ZREM")
-        || eq(cmd, b"ZPOPMIN")
-        || eq(cmd, b"ZPOPMAX")
-        || eq(cmd, b"XADD")
-    {
-        return ShardAccess::SingleWrite;
-    }
-    ShardAccess::General
 }
 
 #[cfg(test)]

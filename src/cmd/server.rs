@@ -272,6 +272,8 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
          # Keyspace\r\n\
          db0:keys={},expires=0,avg_ttl=0\r\n\
          keys:{}\r\n\
+         tracked_key_count:{}\r\n\
+         tracked_total_key_count:{}\r\n\
          vector_keys:{}\r\n",
         env!("CARGO_PKG_VERSION"),
         store.shard_count(),
@@ -295,6 +297,8 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
         store.persistence_disk_write_errors(),
         store.dbsize(now),
         store.dbsize(now),
+        store.tracked_key_count(),
+        store.tracked_key_count() + store.disk_key_count(),
         store.vcard(now)
     )
 }

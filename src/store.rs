@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet as FxHashSet};
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -93,6 +93,8 @@ impl Hasher for FxHasher {
     }
 }
 
+type MsetShardBuckets<'a> = HashMap<usize, Vec<(&'a [u8], &'a [u8])>, FxBuildHasher>;
+
 #[allow(dead_code)]
 pub const MAX_SHARDS: usize = 1024;
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
@@ -135,13 +137,15 @@ impl SetData {
     }
 
     pub fn insert(&mut self, member: String) -> bool {
-        if self.index.contains_key(&member) {
-            return false;
+        match self.index.entry(member.clone()) {
+            hashbrown::hash_map::Entry::Occupied(_) => false,
+            hashbrown::hash_map::Entry::Vacant(v) => {
+                let idx = self.members.len();
+                self.members.push(member);
+                v.insert(idx);
+                true
+            }
         }
-        let idx = self.members.len();
-        self.members.push(member.clone());
-        self.index.insert(member, idx);
-        true
     }
 
     pub fn remove(&mut self, member: &str) -> bool {
@@ -685,37 +689,7 @@ impl Store {
     }
 
     fn entry_to_dump(&self, key: &str, value: &StoreValue, ttl_ms: i64) -> DumpEntry {
-        let dump_value = match value {
-            StoreValue::Str(s) => DumpValue::Str(s.to_vec()),
-            StoreValue::StrBuf(s) => DumpValue::Str(s.clone()),
-            StoreValue::List(l) => DumpValue::List(l.iter().map(|b| b.to_vec()).collect()),
-            StoreValue::Hash(h) => {
-                DumpValue::Hash(h.iter().map(|(k, v)| (k.clone(), v.to_vec())).collect())
-            }
-            StoreValue::Set(s) => DumpValue::Set(s.iter().cloned().collect()),
-            StoreValue::SortedSet(_, scores) => {
-                DumpValue::SortedSet(scores.iter().map(|(m, s)| (m.clone(), *s)).collect())
-            }
-            StoreValue::Stream(s) => {
-                let entries = s
-                    .entries
-                    .iter()
-                    .map(|(id, fields)| {
-                        let flds = fields
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.to_vec()))
-                            .collect();
-                        (id.to_string(), flds)
-                    })
-                    .collect();
-                DumpValue::Stream(entries, s.last_id.to_string())
-            }
-            StoreValue::Vector(v) => DumpValue::Vector(v.data.clone(), v.metadata.clone()),
-            StoreValue::HyperLogLog(regs, cached) => DumpValue::HyperLogLog(regs.clone(), *cached),
-            StoreValue::TimeSeries(ts) => {
-                DumpValue::TimeSeries(ts.samples.clone(), ts.retention, ts.labels.clone())
-            }
-        };
+        let dump_value = store_value_to_dump_value(value);
         DumpEntry {
             key: key.to_string(),
             value: dump_value,
@@ -771,6 +745,12 @@ impl Store {
             Some(ds) => ds.iter().map(|d| d.lock().len()).sum(),
             None => 0,
         }
+    }
+
+    /// Fast in-memory tracked key count used for diagnostics/INFO only.
+    /// This is not a Redis-contract replacement for DBSIZE.
+    pub fn tracked_key_count(&self) -> usize {
+        self.metrics.key_count.load(Ordering::Relaxed)
     }
 
     pub fn disk_usage_bytes(&self) -> usize {
@@ -975,6 +955,7 @@ impl Store {
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub(crate) fn get_and_write(
         data: &HashMap<String, Entry, FxBuildHasher>,
         key: &[u8],
@@ -1060,18 +1041,52 @@ impl Store {
     pub fn get_entry_type(&self, key: &[u8], now: Instant) -> Option<&'static str> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
-            Some(entry) if !entry.is_expired_at(now) => Some(entry.value.type_name()),
-            _ => {
-                drop(shard);
-                if self.try_promote(key, now) {
-                    let shard = self.shards[idx].read();
-                    shard.data.get(key_str(key)).map(|e| e.value.type_name())
-                } else {
-                    None
-                }
+        // Fast path for common ASCII/UTF-8 command keys.
+        let fast = shard.data.get(key_str(key)).and_then(|entry| {
+            if entry.is_expired_at(now) {
+                None
+            } else {
+                Some(entry.value.type_name())
             }
+        });
+        if fast.is_some() {
+            return fast;
         }
+        let raw = Self::get_entry_type_from_shard(&shard.data, key, now);
+        if raw.is_some() {
+            return raw;
+        }
+        drop(shard);
+        if self.try_promote(key, now) {
+            let shard = self.shards[idx].read();
+            shard.data.get(key_str(key)).and_then(|entry| {
+                if entry.is_expired_at(now) {
+                    None
+                } else {
+                    Some(entry.value.type_name())
+                }
+            })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn get_entry_type_from_shard(
+        data: &HashMap<String, Entry, FxBuildHasher>,
+        key: &[u8],
+        now: Instant,
+    ) -> Option<&'static str> {
+        let hash = fx_hash(key);
+        data.raw_entry()
+            .from_hash(hash, |k| k.as_bytes() == key)
+            .and_then(|(_, entry)| {
+                if entry.is_expired_at(now) {
+                    None
+                } else {
+                    Some(entry.value.type_name())
+                }
+            })
     }
 
     pub fn sort_get_elements(&self, key: &[u8], now: Instant) -> Result<Vec<String>, String> {
@@ -1106,6 +1121,60 @@ impl Store {
         shard.version += 1;
         self.set_on_shard(&mut shard.data, key, value, ttl, now);
         self.remove_from_disk(key);
+    }
+
+    pub fn mset_from_args(&self, kv_args: &[&[u8]], now: Instant) {
+        if kv_args.is_empty() {
+            return;
+        }
+        if kv_args.len() == 2 {
+            self.set(kv_args[0], kv_args[1], None, now);
+            return;
+        }
+        let pair_count = kv_args.len() / 2;
+        let tiered = self.disk_shards.is_some();
+        if pair_count <= 8 {
+            let mut pairs = Vec::with_capacity(pair_count);
+            for pair in kv_args.chunks_exact(2) {
+                let key = pair[0];
+                let value = pair[1];
+                pairs.push((self.shard_index(key), key, value));
+            }
+            pairs.sort_unstable_by_key(|(idx, _, _)| *idx);
+            let mut i = 0usize;
+            while i < pairs.len() {
+                let shard_idx = pairs[i].0;
+                let mut shard = self.shards[shard_idx].write();
+                shard.version += 1;
+                while i < pairs.len() && pairs[i].0 == shard_idx {
+                    let (_, key, value) = pairs[i];
+                    self.set_on_shard(&mut shard.data, key, value, None, now);
+                    if tiered {
+                        self.remove_from_disk(key);
+                    }
+                    i += 1;
+                }
+            }
+            return;
+        }
+        let mut by_shard: MsetShardBuckets<'_> =
+            HashMap::with_capacity_and_hasher(kv_args.len().div_ceil(2).min(16), FxBuildHasher);
+        for pair in kv_args.chunks_exact(2) {
+            let key = pair[0];
+            let value = pair[1];
+            let idx = self.shard_index(key);
+            by_shard.entry(idx).or_default().push((key, value));
+        }
+        for (idx, shard_pairs) in by_shard {
+            let mut shard = self.shards[idx].write();
+            shard.version += 1;
+            for (key, value) in shard_pairs {
+                self.set_on_shard(&mut shard.data, key, value, None, now);
+                if tiered {
+                    self.remove_from_disk(key);
+                }
+            }
+        }
     }
 
     pub fn set_nx(&self, key: &[u8], value: &[u8], now: Instant) -> bool {
@@ -1334,21 +1403,63 @@ impl Store {
     }
 
     pub fn exists(&self, keys: &[&[u8]], now: Instant) -> i64 {
-        let mut count = 0i64;
-        for key in keys {
-            let idx = self.shard_index(key);
-            let shard = self.shards[idx].read();
-            if let Some(entry) = shard.data.get(key_str(key)) {
-                if !entry.is_expired_at(now) {
+        if keys.is_empty() {
+            return 0;
+        }
+        let tiered = self.is_tiered();
+        if keys.len() <= 8 {
+            let mut count = 0i64;
+            for key in keys {
+                let idx = self.shard_index(key);
+                let shard = self.shards[idx].read();
+                let exists_in_mem = shard
+                    .data
+                    .get(key_str(key))
+                    .is_some_and(|entry| !entry.is_expired_at(now));
+                drop(shard);
+                if exists_in_mem || (tiered && self.disk_contains(key)) {
                     count += 1;
-                    continue;
                 }
             }
-            drop(shard);
-            if self.disk_contains(key) {
-                count += 1;
+            return count;
+        }
+
+        // Group keys by shard so each shard lock is taken once per EXISTS call.
+        let mut by_shard: HashMap<usize, Vec<&[u8]>, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher);
+        for key in keys {
+            by_shard
+                .entry(self.shard_index(key))
+                .or_default()
+                .push(*key);
+        }
+
+        let mut count = 0i64;
+        let mut missing_or_expired: Vec<&[u8]> = Vec::new();
+
+        for (idx, shard_keys) in by_shard {
+            let shard = self.shards[idx].read();
+            for key in shard_keys {
+                let exists_in_mem = shard
+                    .data
+                    .get(key_str(key))
+                    .is_some_and(|entry| !entry.is_expired_at(now));
+                if exists_in_mem {
+                    count += 1;
+                } else if tiered {
+                    missing_or_expired.push(key);
+                }
             }
         }
+
+        if tiered {
+            for key in missing_or_expired {
+                if self.disk_contains(key) {
+                    count += 1;
+                }
+            }
+        }
+
         count
     }
 
@@ -1628,10 +1739,10 @@ impl Store {
     pub fn persist(&self, key: &[u8], now: Instant) -> bool {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
-        shard.version += 1;
         if let Some(entry) = shard.data.get_mut(key_str(key)) {
             if !entry.is_expired_at(now) && entry.expires_at.is_some() {
                 entry.expires_at = None;
+                shard.version += 1;
                 return true;
             }
         }
@@ -1683,45 +1794,7 @@ impl Store {
             match shard.data.get(ks) {
                 Some(entry) if !entry.is_expired_at(now) => {
                     let ttl = entry.expires_at.map(|exp| exp.duration_since(now));
-                    let dv = match &entry.value {
-                        StoreValue::Str(s) => DumpValue::Str(s.to_vec()),
-                        StoreValue::StrBuf(s) => DumpValue::Str(s.clone()),
-                        StoreValue::List(l) => {
-                            DumpValue::List(l.iter().map(|b| b.to_vec()).collect())
-                        }
-                        StoreValue::Hash(h) => DumpValue::Hash(
-                            h.iter().map(|(k, v)| (k.clone(), v.to_vec())).collect(),
-                        ),
-                        StoreValue::Set(s) => DumpValue::Set(s.iter().cloned().collect()),
-                        StoreValue::SortedSet(_, scores) => DumpValue::SortedSet(
-                            scores.iter().map(|(m, s)| (m.clone(), *s)).collect(),
-                        ),
-                        StoreValue::Stream(s) => {
-                            let entries: Vec<StreamDumpEntry> = s
-                                .entries
-                                .iter()
-                                .map(|(id, fields)| {
-                                    let flds: Vec<(String, Vec<u8>)> = fields
-                                        .iter()
-                                        .map(|(k, v)| (k.clone(), v.to_vec()))
-                                        .collect();
-                                    (id.to_string(), flds)
-                                })
-                                .collect();
-                            DumpValue::Stream(entries, s.last_id.to_string())
-                        }
-                        StoreValue::Vector(v) => {
-                            DumpValue::Vector(v.data.clone(), v.metadata.clone())
-                        }
-                        StoreValue::HyperLogLog(regs, cached) => {
-                            DumpValue::HyperLogLog(regs.clone(), *cached)
-                        }
-                        StoreValue::TimeSeries(ts) => DumpValue::TimeSeries(
-                            ts.samples.clone(),
-                            ts.retention,
-                            ts.labels.clone(),
-                        ),
-                    };
+                    let dv = store_value_to_dump_value(&entry.value);
                     (dv, ttl)
                 }
                 _ => return Ok(false),
@@ -1743,8 +1816,18 @@ impl Store {
     }
 
     pub fn dbsize(&self, now: Instant) -> i64 {
-        let _ = now;
-        (self.metrics.key_count.load(Ordering::Relaxed) + self.disk_key_count()) as i64
+        // Redis contract: DBSIZE reports the exact number of non-expired keys
+        // in the current DB at call time.
+        let mut total = 0i64;
+        for shard in self.shards.iter() {
+            let shard = shard.read();
+            total += shard
+                .data
+                .values()
+                .filter(|e| e.expires_at.is_none_or(|exp| now < exp))
+                .count() as i64;
+        }
+        total + self.disk_key_count() as i64
     }
 
     pub fn flushdb(&self) {
@@ -1772,17 +1855,18 @@ impl Store {
         let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
-        shard.version += 1;
         let ks = key_string(key);
-        let existed = shard.data.contains_key(&ks);
-        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::List(VecDeque::new()),
-            expires_at: None,
-            lru_clock: self.lru_clock(),
-        });
-        if !existed {
-            self.key_added();
-        }
+        let entry = match shard.data.entry(ks) {
+            hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(v) => {
+                self.key_added();
+                v.insert(Entry {
+                    value: StoreValue::List(VecDeque::new()),
+                    expires_at: None,
+                    lru_clock: self.lru_clock(),
+                })
+            }
+        };
         if entry.is_expired_at(now) {
             entry.value = StoreValue::List(VecDeque::new());
             entry.expires_at = None;
@@ -1793,7 +1877,7 @@ impl Store {
                     list.push_front(Bytes::copy_from_slice(v));
                 }
                 let len = list.len() as i64;
-                let _ = entry;
+                shard.version += 1;
                 shard.used_memory += added_mem;
                 self.mem_add(added_mem);
                 Ok(len)
@@ -1814,15 +1898,17 @@ impl Store {
     ) -> Result<i64, String> {
         let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
         let ks = key_string(key);
-        let existed = shard.data.contains_key(&ks);
-        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::List(VecDeque::new()),
-            expires_at: None,
-            lru_clock: self.lru_clock(),
-        });
-        if !existed {
-            self.key_added();
-        }
+        let entry = match shard.data.entry(ks) {
+            hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(v) => {
+                self.key_added();
+                v.insert(Entry {
+                    value: StoreValue::List(VecDeque::new()),
+                    expires_at: None,
+                    lru_clock: self.lru_clock(),
+                })
+            }
+        };
         if entry.is_expired_at(now) {
             entry.value = StoreValue::List(VecDeque::new());
             entry.expires_at = None;
@@ -1916,21 +2002,25 @@ impl Store {
 
     pub fn lpop(&self, key: &[u8], now: Instant) -> Option<Bytes> {
         let idx = self.shard_index(key);
-        let mut shard = self.shards[idx].write();
-        shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
-            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
-                StoreValue::List(list) => {
-                    let val = list.pop_front()?;
-                    let freed = val.len() + 32;
-                    shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    self.mem_sub(freed);
-                    Some(val)
-                }
-                _ => None,
-            },
-            _ => None,
+        {
+            let shard = self.shards[idx].read();
+            let can_pop = match shard.data.get(key_str(key)) {
+                Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                    StoreValue::List(list) => !list.is_empty(),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !can_pop {
+                return None;
+            }
         }
+        let mut shard = self.shards[idx].write();
+        let out = self.lpop_on_shard(&mut shard, key, now);
+        if out.is_some() {
+            shard.version += 1;
+        }
+        out
     }
 
     /// LPOP variant for callers that already hold the correct shard write lock.
@@ -1947,7 +2037,7 @@ impl Store {
                 StoreValue::List(list) => {
                     let val = list.pop_front()?;
                     let freed = val.len() + 32;
-                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    shard.used_memory -= freed;
                     self.mem_sub(freed);
                     Some(val)
                 }
@@ -1959,21 +2049,37 @@ impl Store {
 
     pub fn rpop(&self, key: &[u8], now: Instant) -> Option<Bytes> {
         let idx = self.shard_index(key);
+        {
+            let shard = self.shards[idx].read();
+            let can_pop = match shard.data.get(key_str(key)) {
+                Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                    StoreValue::List(list) => !list.is_empty(),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !can_pop {
+                return None;
+            }
+        }
         let mut shard = self.shards[idx].write();
-        shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        let out = match shard.data.get_mut(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
                     let val = list.pop_back()?;
                     let freed = val.len() + 32;
-                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    shard.used_memory -= freed;
                     self.mem_sub(freed);
                     Some(val)
                 }
                 _ => None,
             },
             _ => None,
+        };
+        if out.is_some() {
+            shard.version += 1;
         }
+        out
     }
 
     /// RPOP variant for callers that already hold the correct shard write lock.
@@ -1990,7 +2096,7 @@ impl Store {
                 StoreValue::List(list) => {
                     let val = list.pop_back()?;
                     let freed = val.len() + 32;
-                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    shard.used_memory -= freed;
                     self.mem_sub(freed);
                     Some(val)
                 }
@@ -2038,7 +2144,13 @@ impl Store {
                     if s >= e {
                         Ok(vec![])
                     } else {
-                        Ok(list.iter().skip(s).take(e - s).cloned().collect())
+                        let mut out = Vec::with_capacity(e - s);
+                        for idx in s..e {
+                            if let Some(value) = list.get(idx) {
+                                out.push(value.clone());
+                            }
+                        }
+                        Ok(out)
                     }
                 }
                 _ => Err(WRONGTYPE.to_string()),
@@ -2070,47 +2182,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_string(key);
-        let existed = shard.data.contains_key(&ks);
-        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::Hash(HashMap::new()),
-            expires_at: None,
-            lru_clock: self.lru_clock(),
-        });
-        if !existed {
-            self.key_added();
-        }
-        if entry.is_expired_at(now) {
-            entry.value = StoreValue::Hash(HashMap::new());
-            entry.expires_at = None;
-        }
-        match &mut entry.value {
-            StoreValue::Hash(map) => {
-                let mut added = 0i64;
-                let mut mem_delta: isize = 0;
-                for (field, value) in pairs {
-                    let new_size = (field.len() + value.len() + 64) as isize;
-                    if let Some(old_val) =
-                        map.insert(key_string(field), Bytes::copy_from_slice(value))
-                    {
-                        mem_delta += value.len() as isize - old_val.len() as isize;
-                    } else {
-                        added += 1;
-                        mem_delta += new_size;
-                    }
-                }
-                if mem_delta > 0 {
-                    shard.used_memory += mem_delta as usize;
-                    self.mem_add(mem_delta as usize);
-                } else if mem_delta < 0 {
-                    let freed = (-mem_delta) as usize;
-                    shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    self.mem_sub(freed);
-                }
-                Ok(added)
-            }
-            _ => Err(WRONGTYPE.to_string()),
-        }
+        self.hset_on_shard(&mut shard, key, pairs, now)
     }
 
     /// HSET variant for callers that already hold the correct shard write lock.
@@ -2123,15 +2195,17 @@ impl Store {
         now: Instant,
     ) -> Result<i64, String> {
         let ks = key_string(key);
-        let existed = shard.data.contains_key(&ks);
-        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::Hash(HashMap::new()),
-            expires_at: None,
-            lru_clock: self.lru_clock(),
-        });
-        if !existed {
-            self.key_added();
-        }
+        let entry = match shard.data.entry(ks) {
+            hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(v) => {
+                self.key_added();
+                v.insert(Entry {
+                    value: StoreValue::Hash(HashMap::new()),
+                    expires_at: None,
+                    lru_clock: self.lru_clock(),
+                })
+            }
+        };
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Hash(HashMap::new());
             entry.expires_at = None;
@@ -2318,15 +2392,17 @@ impl Store {
         now: Instant,
     ) -> Result<i64, String> {
         let ks = key_string(key);
-        let existed = shard.data.contains_key(&ks);
-        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::Hash(HashMap::new()),
-            expires_at: None,
-            lru_clock: self.lru_clock(),
-        });
-        if !existed {
-            self.key_added();
-        }
+        let entry = match shard.data.entry(ks) {
+            hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(v) => {
+                self.key_added();
+                v.insert(Entry {
+                    value: StoreValue::Hash(HashMap::new()),
+                    expires_at: None,
+                    lru_clock: self.lru_clock(),
+                })
+            }
+        };
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Hash(HashMap::new());
             entry.expires_at = None;
@@ -2334,46 +2410,39 @@ impl Store {
         match &mut entry.value {
             StoreValue::Hash(map) => {
                 let fs = key_str(field);
-                let (is_new, old_len) = match map.get(fs) {
-                    Some(v) => (false, v.len()),
-                    None => (true, 0),
-                };
-                let current: i64 = map
-                    .get(fs)
-                    .map(|v| {
-                        std::str::from_utf8(v)
-                            .ok()
-                            .and_then(|s| s.parse::<i64>().ok())
-                            .ok_or_else(|| "ERR hash value is not an integer".to_string())
-                    })
-                    .transpose()?
-                    .unwrap_or(0);
-                let new_val = current + delta;
-                let new_bytes = Bytes::from(new_val.to_string());
-                let new_len = new_bytes.len();
-                map.insert(fs.to_string(), new_bytes);
-                if is_new {
+                if let Some(value) = map.get_mut(fs) {
+                    let old_len = value.len();
+                    let current: i64 = std::str::from_utf8(value)
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .ok_or_else(|| "ERR hash value is not an integer".to_string())?;
+                    let new_val = current + delta;
+                    *value = Bytes::from(new_val.to_string());
+                    let new_len = value.len();
+                    if new_len > old_len {
+                        let added = new_len - old_len;
+                        shard.used_memory += added;
+                        self.mem_add(added);
+                    } else if old_len > new_len {
+                        let freed = old_len - new_len;
+                        shard.used_memory = shard.used_memory.saturating_sub(freed);
+                        self.mem_sub(freed);
+                    }
+                    Ok(new_val)
+                } else {
+                    let new_val = delta;
+                    let new_bytes = Bytes::from(new_val.to_string());
+                    let new_len = new_bytes.len();
+                    map.insert(key_string(field), new_bytes);
                     let added = field.len() + new_len + 64;
-                    let _ = entry;
                     shard.used_memory += added;
                     self.mem_add(added);
-                } else if new_len > old_len {
-                    let added = new_len - old_len;
-                    let _ = entry;
-                    shard.used_memory += added;
-                    self.mem_add(added);
-                } else if old_len > new_len {
-                    let freed = old_len - new_len;
-                    let _ = entry;
-                    shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    self.mem_sub(freed);
+                    Ok(new_val)
                 }
-                Ok(new_val)
             }
             _ => Err(WRONGTYPE.to_string()),
         }
     }
-
     pub fn sadd(&self, key: &[u8], members: &[&[u8]], now: Instant) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
@@ -2510,22 +2579,41 @@ impl Store {
         }
     }
 
-    fn collect_set(&self, key: &[u8], now: Instant) -> Result<HashSet<String>, String> {
+    fn collect_set(
+        &self,
+        key: &[u8],
+        now: Instant,
+    ) -> Result<FxHashSet<String, FxBuildHasher>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Set(set) => Ok(set.iter().cloned().collect()),
+                StoreValue::Set(set) => {
+                    let mut result = FxHashSet::with_capacity_and_hasher(set.len(), FxBuildHasher);
+                    result.extend(set.iter().cloned());
+                    Ok(result)
+                }
                 _ => Err(WRONGTYPE.to_string()),
             },
-            _ => Ok(HashSet::new()),
+            _ => Ok(FxHashSet::with_hasher(FxBuildHasher)),
         }
     }
 
     pub fn sunion(&self, keys: &[&[u8]], now: Instant) -> Result<Vec<String>, String> {
-        let mut result = HashSet::new();
+        if keys.len() == 2 {
+            return self.sunion_two_keys(keys[0], keys[1], now);
+        }
+        let mut result = FxHashSet::with_hasher(FxBuildHasher);
         for key in keys {
-            result.extend(self.collect_set(key, now)?);
+            let idx = self.shard_index(key);
+            let shard = self.shards[idx].read();
+            match shard.data.get(key_str(key)) {
+                Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                    StoreValue::Set(set) => result.extend(set.iter().cloned()),
+                    _ => return Err(WRONGTYPE.to_string()),
+                },
+                _ => {}
+            }
         }
         Ok(result.into_iter().collect())
     }
@@ -2534,10 +2622,20 @@ impl Store {
         if keys.is_empty() {
             return Ok(vec![]);
         }
+        if keys.len() == 2 {
+            return self.sinter_two_keys(keys[0], keys[1], now);
+        }
         let mut result = self.collect_set(keys[0], now)?;
         for key in &keys[1..] {
-            let set = self.collect_set(key, now)?;
-            result.retain(|m| set.contains(m));
+            let idx = self.shard_index(key);
+            let shard = self.shards[idx].read();
+            match shard.data.get(key_str(key)) {
+                Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                    StoreValue::Set(set) => result.retain(|m| set.contains(m)),
+                    _ => return Err(WRONGTYPE.to_string()),
+                },
+                _ => result.clear(),
+            }
         }
         Ok(result.into_iter().collect())
     }
@@ -2546,12 +2644,138 @@ impl Store {
         if keys.is_empty() {
             return Ok(vec![]);
         }
+        if keys.len() == 2 {
+            return self.sdiff_two_keys(keys[0], keys[1], now);
+        }
         let mut result = self.collect_set(keys[0], now)?;
         for key in &keys[1..] {
-            let set = self.collect_set(key, now)?;
-            result.retain(|m| !set.contains(m));
+            let idx = self.shard_index(key);
+            let shard = self.shards[idx].read();
+            match shard.data.get(key_str(key)) {
+                Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                    StoreValue::Set(set) => result.retain(|m| !set.contains(m)),
+                    _ => return Err(WRONGTYPE.to_string()),
+                },
+                _ => {}
+            }
         }
         Ok(result.into_iter().collect())
+    }
+
+    fn sunion_two_keys(
+        &self,
+        key_a: &[u8],
+        key_b: &[u8],
+        now: Instant,
+    ) -> Result<Vec<String>, String> {
+        self.with_two_set_views(key_a, key_b, now, |left, right| {
+            let mut union = FxHashSet::with_capacity_and_hasher(
+                left.map_or(0, SetData::len) + right.map_or(0, SetData::len),
+                FxBuildHasher,
+            );
+            if let Some(set) = left {
+                union.extend(set.iter().cloned());
+            }
+            if let Some(set) = right {
+                union.extend(set.iter().cloned());
+            }
+            Ok(union.into_iter().collect())
+        })
+    }
+
+    fn sinter_two_keys(
+        &self,
+        key_a: &[u8],
+        key_b: &[u8],
+        now: Instant,
+    ) -> Result<Vec<String>, String> {
+        self.with_two_set_views(key_a, key_b, now, |left, right| {
+            let (Some(left), Some(right)) = (left, right) else {
+                return Ok(Vec::new());
+            };
+            let (small, large) = if left.len() <= right.len() {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            let mut out = Vec::with_capacity(small.len());
+            for member in small.iter() {
+                if large.contains(member) {
+                    out.push(member.clone());
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn sdiff_two_keys(
+        &self,
+        key_a: &[u8],
+        key_b: &[u8],
+        now: Instant,
+    ) -> Result<Vec<String>, String> {
+        self.with_two_set_views(key_a, key_b, now, |left, right| {
+            let Some(left) = left else {
+                return Ok(Vec::new());
+            };
+            let Some(right) = right else {
+                return Ok(left.iter().cloned().collect());
+            };
+            let mut out = Vec::with_capacity(left.len());
+            for member in left.iter() {
+                if !right.contains(member) {
+                    out.push(member.clone());
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn with_two_set_views<R, F>(
+        &self,
+        key_a: &[u8],
+        key_b: &[u8],
+        now: Instant,
+        f: F,
+    ) -> Result<R, String>
+    where
+        F: FnOnce(Option<&SetData>, Option<&SetData>) -> Result<R, String>,
+    {
+        fn view_set(entry: Option<&Entry>, now: Instant) -> Result<Option<&SetData>, String> {
+            match entry {
+                Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                    StoreValue::Set(set) => Ok(Some(set)),
+                    _ => Err(WRONGTYPE.to_string()),
+                },
+                _ => Ok(None),
+            }
+        }
+
+        let idx_a = self.shard_index(key_a);
+        let idx_b = self.shard_index(key_b);
+        let key_a_str = key_str(key_a);
+        let key_b_str = key_str(key_b);
+
+        if idx_a == idx_b {
+            let shard = self.shards[idx_a].read();
+            let left = view_set(shard.data.get(key_a_str), now)?;
+            let right = view_set(shard.data.get(key_b_str), now)?;
+            return f(left, right);
+        }
+
+        if idx_a < idx_b {
+            let shard_a = self.shards[idx_a].read();
+            let shard_b = self.shards[idx_b].read();
+            let left = view_set(shard_a.data.get(key_a_str), now)?;
+            let right = view_set(shard_b.data.get(key_b_str), now)?;
+            f(left, right)
+        } else {
+            let shard_b = self.shards[idx_b].read();
+            let shard_a = self.shards[idx_a].read();
+            let left = view_set(shard_a.data.get(key_a_str), now)?;
+            let right = view_set(shard_b.data.get(key_b_str), now)?;
+            f(left, right)
+        }
     }
 
     pub fn xadd(
@@ -2580,19 +2804,21 @@ impl Store {
         now: Instant,
     ) -> Result<StreamId, String> {
         let ks = key_string(key);
-        let existed = shard.data.contains_key(&ks);
-        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::Stream(StreamData {
-                entries: BTreeMap::new(),
-                last_id: StreamId::zero(),
-                groups: std::collections::HashMap::new(),
-            }),
-            expires_at: None,
-            lru_clock: self.lru_clock(),
-        });
-        if !existed {
-            self.key_added();
-        }
+        let entry = match shard.data.entry(ks) {
+            hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(v) => {
+                self.key_added();
+                v.insert(Entry {
+                    value: StoreValue::Stream(StreamData {
+                        entries: BTreeMap::new(),
+                        last_id: StreamId::zero(),
+                        groups: std::collections::HashMap::new(),
+                    }),
+                    expires_at: None,
+                    lru_clock: self.lru_clock(),
+                })
+            }
+        };
         if entry.is_expired_at(now) {
             entry.value = StoreValue::Stream(StreamData {
                 entries: BTreeMap::new(),
@@ -3379,45 +3605,7 @@ impl Store {
                     .unwrap_or(0);
                 entries.push(DumpEntry {
                     key: key.clone(),
-                    value: match &entry.value {
-                        StoreValue::Str(s) => DumpValue::Str(s.to_vec()),
-                        StoreValue::StrBuf(s) => DumpValue::Str(s.clone()),
-                        StoreValue::List(l) => {
-                            DumpValue::List(l.iter().map(|b| b.to_vec()).collect())
-                        }
-                        StoreValue::Hash(h) => DumpValue::Hash(
-                            h.iter().map(|(k, v)| (k.clone(), v.to_vec())).collect(),
-                        ),
-                        StoreValue::Set(s) => DumpValue::Set(s.iter().cloned().collect()),
-                        StoreValue::SortedSet(_, scores) => DumpValue::SortedSet(
-                            scores.iter().map(|(m, s)| (m.clone(), *s)).collect(),
-                        ),
-                        StoreValue::Stream(s) => {
-                            let entries: Vec<StreamDumpEntry> = s
-                                .entries
-                                .iter()
-                                .map(|(id, fields)| {
-                                    let flds: Vec<(String, Vec<u8>)> = fields
-                                        .iter()
-                                        .map(|(k, v)| (k.clone(), v.to_vec()))
-                                        .collect();
-                                    (id.to_string(), flds)
-                                })
-                                .collect();
-                            DumpValue::Stream(entries, s.last_id.to_string())
-                        }
-                        StoreValue::Vector(v) => {
-                            DumpValue::Vector(v.data.clone(), v.metadata.clone())
-                        }
-                        StoreValue::HyperLogLog(regs, cached) => {
-                            DumpValue::HyperLogLog(regs.clone(), *cached)
-                        }
-                        StoreValue::TimeSeries(ts) => DumpValue::TimeSeries(
-                            ts.samples.clone(),
-                            ts.retention,
-                            ts.labels.clone(),
-                        ),
-                    },
+                    value: store_value_to_dump_value(&entry.value),
                     ttl_ms,
                 });
             }
@@ -3452,45 +3640,7 @@ impl Store {
                     .unwrap_or(0);
                 entries.push(DumpEntry {
                     key: key.clone(),
-                    value: match &entry.value {
-                        StoreValue::Str(s) => DumpValue::Str(s.to_vec()),
-                        StoreValue::StrBuf(s) => DumpValue::Str(s.clone()),
-                        StoreValue::List(l) => {
-                            DumpValue::List(l.iter().map(|b| b.to_vec()).collect())
-                        }
-                        StoreValue::Hash(h) => DumpValue::Hash(
-                            h.iter().map(|(k, v)| (k.clone(), v.to_vec())).collect(),
-                        ),
-                        StoreValue::Set(s) => DumpValue::Set(s.iter().cloned().collect()),
-                        StoreValue::SortedSet(_, scores) => DumpValue::SortedSet(
-                            scores.iter().map(|(m, s)| (m.clone(), *s)).collect(),
-                        ),
-                        StoreValue::Stream(s) => {
-                            let entries = s
-                                .entries
-                                .iter()
-                                .map(|(id, fields)| {
-                                    let flds = fields
-                                        .iter()
-                                        .map(|(k, v)| (k.clone(), v.to_vec()))
-                                        .collect();
-                                    (id.to_string(), flds)
-                                })
-                                .collect();
-                            DumpValue::Stream(entries, s.last_id.to_string())
-                        }
-                        StoreValue::Vector(v) => {
-                            DumpValue::Vector(v.data.clone(), v.metadata.clone())
-                        }
-                        StoreValue::HyperLogLog(regs, cached) => {
-                            DumpValue::HyperLogLog(regs.clone(), *cached)
-                        }
-                        StoreValue::TimeSeries(ts) => DumpValue::TimeSeries(
-                            ts.samples.clone(),
-                            ts.retention,
-                            ts.labels.clone(),
-                        ),
-                    },
+                    value: store_value_to_dump_value(&entry.value),
                     ttl_ms,
                 });
             }
@@ -4672,10 +4822,12 @@ impl Store {
     }
 
     pub fn spop(&self, key: &[u8], count: usize, now: Instant) -> Result<Vec<String>, String> {
+        if count == 1 {
+            return Ok(self.spop_one(key, now).into_iter().collect());
+        }
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
-        shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        let out = match shard.data.get_mut(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Set(set) => {
                     let mut result = Vec::new();
@@ -4685,14 +4837,18 @@ impl Store {
                         freed += member.len() + 32;
                         result.push(member);
                     }
-                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    shard.used_memory -= freed;
                     self.mem_sub(freed);
                     Ok(result)
                 }
                 _ => Err(WRONGTYPE.to_string()),
             },
             _ => Ok(vec![]),
+        };
+        if matches!(out, Ok(ref members) if !members.is_empty()) {
+            shard.version += 1;
         }
+        out
     }
 
     /// SPOP variant for callers that already hold the correct shard write lock.
@@ -4705,6 +4861,12 @@ impl Store {
         count: usize,
         now: Instant,
     ) -> Result<Vec<String>, String> {
+        if count == 1 {
+            return Ok(self
+                .spop_one_on_shard(shard, key, now)
+                .into_iter()
+                .collect());
+        }
         match shard.data.get_mut(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Set(set) => {
@@ -4715,13 +4877,44 @@ impl Store {
                         freed += member.len() + 32;
                         result.push(member);
                     }
-                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    shard.used_memory -= freed;
                     self.mem_sub(freed);
                     Ok(result)
                 }
                 _ => Err(WRONGTYPE.to_string()),
             },
             _ => Ok(vec![]),
+        }
+    }
+
+    pub fn spop_one(&self, key: &[u8], now: Instant) -> Option<String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        let out = self.spop_one_on_shard(&mut shard, key, now);
+        if out.is_some() {
+            shard.version += 1;
+        }
+        out
+    }
+
+    pub(crate) fn spop_one_on_shard(
+        &self,
+        shard: &mut Shard,
+        key: &[u8],
+        now: Instant,
+    ) -> Option<String> {
+        match shard.data.get_mut(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+                StoreValue::Set(set) => {
+                    let member = set.pop()?;
+                    let freed = member.len() + 32;
+                    shard.used_memory -= freed;
+                    self.mem_sub(freed);
+                    Some(member)
+                }
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -4867,64 +5060,71 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
+        self.zadd_on_shard(&mut shard, key, members, nx, xx, gt, lt, ch, now)
+    }
+
+    /// Hot-path ZADD for a single member with default options.
+    /// Equivalent to: ZADD key score member.
+    pub fn zadd_single_default(
+        &self,
+        key: &[u8],
+        member: &[u8],
+        score: f64,
+        now: Instant,
+    ) -> Result<i64, String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        shard.version += 1;
+        self.zadd_single_default_on_shard(&mut shard, key, member, score, now)
+    }
+
+    /// Hot-path ZADD for a single member with default options.
+    /// Equivalent to: ZADD key score member.
+    pub(crate) fn zadd_single_default_on_shard(
+        &self,
+        shard: &mut Shard,
+        key: &[u8],
+        member: &[u8],
+        score: f64,
+        now: Instant,
+    ) -> Result<i64, String> {
         let ks = key_string(key);
-        let existed = shard.data.contains_key(&ks);
-        let is_new = !shard.data.contains_key(&ks)
-            || shard.data.get(&ks).is_some_and(|e| e.is_expired_at(now));
-        if xx && is_new {
-            return Ok(0);
-        }
-        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::SortedSet(BTreeMap::new(), HashMap::new()),
-            expires_at: None,
-            lru_clock: self.lru_clock(),
-        });
-        if !existed {
-            self.key_added();
-        }
+        let entry = match shard.data.entry(ks) {
+            hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(v) => {
+                self.key_added();
+                v.insert(Entry {
+                    value: StoreValue::SortedSet(BTreeMap::new(), HashMap::new()),
+                    expires_at: None,
+                    lru_clock: self.lru_clock(),
+                })
+            }
+        };
         if entry.is_expired_at(now) {
             entry.value = StoreValue::SortedSet(BTreeMap::new(), HashMap::new());
             entry.expires_at = None;
         }
         match &mut entry.value {
             StoreValue::SortedSet(tree, scores) => {
-                let mut added = 0i64;
-                let mut changed = 0i64;
-                let mut mem_added = 0usize;
-                for &(member, score) in members {
-                    let ms = key_string(member);
-                    if let Some(&old_score) = scores.get(&ms) {
-                        if nx {
-                            continue;
-                        }
-                        let update = if gt && lt {
-                            score != old_score
-                        } else if gt {
-                            score > old_score
-                        } else if lt {
-                            score < old_score
-                        } else {
-                            true
-                        };
-                        if update && score != old_score {
-                            tree.remove(&(OrderedFloat(old_score), ms.clone()));
-                            tree.insert((OrderedFloat(score), ms.clone()), ());
-                            scores.insert(ms, score);
-                            changed += 1;
-                        }
-                    } else {
-                        if xx {
-                            continue;
-                        }
-                        tree.insert((OrderedFloat(score), ms.clone()), ());
-                        scores.insert(ms, score);
-                        mem_added += member.len() + 48;
-                        added += 1;
+                let member_str = key_str(member);
+                if let Some(old_score) = scores.get_mut(member_str) {
+                    let previous = *old_score;
+                    if score != previous {
+                        let key_owned = member_str.to_owned();
+                        tree.remove(&(OrderedFloat(previous), key_owned.clone()));
+                        tree.insert((OrderedFloat(score), key_owned), ());
+                        *old_score = score;
                     }
+                    Ok(0)
+                } else {
+                    let ms = member_str.to_owned();
+                    tree.insert((OrderedFloat(score), ms.clone()), ());
+                    scores.insert(ms, score);
+                    let mem_added = member.len() + 48;
+                    shard.used_memory += mem_added;
+                    self.mem_add(mem_added);
+                    Ok(1)
                 }
-                shard.used_memory += mem_added;
-                self.mem_add(mem_added);
-                Ok(if ch { added + changed } else { added })
             }
             _ => Err(WRONGTYPE.to_string()),
         }
@@ -4946,19 +5146,22 @@ impl Store {
         now: Instant,
     ) -> Result<i64, String> {
         let ks = key_string(key);
-        let existed = shard.data.contains_key(&ks);
-        let is_new = !shard.data.contains_key(&ks)
-            || shard.data.get(&ks).is_some_and(|e| e.is_expired_at(now));
-        if xx && is_new {
+        let entry = match shard.data.entry(ks) {
+            hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(v) => {
+                if xx {
+                    return Ok(0);
+                }
+                self.key_added();
+                v.insert(Entry {
+                    value: StoreValue::SortedSet(BTreeMap::new(), HashMap::new()),
+                    expires_at: None,
+                    lru_clock: self.lru_clock(),
+                })
+            }
+        };
+        if xx && entry.is_expired_at(now) {
             return Ok(0);
-        }
-        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::SortedSet(BTreeMap::new(), HashMap::new()),
-            expires_at: None,
-            lru_clock: self.lru_clock(),
-        });
-        if !existed {
-            self.key_added();
         }
         if entry.is_expired_at(now) {
             entry.value = StoreValue::SortedSet(BTreeMap::new(), HashMap::new());
@@ -4970,30 +5173,33 @@ impl Store {
                 let mut changed = 0i64;
                 let mut mem_added = 0usize;
                 for &(member, score) in members {
-                    let ms = key_string(member);
-                    if let Some(&old_score) = scores.get(&ms) {
+                    let member_str = key_str(member);
+                    if let Some(old_score) = scores.get_mut(member_str) {
                         if nx {
                             continue;
                         }
+                        let previous = *old_score;
                         let update = if gt && lt {
-                            score != old_score
+                            score != previous
                         } else if gt {
-                            score > old_score
+                            score > previous
                         } else if lt {
-                            score < old_score
+                            score < previous
                         } else {
                             true
                         };
-                        if update && score != old_score {
-                            tree.remove(&(OrderedFloat(old_score), ms.clone()));
-                            tree.insert((OrderedFloat(score), ms.clone()), ());
-                            scores.insert(ms, score);
+                        if update && score != previous {
+                            let key_owned = member_str.to_owned();
+                            tree.remove(&(OrderedFloat(previous), key_owned.clone()));
+                            tree.insert((OrderedFloat(score), key_owned), ());
+                            *old_score = score;
                             changed += 1;
                         }
                     } else {
                         if xx {
                             continue;
                         }
+                        let ms = member_str.to_owned();
                         tree.insert((OrderedFloat(score), ms.clone()), ());
                         scores.insert(ms, score);
                         mem_added += member.len() + 48;
@@ -5012,6 +5218,45 @@ impl Store {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         Self::zscore_from_shard(&shard.data, key, member, now)
+    }
+
+    pub fn zscores(
+        &self,
+        key: &[u8],
+        members: &[&[u8]],
+        now: Instant,
+    ) -> Result<Vec<Option<f64>>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(_, scores) => Ok(members
+                    .iter()
+                    .map(|member| scores.get(key_str(member)).copied())
+                    .collect()),
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Ok(vec![None; members.len()]),
+        }
+    }
+
+    pub fn zscore_with_key_state(
+        &self,
+        key: &[u8],
+        member: &[u8],
+        now: Instant,
+    ) -> Result<(Option<f64>, bool), String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(_, scores) => {
+                    Ok((scores.get(key_str(member)).copied(), true))
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Ok((None, false)),
+        }
     }
 
     pub(crate) fn zscore_from_shard(
@@ -5267,30 +5512,93 @@ impl Store {
         max_exclusive: bool,
         now: Instant,
     ) -> Result<i64, String> {
+        use std::ops::Bound::{Excluded, Included};
+        if min > max {
+            return Ok(0);
+        }
+        if min == max && (min_exclusive || max_exclusive) {
+            return Ok(0);
+        }
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::SortedSet(tree, _) => {
-                    let range_start = (OrderedFloat(min), String::new());
-                    let range_end = (
-                        OrderedFloat(max),
-                        "\u{ffff}\u{ffff}\u{ffff}\u{ffff}".to_string(),
-                    );
-                    let count = tree
-                        .range(range_start..=range_end)
-                        .filter(|((s, _), _)| {
-                            let sv = s.0;
-                            let lo = if min_exclusive { sv > min } else { sv >= min };
-                            let hi = if max_exclusive { sv < max } else { sv <= max };
-                            lo && hi
-                        })
-                        .count();
+                StoreValue::SortedSet(tree, scores) => {
+                    // Common bench/query path: whole-score-space cardinality.
+                    if min.is_infinite()
+                        && min.is_sign_negative()
+                        && max.is_infinite()
+                        && max.is_sign_positive()
+                    {
+                        return Ok(scores.len() as i64);
+                    }
+                    let start_member = String::new();
+                    let end_member = "\u{10ffff}\u{10ffff}".to_string();
+                    let start = if min_exclusive {
+                        Excluded((OrderedFloat(min), end_member.clone()))
+                    } else {
+                        Included((OrderedFloat(min), start_member))
+                    };
+                    let end = if max_exclusive {
+                        Excluded((OrderedFloat(max), String::new()))
+                    } else {
+                        Included((OrderedFloat(max), end_member))
+                    };
+                    let count = tree.range((start, end)).count();
                     Ok(count as i64)
                 }
                 _ => Err(WRONGTYPE.to_string()),
             },
             _ => Ok(0),
+        }
+    }
+
+    pub fn zvisit_all_scores<F>(&self, key: &[u8], now: Instant, mut visit: F) -> Result<(), String>
+    where
+        F: FnMut(&str, f64),
+    {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(tree, _) => {
+                    for ((score, member), _) in tree.iter() {
+                        visit(member, score.0);
+                    }
+                    Ok(())
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Ok(()),
+        }
+    }
+
+    pub fn zvisit_scores_inclusive<F>(
+        &self,
+        key: &[u8],
+        min: f64,
+        max: f64,
+        now: Instant,
+        mut visit: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&str, f64),
+    {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(tree, _) => {
+                    let start = (OrderedFloat(min), String::new());
+                    let end = (OrderedFloat(max), "\u{10ffff}\u{10ffff}".to_string());
+                    for ((score, member), _) in tree.range(start..=end) {
+                        visit(member, score.0);
+                    }
+                    Ok(())
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Ok(()),
         }
     }
 
@@ -5949,6 +6257,40 @@ impl Store {
 
     pub fn vcard(&self, _now: Instant) -> usize {
         self.vector_index.read().len()
+    }
+}
+
+fn store_value_to_dump_value(value: &StoreValue) -> DumpValue {
+    match value {
+        StoreValue::Str(s) => DumpValue::Str(s.to_vec()),
+        StoreValue::StrBuf(s) => DumpValue::Str(s.clone()),
+        StoreValue::List(l) => DumpValue::List(l.iter().map(|b| b.to_vec()).collect()),
+        StoreValue::Hash(h) => {
+            DumpValue::Hash(h.iter().map(|(k, v)| (k.clone(), v.to_vec())).collect())
+        }
+        StoreValue::Set(s) => DumpValue::Set(s.iter().cloned().collect()),
+        StoreValue::SortedSet(_, scores) => {
+            DumpValue::SortedSet(scores.iter().map(|(m, s)| (m.clone(), *s)).collect())
+        }
+        StoreValue::Stream(s) => {
+            let entries: Vec<StreamDumpEntry> = s
+                .entries
+                .iter()
+                .map(|(id, fields)| {
+                    let flds: Vec<(String, Vec<u8>)> = fields
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.to_vec()))
+                        .collect();
+                    (id.to_string(), flds)
+                })
+                .collect();
+            DumpValue::Stream(entries, s.last_id.to_string())
+        }
+        StoreValue::Vector(v) => DumpValue::Vector(v.data.clone(), v.metadata.clone()),
+        StoreValue::HyperLogLog(regs, cached) => DumpValue::HyperLogLog(regs.clone(), *cached),
+        StoreValue::TimeSeries(ts) => {
+            DumpValue::TimeSeries(ts.samples.clone(), ts.retention, ts.labels.clone())
+        }
     }
 }
 

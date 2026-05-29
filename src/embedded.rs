@@ -1549,7 +1549,7 @@ impl EmbeddedClient {
         pipeline: &PreparedPipeline,
     ) -> Result<(), LuxError> {
         if let Some(commands) = pipeline.raw_argvs() {
-            self.pipeline_values(&commands).await?;
+            self.pipeline(&commands).await?;
             return Ok(());
         }
 

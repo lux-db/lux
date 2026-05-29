@@ -12,8 +12,7 @@ pub fn cmd_pfadd(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         return CmdResult::Written;
     }
     let key = args[1];
-    let elements: Vec<&[u8]> = args[2..].to_vec();
-    match store.pfadd(key, &elements, now) {
+    match store.pfadd(key, &args[2..], now) {
         Ok(changed) => resp::write_integer(out, changed),
         Err(e) => resp::write_error(out, &e),
     }
@@ -25,8 +24,7 @@ pub fn cmd_pfcount(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
         resp::write_error(out, "ERR wrong number of arguments for 'pfcount' command");
         return CmdResult::Written;
     }
-    let keys: Vec<&[u8]> = args[1..].to_vec();
-    match store.pfcount(&keys, now) {
+    match store.pfcount(&args[1..], now) {
         Ok(count) => resp::write_integer(out, count),
         Err(e) => resp::write_error(out, &e),
     }
@@ -39,8 +37,7 @@ pub fn cmd_pfmerge(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
         return CmdResult::Written;
     }
     let dest = args[1];
-    let sources: Vec<&[u8]> = args[2..].to_vec();
-    match store.pfmerge(dest, &sources, now) {
+    match store.pfmerge(dest, &args[2..], now) {
         Ok(()) => resp::write_ok(out),
         Err(e) => resp::write_error(out, &e),
     }
