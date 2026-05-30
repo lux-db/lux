@@ -1852,10 +1852,8 @@ fn command_kind(cmd: &[u8]) -> CommandKind {
                 return CommandKind::Transaction;
             }
         }
-        b'X' => {
-            if eq(cmd, b"XREAD") || eq(cmd, b"XREADGROUP") {
-                return CommandKind::Blocking;
-            }
+        b'X' if eq(cmd, b"XREAD") || eq(cmd, b"XREADGROUP") => {
+            return CommandKind::Blocking;
         }
         _ => {}
     }
