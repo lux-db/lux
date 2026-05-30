@@ -3,6 +3,11 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "support/universal_client.rs"]
+mod universal_client;
+
+use universal_client::UniversalClient;
+
 fn resp_cmd(args: &[&str]) -> Vec<u8> {
     let mut buf = format!("*{}\r\n", args.len());
     for arg in args {
@@ -39,6 +44,25 @@ fn send_and_read(stream: &mut TcpStream, args: &[&str]) -> String {
         }
     }
     String::from_utf8_lossy(&data).to_string()
+}
+
+fn assert_resp_simple_ok(resp: &[u8]) {
+    assert_eq!(resp, b"+OK\r\n", "expected +OK, got {resp:?}");
+}
+
+fn assert_resp_int_eq(resp: &[u8], expected: i64) {
+    assert_eq!(
+        universal_client::parse_resp_int_frame(resp),
+        expected,
+        "unexpected int: {resp:?}"
+    );
+}
+
+fn assert_resp_bulk_eq(resp: &[u8], expected: &[u8]) {
+    assert_eq!(
+        universal_client::parse_resp_bulk(resp),
+        Some(expected.to_vec())
+    );
 }
 
 fn send_only(stream: &mut TcpStream, args: &[&str]) {
@@ -159,6 +183,176 @@ async fn embedded_client_rejects_invalid_utf8_key_identity() {
         .unwrap_err();
     assert!(err.to_string().contains("invalid UTF-8"));
 
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn universal_client_runs_strings_on_resp_and_embedded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = lux::ServerConfig {
+        port: 0,
+        shards: 4,
+        password: String::new(),
+        require_auth: false,
+        data_dir: tmp.path().display().to_string(),
+        ..Default::default()
+    };
+
+    let handle = lux::run_with_config(cfg).await.unwrap();
+    let embedded = UniversalClient::embedded(handle.client());
+    let addr = handle.local_addr().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let resp = UniversalClient::resp(addr);
+
+    for (client, prefix) in [(&embedded, "uni:embedded"), (&resp, "uni:resp")] {
+        let key = format!("{prefix}:k");
+        let counter = format!("{prefix}:counter");
+        assert!(client.set(&key, "v1").await);
+        assert_eq!(client.get(&key).await, Some(b"v1".to_vec()));
+        assert!(!client.setnx(&key, "ignored").await);
+        assert!(client.setnx(&counter, "10").await);
+        assert_eq!(client.incrby(&counter, 5).await, 15);
+        assert_eq!(client.append(&key, ":tail").await, 7);
+        assert_eq!(client.strlen(&key).await, 7);
+        assert_eq!(client.get(&key).await, Some(b"v1:tail".to_vec()));
+    }
+
+    drop(resp);
+    drop(embedded);
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn universal_client_runs_core_surface_on_resp_and_embedded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = lux::ServerConfig {
+        port: 0,
+        shards: 4,
+        password: String::new(),
+        require_auth: false,
+        data_dir: tmp.path().display().to_string(),
+        ..Default::default()
+    };
+
+    let handle = lux::run_with_config(cfg).await.unwrap();
+    let embedded = UniversalClient::embedded(handle.client());
+    let addr = handle.local_addr().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let resp = UniversalClient::resp(addr);
+
+    for (client, prefix) in [(&embedded, "u2:embedded"), (&resp, "u2:resp")] {
+        let skey = format!("{prefix}:str");
+        let lkey = format!("{prefix}:list");
+        let hkey = format!("{prefix}:hash");
+        let setkey = format!("{prefix}:set");
+        let zkey = format!("{prefix}:zset");
+        let xkey = format!("{prefix}:stream");
+
+        assert_resp_simple_ok(
+            &client
+                .execute_bytes(&[b"SET", skey.as_bytes(), b"hello"])
+                .await,
+        );
+        assert_resp_bulk_eq(
+            &client.execute_bytes(&[b"GET", skey.as_bytes()]).await,
+            b"hello",
+        );
+        assert_resp_int_eq(
+            &client
+                .execute_bytes(&[b"APPEND", skey.as_bytes(), b":tail"])
+                .await,
+            10,
+        );
+        assert_resp_int_eq(
+            &client.execute_bytes(&[b"STRLEN", skey.as_bytes()]).await,
+            10,
+        );
+        assert_resp_int_eq(
+            &client.execute_bytes(&[b"EXISTS", skey.as_bytes()]).await,
+            1,
+        );
+
+        assert_resp_int_eq(
+            &client
+                .execute_bytes(&[b"LPUSH", lkey.as_bytes(), b"v1", b"v2"])
+                .await,
+            2,
+        );
+        assert_resp_int_eq(&client.execute_bytes(&[b"LLEN", lkey.as_bytes()]).await, 2);
+        assert_resp_bulk_eq(
+            &client.execute_bytes(&[b"LPOP", lkey.as_bytes()]).await,
+            b"v2",
+        );
+
+        assert_resp_int_eq(
+            &client
+                .execute_bytes(&[b"HSET", hkey.as_bytes(), b"f1", b"one"])
+                .await,
+            1,
+        );
+        assert_resp_bulk_eq(
+            &client
+                .execute_bytes(&[b"HGET", hkey.as_bytes(), b"f1"])
+                .await,
+            b"one",
+        );
+
+        assert_resp_int_eq(
+            &client
+                .execute_bytes(&[b"SADD", setkey.as_bytes(), b"m1", b"m2"])
+                .await,
+            2,
+        );
+        assert_resp_int_eq(
+            &client
+                .execute_bytes(&[b"SISMEMBER", setkey.as_bytes(), b"m1"])
+                .await,
+            1,
+        );
+
+        assert_resp_int_eq(
+            &client
+                .execute_bytes(&[b"ZADD", zkey.as_bytes(), b"1", b"a"])
+                .await,
+            1,
+        );
+        assert_resp_bulk_eq(
+            &client
+                .execute_bytes(&[b"ZSCORE", zkey.as_bytes(), b"a"])
+                .await,
+            b"1",
+        );
+
+        let xadd_resp = client
+            .execute_bytes(&[b"XADD", xkey.as_bytes(), b"*", b"f", b"v"])
+            .await;
+        assert!(
+            universal_client::parse_resp_bulk(&xadd_resp).is_some(),
+            "XADD should return entry id, got {xadd_resp:?}"
+        );
+        assert_resp_int_eq(&client.execute_bytes(&[b"XLEN", xkey.as_bytes()]).await, 1);
+
+        assert_resp_int_eq(
+            &client
+                .execute_bytes(&[b"EXPIRE", skey.as_bytes(), b"60"])
+                .await,
+            1,
+        );
+        let ttl = universal_client::parse_resp_int_frame(
+            &client.execute_bytes(&[b"TTL", skey.as_bytes()]).await,
+        );
+        assert!(ttl > 0, "TTL should be positive, got {ttl}");
+
+        assert_resp_int_eq(
+            &client
+                .execute_bytes(&[b"DEL", skey.as_bytes(), lkey.as_bytes()])
+                .await,
+            2,
+        );
+    }
+
+    drop(resp);
+    drop(embedded);
     handle.shutdown_and_wait().await.unwrap();
 }
 
@@ -2017,20 +2211,11 @@ async fn run_with_config_returns_after_snapshot_and_wal_replay() {
 
     let handle = lux::run_with_config(cfg.clone()).await.unwrap();
     let addr = handle.local_addr().unwrap();
-    let mut conn = connect(addr);
-    let set_snapshot = send_and_read(&mut conn, &["SET", "snapshot_key", "snapshot_value"]);
-    assert!(
-        set_snapshot.contains("+OK"),
-        "initial SET should succeed: {set_snapshot:?}"
-    );
-    let save = send_and_read(&mut conn, &["SAVE"]);
-    assert!(save.contains("+OK"), "SAVE should succeed: {save:?}");
-    let set_wal = send_and_read(&mut conn, &["SET", "wal_key", "wal_value"]);
-    assert!(
-        set_wal.contains("+OK"),
-        "WAL SET should succeed: {set_wal:?}"
-    );
-    drop(conn);
+    let writer = UniversalClient::resp(addr);
+    assert!(writer.set("snapshot_key", "snapshot_value").await);
+    writer.save().await;
+    assert!(writer.set("wal_key", "wal_value").await);
+    drop(writer);
     handle.shutdown_and_wait().await.unwrap();
 
     append_corrupt_wal_frames(&storage_dir);
@@ -2045,18 +2230,22 @@ async fn run_with_config_returns_after_snapshot_and_wal_replay() {
 
     let handle = lux::run_with_config(cfg).await.unwrap();
     let addr = handle.local_addr().unwrap();
-    let mut conn = connect(addr);
-    let snapshot_resp = send_and_read(&mut conn, &["GET", "snapshot_key"]);
+    let reader = UniversalClient::resp(addr);
+    let snapshot_resp = reader.get("snapshot_key").await;
     assert!(
-        snapshot_resp.contains("snapshot_value"),
+        snapshot_resp
+            .as_ref()
+            .is_some_and(|v| String::from_utf8_lossy(v).contains("snapshot_value")),
         "snapshot value should be loaded before readiness: {snapshot_resp:?}"
     );
-    let wal_resp = send_and_read(&mut conn, &["GET", "wal_key"]);
+    let wal_resp = reader.get("wal_key").await;
     assert!(
-        wal_resp.contains("wal_value"),
+        wal_resp
+            .as_ref()
+            .is_some_and(|v| String::from_utf8_lossy(v).contains("wal_value")),
         "WAL value should be replayed before readiness: {wal_resp:?}"
     );
-    drop(conn);
+    drop(reader);
     handle.shutdown_and_wait().await.unwrap();
 
     let captured = events.lock().unwrap();
