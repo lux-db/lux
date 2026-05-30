@@ -5,7 +5,7 @@
 //! Evicted entries are written to the DiskShard instead of being deleted.
 //! On read miss, entries are transparently promoted back to memory.
 
-use crate::store::{DumpEntry, DumpValue};
+use crate::store::{DumpEntry, DumpValue, StreamGroupDump};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -797,6 +797,63 @@ fn read_string(r: &mut impl Read) -> io::Result<String> {
     String::from_utf8(raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+fn write_stream_groups(w: &mut impl Write, groups: &[StreamGroupDump]) -> io::Result<()> {
+    write_u32(w, groups.len() as u32)?;
+    for (name, last_delivered_id, consumers, pending) in groups {
+        write_bytes(w, name.as_bytes())?;
+        write_bytes(w, last_delivered_id.as_bytes())?;
+        write_u32(w, consumers.len() as u32)?;
+        for (consumer, pending_ids) in consumers {
+            write_bytes(w, consumer.as_bytes())?;
+            write_u32(w, pending_ids.len() as u32)?;
+            for id in pending_ids {
+                write_bytes(w, id.as_bytes())?;
+            }
+        }
+        write_u32(w, pending.len() as u32)?;
+        for (id, consumer, delivery_count) in pending {
+            write_bytes(w, id.as_bytes())?;
+            write_bytes(w, consumer.as_bytes())?;
+            write_u32(w, (*delivery_count).min(u32::MAX as u64) as u32)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_stream_groups(r: &mut impl Read) -> io::Result<Vec<StreamGroupDump>> {
+    let group_count = match read_u32(r) {
+        Ok(count) => count as usize,
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut groups = Vec::with_capacity(group_count);
+    for _ in 0..group_count {
+        let name = read_string(r)?;
+        let last_delivered_id = read_string(r)?;
+        let consumer_count = read_u32(r)? as usize;
+        let mut consumers = Vec::with_capacity(consumer_count);
+        for _ in 0..consumer_count {
+            let consumer = read_string(r)?;
+            let pending_count = read_u32(r)? as usize;
+            let mut pending_ids = Vec::with_capacity(pending_count);
+            for _ in 0..pending_count {
+                pending_ids.push(read_string(r)?);
+            }
+            consumers.push((consumer, pending_ids));
+        }
+        let pending_count = read_u32(r)? as usize;
+        let mut pending = Vec::with_capacity(pending_count);
+        for _ in 0..pending_count {
+            let id = read_string(r)?;
+            let consumer = read_string(r)?;
+            let delivery_count = read_u32(r)? as u64;
+            pending.push((id, consumer, delivery_count));
+        }
+        groups.push((name, last_delivered_id, consumers, pending));
+    }
+    Ok(groups)
+}
+
 pub fn write_single_entry(w: &mut impl Write, entry: &DumpEntry) -> io::Result<()> {
     let type_byte: u8 = match &entry.value {
         DumpValue::Str(_) => b'S',
@@ -842,7 +899,7 @@ pub fn write_single_entry(w: &mut impl Write, entry: &DumpEntry) -> io::Result<(
                 write_f64(w, *score)?;
             }
         }
-        DumpValue::Stream(stream_entries, last_id) => {
+        DumpValue::Stream(stream_entries, last_id, groups) => {
             write_bytes(w, last_id.as_bytes())?;
             write_u32(w, stream_entries.len() as u32)?;
             for (id, fields) in stream_entries {
@@ -853,6 +910,7 @@ pub fn write_single_entry(w: &mut impl Write, entry: &DumpEntry) -> io::Result<(
                     write_bytes(w, v)?;
                 }
             }
+            write_stream_groups(w, groups)?;
         }
         DumpValue::Vector(data, metadata) => {
             write_u32(w, data.len() as u32)?;
@@ -948,7 +1006,8 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
                 }
                 entries.push((id, fields));
             }
-            DumpValue::Stream(entries, last_id)
+            let groups = read_stream_groups(r)?;
+            DumpValue::Stream(entries, last_id, groups)
         }
         b'V' => {
             let dims = read_u32(r)? as usize;
@@ -1349,7 +1408,11 @@ mod tests {
                 ),
                 arb_string(),
             )
-                .prop_map(|(entries, last_id)| DumpValue::Stream(entries, last_id)),
+                .prop_map(|(entries, last_id)| DumpValue::Stream(
+                    entries,
+                    last_id,
+                    Vec::new()
+                )),
         ]
     }
 
@@ -1369,7 +1432,9 @@ mod tests {
             (DumpValue::Hash(a), DumpValue::Hash(b)) => a == b,
             (DumpValue::Set(a), DumpValue::Set(b)) => a == b,
             (DumpValue::SortedSet(a), DumpValue::SortedSet(b)) => a == b,
-            (DumpValue::Stream(ae, al), DumpValue::Stream(be, bl)) => ae == be && al == bl,
+            (DumpValue::Stream(ae, al, ag), DumpValue::Stream(be, bl, bg)) => {
+                ae == be && al == bl && ag == bg
+            }
             (DumpValue::Vector(ad, am), DumpValue::Vector(bd, bm)) => ad == bd && am == bm,
             (DumpValue::HyperLogLog(ar, _), DumpValue::HyperLogLog(br, _)) => ar == br,
             (DumpValue::TimeSeries(as_, ar, al), DumpValue::TimeSeries(bs, br, bl)) => {

@@ -6,6 +6,18 @@ use crate::store::Store;
 
 use super::{arg_str, cmd_eq, parse_i64, CmdResult};
 
+const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
+
+fn parse_i64_arg(arg: &[u8], out: &mut BytesMut) -> Option<i64> {
+    match parse_i64(arg) {
+        Ok(n) => Some(n),
+        Err(_) => {
+            resp::write_error(out, INTEGER_ERR);
+            None
+        }
+    }
+}
+
 pub fn cmd_setbit(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() != 4 {
         resp::write_error(out, "ERR wrong number of arguments for 'setbit' command");
@@ -112,17 +124,30 @@ pub fn cmd_bitpos(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         }
     };
     let start = if args.len() >= 4 {
-        parse_i64(args[3]).unwrap_or(0)
+        match parse_i64_arg(args[3], out) {
+            Some(start) => start,
+            None => return CmdResult::Written,
+        }
     } else {
         0
     };
     let end = if args.len() >= 5 {
-        Some(parse_i64(args[4]).unwrap_or(-1))
+        match parse_i64_arg(args[4], out) {
+            Some(end) => Some(end),
+            None => return CmdResult::Written,
+        }
     } else {
         None
     };
     let use_bit = if args.len() >= 6 {
-        cmd_eq(args[5], b"BIT")
+        if cmd_eq(args[5], b"BIT") {
+            true
+        } else if cmd_eq(args[5], b"BYTE") {
+            false
+        } else {
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
+        }
     } else {
         false
     };
@@ -139,26 +164,26 @@ pub fn cmd_bitop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         resp::write_error(out, "ERR wrong number of arguments for 'bitop' command");
         return CmdResult::Written;
     }
-    let op = if cmd_eq(args[1], b"AND") {
-        "AND"
-    } else if cmd_eq(args[1], b"OR") {
-        "OR"
-    } else if cmd_eq(args[1], b"XOR") {
-        "XOR"
-    } else if cmd_eq(args[1], b"NOT") {
-        "NOT"
-    } else {
-        arg_str(args[1])
-    };
+    let op = arg_str(args[1]).to_uppercase();
+    if !matches!(op.as_str(), "AND" | "OR" | "XOR" | "NOT") {
+        resp::write_error(
+            out,
+            &format!("ERR BITOP requires AND, OR, XOR, or NOT, got '{op}'"),
+        );
+        return CmdResult::Written;
+    }
     let dest = args[2];
-    let src_keys = &args[3..];
+    let src_keys: Vec<&[u8]> = args[3..].to_vec();
+    for key in &src_keys {
+        store.try_promote(key, now);
+    }
 
     if op == "NOT" && src_keys.len() != 1 {
         resp::write_error(out, "ERR BITOP NOT requires one and only one key");
         return CmdResult::Written;
     }
 
-    match store.bitop(op, dest, src_keys, now) {
+    match store.bitop(&op, dest, &src_keys, now) {
         Ok(len) => resp::write_integer(out, len as i64),
         Err(e) => resp::write_error(out, &e),
     }

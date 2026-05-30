@@ -6,12 +6,25 @@ use crate::store::{Store, StoreValue};
 
 use super::{arg_str, cmd_eq, parse_i64, parse_u64, CmdResult};
 
+const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
+
+fn parse_usize_arg(arg: &[u8], out: &mut BytesMut) -> Option<usize> {
+    match parse_u64(arg).ok().and_then(|n| usize::try_from(n).ok()) {
+        Some(n) => Some(n),
+        None => {
+            resp::write_error(out, INTEGER_ERR);
+            None
+        }
+    }
+}
+
 pub fn cmd_del(args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
     if args.len() < 2 {
         resp::write_error(out, "ERR wrong number of arguments for 'del' command");
         return CmdResult::Written;
     }
-    resp::write_integer(out, store.del(&args[1..]));
+    let keys: Vec<&[u8]> = args[1..].to_vec();
+    resp::write_integer(out, store.del(&keys));
     CmdResult::Written
 }
 
@@ -29,7 +42,8 @@ pub fn cmd_exists(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'exists' command");
         return CmdResult::Written;
     }
-    resp::write_integer(out, store.exists(&args[1..], now));
+    let keys: Vec<&[u8]> = args[1..].to_vec();
+    resp::write_integer(out, store.exists(&keys, now));
     CmdResult::Written
 }
 
@@ -48,7 +62,10 @@ pub fn cmd_scan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'scan' command");
         return CmdResult::Written;
     }
-    let cursor = parse_u64(args[1]).unwrap_or(0) as usize;
+    let cursor = match parse_usize_arg(args[1], out) {
+        Some(cursor) => cursor,
+        None => return CmdResult::Written,
+    };
     let mut pattern: &[u8] = b"*";
     let mut count = 10usize;
     let mut type_filter: Option<&str> = None;
@@ -58,13 +75,21 @@ pub fn cmd_scan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
             pattern = args[i + 1];
             i += 2;
         } else if cmd_eq(args[i], b"COUNT") && i + 1 < args.len() {
-            count = parse_u64(args[i + 1]).unwrap_or(10) as usize;
+            count = match parse_usize_arg(args[i + 1], out) {
+                Some(count) if count > 0 => count,
+                Some(_) => {
+                    resp::write_error(out, INTEGER_ERR);
+                    return CmdResult::Written;
+                }
+                None => return CmdResult::Written,
+            };
             i += 2;
         } else if cmd_eq(args[i], b"TYPE") && i + 1 < args.len() {
             type_filter = Some(arg_str(args[i + 1]));
             i += 2;
         } else {
-            i += 1;
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
         }
     }
     let (next_cursor, all_keys) = store.scan(cursor, pattern, count, now);
@@ -99,6 +124,7 @@ pub fn cmd_rename(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'rename' command");
         return CmdResult::Written;
     }
+    store.try_promote(args[2], now);
     match store.rename(args[1], args[2], now) {
         Ok(()) => resp::write_ok(out),
         Err(e) => resp::write_error(out, &e),
@@ -111,6 +137,7 @@ pub fn cmd_renamenx(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
         resp::write_error(out, "ERR wrong number of arguments for 'renamenx' command");
         return CmdResult::Written;
     }
+    store.try_promote(args[2], now);
     if store.get(args[2], now).is_some() {
         resp::write_integer(out, 0);
     } else {
@@ -128,17 +155,7 @@ pub fn cmd_randomkey(
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
-    let mut found = None;
-    for i in 0..store.shard_count() {
-        let shard = store.lock_read_shard(i);
-        if let Some((k, entry)) = shard.data.iter().next() {
-            if !entry.is_expired_at(now) {
-                found = Some(k.clone());
-                break;
-            }
-        }
-    }
-    match found {
+    match store.keys(b"*", now).into_iter().next() {
         Some(k) => resp::write_bulk(out, &k),
         None => resp::write_null(out),
     }
@@ -180,6 +197,7 @@ pub fn cmd_copy(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
             return CmdResult::Written;
         }
     }
+    store.try_promote(args[2], now);
     match store.copy_key(args[1], args[2], replace, now) {
         Ok(copied) => resp::write_integer(out, if copied { 1 } else { 0 }),
         Err(e) => resp::write_error(out, &e),

@@ -126,7 +126,7 @@ pub fn cmd_time(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Insta
 }
 
 pub fn cmd_save(_args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
-    match crate::snapshot::save(store) {
+    match crate::snapshot::save_and_truncate_wal_consistent(store) {
         Ok(n) => resp::write_simple(out, &format!("OK ({n} keys saved)")),
         Err(e) => resp::write_error(out, &format!("ERR snapshot failed: {e}")),
     }
@@ -134,7 +134,7 @@ pub fn cmd_save(_args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instan
 }
 
 pub fn cmd_bgsave(_args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
-    match crate::snapshot::save(store) {
+    match crate::snapshot::save_and_truncate_wal_consistent(store) {
         Ok(_) => resp::write_simple(out, "Background saving started"),
         Err(e) => resp::write_error(out, &format!("ERR snapshot failed: {e}")),
     }
