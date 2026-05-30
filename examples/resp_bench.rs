@@ -1960,8 +1960,7 @@ async fn bench_embedded_parallel(
                 ),
             };
             let completed =
-                run_embedded_plan_until_deadline(&client, pipeline, deadline, &worker_plan)
-                    .await?;
+                run_embedded_plan_until_deadline(&client, pipeline, deadline, &worker_plan).await?;
             Ok::<usize, DynError>(completed)
         }));
     }
