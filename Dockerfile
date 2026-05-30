@@ -17,6 +17,8 @@ RUN touch src/lib.rs src/main.rs && cargo build --release
 
 FROM scratch
 
+ENV LUX_BIND_HOST=0.0.0.0
+
 COPY --from=builder /build/target/release/lux /lux
 
 EXPOSE 6379
