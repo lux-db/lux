@@ -5,6 +5,7 @@
 //! callers cannot mutate state outside the normal command, WAL, and snapshot
 //! pipeline.
 
+mod auth;
 mod cmd;
 mod command;
 mod disk;
@@ -72,6 +73,59 @@ impl std::fmt::Display for LuxError {
 
 impl std::error::Error for LuxError {}
 
+/// Runtime configuration for per-project Lux Auth.
+#[derive(Clone)]
+pub struct AuthConfig {
+    /// Enables app-user auth, reserved auth tables, and `/auth/v1/*`.
+    pub enabled: bool,
+    /// Issuer used in access tokens.
+    pub issuer: String,
+    /// Access-token lifetime.
+    pub access_token_ttl: Duration,
+    /// Refresh-token lifetime.
+    pub refresh_token_ttl: Duration,
+    /// Enables native email/password signup and sign-in.
+    pub email_password_enabled: bool,
+    /// Optional initial publishable key material for local/bootstrap use.
+    pub initial_publishable_key: Option<String>,
+    /// Optional initial secret key material for local/bootstrap use.
+    pub initial_secret_key: Option<String>,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("enabled", &self.enabled)
+            .field("issuer", &self.issuer)
+            .field("access_token_ttl", &self.access_token_ttl)
+            .field("refresh_token_ttl", &self.refresh_token_ttl)
+            .field("email_password_enabled", &self.email_password_enabled)
+            .field(
+                "initial_publishable_key",
+                &self.initial_publishable_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "initial_secret_key",
+                &self.initial_secret_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer: "http://localhost:7379/auth/v1".to_string(),
+            access_token_ttl: Duration::from_secs(3600),
+            refresh_token_ttl: Duration::from_secs(30 * 24 * 60 * 60),
+            email_password_enabled: true,
+            initial_publishable_key: None,
+            initial_secret_key: None,
+        }
+    }
+}
+
 /// Runtime configuration for an embedded Lux server.
 ///
 /// Defaults match the standalone binary where possible. Library users can
@@ -112,6 +166,8 @@ pub struct ServerConfig {
     pub storage: StorageConfig,
     /// Memory pressure eviction configuration.
     pub eviction: EvictionConfig,
+    /// Per-project application auth configuration.
+    pub auth: AuthConfig,
     /// Enables the RESP listener. Use this instead of overloading `port = 0`.
     pub enable_resp: bool,
     /// Optional informational event sink. Library mode is silent when unset.
@@ -140,6 +196,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("save_interval", &self.save_interval)
             .field("storage", &self.storage)
             .field("eviction", &self.eviction)
+            .field("auth", &self.auth)
             .field("enable_resp", &self.enable_resp)
             .field("on_info", &self.on_info.as_ref().map(|_| "<callback>"))
             .field("on_warn", &self.on_warn.as_ref().map(|_| "<callback>"))
@@ -166,6 +223,7 @@ impl Default for ServerConfig {
             save_interval: Duration::from_secs(60),
             storage: StorageConfig::default(),
             eviction: EvictionConfig::default(),
+            auth: AuthConfig::default(),
             enable_resp: true,
             on_info: None,
             on_warn: None,
@@ -297,6 +355,31 @@ fn validate_listener_security(config: &ServerConfig) -> std::io::Result<()> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "refusing unauthenticated non-loopback listener; set a password or explicitly enable allow_insecure_no_auth",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_auth_config(config: &ServerConfig) -> std::io::Result<()> {
+    if !config.auth.enabled {
+        return Ok(());
+    }
+    if config.auth.issuer.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "auth issuer must not be empty when auth is enabled",
+        ));
+    }
+    if config.auth.access_token_ttl.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "auth access token ttl must be greater than zero",
+        ));
+    }
+    if config.auth.refresh_token_ttl.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "auth refresh token ttl must be greater than zero",
         ));
     }
     Ok(())
@@ -2705,6 +2788,7 @@ pub async fn run() -> std::io::Result<()> {
 /// has completed, and configured listeners have bound successfully.
 pub async fn run_with_config(config: ServerConfig) -> std::io::Result<ServerHandle> {
     validate_listener_security(&config)?;
+    validate_auth_config(&config)?;
     let listener = if config.enable_resp {
         let addr = config.listen_addr();
         Some(TcpListener::bind(&addr).await?)
@@ -2832,6 +2916,24 @@ impl Runtime {
             .store
             .wal_suppress
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        if runtime.config.auth.enabled {
+            if let Err(e) =
+                auth::bootstrap(&runtime.store, &runtime.schema_cache, &runtime.config.auth)
+            {
+                runtime
+                    .store
+                    .wal_suppress
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("auth bootstrap failed: {e}"),
+                ));
+            }
+        }
+        runtime
+            .store
+            .wal_suppress
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         match snapshot::load(&runtime.store) {
             Ok(0) => emit_info(&runtime.config, ServerInfoEvent::NoSnapshotFound),
             Ok(n) => emit_info(&runtime.config, ServerInfoEvent::SnapshotLoaded { keys: n }),
@@ -2847,6 +2949,36 @@ impl Runtime {
             .wal_suppress
             .store(false, std::sync::atomic::Ordering::Relaxed);
         runtime.store.replay_wal(&runtime.broker);
+        if runtime.config.auth.enabled {
+            runtime
+                .store
+                .wal_suppress
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) =
+                auth::bootstrap(&runtime.store, &runtime.schema_cache, &runtime.config.auth)
+            {
+                runtime
+                    .store
+                    .wal_suppress
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("auth bootstrap failed: {e}"),
+                ));
+            }
+            runtime
+                .store
+                .wal_suppress
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) =
+                auth::bootstrap_runtime(&runtime.store, &runtime.schema_cache, &runtime.config.auth)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("auth runtime bootstrap failed: {e}"),
+                ));
+            }
+        }
 
         background_tasks.spawn(snapshot::background_save_loop(runtime.store.clone()));
 

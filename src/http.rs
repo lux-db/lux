@@ -20,6 +20,12 @@ use crate::{CommandExecutor, CommandSession, LuxError};
 
 const WEBSOCKET_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+enum HttpAuthContext {
+    Anonymous,
+    Operator,
+    User(crate::auth::AuthPrincipal),
+}
+
 /// Constant-time byte comparison to prevent timing attacks on auth tokens.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -189,35 +195,62 @@ async fn handle_request(
     };
     let params = parse_query_string(&query_string);
 
-    let password = &store.config().password;
-    if !password.is_empty() {
-        let auth = headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+    if path.starts_with("/auth/v1") {
+        let (status, status_text, result) =
+            crate::auth::route_http(&method, &path, &body, &params, &headers, store, cache);
+        return send_json(socket, status, status_text, &result).await;
+    }
 
-        let bearer = auth.strip_prefix("Bearer ").unwrap_or("");
-        let query_token = if path == "/live" {
-            get_param(&params, "token").unwrap_or("")
-        } else {
-            ""
-        };
-        if !constant_time_eq(bearer.as_bytes(), password.as_bytes())
-            && !constant_time_eq(query_token.as_bytes(), password.as_bytes())
-        {
+    let password = &store.config().password;
+    let bearer = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+        .map(|(_, v)| v.as_str())
+        .and_then(|auth| auth.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let query_token = if path == "/live" {
+        get_param(&params, "token").unwrap_or("")
+    } else {
+        ""
+    };
+    let password_ok = !password.is_empty()
+        && (constant_time_eq(bearer.as_bytes(), password.as_bytes())
+            || constant_time_eq(query_token.as_bytes(), password.as_bytes()));
+    let auth_context = if password_ok {
+        HttpAuthContext::Operator
+    } else if store.config().auth.enabled && !bearer.is_empty() {
+        match crate::auth::authenticate_access_token(bearer, store, cache) {
+            Ok(principal) => HttpAuthContext::User(principal),
+            Err(e) => {
+                let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
+                return send_json(socket, 401, "Unauthorized", &body).await;
+            }
+        }
+    } else {
+        HttpAuthContext::Anonymous
+    };
+    if !password.is_empty() {
+        if !password_ok && !matches!(auth_context, HttpAuthContext::User(_)) {
             let body = r#"{"error":"unauthorized"}"#;
             return send_json(socket, 401, "Unauthorized", body).await;
         }
+    } else if path == "/live"
+        && store.config().auth.enabled
+        && !matches!(auth_context, HttpAuthContext::User(_))
+    {
+        let body = r#"{"error":"unauthorized"}"#;
+        return send_json(socket, 401, "Unauthorized", body).await;
     }
 
     if method == "GET" && path == "/live" {
         return handle_live_upgrade(
             socket,
             &headers,
+            &params,
             store.clone(),
             broker.clone(),
             cache.clone(),
+            live_auth_principal(&auth_context),
         )
         .await;
     }
@@ -228,6 +261,18 @@ async fn handle_request(
     if method == "GET" {
         match segments.as_slice() {
             ["v1", "tables", table] => {
+                if let Err((status, status_text, body)) = require_http_capability(
+                    store,
+                    cache,
+                    &auth_context,
+                    &format!("table.{table}.read"),
+                ) {
+                    return send_json(socket, status, status_text, &body).await;
+                }
+                if let Some(err) = crate::auth::reserved_table_access_error(table) {
+                    let body = format!(r#"{{"error":"{}"}}"#, escape_json(&err));
+                    return send_json(socket, 403, "Forbidden", &body).await;
+                }
                 let prefer = headers
                     .iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case("prefer"))
@@ -237,6 +282,18 @@ async fn handle_request(
                     .await;
             }
             ["v1", "tables", table, "count"] => {
+                if let Err((status, status_text, body)) = require_http_capability(
+                    store,
+                    cache,
+                    &auth_context,
+                    &format!("table.{table}.read"),
+                ) {
+                    return send_json(socket, status, status_text, &body).await;
+                }
+                if let Some(err) = crate::auth::reserved_table_access_error(table) {
+                    let body = format!(r#"{{"error":"{}"}}"#, escape_json(&err));
+                    return send_json(socket, 403, "Forbidden", &body).await;
+                }
                 let now = std::time::Instant::now();
                 let body = match crate::tables::table_count(store, cache, table, now) {
                     Ok(n) => format!(r#"{{"result":{n}}}"#),
@@ -245,6 +302,18 @@ async fn handle_request(
                 return send_json(socket, 200, "OK", &body).await;
             }
             ["v1", "tables", table, "schema"] => {
+                if let Err((status, status_text, body)) = require_http_capability(
+                    store,
+                    cache,
+                    &auth_context,
+                    &format!("table.{table}.read"),
+                ) {
+                    return send_json(socket, status, status_text, &body).await;
+                }
+                if let Some(err) = crate::auth::reserved_table_access_error(table) {
+                    let body = format!(r#"{{"error":"{}"}}"#, escape_json(&err));
+                    return send_json(socket, 403, "Forbidden", &body).await;
+                }
                 let now = std::time::Instant::now();
                 let body = match crate::tables::table_schema(store, cache, table, now) {
                     Ok(fields) => {
@@ -259,6 +328,18 @@ async fn handle_request(
                 return send_json(socket, 200, "OK", &body).await;
             }
             ["v1", "tables", table, id] if *id != "count" && *id != "schema" => {
+                if let Err((status, status_text, body)) = require_http_capability(
+                    store,
+                    cache,
+                    &auth_context,
+                    &format!("table.{table}.read"),
+                ) {
+                    return send_json(socket, status, status_text, &body).await;
+                }
+                if let Some(err) = crate::auth::reserved_table_access_error(table) {
+                    let body = format!(r#"{{"error":"{}"}}"#, escape_json(&err));
+                    return send_json(socket, 403, "Forbidden", &body).await;
+                }
                 let now = std::time::Instant::now();
                 let body = match id.parse::<i64>() {
                     Ok(id_i64) => {
@@ -281,7 +362,8 @@ async fn handle_request(
         cache,
         script_engine,
     };
-    let (status, status_text, result) = route_request(&method, &path, &body, &params, deps);
+    let (status, status_text, result) =
+        route_request_with_auth(&method, &path, &body, &params, deps, &auth_context);
 
     send_json(socket, status, status_text, &result).await
 }
@@ -547,6 +629,69 @@ fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+fn live_auth_principal(auth: &HttpAuthContext) -> Option<crate::auth::AuthPrincipal> {
+    match auth {
+        HttpAuthContext::User(principal) => Some(principal.clone()),
+        HttpAuthContext::Anonymous | HttpAuthContext::Operator => None,
+    }
+}
+
+fn require_http_capability(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+    capability: &str,
+) -> Result<(), (u16, &'static str, String)> {
+    if !store.config().auth.enabled {
+        return Ok(());
+    }
+    match auth {
+        HttpAuthContext::Operator => Ok(()),
+        HttpAuthContext::Anonymous => Err((
+            401,
+            "Unauthorized",
+            r#"{"error":"unauthorized"}"#.to_string(),
+        )),
+        HttpAuthContext::User(principal) => {
+            match crate::auth::principal_has_capability(store, cache, principal, capability) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err((
+                    403,
+                    "Forbidden",
+                    format!(
+                        r#"{{"error":"missing capability '{}'"}}"#,
+                        escape_json(capability)
+                    ),
+                )),
+                Err(e) => Err((
+                    500,
+                    "Internal Server Error",
+                    format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                )),
+            }
+        }
+    }
+}
+
+fn require_live_capability(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    principal: Option<&crate::auth::AuthPrincipal>,
+    capability: &str,
+) -> Result<(), Value> {
+    let Some(principal) = principal else {
+        return Ok(());
+    };
+    match crate::auth::principal_has_capability(store, cache, principal, capability) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(live_error(
+            "FORBIDDEN",
+            &format!("missing capability '{capability}'"),
+        )),
+        Err(e) => Err(live_error("AUTH_ERROR", &e)),
+    }
+}
+
 #[derive(Clone)]
 struct LiveTableSpec {
     table: String,
@@ -626,9 +771,11 @@ fn live_broker_event_from_message(message: &crate::pubsub::Message) -> Option<Li
 async fn handle_live_upgrade(
     socket: &mut tokio::net::TcpStream,
     headers: &[(String, String)],
+    _params: &[(String, String)],
     store: Arc<Store>,
     broker: Broker,
     cache: SharedSchemaCache,
+    principal: Option<crate::auth::AuthPrincipal>,
 ) -> std::io::Result<bool> {
     let Some(key) = header_value(headers, "sec-websocket-key") else {
         return send_json(
@@ -650,7 +797,7 @@ async fn handle_live_upgrade(
     socket.write_all(response.as_bytes()).await?;
 
     let ws = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
-    run_live_socket(ws, store, broker, cache).await?;
+    run_live_socket(ws, store, broker, cache, principal).await?;
     Ok(false)
 }
 
@@ -659,6 +806,7 @@ async fn run_live_socket<S>(
     store: Arc<Store>,
     broker: Broker,
     cache: SharedSchemaCache,
+    principal: Option<crate::auth::AuthPrincipal>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -683,6 +831,7 @@ where
                             &broker,
                             &store,
                             &cache,
+                            principal.as_ref(),
                             &text,
                         ).await?;
                     }
@@ -708,6 +857,7 @@ async fn handle_live_client_message<S>(
     broker: &Broker,
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
+    principal: Option<&crate::auth::AuthPrincipal>,
     text: &str,
 ) -> std::io::Result<()>
 where
@@ -753,7 +903,7 @@ where
         return Ok(());
     };
 
-    match build_live_subscription(spec, broker, store, cache).await {
+    match build_live_subscription(spec, broker, store, cache, principal).await {
         Ok((subscription, initial_events)) => {
             subscriptions.insert(id.clone(), subscription);
             send_live_json(ws, json!({"type":"live.subscribed","id":id})).await?;
@@ -774,11 +924,13 @@ async fn build_live_subscription(
     broker: &Broker,
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
+    principal: Option<&crate::auth::AuthPrincipal>,
 ) -> Result<(LiveSubscription, Vec<Value>), Value> {
     if let Some(pattern) = spec
         .as_str()
         .or_else(|| spec.get("key").and_then(Value::as_str))
     {
+        require_live_capability(store, cache, principal, &format!("live.key.{pattern}"))?;
         return Ok((
             LiveSubscription::Key {
                 pattern: pattern.to_string(),
@@ -791,6 +943,7 @@ async fn build_live_subscription(
     let kind = spec.get("kind").and_then(Value::as_str).unwrap_or("");
     if kind == "key" {
         let pattern = required_str(spec, "pattern")?;
+        require_live_capability(store, cache, principal, &format!("live.key.{pattern}"))?;
         return Ok((
             LiveSubscription::Key {
                 pattern: pattern.to_string(),
@@ -801,6 +954,7 @@ async fn build_live_subscription(
     }
     if kind == "channel" || spec.get("channel").is_some() {
         let channel = required_str(spec, "channel")?;
+        require_live_capability(store, cache, principal, &format!("live.channel.{channel}"))?;
         return Ok((
             LiveSubscription::Channel {
                 channel: channel.to_string(),
@@ -820,6 +974,7 @@ async fn build_live_subscription(
                     "pubsubPattern subscription requires pattern",
                 )
             })?;
+        require_live_capability(store, cache, principal, &format!("live.channel.{pattern}"))?;
         return Ok((
             LiveSubscription::PubSubPattern {
                 pattern: pattern.to_string(),
@@ -830,6 +985,12 @@ async fn build_live_subscription(
     }
     if kind == "table" || spec.get("table").is_some() {
         let table_spec = parse_live_table_spec(spec)?;
+        require_live_capability(
+            store,
+            cache,
+            principal,
+            &format!("table.{}.read", table_spec.table),
+        )?;
         let receivers = vec![
             broker.ksubscribe(&table_spec.table),
             broker.ksubscribe(&format!("_t:{}:row:*", table_spec.table)),
@@ -851,6 +1012,7 @@ async fn build_live_subscription(
     }
     if kind == "vector.near" {
         let vector_spec = parse_live_vector_near_spec(spec)?;
+        require_live_capability(store, cache, principal, "vector.search")?;
         let rows = fetch_live_vector_rows(store, &vector_spec);
         let query =
             json!({"type":"vector.near","k":vector_spec.k,"threshold":vector_spec.threshold});
@@ -1451,12 +1613,13 @@ struct RouteDeps<'a> {
     script_engine: &'a Arc<lua::ScriptEngine>,
 }
 
-fn route_request(
+fn route_request_with_auth(
     method: &str,
     path: &str,
     body: &str,
     params: &[(String, String)],
     deps: RouteDeps<'_>,
+    auth: &HttpAuthContext,
 ) -> (u16, &'static str, String) {
     let RouteDeps {
         store,
@@ -1480,6 +1643,12 @@ fn route_request(
     } else {
         &segments[..]
     };
+
+    if let Some(capability) = required_capability_for_route(method, base) {
+        if let Err(response) = require_http_capability(store, cache, auth, &capability) {
+            return response;
+        }
+    }
 
     match (method, base) {
         // ── exec (escape hatch) ──
@@ -1589,6 +1758,13 @@ fn route_request(
         ("POST", ["tables"]) => route_table_create(body, store, broker, cache, script_engine),
         ("GET", ["tables", table]) => route_table_query(table, params, store, broker, cache),
         ("GET", ["tables", table, "schema"]) => {
+            if let Some(err) = crate::auth::reserved_table_access_error(table) {
+                return (
+                    403,
+                    "Forbidden",
+                    format!(r#"{{"error":"{}"}}"#, escape_json(&err)),
+                );
+            }
             let now = std::time::Instant::now();
             match crate::tables::table_schema(store, cache, table, now) {
                 Ok(fields) => {
@@ -1606,6 +1782,13 @@ fn route_request(
             }
         }
         ("GET", ["tables", table, "count"]) => {
+            if let Some(err) = crate::auth::reserved_table_access_error(table) {
+                return (
+                    403,
+                    "Forbidden",
+                    format!(r#"{{"error":"{}"}}"#, escape_json(&err)),
+                );
+            }
             let now = std::time::Instant::now();
             match crate::tables::table_count(store, cache, table, now) {
                 Ok(n) => ok(format!(r#"{{"result":{n}}}"#)),
@@ -1756,6 +1939,53 @@ fn route_request(
     }
 }
 
+fn required_capability_for_route(method: &str, base: &[&str]) -> Option<String> {
+    match (method, base) {
+        ("GET", ["ping"]) => None,
+        ("POST", ["exec"]) => Some("exec".to_string()),
+        ("GET", ["dbsize"]) => Some("db.read".to_string()),
+        ("GET", ["keys"]) | ("GET", ["keys", _]) => Some("kv.*.read".to_string()),
+
+        ("GET", ["kv", key])
+        | ("GET", ["kv", key, "hash"])
+        | ("GET", ["kv", key, "list"])
+        | ("GET", ["kv", key, "set"])
+        | ("GET", ["kv", key, "zset"])
+        | ("GET", ["get", key])
+        | ("GET", ["hgetall", key]) => Some(format!("kv.{key}.read")),
+
+        ("PUT", ["kv", key])
+        | ("DELETE", ["kv", key])
+        | ("POST", ["kv", key, "incr"])
+        | ("POST", ["kv", key, "decr"])
+        | ("POST", ["set", key])
+        | ("POST", ["del", key])
+        | ("POST", ["incr", key])
+        | ("POST", ["decr", key]) => Some(format!("kv.{key}.write")),
+
+        ("GET", ["tables"]) => Some("table.*.read".to_string()),
+        ("POST", ["tables"]) => Some("table.*.write".to_string()),
+        ("GET", ["tables", table])
+        | ("GET", ["tables", table, "schema"])
+        | ("GET", ["tables", table, "count"]) => Some(format!("table.{table}.read")),
+        ("POST", ["tables", table])
+        | ("PATCH", ["tables", table])
+        | ("DELETE", ["tables", table]) => Some(format!("table.{table}.write")),
+
+        ("GET", ["ts"]) => Some("ts.*.read".to_string()),
+        ("GET", ["ts", key]) | ("GET", ["ts", key, "info"]) | ("GET", ["ts", key, "latest"]) => {
+            Some(format!("ts.{key}.read"))
+        }
+        ("POST", ["ts", key]) => Some(format!("ts.{key}.write")),
+
+        ("POST", ["vectors", "search"]) => Some("vector.search".to_string()),
+        ("POST", ["vectors", _]) | ("DELETE", ["vectors", _]) => Some("vector.write".to_string()),
+        ("GET", ["vectors"]) | ("GET", ["vectors", _]) => Some("vector.read".to_string()),
+
+        _ => None,
+    }
+}
+
 fn ok(result: String) -> (u16, &'static str, String) {
     (200, "OK", result)
 }
@@ -1857,6 +2087,14 @@ fn route_table_query(
     _broker: &Broker,
     cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
+    if let Some(err) = crate::auth::reserved_table_access_error(table) {
+        return (
+            403,
+            "Forbidden",
+            format!(r#"{{"error":"{}"}}"#, escape_json(&err)),
+        );
+    }
+
     let now = std::time::Instant::now();
 
     match parse_http_table_query(params, table, None) {

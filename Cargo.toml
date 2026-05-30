@@ -29,6 +29,11 @@ sha1_smol = "1"
 rmp = "0.8"
 serde_json = "1"
 tokio-tungstenite = "0.24"
+argon2 = "0.5"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"

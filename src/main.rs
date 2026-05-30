@@ -56,6 +56,18 @@ async fn async_main() -> std::io::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5usize);
+    let auth_enabled = std::env::var("LUX_AUTH_ENABLED").is_ok_and(|v| {
+        let v = v.to_ascii_lowercase();
+        v == "1" || v == "true"
+    });
+    let auth_access_token_ttl = std::env::var("LUX_AUTH_ACCESS_TOKEN_TTL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3600);
+    let auth_refresh_token_ttl = std::env::var("LUX_AUTH_REFRESH_TOKEN_TTL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30 * 24 * 60 * 60);
 
     let config = lux::ServerConfig {
         bind_host: std::env::var("LUX_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
@@ -100,6 +112,19 @@ async fn async_main() -> std::io::Result<()> {
             max_memory: eviction_max_memory,
             policy: eviction_policy,
             sample_size: eviction_sample_size,
+        },
+        auth: lux::AuthConfig {
+            enabled: auth_enabled,
+            issuer: std::env::var("LUX_AUTH_ISSUER")
+                .unwrap_or_else(|_| "http://localhost:7379/auth/v1".to_string()),
+            access_token_ttl: std::time::Duration::from_secs(auth_access_token_ttl),
+            refresh_token_ttl: std::time::Duration::from_secs(auth_refresh_token_ttl),
+            email_password_enabled: std::env::var("LUX_AUTH_EMAIL_PASSWORD").map_or(true, |v| {
+                let v = v.to_ascii_lowercase();
+                !(v == "0" || v == "false")
+            }),
+            initial_publishable_key: std::env::var("LUX_AUTH_PUBLISHABLE_KEY").ok(),
+            initial_secret_key: std::env::var("LUX_AUTH_SECRET_KEY").ok(),
         },
         // The library is quiet by default; the binary maps severity-specific
         // callbacks back to the previous stdout/stderr behavior.

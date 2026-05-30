@@ -329,6 +329,16 @@ fn is_valid_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
+fn is_valid_table_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !name.contains("..")
+}
+
 /// Parse a single field definition in SQL-like syntax.
 ///
 /// Examples:
@@ -820,7 +830,7 @@ pub fn table_create(
     col_args: &[&str],
     now: Instant,
 ) -> Result<(), String> {
-    if !is_valid_name(table) {
+    if !is_valid_table_name(table) {
         return Err("ERR invalid table name".to_string());
     }
     if col_args.is_empty() {
@@ -1567,6 +1577,9 @@ pub fn table_drop(
     table: &str,
     now: Instant,
 ) -> Result<(), String> {
+    if crate::auth::is_reserved_auth_table(table) {
+        return Err(format!("ERR table '{}' is managed by Lux Auth", table));
+    }
     let schema = match load_schema(store, cache, table, now) {
         Ok(s) => s,
         Err(_) => return Err(format!("ERR table '{}' does not exist", table)),

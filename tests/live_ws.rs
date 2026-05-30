@@ -35,6 +35,15 @@ fn free_port() -> u16 {
 }
 
 fn start_lux(resp_port: u16, http_port: u16, password: Option<&str>) -> LuxServer {
+    start_lux_with_env(resp_port, http_port, password, &[])
+}
+
+fn start_lux_with_env(
+    resp_port: u16,
+    http_port: u16,
+    password: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> LuxServer {
     let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_lux"));
     let tmpdir = std::env::temp_dir().join(format!(
         "lux_live_ws_test_{}_{}",
@@ -56,6 +65,9 @@ fn start_lux(resp_port: u16, http_port: u16, password: Option<&str>) -> LuxServe
     if let Some(password) = password {
         cmd.env("LUX_PASSWORD", password);
     }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
 
     let child = cmd.spawn().expect("failed to start lux");
     let server = LuxServer { child, tmpdir };
@@ -68,6 +80,71 @@ fn start_lux(resp_port: u16, http_port: u16, password: Option<&str>) -> LuxServe
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("lux did not start on resp={resp_port} http={http_port}");
+}
+
+fn http_json_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+    auth: Option<&str>,
+) -> (u16, Value) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\n\r\n{}",
+        auth.map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default(),
+        body.len(),
+        body
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                response.extend_from_slice(&buf[..n]);
+                if let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&response[..header_end]);
+                    let Some(len) = headers
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+                        .and_then(|line| line.split(':').nth(1))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                    else {
+                        continue;
+                    };
+                    if response.len() >= header_end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(e) => panic!("HTTP read failed: {e}"),
+        }
+    }
+
+    let text = String::from_utf8_lossy(&response);
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("");
+    (
+        status,
+        serde_json::from_str(body).unwrap_or_else(|_| json!({})),
+    )
 }
 
 async fn connect_live(http_port: u16, password: Option<&str>) -> TestWs {
@@ -163,6 +240,92 @@ async fn live_websocket_requires_auth_when_password_is_set() {
     let subscribed = recv_json(&mut ws).await;
     assert_eq!(subscribed["type"], "live.subscribed");
     assert_eq!(subscribed["id"], "k");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_requires_lux_auth_token_when_auth_is_enabled() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux_with_env(
+        resp_port,
+        http_port,
+        Some("rootsecret"),
+        &[("LUX_AUTH_ENABLED", "true")],
+    );
+
+    let err = connect_async(format!("ws://127.0.0.1:{http_port}/live"))
+        .await
+        .expect_err("anonymous websocket should be rejected when auth is enabled");
+    assert!(err.to_string().contains("401"), "unexpected error: {err}");
+
+    let (status, signup) = http_json_request(
+        http_port,
+        "POST",
+        "/auth/v1/signup",
+        r#"{"email":"live-auth@example.com","password":"password123"}"#,
+        None,
+    );
+    assert_eq!(status, 200, "signup: {signup}");
+    let access_token = signup["access_token"]
+        .as_str()
+        .expect("signup should return access token");
+    let user_id = signup["user"]["id"]
+        .as_str()
+        .expect("signup should return user id");
+
+    let mut ws = connect_live(http_port, Some(access_token)).await;
+    send_json(
+        &mut ws,
+        json!({"type":"live.subscribe","id":"denied","spec":{"kind":"key","pattern":"authlive:*"}}),
+    )
+    .await;
+    let denied = recv_json(&mut ws).await;
+    assert_eq!(denied["type"], "live.error");
+    assert_eq!(denied["error"]["code"], "FORBIDDEN");
+
+    let (status, grant) = http_json_request(
+        http_port,
+        "POST",
+        "/auth/v1/admin/grants",
+        &format!(
+            r#"{{"user_id":"{}","capability":"live.key.authlive:*"}}"#,
+            user_id
+        ),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "grant: {grant}");
+
+    send_json(
+        &mut ws,
+        json!({"type":"live.subscribe","id":"auth-live","spec":{"kind":"key","pattern":"authlive:*"}}),
+    )
+    .await;
+    let subscribed = recv_json(&mut ws).await;
+    assert_eq!(subscribed["type"], "live.subscribed");
+    assert_eq!(subscribed["id"], "auth-live");
+
+    let (status, logout) = http_json_request(
+        http_port,
+        "POST",
+        "/auth/v1/logout",
+        "{}",
+        Some(access_token),
+    );
+    assert_eq!(status, 200, "logout: {logout}");
+
+    let err = connect_async({
+        let mut request = format!("ws://127.0.0.1:{http_port}/live")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {access_token}")).unwrap(),
+        );
+        request
+    })
+    .await
+    .expect_err("revoked auth token should be rejected at websocket handshake");
+    assert!(err.to_string().contains("401"), "unexpected error: {err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

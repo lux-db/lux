@@ -22,6 +22,10 @@ pub fn cmd_tcreate(
         return CmdResult::Written;
     }
     let table = arg_str(args[1]);
+    if let Some(err) = crate::auth::reserved_table_mutation_error(args, store) {
+        resp::write_error(out, &err);
+        return CmdResult::Written;
+    }
     // Everything after the table name is the SQL-like column list
     let col_args: Vec<&str> = args[2..].iter().map(|a| arg_str(a)).collect();
     match tables::table_create(store, cache, table, &col_args, now) {
@@ -43,6 +47,10 @@ pub fn cmd_tinsert(
         return CmdResult::Written;
     }
     let table = arg_str(args[1]);
+    if let Some(err) = crate::auth::reserved_table_mutation_error(args, store) {
+        resp::write_error(out, &err);
+        return CmdResult::Written;
+    }
     let mut field_values: Vec<(&str, &str)> = Vec::new();
     let mut i = 2;
     while i + 1 < args.len() {
@@ -74,6 +82,10 @@ pub fn cmd_tupdate(
     }
 
     let table = arg_str(args[1]);
+    if let Some(err) = crate::auth::reserved_table_mutation_error(args, store) {
+        resp::write_error(out, &err);
+        return CmdResult::Written;
+    }
 
     // Find WHERE keyword position
     let mut where_pos = None;
@@ -143,6 +155,10 @@ pub fn cmd_tdelete(
     }
 
     let table = arg_str(args[2]);
+    if let Some(err) = crate::auth::reserved_table_mutation_error(args, store) {
+        resp::write_error(out, &err);
+        return CmdResult::Written;
+    }
 
     // Find WHERE keyword
     let mut where_pos = None;
@@ -183,6 +199,10 @@ pub fn cmd_tdrop(
         return CmdResult::Written;
     }
     let table = arg_str(args[1]);
+    if let Some(err) = crate::auth::reserved_table_mutation_error(args, store) {
+        resp::write_error(out, &err);
+        return CmdResult::Written;
+    }
     match tables::table_drop(store, cache, table, now) {
         Ok(()) => resp::write_ok(out),
         Err(e) => resp::write_error(out, &e),
@@ -202,6 +222,10 @@ pub fn cmd_tcount(
         return CmdResult::Written;
     }
     let table = arg_str(args[1]);
+    if let Some(err) = crate::auth::reserved_table_access_error(table) {
+        resp::write_error(out, &err);
+        return CmdResult::Written;
+    }
     match tables::table_count(store, cache, table, now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
@@ -221,6 +245,10 @@ pub fn cmd_tschema(
         return CmdResult::Written;
     }
     let table = arg_str(args[1]);
+    if let Some(err) = crate::auth::reserved_table_access_error(table) {
+        resp::write_error(out, &err);
+        return CmdResult::Written;
+    }
     match tables::table_schema(store, cache, table, now) {
         Ok(fields) => {
             resp::write_array_header(out, fields.len());
@@ -245,6 +273,10 @@ pub fn cmd_talter(
         return CmdResult::Written;
     }
     let table = arg_str(args[1]);
+    if let Some(err) = crate::auth::reserved_table_mutation_error(args, store) {
+        resp::write_error(out, &err);
+        return CmdResult::Written;
+    }
     let action = arg_str(args[2]).to_uppercase();
     match action.as_str() {
         "ADD" => {
@@ -298,6 +330,10 @@ pub fn cmd_tselect(
             return CmdResult::Written;
         }
     };
+    if let Some(err) = crate::auth::reserved_table_access_error(&plan.table) {
+        resp::write_error(out, &err);
+        return CmdResult::Written;
+    }
     match tables::table_select(store, cache, &plan, now) {
         Ok(SelectResult::Rows(rows)) => {
             resp::write_array_header(out, rows.len());

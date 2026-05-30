@@ -2093,6 +2093,10 @@ pub fn execute_with_wal(
     now: Instant,
 ) -> CmdResult {
     if !args.is_empty() && crate::eviction::is_write_command(args[0]) {
+        if let Some(err) = crate::auth::reserved_table_mutation_error(args, store) {
+            resp::write_error(out, &err);
+            return CmdResult::Written;
+        }
         if let Err(e) = store.wal_log_command(args) {
             resp::write_error(out, &format!("ERR WAL append failed: {e}"));
             return CmdResult::Written;
