@@ -1,6 +1,6 @@
 [package]
 name = "lux"
-version = "0.12.1"
+version = "0.13.0"
 edition = "2021"
 description = "A fast, multi-threaded Redis-compatible key-value store."
 license = "MIT"
@@ -19,6 +19,8 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 parking_lot = "0.12"
 hashbrown = "0.14"
 ordered-float = "4"
@@ -26,6 +28,7 @@ mlua = { version = "0.10", features = ["lua54", "vendored"] }
 sha1_smol = "1"
 rmp = "0.8"
 serde_json = "1"
+tokio-tungstenite = "0.24"
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"

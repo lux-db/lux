@@ -5,7 +5,7 @@
 //! Evicted entries are written to the DiskShard instead of being deleted.
 //! On read miss, entries are transparently promoted back to memory.
 
-use crate::store::{DumpEntry, DumpValue};
+use crate::store::{DumpEntry, DumpValue, StreamGroupDump};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -211,6 +211,10 @@ impl Wal {
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(_) => break,
             };
+            let payload_start = self.file.stream_position()?;
+            if payload_start + frame_len as u64 > file_len {
+                break;
+            }
 
             let mut buf = vec![0u8; frame_len];
             match self.file.read_exact(&mut buf) {
@@ -243,7 +247,7 @@ impl Wal {
                 Err(_) => continue,
             };
 
-            let mut args = Vec::with_capacity(argc);
+            let mut args = Vec::new();
             let mut valid = true;
             for _ in 0..argc {
                 match read_bytes(&mut cursor) {
@@ -667,6 +671,10 @@ impl DiskShard {
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                     Err(e) => return Err(e),
                 };
+                let payload_start = self.data_file.stream_position()?;
+                if payload_start + entry_len as u64 > file_len {
+                    break;
+                }
 
                 let mut entry_data = vec![0u8; entry_len];
                 match self.data_file.read_exact(&mut entry_data) {
@@ -787,14 +795,78 @@ fn read_f64(r: &mut impl Read) -> io::Result<f64> {
 
 fn read_bytes(r: &mut impl Read) -> io::Result<Vec<u8>> {
     let len = read_u32(r)? as usize;
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
+    let mut limited = r.take(len as u64);
+    let mut buf = Vec::new();
+    limited.read_to_end(&mut buf)?;
+    if buf.len() != len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short length-prefixed byte string",
+        ));
+    }
     Ok(buf)
 }
 
 fn read_string(r: &mut impl Read) -> io::Result<String> {
     let raw = read_bytes(r)?;
     String::from_utf8(raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn write_stream_groups(w: &mut impl Write, groups: &[StreamGroupDump]) -> io::Result<()> {
+    write_u32(w, groups.len() as u32)?;
+    for (name, last_delivered_id, consumers, pending) in groups {
+        write_bytes(w, name.as_bytes())?;
+        write_bytes(w, last_delivered_id.as_bytes())?;
+        write_u32(w, consumers.len() as u32)?;
+        for (consumer, pending_ids) in consumers {
+            write_bytes(w, consumer.as_bytes())?;
+            write_u32(w, pending_ids.len() as u32)?;
+            for id in pending_ids {
+                write_bytes(w, id.as_bytes())?;
+            }
+        }
+        write_u32(w, pending.len() as u32)?;
+        for (id, consumer, delivery_count) in pending {
+            write_bytes(w, id.as_bytes())?;
+            write_bytes(w, consumer.as_bytes())?;
+            write_u32(w, (*delivery_count).min(u32::MAX as u64) as u32)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_stream_groups(r: &mut impl Read) -> io::Result<Vec<StreamGroupDump>> {
+    let group_count = match read_u32(r) {
+        Ok(count) => count as usize,
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut groups = Vec::with_capacity(group_count);
+    for _ in 0..group_count {
+        let name = read_string(r)?;
+        let last_delivered_id = read_string(r)?;
+        let consumer_count = read_u32(r)? as usize;
+        let mut consumers = Vec::with_capacity(consumer_count);
+        for _ in 0..consumer_count {
+            let consumer = read_string(r)?;
+            let pending_count = read_u32(r)? as usize;
+            let mut pending_ids = Vec::with_capacity(pending_count);
+            for _ in 0..pending_count {
+                pending_ids.push(read_string(r)?);
+            }
+            consumers.push((consumer, pending_ids));
+        }
+        let pending_count = read_u32(r)? as usize;
+        let mut pending = Vec::with_capacity(pending_count);
+        for _ in 0..pending_count {
+            let id = read_string(r)?;
+            let consumer = read_string(r)?;
+            let delivery_count = read_u32(r)? as u64;
+            pending.push((id, consumer, delivery_count));
+        }
+        groups.push((name, last_delivered_id, consumers, pending));
+    }
+    Ok(groups)
 }
 
 pub fn write_single_entry(w: &mut impl Write, entry: &DumpEntry) -> io::Result<()> {
@@ -842,7 +914,7 @@ pub fn write_single_entry(w: &mut impl Write, entry: &DumpEntry) -> io::Result<(
                 write_f64(w, *score)?;
             }
         }
-        DumpValue::Stream(stream_entries, last_id) => {
+        DumpValue::Stream(stream_entries, last_id, groups) => {
             write_bytes(w, last_id.as_bytes())?;
             write_u32(w, stream_entries.len() as u32)?;
             for (id, fields) in stream_entries {
@@ -853,6 +925,7 @@ pub fn write_single_entry(w: &mut impl Write, entry: &DumpEntry) -> io::Result<(
                     write_bytes(w, v)?;
                 }
             }
+            write_stream_groups(w, groups)?;
         }
         DumpValue::Vector(data, metadata) => {
             write_u32(w, data.len() as u32)?;
@@ -899,7 +972,7 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
         b'S' => DumpValue::Str(read_bytes(r)?),
         b'L' => {
             let len = read_u32(r)? as usize;
-            let mut items = Vec::with_capacity(len);
+            let mut items = Vec::new();
             for _ in 0..len {
                 items.push(read_bytes(r)?);
             }
@@ -907,7 +980,7 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
         }
         b'H' => {
             let len = read_u32(r)? as usize;
-            let mut pairs = Vec::with_capacity(len);
+            let mut pairs = Vec::new();
             for _ in 0..len {
                 let k = read_string(r)?;
                 let v = read_bytes(r)?;
@@ -917,7 +990,7 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
         }
         b'T' => {
             let len = read_u32(r)? as usize;
-            let mut members = Vec::with_capacity(len);
+            let mut members = Vec::new();
             for _ in 0..len {
                 members.push(read_string(r)?);
             }
@@ -925,7 +998,7 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
         }
         b'Z' => {
             let len = read_u32(r)? as usize;
-            let mut members = Vec::with_capacity(len);
+            let mut members = Vec::new();
             for _ in 0..len {
                 let m = read_string(r)?;
                 let s = read_f64(r)?;
@@ -936,11 +1009,11 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
         b'X' => {
             let last_id = read_string(r)?;
             let entry_count = read_u32(r)? as usize;
-            let mut entries = Vec::with_capacity(entry_count);
+            let mut entries = Vec::new();
             for _ in 0..entry_count {
                 let id = read_string(r)?;
                 let field_count = read_u32(r)? as usize;
-                let mut fields = Vec::with_capacity(field_count);
+                let mut fields = Vec::new();
                 for _ in 0..field_count {
                     let k = read_string(r)?;
                     let v = read_bytes(r)?;
@@ -948,11 +1021,12 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
                 }
                 entries.push((id, fields));
             }
-            DumpValue::Stream(entries, last_id)
+            let groups = read_stream_groups(r)?;
+            DumpValue::Stream(entries, last_id, groups)
         }
         b'V' => {
             let dims = read_u32(r)? as usize;
-            let mut data = Vec::with_capacity(dims);
+            let mut data = Vec::new();
             for _ in 0..dims {
                 let mut buf = [0u8; 4];
                 r.read_exact(&mut buf)?;
@@ -976,7 +1050,7 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
         }
         b'I' => {
             let sample_count = read_u32(r)? as usize;
-            let mut samples = Vec::with_capacity(sample_count);
+            let mut samples = Vec::new();
             for _ in 0..sample_count {
                 let ts = read_i64(r)?;
                 let val = read_f64(r)?;
@@ -984,7 +1058,7 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
             }
             let retention = read_i64(r)? as u64;
             let label_count = read_u32(r)? as usize;
-            let mut labels = Vec::with_capacity(label_count);
+            let mut labels = Vec::new();
             for _ in 0..label_count {
                 let k = read_string(r)?;
                 let v = read_string(r)?;
@@ -1349,7 +1423,11 @@ mod tests {
                 ),
                 arb_string(),
             )
-                .prop_map(|(entries, last_id)| DumpValue::Stream(entries, last_id)),
+                .prop_map(|(entries, last_id)| DumpValue::Stream(
+                    entries,
+                    last_id,
+                    Vec::new()
+                )),
         ]
     }
 
@@ -1369,7 +1447,9 @@ mod tests {
             (DumpValue::Hash(a), DumpValue::Hash(b)) => a == b,
             (DumpValue::Set(a), DumpValue::Set(b)) => a == b,
             (DumpValue::SortedSet(a), DumpValue::SortedSet(b)) => a == b,
-            (DumpValue::Stream(ae, al), DumpValue::Stream(be, bl)) => ae == be && al == bl,
+            (DumpValue::Stream(ae, al, ag), DumpValue::Stream(be, bl, bg)) => {
+                ae == be && al == bl && ag == bg
+            }
             (DumpValue::Vector(ad, am), DumpValue::Vector(bd, bm)) => ad == bd && am == bm,
             (DumpValue::HyperLogLog(ar, _), DumpValue::HyperLogLog(br, _)) => ar == br,
             (DumpValue::TimeSeries(as_, ar, al), DumpValue::TimeSeries(bs, br, bl)) => {

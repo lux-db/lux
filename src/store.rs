@@ -93,8 +93,6 @@ impl Hasher for FxHasher {
     }
 }
 
-type MsetShardBuckets<'a> = HashMap<usize, Vec<(&'a [u8], &'a [u8])>, FxBuildHasher>;
-
 #[allow(dead_code)]
 pub const MAX_SHARDS: usize = 1024;
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
@@ -621,18 +619,12 @@ impl Store {
     /// the disk shard BEFORE being removed from memory. If the disk write
     /// fails, the entry stays in memory (no silent data loss). The shard
     /// write lock is dropped before disk I/O to avoid blocking other operations.
-    pub fn evict_key(&self, shard_idx: usize, key: &str) {
+    pub fn evict_key(&self, shard_idx: usize, key: &str) -> bool {
         if let Some(ref disk_shards) = self.disk_shards {
-            let mut shard = self.shards[shard_idx].write();
+            let shard = self.shards[shard_idx].write();
             if let Some(entry) = shard.data.get(key) {
                 if matches!(entry.value, StoreValue::Vector(_)) {
-                    let mem = estimate_entry_memory(key, &entry.value);
-                    shard.data.remove(key);
-                    self.key_removed();
-                    shard.used_memory = shard.used_memory.saturating_sub(mem);
-                    self.mem_sub(mem);
-                    shard.version += 1;
-                    return;
+                    return false;
                 }
                 let now = Instant::now();
                 let ttl_ms = entry
@@ -656,7 +648,7 @@ impl Store {
                         key: key.to_string(),
                         error: e.to_string(),
                     });
-                    return;
+                    return false;
                 }
                 if disk.should_compact() {
                     if let Err(e) = disk.compact() {
@@ -674,6 +666,7 @@ impl Store {
                     shard.used_memory = shard.used_memory.saturating_sub(mem);
                     self.mem_sub(mem);
                     shard.version += 1;
+                    return true;
                 }
             }
         } else {
@@ -684,8 +677,10 @@ impl Store {
                 shard.used_memory = shard.used_memory.saturating_sub(mem);
                 self.mem_sub(mem);
                 shard.version += 1;
+                return true;
             }
         }
+        false
     }
 
     fn entry_to_dump(&self, key: &str, value: &StoreValue, ttl_ms: i64) -> DumpEntry {
@@ -1121,60 +1116,6 @@ impl Store {
         shard.version += 1;
         self.set_on_shard(&mut shard.data, key, value, ttl, now);
         self.remove_from_disk(key);
-    }
-
-    pub fn mset_from_args(&self, kv_args: &[&[u8]], now: Instant) {
-        if kv_args.is_empty() {
-            return;
-        }
-        if kv_args.len() == 2 {
-            self.set(kv_args[0], kv_args[1], None, now);
-            return;
-        }
-        let pair_count = kv_args.len() / 2;
-        let tiered = self.disk_shards.is_some();
-        if pair_count <= 8 {
-            let mut pairs = Vec::with_capacity(pair_count);
-            for pair in kv_args.chunks_exact(2) {
-                let key = pair[0];
-                let value = pair[1];
-                pairs.push((self.shard_index(key), key, value));
-            }
-            pairs.sort_unstable_by_key(|(idx, _, _)| *idx);
-            let mut i = 0usize;
-            while i < pairs.len() {
-                let shard_idx = pairs[i].0;
-                let mut shard = self.shards[shard_idx].write();
-                shard.version += 1;
-                while i < pairs.len() && pairs[i].0 == shard_idx {
-                    let (_, key, value) = pairs[i];
-                    self.set_on_shard(&mut shard.data, key, value, None, now);
-                    if tiered {
-                        self.remove_from_disk(key);
-                    }
-                    i += 1;
-                }
-            }
-            return;
-        }
-        let mut by_shard: MsetShardBuckets<'_> =
-            HashMap::with_capacity_and_hasher(kv_args.len().div_ceil(2).min(16), FxBuildHasher);
-        for pair in kv_args.chunks_exact(2) {
-            let key = pair[0];
-            let value = pair[1];
-            let idx = self.shard_index(key);
-            by_shard.entry(idx).or_default().push((key, value));
-        }
-        for (idx, shard_pairs) in by_shard {
-            let mut shard = self.shards[idx].write();
-            shard.version += 1;
-            for (key, value) in shard_pairs {
-                self.set_on_shard(&mut shard.data, key, value, None, now);
-                if tiered {
-                    self.remove_from_disk(key);
-                }
-            }
-        }
     }
 
     pub fn set_nx(&self, key: &[u8], value: &[u8], now: Instant) -> bool {
@@ -2037,7 +1978,7 @@ impl Store {
                 StoreValue::List(list) => {
                     let val = list.pop_front()?;
                     let freed = val.len() + 32;
-                    shard.used_memory -= freed;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
                     self.mem_sub(freed);
                     Some(val)
                 }
@@ -2068,7 +2009,7 @@ impl Store {
                 StoreValue::List(list) => {
                     let val = list.pop_back()?;
                     let freed = val.len() + 32;
-                    shard.used_memory -= freed;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
                     self.mem_sub(freed);
                     Some(val)
                 }
@@ -2096,7 +2037,7 @@ impl Store {
                 StoreValue::List(list) => {
                     let val = list.pop_back()?;
                     let freed = val.len() + 32;
-                    shard.used_memory -= freed;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
                     self.mem_sub(freed);
                     Some(val)
                 }
@@ -3591,6 +3532,7 @@ impl Store {
         self.metrics.used_memory.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub fn dump_all(&self, now: Instant) -> Vec<DumpEntry> {
         let mut entries = Vec::new();
         for shard in self.shards.iter() {
@@ -3670,7 +3612,7 @@ impl Store {
                 }
                 StoreValue::SortedSet(tree, scores)
             }
-            DumpValue::Stream(entries_data, last_id_str) => {
+            DumpValue::Stream(entries_data, last_id_str, groups_data) => {
                 let last_id = StreamId::parse(&last_id_str).unwrap_or(StreamId::zero());
                 let mut entries = BTreeMap::new();
                 for (id_str, fields_data) in entries_data {
@@ -3682,10 +3624,60 @@ impl Store {
                         entries.insert(id, fields);
                     }
                 }
+                let inst_now = Instant::now();
+                let mut groups = std::collections::HashMap::new();
+                for (group_name, last_delivered_str, consumers_data, pending_data) in groups_data {
+                    let last_delivered_id =
+                        StreamId::parse(&last_delivered_str).unwrap_or(StreamId::zero());
+                    let mut consumers = std::collections::HashMap::new();
+                    for (consumer_name, pending_ids) in consumers_data {
+                        let pel = pending_ids
+                            .into_iter()
+                            .filter_map(|id| StreamId::parse(&id))
+                            .collect();
+                        consumers.insert(
+                            consumer_name,
+                            Consumer {
+                                pel,
+                                seen_time: inst_now,
+                            },
+                        );
+                    }
+                    let mut pel = BTreeMap::new();
+                    for (id_str, consumer, delivery_count) in pending_data {
+                        if let Some(id) = StreamId::parse(&id_str) {
+                            pel.insert(
+                                id,
+                                PendingEntry {
+                                    consumer: consumer.clone(),
+                                    delivery_time: inst_now,
+                                    delivery_count,
+                                },
+                            );
+                            consumers.entry(consumer).or_insert_with(|| Consumer {
+                                pel: HashSet::new(),
+                                seen_time: inst_now,
+                            });
+                        }
+                    }
+                    for (id, pending) in &pel {
+                        if let Some(consumer) = consumers.get_mut(&pending.consumer) {
+                            consumer.pel.insert(*id);
+                        }
+                    }
+                    groups.insert(
+                        group_name,
+                        ConsumerGroup {
+                            last_delivered_id,
+                            consumers,
+                            pel,
+                        },
+                    );
+                }
                 StoreValue::Stream(StreamData {
                     entries,
                     last_id,
-                    groups: std::collections::HashMap::new(),
+                    groups,
                 })
             }
             DumpValue::Vector(data, metadata) => {
@@ -4837,7 +4829,7 @@ impl Store {
                         freed += member.len() + 32;
                         result.push(member);
                     }
-                    shard.used_memory -= freed;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
                     self.mem_sub(freed);
                     Ok(result)
                 }
@@ -4877,7 +4869,7 @@ impl Store {
                         freed += member.len() + 32;
                         result.push(member);
                     }
-                    shard.used_memory -= freed;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
                     self.mem_sub(freed);
                     Ok(result)
                 }
@@ -4908,7 +4900,7 @@ impl Store {
                 StoreValue::Set(set) => {
                     let member = set.pop()?;
                     let freed = member.len() + 32;
-                    shard.used_memory -= freed;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
                     self.mem_sub(freed);
                     Some(member)
                 }
@@ -5061,21 +5053,6 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         self.zadd_on_shard(&mut shard, key, members, nx, xx, gt, lt, ch, now)
-    }
-
-    /// Hot-path ZADD for a single member with default options.
-    /// Equivalent to: ZADD key score member.
-    pub fn zadd_single_default(
-        &self,
-        key: &[u8],
-        member: &[u8],
-        score: f64,
-        now: Instant,
-    ) -> Result<i64, String> {
-        let idx = self.shard_index(key);
-        let mut shard = self.shards[idx].write();
-        shard.version += 1;
-        self.zadd_single_default_on_shard(&mut shard, key, member, score, now)
     }
 
     /// Hot-path ZADD for a single member with default options.
@@ -6284,7 +6261,36 @@ fn store_value_to_dump_value(value: &StoreValue) -> DumpValue {
                     (id.to_string(), flds)
                 })
                 .collect();
-            DumpValue::Stream(entries, s.last_id.to_string())
+            let groups: Vec<StreamGroupDump> = s
+                .groups
+                .iter()
+                .map(|(name, group)| {
+                    let consumers = group
+                        .consumers
+                        .iter()
+                        .map(|(consumer, data)| {
+                            let mut pending: Vec<String> =
+                                data.pel.iter().map(ToString::to_string).collect();
+                            pending.sort();
+                            (consumer.clone(), pending)
+                        })
+                        .collect();
+                    let pending = group
+                        .pel
+                        .iter()
+                        .map(|(id, entry)| {
+                            (id.to_string(), entry.consumer.clone(), entry.delivery_count)
+                        })
+                        .collect();
+                    (
+                        name.clone(),
+                        group.last_delivered_id.to_string(),
+                        consumers,
+                        pending,
+                    )
+                })
+                .collect();
+            DumpValue::Stream(entries, s.last_id.to_string(), groups)
         }
         StoreValue::Vector(v) => DumpValue::Vector(v.data.clone(), v.metadata.clone()),
         StoreValue::HyperLogLog(regs, cached) => DumpValue::HyperLogLog(regs.clone(), *cached),
@@ -6384,6 +6390,14 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 pub type StreamDumpEntry = (String, Vec<(String, Vec<u8>)>);
+pub type StreamConsumerDump = (String, Vec<String>);
+pub type StreamPendingDump = (String, String, u64);
+pub type StreamGroupDump = (
+    String,
+    String,
+    Vec<StreamConsumerDump>,
+    Vec<StreamPendingDump>,
+);
 
 #[derive(Debug)]
 pub enum DumpValue {
@@ -6392,7 +6406,7 @@ pub enum DumpValue {
     Hash(Vec<(String, Vec<u8>)>),
     Set(Vec<String>),
     SortedSet(Vec<(String, f64)>),
-    Stream(Vec<StreamDumpEntry>, String),
+    Stream(Vec<StreamDumpEntry>, String, Vec<StreamGroupDump>),
     Vector(Vec<f32>, Option<String>),
     HyperLogLog(Vec<u8>, u64),
     TimeSeries(Vec<(i64, f64)>, u64, Vec<(String, String)>),

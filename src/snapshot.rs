@@ -5,7 +5,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const HEADER: &[u8; 4] = b"LUX\x01";
+const HEADER_V1: &[u8; 4] = b"LUX\x01";
+const HEADER: &[u8; 4] = b"LUX\x02";
 
 fn snapshot_path(store: &Store) -> String {
     let dir = &store.config().data_dir;
@@ -61,12 +62,6 @@ fn read_f64(r: &mut impl Read) -> io::Result<f64> {
 fn read_string(r: &mut impl Read) -> io::Result<String> {
     let raw = read_bytes(r)?;
     String::from_utf8(raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-pub fn save(store: &Store) -> io::Result<usize> {
-    let now = Instant::now();
-    let entries = store.dump_all(now);
-    save_entries(store, &entries)
 }
 
 fn save_entries(store: &Store, entries: &[crate::store::DumpEntry]) -> io::Result<usize> {
@@ -142,7 +137,7 @@ fn save_binary(w: &mut impl Write, entries: &[crate::store::DumpEntry]) -> io::R
                     write_f64(w, *score)?;
                 }
             }
-            DumpValue::Stream(stream_entries, last_id) => {
+            DumpValue::Stream(stream_entries, last_id, groups) => {
                 write_bytes(w, last_id.as_bytes())?;
                 write_u32(w, stream_entries.len() as u32)?;
                 for (id, fields) in stream_entries {
@@ -151,6 +146,25 @@ fn save_binary(w: &mut impl Write, entries: &[crate::store::DumpEntry]) -> io::R
                     for (k, v) in fields {
                         write_bytes(w, k.as_bytes())?;
                         write_bytes(w, v)?;
+                    }
+                }
+                write_u32(w, groups.len() as u32)?;
+                for (name, last_delivered_id, consumers, pending) in groups {
+                    write_bytes(w, name.as_bytes())?;
+                    write_bytes(w, last_delivered_id.as_bytes())?;
+                    write_u32(w, consumers.len() as u32)?;
+                    for (consumer, pending_ids) in consumers {
+                        write_bytes(w, consumer.as_bytes())?;
+                        write_u32(w, pending_ids.len() as u32)?;
+                        for id in pending_ids {
+                            write_bytes(w, id.as_bytes())?;
+                        }
+                    }
+                    write_u32(w, pending.len() as u32)?;
+                    for (id, consumer, delivery_count) in pending {
+                        write_bytes(w, id.as_bytes())?;
+                        write_bytes(w, consumer.as_bytes())?;
+                        write_u32(w, (*delivery_count).min(u32::MAX as u64) as u32)?;
                     }
                 }
             }
@@ -205,14 +219,16 @@ fn load_from_reader(store: &Store, mut file: fs::File) -> io::Result<usize> {
     let mut header = [0u8; 4];
     let n = file.read(&mut header)?;
     if n == 4 && &header == HEADER {
-        load_binary(store, &mut io::BufReader::new(file))
+        load_binary(store, &mut io::BufReader::new(file), true)
+    } else if n == 4 && &header == HEADER_V1 {
+        load_binary(store, &mut io::BufReader::new(file), false)
     } else {
         file.seek(SeekFrom::Start(0))?;
         load_legacy(store, file)
     }
 }
 
-fn load_binary(store: &Store, r: &mut impl Read) -> io::Result<usize> {
+fn load_binary(store: &Store, r: &mut impl Read, stream_groups: bool) -> io::Result<usize> {
     let mut count = 0;
     loop {
         let mut type_buf = [0u8; 1];
@@ -283,7 +299,36 @@ fn load_binary(store: &Store, r: &mut impl Read) -> io::Result<usize> {
                     }
                     entries.push((id, fields));
                 }
-                DumpValue::Stream(entries, last_id)
+                let mut groups = Vec::new();
+                if stream_groups {
+                    let group_count = read_u32(r)? as usize;
+                    groups.reserve(group_count);
+                    for _ in 0..group_count {
+                        let name = read_string(r)?;
+                        let last_delivered_id = read_string(r)?;
+                        let consumer_count = read_u32(r)? as usize;
+                        let mut consumers = Vec::with_capacity(consumer_count);
+                        for _ in 0..consumer_count {
+                            let consumer = read_string(r)?;
+                            let pending_count = read_u32(r)? as usize;
+                            let mut pending_ids = Vec::with_capacity(pending_count);
+                            for _ in 0..pending_count {
+                                pending_ids.push(read_string(r)?);
+                            }
+                            consumers.push((consumer, pending_ids));
+                        }
+                        let pending_count = read_u32(r)? as usize;
+                        let mut pending = Vec::with_capacity(pending_count);
+                        for _ in 0..pending_count {
+                            let id = read_string(r)?;
+                            let consumer = read_string(r)?;
+                            let delivery_count = read_u32(r)? as u64;
+                            pending.push((id, consumer, delivery_count));
+                        }
+                        groups.push((name, last_delivered_id, consumers, pending));
+                    }
+                }
+                DumpValue::Stream(entries, last_id, groups)
             }
             b'V' => {
                 let dims = read_u32(r)? as usize;
@@ -468,7 +513,7 @@ fn load_legacy(store: &Store, file: fs::File) -> io::Result<usize> {
                         }
                     }
                 }
-                DumpValue::Stream(entries, last_id_str)
+                DumpValue::Stream(entries, last_id_str, Vec::new())
             }
             _ => continue,
         };
@@ -571,7 +616,7 @@ fn save_legacy_to_path(store: &Store, path: &str) -> io::Result<usize> {
                 .map(|(m, s)| format!("{}\x1e{}", m, s))
                 .collect::<Vec<_>>()
                 .join("\x1f"),
-            DumpValue::Stream(stream_entries, last_id) => {
+            DumpValue::Stream(stream_entries, last_id, _groups) => {
                 let entries_str: Vec<String> = stream_entries
                     .iter()
                     .map(|(id, fields)| {

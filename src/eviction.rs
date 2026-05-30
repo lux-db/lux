@@ -1,4 +1,4 @@
-use crate::store::Store;
+use crate::store::{Store, StoreValue};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvictionPolicy {
@@ -136,6 +136,9 @@ fn evict_lru(store: &Store, sample_size: usize, volatile_only: bool) -> bool {
             if volatile_only && entry.expires_at.is_none() {
                 continue;
             }
+            if matches!(entry.value, StoreValue::Vector(_)) {
+                continue;
+            }
             sampled += 1;
             if entry.lru_clock < best_clock {
                 best_clock = entry.lru_clock;
@@ -150,8 +153,7 @@ fn evict_lru(store: &Store, sample_size: usize, volatile_only: bool) -> bool {
     }
 
     if let Some(key) = best_key {
-        store.evict_key(best_shard, &key);
-        true
+        store.evict_key(best_shard, &key)
     } else {
         false
     }
@@ -173,16 +175,19 @@ fn evict_random(store: &Store, volatile_only: bool) -> bool {
             shard
                 .data
                 .iter()
-                .find(|(_, e)| e.expires_at.is_some())
+                .find(|(_, e)| e.expires_at.is_some() && !matches!(e.value, StoreValue::Vector(_)))
                 .map(|(k, _)| k.clone())
         } else {
-            shard.data.keys().next().cloned()
+            shard
+                .data
+                .iter()
+                .find(|(_, e)| !matches!(e.value, StoreValue::Vector(_)))
+                .map(|(k, _)| k.clone())
         };
         drop(shard);
 
         if let Some(k) = key {
-            store.evict_key(shard_idx, &k);
-            return true;
+            return store.evict_key(shard_idx, &k);
         }
     }
     false

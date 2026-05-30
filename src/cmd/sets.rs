@@ -6,6 +6,18 @@ use crate::store::Store;
 
 use super::{cmd_eq, parse_i64, parse_u64, CmdResult};
 
+const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
+
+fn parse_usize_arg(arg: &[u8], out: &mut BytesMut) -> Option<usize> {
+    match parse_u64(arg).ok().and_then(|n| usize::try_from(n).ok()) {
+        Some(n) => Some(n),
+        None => {
+            resp::write_error(out, INTEGER_ERR);
+            None
+        }
+    }
+}
+
 pub fn cmd_sadd(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 3 {
         resp::write_error(out, "ERR wrong number of arguments for 'sadd' command");
@@ -107,10 +119,9 @@ pub fn cmd_spop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         }
         return CmdResult::Written;
     }
-    let count = if args.len() > 2 {
-        parse_u64(args[2]).unwrap_or(1) as usize
-    } else {
-        1
+    let count = match parse_usize_arg(args[2], out) {
+        Some(count) => count,
+        None => return CmdResult::Written,
     };
     match store.spop(args[1], count, now) {
         Ok(members) => {
@@ -138,7 +149,13 @@ pub fn cmd_srandmember(
         return CmdResult::Written;
     }
     let count = if args.len() > 2 {
-        parse_i64(args[2]).unwrap_or(1)
+        match parse_i64(args[2]) {
+            Ok(count) => count,
+            Err(_) => {
+                resp::write_error(out, INTEGER_ERR);
+                return CmdResult::Written;
+            }
+        }
     } else {
         0
     };
@@ -304,7 +321,10 @@ pub fn cmd_sintercard(
     let mut limit: usize = 0;
     let rest = &args[2 + numkeys..];
     if rest.len() == 2 && cmd_eq(rest[0], b"LIMIT") {
-        limit = parse_u64(rest[1]).unwrap_or(0) as usize;
+        limit = match parse_usize_arg(rest[1], out) {
+            Some(limit) => limit,
+            None => return CmdResult::Written,
+        };
     } else if !rest.is_empty() {
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;

@@ -1,15 +1,24 @@
+use base64::Engine;
 use bytes::BytesMut;
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpSocket;
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
+use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::WebSocketStream;
 
 use crate::lua;
 use crate::pubsub::Broker;
 use crate::store::Store;
 use crate::tables::SharedSchemaCache;
 use crate::{CommandExecutor, CommandSession, LuxError};
+
+const WEBSOCKET_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /// Constant-time byte comparison to prevent timing attacks on auth tokens.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -174,6 +183,12 @@ async fn handle_request(
         return Ok(true);
     }
 
+    let (path, query_string) = match full_path.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (full_path.clone(), String::new()),
+    };
+    let params = parse_query_string(&query_string);
+
     let password = &store.config().password;
     if !password.is_empty() {
         let auth = headers
@@ -182,18 +197,30 @@ async fn handle_request(
             .map(|(_, v)| v.as_str())
             .unwrap_or("");
 
-        let token = auth.strip_prefix("Bearer ").unwrap_or("");
-        if !constant_time_eq(token.as_bytes(), password.as_bytes()) {
+        let bearer = auth.strip_prefix("Bearer ").unwrap_or("");
+        let query_token = if path == "/live" {
+            get_param(&params, "token").unwrap_or("")
+        } else {
+            ""
+        };
+        if !constant_time_eq(bearer.as_bytes(), password.as_bytes())
+            && !constant_time_eq(query_token.as_bytes(), password.as_bytes())
+        {
             let body = r#"{"error":"unauthorized"}"#;
             return send_json(socket, 401, "Unauthorized", body).await;
         }
     }
 
-    let (path, query_string) = match full_path.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (full_path.clone(), String::new()),
-    };
-    let params = parse_query_string(&query_string);
+    if method == "GET" && path == "/live" {
+        return handle_live_upgrade(
+            socket,
+            &headers,
+            store.clone(),
+            broker.clone(),
+            cache.clone(),
+        )
+        .await;
+    }
 
     // Fast path: table GET queries stream JSON directly without building
     // the full response string in memory first.
@@ -518,6 +545,809 @@ fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .iter()
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.as_str())
+}
+
+#[derive(Clone)]
+struct LiveTableSpec {
+    table: String,
+    select: String,
+    where_conditions: Vec<(String, String, Value)>,
+    order_by: Option<(String, String)>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Clone)]
+struct LiveVectorNearSpec {
+    vector: Vec<f32>,
+    k: usize,
+    threshold: Option<f32>,
+    filter: Option<(String, String)>,
+}
+
+struct LiveQueryState {
+    query: Value,
+    rows: HashMap<String, Value>,
+}
+
+enum LiveSubscription {
+    Key {
+        pattern: String,
+        receivers: Vec<broadcast::Receiver<crate::pubsub::Message>>,
+    },
+    Channel {
+        channel: String,
+        receiver: broadcast::Receiver<crate::pubsub::Message>,
+    },
+    PubSubPattern {
+        pattern: String,
+        receiver: broadcast::Receiver<crate::pubsub::Message>,
+    },
+    Table {
+        spec: LiveTableSpec,
+        state: LiveQueryState,
+        receivers: Vec<broadcast::Receiver<crate::pubsub::Message>>,
+    },
+    VectorNear {
+        spec: LiveVectorNearSpec,
+        state: LiveQueryState,
+        receiver: broadcast::Receiver<crate::pubsub::Message>,
+    },
+}
+
+enum LiveBrokerEvent {
+    Key {
+        pattern: String,
+        key: String,
+        operation: String,
+    },
+    Message {
+        channel: String,
+        message: String,
+        pattern: Option<String>,
+    },
+}
+
+fn live_broker_event_from_message(message: &crate::pubsub::Message) -> Option<LiveBrokerEvent> {
+    match message.kind {
+        crate::pubsub::MessageKind::PubSub => Some(LiveBrokerEvent::Message {
+            channel: message.channel.clone(),
+            message: String::from_utf8_lossy(&message.payload).to_string(),
+            pattern: message.pattern.clone(),
+        }),
+        crate::pubsub::MessageKind::KeyEvent => Some(LiveBrokerEvent::Key {
+            pattern: message.pattern.clone()?,
+            key: message.channel.clone(),
+            operation: String::from_utf8_lossy(&message.payload).to_string(),
+        }),
+    }
+}
+
+async fn handle_live_upgrade(
+    socket: &mut tokio::net::TcpStream,
+    headers: &[(String, String)],
+    store: Arc<Store>,
+    broker: Broker,
+    cache: SharedSchemaCache,
+) -> std::io::Result<bool> {
+    let Some(key) = header_value(headers, "sec-websocket-key") else {
+        return send_json(
+            socket,
+            400,
+            "Bad Request",
+            r#"{"error":"missing websocket key"}"#,
+        )
+        .await;
+    };
+
+    let accept = websocket_accept_key(key);
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\r\n"
+    );
+    socket.write_all(response.as_bytes()).await?;
+
+    let ws = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
+    run_live_socket(ws, store, broker, cache).await?;
+    Ok(false)
+}
+
+async fn run_live_socket<S>(
+    mut ws: WebSocketStream<S>,
+    store: Arc<Store>,
+    broker: Broker,
+    cache: SharedSchemaCache,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut subscriptions: HashMap<String, LiveSubscription> = HashMap::new();
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            incoming = ws.next() => {
+                let Some(incoming) = incoming else { break; };
+                let incoming = match incoming {
+                    Ok(message) => message,
+                    Err(_) => break,
+                };
+                match incoming {
+                    WsMessage::Text(text) => {
+                        handle_live_client_message(
+                            &mut ws,
+                            &mut subscriptions,
+                            &broker,
+                            &store,
+                            &cache,
+                            &text,
+                        ).await?;
+                    }
+                    WsMessage::Close(_) => break,
+                    WsMessage::Ping(payload) => {
+                        let _ = ws.send(WsMessage::Pong(payload)).await;
+                    }
+                    _ => {}
+                }
+            }
+            _ = tick.tick() => {
+                drain_live_subscription_events(&mut ws, &mut subscriptions, &store, &cache).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_live_client_message<S>(
+    ws: &mut WebSocketStream<S>,
+    subscriptions: &mut HashMap<String, LiveSubscription>,
+    broker: &Broker,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    text: &str,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let parsed: Value = match serde_json::from_str(text) {
+        Ok(value) => value,
+        Err(_) => {
+            send_live_json(ws, json!({"type":"live.error","error":{"code":"INVALID_JSON","message":"invalid json"}})).await?;
+            return Ok(());
+        }
+    };
+
+    let msg_type = parsed.get("type").and_then(Value::as_str).unwrap_or("");
+    let id = parsed
+        .get("id")
+        .or_else(|| parsed.get("subscriptionId"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    if msg_type == "live.unsubscribe" {
+        if !id.is_empty() {
+            stop_live_subscription(broker, subscriptions, &id);
+            send_live_json(ws, json!({"type":"live.unsubscribed","id":id})).await?;
+        }
+        return Ok(());
+    }
+
+    if msg_type != "live.subscribe" {
+        send_live_json(ws, json!({"type":"live.error","id":id,"error":{"code":"UNKNOWN_MESSAGE","message":"unknown live message type"}})).await?;
+        return Ok(());
+    }
+
+    if id.is_empty() {
+        send_live_json(ws, json!({"type":"live.error","error":{"code":"MISSING_ID","message":"live.subscribe requires id"}})).await?;
+        return Ok(());
+    }
+
+    stop_live_subscription(broker, subscriptions, &id);
+    let Some(spec) = parsed.get("spec").or_else(|| parsed.get("query")) else {
+        send_live_json(ws, json!({"type":"live.error","id":id,"error":{"code":"MISSING_SPEC","message":"live.subscribe requires spec"}})).await?;
+        return Ok(());
+    };
+
+    match build_live_subscription(spec, broker, store, cache).await {
+        Ok((subscription, initial_events)) => {
+            subscriptions.insert(id.clone(), subscription);
+            send_live_json(ws, json!({"type":"live.subscribed","id":id})).await?;
+            for event in initial_events {
+                send_live_json(ws, json!({"type":"live.event","id":id,"event":event})).await?;
+            }
+        }
+        Err(error) => {
+            send_live_json(ws, json!({"type":"live.error","id":id,"error":error})).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn build_live_subscription(
+    spec: &Value,
+    broker: &Broker,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> Result<(LiveSubscription, Vec<Value>), Value> {
+    if let Some(pattern) = spec
+        .as_str()
+        .or_else(|| spec.get("key").and_then(Value::as_str))
+    {
+        return Ok((
+            LiveSubscription::Key {
+                pattern: pattern.to_string(),
+                receivers: vec![broker.ksubscribe(pattern)],
+            },
+            Vec::new(),
+        ));
+    }
+
+    let kind = spec.get("kind").and_then(Value::as_str).unwrap_or("");
+    if kind == "key" {
+        let pattern = required_str(spec, "pattern")?;
+        return Ok((
+            LiveSubscription::Key {
+                pattern: pattern.to_string(),
+                receivers: vec![broker.ksubscribe(pattern)],
+            },
+            Vec::new(),
+        ));
+    }
+    if kind == "channel" || spec.get("channel").is_some() {
+        let channel = required_str(spec, "channel")?;
+        return Ok((
+            LiveSubscription::Channel {
+                channel: channel.to_string(),
+                receiver: broker.subscribe(channel),
+            },
+            Vec::new(),
+        ));
+    }
+    if kind == "pubsubPattern" || spec.get("pubsubPattern").is_some() {
+        let pattern = spec
+            .get("pattern")
+            .or_else(|| spec.get("pubsubPattern"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                live_error(
+                    "INVALID_SPEC",
+                    "pubsubPattern subscription requires pattern",
+                )
+            })?;
+        return Ok((
+            LiveSubscription::PubSubPattern {
+                pattern: pattern.to_string(),
+                receiver: broker.psubscribe(pattern),
+            },
+            Vec::new(),
+        ));
+    }
+    if kind == "table" || spec.get("table").is_some() {
+        let table_spec = parse_live_table_spec(spec)?;
+        let receivers = vec![
+            broker.ksubscribe(&table_spec.table),
+            broker.ksubscribe(&format!("_t:{}:row:*", table_spec.table)),
+        ];
+        let rows = fetch_live_table_rows(store, cache, &table_spec)?;
+        let query = json!({"type":"table","table":table_spec.table});
+        let state = LiveQueryState {
+            query: query.clone(),
+            rows: index_live_rows(rows.clone()),
+        };
+        return Ok((
+            LiveSubscription::Table {
+                spec: table_spec,
+                state,
+                receivers,
+            },
+            vec![json!({"kind":"snapshot","scope":"query","query":query,"rows":rows})],
+        ));
+    }
+    if kind == "vector.near" {
+        let vector_spec = parse_live_vector_near_spec(spec)?;
+        let rows = fetch_live_vector_rows(store, &vector_spec);
+        let query =
+            json!({"type":"vector.near","k":vector_spec.k,"threshold":vector_spec.threshold});
+        let state = LiveQueryState {
+            query: query.clone(),
+            rows: index_live_rows(rows.clone()),
+        };
+        return Ok((
+            LiveSubscription::VectorNear {
+                spec: vector_spec,
+                state,
+                receiver: broker.ksubscribe("*"),
+            },
+            vec![json!({"kind":"snapshot","scope":"query","query":query,"rows":rows})],
+        ));
+    }
+
+    Err(live_error(
+        "INVALID_SPEC",
+        "unsupported live subscription spec",
+    ))
+}
+
+async fn drain_live_subscription_events<S>(
+    ws: &mut WebSocketStream<S>,
+    subscriptions: &mut HashMap<String, LiveSubscription>,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut events = Vec::new();
+    for subscription in subscriptions.values_mut() {
+        match subscription {
+            LiveSubscription::Key { receivers, .. } | LiveSubscription::Table { receivers, .. } => {
+                for receiver in receivers {
+                    drain_receiver(receiver, &mut events);
+                }
+            }
+            LiveSubscription::Channel { receiver, .. }
+            | LiveSubscription::PubSubPattern { receiver, .. }
+            | LiveSubscription::VectorNear { receiver, .. } => {
+                drain_receiver(receiver, &mut events)
+            }
+        }
+    }
+
+    for event in events {
+        dispatch_live_broker_event(ws, subscriptions, store, cache, event).await?;
+    }
+    Ok(())
+}
+
+fn drain_receiver(
+    receiver: &mut broadcast::Receiver<crate::pubsub::Message>,
+    events: &mut Vec<LiveBrokerEvent>,
+) {
+    loop {
+        match receiver.try_recv() {
+            Ok(message) => {
+                if let Some(event) = live_broker_event_from_message(&message) {
+                    events.push(event);
+                }
+            }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(broadcast::error::TryRecvError::Empty)
+            | Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+}
+
+async fn dispatch_live_broker_event<S>(
+    ws: &mut WebSocketStream<S>,
+    subscriptions: &mut HashMap<String, LiveSubscription>,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    event: LiveBrokerEvent,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut outgoing = Vec::new();
+    for (id, subscription) in subscriptions.iter_mut() {
+        match (subscription, &event) {
+            (
+                LiveSubscription::Key { pattern, .. },
+                LiveBrokerEvent::Key {
+                    pattern: event_pattern,
+                    key,
+                    operation,
+                },
+            ) if pattern == event_pattern => {
+                outgoing.push((id.clone(), live_key_event(event_pattern, key, operation)));
+            }
+            (
+                LiveSubscription::Channel { channel, .. },
+                LiveBrokerEvent::Message {
+                    channel: event_channel,
+                    message,
+                    pattern: None,
+                },
+            ) if channel == event_channel => {
+                outgoing.push((id.clone(), json!({"kind":"pubsub.message","scope":"pubsub","channel":event_channel,"message":message})));
+            }
+            (
+                LiveSubscription::PubSubPattern { pattern, .. },
+                LiveBrokerEvent::Message {
+                    channel,
+                    message,
+                    pattern: Some(event_pattern),
+                },
+            ) if pattern == event_pattern => {
+                outgoing.push((id.clone(), json!({"kind":"pubsub.message","scope":"pubsub","pattern":event_pattern,"channel":channel,"message":message})));
+            }
+            (
+                LiveSubscription::Table { spec, state, .. },
+                LiveBrokerEvent::Key { key, operation, .. },
+            ) => {
+                if key == &spec.table || key.starts_with(&format!("_t:{}:row:", spec.table)) {
+                    let next = fetch_live_table_rows(store, cache, spec).unwrap_or_default();
+                    outgoing.extend(diff_live_query(
+                        id,
+                        state,
+                        next,
+                        Some(json!({"kind":table_cause_kind(operation),"table":spec.table,"operation":operation,"raw":{"pattern":format!("_t:{}:row:*", spec.table),"key":key,"operation":operation}})),
+                    ));
+                }
+            }
+            (
+                LiveSubscription::VectorNear { spec, state, .. },
+                LiveBrokerEvent::Key { key, operation, .. },
+            ) => {
+                let next = fetch_live_vector_rows(store, spec);
+                outgoing.extend(diff_live_query(
+                    id,
+                    state,
+                    next,
+                    Some(json!({"kind":vector_cause_kind(operation),"key":key,"operation":operation})),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    for (id, event) in outgoing {
+        send_live_json(ws, json!({"type":"live.event","id":id,"event":event})).await?;
+    }
+    Ok(())
+}
+
+fn stop_live_subscription(
+    broker: &Broker,
+    subscriptions: &mut HashMap<String, LiveSubscription>,
+    id: &str,
+) {
+    let Some(subscription) = subscriptions.remove(id) else {
+        return;
+    };
+    match subscription {
+        LiveSubscription::Key { pattern, .. } => broker.kunsub(&pattern),
+        LiveSubscription::Channel { channel, .. } => broker.unsubscribe_channel(&channel),
+        LiveSubscription::PubSubPattern { pattern, .. } => broker.punsubscribe_pattern(&pattern),
+        LiveSubscription::Table { spec, .. } => {
+            broker.kunsub(&spec.table);
+            broker.kunsub(&format!("_t:{}:row:*", spec.table));
+        }
+        LiveSubscription::VectorNear { .. } => broker.kunsub("*"),
+    }
+}
+
+fn diff_live_query(
+    id: &str,
+    state: &mut LiveQueryState,
+    next_rows: Vec<Value>,
+    cause: Option<Value>,
+) -> Vec<(String, Value)> {
+    let previous = std::mem::take(&mut state.rows);
+    let next = index_live_rows(next_rows);
+    let mut events = Vec::new();
+
+    for (pk, row) in &next {
+        match previous.get(pk) {
+            None => events.push((
+                id.to_string(),
+                json!({"kind":"insert","scope":"query","query":state.query,"pk":pk,"row":row,"previous":null,"cause":cause}),
+            )),
+            Some(before) if row_fingerprint(before) != row_fingerprint(row) => events.push((
+                id.to_string(),
+                json!({"kind":"update","scope":"query","query":state.query,"pk":pk,"row":row,"previous":before,"changed":changed_json_fields(before, row),"cause":cause}),
+            )),
+            _ => {}
+        }
+    }
+
+    for (pk, before) in &previous {
+        if !next.contains_key(pk) {
+            events.push((
+                id.to_string(),
+                json!({"kind":"delete","scope":"query","query":state.query,"pk":pk,"row":null,"previous":before,"cause":cause}),
+            ));
+        }
+    }
+
+    state.rows = next;
+    events
+}
+
+fn parse_live_table_spec(spec: &Value) -> Result<LiveTableSpec, Value> {
+    let table = required_str(spec, "table")?.to_string();
+    let select = spec
+        .get("select")
+        .and_then(Value::as_str)
+        .unwrap_or("*")
+        .to_string();
+    let mut where_conditions = Vec::new();
+    if let Some(where_value) = spec.get("where") {
+        if let Some(array) = where_value.as_array() {
+            for condition in array {
+                where_conditions.push((
+                    required_str(condition, "field")?.to_string(),
+                    condition
+                        .get("op")
+                        .and_then(Value::as_str)
+                        .unwrap_or("=")
+                        .to_string(),
+                    condition.get("value").cloned().unwrap_or(Value::Null),
+                ));
+            }
+        } else if let Some(object) = where_value.as_object() {
+            for (field, value) in object {
+                where_conditions.push((field.clone(), "=".to_string(), value.clone()));
+            }
+        }
+    }
+    let order_by = spec.get("orderBy").and_then(|value| {
+        Some((
+            value.get("field")?.as_str()?.to_string(),
+            value
+                .get("dir")
+                .and_then(Value::as_str)
+                .unwrap_or("asc")
+                .to_string(),
+        ))
+    });
+    let limit = spec
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+    let offset = spec
+        .get("offset")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+    Ok(LiveTableSpec {
+        table,
+        select,
+        where_conditions,
+        order_by,
+        limit,
+        offset,
+    })
+}
+
+fn fetch_live_table_rows(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    spec: &LiveTableSpec,
+) -> Result<Vec<Value>, Value> {
+    let mut tokens = vec![spec.select.clone(), "FROM".to_string(), spec.table.clone()];
+    if !spec.where_conditions.is_empty() {
+        tokens.push("WHERE".to_string());
+        for (index, (field, op, value)) in spec.where_conditions.iter().enumerate() {
+            if index > 0 {
+                tokens.push("AND".to_string());
+            }
+            tokens.push(field.clone());
+            tokens.push(op.clone());
+            tokens.push(live_value_to_token(value));
+        }
+    }
+    if let Some((field, dir)) = &spec.order_by {
+        tokens.push("ORDER".to_string());
+        tokens.push("BY".to_string());
+        tokens.push(field.clone());
+        tokens.push(dir.to_ascii_uppercase());
+    }
+    if let Some(limit) = spec.limit {
+        tokens.push("LIMIT".to_string());
+        tokens.push(limit.to_string());
+    }
+    if let Some(offset) = spec.offset {
+        tokens.push("OFFSET".to_string());
+        tokens.push(offset.to_string());
+    }
+    let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    let plan = crate::tables::parse_select(&refs).map_err(|e| live_error("TSELECT_ERROR", &e))?;
+    match crate::tables::table_select(store, cache, &plan, Instant::now())
+        .map_err(|e| live_error("TSELECT_ERROR", &e))?
+    {
+        crate::tables::SelectResult::Rows(rows) => {
+            Ok(rows.into_iter().map(table_row_to_value).collect())
+        }
+        crate::tables::SelectResult::Aggregate(row) => Ok(vec![table_row_to_value(row)]),
+    }
+}
+
+fn parse_live_vector_near_spec(spec: &Value) -> Result<LiveVectorNearSpec, Value> {
+    let vector = spec
+        .get("vector")
+        .and_then(Value::as_array)
+        .ok_or_else(|| live_error("INVALID_SPEC", "vector.near requires vector"))?
+        .iter()
+        .map(|value| value.as_f64().map(|n| n as f32))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| live_error("INVALID_SPEC", "vector must contain numbers"))?;
+    let k = spec.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+    let threshold = spec
+        .get("threshold")
+        .and_then(Value::as_f64)
+        .map(|n| n as f32);
+    let filter = spec.get("filter").and_then(|value| {
+        Some((
+            value.get("key")?.as_str()?.to_string(),
+            value.get("value")?.as_str()?.to_string(),
+        ))
+    });
+    Ok(LiveVectorNearSpec {
+        vector,
+        k,
+        threshold,
+        filter,
+    })
+}
+
+fn fetch_live_vector_rows(store: &Arc<Store>, spec: &LiveVectorNearSpec) -> Vec<Value> {
+    let (filter_key, filter_value) = spec
+        .filter
+        .as_ref()
+        .map(|(key, value)| (Some(key.as_str()), Some(value.as_str())))
+        .unwrap_or((None, None));
+    store
+        .vsearch(
+            &spec.vector,
+            spec.k,
+            filter_key,
+            filter_value,
+            Instant::now(),
+        )
+        .into_iter()
+        .filter(|(_, similarity, _)| {
+            spec.threshold
+                .is_none_or(|threshold| *similarity >= threshold)
+        })
+        .map(|(key, similarity, metadata)| {
+            let metadata = metadata
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .unwrap_or(Value::Null);
+            json!({"id":key,"key":key,"similarity":similarity,"metadata":metadata})
+        })
+        .collect()
+}
+
+async fn send_live_json<S>(ws: &mut WebSocketStream<S>, value: Value) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    ws.send(WsMessage::Text(value.to_string()))
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn websocket_accept_key(key: &str) -> String {
+    let mut sha1 = sha1_smol::Sha1::new();
+    sha1.update(key.as_bytes());
+    sha1.update(WEBSOCKET_ACCEPT_GUID.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(sha1.digest().bytes())
+}
+
+fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, Value> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| live_error("INVALID_SPEC", &format!("missing {field}")))
+}
+
+fn live_error(code: &str, message: &str) -> Value {
+    json!({"code":code,"message":message})
+}
+
+fn live_key_event(pattern: &str, key: &str, operation: &str) -> Value {
+    json!({
+        "kind": key_event_kind(operation),
+        "scope": "key",
+        "pattern": pattern,
+        "key": key,
+        "operation": operation,
+    })
+}
+
+fn key_event_kind(operation: &str) -> &'static str {
+    match operation.to_ascii_lowercase().as_str() {
+        "del" | "unlink" => "key.delete",
+        "expire" | "pexpire" | "expireat" | "pexpireat" => "key.expire",
+        "rename" | "renamenx" => "key.rename",
+        "set" | "mset" | "msetnx" | "setex" | "psetex" | "getset" | "vset" => "key.set",
+        "" => "key.unknown",
+        _ => "key.update",
+    }
+}
+
+fn table_cause_kind(operation: &str) -> &'static str {
+    match operation.to_ascii_lowercase().as_str() {
+        "tinsert" => "table.insert",
+        "tupdate" => "table.update",
+        "tdelete" => "table.delete",
+        _ => key_event_kind(operation),
+    }
+}
+
+fn vector_cause_kind(operation: &str) -> &'static str {
+    match operation.to_ascii_lowercase().as_str() {
+        "del" | "unlink" => "vector.delete",
+        _ => "vector.set",
+    }
+}
+
+fn table_row_to_value(row: Vec<(String, String)>) -> Value {
+    let mut object = serde_json::Map::new();
+    for (key, value) in row {
+        object.insert(key, live_string_to_value(&value));
+    }
+    Value::Object(object)
+}
+
+fn live_string_to_value(value: &str) -> Value {
+    if value == "true" {
+        Value::Bool(true)
+    } else if value == "false" {
+        Value::Bool(false)
+    } else if let Ok(n) = value.parse::<i64>() {
+        json!(n)
+    } else if let Ok(n) = value.parse::<f64>() {
+        json!(n)
+    } else {
+        json!(value)
+    }
+}
+
+fn live_value_to_token(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn index_live_rows(rows: Vec<Value>) -> HashMap<String, Value> {
+    let mut indexed = HashMap::new();
+    for row in rows {
+        let Some(id) = row.get("id").or_else(|| row.get("key")).and_then(|value| {
+            value
+                .as_str()
+                .map(String::from)
+                .or_else(|| value.as_i64().map(|n| n.to_string()))
+                .or_else(|| value.as_u64().map(|n| n.to_string()))
+        }) else {
+            continue;
+        };
+        indexed.insert(id, row);
+    }
+    indexed
+}
+
+fn row_fingerprint(value: &Value) -> String {
+    value.to_string()
+}
+
+fn changed_json_fields(previous: &Value, next: &Value) -> Vec<String> {
+    let Some(previous) = previous.as_object() else {
+        return Vec::new();
+    };
+    let Some(next) = next.as_object() else {
+        return Vec::new();
+    };
+    let keys: HashSet<String> = previous.keys().chain(next.keys()).cloned().collect();
+    keys.into_iter()
+        .filter(|key| previous.get(key) != next.get(key))
+        .collect()
 }
 
 struct HttpTableQueryParams {

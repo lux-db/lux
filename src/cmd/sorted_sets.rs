@@ -6,57 +6,148 @@ use crate::store::{Store, StoreValue};
 
 use super::{arg_str, cmd_eq, format_float, parse_i64, parse_u64, CmdResult};
 
-fn parse_score_bound(s: &str, is_max: bool) -> (f64, bool) {
-    if s == "-inf" || s == "-" {
-        (f64::NEG_INFINITY, false)
-    } else if s == "+inf" || s == "+" {
-        (f64::INFINITY, false)
-    } else if let Some(rest) = s.strip_prefix('(') {
-        (
-            rest.parse::<f64>().unwrap_or(if is_max {
-                f64::INFINITY
-            } else {
-                f64::NEG_INFINITY
-            }),
-            true,
-        )
-    } else {
-        (
-            s.parse::<f64>().unwrap_or(if is_max {
-                f64::INFINITY
-            } else {
-                f64::NEG_INFINITY
-            }),
-            false,
-        )
+const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
+
+fn parse_i64_arg(arg: &[u8], out: &mut BytesMut) -> Option<i64> {
+    match parse_i64(arg) {
+        Ok(n) => Some(n),
+        Err(_) => {
+            resp::write_error(out, INTEGER_ERR);
+            None
+        }
     }
 }
 
-fn parse_zstore_options(args: &[&[u8]]) -> (Vec<f64>, &'static str) {
+fn parse_usize_arg(arg: &[u8], out: &mut BytesMut) -> Option<usize> {
+    match parse_u64(arg).ok().and_then(|n| usize::try_from(n).ok()) {
+        Some(n) => Some(n),
+        None => {
+            resp::write_error(out, INTEGER_ERR);
+            None
+        }
+    }
+}
+
+fn parse_score_bound(s: &str, _is_max: bool) -> Result<(f64, bool), String> {
+    if s == "-inf" || s == "-" {
+        Ok((f64::NEG_INFINITY, false))
+    } else if s == "+inf" || s == "+" {
+        Ok((f64::INFINITY, false))
+    } else if let Some(rest) = s.strip_prefix('(') {
+        match rest.parse::<f64>() {
+            Ok(v) if v.is_finite() => Ok((v, true)),
+            _ => Err("ERR min or max is not a float".to_string()),
+        }
+    } else {
+        match s.parse::<f64>() {
+            Ok(v) if v.is_finite() => Ok((v, false)),
+            _ => Err("ERR min or max is not a float".to_string()),
+        }
+    }
+}
+
+fn parse_limit(
+    args: &[&[u8]],
+    i: usize,
+    out: &mut BytesMut,
+) -> Option<(Option<usize>, Option<usize>)> {
+    if i + 2 >= args.len() {
+        resp::write_error(out, "ERR syntax error");
+        return None;
+    }
+    let offset = parse_usize_arg(args[i + 1], out)?;
+    let count = parse_usize_arg(args[i + 2], out)?;
+    Some((Some(offset), Some(count)))
+}
+
+fn glob_match(pattern: &str, s: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let s: Vec<char> = s.chars().collect();
+    do_glob(&p, &s, 0, 0)
+}
+
+fn do_glob(p: &[char], s: &[char], pi: usize, si: usize) -> bool {
+    if pi == p.len() && si == s.len() {
+        return true;
+    }
+    if pi == p.len() {
+        return false;
+    }
+    match p[pi] {
+        '*' => do_glob(p, s, pi + 1, si) || (si < s.len() && do_glob(p, s, pi, si + 1)),
+        '?' => si < s.len() && do_glob(p, s, pi + 1, si + 1),
+        c => si < s.len() && c == s[si] && do_glob(p, s, pi + 1, si + 1),
+    }
+}
+
+fn parse_zstore_numkeys(arg: &[u8], out: &mut BytesMut) -> Option<usize> {
+    let numkeys = match parse_u64(arg) {
+        Ok(n) => n,
+        Err(_) => {
+            resp::write_error(out, "ERR value is not an integer or out of range");
+            return None;
+        }
+    };
+    let numkeys = match usize::try_from(numkeys) {
+        Ok(n) if n > 0 => n,
+        _ => {
+            resp::write_error(
+                out,
+                "ERR at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE",
+            );
+            return None;
+        }
+    };
+    Some(numkeys)
+}
+
+fn parse_zstore_options(
+    args: &[&[u8]],
+    numkeys: usize,
+    out: &mut BytesMut,
+) -> Option<(Vec<f64>, String)> {
     let mut weights = Vec::new();
-    let mut aggregate = "SUM";
+    let mut aggregate = "SUM".to_string();
     let mut i = 0;
     while i < args.len() {
         if cmd_eq(args[i], b"WEIGHTS") {
             i += 1;
-            while i < args.len() && !cmd_eq(args[i], b"AGGREGATE") {
-                weights.push(arg_str(args[i]).parse::<f64>().unwrap_or(1.0));
-                i += 1;
+            if i + numkeys > args.len() {
+                resp::write_error(out, "ERR syntax error");
+                return None;
             }
-        } else if cmd_eq(args[i], b"AGGREGATE") && i + 1 < args.len() {
-            aggregate = if cmd_eq(args[i + 1], b"MIN") {
-                "MIN"
-            } else if cmd_eq(args[i + 1], b"MAX") {
-                "MAX"
+            for weight_arg in &args[i..i + numkeys] {
+                match arg_str(weight_arg).parse::<f64>() {
+                    Ok(weight) if weight.is_finite() => weights.push(weight),
+                    _ => {
+                        resp::write_error(out, "ERR weight value is not a float");
+                        return None;
+                    }
+                }
+            }
+            i += numkeys;
+        } else if cmd_eq(args[i], b"AGGREGATE") {
+            if i + 1 >= args.len() {
+                resp::write_error(out, "ERR syntax error");
+                return None;
+            }
+            let mode = arg_str(args[i + 1]).to_uppercase();
+            if matches!(mode.as_str(), "SUM" | "MIN" | "MAX") {
+                aggregate = mode;
+                i += 2;
             } else {
-                "SUM"
-            };
-            i += 2;
+                resp::write_error(out, "ERR syntax error");
+                return None;
+            }
         } else {
-            i += 1;
+            resp::write_error(out, "ERR syntax error");
+            return None;
         }
     }
-    (weights, aggregate)
+    Some((weights, aggregate))
 }
 
 fn write_zset_result(out: &mut BytesMut, items: &[(String, f64)], with_scores: bool) {
@@ -77,24 +168,6 @@ fn write_zset_result(out: &mut BytesMut, items: &[(String, f64)], with_scores: b
 pub fn cmd_zadd(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 4 {
         resp::write_error(out, "ERR wrong number of arguments for 'zadd' command");
-        return CmdResult::Written;
-    }
-    if args.len() == 4 {
-        let score: f64 = match arg_str(args[2]).parse::<f64>() {
-            Ok(s) if s.is_nan() => {
-                resp::write_error(out, "ERR value is not a valid float");
-                return CmdResult::Written;
-            }
-            Ok(s) => s,
-            Err(_) => {
-                resp::write_error(out, "ERR value is not a valid float");
-                return CmdResult::Written;
-            }
-        };
-        match store.zadd_single_default(args[1], args[3], score, now) {
-            Ok(count) => resp::write_integer(out, count),
-            Err(error) => resp::write_error(out, &error),
-        };
         return CmdResult::Written;
     }
     let mut nx = false;
@@ -130,7 +203,14 @@ pub fn cmd_zadd(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         );
         return CmdResult::Written;
     }
-    if nx && (gt || lt) {
+    if nx && gt {
+        resp::write_error(
+            out,
+            "ERR GT, LT, and NX options at the same time are not compatible",
+        );
+        return CmdResult::Written;
+    }
+    if nx && lt {
         resp::write_error(
             out,
             "ERR GT, LT, and NX options at the same time are not compatible",
@@ -148,7 +228,7 @@ pub fn cmd_zadd(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
-    let mut members = Vec::with_capacity((args.len() - i) / 2);
+    let mut members = Vec::new();
     while i + 1 < args.len() {
         let score: f64 = match arg_str(args[i]).parse::<f64>() {
             Ok(s) if s.is_nan() => {
@@ -192,7 +272,8 @@ pub fn cmd_zmscore(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
         resp::write_error(out, "ERR wrong number of arguments for 'zmscore' command");
         return CmdResult::Written;
     }
-    match store.zmscore(args[1], &args[2..], now) {
+    let members: Vec<&[u8]> = args[2..].to_vec();
+    match store.zmscore(args[1], &members, now) {
         Ok(scores) => {
             resp::write_array_header(out, scores.len());
             for s in &scores {
@@ -238,7 +319,8 @@ pub fn cmd_zrem(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'zrem' command");
         return CmdResult::Written;
     }
-    match store.zrem(args[1], &args[2..], now) {
+    let members: Vec<&[u8]> = args[2..].to_vec();
+    match store.zrem(args[1], &members, now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
     }
@@ -262,8 +344,20 @@ pub fn cmd_zcount(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'zcount' command");
         return CmdResult::Written;
     }
-    let (min, min_ex) = parse_score_bound(arg_str(args[2]), false);
-    let (max, max_ex) = parse_score_bound(arg_str(args[3]), true);
+    let (min, min_ex) = match parse_score_bound(arg_str(args[2]), false) {
+        Ok(bound) => bound,
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
+    };
+    let (max, max_ex) = match parse_score_bound(arg_str(args[3]), true) {
+        Ok(bound) => bound,
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
+    };
     match store.zcount(args[1], min, max, min_ex, max_ex, now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
@@ -322,15 +416,6 @@ pub fn cmd_zrange(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'zrange' command");
         return CmdResult::Written;
     }
-    if args.len() == 4 {
-        let start = parse_i64(args[2]).unwrap_or(0);
-        let stop = parse_i64(args[3]).unwrap_or(-1);
-        match store.zrange(args[1], start, stop, false, false, now) {
-            Ok(items) => write_zset_result(out, &items, false),
-            Err(e) => resp::write_error(out, &e),
-        }
-        return CmdResult::Written;
-    }
     let mut reverse = false;
     let mut with_scores = false;
     let mut byscore = false;
@@ -351,17 +436,34 @@ pub fn cmd_zrange(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         } else if cmd_eq(args[i], b"BYLEX") {
             bylex = true;
             i += 1;
-        } else if cmd_eq(args[i], b"LIMIT") && i + 2 < args.len() {
-            offset = Some(parse_u64(args[i + 1]).unwrap_or(0) as usize);
-            count = Some(parse_u64(args[i + 2]).unwrap_or(0) as usize);
+        } else if cmd_eq(args[i], b"LIMIT") {
+            let parsed = match parse_limit(args, i, out) {
+                Some(parsed) => parsed,
+                None => return CmdResult::Written,
+            };
+            offset = parsed.0;
+            count = parsed.1;
             i += 3;
         } else {
-            i += 1;
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
         }
     }
     if byscore {
-        let (min, min_ex) = parse_score_bound(arg_str(args[2]), false);
-        let (max, max_ex) = parse_score_bound(arg_str(args[3]), true);
+        let (min, min_ex) = match parse_score_bound(arg_str(args[2]), false) {
+            Ok(bound) => bound,
+            Err(e) => {
+                resp::write_error(out, &e);
+                return CmdResult::Written;
+            }
+        };
+        let (max, max_ex) = match parse_score_bound(arg_str(args[3]), true) {
+            Ok(bound) => bound,
+            Err(e) => {
+                resp::write_error(out, &e);
+                return CmdResult::Written;
+            }
+        };
         match store.zrangebyscore(
             args[1],
             min,
@@ -396,8 +498,14 @@ pub fn cmd_zrange(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
             Err(e) => resp::write_error(out, &e),
         }
     } else {
-        let start = parse_i64(args[2]).unwrap_or(0);
-        let stop = parse_i64(args[3]).unwrap_or(-1);
+        let start = match parse_i64_arg(args[2], out) {
+            Some(start) => start,
+            None => return CmdResult::Written,
+        };
+        let stop = match parse_i64_arg(args[3], out) {
+            Some(stop) => stop,
+            None => return CmdResult::Written,
+        };
         match store.zrange(args[1], start, stop, reverse, with_scores, now) {
             Ok(items) => write_zset_result(out, &items, with_scores),
             Err(e) => resp::write_error(out, &e),
@@ -411,9 +519,24 @@ pub fn cmd_zrevrange(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Ins
         resp::write_error(out, "ERR wrong number of arguments for 'zrevrange' command");
         return CmdResult::Written;
     }
-    let with_scores = args.len() > 4 && cmd_eq(args[4], b"WITHSCORES");
-    let start = parse_i64(args[2]).unwrap_or(0);
-    let stop = parse_i64(args[3]).unwrap_or(-1);
+    let with_scores = if args.len() > 4 {
+        if args.len() == 5 && cmd_eq(args[4], b"WITHSCORES") {
+            true
+        } else {
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
+        }
+    } else {
+        false
+    };
+    let start = match parse_i64_arg(args[2], out) {
+        Some(start) => start,
+        None => return CmdResult::Written,
+    };
+    let stop = match parse_i64_arg(args[3], out) {
+        Some(stop) => stop,
+        None => return CmdResult::Written,
+    };
     match store.zrange(args[1], start, stop, true, with_scores, now) {
         Ok(items) => write_zset_result(out, &items, with_scores),
         Err(e) => resp::write_error(out, &e),
@@ -434,8 +557,20 @@ pub fn cmd_zrangebyscore(
         );
         return CmdResult::Written;
     }
-    let (min, min_ex) = parse_score_bound(arg_str(args[2]), false);
-    let (max, max_ex) = parse_score_bound(arg_str(args[3]), true);
+    let (min, min_ex) = match parse_score_bound(arg_str(args[2]), false) {
+        Ok(bound) => bound,
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
+    };
+    let (max, max_ex) = match parse_score_bound(arg_str(args[3]), true) {
+        Ok(bound) => bound,
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
+    };
     let mut with_scores = false;
     let mut offset: Option<usize> = None;
     let mut count: Option<usize> = None;
@@ -444,12 +579,17 @@ pub fn cmd_zrangebyscore(
         if cmd_eq(args[i], b"WITHSCORES") {
             with_scores = true;
             i += 1;
-        } else if cmd_eq(args[i], b"LIMIT") && i + 2 < args.len() {
-            offset = Some(parse_u64(args[i + 1]).unwrap_or(0) as usize);
-            count = Some(parse_u64(args[i + 2]).unwrap_or(0) as usize);
+        } else if cmd_eq(args[i], b"LIMIT") {
+            let parsed = match parse_limit(args, i, out) {
+                Some(parsed) => parsed,
+                None => return CmdResult::Written,
+            };
+            offset = parsed.0;
+            count = parsed.1;
             i += 3;
         } else {
-            i += 1;
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
         }
     }
     match store.zrangebyscore(
@@ -483,8 +623,20 @@ pub fn cmd_zrevrangebyscore(
         );
         return CmdResult::Written;
     }
-    let (max, max_ex) = parse_score_bound(arg_str(args[2]), true);
-    let (min, min_ex) = parse_score_bound(arg_str(args[3]), false);
+    let (max, max_ex) = match parse_score_bound(arg_str(args[2]), true) {
+        Ok(bound) => bound,
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
+    };
+    let (min, min_ex) = match parse_score_bound(arg_str(args[3]), false) {
+        Ok(bound) => bound,
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
+    };
     let mut with_scores = false;
     let mut offset: Option<usize> = None;
     let mut count: Option<usize> = None;
@@ -493,12 +645,17 @@ pub fn cmd_zrevrangebyscore(
         if cmd_eq(args[i], b"WITHSCORES") {
             with_scores = true;
             i += 1;
-        } else if cmd_eq(args[i], b"LIMIT") && i + 2 < args.len() {
-            offset = Some(parse_u64(args[i + 1]).unwrap_or(0) as usize);
-            count = Some(parse_u64(args[i + 2]).unwrap_or(0) as usize);
+        } else if cmd_eq(args[i], b"LIMIT") {
+            let parsed = match parse_limit(args, i, out) {
+                Some(parsed) => parsed,
+                None => return CmdResult::Written,
+            };
+            offset = parsed.0;
+            count = parsed.1;
             i += 3;
         } else {
-            i += 1;
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
         }
     }
     match store.zrangebyscore(
@@ -536,12 +693,17 @@ pub fn cmd_zrangebylex(
     let mut count: Option<usize> = None;
     let mut i = 4;
     while i < args.len() {
-        if cmd_eq(args[i], b"LIMIT") && i + 2 < args.len() {
-            offset = Some(parse_u64(args[i + 1]).unwrap_or(0) as usize);
-            count = Some(parse_u64(args[i + 2]).unwrap_or(0) as usize);
+        if cmd_eq(args[i], b"LIMIT") {
+            let parsed = match parse_limit(args, i, out) {
+                Some(parsed) => parsed,
+                None => return CmdResult::Written,
+            };
+            offset = parsed.0;
+            count = parsed.1;
             i += 3;
         } else {
-            i += 1;
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
         }
     }
     match store.zrangebylex(
@@ -581,12 +743,17 @@ pub fn cmd_zrevrangebylex(
     let mut count: Option<usize> = None;
     let mut i = 4;
     while i < args.len() {
-        if cmd_eq(args[i], b"LIMIT") && i + 2 < args.len() {
-            offset = Some(parse_u64(args[i + 1]).unwrap_or(0) as usize);
-            count = Some(parse_u64(args[i + 2]).unwrap_or(0) as usize);
+        if cmd_eq(args[i], b"LIMIT") {
+            let parsed = match parse_limit(args, i, out) {
+                Some(parsed) => parsed,
+                None => return CmdResult::Written,
+            };
+            offset = parsed.0;
+            count = parsed.1;
             i += 3;
         } else {
-            i += 1;
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
         }
     }
     match store.zrangebylex(
@@ -615,7 +782,10 @@ pub fn cmd_zpopmin(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
         return CmdResult::Written;
     }
     let count = if args.len() > 2 {
-        parse_u64(args[2]).unwrap_or(1) as usize
+        match parse_usize_arg(args[2], out) {
+            Some(count) => count,
+            None => return CmdResult::Written,
+        }
     } else {
         1
     };
@@ -648,7 +818,10 @@ pub fn cmd_zpopmax(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
         return CmdResult::Written;
     }
     let count = if args.len() > 2 {
-        parse_u64(args[2]).unwrap_or(1) as usize
+        match parse_usize_arg(args[2], out) {
+            Some(count) => count,
+            None => return CmdResult::Written,
+        }
     } else {
         1
     };
@@ -688,13 +861,23 @@ pub fn cmd_zunionstore(
         );
         return CmdResult::Written;
     }
-    let numkeys = parse_u64(args[2]).unwrap_or(0) as usize;
+    let numkeys = match parse_zstore_numkeys(args[2], out) {
+        Some(numkeys) => numkeys,
+        None => return CmdResult::Written,
+    };
     if 3 + numkeys > args.len() {
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
-    let (weights, aggregate) = parse_zstore_options(&args[3 + numkeys..]);
-    match store.zunionstore(args[1], &args[3..3 + numkeys], &weights, aggregate, now) {
+    let keys: Vec<&[u8]> = args[3..3 + numkeys].to_vec();
+    for key in &keys {
+        store.try_promote(key, now);
+    }
+    let (weights, aggregate) = match parse_zstore_options(&args[3 + numkeys..], numkeys, out) {
+        Some(parsed) => parsed,
+        None => return CmdResult::Written,
+    };
+    match store.zunionstore(args[1], &keys, &weights, &aggregate, now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
     }
@@ -714,13 +897,23 @@ pub fn cmd_zinterstore(
         );
         return CmdResult::Written;
     }
-    let numkeys = parse_u64(args[2]).unwrap_or(0) as usize;
+    let numkeys = match parse_zstore_numkeys(args[2], out) {
+        Some(numkeys) => numkeys,
+        None => return CmdResult::Written,
+    };
     if 3 + numkeys > args.len() {
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
-    let (weights, aggregate) = parse_zstore_options(&args[3 + numkeys..]);
-    match store.zinterstore(args[1], &args[3..3 + numkeys], &weights, aggregate, now) {
+    let keys: Vec<&[u8]> = args[3..3 + numkeys].to_vec();
+    for key in &keys {
+        store.try_promote(key, now);
+    }
+    let (weights, aggregate) = match parse_zstore_options(&args[3 + numkeys..], numkeys, out) {
+        Some(parsed) => parsed,
+        None => return CmdResult::Written,
+    };
+    match store.zinterstore(args[1], &keys, &weights, &aggregate, now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
     }
@@ -740,12 +933,23 @@ pub fn cmd_zdiffstore(
         );
         return CmdResult::Written;
     }
-    let numkeys = parse_u64(args[2]).unwrap_or(0) as usize;
+    let numkeys = match parse_zstore_numkeys(args[2], out) {
+        Some(numkeys) => numkeys,
+        None => return CmdResult::Written,
+    };
     if 3 + numkeys > args.len() {
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
-    match store.zdiffstore(args[1], &args[3..3 + numkeys], now) {
+    if 3 + numkeys != args.len() {
+        resp::write_error(out, "ERR syntax error");
+        return CmdResult::Written;
+    }
+    let keys: Vec<&[u8]> = args[3..3 + numkeys].to_vec();
+    for key in &keys {
+        store.try_promote(key, now);
+    }
+    match store.zdiffstore(args[1], &keys, now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
     }
@@ -765,8 +969,14 @@ pub fn cmd_zremrangebyrank(
         );
         return CmdResult::Written;
     }
-    let start = parse_i64(args[2]).unwrap_or(0);
-    let stop = parse_i64(args[3]).unwrap_or(-1);
+    let start = match parse_i64_arg(args[2], out) {
+        Some(start) => start,
+        None => return CmdResult::Written,
+    };
+    let stop = match parse_i64_arg(args[3], out) {
+        Some(stop) => stop,
+        None => return CmdResult::Written,
+    };
     match store.zrange(args[1], start, stop, false, true, now) {
         Ok(items) => {
             let members: Vec<&[u8]> = items.iter().map(|(m, _)| m.as_bytes()).collect();
@@ -793,8 +1003,20 @@ pub fn cmd_zremrangebyscore(
         );
         return CmdResult::Written;
     }
-    let (min, min_ex) = parse_score_bound(arg_str(args[2]), false);
-    let (max, max_ex) = parse_score_bound(arg_str(args[3]), true);
+    let (min, min_ex) = match parse_score_bound(arg_str(args[2]), false) {
+        Ok(bound) => bound,
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
+    };
+    let (max, max_ex) = match parse_score_bound(arg_str(args[3]), true) {
+        Ok(bound) => bound,
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
+    };
     match store.zrangebyscore(
         args[1], min, max, min_ex, max_ex, false, None, None, true, now,
     ) {
@@ -849,15 +1071,30 @@ pub fn cmd_zscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         resp::write_error(out, "ERR wrong number of arguments for 'zscan' command");
         return CmdResult::Written;
     }
-    let cursor = parse_u64(args[2]).unwrap_or(0) as usize;
+    let cursor = match parse_usize_arg(args[2], out) {
+        Some(cursor) => cursor,
+        None => return CmdResult::Written,
+    };
     let mut count = 10usize;
+    let mut pattern: Option<&str> = None;
     let mut i = 3;
     while i < args.len() {
         if cmd_eq(args[i], b"COUNT") && i + 1 < args.len() {
-            count = parse_u64(args[i + 1]).unwrap_or(10) as usize;
+            count = match parse_usize_arg(args[i + 1], out) {
+                Some(count) if count > 0 => count,
+                Some(_) => {
+                    resp::write_error(out, INTEGER_ERR);
+                    return CmdResult::Written;
+                }
+                None => return CmdResult::Written,
+            };
+            i += 2;
+        } else if cmd_eq(args[i], b"MATCH") && i + 1 < args.len() {
+            pattern = Some(arg_str(args[i + 1]));
             i += 2;
         } else {
-            i += 1;
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
         }
     }
     let idx = store.shard_for_key(args[1]);
@@ -866,7 +1103,10 @@ pub fn cmd_zscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
     match shard.data.get(ks) {
         Some(entry) if !entry.is_expired_at(now) => {
             if let StoreValue::SortedSet(tree, _) = &entry.value {
-                let all: Vec<_> = tree.keys().collect();
+                let all: Vec<_> = tree
+                    .keys()
+                    .filter(|(_, member)| pattern.is_none_or(|p| glob_match(p, member)))
+                    .collect();
                 let s = cursor.min(all.len());
                 let e = (s + count).min(all.len());
                 let next = if e >= all.len() { 0 } else { e };
@@ -906,8 +1146,9 @@ pub fn cmd_bzpopmin(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
     }
     let is_min = cmd_eq(args[0], b"BZPOPMIN");
     let timeout_secs: f64 = arg_str(args[args.len() - 1]).parse().unwrap_or(0.0);
-    let keys = &args[1..args.len() - 1];
-    for key in keys {
+    let keys: Vec<&[u8]> = args[1..args.len() - 1].to_vec();
+
+    for key in &keys {
         let result = if is_min {
             store.zpopmin(key, 1, now)
         } else {

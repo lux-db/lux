@@ -7,6 +7,55 @@ use crate::store::{Store, StoreValue};
 
 use super::{arg_str, cmd_eq, parse_i64, parse_u64, CmdResult};
 
+const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
+
+fn parse_i64_arg(arg: &[u8], out: &mut BytesMut) -> Option<i64> {
+    match parse_i64(arg) {
+        Ok(n) => Some(n),
+        Err(_) => {
+            resp::write_error(out, INTEGER_ERR);
+            None
+        }
+    }
+}
+
+fn parse_u64_arg(arg: &[u8], out: &mut BytesMut) -> Option<u64> {
+    match parse_u64(arg) {
+        Ok(n) => Some(n),
+        Err(_) => {
+            resp::write_error(out, INTEGER_ERR);
+            None
+        }
+    }
+}
+
+fn parse_list_side(arg: &[u8], out: &mut BytesMut) -> Option<bool> {
+    if cmd_eq(arg, b"LEFT") {
+        Some(true)
+    } else if cmd_eq(arg, b"RIGHT") {
+        Some(false)
+    } else {
+        resp::write_error(out, "ERR syntax error");
+        None
+    }
+}
+
+fn parse_block_timeout(arg: &[u8], out: &mut BytesMut) -> Option<Duration> {
+    match arg_str(arg).parse::<f64>() {
+        Ok(secs) if secs >= 0.0 && secs.is_finite() && secs <= u64::MAX as f64 => {
+            Some(if secs == 0.0 {
+                Duration::from_secs(300)
+            } else {
+                Duration::from_secs_f64(secs)
+            })
+        }
+        _ => {
+            resp::write_error(out, "ERR timeout is not a float or out of range");
+            None
+        }
+    }
+}
+
 pub fn cmd_lpush(
     args: &[&[u8]],
     store: &Store,
@@ -192,8 +241,14 @@ pub fn cmd_lrange(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'lrange' command");
         return CmdResult::Written;
     }
-    let start = parse_i64(args[2]).unwrap_or(0);
-    let stop = parse_i64(args[3]).unwrap_or(-1);
+    let start = match parse_i64_arg(args[2], out) {
+        Some(n) => n,
+        None => return CmdResult::Written,
+    };
+    let stop = match parse_i64_arg(args[3], out) {
+        Some(n) => n,
+        None => return CmdResult::Written,
+    };
     match store.lrange(args[1], start, stop, now) {
         Ok(items) => resp::write_bulk_array_raw(out, &items),
         Err(e) => resp::write_error(out, &e),
@@ -206,7 +261,10 @@ pub fn cmd_lindex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'lindex' command");
         return CmdResult::Written;
     }
-    let index = parse_i64(args[2]).unwrap_or(0);
+    let index = match parse_i64_arg(args[2], out) {
+        Some(n) => n,
+        None => return CmdResult::Written,
+    };
     resp::write_optional_bulk_raw(out, &store.lindex(args[1], index, now));
     CmdResult::Written
 }
@@ -216,7 +274,11 @@ pub fn cmd_lset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'lset' command");
         return CmdResult::Written;
     }
-    match store.lset(args[1], parse_i64(args[2]).unwrap_or(0), args[3], now) {
+    let index = match parse_i64_arg(args[2], out) {
+        Some(n) => n,
+        None => return CmdResult::Written,
+    };
+    match store.lset(args[1], index, args[3], now) {
         Ok(()) => resp::write_ok(out),
         Err(e) => resp::write_error(out, &e),
     }
@@ -228,7 +290,15 @@ pub fn cmd_linsert(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
         resp::write_error(out, "ERR wrong number of arguments for 'linsert' command");
         return CmdResult::Written;
     }
-    match store.linsert(args[1], cmd_eq(args[2], b"BEFORE"), args[3], args[4], now) {
+    let before = if cmd_eq(args[2], b"BEFORE") {
+        true
+    } else if cmd_eq(args[2], b"AFTER") {
+        false
+    } else {
+        resp::write_error(out, "ERR syntax error");
+        return CmdResult::Written;
+    };
+    match store.linsert(args[1], before, args[3], args[4], now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
     }
@@ -240,7 +310,11 @@ pub fn cmd_lrem(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'lrem' command");
         return CmdResult::Written;
     }
-    match store.lrem(args[1], parse_i64(args[2]).unwrap_or(0), args[3], now) {
+    let count = match parse_i64_arg(args[2], out) {
+        Some(n) => n,
+        None => return CmdResult::Written,
+    };
+    match store.lrem(args[1], count, args[3], now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
     }
@@ -254,8 +328,14 @@ pub fn cmd_ltrim(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
     }
     match store.ltrim(
         args[1],
-        parse_i64(args[2]).unwrap_or(0),
-        parse_i64(args[3]).unwrap_or(-1),
+        match parse_i64_arg(args[2], out) {
+            Some(n) => n,
+            None => return CmdResult::Written,
+        },
+        match parse_i64_arg(args[3], out) {
+            Some(n) => n,
+            None => return CmdResult::Written,
+        },
         now,
     ) {
         Ok(()) => resp::write_ok(out),
@@ -277,7 +357,10 @@ pub fn cmd_lpos(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     let mut i = 3;
     while i < args.len() {
         if cmd_eq(args[i], b"RANK") && i + 1 < args.len() {
-            rank = parse_i64(args[i + 1]).unwrap_or(1);
+            rank = match parse_i64_arg(args[i + 1], out) {
+                Some(n) => n,
+                None => return CmdResult::Written,
+            };
             if rank == 0 {
                 resp::write_error(out, "ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list");
                 return CmdResult::Written;
@@ -288,14 +371,21 @@ pub fn cmd_lpos(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
             }
             i += 2;
         } else if cmd_eq(args[i], b"COUNT") && i + 1 < args.len() {
-            let c = parse_u64(args[i + 1]).unwrap_or(0) as usize;
+            let c = match parse_u64_arg(args[i + 1], out) {
+                Some(n) => n as usize,
+                None => return CmdResult::Written,
+            };
             count = Some(c);
             i += 2;
         } else if cmd_eq(args[i], b"MAXLEN") && i + 1 < args.len() {
-            maxlen = parse_u64(args[i + 1]).unwrap_or(0) as usize;
+            maxlen = match parse_u64_arg(args[i + 1], out) {
+                Some(n) => n as usize,
+                None => return CmdResult::Written,
+            };
             i += 2;
         } else {
-            i += 1;
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
         }
     }
     let idx = store.shard_for_key(key);
@@ -381,16 +471,15 @@ pub fn cmd_lmove(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         resp::write_error(out, "ERR wrong number of arguments for 'lmove' command");
         return CmdResult::Written;
     }
-    resp::write_optional_bulk_raw(
-        out,
-        &store.lmove(
-            args[1],
-            args[2],
-            cmd_eq(args[3], b"LEFT"),
-            cmd_eq(args[4], b"LEFT"),
-            now,
-        ),
-    );
+    let src_left = match parse_list_side(args[3], out) {
+        Some(side) => side,
+        None => return CmdResult::Written,
+    };
+    let dst_left = match parse_list_side(args[4], out) {
+        Some(side) => side,
+        None => return CmdResult::Written,
+    };
+    resp::write_optional_bulk_raw(out, &store.lmove(args[1], args[2], src_left, dst_left, now));
     CmdResult::Written
 }
 
@@ -415,7 +504,10 @@ pub fn cmd_blpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         return CmdResult::Written;
     }
     let pop_left = cmd_eq(args[0], b"BLPOP");
-    let timeout_secs: f64 = arg_str(args[args.len() - 1]).parse().unwrap_or(0.0);
+    let timeout = match parse_block_timeout(args[args.len() - 1], out) {
+        Some(timeout) => timeout,
+        None => return CmdResult::Written,
+    };
     let keys: Vec<String> = args[1..args.len() - 1]
         .iter()
         .map(|k| arg_str(k).to_string())
@@ -435,11 +527,6 @@ pub fn cmd_blpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         }
     }
 
-    let timeout = if timeout_secs <= 0.0 {
-        Duration::from_secs(300)
-    } else {
-        Duration::from_secs_f64(timeout_secs)
-    };
     CmdResult::BlockPop {
         keys,
         timeout,
@@ -454,20 +541,24 @@ pub fn cmd_blmove(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
     }
     let src = arg_str(args[1]).to_string();
     let dst = arg_str(args[2]).to_string();
-    let src_left = cmd_eq(args[3], b"LEFT");
-    let dst_left = cmd_eq(args[4], b"LEFT");
-    let timeout_secs: f64 = arg_str(args[5]).parse().unwrap_or(0.0);
+    let src_left = match parse_list_side(args[3], out) {
+        Some(side) => side,
+        None => return CmdResult::Written,
+    };
+    let dst_left = match parse_list_side(args[4], out) {
+        Some(side) => side,
+        None => return CmdResult::Written,
+    };
+    let timeout = match parse_block_timeout(args[5], out) {
+        Some(timeout) => timeout,
+        None => return CmdResult::Written,
+    };
 
     if let Some(v) = store.lmove(args[1], args[2], src_left, dst_left, now) {
         resp::write_bulk_raw(out, &v);
         return CmdResult::Written;
     }
 
-    let timeout = if timeout_secs <= 0.0 {
-        Duration::from_secs(300)
-    } else {
-        Duration::from_secs_f64(timeout_secs)
-    };
     CmdResult::BlockMove {
         src,
         dst,
