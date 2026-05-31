@@ -98,16 +98,17 @@ REDIS_BENCH="$REDIS_CACHE_DIR/redis-benchmark"
 REDIS_CLI="$REDIS_CACHE_DIR/redis-cli"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LUX_BIN="$SCRIPT_DIR/target/release/lux"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LUX_BIN="$PROJECT_ROOT/target/release/lux"
 
 if [ ! -f "$LUX_BIN" ]; then
     echo -e "${YELLOW}Building Lux (release)...${NC}"
-    cd "$SCRIPT_DIR"
+    cd "$PROJECT_ROOT"
     cargo build --release
 fi
 
 REDIS_VER=$("$REDIS_SERVER" --version 2>&1 | head -1 | grep -oE 'v=[0-9]+\.[0-9]+\.[0-9]+' | cut -d= -f2)
-LUX_VER=$(grep '^version' "$SCRIPT_DIR/Cargo.toml" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+LUX_VER=$(grep '^version' "$PROJECT_ROOT/Cargo.toml" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 
 echo -e "${BOLD}=== Lux Benchmark ===${NC}"
 echo "    redis-benchmark: $("$REDIS_BENCH" --version 2>&1 | head -1)"

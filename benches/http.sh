@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-LUX_DIR="/Users/mattyhogan/Desktop/Lux/lux"
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+LUX_DIR="${LUX_DIR:-$SCRIPT_DIR}"
 LUX_BIN="$LUX_DIR/target/release/lux"
 REDIS_CLI="${XDG_CACHE_HOME:-$HOME/.cache}/lux-bench/redis-cli"
 LUX_PORT=6395
