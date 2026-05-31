@@ -6,6 +6,18 @@ use crate::store::{Store, StoreValue};
 
 use super::{arg_str, cmd_eq, parse_i64, parse_u64, CmdResult};
 
+const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
+
+fn parse_usize_arg(arg: &[u8], out: &mut BytesMut) -> Option<usize> {
+    match parse_u64(arg).ok().and_then(|n| usize::try_from(n).ok()) {
+        Some(n) => Some(n),
+        None => {
+            resp::write_error(out, INTEGER_ERR);
+            None
+        }
+    }
+}
+
 pub fn cmd_hset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     let is_hmset = cmd_eq(args[0], b"HMSET");
     if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
@@ -310,14 +322,24 @@ pub fn cmd_hscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         resp::write_error(out, "ERR wrong number of arguments");
         return CmdResult::Written;
     }
-    let cursor = parse_u64(args[2]).unwrap_or(0) as usize;
+    let cursor = match parse_usize_arg(args[2], out) {
+        Some(cursor) => cursor,
+        None => return CmdResult::Written,
+    };
     let mut count = 10usize;
     let mut pattern: Option<&[u8]> = None;
     let mut novalues = false;
     let mut i = 3;
     while i < args.len() {
         if cmd_eq(args[i], b"COUNT") && i + 1 < args.len() {
-            count = parse_u64(args[i + 1]).unwrap_or(10) as usize;
+            count = match parse_usize_arg(args[i + 1], out) {
+                Some(count) if count > 0 => count,
+                Some(_) => {
+                    resp::write_error(out, INTEGER_ERR);
+                    return CmdResult::Written;
+                }
+                None => return CmdResult::Written,
+            };
             i += 2;
         } else if cmd_eq(args[i], b"MATCH") && i + 1 < args.len() {
             pattern = Some(args[i + 1]);
@@ -326,7 +348,8 @@ pub fn cmd_hscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
             novalues = true;
             i += 1;
         } else {
-            i += 1;
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
         }
     }
     let pat_str = pattern.map(|p| arg_str(p).to_string());

@@ -6,6 +6,18 @@ use crate::store::Store;
 
 use super::{arg_str, cmd_eq, parse_i64, CmdResult};
 
+const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
+
+fn parse_i64_arg(arg: &[u8], out: &mut BytesMut) -> Option<i64> {
+    match parse_i64(arg) {
+        Ok(n) => Some(n),
+        Err(_) => {
+            resp::write_error(out, INTEGER_ERR);
+            None
+        }
+    }
+}
+
 pub fn cmd_sort(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     let readonly = cmd_eq(args[0], b"SORT_RO");
     if args.len() < 2 {
@@ -42,8 +54,22 @@ pub fn cmd_sort(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
                 resp::write_error(out, "ERR syntax error");
                 return CmdResult::Written;
             }
-            limit_offset = parse_i64(args[i + 1]).unwrap_or(0);
-            limit_count = parse_i64(args[i + 2]).unwrap_or(-1);
+            limit_offset = match parse_i64_arg(args[i + 1], out) {
+                Some(offset) if offset >= 0 => offset,
+                Some(_) => {
+                    resp::write_error(out, INTEGER_ERR);
+                    return CmdResult::Written;
+                }
+                None => return CmdResult::Written,
+            };
+            limit_count = match parse_i64_arg(args[i + 2], out) {
+                Some(count) if count >= 0 => count,
+                Some(_) => {
+                    resp::write_error(out, INTEGER_ERR);
+                    return CmdResult::Written;
+                }
+                None => return CmdResult::Written,
+            };
             i += 3;
         } else if cmd_eq(args[i], b"ASC") {
             desc = false;

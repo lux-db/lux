@@ -6,6 +6,45 @@ use crate::store::{Entry, Store, StoreValue};
 
 use super::{arg_str, cmd_eq, parse_i64, parse_u64, CmdResult};
 
+const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
+
+fn parse_i64_arg(arg: &[u8], out: &mut BytesMut) -> Option<i64> {
+    match parse_i64(arg) {
+        Ok(n) => Some(n),
+        Err(_) => {
+            resp::write_error(out, INTEGER_ERR);
+            None
+        }
+    }
+}
+
+fn parse_u64_arg(arg: &[u8], out: &mut BytesMut) -> Option<u64> {
+    match parse_u64(arg) {
+        Ok(n) => Some(n),
+        Err(_) => {
+            resp::write_error(out, INTEGER_ERR);
+            None
+        }
+    }
+}
+
+fn parse_positive_ttl(arg: &[u8], command: &str, out: &mut BytesMut) -> Option<u64> {
+    match parse_u64(arg) {
+        Ok(0) => {
+            resp::write_error(
+                out,
+                &format!("ERR invalid expire time in '{command}' command"),
+            );
+            None
+        }
+        Ok(n) => Some(n),
+        Err(_) => {
+            resp::write_error(out, INTEGER_ERR);
+            None
+        }
+    }
+}
+
 pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 3 {
         resp::write_error(out, "ERR wrong number of arguments for 'set' command");
@@ -21,21 +60,36 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
                 resp::write_error(out, "ERR syntax error");
                 return CmdResult::Written;
             }
-            match parse_u64(args[i + 1]) {
-                Ok(s) => ttl = Some(Duration::from_secs(s)),
-                Err(_) => {
-                    resp::write_error(out, "ERR value is not an integer or out of range");
-                    return CmdResult::Written;
-                }
-            }
+            let secs = match parse_positive_ttl(args[i + 1], "set", out) {
+                Some(secs) => secs,
+                None => return CmdResult::Written,
+            };
+            ttl = Some(Duration::from_secs(secs));
             i += 2;
         } else if cmd_eq(args[i], b"PX") {
             if i + 1 >= args.len() {
                 resp::write_error(out, "ERR syntax error");
                 return CmdResult::Written;
             }
+            let ms = match parse_positive_ttl(args[i + 1], "set", out) {
+                Some(ms) => ms,
+                None => return CmdResult::Written,
+            };
+            ttl = Some(Duration::from_millis(ms));
+            i += 2;
+        } else if cmd_eq(args[i], b"PXAT") {
+            if i + 1 >= args.len() {
+                resp::write_error(out, "ERR syntax error");
+                return CmdResult::Written;
+            }
             match parse_u64(args[i + 1]) {
-                Ok(ms) => ttl = Some(Duration::from_millis(ms)),
+                Ok(expiry_ms) => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    ttl = Some(Duration::from_millis(expiry_ms.saturating_sub(now_ms)));
+                }
                 Err(_) => {
                     resp::write_error(out, "ERR value is not an integer or out of range");
                     return CmdResult::Written;
@@ -117,13 +171,12 @@ pub fn cmd_psetex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'psetex' command");
         return CmdResult::Written;
     }
-    match parse_u64(args[2]) {
-        Ok(ms) => {
-            store.set(args[1], args[3], Some(Duration::from_millis(ms)), now);
-            resp::write_ok(out);
-        }
-        Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
-    }
+    let ms = match parse_positive_ttl(args[2], "psetex", out) {
+        Some(ms) => ms,
+        None => return CmdResult::Written,
+    };
+    store.set(args[1], args[3], Some(Duration::from_millis(ms)), now);
+    resp::write_ok(out);
     CmdResult::Written
 }
 
@@ -132,9 +185,7 @@ pub fn cmd_get(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
         resp::write_error(out, "ERR wrong number of arguments for 'get' command");
         return CmdResult::Written;
     }
-    let idx = store.shard_for_key(args[1]);
-    let shard = store.lock_read_shard(idx);
-    Store::get_and_write(&shard.data, args[1], now, out);
+    resp::write_optional_bulk_raw(out, &store.get(args[1], now));
     CmdResult::Written
 }
 
@@ -163,36 +214,72 @@ pub fn cmd_getex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
     }
     let mut ttl = None;
     let mut persist = false;
+    let mut option_seen = false;
     let mut i = 2;
     while i < args.len() {
         if cmd_eq(args[i], b"EX") && i + 1 < args.len() {
-            ttl = Some(Duration::from_secs(parse_u64(args[i + 1]).unwrap_or(0)));
+            if option_seen {
+                resp::write_error(out, "ERR syntax error");
+                return CmdResult::Written;
+            }
+            let secs = match parse_positive_ttl(args[i + 1], "getex", out) {
+                Some(secs) => secs,
+                None => return CmdResult::Written,
+            };
+            ttl = Some(Duration::from_secs(secs));
+            option_seen = true;
             i += 2;
         } else if cmd_eq(args[i], b"PX") && i + 1 < args.len() {
-            ttl = Some(Duration::from_millis(parse_u64(args[i + 1]).unwrap_or(0)));
+            if option_seen {
+                resp::write_error(out, "ERR syntax error");
+                return CmdResult::Written;
+            }
+            let ms = match parse_positive_ttl(args[i + 1], "getex", out) {
+                Some(ms) => ms,
+                None => return CmdResult::Written,
+            };
+            ttl = Some(Duration::from_millis(ms));
+            option_seen = true;
             i += 2;
         } else if cmd_eq(args[i], b"EXAT") && i + 1 < args.len() {
-            let ts = parse_u64(args[i + 1]).unwrap_or(0);
+            if option_seen {
+                resp::write_error(out, "ERR syntax error");
+                return CmdResult::Written;
+            }
+            let ts = match parse_u64_arg(args[i + 1], out) {
+                Some(ts) => ts,
+                None => return CmdResult::Written,
+            };
             let now_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if ts > now_ts {
-                ttl = Some(Duration::from_secs(ts - now_ts));
-            }
+            ttl = Some(Duration::from_secs(ts.saturating_sub(now_ts)));
+            option_seen = true;
             i += 2;
         } else if cmd_eq(args[i], b"PXAT") && i + 1 < args.len() {
-            let ts = parse_u64(args[i + 1]).unwrap_or(0);
+            if option_seen {
+                resp::write_error(out, "ERR syntax error");
+                return CmdResult::Written;
+            }
+            let ts = match parse_u64_arg(args[i + 1], out) {
+                Some(ts) => ts,
+                None => return CmdResult::Written,
+            };
             let now_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            if ts > now_ts {
-                ttl = Some(Duration::from_millis(ts - now_ts));
-            }
+            ttl = Some(Duration::from_millis(ts.saturating_sub(now_ts)));
+            option_seen = true;
             i += 2;
         } else if cmd_eq(args[i], b"PERSIST") {
+            if option_seen {
+                resp::write_error(out, "ERR syntax error");
+                return CmdResult::Written;
+            }
             persist = true;
+            option_seen = true;
             i += 1;
         } else {
             resp::write_error(out, "ERR syntax error");
@@ -208,12 +295,15 @@ pub fn cmd_getrange(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
         resp::write_error(out, "ERR wrong number of arguments for 'getrange' command");
         return CmdResult::Written;
     }
-    let val = store.getrange(
-        args[1],
-        parse_i64(args[2]).unwrap_or(0),
-        parse_i64(args[3]).unwrap_or(-1),
-        now,
-    );
+    let start = match parse_i64_arg(args[2], out) {
+        Some(n) => n,
+        None => return CmdResult::Written,
+    };
+    let end = match parse_i64_arg(args[3], out) {
+        Some(n) => n,
+        None => return CmdResult::Written,
+    };
+    let val = store.getrange(args[1], start, end, now);
     resp::write_bulk_raw(out, &val);
     CmdResult::Written
 }
@@ -223,15 +313,22 @@ pub fn cmd_setrange(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
         resp::write_error(out, "ERR wrong number of arguments for 'setrange' command");
         return CmdResult::Written;
     }
-    resp::write_integer(
-        out,
-        store.setrange(
-            args[1],
-            parse_u64(args[2]).unwrap_or(0) as usize,
-            args[3],
-            now,
-        ),
-    );
+    let offset_u64 = match parse_u64_arg(args[2], out) {
+        Some(n) => n,
+        None => return CmdResult::Written,
+    };
+    let offset = match usize::try_from(offset_u64) {
+        Ok(offset) => offset,
+        Err(_) => {
+            resp::write_error(out, INTEGER_ERR);
+            return CmdResult::Written;
+        }
+    };
+    if offset.checked_add(args[3].len()).is_none() {
+        resp::write_error(out, INTEGER_ERR);
+        return CmdResult::Written;
+    }
+    resp::write_integer(out, store.setrange(args[1], offset, args[3], now));
     CmdResult::Written
 }
 
@@ -242,9 +339,7 @@ pub fn cmd_mget(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     }
     resp::write_array_header(out, args.len() - 1);
     for key in &args[1..] {
-        let idx = store.shard_for_key(key);
-        let shard = store.lock_read_shard(idx);
-        Store::get_and_write(&shard.data, key, now, out);
+        resp::write_optional_bulk_raw(out, &store.get(key, now));
     }
     CmdResult::Written
 }
@@ -254,7 +349,11 @@ pub fn cmd_mset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'mset' command");
         return CmdResult::Written;
     }
-    store.mset_from_args(&args[1..], now);
+    let mut i = 1;
+    while i < args.len() {
+        store.set(args[i], args[i + 1], None, now);
+        i += 2;
+    }
     resp::write_ok(out);
     CmdResult::Written
 }
@@ -374,8 +473,8 @@ pub fn cmd_incrbyfloat(
     let mut shard = store.lock_write_shard(idx);
     let ks = arg_str(args[1]);
     let current: f64 = match shard.data.get(ks) {
-        Some(e) if !e.is_expired_at(now) => match e.value.string_bytes() {
-            Some(s) => {
+        Some(e) if !e.is_expired_at(now) => match &e.value {
+            StoreValue::Str(s) => {
                 let ss = std::str::from_utf8(s).unwrap_or("");
                 if ss.contains(' ') {
                     resp::write_error(out, "ERR value is not a valid float");
@@ -393,7 +492,7 @@ pub fn cmd_incrbyfloat(
                     }
                 }
             }
-            None => {
+            _ => {
                 resp::write_error(
                     out,
                     "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -415,7 +514,7 @@ pub fn cmd_incrbyfloat(
     };
     let expires_at = shard.data.get(ks).and_then(|e| e.expires_at);
     shard.version += 1;
-    let old = shard.data.insert(
+    shard.data.insert(
         ks.to_string(),
         Entry {
             value: StoreValue::Str(Bytes::from(new_str.clone())),
@@ -423,9 +522,6 @@ pub fn cmd_incrbyfloat(
             lru_clock: store.lru_clock(),
         },
     );
-    if old.is_none() {
-        store.key_added();
-    }
     resp::write_bulk(out, &new_str);
     CmdResult::Written
 }
