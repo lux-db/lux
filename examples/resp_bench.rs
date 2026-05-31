@@ -951,7 +951,13 @@ fn specs() -> Vec<Spec> {
         Spec {
             label: "SMISMEMBER",
             id: CommandId::Smismember,
-            argv: &["SMISMEMBER", "__lux_bench_set", "member:1", "member:2", "member:3"],
+            argv: &[
+                "SMISMEMBER",
+                "__lux_bench_set",
+                "member:1",
+                "member:2",
+                "member:3",
+            ],
         },
         Spec {
             label: "SCARD",
@@ -1012,7 +1018,13 @@ fn specs() -> Vec<Spec> {
         Spec {
             label: "ZMSCORE",
             id: CommandId::Zmscore,
-            argv: &["ZMSCORE", "__lux_bench_zset", "member:1", "member:2", "member:3"],
+            argv: &[
+                "ZMSCORE",
+                "__lux_bench_zset",
+                "member:1",
+                "member:2",
+                "member:3",
+            ],
         },
         Spec {
             label: "ZRANK",
@@ -1329,10 +1341,9 @@ fn target_spec(
                 kind: TargetKind::RedisResp { server },
             })
         }
-        other => Err(format!(
-            "unknown BENCH_TARGETS entry {other:?}; expected embedded,lux,redis"
-        )
-        .into()),
+        other => Err(
+            format!("unknown BENCH_TARGETS entry {other:?}; expected embedded,lux,redis").into(),
+        ),
     }
 }
 
@@ -2011,7 +2022,9 @@ fn next_seed_commands(
         | CommandId::Hgetall
         | CommandId::Hscan => seed_hash_keyspace_chunk(cfg, state, 128.min(remaining), false),
         CommandId::Hincrby => seed_hash_keyspace_chunk(cfg, state, 128.min(remaining), true),
-        CommandId::Sadd | CommandId::Srem => seed_set_keyspace_chunk(cfg, state, 512.min(remaining)),
+        CommandId::Sadd | CommandId::Srem => {
+            seed_set_keyspace_chunk(cfg, state, 512.min(remaining))
+        }
         CommandId::Sismember
         | CommandId::Smismember
         | CommandId::Scard
@@ -2023,7 +2036,9 @@ fn next_seed_commands(
         CommandId::Sunion | CommandId::Sinter | CommandId::Sdiff => {
             seed_set_pair_keyspace_chunk(cfg, state, 512.min(remaining))
         }
-        CommandId::Zadd | CommandId::Zrem => seed_zset_keyspace_chunk(cfg, state, 256.min(remaining)),
+        CommandId::Zadd | CommandId::Zrem => {
+            seed_zset_keyspace_chunk(cfg, state, 256.min(remaining))
+        }
         CommandId::Zscore
         | CommandId::Zmscore
         | CommandId::Zrank
@@ -2047,9 +2062,7 @@ fn next_seed_commands(
         | CommandId::Xdel
         | CommandId::Xlen
         | CommandId::Xrange
-        | CommandId::Xrevrange => {
-            seed_stream_keyspace_chunk(cfg, state, 128.min(remaining))
-        }
+        | CommandId::Xrevrange => seed_stream_keyspace_chunk(cfg, state, 128.min(remaining)),
         CommandId::Pfadd | CommandId::Pfcount => {
             seed_set_keyspace_chunk(cfg, state, 512.min(remaining))
         }
@@ -2068,9 +2081,7 @@ fn fixture_item_limit(cfg: &BenchConfig, spec: Spec) -> Option<usize> {
         | CommandId::Mget
         | CommandId::Hmget
         | CommandId::Smismember
-        | CommandId::Zmscore => {
-            Some(cfg.fixture_items.saturating_mul(3))
-        }
+        | CommandId::Zmscore => Some(cfg.fixture_items.saturating_mul(3)),
         CommandId::Exists => Some(cfg.fixture_items.saturating_mul(4)),
         _ => Some(cfg.fixture_items),
     }
@@ -2906,7 +2917,13 @@ fn query_argv_plan(cfg: &BenchConfig, spec: Spec, seed_items: usize) -> QueryArg
         CommandId::Bitcount => cycle_one_arg("BITCOUNT", count, |index| string_key(cfg, index)),
         CommandId::Bitpos => QueryArgvPlan::Cycling(
             (0..count)
-                .map(|index| vec!["BITPOS".to_string(), string_key(cfg, index), "1".to_string()])
+                .map(|index| {
+                    vec![
+                        "BITPOS".to_string(),
+                        string_key(cfg, index),
+                        "1".to_string(),
+                    ]
+                })
                 .collect(),
         ),
         // ---- Lists ----
@@ -2993,12 +3010,8 @@ fn query_argv_plan(cfg: &BenchConfig, spec: Spec, seed_items: usize) -> QueryArg
                 })
                 .collect(),
         ),
-        CommandId::Hkeys => {
-            cycle_one_arg("HKEYS", count, |index| hash_partition_key(cfg, index))
-        }
-        CommandId::Hvals => {
-            cycle_one_arg("HVALS", count, |index| hash_partition_key(cfg, index))
-        }
+        CommandId::Hkeys => cycle_one_arg("HKEYS", count, |index| hash_partition_key(cfg, index)),
+        CommandId::Hvals => cycle_one_arg("HVALS", count, |index| hash_partition_key(cfg, index)),
         CommandId::Hstrlen => QueryArgvPlan::Cycling(
             (0..count)
                 .map(|index| {
