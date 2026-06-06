@@ -1,6 +1,6 @@
 {
     "name": "@luxdb/sdk",
-    "version": "1.4.0",
+    "version": "1.4.1",
     "description": "Lux SDK - ioredis extended with vector search, time series, and realtime key subscriptions",
     "main": "./dist/cjs/index.js",
     "module": "./dist/esm/index.js",
