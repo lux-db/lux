@@ -2004,6 +2004,43 @@ fn candidates_from_index(
     }
 }
 
+fn candidates_from_implicit_id(
+    store: &Store,
+    table: &str,
+    cond: &WhereClause,
+    limit: Option<usize>,
+    now: Instant,
+) -> Option<Vec<String>> {
+    let score: f64 = match cond.value.parse() {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    let (min, max, min_excl, max_excl) = match cond.op {
+        CmpOp::Eq => (score, score, false, false),
+        CmpOp::Gt => (score, f64::INFINITY, true, false),
+        CmpOp::Ge => (score, f64::INFINITY, false, false),
+        CmpOp::Lt => (f64::NEG_INFINITY, score, false, true),
+        CmpOp::Le => (f64::NEG_INFINITY, score, false, false),
+        CmpOp::Ne => return None,
+    };
+
+    let results = store
+        .zrangebyscore(
+            ids_key(table).as_bytes(),
+            min,
+            max,
+            min_excl,
+            max_excl,
+            false,
+            Some(0),
+            limit,
+            false,
+            now,
+        )
+        .unwrap_or_default();
+    Some(results.into_iter().map(|(s, _)| s).collect())
+}
+
 // ---------------------------------------------------------------------------
 // TSELECT parser
 // ---------------------------------------------------------------------------
@@ -2392,6 +2429,19 @@ pub fn table_select(
         .iter()
         .map(|f| (f.name.as_str(), &f.field_type))
         .collect();
+    let implicit_id_field = if schema.iter().any(|f| f.primary_key) {
+        None
+    } else {
+        Some(FieldDef {
+            name: "id".to_string(),
+            field_type: FieldType::Int,
+            primary_key: true,
+            unique: true,
+            nullable: false,
+            default_value: None,
+            references: None,
+        })
+    };
 
     // Apply LIMIT early only when safe to do so:
     // - no joins (join changes the row count unpredictably)
@@ -2427,6 +2477,20 @@ pub fn table_select(
                         },
                         fd,
                     )
+                } else if bare == "id" {
+                    if let Some(fd) = implicit_id_field.as_ref() {
+                        matches_condition(
+                            row,
+                            &WhereClause {
+                                field: bare.to_string(),
+                                op: cond.op.clone(),
+                                value: cond.value.clone(),
+                            },
+                            fd,
+                        )
+                    } else {
+                        true
+                    }
                 } else {
                     true // join column - filter after join
                 }
@@ -2561,7 +2625,25 @@ fn build_candidates(
 
     for cond in conditions {
         let bare = bare_col(&cond.field);
-        if let Some(fd) = schema.iter().find(|f| f.name == bare) {
+        if !schema.iter().any(|f| f.primary_key) && bare == "id" {
+            if let Some(pks) = candidates_from_implicit_id(
+                store,
+                table,
+                &WhereClause {
+                    field: "id".to_string(),
+                    op: cond.op.clone(),
+                    value: cond.value.clone(),
+                },
+                index_limit,
+                now,
+            ) {
+                let pk_set: HashSet<String> = pks.into_iter().collect();
+                candidate_set = Some(match candidate_set {
+                    Some(existing) => existing.intersection(&pk_set).cloned().collect(),
+                    None => pk_set,
+                });
+            }
+        } else if let Some(fd) = schema.iter().find(|f| f.name == bare) {
             if let Some(pks) = candidates_from_index(
                 store,
                 table,

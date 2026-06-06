@@ -128,6 +128,8 @@ fn tinsert_and_tselect() {
 
     let r = send(&mut s, &["TINSERT", "users", "name", "alice", "age", "30"]);
     assert_eq!(r, ":1");
+    let r = send(&mut s, &["TINSERT", "users", "name", "bob", "age", "31"]);
+    assert_eq!(r, ":2");
 
     let r = send(
         &mut s,
@@ -135,6 +137,14 @@ fn tinsert_and_tselect() {
     );
     assert!(r.contains("alice"), "should find alice: {}", r);
     assert!(r.contains("30"), "should find age 30: {}", r);
+    assert!(!r.contains("bob"), "id=1 should not return bob: {}", r);
+
+    let r = send(
+        &mut s,
+        &["TSELECT", "*", "FROM", "users", "WHERE", "id", "=", "2"],
+    );
+    assert!(r.contains("bob"), "should find bob by implicit id: {}", r);
+    assert!(!r.contains("alice"), "id=2 should not return alice: {}", r);
 
     child.kill().ok();
     child.wait().ok();
