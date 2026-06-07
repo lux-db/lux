@@ -95,10 +95,7 @@ export class Lux extends Redis {
 	constructor(options?: LuxClientOptions | RedisOptions | string) {
 		let authOptions: LuxAuthOptions = {};
 		if (typeof options === 'string') {
-			if (options.startsWith('rediss://') || options.startsWith('luxs://')) {
-				throw new Error('TLS is not yet supported');
-			}
-			options = options.replace(/^lux:\/\//, 'redis://');
+			options = options.replace(/^luxs:\/\//, 'rediss://').replace(/^lux:\/\//, 'redis://');
 		} else if (options) {
 			const { httpUrl, apiKey, authToken, fetch: fetchImpl, ...redisOptions } = options as LuxClientOptions;
 			authOptions = { httpUrl, apiKey, authToken, fetch: fetchImpl };
