@@ -266,6 +266,13 @@ pub(crate) struct StoreMetrics {
     persistence_err_disk_write: AtomicUsize,
 }
 
+#[derive(Default)]
+pub(crate) struct StoreBatchStats {
+    mem_added: usize,
+    mem_removed: usize,
+    keys_added: usize,
+}
+
 impl StoreMetrics {
     fn new() -> Self {
         Self {
@@ -527,6 +534,21 @@ impl Store {
     #[inline(always)]
     pub(crate) fn key_added(&self) {
         self.metrics.key_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub(crate) fn apply_batch_stats(&self, stats: StoreBatchStats) {
+        if stats.mem_removed != 0 {
+            self.mem_sub(stats.mem_removed);
+        }
+        if stats.mem_added != 0 {
+            self.mem_add(stats.mem_added);
+        }
+        if stats.keys_added != 0 {
+            self.metrics
+                .key_count
+                .fetch_add(stats.keys_added, Ordering::Relaxed);
+        }
     }
 
     #[inline(always)]
@@ -1057,6 +1079,51 @@ impl Store {
                 );
                 self.mem_add(new_size);
                 self.key_added();
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_on_shard_batched(
+        &self,
+        data: &mut ShardData,
+        key: &[u8],
+        value: &[u8],
+        stats: &mut StoreBatchStats,
+    ) {
+        let hash = fx_hash(key);
+        let new_value = StoreValue::Str(Bytes::copy_from_slice(value));
+        let new_size = key.len() + 64 + value.len();
+        let clock = self.lru_clock();
+        match data
+            .raw_entry_mut()
+            .from_hash(hash, |k| k.as_slice() == key)
+        {
+            hashbrown::hash_map::RawEntryMut::Occupied(mut e) => {
+                let old_size = estimate_entry_memory(e.key(), &e.get().value);
+                let entry = e.get_mut();
+                entry.value = new_value;
+                entry.expires_at = None;
+                entry.lru_clock = clock;
+                if new_size >= old_size {
+                    stats.mem_added += new_size - old_size;
+                } else {
+                    stats.mem_removed += old_size - new_size;
+                }
+            }
+            hashbrown::hash_map::RawEntryMut::Vacant(e) => {
+                e.insert_with_hasher(
+                    hash,
+                    key_bytes(key),
+                    Entry {
+                        value: new_value,
+                        expires_at: None,
+                        lru_clock: clock,
+                    },
+                    |k| fx_hash(k),
+                );
+                stats.mem_added += new_size;
+                stats.keys_added += 1;
             }
         }
     }

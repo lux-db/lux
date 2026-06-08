@@ -1487,7 +1487,21 @@ pub fn table_update_where(
         }
     }
 
-    let row_ids = get_all_row_ids(store, table, now);
+    let row_ids = plan_table_scan(
+        store,
+        table,
+        &schema,
+        TableScanPlan {
+            conditions: &conditions,
+            order_by: None,
+            limit: None,
+            offset: None,
+            allow_order_pushdown: false,
+            early_limit: None,
+        },
+        now,
+    )
+    .row_ids;
     let mut updated_count = 0i64;
 
     for pk_str in row_ids {
@@ -1545,7 +1559,21 @@ pub fn table_delete_where(
         }
     }
 
-    let row_ids = get_all_row_ids(store, table, now);
+    let row_ids = plan_table_scan(
+        store,
+        table,
+        &schema,
+        TableScanPlan {
+            conditions: &conditions,
+            order_by: None,
+            limit: None,
+            offset: None,
+            allow_order_pushdown: false,
+            early_limit: None,
+        },
+        now,
+    )
+    .row_ids;
     let mut deleted_count = 0i64;
 
     // Collect PKs to delete first (to avoid modifying while iterating)
@@ -2376,6 +2404,40 @@ pub enum SelectResult {
     Aggregate(Vec<(String, String)>),
 }
 
+struct TableScan {
+    row_ids: Vec<String>,
+    order_satisfied: bool,
+    pagination_satisfied: bool,
+}
+
+struct TableScanPlan<'a> {
+    conditions: &'a [WhereClause],
+    order_by: Option<&'a (String, bool)>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    allow_order_pushdown: bool,
+    early_limit: Option<usize>,
+}
+
+struct OrderScan<'a> {
+    column: &'a str,
+    ascending: bool,
+    min: f64,
+    max: f64,
+    min_exclusive: bool,
+    max_exclusive: bool,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct ScoreRange {
+    min: f64,
+    max: f64,
+    min_exclusive: bool,
+    max_exclusive: bool,
+}
+
 pub fn table_select(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -2452,16 +2514,23 @@ pub fn table_select(
         None
     };
 
-    // Pass early_limit into build_candidates so index lookups stop after N results
-    // rather than fetching all matching IDs first (e.g. WHERE age > 40 LIMIT 100
-    // used to fetch 61k IDs from the sorted set before truncating to 100)
-    let mut candidates =
-        build_candidates(store, &plan.table, &schema, &conditions, early_limit, now);
-    if let Some(lim) = early_limit {
-        candidates.truncate(lim);
-    }
+    let scan = plan_table_scan(
+        store,
+        &plan.table,
+        &schema,
+        TableScanPlan {
+            conditions: &conditions,
+            order_by: plan.order_by.as_ref(),
+            limit: plan.limit,
+            offset: plan.offset,
+            allow_order_pushdown: plan.joins.is_empty(),
+            early_limit,
+        },
+        now,
+    );
 
-    let mut rows: Vec<Vec<(String, String)>> = candidates
+    let mut rows: Vec<Vec<(String, String)>> = scan
+        .row_ids
         .into_iter()
         .filter_map(|pk_str| get_row_with_map(store, &plan.table, &type_map, &pk_str, now))
         .filter(|row| {
@@ -2569,32 +2638,40 @@ pub fn table_select(
     }
 
     // ---- ORDER BY ----
-    if let Some((ref col, ascending)) = plan.order_by {
-        rows.sort_by(|a, b| {
-            let av = find_col(a, col, table_alias).unwrap_or("");
-            let bv = find_col(b, col, table_alias).unwrap_or("");
-            // Try numeric sort first, fall back to string
-            let cmp = match (av.parse::<f64>(), bv.parse::<f64>()) {
-                (Ok(af), Ok(bf)) => af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal),
-                _ => av.cmp(bv),
-            };
-            if ascending {
-                cmp
-            } else {
-                cmp.reverse()
-            }
-        });
+    if !scan.order_satisfied {
+        if let Some((ref col, ascending)) = plan.order_by {
+            rows.sort_by(|a, b| {
+                let av = find_col(a, col, table_alias).unwrap_or("");
+                let bv = find_col(b, col, table_alias).unwrap_or("");
+                // Try numeric sort first, fall back to string
+                let cmp = match (av.parse::<f64>(), bv.parse::<f64>()) {
+                    (Ok(af), Ok(bf)) => af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal),
+                    _ => av.cmp(bv),
+                };
+                if ascending {
+                    cmp
+                } else {
+                    cmp.reverse()
+                }
+            });
+        }
     }
 
     // ---- OFFSET / LIMIT ----
-    let rows = if let Some(off) = plan.offset {
-        rows.into_iter().skip(off).collect()
+    let rows = if !scan.pagination_satisfied {
+        if let Some(off) = plan.offset {
+            rows.into_iter().skip(off).collect()
+        } else {
+            rows
+        }
     } else {
         rows
     };
     let mut rows = rows;
-    if let Some(lim) = plan.limit {
-        rows.truncate(lim);
+    if !scan.pagination_satisfied {
+        if let Some(lim) = plan.limit {
+            rows.truncate(lim);
+        }
     }
 
     // ---- Column projection ----
@@ -2608,7 +2685,150 @@ pub fn table_select(
     Ok(SelectResult::Rows(rows))
 }
 
-/// Build candidate row PK strings using the index where possible.
+fn plan_table_scan(
+    store: &Store,
+    table: &str,
+    schema: &[FieldDef],
+    plan: TableScanPlan<'_>,
+    now: Instant,
+) -> TableScan {
+    if plan.allow_order_pushdown {
+        if let Some((order_col, ascending)) = plan.order_by {
+            let order_col = bare_col(order_col);
+            if let Some(range) = score_range_from_conditions(order_col, plan.conditions) {
+                let pushed_offset = Some(plan.offset.unwrap_or(0));
+                let pushed_limit = Some(plan.limit.unwrap_or(usize::MAX));
+
+                if let Some(row_ids) = candidates_from_order_index(
+                    store,
+                    table,
+                    schema,
+                    OrderScan {
+                        column: order_col,
+                        ascending: *ascending,
+                        min: range.min,
+                        max: range.max,
+                        min_exclusive: range.min_exclusive,
+                        max_exclusive: range.max_exclusive,
+                        offset: pushed_offset,
+                        limit: pushed_limit,
+                    },
+                    now,
+                ) {
+                    return TableScan {
+                        row_ids,
+                        order_satisfied: true,
+                        pagination_satisfied: plan.limit.is_some() || plan.offset.is_some(),
+                    };
+                }
+            }
+        }
+    }
+
+    let candidate_set =
+        build_candidate_set(store, table, schema, plan.conditions, plan.early_limit, now);
+
+    if plan.allow_order_pushdown {
+        if let Some((order_col, ascending)) = plan.order_by {
+            let can_push_pagination = candidate_set.is_none() && plan.conditions.is_empty();
+            let pushed_offset = can_push_pagination.then_some(plan.offset.unwrap_or(0));
+            let pushed_limit = can_push_pagination.then_some(plan.limit.unwrap_or(usize::MAX));
+
+            if let Some(mut row_ids) = candidates_from_order_index(
+                store,
+                table,
+                schema,
+                OrderScan {
+                    column: bare_col(order_col),
+                    ascending: *ascending,
+                    min: f64::NEG_INFINITY,
+                    max: f64::INFINITY,
+                    min_exclusive: false,
+                    max_exclusive: false,
+                    offset: pushed_offset,
+                    limit: pushed_limit,
+                },
+                now,
+            ) {
+                if let Some(set) = candidate_set.as_ref() {
+                    row_ids.retain(|pk| set.contains(pk));
+                }
+                return TableScan {
+                    row_ids,
+                    order_satisfied: true,
+                    pagination_satisfied: can_push_pagination
+                        && (plan.limit.is_some() || plan.offset.is_some()),
+                };
+            }
+        }
+    }
+
+    let mut row_ids = match candidate_set {
+        Some(pks) => pks.into_iter().collect(),
+        None => get_all_row_ids(store, table, now),
+    };
+    if let Some(lim) = plan.early_limit {
+        row_ids.truncate(lim);
+    }
+    TableScan {
+        row_ids,
+        order_satisfied: false,
+        pagination_satisfied: false,
+    }
+}
+
+fn score_range_from_conditions(order_col: &str, conditions: &[WhereClause]) -> Option<ScoreRange> {
+    let mut range = ScoreRange {
+        min: f64::NEG_INFINITY,
+        max: f64::INFINITY,
+        min_exclusive: false,
+        max_exclusive: false,
+    };
+
+    for cond in conditions {
+        if bare_col(&cond.field) != order_col {
+            return None;
+        }
+        let score = cond.value.parse::<f64>().ok()?;
+        match cond.op {
+            CmpOp::Eq => {
+                range.min = score;
+                range.max = score;
+                range.min_exclusive = false;
+                range.max_exclusive = false;
+            }
+            CmpOp::Gt => {
+                if score > range.min || (score == range.min && !range.min_exclusive) {
+                    range.min = score;
+                    range.min_exclusive = true;
+                }
+            }
+            CmpOp::Ge => {
+                if score > range.min {
+                    range.min = score;
+                    range.min_exclusive = false;
+                }
+            }
+            CmpOp::Lt => {
+                if score < range.max || (score == range.max && !range.max_exclusive) {
+                    range.max = score;
+                    range.max_exclusive = true;
+                }
+            }
+            CmpOp::Le => {
+                if score < range.max {
+                    range.max = score;
+                    range.max_exclusive = false;
+                }
+            }
+            CmpOp::Ne => return None,
+        }
+    }
+
+    Some(range)
+}
+
+/// Build candidate row PK strings using condition indexes where possible.
 fn build_candidates(
     store: &Store,
     table: &str,
@@ -2617,6 +2837,20 @@ fn build_candidates(
     limit: Option<usize>,
     now: Instant,
 ) -> Vec<String> {
+    match build_candidate_set(store, table, schema, conditions, limit, now) {
+        Some(pks) => pks.into_iter().collect(),
+        None => get_all_row_ids(store, table, now),
+    }
+}
+
+fn build_candidate_set(
+    store: &Store,
+    table: &str,
+    schema: &[FieldDef],
+    conditions: &[WhereClause],
+    limit: Option<usize>,
+    now: Instant,
+) -> Option<HashSet<String>> {
     let mut candidate_set: Option<HashSet<String>> = None;
 
     // Only push limit down to index when there's a single condition - with multiple
@@ -2625,7 +2859,22 @@ fn build_candidates(
 
     for cond in conditions {
         let bare = bare_col(&cond.field);
-        if !schema.iter().any(|f| f.primary_key) && bare == "id" {
+        let primary_key_candidate = schema
+            .iter()
+            .find(|f| f.primary_key && f.name == bare)
+            .filter(|pk| cond.op == CmpOp::Eq && validate_value(pk, &cond.value).is_ok());
+        if primary_key_candidate.is_some() {
+            let row_exists = !store
+                .hgetall(row_key_for_pk(table, &cond.value).as_bytes(), now)
+                .unwrap_or_default()
+                .is_empty();
+            let pk_set: HashSet<String> =
+                row_exists.then(|| cond.value.clone()).into_iter().collect();
+            candidate_set = Some(match candidate_set {
+                Some(existing) => existing.intersection(&pk_set).cloned().collect(),
+                None => pk_set,
+            });
+        } else if !schema.iter().any(|f| f.primary_key) && bare == "id" {
             if let Some(pks) = candidates_from_implicit_id(
                 store,
                 table,
@@ -2665,10 +2914,46 @@ fn build_candidates(
         }
     }
 
-    match candidate_set {
-        Some(pks) => pks.into_iter().collect(),
-        None => get_all_row_ids(store, table, now),
-    }
+    candidate_set
+}
+
+fn candidates_from_order_index(
+    store: &Store,
+    table: &str,
+    schema: &[FieldDef],
+    scan: OrderScan<'_>,
+    now: Instant,
+) -> Option<Vec<String>> {
+    let has_explicit_pk = schema.iter().any(|f| f.primary_key);
+    let zkey = if !has_explicit_pk && scan.column == "id" {
+        ids_key(table)
+    } else {
+        let field = schema.iter().find(|f| f.name == scan.column)?;
+        match &field.field_type {
+            FieldType::Int
+            | FieldType::Float
+            | FieldType::Bool
+            | FieldType::Timestamp
+            | FieldType::Ref(_) => idx_sorted_key(table, scan.column),
+            FieldType::Str | FieldType::Uuid => return None,
+        }
+    };
+
+    let rows = store
+        .zrangebyscore(
+            zkey.as_bytes(),
+            scan.min,
+            scan.max,
+            scan.min_exclusive,
+            scan.max_exclusive,
+            !scan.ascending,
+            scan.offset,
+            scan.limit,
+            false,
+            now,
+        )
+        .unwrap_or_default();
+    Some(rows.into_iter().map(|(pk, _)| pk).collect())
 }
 
 /// Hash Join implementation.
@@ -4158,6 +4443,103 @@ mod tests {
                 assert_eq!(rows.len(), 2);
             }
             _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn select_order_by_uses_index_with_limit_offset_semantics() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_users(&store, &cache, now);
+
+        let plan = parse_select(&[
+            "name", "FROM", "users", "ORDER", "BY", "age", "DESC", "LIMIT", "2", "OFFSET", "1",
+        ])
+        .unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+
+        match result {
+            SelectResult::Rows(rows) => {
+                let names: Vec<&str> = rows
+                    .iter()
+                    .filter_map(|r| r.iter().find(|(k, _)| k == "name").map(|(_, v)| v.as_str()))
+                    .collect();
+                assert_eq!(names, vec!["Alice", "Dave"]);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn select_where_order_by_uses_bounded_index_scan() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_users(&store, &cache, now);
+
+        let plan = parse_select(&[
+            "name", "FROM", "users", "WHERE", "age", ">", "25", "ORDER", "BY", "age", "DESC",
+            "LIMIT", "2",
+        ])
+        .unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+
+        match result {
+            SelectResult::Rows(rows) => {
+                let names: Vec<&str> = rows
+                    .iter()
+                    .filter_map(|r| r.iter().find(|(k, _)| k == "name").map(|(_, v)| v.as_str()))
+                    .collect();
+                assert_eq!(names, vec!["Carol", "Alice"]);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn update_and_delete_where_use_index_candidate_semantics() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_users(&store, &cache, now);
+
+        let updated = table_update_where(
+            &store,
+            &cache,
+            "users",
+            &[("active", "false")],
+            &["age", "=", "28"],
+            now,
+        )
+        .unwrap();
+        assert_eq!(updated, 1);
+
+        let plan = parse_select(&["*", "FROM", "users", "WHERE", "name", "=", "Dave"]).unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+        match result {
+            SelectResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert!(rows[0].iter().any(|(k, v)| k == "active" && v == "false"));
+            }
+            _ => panic!("expected rows"),
+        }
+
+        let deleted =
+            table_delete_where(&store, &cache, "users", &["name", "=", "Bob"], now).unwrap();
+        assert_eq!(deleted, 1);
+
+        let plan = parse_select(&["COUNT(*)", "FROM", "users"]).unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+        match result {
+            SelectResult::Aggregate(row) => {
+                let count = row
+                    .iter()
+                    .find(|(k, _)| k == "count(*)")
+                    .map(|(_, v)| v.as_str());
+                assert_eq!(count, Some("3"));
+            }
+            _ => panic!("expected aggregate"),
         }
     }
 }

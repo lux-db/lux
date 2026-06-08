@@ -140,16 +140,17 @@ impl ShardExecutor {
             shard.version += 1;
             if bare_set_batch {
                 out.reserve(commands.len() * crate::resp::OK.len());
+                let mut stats = crate::store::StoreBatchStats::default();
                 for command in commands {
-                    self.store.set_on_shard(
+                    self.store.set_on_shard_batched(
                         &mut shard.data,
                         command.args[1],
                         command.args[2],
-                        None,
-                        now,
+                        &mut stats,
                     );
                     crate::resp::write_ok(out);
                 }
+                self.store.apply_batch_stats(stats);
             } else {
                 for command in commands {
                     cmd::execute_on_shard(
@@ -225,12 +226,14 @@ impl ShardExecutor {
             shard.version += 1;
             if bare_set_batch {
                 out.reserve(commands.len() * crate::resp::OK.len());
+                let mut stats = crate::store::StoreBatchStats::default();
                 for command in commands {
                     let args = command.argv();
                     self.store
-                        .set_on_shard(&mut shard.data, args[1], args[2], None, now);
+                        .set_on_shard_batched(&mut shard.data, args[1], args[2], &mut stats);
                     crate::resp::write_ok(out);
                 }
+                self.store.apply_batch_stats(stats);
             } else {
                 for command in commands {
                     cmd::execute_on_shard(
@@ -396,6 +399,59 @@ mod tests {
 
         let stats = executor.broker.key_event_stats();
         assert_eq!(stats.enqueued, 1);
+    }
+
+    #[test]
+    fn bare_set_batch_updates_key_accounting_once_per_new_key() {
+        let store = Arc::new(Store::new());
+        let broker = Broker::new();
+        let executor = ShardExecutor::new(store.clone(), broker);
+        let now = Instant::now();
+        let shard_idx = store.shard_for_key(b"k");
+        let set_first: [&[u8]; 3] = [b"SET", b"k", b"v1"];
+        let set_replace: [&[u8]; 3] = [b"SET", b"k", b"v2"];
+        let commands = [
+            ShardPipelineCommand {
+                args: &set_first,
+                access: PipelineAccess::Write,
+            },
+            ShardPipelineCommand {
+                args: &set_replace,
+                access: PipelineAccess::Write,
+            },
+        ];
+        let mut out = BytesMut::new();
+
+        executor
+            .execute_pipeline_batch(shard_idx, &commands, &mut out, now)
+            .unwrap();
+
+        assert_eq!(&out[..], b"+OK\r\n+OK\r\n");
+        assert_eq!(store.dbsize(now), 1);
+        assert_eq!(store.get(b"k", now).unwrap().as_ref(), b"v2");
+    }
+
+    #[test]
+    fn argv_bare_set_batch_updates_key_accounting_once_per_new_key() {
+        let store = Arc::new(Store::new());
+        let broker = Broker::new();
+        let executor = ShardExecutor::new(store.clone(), broker);
+        let now = Instant::now();
+        let shard_idx = store.shard_for_key(b"k");
+        let commands = vec![
+            vec![b"SET".as_slice(), b"k".as_slice(), b"v1".as_slice()],
+            vec![b"SET".as_slice(), b"k".as_slice(), b"v2".as_slice()],
+        ];
+        let access = vec![PipelineAccess::Write, PipelineAccess::Write];
+        let mut out = BytesMut::new();
+
+        executor
+            .execute_argv_pipeline_batch(shard_idx, &commands, &access, &mut out, now)
+            .unwrap();
+
+        assert_eq!(&out[..], b"+OK\r\n+OK\r\n");
+        assert_eq!(store.dbsize(now), 1);
+        assert_eq!(store.get(b"k", now).unwrap().as_ref(), b"v2");
     }
 
     #[test]
