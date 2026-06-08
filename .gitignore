@@ -1,5 +1,7 @@
 /target
 /cli/target
+.cache/
+config.toml
 *.dat
 *.dat.tmp
 sdk/node_modules/

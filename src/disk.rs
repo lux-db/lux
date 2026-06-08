@@ -145,11 +145,7 @@ impl Wal {
         })
     }
 
-    /// Append a command to the WAL. Builds the entire frame in memory and
-    /// writes it in a single call to minimize partial-write risk. If the
-    /// write fails (e.g. ENOSPC), truncates back to the pre-write position
-    /// so the WAL stays clean for the next attempt.
-    pub fn append_command(&mut self, args: &[&[u8]]) -> io::Result<()> {
+    fn encode_command_frame(args: &[&[u8]], out: &mut Vec<u8>) {
         let mut payload = Vec::new();
         let argc = args.len() as u32;
         payload.extend_from_slice(&argc.to_le_bytes());
@@ -162,14 +158,42 @@ impl Wal {
         let checksum = crc32(&payload);
         let frame_len = (4 + payload.len()) as u32;
 
-        // Build complete frame in one buffer to minimize partial-write window.
-        let mut frame = Vec::with_capacity(4 + 4 + payload.len());
-        frame.extend_from_slice(&frame_len.to_le_bytes());
-        frame.extend_from_slice(&checksum.to_le_bytes());
-        frame.extend_from_slice(&payload);
+        out.extend_from_slice(&frame_len.to_le_bytes());
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out.extend_from_slice(&payload);
+    }
 
+    /// Append a command to the WAL. Builds the entire frame in memory and
+    /// writes it in a single call to minimize partial-write risk. If the
+    /// write fails (e.g. ENOSPC), truncates back to the pre-write position
+    /// so the WAL stays clean for the next attempt.
+    pub fn append_command(&mut self, args: &[&[u8]]) -> io::Result<()> {
+        let mut frame = Vec::new();
+        Self::encode_command_frame(args, &mut frame);
+
+        self.append_encoded_frames(&frame)
+    }
+
+    /// Append multiple command frames in one write/flush. Used by pipelined
+    /// single-shard writes so durability preserves the same batching advantage
+    /// as the in-memory executor.
+    pub fn append_commands<'a, I>(&mut self, commands: I) -> io::Result<()>
+    where
+        I: IntoIterator<Item = &'a [&'a [u8]]>,
+    {
+        let mut frames = Vec::new();
+        for args in commands {
+            Self::encode_command_frame(args, &mut frames);
+        }
+        if frames.is_empty() {
+            return Ok(());
+        }
+        self.append_encoded_frames(&frames)
+    }
+
+    fn append_encoded_frames(&mut self, frames: &[u8]) -> io::Result<()> {
         let pos_before = self.file.stream_position()?;
-        if let Err(e) = self.file.write_all(&frame).and_then(|_| self.file.flush()) {
+        if let Err(e) = self.file.write_all(frames).and_then(|_| self.file.flush()) {
             // Truncate back to clean position so partial bytes don't
             // corrupt future appends or waste space.
             let _ = self.file.set_len(pos_before);
@@ -1173,6 +1197,29 @@ mod tests {
             assert_eq!(commands[0][1], b"key1");
             assert_eq!(commands[1][1], b"key2");
         }
+    }
+
+    #[test]
+    fn wal_batch_append_roundtrips_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut wal = Wal::open(dir.path(), 0).unwrap();
+            let first: &[&[u8]] = &[b"SET", b"k1", b"v1"];
+            let second: &[&[u8]] = &[b"SET", b"k2", b"v2"];
+            wal.append_commands([first, second]).unwrap();
+            wal.fsync().unwrap();
+        }
+
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        let replay = wal.replay().unwrap();
+        assert_eq!(
+            replay.commands,
+            vec![
+                vec![b"SET".to_vec(), b"k1".to_vec(), b"v1".to_vec()],
+                vec![b"SET".to_vec(), b"k2".to_vec(), b"v2".to_vec()],
+            ]
+        );
+        assert!(replay.corrupted_frames.is_empty());
     }
 
     #[test]

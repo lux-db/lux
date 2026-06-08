@@ -113,16 +113,48 @@ fn extract_two_bulk_integers(data: &[u8]) -> Option<(i64, i64)> {
     }
 }
 
+fn extract_bulk_strings(data: &[u8]) -> Vec<String> {
+    let mut vals = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let Some(nl) = memchr(b'\n', &data[i..]) else {
+            break;
+        };
+        let Ok(len_str) = std::str::from_utf8(&data[i + 1..i + nl - 1]) else {
+            break;
+        };
+        let Ok(len) = len_str.parse::<i64>() else {
+            break;
+        };
+        i += nl + 1;
+        if len < 0 {
+            vals.push(String::new());
+            continue;
+        }
+        let end = i + len as usize;
+        if end > data.len() {
+            break;
+        }
+        vals.push(String::from_utf8_lossy(&data[i..end]).into_owned());
+        i = end + 2;
+    }
+    vals
+}
+
 fn find_lux_binary() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let target_dir = exe.parent()?.parent()?.parent()?;
-    let release = target_dir.join("release").join("lux");
-    if release.exists() {
-        return Some(release);
-    }
     let debug = target_dir.join("debug").join("lux");
     if debug.exists() {
         return Some(debug);
+    }
+    let release = target_dir.join("release").join("lux");
+    if release.exists() {
+        return Some(release);
     }
     None
 }
@@ -454,4 +486,37 @@ fn pipeline_high_contention_ordering() {
     eprintln!(
         "pipeline_high_contention_ordering: {s} samples across {num_writers} pairs, 0 violations"
     );
+}
+
+#[test]
+fn large_memory_pipeline_preserves_response_order() {
+    let port: u16 = 16382;
+    let commands = 160usize;
+
+    let _server = start_lux(port, 16);
+    let addr = format!("127.0.0.1:{port}");
+    let mut conn = TcpStream::connect(&addr).unwrap();
+    conn.set_nodelay(true).unwrap();
+
+    let mut writes = Vec::new();
+    for i in 0..commands {
+        let key = format!("scatter:{i}");
+        let value = format!("value:{i}");
+        writes.extend_from_slice(&resp_cmd(&["SET", &key, &value]));
+    }
+    conn.write_all(&writes).unwrap();
+    let write_response = read_n_responses(&mut conn, commands);
+    assert_eq!(count_complete_responses(&write_response), commands);
+
+    let mut reads = Vec::new();
+    let expected: Vec<String> = (0..commands).rev().map(|i| format!("value:{i}")).collect();
+    for i in (0..commands).rev() {
+        let key = format!("scatter:{i}");
+        reads.extend_from_slice(&resp_cmd(&["GET", &key]));
+    }
+    conn.write_all(&reads).unwrap();
+    let read_response = read_n_responses(&mut conn, commands);
+    let values = extract_bulk_strings(&read_response);
+
+    assert_eq!(values, expected);
 }

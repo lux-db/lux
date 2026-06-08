@@ -143,11 +143,7 @@ impl Broker {
     pub(crate) fn drain_list_waiters(
         &self,
         key: &str,
-        shard_data: &mut hashbrown::HashMap<
-            String,
-            crate::store::Entry,
-            crate::store::FxBuildHasher,
-        >,
+        shard_data: &mut crate::store::ShardData,
         now: std::time::Instant,
     ) {
         let mut waiters = self.list_waiters.lock();
@@ -157,7 +153,7 @@ impl Broker {
         };
 
         while !queue.is_empty() {
-            let entry = match shard_data.get_mut(key) {
+            let entry = match shard_data.get_mut(key.as_bytes()) {
                 Some(e) if !e.is_expired_at(now) => e,
                 _ => return,
             };

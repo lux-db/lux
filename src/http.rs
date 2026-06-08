@@ -215,13 +215,25 @@ async fn handle_request(
     } else {
         ""
     };
+    let query_access_token = if path == "/live" {
+        get_param(&params, "access_token")
+            .or_else(|| get_param(&params, "jwt"))
+            .unwrap_or("")
+    } else {
+        ""
+    };
     let password_ok = !password.is_empty()
         && (constant_time_eq(bearer.as_bytes(), password.as_bytes())
             || constant_time_eq(query_token.as_bytes(), password.as_bytes()));
+    let user_token = if !bearer.is_empty() {
+        bearer
+    } else {
+        query_access_token
+    };
     let auth_context = if password_ok {
         HttpAuthContext::Operator
-    } else if store.config().auth.enabled && !bearer.is_empty() {
-        match crate::auth::authenticate_access_token(bearer, store, cache) {
+    } else if store.config().auth.enabled && !user_token.is_empty() {
+        match crate::auth::authenticate_access_token(user_token, store, cache) {
             Ok(principal) => HttpAuthContext::User(principal),
             Err(e) => {
                 let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
@@ -2149,7 +2161,7 @@ fn route_table_insert(
     table: &str,
     body: &str,
     store: &Arc<Store>,
-    _broker: &Broker,
+    broker: &Broker,
     cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
@@ -2196,7 +2208,10 @@ fn route_table_insert(
 
     let now = Instant::now();
     match crate::tables::table_insert(store, cache, table, &field_values, now) {
-        Ok(id) => ok(format!(r#"{{"result":{}}}"#, id)),
+        Ok(id) => {
+            broker.enqueue_key_event(table.as_bytes(), b"TINSERT");
+            ok(format!(r#"{{"result":{}}}"#, id))
+        }
         Err(e) => (
             400,
             "Bad Request",

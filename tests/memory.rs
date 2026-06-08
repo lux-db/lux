@@ -3,7 +3,28 @@ use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::time::Duration;
 
-fn start_server(port: u16) -> Child {
+struct TestServer {
+    child: Child,
+}
+
+impl TestServer {
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_server(port: u16) -> TestServer {
     let child = Command::new(env!("CARGO_BIN_EXE_lux"))
         .env("LUX_PORT", port.to_string())
         .env("LUX_SAVE_INTERVAL", "0")
@@ -11,8 +32,16 @@ fn start_server(port: u16) -> Child {
         .env("LUX_DATA_DIR", format!("/tmp/lux-test-mem-{}", port))
         .spawn()
         .expect("failed to start lux");
-    std::thread::sleep(Duration::from_millis(500));
-    child
+    let mut server = TestServer { child };
+    let addr = format!("127.0.0.1:{port}");
+    for _ in 0..100 {
+        if TcpStream::connect(&addr).is_ok() {
+            return server;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = server.kill();
+    panic!("lux did not start on port {port}");
 }
 
 fn send(stream: &mut TcpStream, args: &[&str]) -> String {

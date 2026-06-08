@@ -327,14 +327,39 @@ impl<'a> Parser<'a> {
             {
                 let line = &self.buf[start..self.pos];
                 self.pos += 2;
-                let s = std::str::from_utf8(line).ok()?;
-                return s.parse().ok();
+                return parse_i64_bytes(line);
             }
             self.pos += 1;
         }
         // Incomplete line: keep parser retry-safe by restoring cursor.
         self.pos = start;
         None
+    }
+}
+
+fn parse_i64_bytes(line: &[u8]) -> Option<i64> {
+    let (negative, digits) = match line.first().copied() {
+        Some(b'-') => (true, &line[1..]),
+        Some(b'+') => (false, &line[1..]),
+        Some(_) => (false, line),
+        None => return None,
+    };
+    if digits.is_empty() {
+        return None;
+    }
+
+    let mut value: i64 = 0;
+    for &byte in digits {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        let digit = i64::from(byte - b'0');
+        value = value.checked_mul(10)?.checked_add(digit)?;
+    }
+    if negative {
+        value.checked_neg()
+    } else {
+        Some(value)
     }
 }
 

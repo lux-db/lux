@@ -304,6 +304,20 @@ async fn live_websocket_requires_lux_auth_token_when_auth_is_enabled() {
     assert_eq!(subscribed["type"], "live.subscribed");
     assert_eq!(subscribed["id"], "auth-live");
 
+    let (mut query_ws, _) = connect_async(format!(
+        "ws://127.0.0.1:{http_port}/live?access_token={access_token}"
+    ))
+    .await
+    .expect("query access token websocket should connect");
+    send_json(
+        &mut query_ws,
+        json!({"type":"live.subscribe","id":"query-auth","spec":{"kind":"key","pattern":"authlive:*"}}),
+    )
+    .await;
+    let query_subscribed = recv_json(&mut query_ws).await;
+    assert_eq!(query_subscribed["type"], "live.subscribed");
+    assert_eq!(query_subscribed["id"], "query-auth");
+
     let (status, logout) = http_json_request(
         http_port,
         "POST",
@@ -359,6 +373,71 @@ async fn live_websocket_delivers_key_and_pubsub_events() {
     assert_eq!(pubsub_event["kind"], "pubsub.message");
     assert_eq!(pubsub_event["channel"], "room:1");
     assert_eq!(pubsub_event["message"], "hello");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_table_subscription_receives_http_insert() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, None);
+
+    let (status, created) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"live_messages","columns":[{"name":"id","type":"STR","primaryKey":true},{"name":"workspace_id","type":"STR","notNull":true},{"name":"body","type":"STR","notNull":true}]}"#,
+        None,
+    );
+    assert_eq!(status, 200, "create table: {created}");
+
+    let mut ws = connect_live(http_port, None).await;
+    send_json(
+        &mut ws,
+        json!({
+            "type":"live.subscribe",
+            "id":"messages",
+            "spec":{
+                "kind":"table",
+                "table":"live_messages",
+                "where":{"workspace_id":"workspace-a"}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws).await["type"], "live.subscribed");
+    let snapshot = recv_live_event(&mut ws, "messages").await;
+    assert_eq!(snapshot["kind"], "snapshot");
+    assert_eq!(snapshot["rows"].as_array().unwrap().len(), 0);
+
+    let (status, inserted_other) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/live_messages",
+        r#"{"id":"msg-other","workspace_id":"workspace-b","body":"wrong workspace"}"#,
+        None,
+    );
+    assert_eq!(status, 200, "insert other workspace: {inserted_other}");
+    let no_event = tokio::time::timeout(Duration::from_millis(250), ws.next()).await;
+    assert!(
+        no_event.is_err(),
+        "non-matching HTTP table insert should not produce a live event"
+    );
+
+    let (status, inserted) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/live_messages",
+        r#"{"id":"msg-1","workspace_id":"workspace-a","body":"hello live"}"#,
+        None,
+    );
+    assert_eq!(status, 200, "insert matching row: {inserted}");
+
+    let event = recv_live_event(&mut ws, "messages").await;
+    assert_eq!(event["kind"], "insert");
+    assert_eq!(event["pk"], "msg-1");
+    assert_eq!(event["row"]["body"], "hello live");
+    assert_eq!(event["cause"]["kind"], "table.insert");
+    assert_eq!(event["cause"]["table"], "live_messages");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -354,7 +354,7 @@ pub fn cmd_object(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         let key = args[2];
         let idx = store.shard_for_key(key);
         let shard = store.lock_read_shard(idx);
-        let ks = arg_str(key);
+        let ks = key;
         match shard.data.get(ks) {
             Some(entry) if !entry.is_expired_at(now) => {
                 let enc = match &entry.value {
@@ -436,7 +436,7 @@ pub fn cmd_memory(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         let key = args[2];
         let idx = store.shard_for_key(key);
         let shard = store.lock_read_shard(idx);
-        let ks = arg_str(key);
+        let ks = key;
         match shard.data.get(ks) {
             Some(entry) if !entry.is_expired_at(now) => {
                 let size = ks.len()

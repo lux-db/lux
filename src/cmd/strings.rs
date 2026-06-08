@@ -471,7 +471,7 @@ pub fn cmd_incrbyfloat(
     };
     let idx = store.shard_for_key(args[1]);
     let mut shard = store.lock_write_shard(idx);
-    let ks = arg_str(args[1]);
+    let ks = args[1];
     let current: f64 = match shard.data.get(ks) {
         Some(e) if !e.is_expired_at(now) => match &e.value {
             StoreValue::Str(s) => {
@@ -515,7 +515,7 @@ pub fn cmd_incrbyfloat(
     let expires_at = shard.data.get(ks).and_then(|e| e.expires_at);
     shard.version += 1;
     shard.data.insert(
-        ks.to_string(),
+        ks.to_vec(),
         Entry {
             value: StoreValue::Str(Bytes::from(new_str.clone())),
             expires_at,

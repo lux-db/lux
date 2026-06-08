@@ -18,6 +18,7 @@ mod http;
 mod lua;
 mod pubsub;
 mod resp;
+mod shard_exec;
 mod snapshot;
 mod store;
 mod tables;
@@ -27,6 +28,7 @@ use cmd::CmdResult;
 use command::{Command, CommandKind, CommandOutput, PubSubCommand, SetOption};
 use pubsub::Broker;
 use resp::Parser;
+use shard_exec::{ShardExecutionError, ShardExecutor, ShardPipelineCommand};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,7 +47,6 @@ pub use embedded::{
 pub use eviction::{parse_eviction_policy, parse_memory_size, EvictionConfig, EvictionPolicy};
 
 const SUB_MODE_BATCH_MAX: usize = 64;
-
 #[derive(Debug, Clone)]
 pub enum LuxError {
     Command(String),
@@ -451,6 +452,7 @@ enum EmbeddedSubscriptionKind {
 struct Runtime {
     store: Arc<Store>,
     broker: Broker,
+    shard_executor: ShardExecutor,
     schema_cache: SharedSchemaCache,
     script_engine: Arc<lua::ScriptEngine>,
     config: Arc<ServerConfig>,
@@ -778,16 +780,9 @@ impl EmbeddedClient {
             }
         }
 
-        for (shard_idx, pairs) in pairs_by_shard.into_iter().enumerate() {
-            if pairs.is_empty() {
-                continue;
-            }
-            let mut shard = store.lock_write_shard(shard_idx);
-            shard.version += 1;
-            for (key, value) in pairs {
-                store.set_on_shard(&mut shard.data, key, value, None, now);
-            }
-        }
+        self.runtime
+            .shard_executor
+            .apply_mset_batches(pairs_by_shard, now);
 
         if emit_key_events {
             for key in event_keys {
@@ -2003,7 +1998,7 @@ fn optional_score_output(value: Option<f64>) -> CommandOutput {
 }
 
 fn geopos_output_from_shard(
-    data: &hashbrown::HashMap<String, store::Entry, store::FxBuildHasher>,
+    data: &store::ShardData,
     key: &[u8],
     members: &[&[u8]],
     now: Instant,
@@ -2025,7 +2020,7 @@ fn geopos_output_from_shard(
 }
 
 fn geodist_output_from_shard(
-    data: &hashbrown::HashMap<String, store::Entry, store::FxBuildHasher>,
+    data: &store::ShardData,
     key: &[u8],
     member_a: &[u8],
     member_b: &[u8],
@@ -2893,11 +2888,13 @@ impl Runtime {
         let schema_cache: SharedSchemaCache =
             std::sync::Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
         let broker = Broker::new();
+        let shard_executor = ShardExecutor::new(store.clone(), broker.clone());
         let script_engine = Arc::new(lua::ScriptEngine::new());
 
         let runtime = Arc::new(Self {
             store,
             broker,
+            shard_executor,
             schema_cache,
             script_engine,
             config,
@@ -3365,6 +3362,7 @@ impl<'a> ArgvSlice for resp::CommandArgs<'a> {
 pub(crate) struct CommandExecutor {
     store: Arc<Store>,
     broker: Broker,
+    shard_executor: ShardExecutor,
     script_engine: Arc<lua::ScriptEngine>,
     schema_cache: SharedSchemaCache,
 }
@@ -3376,9 +3374,11 @@ impl CommandExecutor {
         script_engine: Arc<lua::ScriptEngine>,
         schema_cache: SharedSchemaCache,
     ) -> Self {
+        let shard_executor = ShardExecutor::new(store.clone(), broker.clone());
         Self {
             store,
             broker,
+            shard_executor,
             script_engine,
             schema_cache,
         }
@@ -3415,6 +3415,21 @@ impl CommandExecutor {
             now,
         ) {
             return None;
+        }
+
+        if !cmd::is_pipeline_special_command(args[0]) {
+            let access = cmd::pipeline_access_for_args(args);
+            if access == cmd::PipelineAccess::Read {
+                let command = [ShardPipelineCommand { args, access }];
+                let shard_idx = self.store.shard_for_key(args[1]);
+                if let Err(err) = self
+                    .shard_executor
+                    .execute_pipeline_batch(shard_idx, &command, write_buf, now)
+                {
+                    write_shard_execution_error(write_buf, err);
+                }
+                return None;
+            }
         }
 
         let cmd_result = {
@@ -3547,58 +3562,15 @@ impl CommandExecutor {
                 batch_end += 1;
             }
 
-            let batch_flags = &flags[i..batch_end];
-            if batch_flags.contains(&cmd::PipelineAccess::Write) {
-                let eviction_enabled = crate::eviction::eviction_enabled(&self.store);
-                for command in &commands[i..batch_end] {
-                    let args = command.argv();
-                    self.store.try_promote(args[1], now);
-                    if crate::eviction::is_write_command(args[0]) {
-                        if eviction_enabled {
-                            if let Err(e) = crate::eviction::evict_if_needed(&self.store) {
-                                resp::write_error(write_buf, e);
-                                return None;
-                            }
-                        }
-                        if let Err(e) = self.store.wal_log_command(args) {
-                            resp::write_error(write_buf, &format!("ERR WAL append failed: {e}"));
-                            return None;
-                        }
-                    } else {
-                        continue;
-                    }
-                }
-
-                {
-                    let mut shard = self.store.lock_write_shard(shard_idx);
-                    shard.version += 1;
-                    for command in &commands[i..batch_end] {
-                        let args = command.argv();
-                        cmd::execute_on_shard(
-                            &mut shard,
-                            &self.store,
-                            &self.broker,
-                            args,
-                            write_buf,
-                            now,
-                        );
-                    }
-                }
-
-                if self.broker.has_key_subs() {
-                    for (offset, command) in commands[i..batch_end].iter().enumerate() {
-                        if batch_flags[offset] == cmd::PipelineAccess::Write {
-                            let args = command.argv();
-                            self.broker.enqueue_key_event(args[1], args[0]);
-                        }
-                    }
-                }
-            } else {
-                let shard = self.store.lock_read_shard(shard_idx);
-                for command in &commands[i..batch_end] {
-                    let args = command.argv();
-                    cmd::execute_on_shard_read(&shard.data, args, write_buf, now);
-                }
+            if let Err(err) = self.shard_executor.execute_argv_pipeline_batch(
+                shard_idx,
+                &commands[i..batch_end],
+                &flags[i..batch_end],
+                write_buf,
+                now,
+            ) {
+                write_shard_execution_error(write_buf, err);
+                return None;
             }
 
             i = batch_end;
@@ -3706,6 +3678,16 @@ impl CommandExecutor {
                 handle_script_op(write_buf, &self.script_engine, &refs);
                 None
             }
+        }
+    }
+}
+
+fn write_shard_execution_error(write_buf: &mut BytesMut, err: ShardExecutionError) {
+    match err {
+        ShardExecutionError::Command(message) => resp::write_error(write_buf, &message),
+        ShardExecutionError::Eviction(message) => resp::write_error(write_buf, message),
+        ShardExecutionError::Wal(message) => {
+            resp::write_error(write_buf, &format!("ERR WAL append failed: {message}"))
         }
     }
 }
@@ -3956,56 +3938,45 @@ async fn handle_connection(
                 socket.write_all(&write_buf).await?;
                 return Ok(());
             }
-            let execution_result = (|| {
-                let now = Instant::now();
-                let mut parser = Parser::with_max_bulk_len(&pending, max_resp_request);
-
-                let mut commands: Vec<resp::CommandArgs<'_>> = Vec::new();
-                loop {
-                    match parser.parse_command_args() {
-                        Ok(Some(args)) => {
-                            if !args.is_empty() {
-                                commands.push(args);
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            resp::write_error(&mut write_buf, e);
-                            return Err(());
+            let now = Instant::now();
+            let mut parser = Parser::with_max_bulk_len(&pending, max_resp_request);
+            let mut commands: Vec<resp::CommandArgs<'_>> = Vec::new();
+            loop {
+                match parser.parse_command_args() {
+                    Ok(Some(args)) => {
+                        if !args.is_empty() {
+                            commands.push(args);
                         }
                     }
-                }
-                let consumed = parser.pos();
-
-                let mut deferred_action: Option<CmdResult> = None;
-
-                if commands.len() <= 1 {
-                    for command in &commands {
-                        let args = command.argv();
-                        store.add_total_commands(1);
-                        if let Some(action) =
-                            executor.execute_command(args, &mut session, &mut write_buf, now)
-                        {
-                            deferred_action = Some(action);
-                            break;
-                        }
+                    Ok(None) => break,
+                    Err(e) => {
+                        resp::write_error(&mut write_buf, e);
+                        socket.write_all(&write_buf).await?;
+                        return Ok(());
                     }
-                } else {
-                    deferred_action =
-                        executor.execute_pipeline(&commands, &mut session, &mut write_buf, now);
                 }
+            }
+            let consumed = parser.pos();
 
-                drop(commands);
-                Ok((consumed, deferred_action))
-            })();
+            let mut deferred_action: Option<CmdResult> = None;
 
-            let (consumed, deferred_action) = match execution_result {
-                Ok(result) => result,
-                Err(()) => {
-                    socket.write_all(&write_buf).await?;
-                    return Ok(());
+            if commands.len() <= 1 {
+                for command in &commands {
+                    let args = command.argv();
+                    store.add_total_commands(1);
+                    if let Some(action) =
+                        executor.execute_command(args, &mut session, &mut write_buf, now)
+                    {
+                        deferred_action = Some(action);
+                        break;
+                    }
                 }
-            };
+            } else {
+                deferred_action =
+                    executor.execute_pipeline(&commands, &mut session, &mut write_buf, now);
+            }
+
+            drop(commands);
             let _ = pending.split_to(consumed);
 
             if !write_buf.is_empty() {
@@ -4381,6 +4352,31 @@ fn handle_script_op(out: &mut BytesMut, script_engine: &lua::ScriptEngine, args:
 #[cfg(test)]
 mod tx_tests {
     use super::*;
+
+    fn test_executor() -> (CommandExecutor, CommandSession) {
+        let store = Arc::new(Store::new());
+        let broker = Broker::new();
+        let schema_cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
+        let executor = CommandExecutor::new(
+            store,
+            broker,
+            Arc::new(lua::ScriptEngine::new()),
+            schema_cache,
+        );
+        (executor, CommandSession::new(false))
+    }
+
+    #[test]
+    fn single_key_reads_route_through_shard_executor() {
+        let (executor, mut session) = test_executor();
+        let mut out = BytesMut::new();
+
+        executor.store.set(b"k", b"v", None, Instant::now());
+        executor.execute_command(&[b"GET", b"k"], &mut session, &mut out, Instant::now());
+
+        assert_eq!(&out[..], b"$1\r\nv\r\n");
+    }
 
     #[test]
     fn pubsub_commands_are_rejected_inside_multi() {

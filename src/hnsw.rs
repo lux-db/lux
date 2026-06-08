@@ -1,10 +1,10 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::store::cosine_similarity;
-
 #[derive(Clone)]
 struct HnswNode {
+    // Unit-normalized vector used by HNSW. The store keeps the original vector
+    // for VGET; the index only needs cosine ordering.
     vector: Vec<f32>,
     connections: Vec<Vec<String>>,
 }
@@ -22,20 +22,20 @@ pub struct HnswIndex {
 }
 
 #[derive(PartialEq)]
-struct Candidate {
+struct Candidate<'a> {
     similarity: ordered_float::OrderedFloat<f32>,
-    key: String,
+    key: &'a str,
 }
 
-impl Eq for Candidate {}
+impl Eq for Candidate<'_> {}
 
-impl PartialOrd for Candidate {
+impl PartialOrd for Candidate<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for Candidate {
+impl Ord for Candidate<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.similarity.cmp(&other.similarity)
     }
@@ -88,32 +88,32 @@ impl HnswIndex {
         }
     }
 
-    fn search_layer(
-        &self,
+    fn search_layer<'a>(
+        &'a self,
         query: &[f32],
-        entry_key: &str,
+        entry_key: &'a str,
         ef: usize,
         layer: usize,
-    ) -> Vec<(String, f32)> {
+    ) -> Vec<(&'a str, f32)> {
         let entry_node = match self.nodes.get(entry_key) {
             Some(n) => n,
             None => return Vec::new(),
         };
-        let entry_sim = cosine_similarity(query, &entry_node.vector);
+        let entry_sim = cosine_unit_similarity(query, &entry_node.vector);
 
         let mut visited = HashSet::new();
-        visited.insert(entry_key.to_string());
+        visited.insert(entry_key);
 
         let mut candidates: BinaryHeap<Candidate> = BinaryHeap::new();
         let mut results: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
 
         candidates.push(Candidate {
             similarity: ordered_float::OrderedFloat(entry_sim),
-            key: entry_key.to_string(),
+            key: entry_key,
         });
         results.push(Reverse(Candidate {
             similarity: ordered_float::OrderedFloat(entry_sim),
-            key: entry_key.to_string(),
+            key: entry_key,
         }));
 
         while let Some(current) = candidates.pop() {
@@ -125,20 +125,21 @@ impl HnswIndex {
                 break;
             }
 
-            if let Some(node) = self.nodes.get(&current.key) {
+            if let Some(node) = self.nodes.get(current.key) {
                 let neighbors = if layer < node.connections.len() {
                     &node.connections[layer]
                 } else {
                     continue;
                 };
                 for neighbor_key in neighbors {
+                    let neighbor_key = neighbor_key.as_str();
                     if visited.contains(neighbor_key) {
                         continue;
                     }
-                    visited.insert(neighbor_key.clone());
+                    visited.insert(neighbor_key);
 
                     if let Some(neighbor_node) = self.nodes.get(neighbor_key) {
-                        let sim = cosine_similarity(query, &neighbor_node.vector);
+                        let sim = cosine_unit_similarity(query, &neighbor_node.vector);
 
                         let worst_result = results
                             .peek()
@@ -147,11 +148,11 @@ impl HnswIndex {
                         if results.len() < ef || ordered_float::OrderedFloat(sim) > worst_result {
                             candidates.push(Candidate {
                                 similarity: ordered_float::OrderedFloat(sim),
-                                key: neighbor_key.clone(),
+                                key: neighbor_key,
                             });
                             results.push(Reverse(Candidate {
                                 similarity: ordered_float::OrderedFloat(sim),
-                                key: neighbor_key.clone(),
+                                key: neighbor_key,
                             }));
                             if results.len() > ef {
                                 results.pop();
@@ -196,6 +197,7 @@ impl HnswIndex {
             self.remove(&key);
         }
 
+        let vector = normalize_vector(vector);
         let level = self.random_level();
         let mut connections = Vec::with_capacity(level + 1);
         for _ in 0..=level {
@@ -220,7 +222,7 @@ impl HnswIndex {
         for l in (level + 1..=self.max_layer).rev() {
             let results = self.search_layer(&vector, &current_entry, 1, l);
             if let Some((best, _)) = results.first() {
-                current_entry = best.clone();
+                current_entry = (*best).to_string();
             }
         }
 
@@ -228,13 +230,17 @@ impl HnswIndex {
         for l in (0..=insert_from).rev() {
             let ef = self.ef_construction;
             let candidates = self.search_layer(&vector, &current_entry, ef, l);
-
-            if let Some((best, _)) = candidates.first() {
-                current_entry = best.clone();
+            let next_entry = candidates.first().map(|(best, _)| (*best).to_string());
+            let owned_candidates: Vec<(String, f32)> = candidates
+                .iter()
+                .map(|(key, sim)| ((*key).to_string(), *sim))
+                .collect();
+            if let Some(best) = next_entry {
+                current_entry = best;
             }
 
             let m = self.max_connections(l);
-            let neighbors = self.select_neighbors(&vector, &candidates, m);
+            let neighbors = self.select_neighbors(&vector, &owned_candidates, m);
 
             if let Some(node) = self.nodes.get_mut(&key) {
                 if l < node.connections.len() {
@@ -270,7 +276,7 @@ impl HnswIndex {
                     .filter_map(|k| {
                         self.nodes
                             .get(k)
-                            .map(|n| (k.clone(), cosine_similarity(&nv, &n.vector)))
+                            .map(|n| (k.clone(), cosine_unit_similarity(&nv, &n.vector)))
                     })
                     .collect();
                 let pruned = self.select_neighbors(&nv, &conn_with_sim, max_conn);
@@ -364,21 +370,28 @@ impl HnswIndex {
             Some(ep) => ep.clone(),
             None => return Vec::new(),
         };
+        if self.dims != 0 && self.dims != query.len() as u32 {
+            return Vec::new();
+        }
+        let query = normalize_vector(query.to_vec());
 
         let mut current_entry = entry_point;
 
         for l in (1..=self.max_layer).rev() {
-            let results = self.search_layer(query, &current_entry, 1, l);
+            let results = self.search_layer(&query, &current_entry, 1, l);
             if let Some((best, _)) = results.first() {
-                current_entry = best.clone();
+                current_entry = (*best).to_string();
             }
         }
 
         let ef = std::cmp::max(k, 10);
-        let mut results = self.search_layer(query, &current_entry, ef, 0);
+        let mut results = self.search_layer(&query, &current_entry, ef, 0);
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(k);
         results
+            .into_iter()
+            .map(|(key, sim)| (key.to_string(), sim))
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -389,6 +402,25 @@ impl HnswIndex {
     pub fn contains(&self, key: &str) -> bool {
         self.nodes.contains_key(key)
     }
+}
+
+fn normalize_vector(mut vector: Vec<f32>) -> Vec<f32> {
+    let norm_sq = vector.iter().map(|v| v * v).sum::<f32>();
+    if norm_sq == 0.0 {
+        return vector;
+    }
+    let inv_norm = norm_sq.sqrt().recip();
+    for value in &mut vector {
+        *value *= inv_norm;
+    }
+    vector
+}
+
+fn cosine_unit_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
 #[cfg(test)]

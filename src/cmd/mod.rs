@@ -1091,7 +1091,7 @@ pub(crate) fn pipeline_access(cmd: &[u8]) -> PipelineAccess {
             if cmd_eq(cmd, b"PTTL") {
                 return PipelineAccess::Read;
             }
-            if cmd_eq(cmd, b"PERSIST") || cmd_eq(cmd, b"PSETEX") {
+            if cmd_eq(cmd, b"PERSIST") {
                 return PipelineAccess::Write;
             }
         }
@@ -1156,6 +1156,13 @@ pub(crate) fn pipeline_access_for_args(args: &[&[u8]]) -> PipelineAccess {
     }
 
     let cmd = args[0];
+    if args.len() == 2 && cmd_eq(cmd, b"GET") {
+        return PipelineAccess::Read;
+    }
+    if args.len() == 3 && cmd_eq(cmd, b"SET") {
+        return PipelineAccess::Write;
+    }
+
     if cmd[0].eq_ignore_ascii_case(&b'Z') {
         if cmd_eq(cmd, b"ZCARD") {
             return if args.len() == 2 {
@@ -1239,7 +1246,6 @@ fn pipeline_fast_path_arity(args: &[&[u8]]) -> bool {
         b'P' => {
             (cmd_eq(cmd, b"PTTL") && args.len() == 2)
                 || (cmd_eq(cmd, b"PERSIST") && args.len() == 2)
-                || (cmd_eq(cmd, b"PSETEX") && args.len() == 4)
         }
         b'R' => {
             (cmd_eq(cmd, b"RPOP") && args.len() == 2) || (cmd_eq(cmd, b"RPUSH") && args.len() >= 3)
@@ -1250,12 +1256,11 @@ fn pipeline_fast_path_arity(args: &[&[u8]]) -> bool {
                 || (cmd_eq(cmd, b"SMEMBERS") && args.len() == 2)
                 || (cmd_eq(cmd, b"SISMEMBER") && args.len() == 3)
                 || (cmd_eq(cmd, b"SRANDMEMBER") && args.len() == 2)
-                || (cmd_eq(cmd, b"SET") && args.len() >= 3)
+                || (cmd_eq(cmd, b"SET") && set_pipeline_fast_path_arity(args))
                 || (cmd_eq(cmd, b"SETNX") && args.len() == 3)
-                || (cmd_eq(cmd, b"SETEX") && args.len() == 4)
                 || (cmd_eq(cmd, b"SADD") && args.len() >= 3)
                 || (cmd_eq(cmd, b"SREM") && args.len() >= 3)
-                || (cmd_eq(cmd, b"SPOP") && args.len() >= 2)
+                || (cmd_eq(cmd, b"SPOP") && args.len() == 2)
         }
         b'T' => (cmd_eq(cmd, b"TTL") || cmd_eq(cmd, b"TYPE")) && args.len() == 2,
         b'X' => {
@@ -1271,11 +1276,23 @@ fn pipeline_fast_path_arity(args: &[&[u8]]) -> bool {
                 || (cmd_eq(cmd, b"ZADD") && args.len() >= 4)
                 || (cmd_eq(cmd, b"ZINCRBY") && args.len() == 4)
                 || (cmd_eq(cmd, b"ZREM") && args.len() >= 3)
-                || (cmd_eq(cmd, b"ZPOPMIN") && args.len() >= 2)
-                || (cmd_eq(cmd, b"ZPOPMAX") && args.len() >= 2)
+                || (cmd_eq(cmd, b"ZPOPMIN") && args.len() == 2)
+                || (cmd_eq(cmd, b"ZPOPMAX") && args.len() == 2)
         }
         _ => false,
     }
+}
+
+fn set_pipeline_fast_path_arity(args: &[&[u8]]) -> bool {
+    if args.len() == 3 {
+        return true;
+    }
+    if args.len() < 4 {
+        return false;
+    }
+    args[3..]
+        .iter()
+        .all(|arg| cmd_eq(arg, b"NX") || cmd_eq(arg, b"XX"))
 }
 
 #[inline(always)]
@@ -2106,7 +2123,7 @@ pub fn execute_with_wal(
 }
 
 #[allow(dead_code)]
-pub(crate) type ShardData = hashbrown::HashMap<String, Entry, crate::store::FxBuildHasher>;
+pub(crate) type ShardData = crate::store::ShardData;
 
 #[allow(dead_code)]
 pub(crate) fn execute_on_shard(
@@ -2123,7 +2140,7 @@ pub(crate) fn execute_on_shard(
     }
     let cmd = args[0];
     let key = args[1];
-    let ks = arg_str(key);
+    let ks = key;
 
     if cmd_eq(cmd, b"SET") && args.len() >= 3 {
         let mut ttl = None;
@@ -2483,7 +2500,7 @@ pub(crate) fn execute_on_shard_read(
     }
     let cmd = args[0];
     let key = args[1];
-    let ks = arg_str(key);
+    let ks = key;
 
     if cmd[0].eq_ignore_ascii_case(&b'Z') {
         if cmd_eq(cmd, b"ZCARD") {
@@ -2934,7 +2951,7 @@ fn shard_incr_fast(
     now: Instant,
     out: &mut BytesMut,
 ) {
-    let ks = arg_str(key);
+    let ks = key;
     if let Some(entry) = data.get_mut(ks) {
         if entry.is_expired_at(now) {
             match 0i64.checked_add(delta) {
@@ -2983,7 +3000,7 @@ fn shard_incr_fast(
     match 0i64.checked_add(delta) {
         Some(new_val) => {
             data.insert(
-                ks.to_string(),
+                ks.to_vec(),
                 Entry {
                     value: StoreValue::Str(Bytes::from(new_val.to_string())),
                     expires_at: None,
@@ -3005,7 +3022,7 @@ fn shard_list_push_fast(
     now: Instant,
     out: &mut BytesMut,
 ) {
-    let ks = arg_str(key).to_string();
+    let ks = crate::store::key_bytes(key);
     let entry = data.entry(ks).or_insert_with(|| Entry {
         value: StoreValue::List(std::collections::VecDeque::new()),
         expires_at: None,
@@ -3041,7 +3058,7 @@ fn shard_sadd_fast(
     now: Instant,
     out: &mut BytesMut,
 ) {
-    let ks = arg_str(key).to_string();
+    let ks = crate::store::key_bytes(key);
     let entry = data.entry(ks).or_insert_with(|| Entry {
         value: StoreValue::Set(crate::store::SetData::new()),
         expires_at: None,
@@ -3089,7 +3106,7 @@ fn shard_srem(
     now: Instant,
     out: &mut BytesMut,
 ) {
-    let ks = arg_str(key);
+    let ks = key;
     match data.get_mut(ks) {
         Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
             StoreValue::Set(set) => {
@@ -3118,7 +3135,7 @@ fn shard_hdel(
     now: Instant,
     out: &mut BytesMut,
 ) {
-    let ks = arg_str(key);
+    let ks = key;
     match data.get_mut(ks) {
         Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
             StoreValue::Hash(map) => {
@@ -3231,7 +3248,7 @@ fn shard_zrem(
     now: Instant,
     out: &mut BytesMut,
 ) {
-    let ks = arg_str(key);
+    let ks = key;
     match data.get_mut(ks) {
         Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
             StoreValue::SortedSet(tree, scores) => {
@@ -3320,7 +3337,7 @@ fn shard_zpop(
     now: Instant,
     out: &mut BytesMut,
 ) {
-    let ks = arg_str(key);
+    let ks = key;
     match data.get_mut(ks) {
         Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
             StoreValue::SortedSet(tree, scores) => {
@@ -3519,6 +3536,46 @@ mod tests {
         assert_eq!(
             pipeline_access_for_args(&[b"EXISTS" as &[u8], b"a"]),
             PipelineAccess::Read
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"SET" as &[u8], b"k", b"v"]),
+            PipelineAccess::Write
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"SET" as &[u8], b"k", b"v", b"NX"]),
+            PipelineAccess::Write
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"SET" as &[u8], b"k", b"v", b"BAD"]),
+            PipelineAccess::General
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"SET" as &[u8], b"k", b"v", b"EX", b"10"]),
+            PipelineAccess::General
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"SETEX" as &[u8], b"k", b"10", b"v"]),
+            PipelineAccess::General
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"PSETEX" as &[u8], b"k", b"10", b"v"]),
+            PipelineAccess::General
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"SPOP" as &[u8], b"k"]),
+            PipelineAccess::Write
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"SPOP" as &[u8], b"k", b"2"]),
+            PipelineAccess::General
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"ZPOPMIN" as &[u8], b"k"]),
+            PipelineAccess::Write
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"ZPOPMIN" as &[u8], b"k", b"2"]),
+            PipelineAccess::General
         );
     }
 

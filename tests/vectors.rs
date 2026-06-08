@@ -4,14 +4,21 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 fn start_server(port: u16) -> Child {
-    let child = Command::new(env!("CARGO_BIN_EXE_lux"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lux"))
         .env("LUX_PORT", port.to_string())
         .env("LUX_SAVE_INTERVAL", "0")
         .env("LUX_DATA_DIR", format!("/tmp/lux-test-{}", port))
         .spawn()
         .expect("failed to start lux");
-    std::thread::sleep(Duration::from_millis(500));
-    child
+    for _ in 0..100 {
+        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            return child;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("lux did not start within 5 seconds on port {port}");
 }
 
 fn send(stream: &mut TcpStream, args: &[&str]) -> String {
@@ -233,6 +240,54 @@ fn vsearch_with_metadata_filter() {
     assert!(r.contains("cat1"), "should find cat1: {}", r);
     assert!(r.contains("cat2"), "should find cat2: {}", r);
     assert!(!r.contains("dog1"), "should not find dog1: {}", r);
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn vsearch_filter_finds_match_beyond_unfiltered_top_k_window() {
+    let port = 16410;
+    let mut child = start_server(port);
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    for i in 0..25 {
+        let x = format!("1.{}", i);
+        let y = format!("0.{}", i);
+        send(
+            &mut s,
+            &[
+                "VSET",
+                &format!("dog:{i}"),
+                "2",
+                &x,
+                &y,
+                "META",
+                r#"{"animal":"dog"}"#,
+            ],
+        );
+    }
+    send(
+        &mut s,
+        &[
+            "VSET",
+            "cat:far",
+            "2",
+            "0.0",
+            "1.0",
+            "META",
+            r#"{"animal":"cat"}"#,
+        ],
+    );
+
+    let r = send(
+        &mut s,
+        &[
+            "VSEARCH", "2", "1.0", "0.0", "K", "1", "FILTER", "animal", "cat",
+        ],
+    );
+    assert!(r.contains("cat:far"), "filtered result was missed: {r}");
 
     child.kill().ok();
     child.wait().ok();

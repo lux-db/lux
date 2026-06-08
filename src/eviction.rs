@@ -117,7 +117,7 @@ fn evict_lru(store: &Store, sample_size: usize, volatile_only: bool) -> bool {
     let seed = store.approximate_memory();
     let start_shard = seed % n;
 
-    let mut best_key: Option<String> = None;
+    let mut best_key: Option<Vec<u8>> = None;
     let mut best_clock: u32 = u32::MAX;
     let mut best_shard: usize = 0;
 

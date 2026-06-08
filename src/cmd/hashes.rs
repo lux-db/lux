@@ -250,7 +250,7 @@ pub fn cmd_hrandfield(
     };
     let idx = store.shard_for_key(args[1]);
     let shard = store.lock_read_shard(idx);
-    let ks = arg_str(args[1]);
+    let ks = args[1];
     match shard.data.get(ks) {
         Some(entry) if !entry.is_expired_at(now) => {
             if let StoreValue::Hash(map) = &entry.value {
@@ -355,7 +355,7 @@ pub fn cmd_hscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
     let pat_str = pattern.map(|p| arg_str(p).to_string());
     let idx = store.shard_for_key(args[1]);
     let shard = store.lock_read_shard(idx);
-    let ks = arg_str(args[1]);
+    let ks = args[1];
     match shard.data.get(ks) {
         Some(entry) if !entry.is_expired_at(now) => {
             if cmd_eq(args[0], b"HSCAN") {

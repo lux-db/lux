@@ -1099,7 +1099,7 @@ pub fn cmd_zscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
     }
     let idx = store.shard_for_key(args[1]);
     let shard = store.lock_read_shard(idx);
-    let ks = arg_str(args[1]);
+    let ks = args[1];
     match shard.data.get(ks) {
         Some(entry) if !entry.is_expired_at(now) => {
             if let StoreValue::SortedSet(tree, _) = &entry.value {

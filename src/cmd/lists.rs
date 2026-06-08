@@ -146,7 +146,7 @@ pub fn cmd_lpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         let idx = store.shard_for_key(args[1]);
         let mut shard = store.lock_write_shard(idx);
         shard.version += 1;
-        let ks = arg_str(args[1]);
+        let ks = args[1];
         match shard.data.get_mut(ks) {
             Some(entry) if !entry.is_expired_at(now) => {
                 if let StoreValue::List(list) = &mut entry.value {
@@ -195,7 +195,7 @@ pub fn cmd_rpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         let idx = store.shard_for_key(args[1]);
         let mut shard = store.lock_write_shard(idx);
         shard.version += 1;
-        let ks = arg_str(args[1]);
+        let ks = args[1];
         match shard.data.get_mut(ks) {
             Some(entry) if !entry.is_expired_at(now) => {
                 if let StoreValue::List(list) = &mut entry.value {
@@ -390,7 +390,7 @@ pub fn cmd_lpos(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     }
     let idx = store.shard_for_key(key);
     let shard = store.lock_read_shard(idx);
-    let ks = arg_str(key);
+    let ks = key;
     match shard.data.get(ks) {
         Some(entry) if !entry.is_expired_at(now) => {
             if let StoreValue::List(list) = &entry.value {

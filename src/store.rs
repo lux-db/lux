@@ -245,7 +245,7 @@ impl Entry {
 
 #[repr(align(128))]
 pub(crate) struct Shard {
-    pub(crate) data: HashMap<String, Entry, FxBuildHasher>,
+    pub(crate) data: ShardData,
     pub(crate) version: u64,
     pub(crate) used_memory: usize,
 }
@@ -289,7 +289,7 @@ pub struct Store {
     /// Serializes Lua script execution for this runtime without blocking other
     /// embedded Lux instances in the same process.
     script_gate: RwLock<()>,
-    pub(crate) vector_index: RwLock<crate::hnsw::HnswIndex>,
+    pub(crate) vector_indexes: RwLock<HashMap<u32, crate::hnsw::HnswIndex, FxBuildHasher>>,
     disk_shards: Option<Box<[parking_lot::Mutex<crate::disk::DiskShard>]>>,
     wal_shards: Option<Box<[parking_lot::Mutex<crate::disk::Wal>]>>,
     pub(crate) wal_suppress: std::sync::atomic::AtomicBool,
@@ -305,14 +305,25 @@ pub(crate) fn fx_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
+pub(crate) type ShardKey = Vec<u8>;
+pub(crate) type ShardData = HashMap<ShardKey, Entry, FxBuildHasher>;
+
 #[inline(always)]
 fn key_str(key: &[u8]) -> &str {
     std::str::from_utf8(key).unwrap_or("")
 }
 
 #[inline(always)]
+pub(crate) fn key_bytes(key: &[u8]) -> ShardKey {
+    key.to_vec()
+}
+
+#[inline(always)]
 fn key_string(key: &[u8]) -> String {
-    String::from_utf8_lossy(key).into_owned()
+    match std::str::from_utf8(key) {
+        Ok(key) => key.to_owned(),
+        Err(_) => String::from_utf8_lossy(key).into_owned(),
+    }
 }
 
 fn stream_entry_memory(fields: &[(String, Bytes)]) -> usize {
@@ -322,8 +333,8 @@ fn stream_entry_memory(fields: &[(String, Bytes)]) -> usize {
         .sum::<usize>()
 }
 
-pub fn estimate_entry_memory(key: &str, value: &StoreValue) -> usize {
-    let key_overhead = key.len() + 64;
+pub fn estimate_entry_memory<K: AsRef<[u8]>>(key: K, value: &StoreValue) -> usize {
+    let key_overhead = key.as_ref().len() + 64;
     let val_size = match value {
         StoreValue::Str(s) => s.len(),
         StoreValue::StrBuf(s) => s.len(),
@@ -447,7 +458,7 @@ impl Store {
             shards: shards.into_boxed_slice(),
             metrics: StoreMetrics::new(),
             script_gate: RwLock::new(()),
-            vector_index: RwLock::new(crate::hnsw::HnswIndex::new(0)),
+            vector_indexes: RwLock::new(HashMap::with_hasher(FxBuildHasher)),
             disk_shards,
             wal_shards,
             wal_suppress: std::sync::atomic::AtomicBool::new(false),
@@ -619,7 +630,7 @@ impl Store {
     /// the disk shard BEFORE being removed from memory. If the disk write
     /// fails, the entry stays in memory (no silent data loss). The shard
     /// write lock is dropped before disk I/O to avoid blocking other operations.
-    pub fn evict_key(&self, shard_idx: usize, key: &str) -> bool {
+    pub fn evict_key(&self, shard_idx: usize, key: &[u8]) -> bool {
         if let Some(ref disk_shards) = self.disk_shards {
             let shard = self.shards[shard_idx].write();
             if let Some(entry) = shard.data.get(key) {
@@ -637,15 +648,16 @@ impl Store {
                         }
                     })
                     .unwrap_or(0);
-                let dump = self.entry_to_dump(key, &entry.value, ttl_ms);
+                let key_string = key_string(key);
+                let dump = self.entry_to_dump(&key_string, &entry.value, ttl_ms);
                 drop(shard);
 
-                let disk_idx = (fx_hash(key.as_bytes()) % disk_shards.len() as u64) as usize;
+                let disk_idx = (fx_hash(key) % disk_shards.len() as u64) as usize;
                 let mut disk = disk_shards[disk_idx].lock();
-                if let Err(e) = disk.put(key, &dump) {
+                if let Err(e) = disk.put(&key_string, &dump) {
                     self.record_disk_write_error();
                     self.emit_error(crate::ServerErrorEvent::DiskEvictionWriteFailed {
-                        key: key.to_string(),
+                        key: key_string,
                         error: e.to_string(),
                     });
                     return false;
@@ -816,6 +828,46 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn wal_log_command_batch<'a>(
+        &self,
+        commands: &[&'a [&'a [u8]]],
+    ) -> std::io::Result<()> {
+        if self.wal_suppress.load(std::sync::atomic::Ordering::Relaxed) || commands.is_empty() {
+            return Ok(());
+        }
+        let Some(ref ws) = self.wal_shards else {
+            return Ok(());
+        };
+
+        let first = commands[0];
+        if first.len() < 2 {
+            return Ok(());
+        }
+        if commands.len() == 1 {
+            return self.wal_log_command(first);
+        }
+        let idx = self.disk_shard_index(first[1]);
+        if commands
+            .iter()
+            .any(|args| args.len() < 2 || self.disk_shard_index(args[1]) != idx)
+        {
+            for args in commands {
+                self.wal_log_command(args)?;
+            }
+            return Ok(());
+        }
+
+        let mut wal = ws[idx].lock();
+        if let Err(e) = wal.append_commands(commands.iter().copied()) {
+            self.record_wal_append_error();
+            self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
+                error: e.to_string(),
+            });
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Replay WAL entries by re-executing each command through the normal
     /// command dispatch. Called on startup after snapshot load to recover
     /// writes that happened between the last snapshot and the crash.
@@ -933,33 +985,25 @@ impl Store {
     }
 
     #[inline(always)]
-    pub(crate) fn get_from_shard(
-        data: &HashMap<String, Entry, FxBuildHasher>,
-        key: &[u8],
-        now: Instant,
-    ) -> Option<Bytes> {
-        let hash = fx_hash(key);
-        data.raw_entry()
-            .from_hash(hash, |k| k.as_bytes() == key)
-            .and_then(|(_, entry)| {
-                if entry.is_expired_at(now) {
-                    return None;
-                }
-                entry.value.string_to_bytes()
-            })
+    pub(crate) fn get_from_shard(data: &ShardData, key: &[u8], now: Instant) -> Option<Bytes> {
+        data.get(key).and_then(|entry| {
+            if entry.is_expired_at(now) {
+                return None;
+            }
+            entry.value.string_to_bytes()
+        })
     }
 
     #[inline(always)]
     #[allow(dead_code)]
     pub(crate) fn get_and_write(
-        data: &HashMap<String, Entry, FxBuildHasher>,
+        data: &ShardData,
         key: &[u8],
         now: Instant,
         out: &mut bytes::BytesMut,
     ) {
-        let hash = fx_hash(key);
-        match data.raw_entry().from_hash(hash, |k| k.as_bytes() == key) {
-            Some((_, entry)) if !entry.is_expired_at(now) => {
+        match data.get(key) {
+            Some(entry) if !entry.is_expired_at(now) => {
                 if let Some(s) = entry.value.string_bytes() {
                     crate::resp::write_bulk_raw(out, s);
                 } else {
@@ -973,7 +1017,7 @@ impl Store {
     #[inline(always)]
     pub(crate) fn set_on_shard(
         &self,
-        data: &mut HashMap<String, Entry, FxBuildHasher>,
+        data: &mut ShardData,
         key: &[u8],
         value: &[u8],
         ttl: Option<Duration>,
@@ -982,11 +1026,11 @@ impl Store {
         let hash = fx_hash(key);
         let expires_at = ttl.map(|d| now + d);
         let new_value = StoreValue::Str(Bytes::copy_from_slice(value));
-        let new_size = estimate_entry_memory(key_str(key), &new_value);
+        let new_size = key.len() + 64 + value.len();
         let clock = self.lru_clock();
         match data
             .raw_entry_mut()
-            .from_hash(hash, |k| k.as_bytes() == key)
+            .from_hash(hash, |k| k.as_slice() == key)
         {
             hashbrown::hash_map::RawEntryMut::Occupied(mut e) => {
                 let old_size = estimate_entry_memory(e.key(), &e.get().value);
@@ -1003,13 +1047,13 @@ impl Store {
             hashbrown::hash_map::RawEntryMut::Vacant(e) => {
                 e.insert_with_hasher(
                     hash,
-                    key_string(key),
+                    key_bytes(key),
                     Entry {
                         value: new_value,
                         expires_at,
                         lru_clock: clock,
                     },
-                    |k| fx_hash(k.as_bytes()),
+                    |k| fx_hash(k),
                 );
                 self.mem_add(new_size);
                 self.key_added();
@@ -1037,7 +1081,7 @@ impl Store {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         // Fast path for common ASCII/UTF-8 command keys.
-        let fast = shard.data.get(key_str(key)).and_then(|entry| {
+        let fast = shard.data.get(key).and_then(|entry| {
             if entry.is_expired_at(now) {
                 None
             } else {
@@ -1054,7 +1098,7 @@ impl Store {
         drop(shard);
         if self.try_promote(key, now) {
             let shard = self.shards[idx].read();
-            shard.data.get(key_str(key)).and_then(|entry| {
+            shard.data.get(key).and_then(|entry| {
                 if entry.is_expired_at(now) {
                     None
                 } else {
@@ -1068,13 +1112,13 @@ impl Store {
 
     #[inline(always)]
     fn get_entry_type_from_shard(
-        data: &HashMap<String, Entry, FxBuildHasher>,
+        data: &ShardData,
         key: &[u8],
         now: Instant,
     ) -> Option<&'static str> {
         let hash = fx_hash(key);
         data.raw_entry()
-            .from_hash(hash, |k| k.as_bytes() == key)
+            .from_hash(hash, |k| k.as_slice() == key)
             .and_then(|(_, entry)| {
                 if entry.is_expired_at(now) {
                     None
@@ -1087,7 +1131,7 @@ impl Store {
     pub fn sort_get_elements(&self, key: &[u8], now: Instant) -> Result<Vec<String>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::List(list) => Ok(list
                     .iter()
@@ -1122,7 +1166,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_str(key);
+        let ks = key;
         if let Some(entry) = shard.data.get(ks) {
             if !entry.is_expired_at(now) {
                 return false;
@@ -1131,7 +1175,7 @@ impl Store {
         let new_value = StoreValue::Str(Bytes::copy_from_slice(value));
         let mem = estimate_entry_memory(ks, &new_value);
         let old = shard.data.insert(
-            key_string(key),
+            key_bytes(key),
             Entry {
                 value: new_value,
                 expires_at: None,
@@ -1157,12 +1201,12 @@ impl Store {
     /// disk invalidation when the value changes.
     pub(crate) fn set_nx_on_shard(
         &self,
-        data: &mut HashMap<String, Entry, FxBuildHasher>,
+        data: &mut ShardData,
         key: &[u8],
         value: &[u8],
         now: Instant,
     ) -> bool {
-        let ks = key_str(key);
+        let ks = key;
         if let Some(entry) = data.get(ks) {
             if !entry.is_expired_at(now) {
                 return false;
@@ -1171,7 +1215,7 @@ impl Store {
         let new_value = StoreValue::Str(Bytes::copy_from_slice(value));
         let mem = estimate_entry_memory(ks, &new_value);
         let old = data.insert(
-            key_string(key),
+            key_bytes(key),
             Entry {
                 value: new_value,
                 expires_at: None,
@@ -1196,7 +1240,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_str(key);
+        let ks = key;
         let old = shard.data.get(ks).and_then(|e| {
             if e.is_expired_at(now) {
                 None
@@ -1207,7 +1251,7 @@ impl Store {
         let new_value = StoreValue::Str(Bytes::copy_from_slice(value));
         let mem = estimate_entry_memory(ks, &new_value);
         let old_entry = shard.data.insert(
-            key_string(key),
+            key_bytes(key),
             Entry {
                 value: new_value,
                 expires_at: None,
@@ -1233,12 +1277,12 @@ impl Store {
     /// disk invalidation.
     pub(crate) fn get_set_on_shard(
         &self,
-        data: &mut HashMap<String, Entry, FxBuildHasher>,
+        data: &mut ShardData,
         key: &[u8],
         value: &[u8],
         now: Instant,
     ) -> Option<Bytes> {
-        let ks = key_str(key);
+        let ks = key;
         let old = data.get(ks).and_then(|e| {
             if e.is_expired_at(now) {
                 None
@@ -1249,7 +1293,7 @@ impl Store {
         let new_value = StoreValue::Str(Bytes::copy_from_slice(value));
         let mem = estimate_entry_memory(ks, &new_value);
         let old_entry = data.insert(
-            key_string(key),
+            key_bytes(key),
             Entry {
                 value: new_value,
                 expires_at: None,
@@ -1276,12 +1320,8 @@ impl Store {
         Self::strlen_from_shard(&shard.data, key, now)
     }
 
-    pub(crate) fn strlen_from_shard(
-        data: &HashMap<String, Entry, FxBuildHasher>,
-        key: &[u8],
-        now: Instant,
-    ) -> i64 {
-        match data.get(key_str(key)) {
+    pub(crate) fn strlen_from_shard(data: &ShardData, key: &[u8], now: Instant) -> i64 {
+        match data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => {
                 entry.value.string_bytes().map_or(0, |s| s.len() as i64)
             }
@@ -1292,20 +1332,24 @@ impl Store {
     pub fn del(&self, keys: &[&[u8]]) -> i64 {
         let now = Instant::now();
         let mut count = 0i64;
-        let mut vector_keys_removed: Vec<String> = Vec::new();
+        let mut vector_keys_removed: Vec<(String, u32)> = Vec::new();
         for key in keys {
+            let key = *key;
             let idx = self.shard_index(key);
             let mut shard = self.shards[idx].write();
             shard.version += 1;
-            if let Some(entry) = shard.data.remove(key_str(key)) {
+            if let Some(entry) = shard.data.remove(key) {
                 self.key_removed();
                 let expired = entry.is_expired_at(now);
-                let is_vector = matches!(&entry.value, StoreValue::Vector(_));
-                let mem = estimate_entry_memory(key_str(key), &entry.value);
+                let vector_dims = match &entry.value {
+                    StoreValue::Vector(v) => Some(v.dims),
+                    _ => None,
+                };
+                let mem = estimate_entry_memory(key, &entry.value);
                 shard.used_memory = shard.used_memory.saturating_sub(mem);
                 self.mem_sub(mem);
-                if is_vector {
-                    vector_keys_removed.push(key_str(key).to_string());
+                if let Some(dims) = vector_dims {
+                    vector_keys_removed.push((key_string(key), dims));
                 }
                 if !expired {
                     count += 1;
@@ -1319,26 +1363,33 @@ impl Store {
             }
         }
         if !vector_keys_removed.is_empty() {
-            let mut index = self.vector_index.write();
-            for k in &vector_keys_removed {
-                index.remove(k);
+            let mut indexes = self.vector_indexes.write();
+            for (k, dims) in &vector_keys_removed {
+                if let Some(index) = indexes.get_mut(dims) {
+                    index.remove(k);
+                }
             }
         }
         count
     }
 
     pub(crate) fn del_on_shard(&self, shard: &mut Shard, key: &[u8], now: Instant) -> i64 {
-        let Some(entry) = shard.data.remove(key_str(key)) else {
+        let Some(entry) = shard.data.remove(key) else {
             return 0;
         };
         self.key_removed();
         let expired = entry.is_expired_at(now);
-        let is_vector = matches!(&entry.value, StoreValue::Vector(_));
+        let vector_dims = match &entry.value {
+            StoreValue::Vector(v) => Some(v.dims),
+            _ => None,
+        };
         let mem = estimate_entry_memory(key_str(key), &entry.value);
         shard.used_memory = shard.used_memory.saturating_sub(mem);
         self.mem_sub(mem);
-        if is_vector {
-            self.vector_index.write().remove(key_str(key));
+        if let Some(dims) = vector_dims {
+            if let Some(index) = self.vector_indexes.write().get_mut(&dims) {
+                index.remove(key_str(key));
+            }
         }
         i64::from(!expired)
     }
@@ -1355,7 +1406,7 @@ impl Store {
                 let shard = self.shards[idx].read();
                 let exists_in_mem = shard
                     .data
-                    .get(key_str(key))
+                    .get(*key)
                     .is_some_and(|entry| !entry.is_expired_at(now));
                 drop(shard);
                 if exists_in_mem || (tiered && self.disk_contains(key)) {
@@ -1383,7 +1434,7 @@ impl Store {
             for key in shard_keys {
                 let exists_in_mem = shard
                     .data
-                    .get(key_str(key))
+                    .get(key)
                     .is_some_and(|entry| !entry.is_expired_at(now));
                 if exists_in_mem {
                     count += 1;
@@ -1404,20 +1455,15 @@ impl Store {
         count
     }
 
-    pub(crate) fn exists_on_shard(
-        data: &HashMap<String, Entry, FxBuildHasher>,
-        key: &[u8],
-        now: Instant,
-    ) -> bool {
-        data.get(key_str(key))
-            .is_some_and(|entry| !entry.is_expired_at(now))
+    pub(crate) fn exists_on_shard(data: &ShardData, key: &[u8], now: Instant) -> bool {
+        data.get(key).is_some_and(|entry| !entry.is_expired_at(now))
     }
 
     pub fn incr(&self, key: &[u8], delta: i64, now: Instant) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_str(key);
+        let ks = key;
         let (current, expires_at) = match shard.data.get(ks) {
             Some(e) if !e.is_expired_at(now) => match e.value.string_bytes() {
                 Some(s) => {
@@ -1438,7 +1484,7 @@ impl Store {
         let new_value = StoreValue::Str(Bytes::from(new_val.to_string()));
         let mem = estimate_entry_memory(ks, &new_value);
         let old_entry = shard.data.insert(
-            key_string(key),
+            key_bytes(key),
             Entry {
                 value: new_value,
                 expires_at,
@@ -1463,12 +1509,12 @@ impl Store {
     /// lock. The caller owns shard versioning, WAL logging, and key events.
     pub(crate) fn incr_on_shard(
         &self,
-        data: &mut HashMap<String, Entry, FxBuildHasher>,
+        data: &mut ShardData,
         key: &[u8],
         delta: i64,
         now: Instant,
     ) -> Result<i64, String> {
-        let ks = key_str(key);
+        let ks = key;
         let (current, expires_at) = match data.get(ks) {
             Some(e) if !e.is_expired_at(now) => match e.value.string_bytes() {
                 Some(s) => {
@@ -1489,7 +1535,7 @@ impl Store {
         let new_value = StoreValue::Str(Bytes::from(new_val.to_string()));
         let mem = estimate_entry_memory(ks, &new_value);
         let old_entry = data.insert(
-            key_string(key),
+            key_bytes(key),
             Entry {
                 value: new_value,
                 expires_at,
@@ -1524,7 +1570,7 @@ impl Store {
         value: &[u8],
         now: Instant,
     ) -> i64 {
-        let ks = key_str(key);
+        let ks = key;
         if let Some(entry) = shard.data.get_mut(ks) {
             if !entry.is_expired_at(now) {
                 match &mut entry.value {
@@ -1555,7 +1601,7 @@ impl Store {
         let new_value = StoreValue::Str(val);
         let mem = estimate_entry_memory(ks, &new_value);
         let old_entry = shard.data.insert(
-            key_string(key),
+            key_bytes(key),
             Entry {
                 value: new_value,
                 expires_at: None,
@@ -1583,8 +1629,9 @@ impl Store {
         for shard in self.shards.iter() {
             let shard = shard.read();
             for (k, e) in shard.data.iter() {
-                if e.expires_at.is_none_or(|exp| now < exp) && matcher.matches(k) {
-                    result.push(k.clone());
+                let key = key_string(k);
+                if e.expires_at.is_none_or(|exp| now < exp) && matcher.matches(&key) {
+                    result.push(key);
                 }
             }
         }
@@ -1618,7 +1665,7 @@ impl Store {
     pub fn ttl(&self, key: &[u8], now: Instant) -> i64 {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             None => -2,
             Some(entry) => match entry.expires_at {
                 None => -1,
@@ -1636,7 +1683,7 @@ impl Store {
     pub fn pttl(&self, key: &[u8], now: Instant) -> i64 {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             None => -2,
             Some(entry) => match entry.expires_at {
                 None => -1,
@@ -1655,7 +1702,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        if let Some(entry) = shard.data.get_mut(key_str(key)) {
+        if let Some(entry) = shard.data.get_mut(key) {
             if !entry.is_expired_at(now) {
                 entry.expires_at = Some(now + Duration::from_secs(seconds));
                 return true;
@@ -1668,7 +1715,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        if let Some(entry) = shard.data.get_mut(key_str(key)) {
+        if let Some(entry) = shard.data.get_mut(key) {
             if !entry.is_expired_at(now) {
                 entry.expires_at = Some(now + Duration::from_millis(millis));
                 return true;
@@ -1680,7 +1727,7 @@ impl Store {
     pub fn persist(&self, key: &[u8], now: Instant) -> bool {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
-        if let Some(entry) = shard.data.get_mut(key_str(key)) {
+        if let Some(entry) = shard.data.get_mut(key) {
             if !entry.is_expired_at(now) && entry.expires_at.is_some() {
                 entry.expires_at = None;
                 shard.version += 1;
@@ -1695,7 +1742,7 @@ impl Store {
         let entry = {
             let mut shard = self.shards[old_idx].write();
             shard.version += 1;
-            match shard.data.remove(key_str(key)) {
+            match shard.data.remove(key) {
                 Some(e) if !e.is_expired_at(now) => {
                     self.key_removed();
                     let mem = estimate_entry_memory(key_str(key), &e.value);
@@ -1710,7 +1757,7 @@ impl Store {
         let mut shard = self.shards[new_idx].write();
         shard.version += 1;
         let mem = estimate_entry_memory(key_str(new_key), &entry.value);
-        let old = shard.data.insert(key_string(new_key), entry);
+        let old = shard.data.insert(key_bytes(new_key), entry);
         if old.is_none() {
             self.key_added();
         }
@@ -1731,7 +1778,7 @@ impl Store {
 
         let (dump_val, ttl) = {
             let shard = self.shards[src_idx].read();
-            let ks = key_str(src);
+            let ks = src;
             match shard.data.get(ks) {
                 Some(entry) if !entry.is_expired_at(now) => {
                     let ttl = entry.expires_at.map(|exp| exp.duration_since(now));
@@ -1744,7 +1791,7 @@ impl Store {
 
         if !replace {
             let shard = self.shards[dst_idx].read();
-            let ks = key_str(dst);
+            let ks = dst;
             if let Some(entry) = shard.data.get(ks) {
                 if !entry.is_expired_at(now) {
                     return Ok(false);
@@ -1780,7 +1827,7 @@ impl Store {
             shard.used_memory = 0;
         }
         self.metrics.key_count.store(0, Ordering::Relaxed);
-        *self.vector_index.write() = crate::hnsw::HnswIndex::new(0);
+        self.vector_indexes.write().clear();
         if let Some(ref ds) = self.disk_shards {
             for d in ds.iter() {
                 let mut disk = d.lock();
@@ -1796,7 +1843,7 @@ impl Store {
         let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let entry = match shard.data.entry(ks) {
             hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
             hashbrown::hash_map::Entry::Vacant(v) => {
@@ -1838,7 +1885,7 @@ impl Store {
         now: Instant,
     ) -> Result<i64, String> {
         let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let entry = match shard.data.entry(ks) {
             hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
             hashbrown::hash_map::Entry::Vacant(v) => {
@@ -1873,7 +1920,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::List(VecDeque::new()),
@@ -1913,7 +1960,7 @@ impl Store {
         now: Instant,
     ) -> Result<i64, String> {
         let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::List(VecDeque::new()),
@@ -1945,7 +1992,7 @@ impl Store {
         let idx = self.shard_index(key);
         {
             let shard = self.shards[idx].read();
-            let can_pop = match shard.data.get(key_str(key)) {
+            let can_pop = match shard.data.get(key) {
                 Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                     StoreValue::List(list) => !list.is_empty(),
                     _ => false,
@@ -1973,7 +2020,7 @@ impl Store {
         key: &[u8],
         now: Instant,
     ) -> Option<Bytes> {
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
                     let val = list.pop_front()?;
@@ -1992,7 +2039,7 @@ impl Store {
         let idx = self.shard_index(key);
         {
             let shard = self.shards[idx].read();
-            let can_pop = match shard.data.get(key_str(key)) {
+            let can_pop = match shard.data.get(key) {
                 Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                     StoreValue::List(list) => !list.is_empty(),
                     _ => false,
@@ -2004,7 +2051,7 @@ impl Store {
             }
         }
         let mut shard = self.shards[idx].write();
-        let out = match shard.data.get_mut(key_str(key)) {
+        let out = match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
                     let val = list.pop_back()?;
@@ -2032,7 +2079,7 @@ impl Store {
         key: &[u8],
         now: Instant,
     ) -> Option<Bytes> {
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
                     let val = list.pop_back()?;
@@ -2050,7 +2097,7 @@ impl Store {
     pub fn llen(&self, key: &[u8], now: Instant) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::List(list) => Ok(list.len() as i64),
                 _ => Err(WRONGTYPE.to_string()),
@@ -2068,7 +2115,7 @@ impl Store {
     ) -> Result<Vec<Bytes>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::List(list) => {
                     let len = list.len() as i64;
@@ -2103,7 +2150,7 @@ impl Store {
     pub fn lindex(&self, key: &[u8], index: i64, now: Instant) -> Option<Bytes> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::List(list) => {
                     let i = if index < 0 {
@@ -2135,7 +2182,7 @@ impl Store {
         pairs: &[(&[u8], &[u8])],
         now: Instant,
     ) -> Result<i64, String> {
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let entry = match shard.data.entry(ks) {
             hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
             hashbrown::hash_map::Entry::Vacant(v) => {
@@ -2183,7 +2230,7 @@ impl Store {
     pub fn hget(&self, key: &[u8], field: &[u8], now: Instant) -> Option<Bytes> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => map.get(key_str(field)).cloned(),
                 _ => None,
@@ -2193,12 +2240,12 @@ impl Store {
     }
 
     pub(crate) fn hget_from_shard(
-        data: &HashMap<String, Entry, FxBuildHasher>,
+        data: &ShardData,
         key: &[u8],
         field: &[u8],
         now: Instant,
     ) -> Option<Bytes> {
-        match data.get(key_str(key)) {
+        match data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => map.get(key_str(field)).cloned(),
                 _ => None,
@@ -2210,7 +2257,7 @@ impl Store {
     pub fn hmget(&self, key: &[u8], fields: &[&[u8]], now: Instant) -> Vec<Option<Bytes>> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => fields
                     .iter()
@@ -2226,7 +2273,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Hash(map) => {
                     let mut removed = 0i64;
@@ -2250,7 +2297,7 @@ impl Store {
     pub fn hgetall(&self, key: &[u8], now: Instant) -> Result<Vec<(String, Bytes)>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => {
                     Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -2264,7 +2311,7 @@ impl Store {
     pub fn hkeys(&self, key: &[u8], now: Instant) -> Result<Vec<String>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => Ok(map.keys().cloned().collect()),
                 _ => Err(WRONGTYPE.to_string()),
@@ -2276,7 +2323,7 @@ impl Store {
     pub fn hvals(&self, key: &[u8], now: Instant) -> Result<Vec<Bytes>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => Ok(map.values().cloned().collect()),
                 _ => Err(WRONGTYPE.to_string()),
@@ -2288,7 +2335,7 @@ impl Store {
     pub fn hlen(&self, key: &[u8], now: Instant) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => Ok(map.len() as i64),
                 _ => Err(WRONGTYPE.to_string()),
@@ -2300,7 +2347,7 @@ impl Store {
     pub fn hexists(&self, key: &[u8], field: &[u8], now: Instant) -> Result<bool, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => Ok(map.contains_key(key_str(field))),
                 _ => Err(WRONGTYPE.to_string()),
@@ -2332,7 +2379,7 @@ impl Store {
         delta: i64,
         now: Instant,
     ) -> Result<i64, String> {
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let entry = match shard.data.entry(ks) {
             hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
             hashbrown::hash_map::Entry::Vacant(v) => {
@@ -2388,7 +2435,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Set(SetData::new()),
@@ -2427,7 +2474,7 @@ impl Store {
         members: &[&[u8]],
         now: Instant,
     ) -> Result<i64, String> {
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Set(SetData::new()),
@@ -2463,7 +2510,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Set(set) => {
                     let mut removed = 0i64;
@@ -2487,7 +2534,7 @@ impl Store {
     pub fn smembers(&self, key: &[u8], now: Instant) -> Result<Vec<String>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Set(set) => Ok(set.iter().cloned().collect()),
                 _ => Err(WRONGTYPE.to_string()),
@@ -2499,7 +2546,7 @@ impl Store {
     pub fn sismember(&self, key: &[u8], member: &[u8], now: Instant) -> Result<bool, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Set(set) => Ok(set.contains(key_str(member))),
                 _ => Err(WRONGTYPE.to_string()),
@@ -2511,7 +2558,7 @@ impl Store {
     pub fn scard(&self, key: &[u8], now: Instant) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Set(set) => Ok(set.len() as i64),
                 _ => Err(WRONGTYPE.to_string()),
@@ -2527,7 +2574,7 @@ impl Store {
     ) -> Result<FxHashSet<String, FxBuildHasher>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Set(set) => {
                     let mut result = FxHashSet::with_capacity_and_hasher(set.len(), FxBuildHasher);
@@ -2546,9 +2593,10 @@ impl Store {
         }
         let mut result = FxHashSet::with_hasher(FxBuildHasher);
         for key in keys {
+            let key = *key;
             let idx = self.shard_index(key);
             let shard = self.shards[idx].read();
-            match shard.data.get(key_str(key)) {
+            match shard.data.get(key) {
                 Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                     StoreValue::Set(set) => result.extend(set.iter().cloned()),
                     _ => return Err(WRONGTYPE.to_string()),
@@ -2568,9 +2616,10 @@ impl Store {
         }
         let mut result = self.collect_set(keys[0], now)?;
         for key in &keys[1..] {
+            let key = *key;
             let idx = self.shard_index(key);
             let shard = self.shards[idx].read();
-            match shard.data.get(key_str(key)) {
+            match shard.data.get(key) {
                 Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                     StoreValue::Set(set) => result.retain(|m| set.contains(m)),
                     _ => return Err(WRONGTYPE.to_string()),
@@ -2590,9 +2639,10 @@ impl Store {
         }
         let mut result = self.collect_set(keys[0], now)?;
         for key in &keys[1..] {
+            let key = *key;
             let idx = self.shard_index(key);
             let shard = self.shards[idx].read();
-            match shard.data.get(key_str(key)) {
+            match shard.data.get(key) {
                 Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                     StoreValue::Set(set) => result.retain(|m| !set.contains(m)),
                     _ => return Err(WRONGTYPE.to_string()),
@@ -2694,27 +2744,24 @@ impl Store {
 
         let idx_a = self.shard_index(key_a);
         let idx_b = self.shard_index(key_b);
-        let key_a_str = key_str(key_a);
-        let key_b_str = key_str(key_b);
-
         if idx_a == idx_b {
             let shard = self.shards[idx_a].read();
-            let left = view_set(shard.data.get(key_a_str), now)?;
-            let right = view_set(shard.data.get(key_b_str), now)?;
+            let left = view_set(shard.data.get(key_a), now)?;
+            let right = view_set(shard.data.get(key_b), now)?;
             return f(left, right);
         }
 
         if idx_a < idx_b {
             let shard_a = self.shards[idx_a].read();
             let shard_b = self.shards[idx_b].read();
-            let left = view_set(shard_a.data.get(key_a_str), now)?;
-            let right = view_set(shard_b.data.get(key_b_str), now)?;
+            let left = view_set(shard_a.data.get(key_a), now)?;
+            let right = view_set(shard_b.data.get(key_b), now)?;
             f(left, right)
         } else {
             let shard_b = self.shards[idx_b].read();
             let shard_a = self.shards[idx_a].read();
-            let left = view_set(shard_a.data.get(key_a_str), now)?;
-            let right = view_set(shard_b.data.get(key_b_str), now)?;
+            let left = view_set(shard_a.data.get(key_a), now)?;
+            let right = view_set(shard_b.data.get(key_b), now)?;
             f(left, right)
         }
     }
@@ -2744,7 +2791,7 @@ impl Store {
         maxlen: Option<usize>,
         now: Instant,
     ) -> Result<StreamId, String> {
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let entry = match shard.data.entry(ks) {
             hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
             hashbrown::hash_map::Entry::Vacant(v) => {
@@ -2850,7 +2897,7 @@ impl Store {
     pub fn xlen(&self, key: &[u8], now: Instant) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Stream(s) => Ok(s.entries.len() as i64),
                 _ => Err(WRONGTYPE.to_string()),
@@ -2870,7 +2917,7 @@ impl Store {
     ) -> Result<Vec<(StreamId, Vec<(String, Bytes)>)>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Stream(s) => {
                     let mut result = Vec::new();
@@ -2901,7 +2948,7 @@ impl Store {
     ) -> Result<Vec<(StreamId, Vec<(String, Bytes)>)>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Stream(s) => {
                     let mut result = Vec::new();
@@ -2934,7 +2981,7 @@ impl Store {
             let after_id = ids[i];
             let idx = self.shard_index(key.as_bytes());
             let shard = self.shards[idx].read();
-            if let Some(entry) = shard.data.get(key.as_str()) {
+            if let Some(entry) = shard.data.get(key.as_bytes()) {
                 if !entry.is_expired_at(now) {
                     if let StoreValue::Stream(s) = &entry.value {
                         let start = StreamId {
@@ -2971,7 +3018,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_string(key);
+        let ks = key_bytes(key);
 
         if mkstream {
             let existed = shard.data.contains_key(&ks);
@@ -3025,7 +3072,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Stream(s) => Ok(s.groups.remove(group).is_some()),
                 _ => Err(WRONGTYPE.to_string()),
@@ -3052,7 +3099,7 @@ impl Store {
             let idx = self.shard_index(key.as_bytes());
             let mut shard = self.shards[idx].write();
             shard.version += 1;
-            if let Some(entry) = shard.data.get_mut(key.as_str()) {
+            if let Some(entry) = shard.data.get_mut(key.as_bytes()) {
                 if !entry.is_expired_at(now) {
                     if let StoreValue::Stream(s) = &mut entry.value {
                         let cg = match s.groups.get_mut(group) {
@@ -3144,7 +3191,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Stream(s) => {
                     let cg = match s.groups.get_mut(group) {
@@ -3177,7 +3224,7 @@ impl Store {
     ) -> Result<(i64, Option<StreamId>, Option<StreamId>, Vec<(String, i64)>), String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Stream(s) => {
                     let cg = match s.groups.get(group) {
@@ -3225,7 +3272,7 @@ impl Store {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         let inst_now = Instant::now();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Stream(s) => {
                     let cg = match s.groups.get(group) {
@@ -3277,7 +3324,7 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let inst_now = Instant::now();
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Stream(s) => {
                     let cg = match s.groups.get_mut(group) {
@@ -3347,7 +3394,7 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let inst_now = Instant::now();
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Stream(s) => {
                     let cg = match s.groups.get_mut(group) {
@@ -3414,7 +3461,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Stream(s) => {
                     let mut removed = 0i64;
@@ -3439,7 +3486,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Stream(s) => {
                     let mut trimmed = 0i64;
@@ -3463,7 +3510,7 @@ impl Store {
     pub fn xinfo_stream(&self, key: &[u8], now: Instant) -> Result<Vec<(String, String)>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Stream(s) => {
                     let mut info = Vec::new();
@@ -3491,7 +3538,7 @@ impl Store {
     ) -> Result<Vec<Vec<(String, String)>>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Stream(s) => {
                     let mut groups_info = Vec::new();
@@ -3518,7 +3565,7 @@ impl Store {
     pub fn stream_last_id(&self, key: &[u8], now: Instant) -> Option<StreamId> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Stream(s) => Some(s.last_id),
                 _ => None,
@@ -3546,7 +3593,7 @@ impl Store {
                     .map(|exp| exp.duration_since(now).as_millis() as i64)
                     .unwrap_or(0);
                 entries.push(DumpEntry {
-                    key: key.clone(),
+                    key: key_string(key),
                     value: store_value_to_dump_value(&entry.value),
                     ttl_ms,
                 });
@@ -3581,7 +3628,7 @@ impl Store {
                     .map(|exp| exp.duration_since(now).as_millis() as i64)
                     .unwrap_or(0);
                 entries.push(DumpEntry {
-                    key: key.clone(),
+                    key: key_string(key),
                     value: store_value_to_dump_value(&entry.value),
                     ttl_ms,
                 });
@@ -3596,6 +3643,7 @@ impl Store {
         let idx = self.shard_index(key.as_bytes());
         let mut shard = self.shards[idx].write();
         shard.version += 1;
+        let key_bytes_owned = key.as_bytes().to_vec();
         let store_value = match value {
             DumpValue::Str(s) => StoreValue::Str(Bytes::from(s)),
             DumpValue::List(l) => StoreValue::List(l.into_iter().map(Bytes::from).collect()),
@@ -3692,7 +3740,7 @@ impl Store {
                 let expires_at = ttl.map(|d| Instant::now() + d);
                 let mem = estimate_entry_memory(&key, &sv);
                 let old = shard.data.insert(
-                    key,
+                    key_bytes_owned,
                     Entry {
                         value: sv,
                         expires_at,
@@ -3705,7 +3753,11 @@ impl Store {
                 shard.used_memory += mem;
                 self.mem_add(mem);
                 drop(shard);
-                self.vector_index.write().insert(key_clone, index_data);
+                self.vector_indexes
+                    .write()
+                    .entry(dims)
+                    .or_insert_with(|| crate::hnsw::HnswIndex::new(dims))
+                    .insert(key_clone, index_data);
                 return;
             }
             DumpValue::HyperLogLog(regs, cached) => StoreValue::HyperLogLog(regs, cached),
@@ -3720,7 +3772,7 @@ impl Store {
         let expires_at = ttl.map(|d| Instant::now() + d);
         let mem = estimate_entry_memory(&key, &store_value);
         let old = shard.data.insert(
-            key,
+            key_bytes_owned,
             Entry {
                 value: store_value,
                 expires_at,
@@ -3738,7 +3790,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_str(key);
+        let ks = key;
         match shard.data.get(ks) {
             Some(entry) if !entry.is_expired_at(now) => {
                 if entry.value.string_bytes().is_some() {
@@ -3766,7 +3818,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_str(key);
+        let ks = key;
         match shard.data.get_mut(ks) {
             Some(entry) if !entry.is_expired_at(now) => {
                 if persist {
@@ -3783,7 +3835,7 @@ impl Store {
     pub fn getrange(&self, key: &[u8], start: i64, end: i64, now: Instant) -> Bytes {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => {
                 if let Some(s) = entry.value.string_bytes() {
                     let len = s.len() as i64;
@@ -3814,7 +3866,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Str(Bytes::new()),
@@ -3869,7 +3921,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Str(Bytes::new()),
@@ -3915,7 +3967,7 @@ impl Store {
         let bit_idx = 7 - (offset % 8) as u8;
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match entry.value.string_bytes() {
                 Some(s) => {
                     if byte_idx >= s.len() {
@@ -3940,7 +3992,7 @@ impl Store {
     ) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match entry.value.string_bytes() {
                 Some(s) => {
                     if use_bit {
@@ -4006,7 +4058,7 @@ impl Store {
     ) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match entry.value.string_bytes() {
                 Some(s) => {
                     if s.is_empty() {
@@ -4100,9 +4152,10 @@ impl Store {
         let mut sources: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
         let mut max_len = 0usize;
         for key in keys {
+            let key = *key;
             let idx = self.shard_index(key);
             let shard = self.shards[idx].read();
-            match shard.data.get(key_str(key)) {
+            match shard.data.get(key) {
                 Some(entry) if !entry.is_expired_at(now) => match entry.value.string_bytes() {
                     Some(s) => {
                         max_len = max_len.max(s.len());
@@ -4173,7 +4226,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::TimeSeries(TimeSeriesData {
@@ -4239,7 +4292,7 @@ impl Store {
     pub fn tsget(&self, key: &[u8], now: Instant) -> Result<Option<(i64, f64)>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::TimeSeries(ts) => Ok(ts.samples.last().copied()),
                 _ => Err(WRONGTYPE.to_string()),
@@ -4260,7 +4313,7 @@ impl Store {
     ) -> Result<Vec<(i64, f64)>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::TimeSeries(ts) => {
                     let start = ts.samples.partition_point(|s| s.0 < from);
@@ -4303,7 +4356,7 @@ impl Store {
     > {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::TimeSeries(ts) => Ok(Some((
                     ts.samples.len(),
@@ -4349,7 +4402,7 @@ impl Store {
                     } else {
                         slice.to_vec()
                     };
-                    results.push((key.clone(), ts.labels.clone(), samples));
+                    results.push((key_string(key), ts.labels.clone(), samples));
                 }
             }
         }
@@ -4383,7 +4436,7 @@ impl Store {
     pub fn expiretime(&self, key: &[u8], now: Instant) -> i64 {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             None => -2,
             Some(entry) if entry.is_expired_at(now) => -2,
             Some(entry) => match entry.expires_at {
@@ -4402,7 +4455,7 @@ impl Store {
     pub fn pexpiretime(&self, key: &[u8], now: Instant) -> i64 {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             None => -2,
             Some(entry) if entry.is_expired_at(now) => -2,
             Some(entry) => match entry.expires_at {
@@ -4423,7 +4476,7 @@ impl Store {
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         let delta = {
-            match shard.data.get_mut(key_str(key)) {
+            match shard.data.get_mut(key) {
                 Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                     StoreValue::List(list) => {
                         let i = if index < 0 {
@@ -4465,7 +4518,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
                     if let Some(pos) = list.iter().position(|v| v.as_ref() == pivot) {
@@ -4491,7 +4544,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
                     let mut removed = 0i64;
@@ -4540,7 +4593,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
                     let len = list.len() as i64;
@@ -4580,7 +4633,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let result = match shard.data.get_mut(key_str(key)) {
+        let result = match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
                     for v in values {
@@ -4606,7 +4659,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let result = match shard.data.get_mut(key_str(key)) {
+        let result = match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
                     for v in values {
@@ -4639,7 +4692,7 @@ impl Store {
         let val = {
             let mut shard = self.shards[src_idx].write();
             shard.version += 1;
-            match shard.data.get_mut(key_str(src)) {
+            match shard.data.get_mut(src) {
                 Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                     StoreValue::List(list) => {
                         let v = if from_left {
@@ -4663,7 +4716,7 @@ impl Store {
             let dst_idx = self.shard_index(dst);
             let mut shard = self.shards[dst_idx].write();
             shard.version += 1;
-            let ks = key_string(dst);
+            let ks = key_bytes(dst);
             let existed = shard.data.contains_key(&ks);
             let entry = shard.data.entry(ks).or_insert_with(|| Entry {
                 value: StoreValue::List(VecDeque::new()),
@@ -4701,7 +4754,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Hash(HashMap::new()),
@@ -4742,7 +4795,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Hash(HashMap::new()),
@@ -4802,7 +4855,7 @@ impl Store {
     pub fn hstrlen(&self, key: &[u8], field: &[u8], now: Instant) -> i64 {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => {
                     map.get(key_str(field)).map(|v| v.len() as i64).unwrap_or(0)
@@ -4819,7 +4872,7 @@ impl Store {
         }
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
-        let out = match shard.data.get_mut(key_str(key)) {
+        let out = match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Set(set) => {
                     let mut result = Vec::new();
@@ -4859,7 +4912,7 @@ impl Store {
                 .into_iter()
                 .collect());
         }
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Set(set) => {
                     let mut result = Vec::new();
@@ -4895,7 +4948,7 @@ impl Store {
         key: &[u8],
         now: Instant,
     ) -> Option<String> {
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Set(set) => {
                     let member = set.pop()?;
@@ -4913,7 +4966,7 @@ impl Store {
     pub fn srandmember(&self, key: &[u8], count: i64, now: Instant) -> Result<Vec<String>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Set(set) => {
                     if count == 0 || set.is_empty() {
@@ -4946,7 +4999,7 @@ impl Store {
         let removed = {
             let mut shard = self.shards[src_idx].write();
             shard.version += 1;
-            match shard.data.get_mut(key_str(src)) {
+            match shard.data.get_mut(src) {
                 Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                     StoreValue::Set(set) => {
                         let r = set.remove(key_str(member));
@@ -4967,7 +5020,7 @@ impl Store {
         let dst_idx = self.shard_index(dst);
         let mut shard = self.shards[dst_idx].write();
         shard.version += 1;
-        let ks = key_string(dst);
+        let ks = key_bytes(dst);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::Set(SetData::new()),
@@ -4997,7 +5050,7 @@ impl Store {
     pub fn smismember(&self, key: &[u8], members: &[&[u8]], now: Instant) -> Vec<bool> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Set(set) => members.iter().map(|m| set.contains(key_str(m))).collect(),
                 _ => members.iter().map(|_| false).collect(),
@@ -5065,7 +5118,7 @@ impl Store {
         score: f64,
         now: Instant,
     ) -> Result<i64, String> {
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let entry = match shard.data.entry(ks) {
             hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
             hashbrown::hash_map::Entry::Vacant(v) => {
@@ -5122,7 +5175,7 @@ impl Store {
         ch: bool,
         now: Instant,
     ) -> Result<i64, String> {
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let entry = match shard.data.entry(ks) {
             hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
             hashbrown::hash_map::Entry::Vacant(v) => {
@@ -5205,7 +5258,7 @@ impl Store {
     ) -> Result<Vec<Option<f64>>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(_, scores) => Ok(members
                     .iter()
@@ -5225,7 +5278,7 @@ impl Store {
     ) -> Result<(Option<f64>, bool), String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(_, scores) => {
                     Ok((scores.get(key_str(member)).copied(), true))
@@ -5237,12 +5290,12 @@ impl Store {
     }
 
     pub(crate) fn zscore_from_shard(
-        data: &HashMap<String, Entry, FxBuildHasher>,
+        data: &ShardData,
         key: &[u8],
         member: &[u8],
         now: Instant,
     ) -> Result<Option<f64>, String> {
-        match data.get(key_str(key)) {
+        match data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(_, scores) => Ok(scores.get(key_str(member)).copied()),
                 _ => Err(WRONGTYPE.to_string()),
@@ -5260,7 +5313,7 @@ impl Store {
     ) -> Result<Option<i64>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(tree, scores) => {
                     let ms = key_str(member);
@@ -5287,7 +5340,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::SortedSet(tree, scores) => {
                     let mut removed = 0i64;
@@ -5313,7 +5366,7 @@ impl Store {
     pub fn zcard(&self, key: &[u8], now: Instant) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(_, scores) => Ok(scores.len() as i64),
                 _ => Err(WRONGTYPE.to_string()),
@@ -5333,7 +5386,7 @@ impl Store {
     ) -> Result<Vec<(String, f64)>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(tree, _) => {
                     let len = tree.len() as i64;
@@ -5388,7 +5441,7 @@ impl Store {
     ) -> Result<Vec<(String, f64)>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(tree, _) => {
                     let range_start = (OrderedFloat(min), String::new());
@@ -5450,7 +5503,7 @@ impl Store {
         increment: f64,
         now: Instant,
     ) -> Result<f64, String> {
-        let ks = key_string(key);
+        let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
             value: StoreValue::SortedSet(BTreeMap::new(), HashMap::new()),
@@ -5498,7 +5551,7 @@ impl Store {
         }
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(tree, scores) => {
                     // Common bench/query path: whole-score-space cardinality.
@@ -5536,7 +5589,7 @@ impl Store {
     {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(tree, _) => {
                     for ((score, member), _) in tree.iter() {
@@ -5563,7 +5616,7 @@ impl Store {
     {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(tree, _) => {
                     let start = (OrderedFloat(min), String::new());
@@ -5588,7 +5641,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::SortedSet(tree, scores) => {
                     let mut result = Vec::new();
@@ -5621,7 +5674,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        match shard.data.get_mut(key_str(key)) {
+        match shard.data.get_mut(key) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::SortedSet(tree, scores) => {
                     let mut result = Vec::new();
@@ -5648,7 +5701,7 @@ impl Store {
     fn collect_sorted_set(&self, key: &[u8], now: Instant) -> Result<HashMap<String, f64>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(_, scores) => Ok(scores.clone()),
                 _ => Err(WRONGTYPE.to_string()),
@@ -5694,7 +5747,7 @@ impl Store {
                 scores.insert(member, score);
             }
             let old = shard.data.insert(
-                key_string(dst),
+                key_bytes(dst),
                 Entry {
                     value: StoreValue::SortedSet(tree, scores),
                     expires_at: None,
@@ -5758,7 +5811,7 @@ impl Store {
                 scores.insert(member, score);
             }
             let old = shard.data.insert(
-                key_string(dst),
+                key_bytes(dst),
                 Entry {
                     value: StoreValue::SortedSet(tree, scores),
                     expires_at: None,
@@ -5799,7 +5852,7 @@ impl Store {
                 scores.insert(member, score);
             }
             let old = shard.data.insert(
-                key_string(dst),
+                key_bytes(dst),
                 Entry {
                     value: StoreValue::SortedSet(tree, scores),
                     expires_at: None,
@@ -5828,7 +5881,7 @@ impl Store {
     ) -> Result<Vec<String>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(tree, _) => {
                     let all: Vec<&String> = if reverse {
@@ -5879,7 +5932,7 @@ impl Store {
     ) -> Result<Vec<Option<f64>>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        match shard.data.get(key_str(key)) {
+        match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(_, scores) => Ok(members
                     .iter()
@@ -5909,7 +5962,7 @@ impl Store {
             }
 
             let mut shard = shard.write();
-            let keys: Vec<String> = shard
+            let keys: Vec<ShardKey> = shard
                 .data
                 .keys()
                 .enumerate()
@@ -5928,7 +5981,7 @@ impl Store {
                         shard.used_memory = shard.used_memory.saturating_sub(mem);
                         self.mem_sub(mem);
                         if is_vector {
-                            expired_vectors.push(key);
+                            expired_vectors.push(key_string(&key));
                         }
                     }
                     removed_any = true;
@@ -5939,9 +5992,11 @@ impl Store {
             }
         }
         if !expired_vectors.is_empty() {
-            let mut index = self.vector_index.write();
+            let mut indexes = self.vector_indexes.write();
             for k in &expired_vectors {
-                index.remove(k);
+                for index in indexes.values_mut() {
+                    index.remove(k);
+                }
             }
         }
     }
@@ -5950,7 +6005,7 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_str(key);
+        let ks = key;
         let entry = shard.data.get_mut(ks);
         match entry {
             Some(e) if e.is_expired_at(now) => {
@@ -6006,7 +6061,7 @@ impl Store {
                 let sv = StoreValue::HyperLogLog(regs, cached);
                 let mem = estimate_entry_memory(ks, &sv);
                 let old = shard.data.insert(
-                    key_string(key),
+                    key_bytes(key),
                     Entry {
                         value: sv,
                         expires_at: None,
@@ -6027,7 +6082,7 @@ impl Store {
         if keys.len() == 1 {
             let idx = self.shard_index(keys[0]);
             let shard = self.shards[idx].read();
-            let ks = key_str(keys[0]);
+            let ks = keys[0];
             match shard.data.get(ks) {
                 Some(e) if !e.is_expired_at(now) => match &e.value {
                     StoreValue::HyperLogLog(_, cached) => Ok(*cached as i64),
@@ -6038,9 +6093,10 @@ impl Store {
         } else {
             let mut merged = vec![0u8; crate::hll::HLL_REGISTERS];
             for key in keys {
+                let key = *key;
                 let idx = self.shard_index(key);
                 let shard = self.shards[idx].read();
-                let ks = key_str(key);
+                let ks = key;
                 match shard.data.get(ks) {
                     Some(e) if !e.is_expired_at(now) => match &e.value {
                         StoreValue::HyperLogLog(regs, _) => {
@@ -6060,7 +6116,7 @@ impl Store {
         let dest_idx = self.shard_index(dest);
         {
             let shard = self.shards[dest_idx].read();
-            let ks = key_str(dest);
+            let ks = dest;
             if let Some(e) = shard.data.get(ks) {
                 if !e.is_expired_at(now) {
                     match &e.value {
@@ -6073,9 +6129,10 @@ impl Store {
             }
         }
         for src in sources {
+            let src = *src;
             let idx = self.shard_index(src);
             let shard = self.shards[idx].read();
-            let ks = key_str(src);
+            let ks = src;
             if let Some(e) = shard.data.get(ks) {
                 if !e.is_expired_at(now) {
                     match &e.value {
@@ -6090,7 +6147,7 @@ impl Store {
         {
             let mut shard = self.shards[dest_idx].write();
             shard.version += 1;
-            let ks = key_str(dest);
+            let ks = dest;
             let cached = crate::hll::hll_count(&merged);
             let sv = StoreValue::HyperLogLog(merged, cached);
             let new_mem = estimate_entry_memory(ks, &sv);
@@ -6110,7 +6167,7 @@ impl Store {
                 self.mem_add(new_mem);
             }
             let old = shard.data.insert(
-                key_string(dest),
+                key_bytes(dest),
                 Entry {
                     value: sv,
                     expires_at: None,
@@ -6135,7 +6192,8 @@ impl Store {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_string(key);
+        let ks = key_bytes(key);
+        let index_key = key_string(key);
         let dims = data.len() as u32;
         let index_data = data.clone();
         let new_value = StoreValue::Vector(VectorData {
@@ -6167,13 +6225,17 @@ impl Store {
             self.key_added();
         }
         drop(shard);
-        self.vector_index.write().insert(ks, index_data);
+        self.vector_indexes
+            .write()
+            .entry(dims)
+            .or_insert_with(|| crate::hnsw::HnswIndex::new(dims))
+            .insert(index_key, index_data);
     }
 
     pub fn vget(&self, key: &[u8], now: Instant) -> Option<(Vec<f32>, Option<String>)> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
-        let ks = key_str(key);
+        let ks = key;
         match shard.data.get(ks) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Vector(v) => Some((v.data.clone(), v.metadata.clone())),
@@ -6192,16 +6254,27 @@ impl Store {
         now: Instant,
     ) -> Vec<(String, f32, Option<String>)> {
         let has_filter = filter_key.is_some() && filter_value.is_some();
-        let fetch_count = if has_filter { k * 10 } else { k };
-        let index = self.vector_index.read();
-        let candidates = index.search(query, fetch_count);
-        drop(index);
+        if has_filter {
+            return self.vsearch_filtered_exact(
+                query,
+                k,
+                filter_key.unwrap(),
+                filter_value.unwrap(),
+                now,
+            );
+        }
+        let indexes = self.vector_indexes.read();
+        let candidates = indexes
+            .get(&(query.len() as u32))
+            .map(|index| index.search(query, k))
+            .unwrap_or_default();
+        drop(indexes);
 
         let mut results: Vec<(String, f32, Option<String>)> = Vec::new();
         for (key, sim) in candidates {
             let idx = self.shard_index(key.as_bytes());
             let shard = self.shards[idx].read();
-            if let Some(entry) = shard.data.get(&key) {
+            if let Some(entry) = shard.data.get(key.as_bytes()) {
                 if entry.is_expired_at(now) {
                     continue;
                 }
@@ -6232,9 +6305,88 @@ impl Store {
         results
     }
 
-    pub fn vcard(&self, _now: Instant) -> usize {
-        self.vector_index.read().len()
+    fn vsearch_filtered_exact(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter_key: &str,
+        filter_value: &str,
+        now: Instant,
+    ) -> Vec<(String, f32, Option<String>)> {
+        let query_norm = vector_norm(query);
+        if query_norm == 0.0 {
+            return Vec::new();
+        }
+
+        let mut results = Vec::new();
+        for shard_lock in self.shards.iter() {
+            let shard = shard_lock.read();
+            for (key, entry) in &shard.data {
+                if entry.is_expired_at(now) {
+                    continue;
+                }
+                let StoreValue::Vector(vector) = &entry.value else {
+                    continue;
+                };
+                if vector.dims as usize != query.len() {
+                    continue;
+                }
+                let Some(metadata) = &vector.metadata else {
+                    continue;
+                };
+                if !metadata_field_matches(metadata, filter_key, filter_value) {
+                    continue;
+                }
+                let score = cosine_similarity(query, query_norm, &vector.data);
+                results.push((key_string(key), score, vector.metadata.clone()));
+            }
+        }
+
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(k);
+        results
     }
+
+    pub fn vcard(&self, _now: Instant) -> usize {
+        self.vector_indexes
+            .read()
+            .values()
+            .map(crate::hnsw::HnswIndex::len)
+            .sum()
+    }
+}
+
+fn vector_norm(vector: &[f32]) -> f32 {
+    vector.iter().map(|value| value * value).sum::<f32>().sqrt()
+}
+
+fn cosine_similarity(query: &[f32], query_norm: f32, vector: &[f32]) -> f32 {
+    if query.len() != vector.len() {
+        return 0.0;
+    }
+    let vector_norm = vector_norm(vector);
+    if vector_norm == 0.0 {
+        return 0.0;
+    }
+    let dot = query
+        .iter()
+        .zip(vector.iter())
+        .map(|(left, right)| left * right)
+        .sum::<f32>();
+    dot / (query_norm * vector_norm)
+}
+
+fn metadata_field_matches(metadata: &str, field: &str, expected: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(metadata)
+        .ok()
+        .and_then(|value| {
+            value
+                .get(field)
+                .and_then(|field| field.as_str())
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some(expected)
 }
 
 fn store_value_to_dump_value(value: &StoreValue) -> DumpValue {
@@ -6366,26 +6518,6 @@ fn compute_agg(vals: &[f64], agg_fn: &str) -> f64 {
             vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (vals.len() - 1) as f64
         }
         _ => vals.iter().sum::<f64>() / vals.len() as f64,
-    }
-}
-
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
-        return 0.0;
-    }
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom == 0.0 {
-        0.0
-    } else {
-        dot / denom
     }
 }
 
@@ -7593,6 +7725,28 @@ mod tests {
         store.ttl(b"k", n);
         let v1 = store.shard_version(idx);
         assert_eq!(v0, v1, "reads should not bump version");
+    }
+
+    #[test]
+    fn vector_search_indexes_are_dimension_scoped() {
+        let store = Store::new();
+        let n = now();
+        store.vset(b"two_dim", vec![1.0, 0.0], None, None, n);
+        store.vset(b"three_dim", vec![0.0, 1.0, 0.0], None, None, n);
+
+        let two_dim = store.vsearch(&[1.0, 0.0], 1, None, None, n);
+        assert_eq!(
+            two_dim.first().map(|(key, _, _)| key.as_str()),
+            Some("two_dim")
+        );
+        assert!(!two_dim.iter().any(|(key, _, _)| key == "three_dim"));
+
+        let three_dim = store.vsearch(&[0.0, 1.0, 0.0], 1, None, None, n);
+        assert_eq!(
+            three_dim.first().map(|(key, _, _)| key.as_str()),
+            Some("three_dim")
+        );
+        assert_eq!(store.vcard(n), 2);
     }
 
     #[test]
