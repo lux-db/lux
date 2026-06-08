@@ -365,6 +365,102 @@ fn tselect_with_join() {
 }
 
 #[test]
+fn tselect_near_vector_field() {
+    let port = alloc_port();
+    let mut child = start_server(port);
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    send(
+        &mut s,
+        &[
+            "TCREATE",
+            "messages",
+            "id INT PRIMARY KEY,",
+            "channel STR,",
+            "body STR,",
+            "embedding VECTOR(2)",
+        ],
+    );
+    send(
+        &mut s,
+        &[
+            "TINSERT",
+            "messages",
+            "id",
+            "1",
+            "channel",
+            "general",
+            "body",
+            "hello",
+            "embedding",
+            "[1,0]",
+        ],
+    );
+    send(
+        &mut s,
+        &[
+            "TINSERT",
+            "messages",
+            "id",
+            "2",
+            "channel",
+            "random",
+            "body",
+            "other",
+            "embedding",
+            "[0,1]",
+        ],
+    );
+
+    let r = send(
+        &mut s,
+        &[
+            "TSELECT",
+            "id,",
+            "body,",
+            "_similarity",
+            "FROM",
+            "messages",
+            "WHERE",
+            "channel",
+            "=",
+            "general",
+            "NEAR",
+            "embedding",
+            "[1,0]",
+            "K",
+            "5",
+            "THRESHOLD",
+            "0.9",
+        ],
+    );
+    assert!(r.contains("hello"), "near query should find hello: {}", r);
+    assert!(
+        r.contains("_similarity"),
+        "near query should include similarity: {}",
+        r
+    );
+    assert!(
+        !r.contains("other"),
+        "where filter should still apply: {}",
+        r
+    );
+
+    let r = send(&mut s, &["VCARD"]);
+    assert_eq!(r, ":2");
+    send(
+        &mut s,
+        &["TDELETE", "FROM", "messages", "WHERE", "id", "=", "1"],
+    );
+    let r = send(&mut s, &["VCARD"]);
+    assert_eq!(r, ":1");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
 fn tupdate_where() {
     let port = alloc_port();
     let mut child = start_server(port);

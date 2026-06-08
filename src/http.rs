@@ -737,9 +737,18 @@ struct LiveTableSpec {
     table: String,
     select: String,
     where_conditions: Vec<(String, String, Value)>,
+    near: Option<LiveTableNearSpec>,
     order_by: Option<(String, String)>,
     limit: Option<usize>,
     offset: Option<usize>,
+}
+
+#[derive(Clone)]
+struct LiveTableNearSpec {
+    field: String,
+    vector: Vec<f32>,
+    k: usize,
+    threshold: Option<f32>,
 }
 
 #[derive(Clone)]
@@ -1301,6 +1310,10 @@ fn parse_live_table_spec(spec: &Value) -> Result<LiveTableSpec, Value> {
                 .to_string(),
         ))
     });
+    let near = match spec.get("near") {
+        Some(value) => Some(parse_live_table_near_spec(value)?),
+        None => None,
+    };
     let limit = spec
         .get("limit")
         .and_then(Value::as_u64)
@@ -1313,9 +1326,33 @@ fn parse_live_table_spec(spec: &Value) -> Result<LiveTableSpec, Value> {
         table,
         select,
         where_conditions,
+        near,
         order_by,
         limit,
         offset,
+    })
+}
+
+fn parse_live_table_near_spec(value: &Value) -> Result<LiveTableNearSpec, Value> {
+    let field = required_str(value, "field")?.to_string();
+    let vector = value
+        .get("vector")
+        .and_then(Value::as_array)
+        .ok_or_else(|| live_error("INVALID_SPEC", "table near requires vector"))?
+        .iter()
+        .map(|value| value.as_f64().map(|n| n as f32))
+        .collect::<Option<Vec<f32>>>()
+        .ok_or_else(|| live_error("INVALID_SPEC", "table near vector must contain numbers"))?;
+    let k = value.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+    let threshold = value
+        .get("threshold")
+        .and_then(Value::as_f64)
+        .map(|n| n as f32);
+    Ok(LiveTableNearSpec {
+        field,
+        vector,
+        k,
+        threshold,
     })
 }
 
@@ -1334,6 +1371,24 @@ fn fetch_live_table_rows(
             tokens.push(field.clone());
             tokens.push(op.clone());
             tokens.push(live_value_to_token(value));
+        }
+    }
+    if let Some(near) = &spec.near {
+        tokens.push("NEAR".to_string());
+        tokens.push(near.field.clone());
+        tokens.push(format!(
+            "[{}]",
+            near.vector
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        tokens.push("K".to_string());
+        tokens.push(near.k.to_string());
+        if let Some(threshold) = near.threshold {
+            tokens.push("THRESHOLD".to_string());
+            tokens.push(threshold.to_string());
         }
     }
     if let Some((field, dir)) = &spec.order_by {
@@ -1572,6 +1627,90 @@ fn parse_http_where_tokens(where_clause: &str) -> Result<Vec<String>, String> {
     Ok(tokens)
 }
 
+fn parse_http_join_tokens(join_clause: &str) -> Result<Vec<String>, String> {
+    if join_clause.split_whitespace().count() > 1 {
+        return Ok(join_clause
+            .split_whitespace()
+            .map(ToString::to_string)
+            .collect());
+    }
+
+    let parts: Vec<&str> = join_clause.split(':').collect();
+    let (table, alias, join_type, on_part) = match parts.as_slice() {
+        [table, alias, on] => (*table, *alias, None, *on),
+        [table, alias, kind, on] if kind.eq_ignore_ascii_case("left") => {
+            (*table, *alias, Some("LEFT"), *on)
+        }
+        _ => {
+            return Err(
+                "invalid join parameter, expected table:alias:on(left=right) or table:alias:left:on(left=right)"
+                    .to_string(),
+            )
+        }
+    };
+
+    if !on_part.starts_with("on(") || !on_part.ends_with(')') {
+        return Err("invalid join parameter, expected on(left=right)".to_string());
+    }
+    let inner = &on_part[3..on_part.len() - 1];
+    let (left, right) = inner
+        .split_once('=')
+        .ok_or_else(|| "invalid join parameter, expected on(left=right)".to_string())?;
+    if table.is_empty() || alias.is_empty() || left.is_empty() || right.is_empty() {
+        return Err(
+            "invalid join parameter, table, alias, and join columns are required".to_string(),
+        );
+    }
+
+    let right_col = if right.contains('.') {
+        right.to_string()
+    } else {
+        format!("{}.{}", alias, right)
+    };
+    let mut tokens = Vec::new();
+    if join_type == Some("LEFT") {
+        tokens.push("LEFT".to_string());
+    }
+    tokens.extend([
+        "JOIN".to_string(),
+        table.to_string(),
+        alias.to_string(),
+        "ON".to_string(),
+        left.to_string(),
+        "=".to_string(),
+        right_col,
+    ]);
+    Ok(tokens)
+}
+
+fn parse_http_near_tokens(params: &[(String, String)]) -> Result<Vec<String>, String> {
+    if let Some(raw) = get_param(params, "near") {
+        let tokens: Vec<String> = raw.split_whitespace().map(ToString::to_string).collect();
+        if tokens.len() < 4 {
+            return Err("invalid near parameter, expected '<field> <vector> K <n>'".to_string());
+        }
+        return Ok(tokens);
+    }
+
+    let Some(field) = get_param(params, "near_field") else {
+        return Ok(Vec::new());
+    };
+    let vector = get_param(params, "near_vector")
+        .ok_or_else(|| "near_vector is required when near_field is provided".to_string())?;
+    let k = get_param(params, "near_k").unwrap_or("10");
+    let mut tokens = vec![
+        field.to_string(),
+        vector.to_string(),
+        "K".to_string(),
+        k.to_string(),
+    ];
+    if let Some(threshold) = get_param(params, "near_threshold") {
+        tokens.push("THRESHOLD".to_string());
+        tokens.push(threshold.to_string());
+    }
+    Ok(tokens)
+}
+
 fn parse_http_table_query(
     params: &[(String, String)],
     table: &str,
@@ -1614,14 +1753,19 @@ fn parse_http_table_query(
         (None, None) => None,
     };
 
-    let mut tokens: Vec<String> = vec!["*".to_string(), "FROM".to_string(), table.to_string()];
+    let select = get_param(params, "select").unwrap_or("*");
+    let mut tokens: Vec<String> = vec![select.to_string(), "FROM".to_string(), table.to_string()];
     if !where_tokens.is_empty() {
         tokens.push("WHERE".to_string());
         tokens.extend(where_tokens.iter().cloned());
     }
-    if let Some(join) = get_param(params, "join") {
-        tokens.push("JOIN".to_string());
-        tokens.push(join.to_string());
+    for (_, join) in params.iter().filter(|(k, _)| k == "join") {
+        tokens.extend(parse_http_join_tokens(join)?);
+    }
+    let near_tokens = parse_http_near_tokens(params)?;
+    if !near_tokens.is_empty() {
+        tokens.push("NEAR".to_string());
+        tokens.extend(near_tokens);
     }
     if !order_tokens.is_empty() {
         tokens.push("ORDER".to_string());
@@ -2895,4 +3039,51 @@ fn escape_json(s: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tables::JoinType;
+
+    #[test]
+    fn parse_http_table_query_supports_structured_left_join() {
+        let params = vec![
+            (
+                "join".to_string(),
+                "users:u:left:on(user_id=id)".to_string(),
+            ),
+            ("limit".to_string(), "25".to_string()),
+        ];
+
+        let (_, plan) = parse_http_table_query(&params, "orders", None).unwrap();
+
+        assert_eq!(plan.joins.len(), 1);
+        assert_eq!(plan.joins[0].join_type, JoinType::Left);
+        assert_eq!(plan.joins[0].table, "users");
+        assert_eq!(plan.joins[0].alias, "u");
+        assert_eq!(plan.joins[0].left_col, "user_id");
+        assert_eq!(plan.joins[0].right_col, "u.id");
+        assert_eq!(plan.limit, Some(25));
+    }
+
+    #[test]
+    fn parse_http_table_query_supports_select_and_near_params() {
+        let params = vec![
+            ("select".to_string(), "id,body,_similarity".to_string()),
+            ("near_field".to_string(), "embedding".to_string()),
+            ("near_vector".to_string(), "[1,0]".to_string()),
+            ("near_k".to_string(), "5".to_string()),
+            ("near_threshold".to_string(), "0.8".to_string()),
+        ];
+
+        let (_, plan) = parse_http_table_query(&params, "messages", None).unwrap();
+
+        assert_eq!(plan.projections.len(), 3);
+        let near = plan.near.unwrap();
+        assert_eq!(near.field, "embedding");
+        assert_eq!(near.vector, vec![1.0, 0.0]);
+        assert_eq!(near.k, 5);
+        assert_eq!(near.threshold, Some(0.8));
+    }
 }

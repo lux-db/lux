@@ -51,6 +51,7 @@ pub enum FieldType {
     Bool,
     Timestamp,
     Uuid,
+    Vector(usize),
     /// Legacy ref type - kept for backwards compat, prefer ForeignKey on FieldDef
     Ref(String),
 }
@@ -124,6 +125,10 @@ impl FieldType {
                 }
                 Ok(bytes)
             }
+            FieldType::Vector(dims) => {
+                let vector = parse_vector_value(value, *dims)?;
+                Ok(format_vector_value(&vector).into_bytes())
+            }
             FieldType::Ref(_) => {
                 let val = value
                     .parse::<i64>()
@@ -185,6 +190,7 @@ impl FieldType {
                     String::from_utf8_lossy(bytes).to_string()
                 }
             }
+            FieldType::Vector(_) => String::from_utf8_lossy(bytes).to_string(),
         }
     }
 }
@@ -215,6 +221,14 @@ pub struct WhereClause {
     pub field: String,
     pub op: CmpOp,
     pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NearClause {
+    pub field: String,
+    pub vector: Vec<f32>,
+    pub k: usize,
+    pub threshold: Option<f32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -250,10 +264,17 @@ pub struct AggExpr {
 /// A JOIN clause - supports explicit ON condition
 #[derive(Debug, Clone)]
 pub struct JoinClause {
+    pub join_type: JoinType,
     pub table: String,     // table to join
     pub alias: String,     // alias for that table (required)
     pub left_col: String,  // left side of ON: "alias.col"
     pub right_col: String, // right side of ON: "alias.col"
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Left,
 }
 
 /// The full query plan produced by the TSELECT parser
@@ -274,6 +295,15 @@ pub struct SelectPlan {
 
     // WHERE
     pub conditions: Vec<WhereClause>,
+
+    // GROUP BY
+    pub group_by: Vec<String>,
+
+    // HAVING
+    pub having: Vec<WhereClause>,
+
+    // NEAR vector search
+    pub near: Option<NearClause>,
 
     // ORDER BY (col, ascending)
     pub order_by: Option<(String, bool)>,
@@ -301,6 +331,10 @@ fn idx_sorted_key(table: &str, field: &str) -> String {
 
 fn idx_str_key(table: &str, field: &str, value: &str) -> String {
     format!("_t:{}:idx:{}:{}", table, field, value)
+}
+
+fn table_vector_key(table: &str, field: &str, pk: &str) -> String {
+    format!("_t:{}:vec:{}:{}", table, field, pk)
 }
 
 fn uniq_key(table: &str, field: &str) -> String {
@@ -368,9 +402,18 @@ fn parse_field_def(spec: &str) -> Result<FieldDef, String> {
         "BOOL" | "BOOLEAN" => FieldType::Bool,
         "TIMESTAMP" | "DATETIME" => FieldType::Timestamp,
         "UUID" => FieldType::Uuid,
+        t if t.starts_with("VECTOR(") && t.ends_with(')') => {
+            let dims = t[7..t.len() - 1]
+                .parse::<usize>()
+                .map_err(|_| format!("ERR invalid vector type '{}'", tokens[1]))?;
+            if dims == 0 {
+                return Err("ERR VECTOR dimension must be greater than zero".to_string());
+            }
+            FieldType::Vector(dims)
+        }
         other => {
             return Err(format!(
-                "ERR unknown field type '{}'. Valid types: STR, INT, FLOAT, BOOL, TIMESTAMP, UUID",
+                "ERR unknown field type '{}'. Valid types: STR, INT, FLOAT, BOOL, TIMESTAMP, UUID, VECTOR(n)",
                 other
             ))
         }
@@ -567,16 +610,17 @@ pub fn parse_column_list(args: &[&str]) -> Result<Vec<FieldDef>, String> {
 /// Format: type[|flag[|flag...]][|ref:table:col:on_delete]
 fn encode_field_def(def: &FieldDef) -> String {
     let type_str = match &def.field_type {
-        FieldType::Str => "str",
-        FieldType::Int => "int",
-        FieldType::Float => "float",
-        FieldType::Bool => "bool",
-        FieldType::Timestamp => "timestamp",
-        FieldType::Uuid => "uuid",
+        FieldType::Str => "str".to_string(),
+        FieldType::Int => "int".to_string(),
+        FieldType::Float => "float".to_string(),
+        FieldType::Bool => "bool".to_string(),
+        FieldType::Timestamp => "timestamp".to_string(),
+        FieldType::Uuid => "uuid".to_string(),
+        FieldType::Vector(dims) => format!("vector:{}", dims),
         FieldType::Ref(t) => return format!("ref|{}", t),
     };
 
-    let mut parts = vec![type_str.to_string()];
+    let mut parts = vec![type_str];
     if def.primary_key {
         parts.push("pk".to_string());
     }
@@ -613,6 +657,10 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
         "bool" => FieldType::Bool,
         "timestamp" => FieldType::Timestamp,
         "uuid" => FieldType::Uuid,
+        s if s.starts_with("vector:") => s[7..]
+            .parse::<usize>()
+            .map(FieldType::Vector)
+            .unwrap_or(FieldType::Vector(0)),
         // Legacy ref format from old colon-based schema
         "ref" => FieldType::Ref(parts.get(1).unwrap_or(&"").to_string()),
         _ => FieldType::Str,
@@ -745,7 +793,52 @@ fn validate_value(field: &FieldDef, value: &str) -> Result<(), String> {
             }
             Ok(())
         }
+        FieldType::Vector(dims) => {
+            parse_vector_value(value, *dims)?;
+            Ok(())
+        }
     }
+}
+
+fn parse_vector_value(value: &str, dims: usize) -> Result<Vec<f32>, String> {
+    let vector = parse_vector_literal(value)?;
+    if vector.len() != dims {
+        return Err(format!(
+            "ERR VECTOR({}) expected {} values, got {}",
+            dims,
+            dims,
+            vector.len()
+        ));
+    }
+    Ok(vector)
+}
+
+fn parse_vector_literal(value: &str) -> Result<Vec<f32>, String> {
+    let trimmed = value.trim().trim_start_matches('[').trim_end_matches(']');
+    if trimmed.is_empty() {
+        return Err("ERR vector requires at least one float value".to_string());
+    }
+
+    let mut vector = Vec::new();
+    for part in trimmed.split([',', ' ']) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        vector.push(
+            part.parse::<f32>()
+                .map_err(|_| format!("ERR invalid vector value '{}'", part))?,
+        );
+    }
+    Ok(vector)
+}
+
+fn format_vector_value(vector: &[f32]) -> String {
+    vector
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn next_id(store: &Store, table: &str, now: Instant) -> i64 {
@@ -793,6 +886,20 @@ fn add_to_index(
             let skey = idx_str_key(table, &field.name, value);
             let _ = store.sadd(skey.as_bytes(), &[pk_str.as_bytes()], now);
         }
+        FieldType::Vector(dims) => {
+            if let Ok(vector) = parse_vector_value(value, *dims) {
+                let metadata = serde_json::json!({
+                    "table": table,
+                    "field": field.name,
+                    "table_field": format!("{}.{}", table, field.name),
+                    "pk": pk_str,
+                    "id": pk_str,
+                })
+                .to_string();
+                let vkey = table_vector_key(table, &field.name, pk_str);
+                store.vset(vkey.as_bytes(), vector, Some(metadata), None, now);
+            }
+        }
     }
 }
 
@@ -816,6 +923,10 @@ fn remove_from_index(
         FieldType::Str | FieldType::Uuid => {
             let skey = idx_str_key(table, &field.name, value);
             let _ = store.srem(skey.as_bytes(), &[pk_str.as_bytes()], now);
+        }
+        FieldType::Vector(_) => {
+            let vkey = table_vector_key(table, &field.name, pk_str);
+            store.del(&[vkey.as_bytes()]);
         }
     }
 }
@@ -1630,6 +1741,18 @@ pub fn table_drop(
         .unwrap_or_default();
 
     for (pk_str, _) in &all_ids {
+        if schema
+            .iter()
+            .any(|field| matches!(field.field_type, FieldType::Vector(_)))
+        {
+            if let Some(row) = get_row(store, table, &schema, pk_str, now) {
+                for field in &schema {
+                    if let Some((_, value)) = row.iter().find(|(k, _)| k == &field.name) {
+                        remove_from_index(store, table, field, value, pk_str, now);
+                    }
+                }
+            }
+        }
         let rk = row_key_for_pk(table, pk_str);
         store.del(&[rk.as_bytes()]);
     }
@@ -1644,7 +1767,7 @@ pub fn table_drop(
                 let zkey = idx_sorted_key(table, &field.name);
                 store.del(&[zkey.as_bytes()]);
             }
-            FieldType::Str | FieldType::Uuid => {}
+            FieldType::Str | FieldType::Uuid | FieldType::Vector(_) => {}
         }
         if field.unique {
             let ukey = uniq_key(table, &field.name);
@@ -1692,6 +1815,7 @@ pub fn table_schema(
             FieldType::Bool => "BOOL".to_string(),
             FieldType::Timestamp => "TIMESTAMP".to_string(),
             FieldType::Uuid => "UUID".to_string(),
+            FieldType::Vector(dims) => format!("VECTOR({})", dims),
             FieldType::Ref(t) => format!("REFERENCES {}(id)", t),
         };
         let mut parts = vec![field.name.clone(), type_str];
@@ -1959,7 +2083,7 @@ fn matches_condition(row: &[(String, String)], cond: &WhereClause, field_def: &F
                 CmpOp::Le => lhs <= rhs,
             }
         }
-        FieldType::Str | FieldType::Uuid => match cond.op {
+        FieldType::Str | FieldType::Uuid | FieldType::Vector(_) => match cond.op {
             CmpOp::Eq => val == cond.value,
             CmpOp::Ne => val != cond.value,
             CmpOp::Gt => val > cond.value.as_str(),
@@ -1992,6 +2116,7 @@ fn candidates_from_index(
             }
             None
         }
+        FieldType::Vector(_) => None,
         FieldType::Int
         | FieldType::Float
         | FieldType::Bool
@@ -2108,8 +2233,7 @@ pub fn parse_select(args: &[&str]) -> Result<SelectPlan, String> {
 
     // Optional alias (not a keyword)
     let alias = if i < rest.len() {
-        let kw = rest[i].to_uppercase();
-        if kw != "JOIN" && kw != "WHERE" && kw != "ORDER" && kw != "LIMIT" && kw != "OFFSET" {
+        if !is_select_clause_keyword(rest[i]) {
             let a = rest[i].to_string();
             i += 1;
             Some(a)
@@ -2128,16 +2252,28 @@ pub fn parse_select(args: &[&str]) -> Result<SelectPlan, String> {
     // ---- Parse remaining clauses (JOIN / WHERE / ORDER BY / LIMIT / OFFSET) ----
     let mut joins = Vec::new();
     let mut conditions = Vec::new();
+    let mut group_by = Vec::new();
+    let mut having = Vec::new();
+    let mut near: Option<NearClause> = None;
     let mut order_by: Option<(String, bool)> = None;
     let mut limit: Option<usize> = None;
     let mut offset: Option<usize> = None;
 
     while i < rest.len() {
         match rest[i].to_uppercase().as_str() {
-            "JOIN" => {
+            "JOIN" | "LEFT" => {
+                let join_type = if rest[i].eq_ignore_ascii_case("LEFT") {
+                    i += 1;
+                    if i >= rest.len() || !rest[i].eq_ignore_ascii_case("JOIN") {
+                        return Err("ERR expected JOIN after LEFT".to_string());
+                    }
+                    JoinType::Left
+                } else {
+                    JoinType::Inner
+                };
                 i += 1;
                 // JOIN table alias ON left = right
-                if i + 4 >= rest.len() {
+                if i + 3 >= rest.len() {
                     return Err(
                         "ERR JOIN syntax: JOIN <table> <alias> ON <left> = <right>".to_string()
                     );
@@ -2159,6 +2295,7 @@ pub fn parse_select(args: &[&str]) -> Result<SelectPlan, String> {
                 let right = rest[i].to_string();
                 i += 1;
                 joins.push(JoinClause {
+                    join_type,
                     table: join_table,
                     alias: join_alias,
                     left_col: left,
@@ -2197,6 +2334,105 @@ pub fn parse_select(args: &[&str]) -> Result<SelectPlan, String> {
                         break;
                     }
                 }
+            }
+            "GROUP" => {
+                i += 1;
+                if i >= rest.len() || rest[i].to_uppercase() != "BY" {
+                    return Err("ERR expected BY after GROUP".to_string());
+                }
+                i += 1;
+                if i >= rest.len() || is_select_clause_keyword(rest[i]) {
+                    return Err("ERR GROUP BY requires at least one column".to_string());
+                }
+                while i < rest.len() && !is_select_clause_keyword(rest[i]) {
+                    for col in rest[i].split(',') {
+                        let col = col.trim();
+                        if !col.is_empty() {
+                            group_by.push(col.to_string());
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            "HAVING" => {
+                i += 1;
+                loop {
+                    if i >= rest.len() || is_select_clause_keyword(rest[i]) {
+                        return Err(
+                            "ERR incomplete HAVING clause: expected field op value".to_string()
+                        );
+                    }
+                    let field = rest[i].trim_end_matches(',').to_string();
+                    i += 1;
+                    if i >= rest.len() {
+                        return Err(format!(
+                            "ERR incomplete HAVING clause: missing operator after '{field}'"
+                        ));
+                    }
+                    let op_str = rest[i];
+                    i += 1;
+                    if i >= rest.len() {
+                        return Err(format!(
+                            "ERR incomplete HAVING clause: missing value after '{op_str}'"
+                        ));
+                    }
+                    let value = rest[i].trim_end_matches(',').to_string();
+                    i += 1;
+                    let op = parse_cmp_op(op_str)?;
+                    having.push(WhereClause { field, op, value });
+                    if i < rest.len() && rest[i].to_uppercase() == "AND" {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "NEAR" => {
+                i += 1;
+                if i + 3 >= rest.len() {
+                    return Err(
+                        "ERR NEAR syntax: NEAR <field> <vector> K <n> [THRESHOLD <score>]"
+                            .to_string(),
+                    );
+                }
+                let field = rest[i].to_string();
+                i += 1;
+                let vector_token = rest[i];
+                i += 1;
+                if i >= rest.len() || !rest[i].eq_ignore_ascii_case("K") {
+                    return Err("ERR NEAR requires K <n>".to_string());
+                }
+                i += 1;
+                if i >= rest.len() {
+                    return Err("ERR NEAR K requires a value".to_string());
+                }
+                let k = rest[i]
+                    .parse::<usize>()
+                    .map_err(|_| "ERR NEAR K must be a positive integer".to_string())?;
+                if k == 0 {
+                    return Err("ERR NEAR K must be greater than zero".to_string());
+                }
+                i += 1;
+                let mut threshold = None;
+                if i < rest.len() && rest[i].eq_ignore_ascii_case("THRESHOLD") {
+                    i += 1;
+                    if i >= rest.len() {
+                        return Err("ERR NEAR THRESHOLD requires a value".to_string());
+                    }
+                    threshold = Some(
+                        rest[i]
+                            .parse::<f32>()
+                            .map_err(|_| "ERR NEAR THRESHOLD must be a float".to_string())?,
+                    );
+                    i += 1;
+                }
+                let vector = parse_vector_literal(vector_token)?;
+                near = Some(NearClause {
+                    field,
+                    vector,
+                    k,
+                    threshold,
+                });
             }
             "ORDER" => {
                 i += 1;
@@ -2263,10 +2499,20 @@ pub fn parse_select(args: &[&str]) -> Result<SelectPlan, String> {
         aggregates,
         joins,
         conditions,
+        group_by,
+        having,
+        near,
         order_by,
         limit,
         offset,
     })
+}
+
+fn is_select_clause_keyword(token: &str) -> bool {
+    matches!(
+        token.to_uppercase().as_str(),
+        "JOIN" | "LEFT" | "WHERE" | "GROUP" | "HAVING" | "NEAR" | "ORDER" | "LIMIT" | "OFFSET"
+    )
 }
 
 fn parse_cmp_op(s: &str) -> Result<CmpOp, String> {
@@ -2438,6 +2684,11 @@ struct ScoreRange {
     max_exclusive: bool,
 }
 
+struct TableVectorMatch {
+    pk: String,
+    similarity: f32,
+}
+
 pub fn table_select(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -2472,7 +2723,11 @@ pub fn table_select(
     // ---- Fast-path aggregates (no row fetches needed) ----
     // We handle the common aggregate-only queries directly against the indexes,
     // bypassing full row hydration entirely.
-    if !plan.aggregates.is_empty() && plan.joins.is_empty() {
+    if !plan.aggregates.is_empty()
+        && plan.joins.is_empty()
+        && plan.group_by.is_empty()
+        && plan.having.is_empty()
+    {
         if let Some(agg_row) = try_fast_aggregate(
             store,
             &plan.table,
@@ -2508,13 +2763,24 @@ pub fn table_select(
     // Apply LIMIT early only when safe to do so:
     // - no joins (join changes the row count unpredictably)
     // - no ORDER BY (ordering requires all rows before truncating)
-    let early_limit = if plan.joins.is_empty() && plan.order_by.is_none() {
+    let early_limit = if plan.joins.is_empty() && plan.order_by.is_none() && plan.near.is_none() {
         plan.limit.map(|l| l + plan.offset.unwrap_or(0))
     } else {
         None
     };
 
-    let scan = plan_table_scan(
+    let vector_matches = match &plan.near {
+        Some(near) => Some(table_vector_candidates(
+            store,
+            &plan.table,
+            &schema,
+            near,
+            now,
+        )?),
+        None => None,
+    };
+
+    let mut scan = plan_table_scan(
         store,
         &plan.table,
         &schema,
@@ -2529,11 +2795,34 @@ pub fn table_select(
         now,
     );
 
+    let vector_similarity: Option<hashbrown::HashMap<String, f32>> =
+        vector_matches.as_ref().map(|matches| {
+            matches
+                .iter()
+                .map(|hit| (hit.pk.clone(), hit.similarity))
+                .collect()
+        });
+    if let Some(matches) = vector_matches.as_ref() {
+        let scan_ids: HashSet<String> = scan.row_ids.iter().cloned().collect();
+        if plan.order_by.is_none() {
+            scan.row_ids = matches
+                .iter()
+                .filter(|hit| scan_ids.contains(&hit.pk))
+                .map(|hit| hit.pk.clone())
+                .collect();
+            scan.order_satisfied = true;
+        } else if let Some(similarity) = vector_similarity.as_ref() {
+            scan.row_ids.retain(|pk| similarity.contains_key(pk));
+        }
+    }
+
     let mut rows: Vec<Vec<(String, String)>> = scan
         .row_ids
         .into_iter()
-        .filter_map(|pk_str| get_row_with_map(store, &plan.table, &type_map, &pk_str, now))
-        .filter(|row| {
+        .filter_map(|pk_str| {
+            get_row_with_map(store, &plan.table, &type_map, &pk_str, now).map(|row| (pk_str, row))
+        })
+        .filter(|(_, row)| {
             conditions.iter().all(|cond| {
                 let bare = bare_col(&cond.field);
                 if let Some(fd) = schema.iter().find(|f| f.name == bare) {
@@ -2568,7 +2857,13 @@ pub fn table_select(
         // Fix 3: project down to only needed columns before prefixing.
         // Only prefix with alias when there's an explicit alias or a join -
         // bare queries (no alias, no join) keep column names clean.
-        .map(|row| {
+        .map(|(pk_str, mut row)| {
+            if let Some(similarity) = vector_similarity
+                .as_ref()
+                .and_then(|scores| scores.get(&pk_str))
+            {
+                row.push(("_similarity".to_string(), similarity.to_string()));
+            }
             let ob_col = plan.order_by.as_ref().map(|(c, _)| c.as_str());
             // Also retain join key columns so the hash join probe can find them
             let join_keys: Vec<&str> = plan
@@ -2577,8 +2872,11 @@ pub fn table_select(
                 .flat_map(|j| [j.left_col.as_str(), j.right_col.as_str()])
                 .map(bare_col)
                 .collect();
-            let mut projected =
-                project_row_fields(&row, &plan.projections, &plan.aggregates, ob_col);
+            let mut projected = if plan.group_by.is_empty() {
+                project_row_fields(&row, &plan.projections, &plan.aggregates, ob_col)
+            } else {
+                row.clone()
+            };
             // Add any join key columns that were stripped but are needed
             for jk in &join_keys {
                 if !projected.iter().any(|(k, _)| k == jk) {
@@ -2633,7 +2931,38 @@ pub fn table_select(
 
     // ---- Slow-path aggregates (needed rows already fetched) ----
     if !plan.aggregates.is_empty() {
+        if !plan.group_by.is_empty() {
+            let mut grouped = compute_grouped_rows(&rows, &plan.group_by, &plan.aggregates);
+            if !plan.having.is_empty() {
+                grouped.retain(|row| matches_all_having(row, &plan.having));
+            }
+            if let Some((ref col, ascending)) = plan.order_by {
+                grouped.sort_by(|a, b| {
+                    let av = find_col(a, col, table_alias).unwrap_or("");
+                    let bv = find_col(b, col, table_alias).unwrap_or("");
+                    let cmp = compare_result_values(av, bv);
+                    if ascending {
+                        cmp
+                    } else {
+                        cmp.reverse()
+                    }
+                });
+            }
+            let grouped = if let Some(off) = plan.offset {
+                grouped.into_iter().skip(off).collect()
+            } else {
+                grouped
+            };
+            let mut grouped = grouped;
+            if let Some(lim) = plan.limit {
+                grouped.truncate(lim);
+            }
+            return Ok(SelectResult::Rows(grouped));
+        }
         let agg_row = compute_aggregates(&rows, &plan.aggregates);
+        if !plan.having.is_empty() && !matches_all_having(&agg_row, &plan.having) {
+            return Ok(SelectResult::Rows(Vec::new()));
+        }
         return Ok(SelectResult::Aggregate(agg_row));
     }
 
@@ -2775,6 +3104,66 @@ fn plan_table_scan(
         order_satisfied: false,
         pagination_satisfied: false,
     }
+}
+
+fn table_vector_candidates(
+    store: &Store,
+    table: &str,
+    schema: &[FieldDef],
+    near: &NearClause,
+    now: Instant,
+) -> Result<Vec<TableVectorMatch>, String> {
+    let field_name = bare_col(&near.field);
+    let field = schema
+        .iter()
+        .find(|field| field.name == field_name)
+        .ok_or_else(|| format!("ERR unknown vector field '{}'", near.field))?;
+    let FieldType::Vector(dims) = field.field_type else {
+        return Err(format!("ERR field '{}' is not a VECTOR column", near.field));
+    };
+    if near.vector.len() != dims {
+        return Err(format!(
+            "ERR VECTOR({}) expected {} query values, got {}",
+            dims,
+            dims,
+            near.vector.len()
+        ));
+    }
+
+    let table_field = format!("{}.{}", table, field.name);
+    let results = store.vsearch(
+        &near.vector,
+        near.k,
+        Some("table_field"),
+        Some(&table_field),
+        now,
+    );
+
+    let mut matches = Vec::with_capacity(results.len());
+    for (key, similarity, metadata) in results {
+        if let Some(threshold) = near.threshold {
+            if similarity < threshold {
+                continue;
+            }
+        }
+        let pk = metadata
+            .as_deref()
+            .and_then(vector_metadata_pk)
+            .or_else(|| key.rsplit(':').next().map(ToString::to_string));
+        if let Some(pk) = pk {
+            matches.push(TableVectorMatch { pk, similarity });
+        }
+    }
+    Ok(matches)
+}
+
+fn vector_metadata_pk(metadata: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(metadata).ok()?;
+    value
+        .get("pk")
+        .or_else(|| value.get("id"))
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
 }
 
 fn score_range_from_conditions(order_col: &str, conditions: &[WhereClause]) -> Option<ScoreRange> {
@@ -2935,7 +3324,7 @@ fn candidates_from_order_index(
             | FieldType::Bool
             | FieldType::Timestamp
             | FieldType::Ref(_) => idx_sorted_key(table, scan.column),
-            FieldType::Str | FieldType::Uuid => return None,
+            FieldType::Str | FieldType::Uuid | FieldType::Vector(_) => return None,
         }
     };
 
@@ -3019,6 +3408,19 @@ fn hash_join(
                     }
                 }
             }
+        } else if join.join_type == JoinType::Left {
+            let mut combined = left_row.clone();
+            combined.extend(
+                right_schema
+                    .iter()
+                    .map(|field| (format!("{}.{}", right_alias, field.name), String::new())),
+            );
+            result.push(combined);
+            if let Some(n) = need {
+                if result.len() >= n {
+                    break 'outer;
+                }
+            }
         }
     }
 
@@ -3059,6 +3461,13 @@ fn find_col<'a>(row: &'a [(String, String)], col: &str, alias: &str) -> Option<&
     row.iter()
         .find(|(k, _)| k == col || k == &qualified || k.ends_with(&format!(".{}", bare_col(col))))
         .map(|(_, v)| v.as_str())
+}
+
+fn compare_result_values(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(af), Ok(bf)) => af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal),
+        _ => a.cmp(b),
+    }
 }
 
 /// Apply column projections to result rows.
@@ -3387,6 +3796,76 @@ fn compute_aggregates(
         .collect()
 }
 
+fn compute_grouped_rows(
+    rows: &[Vec<(String, String)>],
+    group_by: &[String],
+    aggregates: &[AggExpr],
+) -> Vec<Vec<(String, String)>> {
+    let mut groups: hashbrown::HashMap<Vec<String>, Vec<Vec<(String, String)>>> =
+        hashbrown::HashMap::new();
+
+    for row in rows {
+        let key: Vec<String> = group_by
+            .iter()
+            .map(|col| {
+                row.iter()
+                    .find(|(k, _)| k == col || k.ends_with(&format!(".{}", bare_col(col))))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        groups.entry(key).or_default().push(row.clone());
+    }
+
+    let mut out = Vec::with_capacity(groups.len());
+    for (key, group_rows) in groups {
+        let mut row = Vec::with_capacity(group_by.len() + aggregates.len());
+        for (idx, col) in group_by.iter().enumerate() {
+            row.push((
+                bare_col(col).to_string(),
+                key.get(idx).cloned().unwrap_or_default(),
+            ));
+        }
+        row.extend(compute_aggregates(&group_rows, aggregates));
+        out.push(row);
+    }
+    out
+}
+
+fn matches_all_having(row: &[(String, String)], having: &[WhereClause]) -> bool {
+    having.iter().all(|cond| {
+        let actual = row
+            .iter()
+            .find(|(k, _)| k == &cond.field || k.eq_ignore_ascii_case(&cond.field))
+            .map(|(_, v)| v.as_str());
+        match actual {
+            None => cond.op == CmpOp::Ne,
+            Some(value) => compare_condition_value(value, &cond.op, &cond.value),
+        }
+    })
+}
+
+fn compare_condition_value(actual: &str, op: &CmpOp, expected: &str) -> bool {
+    if let (Ok(a), Ok(e)) = (actual.parse::<f64>(), expected.parse::<f64>()) {
+        return match op {
+            CmpOp::Eq => a == e,
+            CmpOp::Ne => a != e,
+            CmpOp::Gt => a > e,
+            CmpOp::Lt => a < e,
+            CmpOp::Ge => a >= e,
+            CmpOp::Le => a <= e,
+        };
+    }
+    match op {
+        CmpOp::Eq => actual == expected,
+        CmpOp::Ne => actual != expected,
+        CmpOp::Gt => actual > expected,
+        CmpOp::Lt => actual < expected,
+        CmpOp::Ge => actual >= expected,
+        CmpOp::Le => actual <= expected,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3428,6 +3907,9 @@ mod tests {
 
         let f = parse_field_def("id UUID").unwrap();
         assert_eq!(f.field_type, FieldType::Uuid);
+
+        let f = parse_field_def("embedding VECTOR(3)").unwrap();
+        assert_eq!(f.field_type, FieldType::Vector(3));
     }
 
     #[test]
@@ -3582,6 +4064,7 @@ mod tests {
             parse_field_def("score FLOAT").unwrap(),
             parse_field_def("active BOOL").unwrap(),
             parse_field_def("created_at TIMESTAMP").unwrap(),
+            parse_field_def("embedding VECTOR(3) NOT NULL").unwrap(),
             parse_field_def("team_id INT REFERENCES teams(id) ON DELETE CASCADE").unwrap(),
         ];
         for original in cases {
@@ -3645,6 +4128,14 @@ mod tests {
         let ft = FieldType::Uuid;
         assert!(ft.encode_value("not-a-uuid").is_err());
         assert!(ft.encode_value("550e8400-e29b-41d4-a716").is_err());
+    }
+
+    #[test]
+    fn encode_decode_vector() {
+        let ft = FieldType::Vector(3);
+        let encoded = ft.encode_value("[1, 0.5, -2]").unwrap();
+        assert_eq!(ft.decode_value(&encoded), "1,0.5,-2");
+        assert!(ft.encode_value("[1, 2]").is_err());
     }
 
     // -------------------------------------------------------------------------
@@ -3930,10 +4421,45 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(plan.joins.len(), 1);
+        assert_eq!(plan.joins[0].join_type, JoinType::Inner);
         assert_eq!(plan.joins[0].table, "posts");
         assert_eq!(plan.joins[0].alias, "p");
         assert_eq!(plan.joins[0].left_col, "p.author_id");
         assert_eq!(plan.joins[0].right_col, "u.id");
+    }
+
+    #[test]
+    fn parse_select_left_join_group_by_having() {
+        let plan = parse_select(&[
+            "team_id,",
+            "COUNT(*)",
+            "AS",
+            "member_count",
+            "FROM",
+            "members",
+            "m",
+            "LEFT",
+            "JOIN",
+            "teams",
+            "t",
+            "ON",
+            "m.team_id",
+            "=",
+            "t.id",
+            "GROUP",
+            "BY",
+            "team_id",
+            "HAVING",
+            "member_count",
+            ">",
+            "1",
+        ])
+        .unwrap();
+        assert_eq!(plan.joins.len(), 1);
+        assert_eq!(plan.joins[0].join_type, JoinType::Left);
+        assert_eq!(plan.group_by, vec!["team_id"]);
+        assert_eq!(plan.having.len(), 1);
+        assert_eq!(plan.having[0].field, "member_count");
     }
 
     #[test]
@@ -4022,12 +4548,8 @@ mod tests {
 
     #[test]
     fn parse_select_unknown_keyword_errors() {
-        // HAVING is not supported - parser should error somewhere after consuming it as alias
-        let result = parse_select(&["*", "FROM", "users", "HAVING", "age", ">", "25"]);
-        assert!(
-            result.is_err(),
-            "expected error for unsupported HAVING clause"
-        );
+        let result = parse_select(&["*", "FROM", "users", "BOGUS", "age", ">", "25"]);
+        assert!(result.is_err(), "expected error for unsupported clause");
     }
 
     #[test]
@@ -4058,13 +4580,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_select_having_not_supported() {
-        // HAVING is not a supported keyword - parser treats it as alias then errors on next token
-        let result = parse_select(&["*", "FROM", "users", "HAVING", "COUNT(*)", ">", "5"]);
-        assert!(
-            result.is_err(),
-            "expected error for unsupported HAVING clause"
-        );
+    fn parse_select_having() {
+        let plan = parse_select(&[
+            "COUNT(*)", "AS", "count", "FROM", "users", "HAVING", "count", ">", "5",
+        ])
+        .unwrap();
+        assert_eq!(plan.having.len(), 1);
+        assert_eq!(plan.having[0].field, "count");
+    }
+
+    #[test]
+    fn parse_select_near() {
+        let plan = parse_select(&[
+            "*",
+            "FROM",
+            "messages",
+            "NEAR",
+            "embedding",
+            "[1,0]",
+            "K",
+            "5",
+            "THRESHOLD",
+            "0.7",
+        ])
+        .unwrap();
+        let near = plan.near.unwrap();
+        assert_eq!(near.field, "embedding");
+        assert_eq!(near.vector, vec![1.0, 0.0]);
+        assert_eq!(near.k, 5);
+        assert_eq!(near.threshold, Some(0.7));
     }
 
     #[test]
@@ -4423,6 +4967,286 @@ mod tests {
             }
             _ => panic!("expected rows"),
         }
+    }
+
+    #[test]
+    fn select_left_join_preserves_unmatched_left_rows() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+
+        table_create(
+            &store,
+            &cache,
+            "teams",
+            &["id INT PRIMARY KEY,", "name STR"],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "teams",
+            &[("id", "1"), ("name", "Engineering")],
+            now,
+        )
+        .unwrap();
+
+        table_create(
+            &store,
+            &cache,
+            "members",
+            &["id INT PRIMARY KEY,", "username STR,", "team_id INT"],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "members",
+            &[("id", "1"), ("username", "alice"), ("team_id", "1")],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "members",
+            &[("id", "2"), ("username", "bob"), ("team_id", "2")],
+            now,
+        )
+        .unwrap();
+
+        let plan = parse_select(&[
+            "m.username,",
+            "t.name",
+            "FROM",
+            "members",
+            "m",
+            "LEFT",
+            "JOIN",
+            "teams",
+            "t",
+            "ON",
+            "m.team_id",
+            "=",
+            "t.id",
+            "ORDER",
+            "BY",
+            "m.id",
+        ])
+        .unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+        match result {
+            SelectResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2);
+                assert!(rows[0].iter().any(|(k, v)| k == "username" && v == "alice"));
+                assert!(rows[0]
+                    .iter()
+                    .any(|(k, v)| k == "name" && v == "Engineering"));
+                assert!(rows[1].iter().any(|(k, v)| k == "username" && v == "bob"));
+                assert!(rows[1].iter().any(|(k, v)| k == "name" && v.is_empty()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn select_group_by_having_filters_aggregate_rows() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+
+        table_create(
+            &store,
+            &cache,
+            "members",
+            &["id INT PRIMARY KEY,", "username STR,", "team_id INT"],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "members",
+            &[("id", "1"), ("username", "alice"), ("team_id", "1")],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "members",
+            &[("id", "2"), ("username", "bob"), ("team_id", "1")],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "members",
+            &[("id", "3"), ("username", "carol"), ("team_id", "2")],
+            now,
+        )
+        .unwrap();
+
+        let plan = parse_select(&[
+            "team_id,",
+            "COUNT(*)",
+            "AS",
+            "member_count",
+            "FROM",
+            "members",
+            "GROUP",
+            "BY",
+            "team_id",
+            "HAVING",
+            "member_count",
+            ">",
+            "1",
+        ])
+        .unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+        match result {
+            SelectResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert!(rows[0].iter().any(|(k, v)| k == "team_id" && v == "1"));
+                assert!(rows[0].iter().any(|(k, v)| k == "member_count" && v == "2"));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn select_near_vector_field_returns_matching_rows_with_similarity() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+
+        table_create(
+            &store,
+            &cache,
+            "messages",
+            &[
+                "id INT PRIMARY KEY,",
+                "channel STR,",
+                "body STR,",
+                "embedding VECTOR(2)",
+            ],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "messages",
+            &[
+                ("id", "1"),
+                ("channel", "general"),
+                ("body", "rust database"),
+                ("embedding", "[1,0]"),
+            ],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "messages",
+            &[
+                ("id", "2"),
+                ("channel", "general"),
+                ("body", "semantic realtime"),
+                ("embedding", "[0.95,0.05]"),
+            ],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "messages",
+            &[
+                ("id", "3"),
+                ("channel", "random"),
+                ("body", "unrelated"),
+                ("embedding", "[0,1]"),
+            ],
+            now,
+        )
+        .unwrap();
+
+        let plan = parse_select(&[
+            "id,",
+            "body,",
+            "_similarity",
+            "FROM",
+            "messages",
+            "WHERE",
+            "channel",
+            "=",
+            "general",
+            "NEAR",
+            "embedding",
+            "[1,0]",
+            "K",
+            "5",
+            "THRESHOLD",
+            "0.9",
+        ])
+        .unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+        match result {
+            SelectResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(
+                    rows[0]
+                        .iter()
+                        .find(|(k, _)| k == "id")
+                        .map(|(_, v)| v.as_str()),
+                    Some("1")
+                );
+                assert!(rows[0].iter().any(|(k, _)| k == "_similarity"));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn vector_field_update_and_delete_maintain_vector_index() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+
+        table_create(
+            &store,
+            &cache,
+            "docs",
+            &["id INT PRIMARY KEY,", "embedding VECTOR(2)"],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "docs",
+            &[("id", "1"), ("embedding", "[1,0]")],
+            now,
+        )
+        .unwrap();
+        assert_eq!(store.vcard(now), 1);
+
+        table_update(&store, &cache, "docs", 1, &[("embedding", "[0,1]")], now).unwrap();
+        let plan =
+            parse_select(&["id", "FROM", "docs", "NEAR", "embedding", "[0,1]", "K", "1"]).unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+        match result {
+            SelectResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            _ => panic!("expected rows"),
+        }
+
+        table_delete(&store, &cache, "docs", 1, now).unwrap();
+        assert_eq!(store.vcard(now), 0);
     }
 
     #[test]

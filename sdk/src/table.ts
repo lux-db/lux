@@ -7,7 +7,6 @@ import type {
 	TableErrorEvent,
 	TableRow,
 	TableSchema,
-	VSearchResult,
 } from './types';
 import { err, ok, toLuxError } from './utils';
 
@@ -21,6 +20,7 @@ interface TableWhereCondition {
 }
 
 interface TableJoinClause {
+	type: 'INNER' | 'LEFT';
 	table: string;
 	alias: string;
 	onLeft: string;
@@ -31,17 +31,13 @@ interface TableSimilarityClause {
 	field: string;
 	vector: number[];
 	k: number;
-	filter?: { key: string; value: string };
+	threshold?: number;
 }
 
 interface TableClient {
 	call(command: string, ...args: Array<string | number>): Promise<unknown>;
 	_tselect(args: string[]): Promise<TableRow[]>;
 	_subscribePattern(pattern: string, handler: (event: KSubEvent) => void): Promise<() => void>;
-	vsearch(
-		query: number[],
-		options: { k: number; filter?: { key: string; value: string }; meta?: boolean },
-	): Promise<VSearchResult[]>;
 }
 
 export interface TableQueryBuilderOptions<T extends TableRow> {
@@ -244,7 +240,7 @@ export class TableQueryBuilder<T extends TableRow = TableRow> {
 
 		if (this.joinClause) {
 			args.push(
-				'JOIN',
+				...(this.joinClause.type === 'LEFT' ? ['LEFT', 'JOIN'] : ['JOIN']),
 				this.joinClause.table,
 				this.joinClause.alias,
 				'ON',
@@ -262,6 +258,19 @@ export class TableQueryBuilder<T extends TableRow = TableRow> {
 				if (i < allConditions.length - 1) {
 					args.push('AND');
 				}
+			}
+		}
+
+		if (this.similarityClause) {
+			args.push(
+				'NEAR',
+				this.similarityClause.field,
+				`[${this.similarityClause.vector.join(',')}]`,
+				'K',
+				String(this.similarityClause.k),
+			);
+			if (this.similarityClause.threshold != null) {
+				args.push('THRESHOLD', String(this.similarityClause.threshold));
 			}
 		}
 
@@ -341,79 +350,32 @@ export class TableQueryBuilder<T extends TableRow = TableRow> {
 	}
 
 	join(table: string, alias: string, onLeft: string, onRight: string): this {
-		this.joinClause = { table, alias, onLeft, onRight };
+		this.joinClause = { type: 'INNER', table, alias, onLeft, onRight };
 		return this;
 	}
 
-	similar(field: string, vector: number[], options: { k: number; filter?: { key: string; value: string } }): this {
+	leftJoin(table: string, alias: string, onLeft: string, onRight: string): this {
+		this.joinClause = { type: 'LEFT', table, alias, onLeft, onRight };
+		return this;
+	}
+
+	near(field: string, vector: number[], options: { k?: number; threshold?: number } = {}): this {
 		this.similarityClause = {
 			field,
 			vector,
-			k: options.k,
-			filter: options.filter,
+			k: options.k ?? 10,
+			threshold: options.threshold,
 		};
 		return this;
 	}
 
-	private parseSimilarityPk(result: VSearchResult, field: string): string | null {
-		const metadata = result.metadata;
-		if (metadata && typeof metadata === 'object') {
-			for (const key of ['id', 'pk', 'row_id']) {
-				const value = (metadata as Record<string, unknown>)[key];
-				if (value != null) return String(value);
-			}
-		}
-
-		const expectedPrefix = `${this.name}:${field}:`;
-		if (result.key.startsWith(expectedPrefix)) {
-			return result.key.slice(expectedPrefix.length);
-		}
-
-		const segments = result.key.split(':');
-		if (segments.length > 0) {
-			return segments[segments.length - 1] || null;
-		}
-
-		return null;
+	similar(field: string, vector: number[], options: { k?: number; threshold?: number } = {}): this {
+		return this.near(field, vector, options);
 	}
 
 	async run(): Promise<LuxResult<T[] | T>> {
 		try {
-			let rows: TableRow[] = [];
-
-			if (this.similarityClause) {
-				if (this.joinClause) {
-					return err(
-						'SIMILAR_JOIN_UNSUPPORTED',
-						'similar(...) cannot be combined with join(...) yet',
-					);
-				}
-
-				const similarResults = await this.client.vsearch(this.similarityClause.vector, {
-					k: this.similarityClause.k,
-					filter: this.similarityClause.filter,
-					meta: true,
-				});
-
-				for (const match of similarResults) {
-					const pk = this.parseSimilarityPk(match, this.similarityClause.field);
-					if (!pk) continue;
-
-					const args = this.buildSelectArgs([{ field: 'id', op: '=', value: pk }]);
-					const one = await this.client._tselect(args);
-					if (one.length === 0) continue;
-
-					rows.push({ ...one[0], _similarity: match.similarity });
-				}
-
-				if (this.offsetCount != null || this.limitCount != null) {
-					const start = this.offsetCount ?? 0;
-					const end = this.limitCount != null ? start + this.limitCount : undefined;
-					rows = rows.slice(start, end);
-				}
-			} else {
-				rows = await this.client._tselect(this.buildSelectArgs());
-			}
+			const rows = await this.client._tselect(this.buildSelectArgs());
 
 			const validated = rows.map((row) => this.validateRow(row));
 
@@ -518,17 +480,6 @@ export class TableQueryBuilder<T extends TableRow = TableRow> {
 	}
 
 	subscribe(): TableSubscription<T> {
-		if (this.similarityClause) {
-			return new TableSubscription<T>(
-				this.client,
-				this.name,
-				(extra) => this.buildSelectArgs(extra),
-				{
-					code: 'SIMILAR_SUBSCRIBE_UNSUPPORTED',
-					message: 'subscribe() is not supported on similar(...) queries yet',
-				},
-			);
-		}
 		return new TableSubscription<T>(this.client, this.name, (extra) => this.buildSelectArgs(extra));
 	}
 }

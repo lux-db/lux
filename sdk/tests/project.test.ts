@@ -122,11 +122,13 @@ describe('Lux project client', () => {
 		await client.table('messages').select().eq('id', 1).limit(10);
 		await client.table('messages').select().gte('created_at', 1780000000);
 		await client.table('messages').select().gt('age', 25).order('age', { ascending: false }).range(5, 14);
+		await client.table('messages').select('id,body,_similarity').near('embedding', [1, 0], { k: 5, threshold: 0.8 });
 
 		expect(seen).toEqual([
 			'http://localhost:3957/v1/project/tables/messages?where=id+%3D+1&limit=10',
 			'http://localhost:3957/v1/project/tables/messages?where=created_at+%3E%3D+1780000000',
 			'http://localhost:3957/v1/project/tables/messages?where=age+%3E+25&order=age+DESC&limit=10&offset=5',
+			'http://localhost:3957/v1/project/tables/messages?near_field=embedding&near_vector=%5B1%2C0%5D&near_k=5&near_threshold=0.8&select=id%2Cbody%2C_similarity',
 		]);
 	});
 
@@ -379,6 +381,7 @@ describe('Lux project client', () => {
 		const sub = client
 			.table<{ id: number; channel_id: string; body: string }>('messages')
 			.eq('channel_id', 'room-1')
+			.near('embedding', [1, 0], { k: 3, threshold: 0.75 })
 			.live()
 			.on('snapshot', (event) => events.push(event))
 			.on('insert', (event) => events.push(event));
@@ -398,6 +401,7 @@ describe('Lux project client', () => {
 				table: 'messages',
 				select: '*',
 				where: [{ field: 'channel_id', op: '=', value: 'room-1' }],
+				near: { field: 'embedding', vector: [1, 0], k: 3, threshold: 0.75 },
 			},
 		});
 

@@ -12,7 +12,7 @@ export interface LuxProjectOptions {
 
 export interface LuxTableColumn {
 	name: string;
-	type: 'STR' | 'INT' | 'FLOAT' | 'BOOL' | 'TIMESTAMP' | 'UUID';
+	type: 'STR' | 'INT' | 'FLOAT' | 'BOOL' | 'TIMESTAMP' | 'UUID' | `VECTOR(${number})`;
 	primaryKey?: boolean;
 	unique?: boolean;
 	notNull?: boolean;
@@ -27,7 +27,7 @@ export interface LuxVectorSearchOptions {
 	filter_value?: string;
 }
 
-type QueryValue = string | number | boolean | null;
+type QueryValue = string | number | boolean | number[] | null;
 type FilterOperator = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'is';
 
 interface QueryFilter {
@@ -39,6 +39,13 @@ interface QueryFilter {
 interface QueryOrder {
 	column: string;
 	ascending: boolean;
+}
+
+interface QueryNear {
+	field: string;
+	vector: number[];
+	k: number;
+	threshold?: number;
 }
 
 export type LuxProjectLiveEventType = 'snapshot' | 'insert' | 'update' | 'delete' | 'error';
@@ -298,6 +305,10 @@ export class LuxProjectTable<T extends Record<string, unknown>> {
 		return this.select().lte(column, value);
 	}
 
+	near(column: string, vector: number[], options: { k?: number; threshold?: number } = {}): LuxProjectSelectBuilder<T, T[]> {
+		return this.select().near(column, vector, options);
+	}
+
 	is(column: string, value: QueryValue): LuxProjectSelectBuilder<T, T[]> {
 		return this.select().is(column, value);
 	}
@@ -353,6 +364,7 @@ abstract class LuxProjectThenable<TResult> implements PromiseLike<LuxResult<TRes
 abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenable<TResult> {
 	protected filters: QueryFilter[] = [];
 	protected orderBy?: QueryOrder;
+	protected nearQuery?: QueryNear;
 	protected limitCount?: number;
 	protected offsetCount?: number;
 
@@ -399,6 +411,14 @@ abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenabl
 	protected filteredQueryParams(): URLSearchParams {
 		const params = new URLSearchParams();
 		if (this.filters.length) params.set('where', filtersToWhere(this.filters));
+		if (this.nearQuery) {
+			params.set('near_field', this.nearQuery.field);
+			params.set('near_vector', `[${this.nearQuery.vector.join(',')}]`);
+			params.set('near_k', String(this.nearQuery.k));
+			if (this.nearQuery.threshold != null) {
+				params.set('near_threshold', String(this.nearQuery.threshold));
+			}
+		}
 		if (this.orderBy) {
 			params.set('order', `${this.orderBy.column} ${this.orderBy.ascending ? 'ASC' : 'DESC'}`);
 		}
@@ -421,6 +441,16 @@ export class LuxProjectSelectBuilder<T extends Record<string, unknown>, TResult>
 
 	order(column: string, options: { ascending?: boolean } = {}): this {
 		this.orderBy = { column, ascending: options.ascending ?? true };
+		return this;
+	}
+
+	near(column: string, vector: number[], options: { k?: number; threshold?: number } = {}): this {
+		this.nearQuery = {
+			field: column,
+			vector,
+			k: options.k ?? 10,
+			threshold: options.threshold,
+		};
 		return this;
 	}
 
@@ -467,6 +497,7 @@ export class LuxProjectSelectBuilder<T extends Record<string, unknown>, TResult>
 			this.tableName,
 			this.columns,
 			this.filters,
+			this.nearQuery,
 			this.orderBy,
 			this.limitCount,
 			this.offsetCount,
@@ -490,6 +521,7 @@ export class LuxProjectLiveSubscription<T extends Record<string, unknown>> {
 		private table: string,
 		private columns: string,
 		private filters: QueryFilter[],
+		private nearQuery?: QueryNear,
 		private orderBy?: QueryOrder,
 		private limitCount?: number,
 		private offsetCount?: number,
@@ -533,6 +565,14 @@ export class LuxProjectLiveSubscription<T extends Record<string, unknown>> {
 				op: filterOperatorToWhere(filter.operator),
 				value: filter.value,
 			}));
+		}
+		if (this.nearQuery) {
+			spec.near = {
+				field: this.nearQuery.field,
+				vector: this.nearQuery.vector,
+				k: this.nearQuery.k,
+				threshold: this.nearQuery.threshold,
+			};
 		}
 		if (this.orderBy) {
 			spec.orderBy = {

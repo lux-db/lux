@@ -77,10 +77,10 @@ Lux Cloud is the fastest path when you want to build an app backend around Lux w
 ## Features
 
 - **200+ commands** -- strings, lists, hashes, sets, sorted sets, streams, vectors, geo, time series, tables, HyperLogLog, bitops, pub/sub, transactions
-- **Relational tables** -- TCREATE, TINSERT, TSELECT, TUPDATE (WHERE), TDELETE (WHERE), TALTER with typed fields (str, int, float, bool, timestamp, uuid), unique constraints, foreign keys, joins, WHERE/ORDER BY/LIMIT. Structured data without standing up a separate primary database
+- **Relational tables** -- TCREATE, TINSERT, TSELECT, TUPDATE (WHERE), TDELETE (WHERE), TALTER with typed fields (str, int, float, bool, timestamp, uuid, vector), unique constraints, foreign keys, joins, GROUP BY/HAVING, WHERE/ORDER BY/LIMIT, and vector-aware NEAR queries. Structured data without standing up a separate primary database
 - **Realtime key subscriptions** -- KSUB/KUNSUB: subscribe to key patterns, receive events when matching keys are mutated. Zero overhead when unused. No global config flags, no separate services. Unlike Redis keyspace notifications which tax every write globally, KSUB is surgical and async
 - **Native time series** -- TSADD, TSGET, TSRANGE, TSMRANGE with aggregation (avg, sum, min, max, count, std), retention policies, and label-based filtering. No modules, no sidecars. TSGET 4x faster than Redis GET
-- **Native vector search** -- VSET, VGET, VSEARCH with cosine similarity and metadata filtering. No extensions, no sidecars
+- **Native vector search** -- VSET, VGET, VSEARCH with cosine similarity and metadata filtering, plus `VECTOR(n)` table columns that compose with table filters and live queries. No extensions, no sidecars
 - **GEO commands** -- GEOADD, GEOSEARCH, GEODIST, GEOPOS, GEOHASH, GEORADIUS with up to 10x faster spatial queries
 - **LRU eviction** -- maxmemory with allkeys-lru, volatile-lru, allkeys-random, volatile-random policies
 - **BullMQ compatible** -- blocking commands, streams, Lua scripting with cmsgpack/cjson
@@ -253,7 +253,7 @@ Built for reactive applications, cache invalidation, live dashboards, and any us
 
 ### Tables
 
-Built-in relational tables with typed fields, indexes, unique constraints, foreign keys, and joins.
+Built-in relational tables with typed fields, indexes, unique constraints, foreign keys, joins, grouped aggregates, and native vector fields.
 
 ```bash
 # Create a table with typed fields
@@ -271,6 +271,15 @@ redis-cli TCREATE posts "id INT PRIMARY KEY," "title STR," "author_id INT REFERE
 redis-cli TINSERT posts id 1 title "Hello World" author_id 1
 redis-cli TSELECT '*' FROM posts p JOIN users u ON p.author_id = u.id
 
+# Grouped aggregates and left joins
+redis-cli TSELECT author_id, COUNT(*) AS post_count FROM posts GROUP BY author_id HAVING post_count '>' 1
+redis-cli TSELECT '*' FROM posts p LEFT JOIN users u ON p.author_id = u.id
+
+# Vector fields compose with table filters
+redis-cli TCREATE messages "id INT PRIMARY KEY," "channel STR," "body STR," "embedding VECTOR(3)"
+redis-cli TINSERT messages id 1 channel general body hello embedding "[0.1,0.2,0.3]"
+redis-cli TSELECT id, body, _similarity FROM messages WHERE channel = general NEAR embedding "[0.1,0.2,0.3]" K 10 THRESHOLD 0.8
+
 # Update and delete by predicates
 redis-cli TUPDATE users SET active true WHERE id = 1
 redis-cli TDELETE FROM users WHERE id = 2
@@ -280,7 +289,7 @@ redis-cli TALTER users ADD role STR
 redis-cli TALTER users DROP role
 ```
 
-Field types: `STR`, `INT`, `FLOAT`, `BOOL`, `TIMESTAMP`, `UUID`.
+Field types: `STR`, `INT`, `FLOAT`, `BOOL`, `TIMESTAMP`, `UUID`, `VECTOR(n)`.
 Use SQL-style constraints like `UNIQUE`, `PRIMARY KEY`, and `REFERENCES table(field)`.
 
 ### CLI
@@ -355,8 +364,9 @@ await lux
   .eq("id", 42)
 
 const sub = lux
-  .table<{ id: string; channel_id: string; body: string }>("messages")
+  .table<{ id: string; channel_id: string; body: string; _similarity?: number }>("messages")
   .eq("channel_id", "general")
+  .near("embedding", queryEmbedding, { k: 20, threshold: 0.8 })
   .live()
   .on("insert", (event) => {
     console.log(event.new)
