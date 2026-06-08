@@ -2865,20 +2865,25 @@ pub fn table_select(
                 row.push(("_similarity".to_string(), similarity.to_string()));
             }
             let ob_col = plan.order_by.as_ref().map(|(c, _)| c.as_str());
-            // Also retain join key columns so the hash join probe can find them
+            // Also retain join key and WHERE columns so the hash join probe and
+            // post-join filters can find them after projection pushdown.
             let join_keys: Vec<&str> = plan
                 .joins
                 .iter()
                 .flat_map(|j| [j.left_col.as_str(), j.right_col.as_str()])
                 .map(bare_col)
                 .collect();
+            let condition_keys: Vec<&str> = plan
+                .conditions
+                .iter()
+                .map(|condition| bare_col(&condition.field))
+                .collect();
             let mut projected = if plan.group_by.is_empty() {
                 project_row_fields(&row, &plan.projections, &plan.aggregates, ob_col)
             } else {
                 row.clone()
             };
-            // Add any join key columns that were stripped but are needed
-            for jk in &join_keys {
+            for jk in join_keys.iter().chain(condition_keys.iter()) {
                 if !projected.iter().any(|(k, _)| k == jk) {
                     if let Some(val) = row.iter().find(|(k, _)| k == jk) {
                         projected.push(val.clone());
@@ -2916,14 +2921,7 @@ pub fn table_select(
                     .map(|(_, v)| v.as_str());
                 match val {
                     None => cond.op == CmpOp::Ne,
-                    Some(v) => match cond.op {
-                        CmpOp::Eq => v == cond.value,
-                        CmpOp::Ne => v != cond.value,
-                        CmpOp::Gt => v > cond.value.as_str(),
-                        CmpOp::Lt => v < cond.value.as_str(),
-                        CmpOp::Ge => v >= cond.value.as_str(),
-                        CmpOp::Le => v <= cond.value.as_str(),
-                    },
+                    Some(v) => compare_condition_value(v, &cond.op, &cond.value),
                 }
             })
         });
@@ -3455,12 +3453,22 @@ fn strip_alias(col: &str, alias: &str) -> String {
     }
 }
 
-/// Find a column value in a row, trying "alias.col" then "col" then suffix match.
+/// Find a column value in a row, preferring exact qualified matches before
+/// falling back to bare-column matches.
 fn find_col<'a>(row: &'a [(String, String)], col: &str, alias: &str) -> Option<&'a str> {
     let qualified = format!("{}.{}", alias, bare_col(col));
+    if let Some((_, value)) = row.iter().find(|(k, _)| k == col) {
+        return Some(value);
+    }
+    if let Some((_, value)) = row.iter().find(|(k, _)| k == &qualified) {
+        return Some(value);
+    }
+    if col.contains('.') {
+        return None;
+    }
     row.iter()
-        .find(|(k, _)| k == col || k == &qualified || k.ends_with(&format!(".{}", bare_col(col))))
-        .map(|(_, v)| v.as_str())
+        .find(|(k, _)| k == bare_col(col) || k.ends_with(&format!(".{}", bare_col(col))))
+        .map(|(_, value)| value.as_str())
 }
 
 fn compare_result_values(a: &str, b: &str) -> std::cmp::Ordering {
@@ -3482,13 +3490,20 @@ fn project_columns(
                 .iter()
                 .filter_map(|proj| {
                     let target = &proj.expr;
-                    // Try exact match, then alias.col match, then bare col match
+                    let qualified = format!("{}.{}", table_alias, bare_col(target));
                     let val = row
                         .iter()
-                        .find(|(k, _)| {
-                            k == target
-                                || k == &format!("{}.{}", table_alias, target)
-                                || k.ends_with(&format!(".{}", bare_col(target)))
+                        .find(|(k, _)| k == target)
+                        .or_else(|| row.iter().find(|(k, _)| k == &qualified))
+                        .or_else(|| {
+                            if target.contains('.') {
+                                None
+                            } else {
+                                row.iter().find(|(k, _)| {
+                                    k == bare_col(target)
+                                        || k.ends_with(&format!(".{}", bare_col(target)))
+                                })
+                            }
                         })
                         .map(|(_, v)| v.clone());
 
@@ -4964,6 +4979,178 @@ mod tests {
                     .filter(|r| r.iter().any(|(_, v)| v == "Engineering"))
                     .collect();
                 assert_eq!(eng_rows.len(), 2);
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn select_multi_join_resolves_qualified_duplicate_column_names() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+
+        table_create(
+            &store,
+            &cache,
+            "organizations",
+            &["id INT PRIMARY KEY,", "name STR"],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "organizations",
+            &[("id", "1"), ("name", "Pompeii Labs")],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "organizations",
+            &[("id", "2"), ("name", "Neptune Systems")],
+            now,
+        )
+        .unwrap();
+
+        table_create(
+            &store,
+            &cache,
+            "users",
+            &["id INT PRIMARY KEY,", "email STR"],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "users",
+            &[("id", "1"), ("email", "matty@pompeii.test")],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "users",
+            &[("id", "2"), ("email", "hunter@pompeii.test")],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "users",
+            &[("id", "3"), ("email", "ops@neptune.test")],
+            now,
+        )
+        .unwrap();
+
+        table_create(
+            &store,
+            &cache,
+            "projects",
+            &[
+                "id INT PRIMARY KEY,",
+                "org_id INT,",
+                "owner_id INT,",
+                "name STR,",
+                "priority INT",
+            ],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "projects",
+            &[
+                ("id", "10"),
+                ("org_id", "1"),
+                ("owner_id", "1"),
+                ("name", "Lux Auth"),
+                ("priority", "9"),
+            ],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "projects",
+            &[
+                ("id", "11"),
+                ("org_id", "1"),
+                ("owner_id", "2"),
+                ("name", "Realtime Engine"),
+                ("priority", "10"),
+            ],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "projects",
+            &[
+                ("id", "20"),
+                ("org_id", "2"),
+                ("owner_id", "3"),
+                ("name", "Vector Ops"),
+                ("priority", "5"),
+            ],
+            now,
+        )
+        .unwrap();
+
+        let plan = parse_select(&[
+            "p.name,",
+            "u.email,",
+            "o.name",
+            "AS",
+            "org_name",
+            "FROM",
+            "projects",
+            "p",
+            "JOIN",
+            "users",
+            "u",
+            "ON",
+            "p.owner_id",
+            "=",
+            "u.id",
+            "JOIN",
+            "organizations",
+            "o",
+            "ON",
+            "p.org_id",
+            "=",
+            "o.id",
+            "WHERE",
+            "p.priority",
+            ">=",
+            "5",
+        ])
+        .unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+        match result {
+            SelectResult::Rows(rows) => {
+                assert_eq!(rows.len(), 3);
+                assert!(rows.iter().any(|row| {
+                    row.iter()
+                        .any(|(k, v)| k == "name" && v == "Realtime Engine")
+                        && row
+                            .iter()
+                            .any(|(k, v)| k == "org_name" && v == "Pompeii Labs")
+                }));
+                assert!(rows.iter().any(|row| {
+                    row.iter().any(|(k, v)| k == "name" && v == "Vector Ops")
+                        && row
+                            .iter()
+                            .any(|(k, v)| k == "org_name" && v == "Neptune Systems")
+                }));
             }
             _ => panic!("expected rows"),
         }
