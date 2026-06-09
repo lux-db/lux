@@ -14,6 +14,99 @@ export interface LuxAuthUser {
 	app_metadata?: Record<string, unknown>;
 }
 
+export type LuxUser = LuxAuthUser;
+
+export interface LuxAuthUserRow {
+	id: string;
+	email?: string;
+	phone?: string;
+	encrypted_password?: string;
+	email_confirmed_at?: number | null;
+	phone_confirmed_at?: number | null;
+	raw_user_meta_data?: string;
+	raw_app_meta_data?: string;
+	created_at?: number | null;
+	updated_at?: number | null;
+	last_sign_in_at?: number | null;
+	banned_until?: number | null;
+	deleted_at?: number | null;
+}
+
+export interface LuxAuthIdentityRow {
+	id: string;
+	user_id: string;
+	provider: string;
+	provider_id: string;
+	identity_data?: string;
+	created_at?: number | null;
+	updated_at?: number | null;
+}
+
+export interface LuxAuthSessionRow {
+	id: string;
+	user_id: string;
+	refresh_token_hash: string;
+	refresh_token_family?: string;
+	user_agent?: string;
+	ip?: string;
+	expires_at?: number | null;
+	revoked_at?: number | null;
+	created_at?: number | null;
+	updated_at?: number | null;
+}
+
+export interface LuxAuthKeyRow {
+	id: string;
+	name?: string;
+	kind: 'publishable' | 'secret' | string;
+	prefix: string;
+	key_hash: string;
+	scopes?: string;
+	created_at?: number | null;
+	revoked_at?: number | null;
+	last_used_at?: number | null;
+}
+
+export interface LuxAuthSigningKeyRow {
+	id: string;
+	kid: string;
+	algorithm: string;
+	public_jwk?: string;
+	private_key_encrypted?: string;
+	active: boolean;
+	created_at?: number | null;
+	rotated_at?: number | null;
+}
+
+export interface LuxAuthGrantRow {
+	id: string;
+	user_id: string;
+	capability: string;
+	created_at?: number | null;
+	revoked_at?: number | null;
+}
+
+export interface LuxAuthProviderRow {
+	provider: LuxOAuthProvider | string;
+	enabled: boolean;
+	client_id?: string;
+	client_secret?: string;
+	redirect_uri?: string;
+	scopes?: string;
+	created_at?: number | null;
+	updated_at?: number | null;
+}
+
+export interface LuxAuthTables {
+	'auth.users': LuxAuthUserRow;
+	'auth.identities': LuxAuthIdentityRow;
+	'auth.sessions': LuxAuthSessionRow;
+	'auth.keys': LuxAuthKeyRow;
+	'auth.signing_keys': LuxAuthSigningKeyRow;
+	'auth.grants': LuxAuthGrantRow;
+	'auth.providers': LuxAuthProviderRow;
+}
+
 export interface LuxAuthSession {
 	access_token: string;
 	token_type: 'bearer';

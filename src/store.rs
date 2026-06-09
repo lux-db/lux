@@ -297,6 +297,8 @@ pub struct Store {
     /// embedded Lux instances in the same process.
     script_gate: RwLock<()>,
     pub(crate) vector_indexes: RwLock<HashMap<u32, crate::hnsw::HnswIndex, FxBuildHasher>>,
+    pub(crate) table_vector_indexes:
+        RwLock<HashMap<(u32, String), crate::hnsw::HnswIndex, FxBuildHasher>>,
     disk_shards: Option<Box<[parking_lot::Mutex<crate::disk::DiskShard>]>>,
     wal_shards: Option<Box<[parking_lot::Mutex<crate::disk::Wal>]>>,
     pub(crate) wal_suppress: std::sync::atomic::AtomicBool,
@@ -331,6 +333,34 @@ fn key_string(key: &[u8]) -> String {
         Ok(key) => key.to_owned(),
         Err(_) => String::from_utf8_lossy(key).into_owned(),
     }
+}
+
+fn parse_table_vector_key(key: &str) -> Option<(&str, &str, &str)> {
+    let rest = key.strip_prefix("_t:")?;
+    let (table, rest) = rest.split_once(":vec:")?;
+    let (field, pk) = rest.split_once(':')?;
+    if table.is_empty() || field.is_empty() || pk.is_empty() {
+        return None;
+    }
+    Some((table, field, pk))
+}
+
+fn table_vector_index_name(table: &str, field: &str) -> String {
+    format!("{}.{}", table, field)
+}
+
+fn table_vector_key_for_pk(table: &str, field: &str, pk: &str) -> String {
+    format!("_t:{}:vec:{}:{}", table, field, pk)
+}
+
+pub(crate) struct TableVectorCandidateQuery<'a> {
+    pub table: &'a str,
+    pub field: &'a str,
+    pub query: &'a [f32],
+    pub candidate_pks: &'a HashSet<String>,
+    pub k: usize,
+    pub threshold: Option<f32>,
+    pub now: Instant,
 }
 
 fn stream_entry_memory(fields: &[(String, Bytes)]) -> usize {
@@ -466,6 +496,7 @@ impl Store {
             metrics: StoreMetrics::new(),
             script_gate: RwLock::new(()),
             vector_indexes: RwLock::new(HashMap::with_hasher(FxBuildHasher)),
+            table_vector_indexes: RwLock::new(HashMap::with_hasher(FxBuildHasher)),
             disk_shards,
             wal_shards,
             wal_suppress: std::sync::atomic::AtomicBool::new(false),
@@ -474,6 +505,38 @@ impl Store {
 
     pub fn config(&self) -> &crate::ServerConfig {
         &self.config
+    }
+
+    fn insert_vector_indexes(&self, key: String, dims: u32, data: Vec<f32>) {
+        if let Some((table, field, _)) = parse_table_vector_key(&key) {
+            let table_field = table_vector_index_name(table, field);
+            self.table_vector_indexes
+                .write()
+                .entry((dims, table_field))
+                .or_insert_with(|| crate::hnsw::HnswIndex::new(dims))
+                .insert(key, data);
+        } else {
+            self.vector_indexes
+                .write()
+                .entry(dims)
+                .or_insert_with(|| crate::hnsw::HnswIndex::new(dims))
+                .insert(key, data);
+        }
+    }
+
+    fn remove_vector_indexes(&self, key: &str, dims: u32) {
+        if let Some((table, field, _)) = parse_table_vector_key(key) {
+            let table_field = table_vector_index_name(table, field);
+            if let Some(index) = self
+                .table_vector_indexes
+                .write()
+                .get_mut(&(dims, table_field))
+            {
+                index.remove(key);
+            }
+        } else if let Some(index) = self.vector_indexes.write().get_mut(&dims) {
+            index.remove(key);
+        }
     }
 
     /// Current instance uptime used by INFO.
@@ -1430,11 +1493,8 @@ impl Store {
             }
         }
         if !vector_keys_removed.is_empty() {
-            let mut indexes = self.vector_indexes.write();
             for (k, dims) in &vector_keys_removed {
-                if let Some(index) = indexes.get_mut(dims) {
-                    index.remove(k);
-                }
+                self.remove_vector_indexes(k, *dims);
             }
         }
         count
@@ -1454,9 +1514,7 @@ impl Store {
         shard.used_memory = shard.used_memory.saturating_sub(mem);
         self.mem_sub(mem);
         if let Some(dims) = vector_dims {
-            if let Some(index) = self.vector_indexes.write().get_mut(&dims) {
-                index.remove(key_str(key));
-            }
+            self.remove_vector_indexes(key_str(key), dims);
         }
         i64::from(!expired)
     }
@@ -1895,6 +1953,7 @@ impl Store {
         }
         self.metrics.key_count.store(0, Ordering::Relaxed);
         self.vector_indexes.write().clear();
+        self.table_vector_indexes.write().clear();
         if let Some(ref ds) = self.disk_shards {
             for d in ds.iter() {
                 let mut disk = d.lock();
@@ -3820,11 +3879,7 @@ impl Store {
                 shard.used_memory += mem;
                 self.mem_add(mem);
                 drop(shard);
-                self.vector_indexes
-                    .write()
-                    .entry(dims)
-                    .or_insert_with(|| crate::hnsw::HnswIndex::new(dims))
-                    .insert(key_clone, index_data);
+                self.insert_vector_indexes(key_clone, dims, index_data);
                 return;
             }
             DumpValue::HyperLogLog(regs, cached) => StoreValue::HyperLogLog(regs, cached),
@@ -6018,7 +6073,7 @@ impl Store {
         now.hash(&mut hasher);
         let seed = hasher.finish() as usize;
 
-        let mut expired_vectors: Vec<String> = Vec::new();
+        let mut expired_vectors: Vec<(String, u32)> = Vec::new();
         for (i, shard) in self.shards.iter().enumerate() {
             let should_check = {
                 let shard = shard.read();
@@ -6043,12 +6098,15 @@ impl Store {
                 if should_remove {
                     if let Some(entry) = shard.data.remove(&key) {
                         self.key_removed();
-                        let is_vector = matches!(&entry.value, StoreValue::Vector(_));
+                        let vector_dims = match &entry.value {
+                            StoreValue::Vector(vector) => Some(vector.dims),
+                            _ => None,
+                        };
                         let mem = estimate_entry_memory(&key, &entry.value);
                         shard.used_memory = shard.used_memory.saturating_sub(mem);
                         self.mem_sub(mem);
-                        if is_vector {
-                            expired_vectors.push(key_string(&key));
+                        if let Some(dims) = vector_dims {
+                            expired_vectors.push((key_string(&key), dims));
                         }
                     }
                     removed_any = true;
@@ -6059,11 +6117,8 @@ impl Store {
             }
         }
         if !expired_vectors.is_empty() {
-            let mut indexes = self.vector_indexes.write();
-            for k in &expired_vectors {
-                for index in indexes.values_mut() {
-                    index.remove(k);
-                }
+            for (key, dims) in &expired_vectors {
+                self.remove_vector_indexes(key, *dims);
             }
         }
     }
@@ -6263,6 +6318,7 @@ impl Store {
         let index_key = key_string(key);
         let dims = data.len() as u32;
         let index_data = data.clone();
+        let mut old_vector_dims = None;
         let new_value = StoreValue::Vector(VectorData {
             dims,
             data,
@@ -6279,6 +6335,9 @@ impl Store {
                 lru_clock: clock,
             },
         ) {
+            if let StoreValue::Vector(old_vector) = &old.value {
+                old_vector_dims = Some(old_vector.dims);
+            }
             let old_mem = estimate_entry_memory(&ks, &old.value);
             if new_mem >= old_mem {
                 self.mem_add(new_mem - old_mem);
@@ -6292,11 +6351,10 @@ impl Store {
             self.key_added();
         }
         drop(shard);
-        self.vector_indexes
-            .write()
-            .entry(dims)
-            .or_insert_with(|| crate::hnsw::HnswIndex::new(dims))
-            .insert(index_key, index_data);
+        if let Some(old_dims) = old_vector_dims {
+            self.remove_vector_indexes(&index_key, old_dims);
+        }
+        self.insert_vector_indexes(index_key, dims, index_data);
     }
 
     pub fn vget(&self, key: &[u8], now: Instant) -> Option<(Vec<f32>, Option<String>)> {
@@ -6322,6 +6380,9 @@ impl Store {
     ) -> Vec<(String, f32, Option<String>)> {
         let has_filter = filter_key.is_some() && filter_value.is_some();
         if has_filter {
+            if filter_key == Some("table_field") {
+                return self.vsearch_table_field_indexed(query, k, filter_value.unwrap(), now);
+            }
             return self.vsearch_filtered_exact(
                 query,
                 k,
@@ -6330,15 +6391,30 @@ impl Store {
                 now,
             );
         }
-        let indexes = self.vector_indexes.read();
-        let candidates = indexes
-            .get(&(query.len() as u32))
-            .map(|index| index.search(query, k))
+        let dims = query.len() as u32;
+        let search_k = k.saturating_mul(4).max(k).max(32);
+        let mut candidates = self
+            .vector_indexes
+            .read()
+            .get(&dims)
+            .map(|index| index.search(query, search_k))
             .unwrap_or_default();
-        drop(indexes);
+        {
+            let table_indexes = self.table_vector_indexes.read();
+            for ((index_dims, _), index) in table_indexes.iter() {
+                if *index_dims == dims {
+                    candidates.extend(index.search(query, search_k));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut results: Vec<(String, f32, Option<String>)> = Vec::new();
+        let mut seen = HashSet::new();
         for (key, sim) in candidates {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
             let idx = self.shard_index(key.as_bytes());
             let shard = self.shards[idx].read();
             if let Some(entry) = shard.data.get(key.as_bytes()) {
@@ -6369,6 +6445,142 @@ impl Store {
                 }
             }
         }
+        results
+    }
+
+    fn vsearch_table_field_indexed(
+        &self,
+        query: &[f32],
+        k: usize,
+        table_field: &str,
+        now: Instant,
+    ) -> Vec<(String, f32, Option<String>)> {
+        let dims = query.len() as u32;
+        let search_k = k.saturating_mul(4).max(k).max(32);
+        let candidates = self
+            .table_vector_indexes
+            .read()
+            .get(&(dims, table_field.to_string()))
+            .map(|index| index.search(query, search_k))
+            .unwrap_or_default();
+
+        let mut results = Vec::with_capacity(k);
+        for (key, similarity) in candidates {
+            let idx = self.shard_index(key.as_bytes());
+            let shard = self.shards[idx].read();
+            let Some(entry) = shard.data.get(key.as_bytes()) else {
+                continue;
+            };
+            if entry.is_expired_at(now) {
+                continue;
+            }
+            let StoreValue::Vector(vector) = &entry.value else {
+                continue;
+            };
+            if vector.dims != dims {
+                continue;
+            }
+            results.push((key, similarity, vector.metadata.clone()));
+            if results.len() >= k {
+                break;
+            }
+        }
+        results
+    }
+
+    pub(crate) fn table_vector_search(
+        &self,
+        table: &str,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        threshold: Option<f32>,
+        now: Instant,
+    ) -> Vec<(String, f32)> {
+        let dims = query.len() as u32;
+        let table_field = table_vector_index_name(table, field);
+        let search_k = k.saturating_mul(4).max(k).max(32);
+        let candidates = self
+            .table_vector_indexes
+            .read()
+            .get(&(dims, table_field))
+            .map(|index| index.search(query, search_k))
+            .unwrap_or_default();
+
+        let mut results = Vec::with_capacity(k);
+        for (key, similarity) in candidates {
+            if threshold.is_some_and(|min| similarity < min) {
+                continue;
+            }
+            let Some((_, _, pk)) = parse_table_vector_key(&key) else {
+                continue;
+            };
+            let idx = self.shard_index(key.as_bytes());
+            let shard = self.shards[idx].read();
+            let Some(entry) = shard.data.get(key.as_bytes()) else {
+                continue;
+            };
+            if entry.is_expired_at(now) {
+                continue;
+            }
+            let StoreValue::Vector(vector) = &entry.value else {
+                continue;
+            };
+            if vector.dims != dims {
+                continue;
+            }
+            results.push((pk.to_string(), similarity));
+            if results.len() >= k {
+                break;
+            }
+        }
+        results
+    }
+
+    pub(crate) fn table_vector_search_candidates(
+        &self,
+        search: TableVectorCandidateQuery<'_>,
+    ) -> Vec<(String, f32)> {
+        let TableVectorCandidateQuery {
+            table,
+            field,
+            query,
+            candidate_pks,
+            k,
+            threshold,
+            now,
+        } = search;
+        let query_norm = vector_norm(query);
+        if query_norm == 0.0 || candidate_pks.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results = Vec::with_capacity(candidate_pks.len().min(k));
+        for pk in candidate_pks {
+            let key = table_vector_key_for_pk(table, field, pk);
+            let idx = self.shard_index(key.as_bytes());
+            let shard = self.shards[idx].read();
+            let Some(entry) = shard.data.get(key.as_bytes()) else {
+                continue;
+            };
+            if entry.is_expired_at(now) {
+                continue;
+            }
+            let StoreValue::Vector(vector) = &entry.value else {
+                continue;
+            };
+            if vector.dims as usize != query.len() {
+                continue;
+            }
+            let similarity = cosine_similarity(query, query_norm, &vector.data);
+            if threshold.is_some_and(|min| similarity < min) {
+                continue;
+            }
+            results.push((pk.clone(), similarity));
+        }
+
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(k);
         results
     }
 
@@ -6415,11 +6627,19 @@ impl Store {
     }
 
     pub fn vcard(&self, _now: Instant) -> usize {
-        self.vector_indexes
+        let raw_count: usize = self
+            .vector_indexes
             .read()
             .values()
             .map(crate::hnsw::HnswIndex::len)
-            .sum()
+            .sum();
+        let table_count: usize = self
+            .table_vector_indexes
+            .read()
+            .values()
+            .map(crate::hnsw::HnswIndex::len)
+            .sum();
+        raw_count + table_count
     }
 }
 

@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use parking_lot::RwLock;
 
-use crate::store::Store;
+use crate::store::{Store, TableVectorCandidateQuery};
 
 // ---------------------------------------------------------------------------
 // Schema Cache
@@ -2769,17 +2769,6 @@ pub fn table_select(
         None
     };
 
-    let vector_matches = match &plan.near {
-        Some(near) => Some(table_vector_candidates(
-            store,
-            &plan.table,
-            &schema,
-            near,
-            now,
-        )?),
-        None => None,
-    };
-
     let mut scan = plan_table_scan(
         store,
         &plan.table,
@@ -2794,6 +2783,33 @@ pub fn table_select(
         },
         now,
     );
+
+    let near_candidate_pks = if plan.near.is_some() && !conditions.is_empty() {
+        let mut candidates = HashSet::new();
+        for pk_str in &scan.row_ids {
+            let Some(row) = get_row_with_map(store, &plan.table, &type_map, pk_str, now) else {
+                continue;
+            };
+            if row_matches_base_conditions(&row, &schema, implicit_id_field.as_ref(), &conditions) {
+                candidates.insert(pk_str.clone());
+            }
+        }
+        Some(candidates)
+    } else {
+        None
+    };
+
+    let vector_matches = match &plan.near {
+        Some(near) => Some(table_vector_candidates(
+            store,
+            &plan.table,
+            &schema,
+            near,
+            near_candidate_pks.as_ref(),
+            now,
+        )?),
+        None => None,
+    };
 
     let vector_similarity: Option<hashbrown::HashMap<String, f32>> =
         vector_matches.as_ref().map(|matches| {
@@ -2823,36 +2839,7 @@ pub fn table_select(
             get_row_with_map(store, &plan.table, &type_map, &pk_str, now).map(|row| (pk_str, row))
         })
         .filter(|(_, row)| {
-            conditions.iter().all(|cond| {
-                let bare = bare_col(&cond.field);
-                if let Some(fd) = schema.iter().find(|f| f.name == bare) {
-                    matches_condition(
-                        row,
-                        &WhereClause {
-                            field: bare.to_string(),
-                            op: cond.op.clone(),
-                            value: cond.value.clone(),
-                        },
-                        fd,
-                    )
-                } else if bare == "id" {
-                    if let Some(fd) = implicit_id_field.as_ref() {
-                        matches_condition(
-                            row,
-                            &WhereClause {
-                                field: bare.to_string(),
-                                op: cond.op.clone(),
-                                value: cond.value.clone(),
-                            },
-                            fd,
-                        )
-                    } else {
-                        true
-                    }
-                } else {
-                    true // join column - filter after join
-                }
-            })
+            row_matches_base_conditions(row, &schema, implicit_id_field.as_ref(), &conditions)
         })
         // Fix 3: project down to only needed columns before prefixing.
         // Only prefix with alias when there's an explicit alias or a join -
@@ -3109,6 +3096,7 @@ fn table_vector_candidates(
     table: &str,
     schema: &[FieldDef],
     near: &NearClause,
+    candidate_pks: Option<&HashSet<String>>,
     now: Instant,
 ) -> Result<Vec<TableVectorMatch>, String> {
     let field_name = bare_col(&near.field);
@@ -3128,40 +3116,69 @@ fn table_vector_candidates(
         ));
     }
 
-    let table_field = format!("{}.{}", table, field.name);
-    let results = store.vsearch(
-        &near.vector,
-        near.k,
-        Some("table_field"),
-        Some(&table_field),
-        now,
-    );
+    let results = match candidate_pks {
+        Some(candidates) => store.table_vector_search_candidates(TableVectorCandidateQuery {
+            table,
+            field: &field.name,
+            query: &near.vector,
+            candidate_pks: candidates,
+            k: near.k,
+            threshold: near.threshold,
+            now,
+        }),
+        None => store.table_vector_search(
+            table,
+            &field.name,
+            &near.vector,
+            near.k,
+            near.threshold,
+            now,
+        ),
+    };
 
     let mut matches = Vec::with_capacity(results.len());
-    for (key, similarity, metadata) in results {
-        if let Some(threshold) = near.threshold {
-            if similarity < threshold {
-                continue;
-            }
-        }
-        let pk = metadata
-            .as_deref()
-            .and_then(vector_metadata_pk)
-            .or_else(|| key.rsplit(':').next().map(ToString::to_string));
-        if let Some(pk) = pk {
-            matches.push(TableVectorMatch { pk, similarity });
-        }
+    for (pk, similarity) in results {
+        matches.push(TableVectorMatch { pk, similarity });
     }
     Ok(matches)
 }
 
-fn vector_metadata_pk(metadata: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(metadata).ok()?;
-    value
-        .get("pk")
-        .or_else(|| value.get("id"))
-        .and_then(|value| value.as_str())
-        .map(ToString::to_string)
+fn row_matches_base_conditions(
+    row: &[(String, String)],
+    schema: &[FieldDef],
+    implicit_id_field: Option<&FieldDef>,
+    conditions: &[WhereClause],
+) -> bool {
+    conditions.iter().all(|cond| {
+        let bare = bare_col(&cond.field);
+        if let Some(fd) = schema.iter().find(|f| f.name == bare) {
+            matches_condition(
+                row,
+                &WhereClause {
+                    field: bare.to_string(),
+                    op: cond.op.clone(),
+                    value: cond.value.clone(),
+                },
+                fd,
+            )
+        } else if bare == "id" {
+            if let Some(fd) = implicit_id_field {
+                matches_condition(
+                    row,
+                    &WhereClause {
+                        field: bare.to_string(),
+                        op: cond.op.clone(),
+                        value: cond.value.clone(),
+                    },
+                    fd,
+                )
+            } else {
+                true
+            }
+        } else {
+            true
+        }
+    })
 }
 
 fn score_range_from_conditions(order_col: &str, conditions: &[WhereClause]) -> Option<ScoreRange> {
@@ -3811,12 +3828,99 @@ fn compute_aggregates(
         .collect()
 }
 
+#[derive(Clone)]
+enum AggAccumulator {
+    Count(usize),
+    Sum(f64),
+    Avg { sum: f64, count: usize },
+    Min(Option<f64>),
+    Max(Option<f64>),
+}
+
+impl AggAccumulator {
+    fn new(func: &AggFunc) -> Self {
+        match func {
+            AggFunc::Count => AggAccumulator::Count(0),
+            AggFunc::Sum => AggAccumulator::Sum(0.0),
+            AggFunc::Avg => AggAccumulator::Avg { sum: 0.0, count: 0 },
+            AggFunc::Min => AggAccumulator::Min(None),
+            AggFunc::Max => AggAccumulator::Max(None),
+        }
+    }
+
+    fn ingest(&mut self, row: &[(String, String)], agg: &AggExpr) {
+        match self {
+            AggAccumulator::Count(count) => match &agg.col {
+                None => *count += 1,
+                Some(col) => {
+                    if row.iter().any(|(key, _)| bare_col(key) == col.as_str()) {
+                        *count += 1;
+                    }
+                }
+            },
+            AggAccumulator::Sum(sum) => {
+                if let Some(value) = aggregate_numeric_value(row, agg) {
+                    *sum += value;
+                }
+            }
+            AggAccumulator::Avg { sum, count } => {
+                if let Some(value) = aggregate_numeric_value(row, agg) {
+                    *sum += value;
+                    *count += 1;
+                }
+            }
+            AggAccumulator::Min(min) => {
+                if let Some(value) = aggregate_numeric_value(row, agg) {
+                    *min = Some(min.map_or(value, |current| current.min(value)));
+                }
+            }
+            AggAccumulator::Max(max) => {
+                if let Some(value) = aggregate_numeric_value(row, agg) {
+                    *max = Some(max.map_or(value, |current| current.max(value)));
+                }
+            }
+        }
+    }
+
+    fn finish(&self) -> String {
+        match self {
+            AggAccumulator::Count(count) => count.to_string(),
+            AggAccumulator::Sum(sum) => format_numeric(*sum),
+            AggAccumulator::Avg { sum, count } => {
+                if *count == 0 {
+                    "0".to_string()
+                } else {
+                    format_numeric(*sum / *count as f64)
+                }
+            }
+            AggAccumulator::Min(value) | AggAccumulator::Max(value) => {
+                value.map(format_numeric).unwrap_or_else(|| "0".to_string())
+            }
+        }
+    }
+}
+
+fn aggregate_numeric_value(row: &[(String, String)], agg: &AggExpr) -> Option<f64> {
+    let col = agg.col.as_deref()?;
+    row.iter()
+        .find(|(key, _)| bare_col(key) == col)
+        .and_then(|(_, value)| value.parse::<f64>().ok())
+}
+
+fn format_numeric(value: f64) -> String {
+    if value.fract() == 0.0 {
+        (value as i64).to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn compute_grouped_rows(
     rows: &[Vec<(String, String)>],
     group_by: &[String],
     aggregates: &[AggExpr],
 ) -> Vec<Vec<(String, String)>> {
-    let mut groups: hashbrown::HashMap<Vec<String>, Vec<Vec<(String, String)>>> =
+    let mut groups: hashbrown::HashMap<Vec<String>, Vec<AggAccumulator>> =
         hashbrown::HashMap::new();
 
     for row in rows {
@@ -3829,11 +3933,19 @@ fn compute_grouped_rows(
                     .unwrap_or_default()
             })
             .collect();
-        groups.entry(key).or_default().push(row.clone());
+        let accumulators = groups.entry(key).or_insert_with(|| {
+            aggregates
+                .iter()
+                .map(|agg| AggAccumulator::new(&agg.func))
+                .collect()
+        });
+        for (accumulator, aggregate) in accumulators.iter_mut().zip(aggregates) {
+            accumulator.ingest(row, aggregate);
+        }
     }
 
     let mut out = Vec::with_capacity(groups.len());
-    for (key, group_rows) in groups {
+    for (key, accumulators) in groups {
         let mut row = Vec::with_capacity(group_by.len() + aggregates.len());
         for (idx, col) in group_by.iter().enumerate() {
             row.push((
@@ -3841,7 +3953,12 @@ fn compute_grouped_rows(
                 key.get(idx).cloned().unwrap_or_default(),
             ));
         }
-        row.extend(compute_aggregates(&group_rows, aggregates));
+        row.extend(
+            aggregates
+                .iter()
+                .zip(accumulators.iter())
+                .map(|(aggregate, accumulator)| (aggregate.alias.clone(), accumulator.finish())),
+        );
         out.push(row);
     }
     out
@@ -5392,6 +5509,99 @@ mod tests {
                         .find(|(k, _)| k == "id")
                         .map(|(_, v)| v.as_str()),
                     Some("1")
+                );
+                assert!(rows[0].iter().any(|(k, _)| k == "_similarity"));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn select_near_with_where_scores_filtered_candidates_exactly() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+
+        table_create(
+            &store,
+            &cache,
+            "messages",
+            &[
+                "id INT PRIMARY KEY,",
+                "channel STR,",
+                "body STR,",
+                "embedding VECTOR(2)",
+            ],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "messages",
+            &[
+                ("id", "1"),
+                ("channel", "other"),
+                ("body", "globally closest but wrong channel"),
+                ("embedding", "[1,0]"),
+            ],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "messages",
+            &[
+                ("id", "2"),
+                ("channel", "target"),
+                ("body", "best target channel match"),
+                ("embedding", "[0.8,0.2]"),
+            ],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "messages",
+            &[
+                ("id", "3"),
+                ("channel", "target"),
+                ("body", "worse target channel match"),
+                ("embedding", "[0,1]"),
+            ],
+            now,
+        )
+        .unwrap();
+
+        let plan = parse_select(&[
+            "id,",
+            "body,",
+            "_similarity",
+            "FROM",
+            "messages",
+            "WHERE",
+            "channel",
+            "=",
+            "target",
+            "NEAR",
+            "embedding",
+            "[1,0]",
+            "K",
+            "1",
+        ])
+        .unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+        match result {
+            SelectResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0]
+                        .iter()
+                        .find(|(k, _)| k == "id")
+                        .map(|(_, v)| v.as_str()),
+                    Some("2")
                 );
                 assert!(rows[0].iter().any(|(k, _)| k == "_similarity"));
             }

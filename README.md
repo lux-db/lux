@@ -324,7 +324,26 @@ bun i @luxdb/sdk
 ```
 
 ```typescript
-import { Lux, createBrowserClient } from "@luxdb/sdk"
+import { Lux, createBrowserClient, type LuxAggregateRow, type LuxNearRow } from "@luxdb/sdk"
+
+interface User {
+  id: number
+  email: string
+  age: number
+}
+
+interface Message {
+  id: string
+  channel_id: string
+  body: string
+  embedding: number[]
+}
+
+interface Member {
+  id: number
+  team_id: number
+  age: number
+}
 
 // App/project client over HTTP. Use a publishable key in browser clients
 // and a secret key on trusted servers.
@@ -339,7 +358,7 @@ const { data: session, error: signInError } = await lux.auth.signInWithPassword(
 })
 
 const { data: users, error } = await lux
-  .table<{ id: number; email: string; age: number }>("users")
+  .table<User[]>("users")
   .select()
   .gt("age", 25)
   .order("age", { ascending: false })
@@ -348,14 +367,16 @@ const { data: users, error } = await lux
 if (error) throw error
 
 const { data: user } = await lux
-  .table<{ id: number; email: string }>("users")
+  .table<User>("users")
   .select()
   .eq("id", 1)
   .single()
 
+type TeamStats = { team_id: number } & LuxAggregateRow<"count">
+
 const { data: teamCounts } = await lux
-  .table("members")
-  .select("team_id,COUNT(*) AS count")
+  .table<Member>("members")
+  .select<TeamStats>("team_id,COUNT(*) AS count")
   .leftJoin("teams", "t", "team_id", "id")
   .group("team_id")
   .having("count", "gt", 1)
@@ -371,7 +392,8 @@ await lux
   .eq("id", 42)
 
 const sub = lux
-  .table<{ id: string; channel_id: string; body: string; _similarity?: number }>("messages")
+  .table<Message>("messages")
+  .select<LuxNearRow<Message>>("id,channel_id,body,_similarity")
   .eq("channel_id", "general")
   .near("embedding", queryEmbedding, { k: 20, threshold: 0.8 })
   .live()
@@ -576,7 +598,7 @@ rdb.Set(ctx, "hello", "world", 0)
 
 ## Testing
 
-Lux has 409 tests across unit, integration, property-based, and crash recovery suites.
+Lux has 617 tests across unit, integration, property-based, and crash recovery suites.
 
 ```bash
 cargo test
@@ -584,30 +606,34 @@ cargo test
 
 | Suite | Tests | What it covers |
 |-------|------:|----------------|
-| **Unit: cmd** | 62 | Every command handler, arg validation, error paths |
-| **Unit: store** | 66 | All data structures, TTL, shard versioning, expiry |
-| **Unit: resp** | 19 | RESP parser, serializers, edge cases |
-| **Unit: snapshot** | 7 | Roundtrip all data types including streams, TTL preservation |
-| **Unit: pubsub** | 5 | Broker subscribe/publish/isolation |
-| **Unit: disk** | 18 | CRC32 checksums, corruption detection, WAL/disk round-trips, partial write recovery, compaction, atomic writes |
+| **Unit: cmd** | 65 | Every command handler, arg validation, error paths |
+| **Unit: store** | 79 | All data structures, TTL, shard versioning, expiry, vector index lifecycle |
+| **Unit: resp** | 18 | RESP parser, serializers, edge cases |
+| **Unit: snapshot** | 16 | Roundtrip all data types including streams, TTL preservation, binary safety |
+| **Unit: pubsub** | 6 | Broker subscribe/publish/isolation |
+| **Unit: disk** | 19 | CRC32 checksums, corruption detection, WAL/disk round-trips, partial write recovery, compaction, atomic writes |
 | **Fuzz: persistence** | 7 | proptest-driven: random bytes into parsers (no panics), round-trip equivalence for all 9 data types, WAL replay fidelity, DiskShard reopen consistency |
 | **Integration: transactions** | 29 | MULTI/EXEC, WATCH/UNWATCH, EXECABORT, DISCARD |
-| **Integration: auth** | 6 | Password gating, per-connection state, error paths |
-| **Integration: pubsub** | 10 | Cross-connection message delivery, unsubscribe, sub mode |
+| **Integration: auth** | 9 | Password gating, per-connection state, error paths, HELLO auth |
+| **Integration: pubsub** | 11 | Cross-connection message delivery, unsubscribe, sub mode, binary payloads |
 | **Integration: persistence** | 3 | Snapshot save/restart/restore, FLUSHDB+SAVE |
 | **Integration: crash recovery** | 10 | Hard kill + WAL replay for all data types, snapshot+WAL interaction, MULTI/EXEC crash, repeated crash cycles, hot+cold data, DEL/FLUSHDB durability, rapid pipeline crash, corrupted WAL startup |
 | **Integration: tiered** | 18 | Cold storage reads/writes, eviction to disk, WAL crash recovery, snapshot with cold data, compaction |
-| **Integration: pipelines** | 3 | Ordering under contention, fast-path batching |
+| **Integration: pipelines** | 4 | Ordering under contention, fast-path batching |
+| **Integration: embedded API** | 36 | Public library API, embedded/direct parity, native pipelines, embedded pub/sub and KSUB, persistence |
+| **Integration: reliability** | 6 | Malformed protocol isolation, tiered restart safety, manual snapshot/WAL truncation |
+| **Integration: stress** | 3 | Deterministic model stress in memory and tiered mode, optional Redis differential subset |
 | **Integration: blocking** | 6 | BLPOP/BRPOP immediate, timeout, woken-by-push, BLMOVE |
 | **Integration: streams** | 10 | XADD, XREAD, XREADGROUP, XACK, XREAD BLOCK, consumer groups |
 | **Integration: lua** | 10 | EVAL, EVALSHA, redis.call, KEYS/ARGV, SCRIPT LOAD/EXISTS/FLUSH |
-| **Integration: vectors** | 10 | VSET, VGET, VSEARCH, VCARD, metadata filtering, TTL, dimension validation |
+| **Integration: vectors** | 11 | VSET, VGET, VSEARCH, VCARD, metadata filtering, TTL, dimension validation |
 | **Integration: geo** | 14 | GEOADD, GEODIST, GEOPOS, GEOHASH, GEOSEARCH, GEOSEARCHSTORE, GEORADIUS, edge cases |
 | **Integration: hll** | 9 | PFADD, PFCOUNT, PFMERGE, cardinality accuracy, multi-key count, merge, WRONGTYPE |
 | **Integration: timeseries** | 18 | TSADD, TSGET, TSRANGE, TSMRANGE, TSMADD, TSINFO, aggregation, retention, labels, filtering |
 | **Integration: ksub** | 6 | KSUB event delivery, pattern filtering, multiple patterns, KUNSUB, HSET/DEL events |
-| **Integration: http** | 14 | HTTP REST API: health, auth, KV CRUD, tables REST, time series REST, vectors REST, data types, exec, CORS, 404 |
-| **Integration: tables** | 14 | TCREATE, TINSERT, TSELECT, TUPDATE, TDELETE, TDROP, TCOUNT, TLIST, TSCHEMA, joins, foreign keys, unique constraints |
+| **Integration: http** | 21 | HTTP REST API: health, auth, auth grants/admin keys, KV CRUD, tables REST, time series REST, vectors REST, data types, exec, CORS |
+| **Integration: live websocket** | 6 | `/live` auth, key/pubsub events, table subscriptions, vector-near subscriptions, unsubscribe |
+| **Integration: tables** | 26 | TCREATE, TINSERT, TSELECT, TUPDATE, TDELETE, TDROP, TCOUNT, TLIST, TSCHEMA, joins, grouped aggregates, NEAR, foreign keys, unique constraints |
 | **Valkey compat** | 10+ | Valkey multi.tcl test suite run against Lux |
 
 Run the benchmark against Redis:

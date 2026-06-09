@@ -1,5 +1,5 @@
 import { LuxAuthClient, type LuxAuthOptions } from './auth';
-import type { LuxResult } from './types';
+import type { LuxResult, LuxTypedRow } from './types';
 import { err, ok, toLuxError } from './utils';
 
 export interface LuxProjectOptions {
@@ -29,6 +29,8 @@ export interface LuxVectorSearchOptions {
 
 type QueryValue = string | number | boolean | number[] | null;
 type FilterOperator = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'is';
+type ProjectRowInput<T extends object> = Partial<T> & Record<string, QueryValue>;
+type ProjectSelectSingle<TResult> = TResult extends readonly (infer Row)[] ? Row : TResult;
 
 interface QueryFilter {
 	column: string;
@@ -64,7 +66,7 @@ interface QueryNear {
 
 export type LuxProjectLiveEventType = 'snapshot' | 'insert' | 'update' | 'delete' | 'error';
 
-export interface LuxProjectLiveEvent<T extends Record<string, unknown> = Record<string, unknown>> {
+export interface LuxProjectLiveEvent<T extends object = Record<string, unknown>> {
 	type: LuxProjectLiveEventType;
 	table: string;
 	pk?: string;
@@ -76,7 +78,7 @@ export interface LuxProjectLiveEvent<T extends Record<string, unknown> = Record<
 	error?: { code?: string; message?: string };
 }
 
-type LiveEventHandler<T extends Record<string, unknown>> = (event: LuxProjectLiveEvent<T>) => void;
+type LiveEventHandler<T extends object> = (event: LuxProjectLiveEvent<T>) => void;
 
 interface LiveSubscriptionRecord {
 	id: string;
@@ -108,8 +110,8 @@ export class LuxProjectClient {
 		});
 	}
 
-	table<T extends Record<string, unknown> = Record<string, unknown>>(name: string): LuxProjectTable<T> {
-		return new LuxProjectTable<T>(this, name);
+	table<T extends object | readonly object[] = Record<string, unknown>>(name: string): LuxProjectTable<LuxTypedRow<T>> {
+		return new LuxProjectTable<LuxTypedRow<T>>(this, name);
 	}
 
 	async ping(): Promise<LuxResult<unknown>> {
@@ -288,11 +290,11 @@ export class LuxProjectClient {
 	}
 }
 
-export class LuxProjectTable<T extends Record<string, unknown>> {
+export class LuxProjectTable<T extends object> {
 	constructor(private client: LuxProjectClient, private name: string) {}
 
-	select(columns = '*'): LuxProjectSelectBuilder<T, T[]> {
-		return new LuxProjectSelectBuilder<T, T[]>(this.client, this.name, columns);
+	select<TResult extends object = T>(columns = '*'): LuxProjectSelectBuilder<T, TResult[]> {
+		return new LuxProjectSelectBuilder<T, TResult[]>(this.client, this.name, columns);
 	}
 
 	eq(column: string, value: QueryValue): LuxProjectSelectBuilder<T, T[]> {
@@ -328,18 +330,18 @@ export class LuxProjectTable<T extends Record<string, unknown>> {
 	}
 
 	live(): LuxProjectLiveSubscription<T> {
-		return this.select().live();
+		return this.select<T>().live() as LuxProjectLiveSubscription<T>;
 	}
 
-	insert(row: Partial<T> & Record<string, QueryValue>): LuxProjectInsertBuilder<unknown>;
-	insert(rows: Array<Partial<T> & Record<string, QueryValue>>): LuxProjectInsertBuilder<unknown[]>;
+	insert(row: ProjectRowInput<T>): LuxProjectInsertBuilder<unknown>;
+	insert(rows: Array<ProjectRowInput<T>>): LuxProjectInsertBuilder<unknown[]>;
 	insert(
-		rowOrRows: (Partial<T> & Record<string, QueryValue>) | Array<Partial<T> & Record<string, QueryValue>>,
+		rowOrRows: ProjectRowInput<T> | Array<ProjectRowInput<T>>,
 	): LuxProjectInsertBuilder<unknown | unknown[]> {
 		return new LuxProjectInsertBuilder(this.client, this.name, rowOrRows);
 	}
 
-	update(patch: Partial<T> & Record<string, QueryValue>): LuxProjectMutationBuilder<unknown> {
+	update(patch: ProjectRowInput<T>): LuxProjectMutationBuilder<unknown> {
 		return new LuxProjectMutationBuilder(this.client, this.name, 'PATCH', patch);
 	}
 
@@ -473,7 +475,7 @@ abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenabl
 	}
 }
 
-export class LuxProjectSelectBuilder<T extends Record<string, unknown>, TResult> extends LuxProjectFilterBuilder<TResult, LuxProjectSelectBuilder<T, TResult>> {
+export class LuxProjectSelectBuilder<T extends object, TResult> extends LuxProjectFilterBuilder<TResult, LuxProjectSelectBuilder<T, TResult>> {
 	private expectSingle = false;
 
 	constructor(
@@ -510,10 +512,10 @@ export class LuxProjectSelectBuilder<T extends Record<string, unknown>, TResult>
 		return this;
 	}
 
-	single(): LuxProjectSelectBuilder<T, T> {
+	single(): LuxProjectSelectBuilder<T, ProjectSelectSingle<TResult>> {
 		this.expectSingle = true;
 		if (this.limitCount == null) this.limitCount = 1;
-		return this as unknown as LuxProjectSelectBuilder<T, T>;
+		return this as unknown as LuxProjectSelectBuilder<T, ProjectSelectSingle<TResult>>;
 	}
 
 	async execute(): Promise<LuxResult<TResult>> {
@@ -536,8 +538,8 @@ export class LuxProjectSelectBuilder<T extends Record<string, unknown>, TResult>
 		return ok(rows[0] as unknown as TResult);
 	}
 
-	live(): LuxProjectLiveSubscription<T> {
-		return new LuxProjectLiveSubscription<T>(
+	live(): LuxProjectLiveSubscription<LuxTypedRow<TResult>> {
+		return new LuxProjectLiveSubscription<LuxTypedRow<TResult>>(
 			this.client,
 			this.tableName,
 			this.columns,
@@ -550,7 +552,7 @@ export class LuxProjectSelectBuilder<T extends Record<string, unknown>, TResult>
 	}
 }
 
-export class LuxProjectLiveSubscription<T extends Record<string, unknown>> {
+export class LuxProjectLiveSubscription<T extends object> {
 	private handlers: Record<LuxProjectLiveEventType | 'change', Array<LiveEventHandler<T>>> = {
 		snapshot: [],
 		insert: [],

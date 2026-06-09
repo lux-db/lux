@@ -46,11 +46,11 @@ interface TableClient {
 	_subscribePattern(pattern: string, handler: (event: KSubEvent) => void): Promise<() => void>;
 }
 
-export interface TableQueryBuilderOptions<T extends TableRow> {
+export interface TableQueryBuilderOptions<T extends object> {
 	schema?: TableSchema<T>;
 }
 
-export class TableSubscription<T extends TableRow> {
+export class TableSubscription<T extends object> {
 	private client: TableClient;
 	private table: string;
 	private selectArgsBuilder: (extra?: TableWhereCondition[]) => string[];
@@ -133,8 +133,9 @@ export class TableSubscription<T extends TableRow> {
 		try {
 			const initial = await this.fetchMatches();
 			for (const row of initial) {
-				if (row.id == null) continue;
-				this.knownRows.set(String(row.id), row);
+				const id = (row as { id?: number | string }).id;
+				if (id == null) continue;
+				this.knownRows.set(String(id), row);
 			}
 
 			const pattern = `_t:${this.table}:row:*`;
@@ -188,7 +189,9 @@ export class TableSubscription<T extends TableRow> {
 			if (!previous || !next) return;
 
 			this.knownRows.set(pk, next);
-			const changed = Object.keys(next).filter((key) => previous[key] !== next[key]);
+			const previousRow = previous as Record<string, unknown>;
+			const nextRow = next as Record<string, unknown>;
+			const changed = Object.keys(nextRow).filter((key) => previousRow[key] !== nextRow[key]);
 			this.emitChange({
 				type: 'update',
 				table: this.table,
@@ -205,7 +208,7 @@ export class TableSubscription<T extends TableRow> {
 	}
 }
 
-export class TableQueryBuilder<T extends TableRow = TableRow> {
+export class TableQueryBuilder<T extends object = TableRow> {
 	private client: TableClient;
 	private name: string;
 	private conditions: TableWhereCondition[] = [];

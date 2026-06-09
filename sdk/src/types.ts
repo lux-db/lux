@@ -38,6 +38,22 @@ export interface TableRow {
 	[field: string]: unknown;
 }
 
+export type LuxInferRow<T> = T extends readonly (infer Row)[] ? Row : T;
+
+export type LuxTypedRow<T> = LuxInferRow<T> extends object
+	? LuxInferRow<T>
+	: TableRow;
+
+export type LuxAggregateValue = number | string;
+
+export type LuxAggregateRow<Aliases extends string = string> = Record<Aliases, LuxAggregateValue>;
+
+export interface LuxSimilarity {
+	_similarity: number | string;
+}
+
+export type LuxNearRow<T extends object = Record<string, unknown>> = T & LuxSimilarity;
+
 export interface LuxError {
 	code: string;
 	message: string;
@@ -58,7 +74,7 @@ export interface TableSchema<T> {
 
 export type TableChangeType = 'insert' | 'update' | 'delete' | 'change' | 'error';
 
-export interface TableChangeEvent<T extends TableRow> {
+export interface TableChangeEvent<T extends object = TableRow> {
 	type: Exclude<TableChangeType, 'error'>;
 	table: string;
 	pk: string;
@@ -74,4 +90,3 @@ export interface TableErrorEvent {
 	table: string;
 	error: LuxError;
 }
-

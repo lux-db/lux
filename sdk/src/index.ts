@@ -6,6 +6,7 @@ import { LuxRealtimeManager } from './realtime';
 import { TableQueryBuilder, type TableQueryBuilderOptions } from './table';
 import type {
 	KSubEvent,
+	LuxTypedRow,
 	TableRow,
 	TSAddOptions,
 	TSMRangeResult,
@@ -16,13 +17,22 @@ import type {
 
 export type {
 	LuxAuthKey,
+	LuxAuthGrantRow,
+	LuxAuthIdentityRow,
 	LuxAuthChangeEvent,
 	LuxAuthOptions,
+	LuxAuthKeyRow,
+	LuxAuthProviderRow,
 	LuxAuthSession,
+	LuxAuthSessionRow,
+	LuxAuthSigningKeyRow,
 	LuxAuthStateChangeCallback,
 	LuxAuthStorage,
 	LuxAuthSubscription,
+	LuxAuthTables,
+	LuxAuthUserRow,
 	LuxAuthUser,
+	LuxUser,
 	LuxOAuthProvider,
 	LuxOAuthUrl,
 	LuxSignInWithOAuthOptions,
@@ -47,8 +57,14 @@ export type {
 } from './project';
 export type {
 	KSubEvent,
+	LuxAggregateRow,
+	LuxAggregateValue,
 	LuxError,
+	LuxInferRow,
+	LuxNearRow,
 	LuxResult,
+	LuxSimilarity,
+	LuxTypedRow,
 	TableChangeEvent,
 	TableChangeType,
 	TableErrorEvent,
@@ -110,8 +126,11 @@ export class Lux extends Redis {
 		this.authApi = this.auth;
 	}
 
-	table<T extends TableRow = TableRow>(name: string, options?: TableQueryBuilderOptions<T>): TableQueryBuilder<T> {
-		return new TableQueryBuilder<T>(this, name, options);
+	table<T extends object | readonly object[] = TableRow>(
+		name: string,
+		options?: TableQueryBuilderOptions<LuxTypedRow<T>>,
+	): TableQueryBuilder<LuxTypedRow<T>> {
+		return new TableQueryBuilder<LuxTypedRow<T>>(this, name, options);
 	}
 
 	async _subscribePattern(pattern: string, handler: (event: KSubEvent) => void): Promise<() => void> {

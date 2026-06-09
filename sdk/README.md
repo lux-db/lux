@@ -35,8 +35,20 @@ if (error) throw error;
 Queries and mutations return a Supabase-style result object:
 
 ```ts
+interface User {
+  id: number;
+  email: string;
+  age: number;
+}
+
+interface Message {
+  id: string;
+  body: string;
+  embedding: number[];
+}
+
 const { data: users, error } = await lux
-  .table<{ id: number; email: string; age: number }>("users")
+  .table<User[]>("users")
   .select()
   .gt("age", 25)
   .order("age", { ascending: false })
@@ -44,6 +56,28 @@ const { data: users, error } = await lux
 
 if (error) throw error;
 console.log(users);
+```
+
+`table<T>()` accepts either a row type or an array type. `table<User>("users")`
+and `table<User[]>("users")` both infer `User` rows; the array form is useful
+when you want the generic to read like the returned data.
+
+For computed projections, pass the projection shape to `select<T>()`:
+
+```ts
+import type { LuxAggregateRow, LuxNearRow } from "@luxdb/sdk";
+
+type TeamStats = { team_id: number } & LuxAggregateRow<"member_count" | "avg_age">;
+
+const { data: teamStats } = await lux
+  .table<User>("members")
+  .select<TeamStats>("team_id,COUNT(*) AS member_count,AVG(age) AS avg_age")
+  .group("team_id");
+
+const { data: matches } = await lux
+  .table<Message>("messages")
+  .select<LuxNearRow<Message>>("id,body,_similarity")
+  .near("embedding", queryEmbedding, { k: 10, threshold: 0.8 });
 ```
 
 ```ts
@@ -107,6 +141,18 @@ if (error) throw error;
 console.log(data.user);
 ```
 
+Auth types are exported for app code and system table reads:
+
+```ts
+import type { LuxUser, LuxAuthTables } from "@luxdb/sdk";
+
+type AuthUserRow = LuxAuthTables["auth.users"];
+
+function renderUser(user: LuxUser, row: AuthUserRow) {
+  return row.email ?? user.email;
+}
+```
+
 ## Server client
 
 Use a secret key only from trusted server code.
@@ -155,4 +201,5 @@ const value = await lux.get("hello");
 - `lux_sec_...` keys are server-only.
 - User sessions issue JWT access tokens.
 - Browser live subscriptions use the project publishable key plus the signed-in user's JWT.
+- Table `select()` accepts Lux's constrained projection grammar, not arbitrary SQL.
 - Direct `lux://` or `rediss://` database access uses the database password and is for trusted infrastructure.
