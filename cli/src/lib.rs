@@ -73,6 +73,14 @@ enum Commands {
         #[arg(help = "Project name or ID")]
         project: Option<String>,
     },
+    Snapshot {
+        #[arg(help = "Project name or ID")]
+        project: Option<String>,
+        #[arg(short, long, help = "List existing snapshots instead of creating one")]
+        list: bool,
+        #[arg(long, value_name = "SNAPSHOT_ID", help = "Restore a snapshot by ID")]
+        restore: Option<String>,
+    },
     Destroy {
         #[arg(help = "Project name or ID")]
         project: String,
@@ -865,6 +873,132 @@ pub async fn run() {
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown error");
                 eprintln!("{} {msg}", "Error:".red());
+            }
+        }
+
+        Commands::Snapshot {
+            project,
+            list,
+            restore,
+        } => {
+            let (client, api_url, token) = get_client(&api_url_override);
+            let project = require_project_arg(project.as_deref());
+            let inst = find_project(&client, &api_url, &token, &project).await;
+
+            if let Some(snapshot_id) = restore {
+                println!(
+                    "{} Restoring '{}' from {}...",
+                    "...".dimmed(),
+                    inst.name,
+                    snapshot_id
+                );
+                let res = client
+                    .post(format!(
+                        "{api_url}/snapshots/{}/{}/restore",
+                        inst.id, snapshot_id
+                    ))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("{} {e}", "Failed:".red());
+                        std::process::exit(1);
+                    });
+                if res.status().is_success() {
+                    println!("{} Restore started for '{}'.", "Done.".green(), inst.name);
+                } else {
+                    let body: serde_json::Value = res.json().await.unwrap_or_default();
+                    let msg = body
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown error");
+                    eprintln!("{} {msg}", "Error:".red());
+                }
+            } else if list {
+                let res = client
+                    .get(format!("{api_url}/snapshots/{}", inst.id))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("{} {e}", "Failed:".red());
+                        std::process::exit(1);
+                    });
+                let body: serde_json::Value = res.json().await.unwrap_or_default();
+                let rows = body
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                if rows.is_empty() {
+                    println!("No snapshots for '{}'.", inst.name);
+                } else {
+                    println!("{:<10} {:<10} {:<26} ID", "STATUS", "SIZE", "CREATED");
+                    for r in rows {
+                        let status = r.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                        let size = r
+                            .get("file_size_bytes")
+                            .and_then(|v| v.as_u64())
+                            .map(format_bytes)
+                            .unwrap_or_else(|| "-".to_string());
+                        let created = r.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+                        let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        let err = r
+                            .get("error_message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let err_suffix = if err.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {}", err.red())
+                        };
+                        println!("{status:<10} {size:<10} {created:<26} {id}{err_suffix}");
+                    }
+                }
+            } else {
+                println!("{} Snapshotting '{}'...", "...".dimmed(), inst.name);
+
+                let res = client
+                    .post(format!("{api_url}/snapshots/{}", inst.id))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("{} {e}", "Failed:".red());
+                        std::process::exit(1);
+                    });
+
+                if res.status().is_success() {
+                    let body: serde_json::Value = res.json().await.unwrap_or_default();
+                    let id = body
+                        .get("data")
+                        .and_then(|d| d.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let suffix = if id.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({id})")
+                    };
+                    println!(
+                        "{} Snapshot started for '{}'.{}",
+                        "Done.".green(),
+                        inst.name,
+                        suffix
+                    );
+                    println!(
+                        "{} {}",
+                        "Tip:".bold(),
+                        format!("lux snapshot {} --list", inst.name).cyan()
+                    );
+                } else {
+                    let body: serde_json::Value = res.json().await.unwrap_or_default();
+                    let msg = body
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown error");
+                    eprintln!("{} {msg}", "Error:".red());
+                }
             }
         }
 
@@ -1851,7 +1985,7 @@ fn resp_read_response_inner<R: BufRead>(reader: &mut R, depth: u8) -> Result<Str
 
 enum DirectStream {
     Plain(TcpStream),
-    Tls(StreamOwned<ClientConnection, TcpStream>),
+    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
 }
 
 impl Read for DirectStream {
@@ -1913,7 +2047,7 @@ impl DirectConn {
                 ServerName::try_from(host.to_string()).map_err(|_| "invalid TLS host".to_string())?;
             let connection = ClientConnection::new(Arc::new(config), server_name)
                 .map_err(|e| format!("TLS setup failed: {e}"))?;
-            DirectStream::Tls(StreamOwned::new(connection, stream))
+            DirectStream::Tls(Box::new(StreamOwned::new(connection, stream)))
         } else {
             DirectStream::Plain(stream)
         };
@@ -2014,7 +2148,7 @@ enum MigrateTarget {
         token: String,
         instance_id: String,
     },
-    Direct(DirectConn),
+    Direct(Box<DirectConn>),
 }
 
 impl MigrateTarget {
@@ -2055,7 +2189,7 @@ async fn resolve_migrate_target(
         let p = port.unwrap_or(6379);
         let pw = password.unwrap_or("");
         match DirectConn::connect(h, p, pw) {
-            Ok(conn) => return MigrateTarget::Direct(conn),
+            Ok(conn) => return MigrateTarget::Direct(Box::new(conn)),
             Err(e) => {
                 eprintln!("{} {}", "Error:".red(), e);
                 std::process::exit(1);
@@ -2069,7 +2203,7 @@ async fn resolve_migrate_target(
         _ => {
             // No project and no host/port: default to localhost
             match DirectConn::connect("localhost", 6379, password.unwrap_or("")) {
-                Ok(conn) => return MigrateTarget::Direct(conn),
+                Ok(conn) => return MigrateTarget::Direct(Box::new(conn)),
                 Err(e) => {
                     eprintln!(
                         "{} No project specified and local connection failed: {}",
@@ -2091,7 +2225,7 @@ async fn resolve_migrate_target(
     if is_connection_url(project) {
         let target = parse_connection_url(project);
         match DirectConn::connect_target(&target) {
-            Ok(conn) => return MigrateTarget::Direct(conn),
+            Ok(conn) => return MigrateTarget::Direct(Box::new(conn)),
             Err(e) => {
                 eprintln!("{} {}", "Error:".red(), e);
                 std::process::exit(1);
