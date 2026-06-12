@@ -274,6 +274,17 @@ async fn handle_request(
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     if method == "GET" {
         match segments.as_slice() {
+            ["v1", "snapshot"] | ["snapshot"] => {
+                // Full-instance backup. Streams a consistent dump out over HTTP
+                // so the control plane never needs a shell in the container.
+                // Operator-only when a password is set (it exposes all data).
+                let password_set = !store.config().password.is_empty();
+                if password_set && !matches!(auth_context, HttpAuthContext::Operator) {
+                    let body = r#"{"error":"snapshot requires operator credentials"}"#;
+                    return send_json(socket, 403, "Forbidden", body).await;
+                }
+                return stream_snapshot(socket, store).await;
+            }
             ["v1", "tables", table] => {
                 if let Err((status, status_text, body)) = require_http_capability(
                     store,
@@ -385,6 +396,59 @@ async fn handle_request(
 /// Stream a table query response using chunked transfer encoding.
 /// Writes rows directly to the socket as they come out of table_select,
 /// without ever building the full JSON string in memory.
+/// Stream a complete, consistent snapshot to the caller. Triggers the same save
+/// the background timer runs (full dump incl. tiered cold data + WAL truncate),
+/// then streams the resulting `lux.dat`. The blocking save runs off the async
+/// runtime via `spawn_blocking`. Caller enforces operator auth.
+async fn stream_snapshot(
+    socket: &mut tokio::net::TcpStream,
+    store: &Arc<Store>,
+) -> std::io::Result<bool> {
+    let store = store.clone();
+    let path =
+        match tokio::task::spawn_blocking(move || crate::snapshot::snapshot_for_backup(&store))
+            .await
+        {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                let body = format!(
+                    r#"{{"error":"snapshot failed: {}"}}"#,
+                    escape_json(&e.to_string())
+                );
+                return send_json(socket, 500, "Internal Server Error", &body).await;
+            }
+            Err(e) => {
+                let body = format!(
+                    r#"{{"error":"snapshot task panicked: {}"}}"#,
+                    escape_json(&e.to_string())
+                );
+                return send_json(socket, 500, "Internal Server Error", &body).await;
+            }
+        };
+
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            let body = format!(
+                r#"{{"error":"snapshot open failed: {}"}}"#,
+                escape_json(&e.to_string())
+            );
+            return send_json(socket, 500, "Internal Server Error", &body).await;
+        }
+    };
+    let len = file.metadata().await?.len();
+    let header = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Content-Disposition: attachment; filename=\"lux.dat\"\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Content-Length: {len}\r\n\r\n"
+    );
+    socket.write_all(header.as_bytes()).await?;
+    tokio::io::copy(&mut file, socket).await?;
+    Ok(true)
+}
+
 async fn stream_table_query(
     socket: &mut tokio::net::TcpStream,
     table: &str,

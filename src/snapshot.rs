@@ -88,6 +88,17 @@ pub(crate) fn save_and_truncate_wal_consistent(store: &Store) -> io::Result<usiz
     })
 }
 
+/// Produce a consistent on-disk snapshot for an out-of-band backup and return
+/// its path. Runs the same consistent save the background timer performs (full
+/// dump including tiered cold data, then WAL truncation), so the file is a
+/// complete point-in-time image of the instance. Used by `GET /v1/snapshot`,
+/// which lets the control plane back an instance up over its own HTTP port
+/// without needing a shell inside the (distroless) container.
+pub fn snapshot_for_backup(store: &Store) -> io::Result<String> {
+    save_and_truncate_wal_consistent(store)?;
+    Ok(snapshot_path(store))
+}
+
 fn save_binary(w: &mut impl Write, entries: &[crate::store::DumpEntry]) -> io::Result<()> {
     w.write_all(HEADER)?;
     for entry in entries {

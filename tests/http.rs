@@ -222,6 +222,36 @@ fn http_health_check() {
 }
 
 #[test]
+fn http_snapshot_streams_consistent_dump_for_operator() {
+    let _server = start_lux(17750, 17751, "operator-secret");
+
+    // Write a key so the dump carries real data past the header.
+    put(
+        17751,
+        "/v1/kv/backup-probe",
+        r#"{"value":"hello"}"#,
+        "operator-secret",
+    );
+
+    // A full-instance dump must not be pullable without credentials.
+    let (status, _) = http_request(17751, "GET", "/v1/snapshot", None, None);
+    assert_eq!(status, 401, "snapshot must require auth");
+
+    // Operator pulls a binary snapshot beginning with the LUX magic header.
+    let (status, body) = http_request(17751, "GET", "/v1/snapshot", None, Some("operator-secret"));
+    assert_eq!(status, 200, "operator snapshot: {body}");
+    assert!(
+        body.starts_with("LUX"),
+        "snapshot magic header missing: {:?}",
+        &body.as_bytes()[..body.len().min(8)]
+    );
+    assert!(
+        body.len() > 4,
+        "snapshot body should contain data beyond the 4-byte header"
+    );
+}
+
+#[test]
 fn http_auth_required() {
     let _server = start_lux(17602, 17603, "secret");
 
