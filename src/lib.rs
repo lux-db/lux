@@ -15,6 +15,7 @@ mod geo;
 mod hll;
 mod hnsw;
 mod http;
+mod jsonb;
 mod lua;
 mod pubsub;
 mod resp;

@@ -1463,8 +1463,32 @@ fn fetch_live_table_rows(
                 tokens.push("AND".to_string());
             }
             tokens.push(field.clone());
-            tokens.push(op.clone());
-            tokens.push(live_value_to_token(value));
+            let op_upper = op.to_ascii_uppercase();
+            if op_upper == "IN" || op_upper == "NOT IN" {
+                if op_upper == "NOT IN" {
+                    tokens.push("NOT".to_string());
+                }
+                tokens.push("IN".to_string());
+                tokens.push("(".to_string());
+                match value.as_array() {
+                    Some(arr) => {
+                        for v in arr {
+                            tokens.push(live_value_to_token(v));
+                        }
+                    }
+                    None => tokens.push(live_value_to_token(value)),
+                }
+                tokens.push(")".to_string());
+            } else if op_upper == "IS VALID" || op_upper == "IS NOT VALID" {
+                tokens.push("IS".to_string());
+                if op_upper == "IS NOT VALID" {
+                    tokens.push("NOT".to_string());
+                }
+                tokens.push("VALID".to_string());
+            } else {
+                tokens.push(op.clone());
+                tokens.push(live_value_to_token(value));
+            }
         }
     }
     if let Some(near) = &spec.near {

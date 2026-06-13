@@ -956,6 +956,14 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 2,
     },
     CommandSpec {
+        name: b"TINDEX",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"TDROPINDEX",
+        min_arity: 3,
+    },
+    CommandSpec {
         name: b"TCOUNT",
         min_arity: 2,
     },
@@ -1937,6 +1945,12 @@ pub fn execute(
             }
             if cmd_eq(cmd, b"TDROP") {
                 return tables::cmd_tdrop(args, store, cache, out, now);
+            }
+            if cmd_eq(cmd, b"TINDEX") {
+                return tables::cmd_tindex(args, store, cache, out, now);
+            }
+            if cmd_eq(cmd, b"TDROPINDEX") {
+                return tables::cmd_tdropindex(args, store, cache, out, now);
             }
             if cmd_eq(cmd, b"TCOUNT") {
                 return tables::cmd_tcount(args, store, cache, out, now);

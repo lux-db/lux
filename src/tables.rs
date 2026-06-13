@@ -16,15 +16,25 @@ use crate::store::{Store, TableVectorCandidateQuery};
 ///
 /// Wrap in Arc<RwLock<SchemaCache>> and pass alongside Store wherever table
 /// functions are called.
+/// A declared, typed index over a JSON dot-path (e.g. `metadata.reactions.count`
+/// as INT) so range queries on the path hit a sorted-set index.
+#[derive(Debug, Clone)]
+pub struct PathIndex {
+    pub path: String,
+    pub field_type: FieldType,
+}
+
 #[derive(Debug, Default)]
 pub struct SchemaCache {
     schemas: hashbrown::HashMap<String, Vec<FieldDef>>,
+    path_indexes: hashbrown::HashMap<String, Vec<PathIndex>>,
 }
 
 impl SchemaCache {
     pub fn new() -> Self {
         Self {
             schemas: hashbrown::HashMap::new(),
+            path_indexes: hashbrown::HashMap::new(),
         }
     }
 
@@ -36,8 +46,21 @@ impl SchemaCache {
         self.schemas.insert(table.to_string(), fields);
     }
 
+    fn get_path_indexes(&self, table: &str) -> Option<Vec<PathIndex>> {
+        self.path_indexes.get(table).cloned()
+    }
+
+    fn insert_path_indexes(&mut self, table: &str, indexes: Vec<PathIndex>) {
+        self.path_indexes.insert(table.to_string(), indexes);
+    }
+
     fn remove(&mut self, table: &str) {
         self.schemas.remove(table);
+        self.path_indexes.remove(table);
+    }
+
+    fn remove_path_indexes(&mut self, table: &str) {
+        self.path_indexes.remove(table);
     }
 }
 
@@ -52,6 +75,12 @@ pub enum FieldType {
     Timestamp,
     Uuid,
     Vector(usize),
+    /// Native JSON document. Stored as canonical JSON bytes; queryable via
+    /// dot-paths (`metadata.a.b`) and the `IS VALID` existence predicate.
+    Json,
+    /// Native JSON array. Like `Json` but constrained to a top-level array;
+    /// supports element access (`tags.0`) and `CONTAINS` membership.
+    Array,
     /// Legacy ref type - kept for backwards compat, prefer ForeignKey on FieldDef
     Ref(String),
 }
@@ -129,6 +158,20 @@ impl FieldType {
                 let vector = parse_vector_value(value, *dims)?;
                 Ok(format_vector_value(&vector).into_bytes())
             }
+            FieldType::Json => {
+                // Parse once at write time into the walkable binary format.
+                let parsed: serde_json::Value = serde_json::from_str(value)
+                    .map_err(|_| format!("ERR invalid JSON '{}'", value))?;
+                Ok(crate::jsonb::encode(&parsed))
+            }
+            FieldType::Array => {
+                let parsed: serde_json::Value = serde_json::from_str(value)
+                    .map_err(|_| format!("ERR invalid JSON array '{}'", value))?;
+                if !parsed.is_array() {
+                    return Err(format!("ERR expected JSON array, got '{}'", value));
+                }
+                Ok(crate::jsonb::encode(&parsed))
+            }
             FieldType::Ref(_) => {
                 let val = value
                     .parse::<i64>()
@@ -191,6 +234,7 @@ impl FieldType {
                 }
             }
             FieldType::Vector(_) => String::from_utf8_lossy(bytes).to_string(),
+            FieldType::Json | FieldType::Array => crate::jsonb::to_json_string(bytes),
         }
     }
 }
@@ -214,13 +258,46 @@ pub enum CmpOp {
     Lt,
     Ge,
     Le,
+    In,
+    NotIn,
+    IsValid,
+    IsNotValid,
+    /// Array membership: `col CONTAINS value` (array column or array-valued path).
+    Contains,
 }
 
 #[derive(Debug, Clone)]
 pub struct WhereClause {
     pub field: String,
     pub op: CmpOp,
+    /// Single comparison operand. Empty for list ops (In/NotIn) and no-RHS ops
+    /// (IsValid/IsNotValid); read `values` for the list ops.
     pub value: String,
+    /// Operand list for In/NotIn. Empty for every other op.
+    pub values: Vec<String>,
+}
+
+impl WhereClause {
+    /// Construct a single-operand clause (Eq/Ne/Gt/Lt/Ge/Le, or the no-RHS
+    /// IsValid/IsNotValid where `value` is empty).
+    pub fn single(field: String, op: CmpOp, value: String) -> Self {
+        WhereClause {
+            field,
+            op,
+            value,
+            values: Vec::new(),
+        }
+    }
+
+    /// Construct a list clause for In/NotIn.
+    pub fn in_list(field: String, op: CmpOp, values: Vec<String>) -> Self {
+        WhereClause {
+            field,
+            op,
+            value: String::new(),
+            values,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -329,6 +406,10 @@ fn idx_sorted_key(table: &str, field: &str) -> String {
     format!("_t:{}:idx:{}", table, field)
 }
 
+fn path_indexes_key(table: &str) -> String {
+    format!("_t:{}:path_indexes", table)
+}
+
 fn idx_str_key(table: &str, field: &str, value: &str) -> String {
     format!("_t:{}:idx:{}:{}", table, field, value)
 }
@@ -402,6 +483,8 @@ fn parse_field_def(spec: &str) -> Result<FieldDef, String> {
         "BOOL" | "BOOLEAN" => FieldType::Bool,
         "TIMESTAMP" | "DATETIME" => FieldType::Timestamp,
         "UUID" => FieldType::Uuid,
+        "JSON" | "JSONB" => FieldType::Json,
+        "ARRAY" => FieldType::Array,
         t if t.starts_with("VECTOR(") && t.ends_with(')') => {
             let dims = t[7..t.len() - 1]
                 .parse::<usize>()
@@ -617,6 +700,8 @@ fn encode_field_def(def: &FieldDef) -> String {
         FieldType::Timestamp => "timestamp".to_string(),
         FieldType::Uuid => "uuid".to_string(),
         FieldType::Vector(dims) => format!("vector:{}", dims),
+        FieldType::Json => "json".to_string(),
+        FieldType::Array => "array".to_string(),
         FieldType::Ref(t) => return format!("ref|{}", t),
     };
 
@@ -657,6 +742,8 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
         "bool" => FieldType::Bool,
         "timestamp" => FieldType::Timestamp,
         "uuid" => FieldType::Uuid,
+        "json" => FieldType::Json,
+        "array" => FieldType::Array,
         s if s.starts_with("vector:") => s[7..]
             .parse::<usize>()
             .map(FieldType::Vector)
@@ -749,6 +836,195 @@ fn load_schema(
     Ok(fields)
 }
 
+/// Token stored in the path-index registry for a given indexable type.
+fn index_type_token(ft: &FieldType) -> Option<&'static str> {
+    match ft {
+        FieldType::Int => Some("int"),
+        FieldType::Float => Some("float"),
+        FieldType::Bool => Some("bool"),
+        FieldType::Timestamp => Some("timestamp"),
+        FieldType::Str => Some("str"),
+        // uuid/vector/json/ref are not path-indexable
+        _ => None,
+    }
+}
+
+/// Parse a user-supplied or stored index type token into a FieldType.
+fn parse_index_type(tok: &str) -> Option<FieldType> {
+    match tok.to_uppercase().as_str() {
+        "INT" | "INTEGER" | "BIGINT" => Some(FieldType::Int),
+        "FLOAT" | "REAL" | "DOUBLE" => Some(FieldType::Float),
+        "BOOL" | "BOOLEAN" => Some(FieldType::Bool),
+        "TIMESTAMP" | "DATETIME" => Some(FieldType::Timestamp),
+        "STR" | "TEXT" | "STRING" => Some(FieldType::Str),
+        _ => None,
+    }
+}
+
+/// A throwaway FieldDef so a declared path index can reuse the column-index
+/// machinery (`add_to_index`/`candidates_from_index`), keyed by the dot-path.
+fn synthetic_path_fielddef(pi: &PathIndex) -> FieldDef {
+    FieldDef {
+        name: pi.path.clone(),
+        field_type: pi.field_type.clone(),
+        primary_key: false,
+        unique: false,
+        nullable: true,
+        default_value: None,
+        references: None,
+    }
+}
+
+/// True if `raw` parses to a JSON array containing a scalar element equal to
+/// `needle` (string form). Used by the `CONTAINS` operator.
+fn json_array_contains(raw: &str, needle: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .any(|el| json_scalar_string(el).as_deref() == Some(needle)),
+        _ => false,
+    }
+}
+
+/// Convert a resolved JSON scalar to its index/compare string form.
+/// Returns None for objects, arrays, and null (not indexable / not VALID).
+fn json_scalar_string(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Extract the scalar at `rest` from a raw JSON string, for path indexing.
+fn extract_json_scalar(raw: &str, rest: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    match json_path_get(&parsed, rest) {
+        JsonResolve::Resolved(v) => json_scalar_string(v),
+        _ => None,
+    }
+}
+
+/// Load declared path indexes for a table (cached alongside the schema). An
+/// empty result is cached too, so write paths on un-indexed tables stay cheap.
+fn load_path_indexes(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    now: Instant,
+) -> Vec<PathIndex> {
+    if let Some(pis) = cache.read().get_path_indexes(table) {
+        return pis;
+    }
+    let key = path_indexes_key(table);
+    let pairs = store.hgetall(key.as_bytes(), now).unwrap_or_default();
+    let mut pis = Vec::new();
+    for (path, ty) in pairs {
+        let tok = String::from_utf8_lossy(&ty).to_string();
+        if let Some(ft) = parse_index_type(&tok) {
+            pis.push(PathIndex {
+                path,
+                field_type: ft,
+            });
+        }
+    }
+    cache.write().insert_path_indexes(table, pis.clone());
+    pis
+}
+
+/// Look up the declared index type for a single path (O(1) hash-field get).
+/// Used by the planner, which has no schema-cache handle.
+fn read_path_index_type(store: &Store, table: &str, path: &str, now: Instant) -> Option<FieldType> {
+    let key = path_indexes_key(table);
+    let val = store.hget(key.as_bytes(), path.as_bytes(), now)?;
+    parse_index_type(&String::from_utf8_lossy(&val))
+}
+
+/// Declare a typed index on a JSON dot-path and backfill it over existing rows.
+pub fn table_create_path_index(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    path: &str,
+    type_token: &str,
+    now: Instant,
+) -> Result<(), String> {
+    let schema = load_schema(store, cache, table, now)?;
+    let (root, rest) = path
+        .split_once('.')
+        .ok_or_else(|| "ERR index path must be a dot-path into a JSON column".to_string())?;
+    if rest.is_empty() {
+        return Err("ERR index path must address a value inside the JSON column".to_string());
+    }
+    if !schema
+        .iter()
+        .any(|f| f.name == root && f.field_type == FieldType::Json)
+    {
+        return Err(format!("ERR '{}' is not a JSON column", root));
+    }
+    let field_type = parse_index_type(type_token).ok_or_else(|| {
+        format!(
+            "ERR invalid index type '{}'. Use INT/FLOAT/BOOL/TIMESTAMP/STR",
+            type_token
+        )
+    })?;
+    let token = index_type_token(&field_type).unwrap_or("str");
+
+    let key = path_indexes_key(table);
+    store.hset(key.as_bytes(), &[(path.as_bytes(), token.as_bytes())], now)?;
+    cache.write().remove_path_indexes(table);
+
+    // Backfill the index over existing rows.
+    let pi = PathIndex {
+        path: path.to_string(),
+        field_type,
+    };
+    let synthetic = synthetic_path_fielddef(&pi);
+    for pk_str in get_all_row_ids(store, table, now) {
+        let Some(row) = get_row(store, table, &schema, &pk_str, now) else {
+            continue;
+        };
+        if let Some(raw) = row.iter().find(|(k, _)| k == root).map(|(_, v)| v.as_str()) {
+            if let Some(scalar) = extract_json_scalar(raw, rest) {
+                add_to_index(store, table, &synthetic, &scalar, &pk_str, now);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Drop a declared path index and remove all of its index entries.
+pub fn table_drop_path_index(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    path: &str,
+    now: Instant,
+) -> Result<(), String> {
+    let schema = load_schema(store, cache, table, now)?;
+    let path_indexes = load_path_indexes(store, cache, table, now);
+    let Some(pi) = path_indexes.iter().find(|p| p.path == path) else {
+        return Err(format!("ERR no index on path '{}'", path));
+    };
+    let (root, rest) = path.split_once('.').unwrap_or((path, ""));
+    let synthetic = synthetic_path_fielddef(pi);
+    for pk_str in get_all_row_ids(store, table, now) {
+        let Some(row) = get_row(store, table, &schema, &pk_str, now) else {
+            continue;
+        };
+        if let Some(raw) = row.iter().find(|(k, _)| k == root).map(|(_, v)| v.as_str()) {
+            if let Some(scalar) = extract_json_scalar(raw, rest) {
+                remove_from_index(store, table, &synthetic, &scalar, &pk_str, now);
+            }
+        }
+    }
+    let key = path_indexes_key(table);
+    let _ = store.hdel(key.as_bytes(), &[path.as_bytes()], now);
+    cache.write().remove_path_indexes(table);
+    Ok(())
+}
+
 fn validate_value(field: &FieldDef, value: &str) -> Result<(), String> {
     match &field.field_type {
         FieldType::Str => Ok(()),
@@ -795,6 +1071,27 @@ fn validate_value(field: &FieldDef, value: &str) -> Result<(), String> {
         }
         FieldType::Vector(dims) => {
             parse_vector_value(value, *dims)?;
+            Ok(())
+        }
+        FieldType::Json => {
+            serde_json::from_str::<serde_json::Value>(value).map_err(|_| {
+                format!("ERR column '{}' expects JSON, got '{}'", field.name, value)
+            })?;
+            Ok(())
+        }
+        FieldType::Array => {
+            let parsed = serde_json::from_str::<serde_json::Value>(value).map_err(|_| {
+                format!(
+                    "ERR column '{}' expects a JSON array, got '{}'",
+                    field.name, value
+                )
+            })?;
+            if !parsed.is_array() {
+                return Err(format!(
+                    "ERR column '{}' expects a JSON array, got '{}'",
+                    field.name, value
+                ));
+            }
             Ok(())
         }
     }
@@ -900,6 +1197,8 @@ fn add_to_index(
                 store.vset(vkey.as_bytes(), vector, Some(metadata), None, now);
             }
         }
+        // JSON/ARRAY columns are not auto-indexed; only declared path indexes apply.
+        FieldType::Json | FieldType::Array => {}
     }
 }
 
@@ -928,6 +1227,7 @@ fn remove_from_index(
             let vkey = table_vector_key(table, &field.name, pk_str);
             store.del(&[vkey.as_bytes()]);
         }
+        FieldType::Json | FieldType::Array => {}
     }
 }
 
@@ -1190,6 +1490,24 @@ pub fn table_insert(
         }
     }
 
+    // Declared JSON path indexes (cached empty for un-indexed tables => cheap).
+    for pi in &load_path_indexes(store, cache, table, now) {
+        if let Some((root, rest)) = pi.path.split_once('.') {
+            if let Some(raw) = provided.get(root).copied() {
+                if let Some(scalar) = extract_json_scalar(raw, rest) {
+                    add_to_index(
+                        store,
+                        table,
+                        &synthetic_path_fielddef(pi),
+                        &scalar,
+                        &pk_str,
+                        now,
+                    );
+                }
+            }
+        }
+    }
+
     let ret_id: i64 = pk_str.parse().unwrap_or(0);
     Ok(ret_id)
 }
@@ -1290,6 +1608,29 @@ fn table_update_by_pk_str(
                 &[(fval.as_bytes() as &[u8], pk_str.as_bytes() as &[u8])],
                 now,
             );
+        }
+    }
+
+    // Reconcile declared JSON path indexes whose root column was updated.
+    for pi in &load_path_indexes(store, cache, table, now) {
+        let Some((root, rest)) = pi.path.split_once('.') else {
+            continue;
+        };
+        let Some(new_raw) = field_values
+            .iter()
+            .find(|(k, _)| *k == root)
+            .map(|(_, v)| *v)
+        else {
+            continue; // root JSON column not updated => index entry unchanged
+        };
+        let synthetic = synthetic_path_fielddef(pi);
+        if let Some(old_raw) = old_map.get(root) {
+            if let Some(old_scalar) = extract_json_scalar(old_raw, rest) {
+                remove_from_index(store, table, &synthetic, &old_scalar, pk_str, now);
+            }
+        }
+        if let Some(new_scalar) = extract_json_scalar(new_raw, rest) {
+            add_to_index(store, table, &synthetic, &new_scalar, pk_str, now);
         }
     }
 
@@ -1487,6 +1828,24 @@ fn table_delete_inner(
         }
     }
 
+    // Remove declared JSON path index entries for this row.
+    for pi in &load_path_indexes(store, cache, table, now) {
+        if let Some((root, rest)) = pi.path.split_once('.') {
+            if let Some(raw) = row_map.get(root) {
+                if let Some(scalar) = extract_json_scalar(raw, rest) {
+                    remove_from_index(
+                        store,
+                        table,
+                        &synthetic_path_fielddef(pi),
+                        &scalar,
+                        pk_str,
+                        now,
+                    );
+                }
+            }
+        }
+    }
+
     let ikey = ids_key(table);
     let _ = store.zrem(ikey.as_bytes(), &[pk_str.as_bytes()], now);
 
@@ -1495,78 +1854,140 @@ fn table_delete_inner(
     Ok(())
 }
 
-/// Parse WHERE conditions from command args (field op value [AND ...])
+/// Parse a parenthesized `IN` value list: `( v1 v2 v3 )`.
+/// Precondition: `args[*i]` is the opening `(`. Advances `*i` past the closing `)`.
+fn parse_in_list(args: &[&str], i: &mut usize) -> Result<Vec<String>, String> {
+    if *i >= args.len() || args[*i] != "(" {
+        return Err("ERR IN operator requires a parenthesized list, e.g. IN ( a b c )".to_string());
+    }
+    *i += 1; // consume "("
+    let mut values = Vec::new();
+    while *i < args.len() && args[*i] != ")" {
+        values.push(args[*i].to_string());
+        *i += 1;
+    }
+    if *i >= args.len() {
+        return Err("ERR unterminated IN list: missing ')'".to_string());
+    }
+    *i += 1; // consume ")"
+    if values.is_empty() {
+        return Err("ERR IN list must contain at least one value".to_string());
+    }
+    Ok(values)
+}
+
+/// Parse a single WHERE condition starting at `args[*i]`, advancing `*i` past it.
+/// Handles `field op value`, `field IN ( ... )`, and `field NOT IN ( ... )`.
+fn parse_where_condition(args: &[&str], i: &mut usize) -> Result<WhereClause, String> {
+    if *i >= args.len() {
+        return Err("ERR incomplete WHERE clause: expected field".to_string());
+    }
+    let field = args[*i].to_string();
+    *i += 1;
+    if *i >= args.len() {
+        return Err(format!(
+            "ERR incomplete WHERE clause: missing operator after '{field}'"
+        ));
+    }
+    let op_str = args[*i];
+    let op_upper = op_str.to_uppercase();
+    *i += 1;
+
+    // List operators: `IN ( ... )` and `NOT IN ( ... )`.
+    if op_upper == "IN" {
+        let values = parse_in_list(args, i)?;
+        return Ok(WhereClause::in_list(field, CmpOp::In, values));
+    }
+    if op_upper == "NOT" {
+        if *i < args.len() && args[*i].eq_ignore_ascii_case("IN") {
+            *i += 1;
+            let values = parse_in_list(args, i)?;
+            return Ok(WhereClause::in_list(field, CmpOp::NotIn, values));
+        }
+        return Err("ERR expected 'IN' after 'NOT' in WHERE clause".to_string());
+    }
+
+    // Existence predicate: `field IS VALID` / `field IS NOT VALID` (no RHS).
+    if op_upper == "IS" {
+        if *i < args.len() && args[*i].eq_ignore_ascii_case("VALID") {
+            *i += 1;
+            return Ok(WhereClause::single(field, CmpOp::IsValid, String::new()));
+        }
+        if *i + 1 < args.len()
+            && args[*i].eq_ignore_ascii_case("NOT")
+            && args[*i + 1].eq_ignore_ascii_case("VALID")
+        {
+            *i += 2;
+            return Ok(WhereClause::single(field, CmpOp::IsNotValid, String::new()));
+        }
+        return Err("ERR expected 'VALID' or 'NOT VALID' after 'IS'".to_string());
+    }
+
+    // Array membership: `field CONTAINS value`.
+    if op_upper == "CONTAINS" {
+        if *i >= args.len() {
+            return Err("ERR missing value after CONTAINS".to_string());
+        }
+        let value = args[*i].to_string();
+        *i += 1;
+        return Ok(WhereClause::single(field, CmpOp::Contains, value));
+    }
+
+    // Single-operand comparison operators.
+    if *i >= args.len() {
+        return Err(format!(
+            "ERR incomplete WHERE clause: missing value after '{op_str}'"
+        ));
+    }
+    let value = args[*i].to_string();
+    *i += 1;
+    let op = parse_cmp_op(op_str)?;
+    Ok(WhereClause::single(field, op, value))
+}
+
+/// Parse WHERE conditions from command args (`field op value [AND ...]`).
 fn parse_where_conditions(args: &[&str]) -> Result<Vec<WhereClause>, String> {
     let mut conditions = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        if i + 2 >= args.len() {
-            return Err("ERR incomplete WHERE clause".to_string());
-        }
-        let field = args[i].to_string();
-        let op_str = args[i + 1];
-        let value = args[i + 2].to_string();
-        let op = parse_cmp_op(op_str)?;
-        conditions.push(WhereClause { field, op, value });
-        i += 3;
-        // Check for AND
-        if i < args.len() && args[i].to_uppercase() == "AND" {
+        conditions.push(parse_where_condition(args, &mut i)?);
+        if i < args.len() && args[i].eq_ignore_ascii_case("AND") {
             i += 1;
         }
     }
     Ok(conditions)
 }
 
-/// Apply WHERE conditions to check if a row matches
-fn row_matches_conditions(
-    row_map: &std::collections::HashMap<String, String>,
-    conditions: &[WhereClause],
-) -> bool {
-    for cond in conditions {
-        let field_val = match row_map.get(&cond.field) {
-            Some(v) => v,
-            None => return false, // Field doesn't exist, no match
-        };
-        let matches = match cond.op {
-            CmpOp::Eq => field_val == &cond.value,
-            CmpOp::Ne => field_val != &cond.value,
-            CmpOp::Gt => {
-                if let (Ok(fv), Ok(cv)) = (field_val.parse::<f64>(), cond.value.parse::<f64>()) {
-                    fv > cv
-                } else {
-                    field_val > &cond.value
-                }
-            }
-            CmpOp::Lt => {
-                if let (Ok(fv), Ok(cv)) = (field_val.parse::<f64>(), cond.value.parse::<f64>()) {
-                    fv < cv
-                } else {
-                    field_val < &cond.value
-                }
-            }
-            CmpOp::Ge => {
-                if let (Ok(fv), Ok(cv)) = (field_val.parse::<f64>(), cond.value.parse::<f64>()) {
-                    fv >= cv
-                } else {
-                    field_val >= &cond.value
-                }
-            }
-            CmpOp::Le => {
-                if let (Ok(fv), Ok(cv)) = (field_val.parse::<f64>(), cond.value.parse::<f64>()) {
-                    fv <= cv
-                } else {
-                    field_val <= &cond.value
-                }
-            }
-        };
-        if !matches {
-            return false;
-        }
+/// Update rows matching WHERE conditions, returns count of updated rows
+/// The synthetic `id` field used when a table has no explicit primary key.
+fn implicit_id_field_for(schema: &[FieldDef]) -> Option<FieldDef> {
+    if schema.iter().any(|f| f.primary_key) {
+        None
+    } else {
+        Some(FieldDef {
+            name: "id".to_string(),
+            field_type: FieldType::Int,
+            primary_key: true,
+            unique: true,
+            nullable: false,
+            default_value: None,
+            references: None,
+        })
     }
-    true
 }
 
-/// Update rows matching WHERE conditions, returns count of updated rows
+/// True if `field` is a dot-path whose leading segment is a JSON or ARRAY column.
+fn is_json_path_field(field: &str, schema: &[FieldDef]) -> bool {
+    field
+        .split_once('.')
+        .map(|(root, _)| {
+            schema.iter().any(|f| {
+                f.name == root && matches!(f.field_type, FieldType::Json | FieldType::Array)
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub fn table_update_where(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -1586,17 +2007,19 @@ pub fn table_update_where(
             .ok_or_else(|| format!("ERR unknown field '{}'", fname))?;
     }
 
-    // Validate all WHERE fields exist (allow "id" for tables with implicit PK)
+    // Validate all WHERE fields exist (allow "id" for implicit-PK tables and
+    // JSON dot-paths whose root is a JSON column).
     let has_implicit_pk = !schema.iter().any(|f| f.primary_key);
     for cond in &conditions {
         let is_implicit_id = has_implicit_pk && cond.field == "id";
-        if !is_implicit_id {
+        if !is_implicit_id && !is_json_path_field(&cond.field, &schema) {
             schema
                 .iter()
                 .find(|f| f.name == cond.field)
                 .ok_or_else(|| format!("ERR unknown field '{}' in WHERE clause", cond.field))?;
         }
     }
+    let implicit_id = implicit_id_field_for(&schema);
 
     let row_ids = plan_table_scan(
         store,
@@ -1619,9 +2042,8 @@ pub fn table_update_where(
         let Some(row) = get_row(store, table, &schema, &pk_str, now) else {
             continue;
         };
-        let row_map: std::collections::HashMap<String, String> = row.into_iter().collect();
 
-        if !row_matches_conditions(&row_map, &conditions) {
+        if !row_matches_base_conditions(&row, &schema, implicit_id.as_ref(), &conditions) {
             continue;
         }
 
@@ -1658,17 +2080,19 @@ pub fn table_delete_where(
     let schema = load_schema(store, cache, table, now)?;
     let conditions = parse_where_conditions(where_args)?;
 
-    // Validate all WHERE fields exist (allow "id" for tables with implicit PK)
+    // Validate all WHERE fields exist (allow "id" for implicit-PK tables and
+    // JSON dot-paths whose root is a JSON column).
     let has_implicit_pk = !schema.iter().any(|f| f.primary_key);
     for cond in &conditions {
         let is_implicit_id = has_implicit_pk && cond.field == "id";
-        if !is_implicit_id {
+        if !is_implicit_id && !is_json_path_field(&cond.field, &schema) {
             schema
                 .iter()
                 .find(|f| f.name == cond.field)
                 .ok_or_else(|| format!("ERR unknown field '{}' in WHERE clause", cond.field))?;
         }
     }
+    let implicit_id = implicit_id_field_for(&schema);
 
     let row_ids = plan_table_scan(
         store,
@@ -1694,9 +2118,8 @@ pub fn table_delete_where(
         let Some(row) = get_row(store, table, &schema, &pk_str, now) else {
             continue;
         };
-        let row_map: std::collections::HashMap<String, String> = row.into_iter().collect();
 
-        if row_matches_conditions(&row_map, &conditions) {
+        if row_matches_base_conditions(&row, &schema, implicit_id.as_ref(), &conditions) {
             pks_to_delete.push(pk_str);
         }
     }
@@ -1767,7 +2190,11 @@ pub fn table_drop(
                 let zkey = idx_sorted_key(table, &field.name);
                 store.del(&[zkey.as_bytes()]);
             }
-            FieldType::Str | FieldType::Uuid | FieldType::Vector(_) => {}
+            FieldType::Str
+            | FieldType::Uuid
+            | FieldType::Vector(_)
+            | FieldType::Json
+            | FieldType::Array => {}
         }
         if field.unique {
             let ukey = uniq_key(table, &field.name);
@@ -1778,6 +2205,7 @@ pub fn table_drop(
     store.del(&[ikey.as_bytes()]);
     store.del(&[schema_key(table).as_bytes()]);
     store.del(&[seq_key(table).as_bytes()]);
+    store.del(&[path_indexes_key(table).as_bytes()]);
 
     let tlist = table_list_key();
     let _ = store.srem(tlist.as_bytes(), &[table.as_bytes()], now);
@@ -1816,6 +2244,8 @@ pub fn table_schema(
             FieldType::Timestamp => "TIMESTAMP".to_string(),
             FieldType::Uuid => "UUID".to_string(),
             FieldType::Vector(dims) => format!("VECTOR({})", dims),
+            FieldType::Json => "JSON".to_string(),
+            FieldType::Array => "ARRAY".to_string(),
             FieldType::Ref(t) => format!("REFERENCES {}(id)", t),
         };
         let mut parts = vec![field.name.clone(), type_str];
@@ -2038,11 +2468,295 @@ fn get_row_with_map(
     Some(out)
 }
 
+/// Type-aware equality between a stored value and a candidate, mirroring the
+/// per-type `Eq` semantics of `matches_condition`. Used by `IN`/`NOT IN`.
+fn elem_eq(field_type: &FieldType, lhs: &str, rhs: &str) -> bool {
+    match field_type {
+        FieldType::Bool => {
+            let normalise = |s: &str| matches!(s, "1" | "true");
+            normalise(lhs) == normalise(rhs)
+        }
+        FieldType::Int | FieldType::Timestamp | FieldType::Ref(_) => {
+            lhs.parse::<i64>().unwrap_or(0) == rhs.parse::<i64>().unwrap_or(0)
+        }
+        FieldType::Float => {
+            (lhs.parse::<f64>().unwrap_or(0.0) - rhs.parse::<f64>().unwrap_or(0.0)).abs()
+                < f64::EPSILON
+        }
+        FieldType::Str
+        | FieldType::Uuid
+        | FieldType::Vector(_)
+        | FieldType::Json
+        | FieldType::Array => lhs == rhs,
+    }
+}
+
+/// Result of walking a dotted path into a JSON value.
+enum JsonResolve<'a> {
+    /// Every segment resolved to a present value (which may be JSON null).
+    Resolved(&'a serde_json::Value),
+    /// A key (or array index) along the path was missing.
+    Absent,
+    /// A segment tried to descend into a scalar/null (e.g. `a.b` where `a` is 5).
+    Invalid,
+}
+
+/// Walk a dotted path (`a.b.c`) into a JSON value. Numeric segments index into
+/// arrays (`tags.0`). Absent vs Invalid are distinguished but both mean
+/// "not VALID" / non-match for filtering.
+fn json_path_get<'a>(root: &'a serde_json::Value, path: &str) -> JsonResolve<'a> {
+    let mut cur = root;
+    for seg in path.split('.') {
+        match cur {
+            serde_json::Value::Object(map) => match map.get(seg) {
+                Some(v) => cur = v,
+                None => return JsonResolve::Absent,
+            },
+            serde_json::Value::Array(arr) => match seg.parse::<usize>() {
+                Ok(idx) => match arr.get(idx) {
+                    Some(v) => cur = v,
+                    None => return JsonResolve::Absent,
+                },
+                Err(_) => return JsonResolve::Invalid,
+            },
+            _ => return JsonResolve::Invalid,
+        }
+    }
+    JsonResolve::Resolved(cur)
+}
+
+/// Evaluate a WHERE condition whose field is a `jsoncol.dotted.path`.
+/// Semantics: an unresolved/null path is a non-match for every comparison op
+/// (never an error); `IS VALID` means the path resolves to a present, non-null
+/// value (existence, NOT truthiness, so 0/false/"" are VALID).
+fn eval_json_path_condition(
+    row: &[(String, String)],
+    root: &str,
+    path: &str,
+    cond: &WhereClause,
+) -> bool {
+    let raw = match row.iter().find(|(k, _)| k == root) {
+        Some((_, v)) => v.as_str(),
+        None => return cond.op == CmpOp::IsNotValid,
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return cond.op == CmpOp::IsNotValid,
+    };
+    let resolved = json_path_get(&parsed, path);
+    let present_non_null = matches!(&resolved, JsonResolve::Resolved(v) if !v.is_null());
+
+    match cond.op {
+        CmpOp::IsValid => return present_non_null,
+        CmpOp::IsNotValid => return !present_non_null,
+        CmpOp::Contains => {
+            return matches!(
+                &resolved,
+                JsonResolve::Resolved(serde_json::Value::Array(arr))
+                    if arr.iter().any(|el| json_scalar_string(el).as_deref()
+                        == Some(cond.value.as_str()))
+            );
+        }
+        _ => {}
+    }
+
+    // Every comparison implicitly requires VALID.
+    if !present_non_null {
+        return false;
+    }
+    let JsonResolve::Resolved(v) = resolved else {
+        return false;
+    };
+    // Only JSON scalars are comparable; objects/arrays are non-matching.
+    let actual = match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        _ => return false,
+    };
+    match cond.op {
+        CmpOp::In => cond
+            .values
+            .iter()
+            .any(|rhs| compare_condition_value(&actual, &CmpOp::Eq, rhs)),
+        CmpOp::NotIn => !cond
+            .values
+            .iter()
+            .any(|rhs| compare_condition_value(&actual, &CmpOp::Eq, rhs)),
+        _ => compare_condition_value(&actual, &cond.op, &cond.value),
+    }
+}
+
+/// Compare a resolved binary-JSON scalar against a condition, matching the
+/// text-path semantics exactly (reuses `compare_condition_value`).
+fn eval_scalar_binary(v: &crate::jsonb::JsonbRef, cond: &WhereClause) -> bool {
+    use crate::jsonb::JsonbRef;
+    let actual: String = match v {
+        JsonbRef::Str(s) => (*s).to_string(),
+        JsonbRef::I64(i) => i.to_string(),
+        JsonbRef::F64(f) => serde_json::Number::from_f64(*f)
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+        JsonbRef::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        _ => return false,
+    };
+    match cond.op {
+        CmpOp::In => cond
+            .values
+            .iter()
+            .any(|rhs| compare_condition_value(&actual, &CmpOp::Eq, rhs)),
+        CmpOp::NotIn => !cond
+            .values
+            .iter()
+            .any(|rhs| compare_condition_value(&actual, &CmpOp::Eq, rhs)),
+        _ => compare_condition_value(&actual, &cond.op, &cond.value),
+    }
+}
+
+/// Evaluate a JSON dot-path condition directly against the stored binary bytes
+/// (zero-alloc walk; no `serde_json::Value` tree). `raw` is the column's bytes.
+fn eval_json_path_binary(raw: Option<&[u8]>, path: &str, cond: &WhereClause) -> bool {
+    use crate::jsonb::{get_path, JsonbRef, Resolve};
+    let Some(raw) = raw else {
+        return cond.op == CmpOp::IsNotValid;
+    };
+    let resolved = get_path(raw, path);
+    let present = matches!(&resolved, Resolve::Found(v) if !v.is_null());
+    match cond.op {
+        CmpOp::IsValid => return present,
+        CmpOp::IsNotValid => return !present,
+        CmpOp::Contains => {
+            return matches!(
+                &resolved,
+                Resolve::Found(JsonbRef::Array(arr)) if crate::jsonb::array_contains(arr, &cond.value)
+            );
+        }
+        _ => {}
+    }
+    if !present {
+        return false;
+    }
+    match resolved {
+        Resolve::Found(v) => eval_scalar_binary(&v, cond),
+        _ => false,
+    }
+}
+
+/// Evaluate a condition on a whole JSON/ARRAY column (no dot-path) against the
+/// stored binary. Handles CONTAINS membership and whole-document equality.
+fn eval_json_whole_binary(raw: Option<&[u8]>, cond: &WhereClause) -> bool {
+    let Some(raw) = raw else {
+        return cond.op == CmpOp::Ne;
+    };
+    match cond.op {
+        CmpOp::Contains => crate::jsonb::array_contains(raw, &cond.value),
+        CmpOp::Eq => crate::jsonb::to_json_string(raw) == cond.value,
+        CmpOp::Ne => crate::jsonb::to_json_string(raw) != cond.value,
+        _ => false,
+    }
+}
+
+/// Store-driven WHERE evaluation: fetches only the fields a condition needs
+/// (HGET, not full-row HGETALL) and walks JSON columns as binary. Lets the scan
+/// filter cheaply and hydrate the full row only for survivors.
+fn row_passes_conditions(
+    store: &Store,
+    table: &str,
+    schema: &[FieldDef],
+    implicit_id: Option<&FieldDef>,
+    pk: &str,
+    conditions: &[WhereClause],
+    now: Instant,
+) -> bool {
+    let rk = row_key_for_pk(table, pk);
+    conditions.iter().all(|cond| {
+        // JSON/ARRAY dot-path => walk the stored binary.
+        if let Some((root, rest)) = cond.field.split_once('.') {
+            if schema.iter().any(|f| {
+                f.name == root && matches!(f.field_type, FieldType::Json | FieldType::Array)
+            }) {
+                let raw = store.hget(rk.as_bytes(), root.as_bytes(), now);
+                return eval_json_path_binary(raw.as_deref(), rest, cond);
+            }
+        }
+        let bare = bare_col(&cond.field);
+        if let Some(fd) = schema.iter().find(|f| f.name == bare) {
+            if matches!(fd.field_type, FieldType::Json | FieldType::Array) {
+                let raw = store.hget(rk.as_bytes(), bare.as_bytes(), now);
+                return eval_json_whole_binary(raw.as_deref(), cond);
+            }
+            return match store.hget(rk.as_bytes(), bare.as_bytes(), now) {
+                Some(b) => {
+                    let val = fd.field_type.decode_value(&b);
+                    let row = [(bare.to_string(), val)];
+                    matches_condition(
+                        &row,
+                        &WhereClause {
+                            field: bare.to_string(),
+                            op: cond.op.clone(),
+                            value: cond.value.clone(),
+                            values: cond.values.clone(),
+                        },
+                        fd,
+                    )
+                }
+                None => cond.op == CmpOp::Ne,
+            };
+        }
+        if bare == "id" {
+            if let Some(fd) = implicit_id {
+                return match store.hget(rk.as_bytes(), b"id", now) {
+                    Some(b) => {
+                        let val = fd.field_type.decode_value(&b);
+                        let row = [("id".to_string(), val)];
+                        matches_condition(
+                            &row,
+                            &WhereClause {
+                                field: "id".to_string(),
+                                op: cond.op.clone(),
+                                value: cond.value.clone(),
+                                values: cond.values.clone(),
+                            },
+                            fd,
+                        )
+                    }
+                    None => cond.op == CmpOp::Ne,
+                };
+            }
+            return true;
+        }
+        // Unknown column (e.g. a join column) - not filtered at this stage.
+        true
+    })
+}
+
 fn matches_condition(row: &[(String, String)], cond: &WhereClause, field_def: &FieldDef) -> bool {
     let val = match row.iter().find(|(k, _)| k == &cond.field) {
         Some((_, v)) => v.as_str(),
         None => return cond.op == CmpOp::Ne,
     };
+
+    // List-membership and VALID ops are handled before the per-type comparison.
+    match cond.op {
+        CmpOp::In => {
+            return cond
+                .values
+                .iter()
+                .any(|v| elem_eq(&field_def.field_type, val, v))
+        }
+        CmpOp::NotIn => {
+            return !cond
+                .values
+                .iter()
+                .any(|v| elem_eq(&field_def.field_type, val, v))
+        }
+        // VALID applies to JSON dot-paths, which are intercepted before this fn.
+        // On a plain scalar column there is no path to resolve, so non-match.
+        CmpOp::IsValid | CmpOp::IsNotValid => return false,
+        // CONTAINS on a whole ARRAY/JSON column: membership over array elements.
+        CmpOp::Contains => return json_array_contains(val, &cond.value),
+        _ => {}
+    }
 
     match &field_def.field_type {
         FieldType::Bool => {
@@ -2069,6 +2783,7 @@ fn matches_condition(row: &[(String, String)], cond: &WhereClause, field_def: &F
                 CmpOp::Lt => lhs < rhs,
                 CmpOp::Ge => lhs >= rhs,
                 CmpOp::Le => lhs <= rhs,
+                _ => false,
             }
         }
         FieldType::Float => {
@@ -2081,15 +2796,21 @@ fn matches_condition(row: &[(String, String)], cond: &WhereClause, field_def: &F
                 CmpOp::Lt => lhs < rhs,
                 CmpOp::Ge => lhs >= rhs,
                 CmpOp::Le => lhs <= rhs,
+                _ => false,
             }
         }
-        FieldType::Str | FieldType::Uuid | FieldType::Vector(_) => match cond.op {
+        FieldType::Str
+        | FieldType::Uuid
+        | FieldType::Vector(_)
+        | FieldType::Json
+        | FieldType::Array => match cond.op {
             CmpOp::Eq => val == cond.value,
             CmpOp::Ne => val != cond.value,
             CmpOp::Gt => val > cond.value.as_str(),
             CmpOp::Lt => val < cond.value.as_str(),
             CmpOp::Ge => val >= cond.value.as_str(),
             CmpOp::Le => val <= cond.value.as_str(),
+            _ => false,
         },
     }
 }
@@ -2116,7 +2837,8 @@ fn candidates_from_index(
             }
             None
         }
-        FieldType::Vector(_) => None,
+        // JSON/ARRAY columns carry only declared path indexes, handled separately.
+        FieldType::Vector(_) | FieldType::Json | FieldType::Array => None,
         FieldType::Int
         | FieldType::Float
         | FieldType::Bool
@@ -2133,7 +2855,12 @@ fn candidates_from_index(
                 CmpOp::Ge => (score, f64::INFINITY, false, false),
                 CmpOp::Lt => (f64::NEG_INFINITY, score, false, true),
                 CmpOp::Le => (f64::NEG_INFINITY, score, false, false),
-                CmpOp::Ne => return None,
+                CmpOp::Ne
+                | CmpOp::In
+                | CmpOp::NotIn
+                | CmpOp::IsValid
+                | CmpOp::IsNotValid
+                | CmpOp::Contains => return None,
             };
             // Pass limit directly to zrangebyscore - avoids fetching all matching IDs
             // when we only need the first N (e.g. WHERE age > 40 LIMIT 100)
@@ -2174,7 +2901,12 @@ fn candidates_from_implicit_id(
         CmpOp::Ge => (score, f64::INFINITY, false, false),
         CmpOp::Lt => (f64::NEG_INFINITY, score, false, true),
         CmpOp::Le => (f64::NEG_INFINITY, score, false, false),
-        CmpOp::Ne => return None,
+        CmpOp::Ne
+        | CmpOp::In
+        | CmpOp::NotIn
+        | CmpOp::IsValid
+        | CmpOp::IsNotValid
+        | CmpOp::Contains => return None,
     };
 
     let results = store
@@ -2305,30 +3037,8 @@ pub fn parse_select(args: &[&str]) -> Result<SelectPlan, String> {
             "WHERE" => {
                 i += 1;
                 loop {
-                    if i >= rest.len() {
-                        return Err(
-                            "ERR incomplete WHERE clause: expected field op value".to_string()
-                        );
-                    }
-                    let field = rest[i].to_string();
-                    i += 1;
-                    if i >= rest.len() {
-                        return Err(format!(
-                            "ERR incomplete WHERE clause: missing operator after '{field}'"
-                        ));
-                    }
-                    let op_str = rest[i];
-                    i += 1;
-                    if i >= rest.len() {
-                        return Err(format!(
-                            "ERR incomplete WHERE clause: missing value after '{op_str}'"
-                        ));
-                    }
-                    let value = rest[i].to_string();
-                    i += 1;
-                    let op = parse_cmp_op(op_str)?;
-                    conditions.push(WhereClause { field, op, value });
-                    if i < rest.len() && rest[i].to_uppercase() == "AND" {
+                    conditions.push(parse_where_condition(rest, &mut i)?);
+                    if i < rest.len() && rest[i].eq_ignore_ascii_case("AND") {
                         i += 1;
                     } else {
                         break;
@@ -2379,7 +3089,7 @@ pub fn parse_select(args: &[&str]) -> Result<SelectPlan, String> {
                     let value = rest[i].trim_end_matches(',').to_string();
                     i += 1;
                     let op = parse_cmp_op(op_str)?;
-                    having.push(WhereClause { field, op, value });
+                    having.push(WhereClause::single(field, op, value));
                     if i < rest.len() && rest[i].to_uppercase() == "AND" {
                         i += 1;
                     } else {
@@ -2708,6 +3418,7 @@ pub fn table_select(
                 field,
                 op: c.op.clone(),
                 value: c.value.clone(),
+                values: c.values.clone(),
             }
         })
         .collect();
@@ -2835,11 +3546,21 @@ pub fn table_select(
     let mut rows: Vec<Vec<(String, String)>> = scan
         .row_ids
         .into_iter()
+        // Filter first (per-field reads + zero-alloc JSON binary walk), then
+        // hydrate the full row only for the survivors.
+        .filter(|pk_str| {
+            row_passes_conditions(
+                store,
+                &plan.table,
+                &schema,
+                implicit_id_field.as_ref(),
+                pk_str,
+                &conditions,
+                now,
+            )
+        })
         .filter_map(|pk_str| {
             get_row_with_map(store, &plan.table, &type_map, &pk_str, now).map(|row| (pk_str, row))
-        })
-        .filter(|(_, row)| {
-            row_matches_base_conditions(row, &schema, implicit_id_field.as_ref(), &conditions)
         })
         // Fix 3: project down to only needed columns before prefixing.
         // Only prefix with alias when there's an explicit alias or a join -
@@ -3150,6 +3871,16 @@ fn row_matches_base_conditions(
     conditions: &[WhereClause],
 ) -> bool {
     conditions.iter().all(|cond| {
+        // JSON dot-path: `jsoncol.a.b` where the leading segment is a JSON
+        // column. Must run BEFORE bare_col, which would collapse the path to
+        // its leaf and silently match every row.
+        if let Some((root, path)) = cond.field.split_once('.') {
+            if schema.iter().any(|f| {
+                f.name == root && matches!(f.field_type, FieldType::Json | FieldType::Array)
+            }) {
+                return eval_json_path_condition(row, root, path, cond);
+            }
+        }
         let bare = bare_col(&cond.field);
         if let Some(fd) = schema.iter().find(|f| f.name == bare) {
             matches_condition(
@@ -3158,6 +3889,7 @@ fn row_matches_base_conditions(
                     field: bare.to_string(),
                     op: cond.op.clone(),
                     value: cond.value.clone(),
+                    values: cond.values.clone(),
                 },
                 fd,
             )
@@ -3169,6 +3901,7 @@ fn row_matches_base_conditions(
                         field: bare.to_string(),
                         op: cond.op.clone(),
                         value: cond.value.clone(),
+                        values: cond.values.clone(),
                     },
                     fd,
                 )
@@ -3225,7 +3958,12 @@ fn score_range_from_conditions(order_col: &str, conditions: &[WhereClause]) -> O
                     range.max_exclusive = false;
                 }
             }
-            CmpOp::Ne => return None,
+            CmpOp::Ne
+            | CmpOp::In
+            | CmpOp::NotIn
+            | CmpOp::IsValid
+            | CmpOp::IsNotValid
+            | CmpOp::Contains => return None,
         }
     }
 
@@ -3262,6 +4000,32 @@ fn build_candidate_set(
     let index_limit = if conditions.len() == 1 { limit } else { None };
 
     for cond in conditions {
+        // JSON dot-path: use a declared path index if one exists (O(log n) range
+        // scan), otherwise leave the candidate set unnarrowed (the row-level
+        // filter applies the predicate on a full scan).
+        if is_json_path_field(&cond.field, schema) {
+            if let Some(ft) = read_path_index_type(store, table, &cond.field, now) {
+                let synthetic = FieldDef {
+                    name: cond.field.clone(),
+                    field_type: ft,
+                    primary_key: false,
+                    unique: false,
+                    nullable: true,
+                    default_value: None,
+                    references: None,
+                };
+                if let Some(pks) =
+                    candidates_from_index(store, table, cond, &synthetic, index_limit, now)
+                {
+                    let pk_set: HashSet<String> = pks.into_iter().collect();
+                    candidate_set = Some(match candidate_set {
+                        Some(existing) => existing.intersection(&pk_set).cloned().collect(),
+                        None => pk_set,
+                    });
+                }
+            }
+            continue;
+        }
         let bare = bare_col(&cond.field);
         let primary_key_candidate = schema
             .iter()
@@ -3286,6 +4050,7 @@ fn build_candidate_set(
                     field: "id".to_string(),
                     op: cond.op.clone(),
                     value: cond.value.clone(),
+                    values: cond.values.clone(),
                 },
                 index_limit,
                 now,
@@ -3304,6 +4069,7 @@ fn build_candidate_set(
                     field: bare.to_string(),
                     op: cond.op.clone(),
                     value: cond.value.clone(),
+                    values: cond.values.clone(),
                 },
                 fd,
                 index_limit,
@@ -3339,7 +4105,11 @@ fn candidates_from_order_index(
             | FieldType::Bool
             | FieldType::Timestamp
             | FieldType::Ref(_) => idx_sorted_key(table, scan.column),
-            FieldType::Str | FieldType::Uuid | FieldType::Vector(_) => return None,
+            FieldType::Str
+            | FieldType::Uuid
+            | FieldType::Vector(_)
+            | FieldType::Json
+            | FieldType::Array => return None,
         }
     };
 
@@ -3583,6 +4353,72 @@ fn project_row_fields(
 ///
 /// Returns None if the fast path can't handle this query (falls through
 /// to the slow path which fetches full rows).
+/// True when every WHERE condition is answered *exactly* by an index, so a
+/// COUNT can trust the candidate-set cardinality without re-checking rows.
+/// Conservative: anything not clearly exact (JSON paths, `!=`, IN, IS VALID,
+/// CONTAINS, unindexed columns) returns false so the caller filters instead.
+fn count_is_exact_via_index(
+    store: &Store,
+    table: &str,
+    schema: &[FieldDef],
+    conditions: &[WhereClause],
+    now: Instant,
+) -> bool {
+    conditions.iter().all(|c| {
+        if is_json_path_field(&c.field, schema) {
+            // A declared path index makes the candidate set exact for the ops
+            // the index can serve: numeric ranges/eq (sorted set) or str eq (set).
+            return match read_path_index_type(store, table, &c.field, now) {
+                Some(FieldType::Str) => c.op == CmpOp::Eq,
+                Some(_) => matches!(
+                    c.op,
+                    CmpOp::Eq | CmpOp::Gt | CmpOp::Ge | CmpOp::Lt | CmpOp::Le
+                ),
+                None => false,
+            };
+        }
+        let bare = bare_col(&c.field);
+        if bare == "id" && !schema.iter().any(|f| f.primary_key) {
+            return matches!(
+                c.op,
+                CmpOp::Eq | CmpOp::Gt | CmpOp::Ge | CmpOp::Lt | CmpOp::Le
+            );
+        }
+        match schema.iter().find(|f| f.name == bare) {
+            Some(fd) => matches!(
+                (&fd.field_type, &c.op),
+                (
+                    FieldType::Int
+                        | FieldType::Float
+                        | FieldType::Bool
+                        | FieldType::Timestamp
+                        | FieldType::Ref(_),
+                    CmpOp::Eq | CmpOp::Gt | CmpOp::Ge | CmpOp::Lt | CmpOp::Le
+                ) | (FieldType::Str | FieldType::Uuid, CmpOp::Eq)
+            ),
+            None => false,
+        }
+    })
+}
+
+/// Count candidate rows that satisfy the predicate. Filters via per-field
+/// reads + zero-alloc JSON binary walk, without hydrating full rows.
+fn count_matching_rows(
+    store: &Store,
+    table: &str,
+    schema: &[FieldDef],
+    conditions: &[WhereClause],
+    now: Instant,
+) -> i64 {
+    let implicit = implicit_id_field_for(schema);
+    build_candidates(store, table, schema, conditions, None, now)
+        .iter()
+        .filter(|pk| {
+            row_passes_conditions(store, table, schema, implicit.as_ref(), pk, conditions, now)
+        })
+        .count() as i64
+}
+
 fn try_fast_aggregate(
     store: &Store,
     table: &str,
@@ -3601,11 +4437,13 @@ fn try_fast_aggregate(
                 let count = if conditions.is_empty() {
                     // COUNT(*) with no WHERE - just read the sorted set cardinality
                     store.zcard(ids_key(table).as_bytes(), now).unwrap_or(0)
+                } else if count_is_exact_via_index(store, table, schema, conditions, now) {
+                    // Candidate set is an exact match set - cardinality is the answer.
+                    build_candidates(store, table, schema, conditions, None, now).len() as i64
                 } else {
-                    // COUNT(*) with WHERE - use index to get candidates, count them
-                    // No limit here - COUNT needs the full matching set
-                    let candidates = build_candidates(store, table, schema, conditions, None, now);
-                    candidates.len() as i64
+                    // Predicate isn't index-exact (JSON path, !=, IN, ...) - the
+                    // candidate set may be a superset, so re-check each row.
+                    count_matching_rows(store, table, schema, conditions, now)
                 };
                 result.push((agg.alias.clone(), count.to_string()));
             }
@@ -3641,7 +4479,12 @@ fn try_fast_aggregate(
                                 CmpOp::Ge => (score, f64::INFINITY, false, false),
                                 CmpOp::Lt => (f64::NEG_INFINITY, score, false, true),
                                 CmpOp::Le => (f64::NEG_INFINITY, score, false, false),
-                                CmpOp::Ne => return None,
+                                CmpOp::Ne
+                                | CmpOp::In
+                                | CmpOp::NotIn
+                                | CmpOp::IsValid
+                                | CmpOp::IsNotValid
+                                | CmpOp::Contains => return None,
                             }
                         }
                         // Conditions on other columns - fall through to slow path
@@ -3986,6 +4829,7 @@ fn compare_condition_value(actual: &str, op: &CmpOp, expected: &str) -> bool {
             CmpOp::Lt => a < e,
             CmpOp::Ge => a >= e,
             CmpOp::Le => a <= e,
+            _ => false,
         };
     }
     match op {
@@ -3995,6 +4839,7 @@ fn compare_condition_value(actual: &str, op: &CmpOp, expected: &str) -> bool {
         CmpOp::Lt => actual < expected,
         CmpOp::Ge => actual >= expected,
         CmpOp::Le => actual <= expected,
+        _ => false,
     }
 }
 
@@ -4141,7 +4986,7 @@ mod tests {
 
     #[test]
     fn parse_field_unknown_type_errors() {
-        assert!(parse_field_def("x JSONB").is_err());
+        assert!(parse_field_def("x BLOB").is_err());
     }
 
     #[test]
@@ -4891,6 +5736,783 @@ mod tests {
             }
             _ => panic!("expected rows"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // IN / NOT IN
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_where_in_list_basic() {
+        let plan = parse_select(&[
+            "*", "FROM", "users", "WHERE", "name", "IN", "(", "Alice", "Bob", "Carol", ")",
+        ])
+        .unwrap();
+        assert_eq!(plan.conditions.len(), 1);
+        assert_eq!(plan.conditions[0].op, CmpOp::In);
+        assert_eq!(plan.conditions[0].values, vec!["Alice", "Bob", "Carol"]);
+    }
+
+    #[test]
+    fn parse_where_not_in() {
+        let plan = parse_select(&[
+            "*", "FROM", "users", "WHERE", "id", "NOT", "IN", "(", "1", "2", ")",
+        ])
+        .unwrap();
+        assert_eq!(plan.conditions[0].op, CmpOp::NotIn);
+        assert_eq!(plan.conditions[0].values, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn parse_in_missing_close_paren_errors() {
+        let err =
+            parse_select(&["*", "FROM", "users", "WHERE", "name", "IN", "(", "Alice"]).unwrap_err();
+        assert!(err.contains("unterminated IN list"), "{err}");
+    }
+
+    #[test]
+    fn parse_in_empty_list_errors() {
+        let err =
+            parse_select(&["*", "FROM", "users", "WHERE", "name", "IN", "(", ")"]).unwrap_err();
+        assert!(err.contains("at least one value"), "{err}");
+    }
+
+    #[test]
+    fn select_in_matches_subset() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_users(&store, &cache, now);
+
+        let plan = parse_select(&[
+            "*", "FROM", "users", "WHERE", "name", "IN", "(", "Alice", "Carol", ")",
+        ])
+        .unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+        match result {
+            SelectResult::Rows(rows) => assert_eq!(rows.len(), 2),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn select_in_numeric_uses_typed_compare() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_users(&store, &cache, now);
+
+        // age is INT: "25"/"35" must compare numerically, not as raw strings.
+        let plan = parse_select(&[
+            "*", "FROM", "users", "WHERE", "age", "IN", "(", "25", "35", ")",
+        ])
+        .unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+        match result {
+            SelectResult::Rows(rows) => assert_eq!(rows.len(), 2), // Bob (25), Carol (35)
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn select_in_on_pk_returns_correct_rows() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_users(&store, &cache, now);
+
+        let plan = parse_select(&[
+            "*", "FROM", "users", "WHERE", "id", "IN", "(", "1", "3", ")",
+        ])
+        .unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+        match result {
+            SelectResult::Rows(rows) => assert_eq!(rows.len(), 2), // Alice (1), Carol (3)
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn select_not_in_excludes_subset() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_users(&store, &cache, now);
+
+        let plan = parse_select(&[
+            "*", "FROM", "users", "WHERE", "name", "NOT", "IN", "(", "Alice", "Bob", ")",
+        ])
+        .unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+        match result {
+            SelectResult::Rows(rows) => assert_eq!(rows.len(), 2), // Carol, Dave
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn tdelete_in_removes_subset() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_users(&store, &cache, now);
+
+        let deleted = table_delete_where(
+            &store,
+            &cache,
+            "users",
+            &["id", "IN", "(", "2", "4", ")"],
+            now,
+        )
+        .unwrap();
+        assert_eq!(deleted, 2);
+
+        let plan = parse_select(&["*", "FROM", "users"]).unwrap();
+        match table_select(&store, &cache, &plan, now).unwrap() {
+            SelectResult::Rows(rows) => assert_eq!(rows.len(), 2),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn tupdate_in_updates_subset() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_users(&store, &cache, now);
+
+        let updated = table_update_where(
+            &store,
+            &cache,
+            "users",
+            &[("active", "false")],
+            &["name", "IN", "(", "Alice", "Bob", ")"],
+            now,
+        )
+        .unwrap();
+        assert_eq!(updated, 2);
+
+        let plan = parse_select(&["*", "FROM", "users", "WHERE", "active", "=", "false"]).unwrap();
+        match table_select(&store, &cache, &plan, now).unwrap() {
+            SelectResult::Rows(rows) => assert_eq!(rows.len(), 3), // Carol + Alice + Bob
+            _ => panic!("expected rows"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // JSON column type + dot-path WHERE + IS VALID
+    // -------------------------------------------------------------------------
+
+    fn seed_events(store: &Arc<Store>, cache: &SharedSchemaCache, now: Instant) {
+        table_create(
+            store,
+            cache,
+            "events",
+            &["id INT PRIMARY KEY,", "kind STR,", "meta JSON"],
+            now,
+        )
+        .unwrap();
+        let rows = [
+            ("1", r#"{"reactions":{"count":10},"flagged":true}"#),
+            ("2", r#"{"reactions":{"count":3}}"#),
+            ("3", r#"{}"#),                        // no reactions
+            ("4", r#"{"reactions":{"count":0}}"#), // count=0 is present => VALID
+            ("5", r#"{"reactions":"none"}"#),      // scalar => .count traversal invalid
+        ];
+        for (id, meta) in rows {
+            table_insert(
+                store,
+                cache,
+                "events",
+                &[("id", id), ("kind", "msg"), ("meta", meta)],
+                now,
+            )
+            .unwrap();
+        }
+    }
+
+    fn count_rows(result: SelectResult) -> usize {
+        match result {
+            SelectResult::Rows(rows) => rows.len(),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn tcreate_json_column_roundtrip() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            store.as_ref(),
+            &cache,
+            "docs",
+            &["id INT PRIMARY KEY,", "body JSON"],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            store.as_ref(),
+            &cache,
+            "docs",
+            &[("id", "1"), ("body", r#"{"a":1,"nested":{"b":2}}"#)],
+            now,
+        )
+        .unwrap();
+        let plan = parse_select(&["*", "FROM", "docs"]).unwrap();
+        match table_select(&store, &cache, &plan, now).unwrap() {
+            SelectResult::Rows(rows) => {
+                let body = rows[0]
+                    .iter()
+                    .find(|(k, _)| k == "body")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(parsed, serde_json::json!({"a":1,"nested":{"b":2}}));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn tinsert_invalid_json_rejected() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            store.as_ref(),
+            &cache,
+            "docs",
+            &["id INT PRIMARY KEY,", "body JSON"],
+            now,
+        )
+        .unwrap();
+        let err = table_insert(
+            store.as_ref(),
+            &cache,
+            "docs",
+            &[("id", "1"), ("body", "{not valid json")],
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("JSON"), "{err}");
+    }
+
+    #[test]
+    fn select_json_dotpath_gt() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        let plan = parse_select(&[
+            "*",
+            "FROM",
+            "events",
+            "WHERE",
+            "meta.reactions.count",
+            ">",
+            "5",
+        ])
+        .unwrap();
+        assert_eq!(
+            count_rows(table_select(&store, &cache, &plan, now).unwrap()),
+            1
+        ); // id 1
+    }
+
+    #[test]
+    fn select_json_dotpath_absent_and_invalid_are_nonmatch() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        // counts 10, 3, 0 all > -1; id3 (absent) and id5 (scalar traversal) excluded.
+        let plan = parse_select(&[
+            "*",
+            "FROM",
+            "events",
+            "WHERE",
+            "meta.reactions.count",
+            ">",
+            "-1",
+        ])
+        .unwrap();
+        assert_eq!(
+            count_rows(table_select(&store, &cache, &plan, now).unwrap()),
+            3
+        );
+    }
+
+    #[test]
+    fn select_json_is_valid_existence_not_truthiness() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        // count present for ids 1,2,4 (incl. count=0 which is VALID, not falsy-excluded).
+        let plan = parse_select(&[
+            "*",
+            "FROM",
+            "events",
+            "WHERE",
+            "meta.reactions.count",
+            "IS",
+            "VALID",
+        ])
+        .unwrap();
+        assert_eq!(
+            count_rows(table_select(&store, &cache, &plan, now).unwrap()),
+            3
+        );
+
+        // Explicitly: count=0 row matches an equality on 0.
+        let plan0 = parse_select(&[
+            "*",
+            "FROM",
+            "events",
+            "WHERE",
+            "meta.reactions.count",
+            "=",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(
+            count_rows(table_select(&store, &cache, &plan0, now).unwrap()),
+            1
+        ); // id 4
+    }
+
+    #[test]
+    fn select_json_is_not_valid_finds_absent() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        // meta.reactions present for 1,2,4 (objects) and 5 ("none" string); absent only for id3.
+        let plan = parse_select(&[
+            "*",
+            "FROM",
+            "events",
+            "WHERE",
+            "meta.reactions",
+            "IS",
+            "NOT",
+            "VALID",
+        ])
+        .unwrap();
+        assert_eq!(
+            count_rows(table_select(&store, &cache, &plan, now).unwrap()),
+            1
+        ); // id 3
+    }
+
+    #[test]
+    fn select_json_dotpath_does_not_collide_with_real_column() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            store.as_ref(),
+            &cache,
+            "c",
+            &["id INT PRIMARY KEY,", "count INT,", "meta JSON"],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            store.as_ref(),
+            &cache,
+            "c",
+            &[("id", "1"), ("count", "2"), ("meta", r#"{"count":99}"#)],
+            now,
+        )
+        .unwrap();
+        // meta.count (99) must use the JSON path, not the real `count` column (2).
+        let json_plan =
+            parse_select(&["*", "FROM", "c", "WHERE", "meta.count", ">", "50"]).unwrap();
+        assert_eq!(
+            count_rows(table_select(&store, &cache, &json_plan, now).unwrap()),
+            1
+        );
+        // The real `count` column (2) is independent.
+        let col_plan = parse_select(&["*", "FROM", "c", "WHERE", "count", ">", "50"]).unwrap();
+        assert_eq!(
+            count_rows(table_select(&store, &cache, &col_plan, now).unwrap()),
+            0
+        );
+    }
+
+    #[test]
+    fn tupdate_where_json_dotpath() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        let updated = table_update_where(
+            store.as_ref(),
+            &cache,
+            "events",
+            &[("kind", "hot")],
+            &["meta.reactions.count", ">", "5"],
+            now,
+        )
+        .unwrap();
+        assert_eq!(updated, 1); // only id 1 (count 10)
+
+        let plan = parse_select(&["*", "FROM", "events", "WHERE", "kind", "=", "hot"]).unwrap();
+        assert_eq!(
+            count_rows(table_select(&store, &cache, &plan, now).unwrap()),
+            1
+        );
+    }
+
+    #[test]
+    fn tdelete_where_json_dotpath() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        let deleted = table_delete_where(
+            store.as_ref(),
+            &cache,
+            "events",
+            &["meta.reactions.count", "IS", "VALID"],
+            now,
+        )
+        .unwrap();
+        assert_eq!(deleted, 3); // ids 1,2,4
+        let plan = parse_select(&["*", "FROM", "events"]).unwrap();
+        assert_eq!(
+            count_rows(table_select(&store, &cache, &plan, now).unwrap()),
+            2
+        ); // ids 3,5
+    }
+
+    // -------------------------------------------------------------------------
+    // Declared JSON path indexes
+    // -------------------------------------------------------------------------
+
+    fn count_gt5(store: &Arc<Store>, cache: &SharedSchemaCache, now: Instant) -> usize {
+        let plan = parse_select(&[
+            "*",
+            "FROM",
+            "events",
+            "WHERE",
+            "meta.reactions.count",
+            ">",
+            "5",
+        ])
+        .unwrap();
+        count_rows(table_select(store, cache, &plan, now).unwrap())
+    }
+
+    #[test]
+    fn tindex_backfill_builds_sorted_index() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        table_create_path_index(&store, &cache, "events", "meta.reactions.count", "INT", now)
+            .unwrap();
+        // count present for ids 1,2,4 => 3 entries in the sorted index.
+        let zkey = idx_sorted_key("events", "meta.reactions.count");
+        assert_eq!(store.zcard(zkey.as_bytes(), now).unwrap(), 3);
+    }
+
+    #[test]
+    fn tindex_query_matches_unindexed_result() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        // Parity oracle: same answer before and after declaring the index.
+        let before = count_gt5(&store, &cache, now);
+        table_create_path_index(&store, &cache, "events", "meta.reactions.count", "INT", now)
+            .unwrap();
+        let after = count_gt5(&store, &cache, now);
+        assert_eq!(before, 1);
+        assert_eq!(after, 1);
+    }
+
+    #[test]
+    fn tindex_insert_maintains_index() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        table_create_path_index(&store, &cache, "events", "meta.reactions.count", "INT", now)
+            .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "events",
+            &[
+                ("id", "6"),
+                ("kind", "msg"),
+                ("meta", r#"{"reactions":{"count":20}}"#),
+            ],
+            now,
+        )
+        .unwrap();
+        let zkey = idx_sorted_key("events", "meta.reactions.count");
+        assert_eq!(store.zcard(zkey.as_bytes(), now).unwrap(), 4); // 1,2,4,6
+        assert_eq!(count_gt5(&store, &cache, now), 2); // ids 1 (10), 6 (20)
+    }
+
+    #[test]
+    fn tindex_update_reindexes_old_and_new() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        table_create_path_index(&store, &cache, "events", "meta.reactions.count", "INT", now)
+            .unwrap();
+        // Bump id2's count from 3 to 99.
+        table_update(
+            &store,
+            &cache,
+            "events",
+            2,
+            &[("meta", r#"{"reactions":{"count":99}}"#)],
+            now,
+        )
+        .unwrap();
+        assert_eq!(count_gt5(&store, &cache, now), 2); // ids 1, 2
+    }
+
+    #[test]
+    fn tindex_delete_removes_entry() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        table_create_path_index(&store, &cache, "events", "meta.reactions.count", "INT", now)
+            .unwrap();
+        table_delete_where(&store, &cache, "events", &["id", "=", "1"], now).unwrap();
+        let zkey = idx_sorted_key("events", "meta.reactions.count");
+        assert_eq!(store.zcard(zkey.as_bytes(), now).unwrap(), 2); // 2,4
+        assert_eq!(count_gt5(&store, &cache, now), 0);
+    }
+
+    #[test]
+    fn tdropindex_removes_index_but_query_still_works() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        table_create_path_index(&store, &cache, "events", "meta.reactions.count", "INT", now)
+            .unwrap();
+        table_drop_path_index(&store, &cache, "events", "meta.reactions.count", now).unwrap();
+        let zkey = idx_sorted_key("events", "meta.reactions.count");
+        assert_eq!(store.zcard(zkey.as_bytes(), now).unwrap(), 0);
+        // Query still correct via full scan.
+        assert_eq!(count_gt5(&store, &cache, now), 1);
+    }
+
+    #[test]
+    fn tindex_rejects_non_json_column() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        // `kind` is a STR column, not JSON.
+        let err =
+            table_create_path_index(&store, &cache, "events", "kind.x", "STR", now).unwrap_err();
+        assert!(err.contains("not a JSON column"), "{err}");
+    }
+
+    // -------------------------------------------------------------------------
+    // ARRAY column type
+    // -------------------------------------------------------------------------
+
+    fn seed_tagged(store: &Arc<Store>, cache: &SharedSchemaCache, now: Instant) {
+        table_create(
+            store,
+            cache,
+            "posts",
+            &["id INT PRIMARY KEY,", "name STR,", "tags ARRAY"],
+            now,
+        )
+        .unwrap();
+        let rows = [
+            ("1", "a", r#"["red","blue"]"#),
+            ("2", "b", r#"["green"]"#),
+            ("3", "c", r#"[]"#),
+        ];
+        for (id, name, tags) in rows {
+            table_insert(
+                store,
+                cache,
+                "posts",
+                &[("id", id), ("name", name), ("tags", tags)],
+                now,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn tcreate_array_roundtrip() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_tagged(&store, &cache, now);
+        let plan = parse_select(&["*", "FROM", "posts", "WHERE", "id", "=", "1"]).unwrap();
+        match table_select(&store, &cache, &plan, now).unwrap() {
+            SelectResult::Rows(rows) => {
+                let tags = rows[0]
+                    .iter()
+                    .find(|(k, _)| k == "tags")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(tags).unwrap();
+                assert_eq!(parsed, serde_json::json!(["red", "blue"]));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn tinsert_non_array_rejected() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            store.as_ref(),
+            &cache,
+            "posts",
+            &["id INT PRIMARY KEY,", "tags ARRAY"],
+            now,
+        )
+        .unwrap();
+        let err = table_insert(
+            store.as_ref(),
+            &cache,
+            "posts",
+            &[("id", "1"), ("tags", r#"{"not":"an array"}"#)],
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("array"), "{err}");
+    }
+
+    #[test]
+    fn select_array_contains() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_tagged(&store, &cache, now);
+        let plan =
+            parse_select(&["*", "FROM", "posts", "WHERE", "tags", "CONTAINS", "blue"]).unwrap();
+        assert_eq!(
+            count_rows(table_select(&store, &cache, &plan, now).unwrap()),
+            1
+        ); // id 1
+    }
+
+    #[test]
+    fn select_array_element_access() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_tagged(&store, &cache, now);
+        // tags.0 is the first element; id3's empty array has no index 0.
+        let plan = parse_select(&["*", "FROM", "posts", "WHERE", "tags.0", "=", "red"]).unwrap();
+        assert_eq!(
+            count_rows(table_select(&store, &cache, &plan, now).unwrap()),
+            1
+        ); // id 1
+    }
+
+    #[test]
+    fn select_array_element_is_valid() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_tagged(&store, &cache, now);
+        // Element 0 present for ids 1,2; id3's array is empty.
+        let plan = parse_select(&["*", "FROM", "posts", "WHERE", "tags.0", "IS", "VALID"]).unwrap();
+        assert_eq!(
+            count_rows(table_select(&store, &cache, &plan, now).unwrap()),
+            2
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // COUNT(*) must apply non-index-exact predicates (regression)
+    // -------------------------------------------------------------------------
+
+    fn agg_count(result: SelectResult) -> i64 {
+        match result {
+            SelectResult::Aggregate(row) => row
+                .iter()
+                .find(|(k, _)| k == "count(*)")
+                .and_then(|(_, v)| v.parse::<i64>().ok())
+                .expect("count(*) value"),
+            _ => panic!("expected aggregate"),
+        }
+    }
+
+    #[test]
+    fn count_json_path_applies_filter() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        let plan = parse_select(&[
+            "COUNT(*)",
+            "FROM",
+            "events",
+            "WHERE",
+            "meta.reactions.count",
+            ">",
+            "5",
+        ])
+        .unwrap();
+        assert_eq!(
+            agg_count(table_select(&store, &cache, &plan, now).unwrap()),
+            1
+        );
+    }
+
+    #[test]
+    fn count_ne_applies_filter() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_users(&store, &cache, now);
+        // age != 30 excludes Alice (30): Bob, Carol, Dave remain.
+        let plan =
+            parse_select(&["COUNT(*)", "FROM", "users", "WHERE", "age", "!=", "30"]).unwrap();
+        assert_eq!(
+            agg_count(table_select(&store, &cache, &plan, now).unwrap()),
+            3
+        );
+    }
+
+    #[test]
+    fn count_indexed_json_path_matches_unindexed() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_events(&store, &cache, now);
+        let args = [
+            "COUNT(*)",
+            "FROM",
+            "events",
+            "WHERE",
+            "meta.reactions.count",
+            ">",
+            "5",
+        ];
+        let before =
+            agg_count(table_select(&store, &cache, &parse_select(&args).unwrap(), now).unwrap());
+        table_create_path_index(&store, &cache, "events", "meta.reactions.count", "INT", now)
+            .unwrap();
+        let after =
+            agg_count(table_select(&store, &cache, &parse_select(&args).unwrap(), now).unwrap());
+        assert_eq!(before, 1);
+        assert_eq!(after, 1);
     }
 
     #[test]

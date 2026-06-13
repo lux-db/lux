@@ -210,6 +210,55 @@ pub fn cmd_tdrop(
     CmdResult::Written
 }
 
+pub fn cmd_tindex(
+    args: &[&[u8]],
+    store: &Store,
+    cache: &SharedSchemaCache,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    if args.len() != 4 {
+        resp::write_error(out, "ERR usage: TINDEX <table> <json.path> <TYPE>");
+        return CmdResult::Written;
+    }
+    let table = arg_str(args[1]);
+    if let Some(err) = crate::auth::reserved_table_mutation_error(args, store) {
+        resp::write_error(out, &err);
+        return CmdResult::Written;
+    }
+    let path = arg_str(args[2]);
+    let type_token = arg_str(args[3]);
+    match tables::table_create_path_index(store, cache, table, path, type_token, now) {
+        Ok(()) => resp::write_ok(out),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_tdropindex(
+    args: &[&[u8]],
+    store: &Store,
+    cache: &SharedSchemaCache,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    if args.len() != 3 {
+        resp::write_error(out, "ERR usage: TDROPINDEX <table> <json.path>");
+        return CmdResult::Written;
+    }
+    let table = arg_str(args[1]);
+    if let Some(err) = crate::auth::reserved_table_mutation_error(args, store) {
+        resp::write_error(out, &err);
+        return CmdResult::Written;
+    }
+    let path = arg_str(args[2]);
+    match tables::table_drop_path_index(store, cache, table, path, now) {
+        Ok(()) => resp::write_ok(out),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
 pub fn cmd_tcount(
     args: &[&[u8]],
     store: &Store,
