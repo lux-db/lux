@@ -10,13 +10,59 @@ import type {
 } from './types';
 import { err, ok, toLuxError } from './utils';
 
-type TableWhereOp = '=' | '!=' | '>' | '<' | '>=' | '<=';
+type TableWhereOp =
+	| '='
+	| '!='
+	| '>'
+	| '<'
+	| '>='
+	| '<='
+	| 'IN'
+	| 'NOT IN'
+	| 'IS VALID'
+	| 'IS NOT VALID'
+	| 'CONTAINS';
 type TableWhereValue = string | number | boolean;
 
 interface TableWhereCondition {
 	field: string;
 	op: TableWhereOp;
-	value: TableWhereValue;
+	value: TableWhereValue | TableWhereValue[];
+}
+
+/** Serialize a field value: JSON objects/arrays round-trip as JSON text. */
+function serializeFieldValue(v: unknown): string {
+	if (v !== null && typeof v === 'object') {
+		return JSON.stringify(v);
+	}
+	return String(v);
+}
+
+/** Serialize one WHERE condition into RESP tokens. */
+function serializeCondition(cond: TableWhereCondition): string[] {
+	if (cond.op === 'IN' || cond.op === 'NOT IN') {
+		const values = Array.isArray(cond.value) ? cond.value : [cond.value];
+		return [
+			cond.field,
+			...(cond.op === 'NOT IN' ? ['NOT', 'IN'] : ['IN']),
+			'(',
+			...values.map(String),
+			')',
+		];
+	}
+	if (cond.op === 'IS VALID') return [cond.field, 'IS', 'VALID'];
+	if (cond.op === 'IS NOT VALID') return [cond.field, 'IS', 'NOT', 'VALID'];
+	return [cond.field, cond.op, String(cond.value)];
+}
+
+/** Join serialized conditions with AND separators. */
+function serializeConditions(conditions: TableWhereCondition[]): string[] {
+	const out: string[] = [];
+	for (let i = 0; i < conditions.length; i++) {
+		out.push(...serializeCondition(conditions[i]));
+		if (i < conditions.length - 1) out.push('AND');
+	}
+	return out;
 }
 
 interface TableJoinClause {
@@ -262,14 +308,7 @@ export class TableQueryBuilder<T extends object = TableRow> {
 		}
 
 		if (allConditions.length) {
-			args.push('WHERE');
-			for (let i = 0; i < allConditions.length; i++) {
-				const cond = allConditions[i];
-				args.push(cond.field, cond.op, String(cond.value));
-				if (i < allConditions.length - 1) {
-					args.push('AND');
-				}
-			}
+			args.push('WHERE', ...serializeConditions(allConditions));
 		}
 
 		if (this.groupFields.length) {
@@ -353,6 +392,34 @@ export class TableQueryBuilder<T extends object = TableRow> {
 
 	lte(field: string, value: TableWhereValue): this {
 		return this.where(field, '<=', value);
+	}
+
+	in(field: string, values: TableWhereValue[]): this {
+		this.conditions.push({ field, op: 'IN', value: values });
+		return this;
+	}
+
+	notIn(field: string, values: TableWhereValue[]): this {
+		this.conditions.push({ field, op: 'NOT IN', value: values });
+		return this;
+	}
+
+	/** Match rows where a JSON dot-path resolves to a present, non-null value. */
+	isValid(field: string): this {
+		this.conditions.push({ field, op: 'IS VALID', value: '' });
+		return this;
+	}
+
+	/** Match rows where a JSON dot-path is absent or resolves to null. */
+	isNotValid(field: string): this {
+		this.conditions.push({ field, op: 'IS NOT VALID', value: '' });
+		return this;
+	}
+
+	/** Match rows where an ARRAY column (or array-valued path) contains a value. */
+	contains(field: string, value: TableWhereValue): this {
+		this.conditions.push({ field, op: 'CONTAINS', value });
+		return this;
 	}
 
 	orderBy(field: string, dir: 'asc' | 'desc' = 'asc'): this {
@@ -448,12 +515,35 @@ export class TableQueryBuilder<T extends object = TableRow> {
 			}
 			const args: (string | number)[] = [this.name];
 			for (const [k, v] of Object.entries(data)) {
-				args.push(k, String(v));
+				args.push(k, serializeFieldValue(v));
 			}
 			const result = await this.client.call('TINSERT', ...args) as string;
 			return ok(parseInt(result, 10) || 0);
 		} catch (error) {
 			return err('TINSERT_ERROR', `Failed to insert into '${this.name}'`, toLuxError(error));
+		}
+	}
+
+	/** Declare a typed index on a JSON dot-path, e.g. ('meta.reactions.count', 'int'). */
+	async createIndex(
+		path: string,
+		type: 'int' | 'float' | 'bool' | 'timestamp' | 'str',
+	): Promise<LuxResult<true>> {
+		try {
+			await this.client.call('TINDEX', this.name, path, type.toUpperCase());
+			return ok(true);
+		} catch (error) {
+			return err('TINDEX_ERROR', `Failed to index '${path}'`, toLuxError(error));
+		}
+	}
+
+	/** Drop a previously declared JSON path index. */
+	async dropIndex(path: string): Promise<LuxResult<true>> {
+		try {
+			await this.client.call('TDROPINDEX', this.name, path);
+			return ok(true);
+		} catch (error) {
+			return err('TDROPINDEX_ERROR', `Failed to drop index '${path}'`, toLuxError(error));
 		}
 	}
 
@@ -471,19 +561,13 @@ export class TableQueryBuilder<T extends object = TableRow> {
 			}
 			const args: (string | number)[] = [this.name, 'SET'];
 			for (const [k, v] of Object.entries(patch)) {
-				args.push(k, String(v));
+				args.push(k, serializeFieldValue(v));
 			}
 			args.push('WHERE');
 			if (hasExplicitId) {
 				args.push('id', '=', String(idOrData));
 			} else {
-				for (let i = 0; i < this.conditions.length; i++) {
-					const cond = this.conditions[i];
-					args.push(cond.field, cond.op, String(cond.value));
-					if (i < this.conditions.length - 1) {
-						args.push('AND');
-					}
-				}
+				args.push(...serializeConditions(this.conditions));
 			}
 			const result = await this.client.call('TUPDATE', ...args) as string | number;
 			return ok(Number(result) || 0);
@@ -499,13 +583,7 @@ export class TableQueryBuilder<T extends object = TableRow> {
 					return err('MISSING_WHERE', 'delete requires at least one filter');
 				}
 				const args: (string | number)[] = ['FROM', this.name, 'WHERE'];
-				for (let i = 0; i < this.conditions.length; i++) {
-					const cond = this.conditions[i];
-					args.push(cond.field, cond.op, String(cond.value));
-					if (i < this.conditions.length - 1) {
-						args.push('AND');
-					}
-				}
+				args.push(...serializeConditions(this.conditions));
 				const result = await this.client.call('TDELETE', ...args) as string | number;
 				return ok(Number(result) || 0);
 			}

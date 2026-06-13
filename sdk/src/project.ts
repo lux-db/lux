@@ -28,14 +28,26 @@ export interface LuxVectorSearchOptions {
 }
 
 type QueryValue = string | number | boolean | number[] | null;
-type FilterOperator = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'is';
+type FilterOperator =
+	| 'eq'
+	| 'neq'
+	| 'gt'
+	| 'gte'
+	| 'lt'
+	| 'lte'
+	| 'is'
+	| 'in'
+	| 'notIn'
+	| 'isValid'
+	| 'isNotValid'
+	| 'contains';
 type ProjectRowInput<T extends object> = Partial<T> & Record<string, QueryValue>;
 type ProjectSelectSingle<TResult> = TResult extends readonly (infer Row)[] ? Row : TResult;
 
 interface QueryFilter {
 	column: string;
 	operator: FilterOperator;
-	value: QueryValue;
+	value: QueryValue | QueryValue[];
 }
 
 interface QueryOrder {
@@ -422,6 +434,26 @@ abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenabl
 		return this.addFilter(column, 'is', value);
 	}
 
+	in(column: string, values: QueryValue[]): TSelf {
+		return this.addFilter(column, 'in', values);
+	}
+
+	notIn(column: string, values: QueryValue[]): TSelf {
+		return this.addFilter(column, 'notIn', values);
+	}
+
+	isValid(column: string): TSelf {
+		return this.addFilter(column, 'isValid', '');
+	}
+
+	isNotValid(column: string): TSelf {
+		return this.addFilter(column, 'isNotValid', '');
+	}
+
+	contains(column: string, value: QueryValue): TSelf {
+		return this.addFilter(column, 'contains', value);
+	}
+
 	join(table: string, alias: string, onLeft: string, onRight: string): TSelf {
 		this.joins.push({ type: 'inner', table, alias, onLeft, onRight });
 		return this as unknown as TSelf;
@@ -444,7 +476,11 @@ abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenabl
 		return this as unknown as TSelf;
 	}
 
-	protected addFilter(column: string, operator: FilterOperator, value: QueryValue): TSelf {
+	protected addFilter(
+		column: string,
+		operator: FilterOperator,
+		value: QueryValue | QueryValue[],
+	): TSelf {
 		this.filters.push({ column, operator, value });
 		return this as unknown as TSelf;
 	}
@@ -742,7 +778,16 @@ function normalizeWhere(where: string): string {
 function filtersToWhere(filters: QueryFilter[]): string {
 	return filters.map((filter) => {
 		const op = filterOperatorToWhere(filter.operator);
-		return normalizeWhere(`${filter.column} ${op} ${formatWhereValue(filter.value)}`);
+		if (filter.operator === 'in' || filter.operator === 'notIn') {
+			const values = Array.isArray(filter.value) ? filter.value : [filter.value];
+			return normalizeWhere(
+				`${filter.column} ${op} ( ${values.map(formatWhereValue).join(' ')} )`,
+			);
+		}
+		if (filter.operator === 'isValid' || filter.operator === 'isNotValid') {
+			return normalizeWhere(`${filter.column} ${op}`);
+		}
+		return normalizeWhere(`${filter.column} ${op} ${formatWhereValue(filter.value as QueryValue)}`);
 	}).join(' AND ');
 }
 
@@ -768,6 +813,16 @@ function filterOperatorToWhere(operator: FilterOperator): string {
 			return '<';
 		case 'lte':
 			return '<=';
+		case 'in':
+			return 'IN';
+		case 'notIn':
+			return 'NOT IN';
+		case 'isValid':
+			return 'IS VALID';
+		case 'isNotValid':
+			return 'IS NOT VALID';
+		case 'contains':
+			return 'CONTAINS';
 	}
 }
 
