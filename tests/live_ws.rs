@@ -269,9 +269,6 @@ async fn live_websocket_requires_lux_auth_token_when_auth_is_enabled() {
     let access_token = signup["access_token"]
         .as_str()
         .expect("signup should return access token");
-    let user_id = signup["user"]["id"]
-        .as_str()
-        .expect("signup should return user id");
 
     let mut ws = connect_live(http_port, Some(access_token)).await;
     send_json(
@@ -281,42 +278,9 @@ async fn live_websocket_requires_lux_auth_token_when_auth_is_enabled() {
     .await;
     let denied = recv_json(&mut ws).await;
     assert_eq!(denied["type"], "live.error");
+    // Token principals may only subscribe to table queries (gated by grants);
+    // raw key subscriptions are operator-only and rejected at subscribe time.
     assert_eq!(denied["error"]["code"], "FORBIDDEN");
-
-    let (status, grant) = http_json_request(
-        http_port,
-        "POST",
-        "/auth/v1/admin/grants",
-        &format!(
-            r#"{{"user_id":"{}","capability":"live.key.authlive:*"}}"#,
-            user_id
-        ),
-        Some("rootsecret"),
-    );
-    assert_eq!(status, 200, "grant: {grant}");
-
-    send_json(
-        &mut ws,
-        json!({"type":"live.subscribe","id":"auth-live","spec":{"kind":"key","pattern":"authlive:*"}}),
-    )
-    .await;
-    let subscribed = recv_json(&mut ws).await;
-    assert_eq!(subscribed["type"], "live.subscribed");
-    assert_eq!(subscribed["id"], "auth-live");
-
-    let (mut query_ws, _) = connect_async(format!(
-        "ws://127.0.0.1:{http_port}/live?access_token={access_token}"
-    ))
-    .await
-    .expect("query access token websocket should connect");
-    send_json(
-        &mut query_ws,
-        json!({"type":"live.subscribe","id":"query-auth","spec":{"kind":"key","pattern":"authlive:*"}}),
-    )
-    .await;
-    let query_subscribed = recv_json(&mut query_ws).await;
-    assert_eq!(query_subscribed["type"], "live.subscribed");
-    assert_eq!(query_subscribed["id"], "query-auth");
 
     let (status, logout) = http_json_request(
         http_port,

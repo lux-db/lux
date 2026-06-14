@@ -363,58 +363,6 @@ fn http_auth_signup_login_user_logout_and_admin_routes() {
     );
     assert_eq!(status, 200, "admin users: {admin_body}");
     assert!(admin_body.contains("http-auth@example.com"), "{admin_body}");
-    let admin_json: serde_json::Value = serde_json::from_str(&admin_body).unwrap();
-    let user_id = admin_json["users"][0]["id"]
-        .as_str()
-        .expect("admin users should include id");
-
-    let (status, grant_body) = http_request(
-        17703,
-        "POST",
-        "/auth/v1/admin/grants",
-        Some(&format!(
-            r#"{{"user_id":"{}","capability":"live.channel.room:*"}}"#,
-            user_id
-        )),
-        Some("rootsecret"),
-    );
-    assert_eq!(status, 200, "grant: {grant_body}");
-    let grant_json: serde_json::Value = serde_json::from_str(&grant_body).unwrap();
-    let grant_id = grant_json["grant"]["id"]
-        .as_str()
-        .expect("grant should include id");
-
-    let (status, grants_body) = http_request(
-        17703,
-        "GET",
-        &format!("/auth/v1/admin/users/{user_id}/grants"),
-        None,
-        Some("rootsecret"),
-    );
-    assert_eq!(status, 200, "list grants: {grants_body}");
-    assert!(grants_body.contains("live.channel.room:*"), "{grants_body}");
-
-    let (status, revoke_body) = http_request(
-        17703,
-        "DELETE",
-        &format!("/auth/v1/admin/grants/{grant_id}"),
-        None,
-        Some("rootsecret"),
-    );
-    assert_eq!(status, 200, "revoke grant: {revoke_body}");
-
-    let (status, grants_body) = http_request(
-        17703,
-        "GET",
-        &format!("/auth/v1/admin/users/{user_id}/grants"),
-        None,
-        Some("rootsecret"),
-    );
-    assert_eq!(status, 200, "list grants after revoke: {grants_body}");
-    assert!(
-        !grants_body.contains("live.channel.room:*"),
-        "revoked grant should not be active: {grants_body}"
-    );
 
     let (status, table_body) = http_request(
         17703,
@@ -464,7 +412,7 @@ fn http_auth_signup_login_user_logout_and_admin_routes() {
 }
 
 #[test]
-fn http_auth_grants_gate_data_apis() {
+fn http_auth_token_users_denied_data_apis() {
     let _server = start_lux_with_env(17704, 17705, "rootsecret", &[("LUX_AUTH_ENABLED", "true")]);
 
     let (status, signup_body) = http_request(
@@ -479,152 +427,54 @@ fn http_auth_grants_gate_data_apis() {
     let access_token = signup_json["access_token"]
         .as_str()
         .expect("signup should return access token");
-    let user_id = signup_json["user"]["id"]
-        .as_str()
-        .expect("signup should return user id");
 
+    // Anonymous callers are unauthorized on data routes.
     let (status, body) = http_request(17705, "GET", "/v1/kv/doc:1", None, None);
     assert_eq!(status, 401, "anonymous data read should be denied: {body}");
 
-    let (status, body) = http_request(17705, "GET", "/v1/kv/doc:1", None, Some(access_token));
-    assert_eq!(status, 403, "ungranted kv read should be denied: {body}");
-    assert!(body.contains("kv.doc:1.read"), "{body}");
-
-    let (status, body) = http_request(
-        17705,
-        "PUT",
-        "/v1/kv/doc:1",
-        Some(r#"{"value":"hello"}"#),
-        Some(access_token),
-    );
-    assert_eq!(status, 403, "ungranted kv write should be denied: {body}");
-
-    for capability in [
-        "kv.doc:1.write",
-        "kv.doc:1.read",
-        "table.messages.write",
-        "table.messages.read",
-        "ts.cpu:host1.write",
-        "ts.cpu:host1.read",
-        "vector.write",
-        "vector.read",
-        "vector.search",
-    ] {
-        let (status, body) = http_request(
-            17705,
+    // Token (end-user) principals are denied raw data routes by default: KV,
+    // time-series, vectors, and exec are operator-only. Per-table access is gated
+    // by row-level grants instead (covered by the grants unit/integration tests).
+    let denied: [(&str, &str, Option<&str>); 5] = [
+        ("GET", "/v1/kv/doc:1", None),
+        ("PUT", "/v1/kv/doc:1", Some(r#"{"value":"hello"}"#)),
+        (
             "POST",
-            "/auth/v1/admin/grants",
-            Some(&format!(
-                r#"{{"user_id":"{}","capability":"{}"}}"#,
-                user_id, capability
-            )),
-            Some("rootsecret"),
+            "/v1/ts/cpu:host1",
+            Some(r#"{"timestamp":"1000","value":72.5}"#),
+        ),
+        (
+            "POST",
+            "/v1/vectors/doc:1",
+            Some(r#"{"vector":[0.1,0.2,0.3]}"#),
+        ),
+        ("POST", "/v1/exec", Some(r#"{"command":["DBSIZE"]}"#)),
+    ];
+    for (method, path, payload) in denied {
+        let (status, body) = http_request(17705, method, path, payload, Some(access_token));
+        assert_eq!(
+            status, 403,
+            "token {method} {path} should be denied: {body}"
         );
-        assert_eq!(status, 200, "grant {capability}: {body}");
     }
 
+    // The operator credential bypasses and reaches the data routes.
     let (status, body) = http_request(
         17705,
         "PUT",
         "/v1/kv/doc:1",
         Some(r#"{"value":"hello"}"#),
-        Some(access_token),
-    );
-    assert_eq!(status, 200, "granted kv write: {body}");
-    assert!(body.contains("\"OK\""), "{body}");
-
-    let (status, body) = http_request(17705, "GET", "/v1/kv/doc:1", None, Some(access_token));
-    assert_eq!(status, 200, "granted kv read: {body}");
-    assert!(body.contains("\"hello\""), "{body}");
-
-    let (status, body) = http_request(
-        17705,
-        "POST",
-        "/v1/tables",
-        Some(r#"{"name":"messages","columns":["body STR","channel STR"]}"#),
         Some("rootsecret"),
     );
-    assert_eq!(status, 200, "operator table create: {body}");
+    assert_eq!(status, 200, "operator kv write: {body}");
 
-    let (status, body) = http_request(
-        17705,
-        "POST",
-        "/v1/tables/messages",
-        Some(r#"{"body":"hello","channel":"general"}"#),
-        Some(access_token),
-    );
-    assert_eq!(status, 200, "granted table write: {body}");
-
-    let (status, body) = http_request(
-        17705,
-        "GET",
-        "/v1/tables/messages",
-        None,
-        Some(access_token),
-    );
-    assert_eq!(status, 200, "granted table read: {body}");
-    assert!(body.contains("hello"), "{body}");
-
-    let (status, body) = http_request(
-        17705,
-        "POST",
-        "/v1/ts/cpu:host1",
-        Some(r#"{"timestamp":"1000","value":72.5,"labels":{"host":"server1"}}"#),
-        Some(access_token),
-    );
-    assert_eq!(status, 200, "granted timeseries write: {body}");
-
-    let (status, body) = http_request(
-        17705,
-        "GET",
-        "/v1/ts/cpu:host1/latest",
-        None,
-        Some(access_token),
-    );
-    assert_eq!(status, 200, "granted timeseries read: {body}");
-    assert!(body.contains("72.5"), "{body}");
-
-    let (status, body) = http_request(
-        17705,
-        "POST",
-        "/v1/vectors/doc:1",
-        Some(r#"{"vector":[0.1,0.2,0.3],"metadata":{"title":"hello"}}"#),
-        Some(access_token),
-    );
-    assert_eq!(status, 200, "granted vector write: {body}");
-
-    let (status, body) = http_request(
-        17705,
-        "POST",
-        "/v1/vectors/search",
-        Some(r#"{"vector":[0.1,0.2,0.3],"k":1}"#),
-        Some(access_token),
-    );
-    assert_eq!(status, 200, "granted vector search: {body}");
-    assert!(body.contains("doc:1"), "{body}");
-
-    let (status, body) = http_request(17705, "GET", "/v1/vectors/doc:1", None, Some(access_token));
-    assert_eq!(status, 200, "granted vector read: {body}");
-    assert!(body.contains("0.1"), "{body}");
-
-    let (status, body) = http_request(
-        17705,
-        "POST",
-        "/auth/v1/logout",
-        Some("{}"),
-        Some(access_token),
-    );
-    assert_eq!(status, 200, "logout: {body}");
-
-    let (status, body) = http_request(17705, "GET", "/v1/kv/doc:1", None, Some(access_token));
-    assert_eq!(
-        status, 401,
-        "revoked access token should not reach granted data API: {body}"
-    );
+    let (status, body) = http_request(17705, "GET", "/v1/kv/doc:1", None, Some("rootsecret"));
+    assert_eq!(status, 200, "operator kv read: {body}");
+    assert!(body.contains("\"hello\""), "{body}");
 }
 
 #[test]
-fn http_auth_sessions_grants_keys_and_revocation_survive_restart() {
+fn http_auth_sessions_keys_and_revocation_survive_restart() {
     let data_dir = tempfile::tempdir().unwrap();
     let first_env = [
         ("LUX_AUTH_ENABLED", "true"),
@@ -655,33 +505,15 @@ fn http_auth_sessions_grants_keys_and_revocation_survive_restart() {
         .as_str()
         .expect("signup should return refresh token")
         .to_string();
-    let user_id = signup_json["user"]["id"]
-        .as_str()
-        .expect("signup should return user id")
-        .to_string();
-
-    for capability in ["kv.persist.write", "kv.persist.read"] {
-        let (status, body) = http_request(
-            17707,
-            "POST",
-            "/auth/v1/admin/grants",
-            Some(&format!(
-                r#"{{"user_id":"{}","capability":"{}"}}"#,
-                user_id, capability
-            )),
-            Some("lux_sec_persist"),
-        );
-        assert_eq!(status, 200, "grant {capability}: {body}");
-    }
-
+    // Write KV as operator before restart to verify tiered-storage data persists.
     let (status, body) = http_request(
         17707,
         "PUT",
         "/v1/kv/persist",
         Some(r#"{"value":"survived"}"#),
-        Some(&access_token),
+        Some("rootsecret"),
     );
-    assert_eq!(status, 200, "granted write before restart: {body}");
+    assert_eq!(status, 200, "operator write before restart: {body}");
 
     common::terminate_child(&mut child);
 
@@ -695,11 +527,8 @@ fn http_auth_sessions_grants_keys_and_revocation_survive_restart() {
     );
     assert!(body.contains("persist-auth@example.com"), "{body}");
 
-    let (status, body) = http_request(17707, "GET", "/v1/kv/persist", None, Some(&access_token));
-    assert_eq!(
-        status, 200,
-        "persisted grants should authorize data API after restart: {body}"
-    );
+    let (status, body) = http_request(17707, "GET", "/v1/kv/persist", None, Some("rootsecret"));
+    assert_eq!(status, 200, "tiered data should survive restart: {body}");
     assert!(body.contains("survived"), "{body}");
 
     let (status, body) = http_request(
