@@ -119,6 +119,13 @@ TCREATE users id STR PRIMARY KEY, email STR UNIQUE
 TINSERT users id user_1 email user@example.com
 ```
 
+Access grants are authored the same way, so row-level security versions and
+travels with your schema:
+
+```text
+GRANT read, write ON messages WHERE user_id = auth.uid()
+```
+
 For commands with complex quoted values, use JSON argv arrays:
 
 ```json

@@ -96,6 +96,31 @@ const { data: deleted, error: deleteError } = await lux
   .eq("id", inserted?.id);
 ```
 
+### Filters and JSON
+
+Beyond `.eq/.neq/.gt/.gte/.lt/.lte`, the query builder supports `IN` lists, JSON
+dot-paths, and arrays:
+
+```ts
+await lux.table("users").select().in("id", [1, 2, 3]);
+await lux.table("users").select().notIn("status", ["banned", "deleted"]);
+
+// JSON columns round-trip as native objects (no manual JSON.stringify)
+await lux.table("events").insert({ metadata: { plan: { tier: "pro" }, count: 0 } });
+
+// Query JSON by dot-path, like a JS object. A path that does not resolve is a
+// non-match, never an error.
+await lux.table("events").select().eq("metadata.plan.tier", "pro");
+
+// IS VALID is existence, not truthiness: 0 / false / "" all count as valid.
+await lux.table("events").select().isValid("metadata.count");
+await lux.table("events").select().isNotValid("metadata.deleted_at");
+
+// Array membership, and a declared JSON-path index for range queries at scale.
+await lux.table("events").select().contains("tags", "urgent");
+await lux.table("events").createIndex("metadata.plan.tier", "str");
+```
+
 ## Live tables
 
 Browser clients can subscribe to table queries over Lux Live. The SDK opens a WebSocket to the project live endpoint, and Lux core sends a snapshot followed by insert/update/delete events for rows matching the query.
@@ -216,3 +241,4 @@ const value = await lux.get("hello");
 - Browser live subscriptions use the project publishable key plus the signed-in user's JWT.
 - Table `select()` accepts Lux's constrained projection grammar, not arbitrary SQL.
 - Direct `lux://` or `rediss://` database access uses the database password and is for trusted infrastructure.
+- With auth enabled, signed-in users are denied by default and gated by per-table **grants** (`GRANT read, write ON t WHERE user_id = auth.uid()`). Reads, writes, and `.live()` are all checked against the grant: a query or subscription must satisfy the predicate or it is rejected (an unscoped `.live()` under a row-scoped grant fails at subscribe time). Grants are authored as migrations.

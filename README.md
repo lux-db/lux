@@ -77,7 +77,7 @@ Lux Cloud is the fastest path when you want to build an app backend around Lux w
 ## Features
 
 - **200+ commands** -- strings, lists, hashes, sets, sorted sets, streams, vectors, geo, time series, tables, HyperLogLog, bitops, pub/sub, transactions
-- **Relational tables** -- TCREATE, TINSERT, TSELECT, TUPDATE (WHERE), TDELETE (WHERE), TALTER with typed fields (str, int, float, bool, timestamp, uuid, vector), unique constraints, foreign keys, joins, GROUP BY/HAVING, WHERE/ORDER BY/LIMIT, and vector-aware NEAR queries. Structured data without standing up a separate primary database
+- **Relational tables** -- TCREATE, TINSERT, TSELECT, TUPDATE (WHERE), TDELETE (WHERE), TALTER with typed fields (str, int, float, bool, timestamp, uuid, vector, json, array), unique constraints, foreign keys, joins, GROUP BY/HAVING, WHERE/ORDER BY/LIMIT, `IN`/`NOT IN`, JSON dot-path queries with `IS VALID`, array `CONTAINS`, declared JSON-path indexes, and vector-aware NEAR queries. Structured data without standing up a separate primary database
 - **Realtime key subscriptions** -- KSUB/KUNSUB: subscribe to key patterns, receive events when matching keys are mutated. Zero overhead when unused. No global config flags, no separate services. Unlike Redis keyspace notifications which tax every write globally, KSUB is surgical and async
 - **Native time series** -- TSADD, TSGET, TSRANGE, TSMRANGE with aggregation (avg, sum, min, max, count, std), retention policies, and label-based filtering. No modules, no sidecars. TSGET 4x faster than Redis GET
 - **Native vector search** -- VSET, VGET, VSEARCH with cosine similarity and metadata filtering, plus `VECTOR(n)` table columns that compose with table filters and live queries. No extensions, no sidecars
@@ -93,7 +93,7 @@ Lux Cloud is the fastest path when you want to build an app backend around Lux w
 - **Zero-copy parser** -- RESP arguments are byte slices into the read buffer
 - **Pipeline batching** -- consecutive same-shard commands batched under a single lock
 - **Persistence** -- automatic snapshots, write-ahead log (WAL) with CRC32 checksums, tiered hot/cold storage with automatic eviction to disk
-- **Auth** -- password authentication via `LUX_PASSWORD`, plus optional app auth with users, identities, sessions, OAuth providers, JWTs, and auth-owned system tables
+- **Auth** -- password authentication via `LUX_PASSWORD`, plus optional app auth with users, identities, sessions, OAuth providers, JWTs, auth-owned system tables, and per-table row-level grants (`GRANT read, write ON t WHERE user_id = auth.uid()`) that gate reads, writes, and `.live()`
 - **Pub/Sub** -- SUBSCRIBE, PSUBSCRIBE, PUBLISH, plus KSUB/KUNSUB for realtime key change events
 - **TTL support** -- EX, PX, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL
 - **MIT licensed** -- no license rug-pulls, unlike Redis (RSALv2/SSPL)
@@ -284,12 +284,24 @@ redis-cli TSELECT id, body, _similarity FROM messages WHERE channel = general NE
 redis-cli TUPDATE users SET active true WHERE id = 1
 redis-cli TDELETE FROM users WHERE id = 2
 
+# IN / NOT IN
+redis-cli TSELECT '*' FROM users WHERE id IN '(' 1 2 3 ')'
+
+# JSON and ARRAY columns, queried by dot-path like a JS object
+redis-cli TCREATE events "id INT PRIMARY KEY," "metadata JSON," "tags ARRAY"
+redis-cli TINSERT events id 1 metadata '{"plan":{"tier":"pro"},"count":0}' tags '["a","b"]'
+redis-cli TSELECT '*' FROM events WHERE metadata.plan.tier = pro      # non-resolving path = non-match, never an error
+redis-cli TSELECT '*' FROM events WHERE metadata.count IS VALID       # existence (0/false/"" are valid), not truthiness
+redis-cli TSELECT '*' FROM events WHERE tags CONTAINS a               # array membership; tags.0 indexes an element
+redis-cli TINDEX events metadata.plan.tier STR                        # declare a JSON-path index
+
 # Alter tables
 redis-cli TALTER users ADD role STR
 redis-cli TALTER users DROP role
 ```
 
-Field types: `STR`, `INT`, `FLOAT`, `BOOL`, `TIMESTAMP`, `UUID`, `VECTOR(n)`.
+Field types: `STR`, `INT`, `FLOAT`, `BOOL`, `TIMESTAMP`, `UUID`, `VECTOR(n)`, `JSON`, `ARRAY`.
+WHERE operators: `= != < > <= >=`, `IN`/`NOT IN`, JSON `IS VALID`/`IS NOT VALID`, and `CONTAINS`.
 Use SQL-style constraints like `UNIQUE`, `PRIMARY KEY`, and `REFERENCES table(field)`.
 
 ### CLI
@@ -508,7 +520,7 @@ Auth creates reserved tables under the `auth` namespace:
 | `auth.identities` | Email/password and OAuth identities linked to users |
 | `auth.sessions` | Refresh-token sessions |
 | `auth.keys` | Project publishable/secret keys |
-| `auth.grants` | Capability grants |
+| `auth.grants` | Per-table access grants (row-level) |
 | `auth.providers` | OAuth provider configuration |
 
 Core auth routes:
@@ -537,6 +549,20 @@ curl -X PUT http://localhost:8080/auth/v1/admin/providers/google \
 ```
 
 Use `createBrowserClient(url, publishableKey)` in browsers and `createClient(url, secretKey)` on trusted servers. Browser live subscriptions use the publishable key plus the signed-in user's JWT; direct RESP access still uses the database password.
+
+#### Grants (row-level access)
+
+With auth enabled, token (end-user) principals are **denied by default**; operator (`LUX_PASSWORD`) and service-key callers bypass. Access is granted per table with a row-scoped predicate:
+
+```bash
+redis-cli GRANT read, write ON messages WHERE user_id = auth.uid()
+redis-cli REVOKE read ON messages
+```
+
+- Two scopes: `read` (covers SELECT and `.live()`), `write` (INSERT/UPDATE/DELETE; INSERT is checked against the new row, UPDATE/DELETE against the WHERE).
+- A grant is a contract the query is checked **against**, not a filter silently applied. A query (or `.live()` subscription) must itself satisfy the predicate, or it is rejected. An unscoped `.live()` under a row-scoped grant is refused at subscribe time.
+- Predicate values: `auth.uid()` (the caller's id), `auth.<claim>` (e.g. `auth.role`, `auth.email`), or a literal. Operators `= != < > <= >=`.
+- Grants are authored as migrations, so they version and travel with schema (`lux migrate run` / `lux migrate pull`).
 
 ### Environment Variables
 
@@ -681,7 +707,9 @@ Release and Docker builds only proceed after tests pass.
 
 **Vectors:** `VSET` `VGET` `VSEARCH` `VCARD`
 
-**Tables:** `TCREATE` `TINSERT` `TSELECT` `TUPDATE` `TDELETE` `TDROP` `TCOUNT` `TSCHEMA` `TLIST` `TALTER`
+**Tables:** `TCREATE` `TINSERT` `TSELECT` `TUPDATE` `TDELETE` `TDROP` `TCOUNT` `TSCHEMA` `TLIST` `TALTER` `TINDEX` `TDROPINDEX`
+
+**Auth grants:** `GRANT` `REVOKE`
 
 **Scripting:** `EVAL` `EVALSHA` `SCRIPT LOAD` `SCRIPT EXISTS` `SCRIPT FLUSH`
 
