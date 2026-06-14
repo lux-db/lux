@@ -245,10 +245,10 @@ pub(crate) fn bootstrap(
         GRANTS_TABLE,
         &[
             "id STR PRIMARY KEY,",
-            "user_id STR,",
-            "capability STR,",
-            "created_at INT,",
-            "revoked_at INT",
+            "tbl STR,",
+            "scope STR,",
+            "predicate STR,",
+            "created_at INT",
         ],
         now,
     )?;
@@ -387,24 +387,6 @@ pub(crate) fn route_http(
                 return response;
             }
             admin_create_user(body, store, cache)
-        }
-        ("POST", ["admin", "grants"]) => {
-            if let Err(response) = require_secret(headers, store, cache) {
-                return response;
-            }
-            admin_create_grant(body, store, cache)
-        }
-        ("DELETE", ["admin", "grants", grant_id]) => {
-            if let Err(response) = require_secret(headers, store, cache) {
-                return response;
-            }
-            admin_revoke_grant(grant_id, store, cache)
-        }
-        ("GET", ["admin", "users", user_id, "grants"]) => {
-            if let Err(response) = require_secret(headers, store, cache) {
-                return response;
-            }
-            admin_list_user_grants(user_id, store, cache)
         }
         ("GET", ["admin", "keys"]) => {
             if let Err(response) = require_secret(headers, store, cache) {
@@ -1288,88 +1270,6 @@ fn oauth_sign_in(
     issue_session_response(store, cache, headers, &user_id, &email, now)
 }
 
-fn admin_create_grant(
-    body: &str,
-    store: &Store,
-    cache: &SharedSchemaCache,
-) -> (u16, &'static str, String) {
-    let parsed = match parse_json(body) {
-        Ok(parsed) => parsed,
-        Err(response) => return response,
-    };
-    let user_id = match required_string(&parsed, "user_id") {
-        Ok(user_id) => user_id,
-        Err(response) => return response,
-    };
-    let capability = match required_string(&parsed, "capability") {
-        Ok(capability) => capability,
-        Err(response) => return response,
-    };
-    if capability.trim().is_empty() {
-        return error(400, "Bad Request", "capability must not be empty");
-    }
-    let now = Instant::now();
-    if find_row_by_field(store, cache, USERS_TABLE, "id", user_id, now)
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return error(404, "Not Found", "user not found");
-    }
-
-    let grant_id = random_id("grnt");
-    let now_sec = unix_seconds().to_string();
-    if let Err(e) = durable_table_insert(
-        store,
-        cache,
-        GRANTS_TABLE,
-        &[
-            ("id", grant_id.as_str()),
-            ("user_id", user_id),
-            ("capability", capability),
-            ("created_at", now_sec.as_str()),
-        ],
-        now,
-    ) {
-        return error(400, "Bad Request", &e);
-    }
-    ok(
-        json!({"grant":{"id":grant_id,"user_id":user_id,"capability":capability,"created_at":now_sec}}),
-    )
-}
-
-fn admin_revoke_grant(
-    grant_id: &str,
-    store: &Store,
-    cache: &SharedSchemaCache,
-) -> (u16, &'static str, String) {
-    let now = Instant::now();
-    let now_sec = unix_seconds().to_string();
-    match durable_table_update_where(
-        store,
-        cache,
-        GRANTS_TABLE,
-        &[("revoked_at", now_sec.as_str())],
-        &["id", "=", grant_id],
-        now,
-    ) {
-        Ok(0) => error(404, "Not Found", "grant not found"),
-        Ok(_) => ok(json!({"result":"OK"})),
-        Err(e) => error(400, "Bad Request", &e),
-    }
-}
-
-fn admin_list_user_grants(
-    user_id: &str,
-    store: &Store,
-    cache: &SharedSchemaCache,
-) -> (u16, &'static str, String) {
-    match active_grants_for_user(store, cache, user_id, Instant::now()) {
-        Ok(grants) => ok(json!({"grants": grants})),
-        Err(e) => error(400, "Bad Request", &e),
-    }
-}
-
 fn admin_list_keys(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
     let plan = SelectPlan {
         table: KEYS_TABLE.to_string(),
@@ -1743,18 +1643,6 @@ pub(crate) fn authenticate_access_token(
     })
 }
 
-pub(crate) fn principal_has_capability(
-    store: &Store,
-    cache: &SharedSchemaCache,
-    principal: &AuthPrincipal,
-    capability: &str,
-) -> Result<bool, String> {
-    let grants = active_grants_for_user(store, cache, &principal.user_id, Instant::now())?;
-    Ok(grants
-        .iter()
-        .any(|grant| grant_matches_capability(grant, capability)))
-}
-
 fn claims_from_access_token(
     token: &str,
     store: &Store,
@@ -1933,60 +1821,6 @@ fn active_signing_secret(
 ) -> Result<Option<String>, String> {
     let row = find_row_by_field(store, cache, SIGNING_KEYS_TABLE, "active", "true", now)?;
     Ok(row.and_then(|row| row.get("private_key_encrypted").cloned()))
-}
-
-fn active_grants_for_user(
-    store: &Store,
-    cache: &SharedSchemaCache,
-    user_id: &str,
-    now: Instant,
-) -> Result<Vec<String>, String> {
-    let plan = SelectPlan {
-        table: GRANTS_TABLE.to_string(),
-        alias: None,
-        projections: Vec::new(),
-        aggregates: Vec::new(),
-        joins: Vec::new(),
-        conditions: vec![WhereClause::single(
-            "user_id".to_string(),
-            CmpOp::Eq,
-            user_id.to_string(),
-        )],
-        group_by: Vec::new(),
-        having: Vec::new(),
-        near: None,
-        order_by: None,
-        limit: None,
-        offset: None,
-    };
-    match tables::table_select(store, cache, &plan, now)? {
-        SelectResult::Rows(rows) => Ok(rows
-            .into_iter()
-            .filter_map(|row| {
-                let row: HashMap<String, String> = row.into_iter().collect();
-                if row
-                    .get("revoked_at")
-                    .map(|v| !v.is_empty() && v != "0")
-                    .unwrap_or(false)
-                {
-                    None
-                } else {
-                    row.get("capability").cloned()
-                }
-            })
-            .collect()),
-        SelectResult::Aggregate(_) => Ok(Vec::new()),
-    }
-}
-
-fn grant_matches_capability(grant: &str, capability: &str) -> bool {
-    if grant == "*" || grant == capability {
-        return true;
-    }
-    if let Some(prefix) = grant.strip_suffix('*') {
-        return capability.starts_with(prefix);
-    }
-    false
 }
 
 fn user_json(
@@ -2485,6 +2319,173 @@ fn find_row_by_field(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Grant storage + enforcement (the GRANT language)
+// ---------------------------------------------------------------------------
+
+/// Store a grant (one row per scope) in `auth.grants`, replacing any existing.
+fn ensure_grants_table(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    now: Instant,
+) -> Result<(), String> {
+    create_table_if_missing(
+        store,
+        cache,
+        GRANTS_TABLE,
+        &[
+            "id STR PRIMARY KEY,",
+            "tbl STR,",
+            "scope STR,",
+            "predicate STR,",
+            "created_at INT",
+        ],
+        now,
+    )
+}
+
+pub(crate) fn put_grant(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    grant: &crate::grants::Grant,
+    now: Instant,
+) -> Result<(), String> {
+    ensure_grants_table(store, cache, now)?;
+    let predicate = crate::grants::predicate_to_string(&grant.predicate);
+    let created = unix_seconds().to_string();
+    for scope in &grant.scopes {
+        let id = format!("{}:{}", grant.table, scope.as_str());
+        let _ =
+            tables::table_delete_where(store, cache, GRANTS_TABLE, &["id", "=", id.as_str()], now);
+        tables::table_insert(
+            store,
+            cache,
+            GRANTS_TABLE,
+            &[
+                ("id", id.as_str()),
+                ("tbl", grant.table.as_str()),
+                ("scope", scope.as_str()),
+                ("predicate", predicate.as_str()),
+                ("created_at", created.as_str()),
+            ],
+            now,
+        )?;
+    }
+    Ok(())
+}
+
+/// Remove a grant for (table, scope). Returns true if one existed.
+pub(crate) fn delete_grant(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    scope: crate::grants::Scope,
+    now: Instant,
+) -> Result<bool, String> {
+    let id = format!("{}:{}", table, scope.as_str());
+    let n = tables::table_delete_where(store, cache, GRANTS_TABLE, &["id", "=", id.as_str()], now)?;
+    Ok(n > 0)
+}
+
+fn load_grant_predicate(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    scope: crate::grants::Scope,
+    now: Instant,
+) -> Result<Option<crate::grants::Predicate>, String> {
+    let id = format!("{}:{}", table, scope.as_str());
+    // A missing grants table means no grants exist yet -> deny-by-default.
+    let row = match find_row_by_field(store, cache, GRANTS_TABLE, "id", &id, now) {
+        Ok(r) => r,
+        Err(e) if e.contains("does not exist") => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match row {
+        Some(row) => {
+            let pred_str = row.get("predicate").cloned().unwrap_or_default();
+            let toks: Vec<&str> = pred_str.split_whitespace().collect();
+            Ok(Some(crate::grants::parse_predicate(&toks)?))
+        }
+        None => Ok(None),
+    }
+}
+
+fn resolve_for_principal(
+    pred: &crate::grants::Predicate,
+    principal: &AuthPrincipal,
+) -> Result<Vec<crate::grants::ResolvedCond>, String> {
+    crate::grants::resolve(pred, &principal.user_id, |claim| match claim {
+        "role" => Some(principal.role.clone()),
+        "email" => Some(principal.email.clone()),
+        "sub" | "uid" => Some(principal.user_id.clone()),
+        _ => None,
+    })
+}
+
+/// Enforce a READ grant: the query's conditions must satisfy the grant.
+pub(crate) fn check_read(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    principal: &AuthPrincipal,
+    table: &str,
+    query_conditions: &[crate::grants::ResolvedCond],
+    now: Instant,
+) -> Result<(), String> {
+    let Some(pred) = load_grant_predicate(store, cache, table, crate::grants::Scope::Read, now)?
+    else {
+        return Err(format!("no read access to '{table}'"));
+    };
+    let resolved = resolve_for_principal(&pred, principal)?;
+    if crate::grants::query_satisfies(&resolved, query_conditions) {
+        Ok(())
+    } else {
+        Err(format!("query not permitted by read grant on '{table}'"))
+    }
+}
+
+/// Enforce a WRITE grant on a new/updated row (WITH CHECK).
+pub(crate) fn check_write_row(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    principal: &AuthPrincipal,
+    table: &str,
+    row_value: impl Fn(&str) -> Option<String>,
+    now: Instant,
+) -> Result<(), String> {
+    let Some(pred) = load_grant_predicate(store, cache, table, crate::grants::Scope::Write, now)?
+    else {
+        return Err(format!("no write access to '{table}'"));
+    };
+    let resolved = resolve_for_principal(&pred, principal)?;
+    if crate::grants::row_satisfies(&resolved, row_value) {
+        Ok(())
+    } else {
+        Err(format!("row not permitted by write grant on '{table}'"))
+    }
+}
+
+/// Enforce a WRITE grant on an UPDATE/DELETE WHERE (only target rows in scope).
+pub(crate) fn check_write_where(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    principal: &AuthPrincipal,
+    table: &str,
+    where_conditions: &[crate::grants::ResolvedCond],
+    now: Instant,
+) -> Result<(), String> {
+    let Some(pred) = load_grant_predicate(store, cache, table, crate::grants::Scope::Write, now)?
+    else {
+        return Err(format!("no write access to '{table}'"));
+    };
+    let resolved = resolve_for_principal(&pred, principal)?;
+    if crate::grants::query_satisfies(&resolved, where_conditions) {
+        Ok(())
+    } else {
+        Err(format!("query not permitted by write grant on '{table}'"))
+    }
+}
+
 fn find_rows_by_field(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -2695,6 +2696,170 @@ mod tests {
     use super::*;
     use crate::tables::SchemaCache;
 
+    fn principal(uid: &str) -> AuthPrincipal {
+        AuthPrincipal {
+            user_id: uid.into(),
+            email: "u@x.dev".into(),
+            session_id: "sess".into(),
+            role: "authenticated".into(),
+        }
+    }
+
+    fn cond(c: &str, o: &str, v: &str) -> crate::grants::ResolvedCond {
+        crate::grants::ResolvedCond {
+            column: c.into(),
+            op: o.into(),
+            value: v.into(),
+        }
+    }
+
+    #[test]
+    fn read_grant_enforced_end_to_end() {
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+
+        // GRANT read ON messages WHERE user_id = auth.uid()
+        let grant = crate::grants::parse_grant(&[
+            "read",
+            "ON",
+            "messages",
+            "WHERE",
+            "user_id",
+            "=",
+            "auth.uid()",
+        ])
+        .unwrap();
+        put_grant(&store, &cache, &grant, now).unwrap();
+
+        let p = principal("123abc");
+        // Query scoped to own rows -> allowed.
+        assert!(check_read(
+            &store,
+            &cache,
+            &p,
+            "messages",
+            &[cond("user_id", "=", "123abc")],
+            now
+        )
+        .is_ok());
+        // Extra filter on top -> still allowed (stricter).
+        assert!(check_read(
+            &store,
+            &cache,
+            &p,
+            "messages",
+            &[cond("user_id", "=", "123abc"), cond("room", "=", "abc")],
+            now
+        )
+        .is_ok());
+        // Unscoped query -> denied.
+        assert!(check_read(&store, &cache, &p, "messages", &[], now).is_err());
+        // Asking for another user's rows -> denied.
+        assert!(check_read(
+            &store,
+            &cache,
+            &p,
+            "messages",
+            &[cond("user_id", "=", "evil")],
+            now
+        )
+        .is_err());
+        // No grant on another table -> deny-by-default.
+        assert!(check_read(
+            &store,
+            &cache,
+            &p,
+            "secrets",
+            &[cond("user_id", "=", "123abc")],
+            now
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn write_grant_with_check_end_to_end() {
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+
+        let grant = crate::grants::parse_grant(&[
+            "write",
+            "ON",
+            "messages",
+            "WHERE",
+            "user_id",
+            "=",
+            "auth.uid()",
+        ])
+        .unwrap();
+        put_grant(&store, &cache, &grant, now).unwrap();
+        let p = principal("123abc");
+
+        // Inserting a row owned by self -> allowed.
+        let own = |c: &str| match c {
+            "user_id" => Some("123abc".to_string()),
+            _ => None,
+        };
+        assert!(check_write_row(&store, &cache, &p, "messages", own, now).is_ok());
+        // Inserting a row for someone else -> denied (WITH CHECK).
+        let other = |c: &str| match c {
+            "user_id" => Some("evil".to_string()),
+            _ => None,
+        };
+        assert!(check_write_row(&store, &cache, &p, "messages", other, now).is_err());
+        // Delete scoped to own rows -> allowed; unscoped -> denied.
+        assert!(check_write_where(
+            &store,
+            &cache,
+            &p,
+            "messages",
+            &[cond("user_id", "=", "123abc")],
+            now
+        )
+        .is_ok());
+        assert!(check_write_where(&store, &cache, &p, "messages", &[], now).is_err());
+    }
+
+    #[test]
+    fn revoke_removes_grant() {
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        let grant = crate::grants::parse_grant(&[
+            "read",
+            "ON",
+            "messages",
+            "WHERE",
+            "user_id",
+            "=",
+            "auth.uid()",
+        ])
+        .unwrap();
+        put_grant(&store, &cache, &grant, now).unwrap();
+        let p = principal("123abc");
+        assert!(check_read(
+            &store,
+            &cache,
+            &p,
+            "messages",
+            &[cond("user_id", "=", "123abc")],
+            now
+        )
+        .is_ok());
+        delete_grant(&store, &cache, "messages", crate::grants::Scope::Read, now).unwrap();
+        // After revoke -> deny-by-default.
+        assert!(check_read(
+            &store,
+            &cache,
+            &p,
+            "messages",
+            &[cond("user_id", "=", "123abc")],
+            now
+        )
+        .is_err());
+    }
+
     #[test]
     fn bootstrap_creates_auth_tables_idempotently() {
         let store = Store::new();
@@ -2776,27 +2941,6 @@ mod tests {
             assert!(response.starts_with("-ERR"), "{response}");
             assert!(response.contains("managed by Lux Auth"), "{response}");
         }
-    }
-
-    #[test]
-    fn grant_matching_supports_exact_and_suffix_wildcard() {
-        assert!(grant_matches_capability(
-            "live.channel.room:1",
-            "live.channel.room:1"
-        ));
-        assert!(grant_matches_capability(
-            "live.channel.room:*",
-            "live.channel.room:1"
-        ));
-        assert!(grant_matches_capability("*", "table.messages.read"));
-        assert!(!grant_matches_capability(
-            "live.channel.room:1",
-            "live.channel.room:2"
-        ));
-        assert!(!grant_matches_capability(
-            "table.messages.read",
-            "table.messages.write"
-        ));
     }
 
     #[test]

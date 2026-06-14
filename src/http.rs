@@ -316,12 +316,10 @@ async fn handle_request(
                 return stream_snapshot(socket, store).await;
             }
             ["v1", "tables", table] => {
-                if let Err((status, status_text, body)) = require_http_capability(
-                    store,
-                    cache,
-                    &auth_context,
-                    &format!("table.{table}.read"),
-                ) {
+                let where_clause = get_param(&params, "where").unwrap_or("");
+                if let Err((status, status_text, body)) =
+                    enforce_table_read(store, cache, &auth_context, table, where_clause)
+                {
                     return send_json(socket, status, status_text, &body).await;
                 }
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
@@ -337,12 +335,9 @@ async fn handle_request(
                     .await;
             }
             ["v1", "tables", table, "count"] => {
-                if let Err((status, status_text, body)) = require_http_capability(
-                    store,
-                    cache,
-                    &auth_context,
-                    &format!("table.{table}.read"),
-                ) {
+                if let Err((status, status_text, body)) =
+                    enforce_table_read(store, cache, &auth_context, table, "")
+                {
                     return send_json(socket, status, status_text, &body).await;
                 }
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
@@ -357,12 +352,9 @@ async fn handle_request(
                 return send_json(socket, 200, "OK", &body).await;
             }
             ["v1", "tables", table, "schema"] => {
-                if let Err((status, status_text, body)) = require_http_capability(
-                    store,
-                    cache,
-                    &auth_context,
-                    &format!("table.{table}.read"),
-                ) {
+                if let Err((status, status_text, body)) =
+                    enforce_table_read(store, cache, &auth_context, table, "")
+                {
                     return send_json(socket, status, status_text, &body).await;
                 }
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
@@ -383,12 +375,9 @@ async fn handle_request(
                 return send_json(socket, 200, "OK", &body).await;
             }
             ["v1", "tables", table, id] if *id != "count" && *id != "schema" => {
-                if let Err((status, status_text, body)) = require_http_capability(
-                    store,
-                    cache,
-                    &auth_context,
-                    &format!("table.{table}.read"),
-                ) {
+                if let Err((status, status_text, body)) =
+                    enforce_table_read(store, cache, &auth_context, table, "")
+                {
                     return send_json(socket, status, status_text, &body).await;
                 }
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
@@ -770,11 +759,15 @@ fn live_auth_principal(auth: &HttpAuthContext) -> Option<crate::auth::AuthPrinci
     }
 }
 
-fn require_http_capability(
+/// Enforce a READ grant on a table query. When end-user auth is off, the
+/// operator/service-key model applies and everything is allowed. Otherwise a
+/// token user's query conditions must satisfy a `read` grant on the table.
+fn enforce_table_read(
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
     auth: &HttpAuthContext,
-    capability: &str,
+    table: &str,
+    where_clause: &str,
 ) -> Result<(), (u16, &'static str, String)> {
     if !store.config().auth.enabled {
         return Ok(());
@@ -787,42 +780,151 @@ fn require_http_capability(
             r#"{"error":"unauthorized"}"#.to_string(),
         )),
         HttpAuthContext::User(principal) => {
-            match crate::auth::principal_has_capability(store, cache, principal, capability) {
-                Ok(true) => Ok(()),
-                Ok(false) => Err((
-                    403,
-                    "Forbidden",
-                    format!(
-                        r#"{{"error":"missing capability '{}'"}}"#,
-                        escape_json(capability)
-                    ),
-                )),
-                Err(e) => Err((
-                    500,
-                    "Internal Server Error",
-                    format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
-                )),
-            }
+            let conds: Vec<crate::grants::ResolvedCond> =
+                crate::tables::where_param_conditions(where_clause)
+                    .into_iter()
+                    .map(|(c, o, v)| crate::grants::ResolvedCond {
+                        column: c,
+                        op: o,
+                        value: v,
+                    })
+                    .collect();
+            crate::auth::check_read(store, cache, principal, table, &conds, Instant::now()).map_err(
+                |e| {
+                    (
+                        403,
+                        "Forbidden",
+                        format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                    )
+                },
+            )
         }
     }
 }
 
-fn require_live_capability(
+/// Enforce a write grant on an INSERT: the row being written must satisfy the
+/// table's write grant (WITH CHECK). Operators bypass; anonymous is rejected;
+/// auth-disabled instances are open.
+fn enforce_table_insert(
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
-    principal: Option<&crate::auth::AuthPrincipal>,
-    capability: &str,
-) -> Result<(), Value> {
-    let Some(principal) = principal else {
+    auth: &HttpAuthContext,
+    table: &str,
+    row: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), (u16, &'static str, String)> {
+    if !store.config().auth.enabled {
         return Ok(());
-    };
-    match crate::auth::principal_has_capability(store, cache, principal, capability) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(live_error(
-            "FORBIDDEN",
-            &format!("missing capability '{capability}'"),
+    }
+    match auth {
+        HttpAuthContext::Operator => Ok(()),
+        HttpAuthContext::Anonymous => Err((
+            401,
+            "Unauthorized",
+            r#"{"error":"unauthorized"}"#.to_string(),
         )),
-        Err(e) => Err(live_error("AUTH_ERROR", &e)),
+        HttpAuthContext::User(principal) => {
+            let lookup = |col: &str| {
+                row.get(col).map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Null => String::new(),
+                    other => other.to_string(),
+                })
+            };
+            crate::auth::check_write_row(store, cache, principal, table, lookup, Instant::now())
+                .map_err(|e| {
+                    (
+                        403,
+                        "Forbidden",
+                        format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                    )
+                })
+        }
+    }
+}
+
+/// Enforce a write grant on an UPDATE/DELETE: the WHERE clause must satisfy the
+/// table's write grant so only in-scope rows can be targeted.
+fn enforce_table_write_where(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+    table: &str,
+    where_clause: &str,
+) -> Result<(), (u16, &'static str, String)> {
+    if !store.config().auth.enabled {
+        return Ok(());
+    }
+    match auth {
+        HttpAuthContext::Operator => Ok(()),
+        HttpAuthContext::Anonymous => Err((
+            401,
+            "Unauthorized",
+            r#"{"error":"unauthorized"}"#.to_string(),
+        )),
+        HttpAuthContext::User(principal) => {
+            let conds: Vec<crate::grants::ResolvedCond> =
+                crate::tables::where_param_conditions(where_clause)
+                    .into_iter()
+                    .map(|(c, o, v)| crate::grants::ResolvedCond {
+                        column: c,
+                        op: o,
+                        value: v,
+                    })
+                    .collect();
+            crate::auth::check_write_where(store, cache, principal, table, &conds, Instant::now())
+                .map_err(|e| {
+                    (
+                        403,
+                        "Forbidden",
+                        format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                    )
+                })
+        }
+    }
+}
+
+/// Gate an operator-only route. Under the grant model, token principals have no
+/// access to privileged routes (raw KV, exec, catalog, etc.); only an operator
+/// credential passes. Auth-disabled instances are open.
+fn require_operator(
+    store: &Arc<Store>,
+    auth: &HttpAuthContext,
+) -> Result<(), (u16, &'static str, String)> {
+    if !store.config().auth.enabled {
+        return Ok(());
+    }
+    match auth {
+        HttpAuthContext::Operator => Ok(()),
+        HttpAuthContext::Anonymous => Err((
+            401,
+            "Unauthorized",
+            r#"{"error":"unauthorized"}"#.to_string(),
+        )),
+        HttpAuthContext::User(_) => Err((
+            403,
+            "Forbidden",
+            r#"{"error":"operator credentials required"}"#.to_string(),
+        )),
+    }
+}
+
+/// Gate a non-table live subscription (raw key, channel, pubsub, vector). These
+/// are operator-only under the grant model: a token principal may only subscribe
+/// to table queries (gated by its read grant). `None` is the operator / no-auth
+/// path and passes.
+fn require_live_operator(
+    store: &Arc<Store>,
+    principal: Option<&crate::auth::AuthPrincipal>,
+) -> Result<(), Value> {
+    if !store.config().auth.enabled {
+        return Ok(());
+    }
+    match principal {
+        None => Ok(()),
+        Some(_) => Err(live_error(
+            "FORBIDDEN",
+            "token principals may only subscribe to table queries",
+        )),
     }
 }
 
@@ -1073,7 +1175,7 @@ async fn build_live_subscription(
         .as_str()
         .or_else(|| spec.get("key").and_then(Value::as_str))
     {
-        require_live_capability(store, cache, principal, &format!("live.key.{pattern}"))?;
+        require_live_operator(store, principal)?;
         return Ok((
             LiveSubscription::Key {
                 pattern: pattern.to_string(),
@@ -1086,7 +1188,7 @@ async fn build_live_subscription(
     let kind = spec.get("kind").and_then(Value::as_str).unwrap_or("");
     if kind == "key" {
         let pattern = required_str(spec, "pattern")?;
-        require_live_capability(store, cache, principal, &format!("live.key.{pattern}"))?;
+        require_live_operator(store, principal)?;
         return Ok((
             LiveSubscription::Key {
                 pattern: pattern.to_string(),
@@ -1097,7 +1199,7 @@ async fn build_live_subscription(
     }
     if kind == "channel" || spec.get("channel").is_some() {
         let channel = required_str(spec, "channel")?;
-        require_live_capability(store, cache, principal, &format!("live.channel.{channel}"))?;
+        require_live_operator(store, principal)?;
         return Ok((
             LiveSubscription::Channel {
                 channel: channel.to_string(),
@@ -1117,7 +1219,7 @@ async fn build_live_subscription(
                     "pubsubPattern subscription requires pattern",
                 )
             })?;
-        require_live_capability(store, cache, principal, &format!("live.channel.{pattern}"))?;
+        require_live_operator(store, principal)?;
         return Ok((
             LiveSubscription::PubSubPattern {
                 pattern: pattern.to_string(),
@@ -1131,12 +1233,27 @@ async fn build_live_subscription(
         if let Some(err) = crate::auth::reserved_table_access_error(&table_spec.table) {
             return Err(live_error("FORBIDDEN", &err));
         }
-        require_live_capability(
-            store,
-            cache,
-            principal,
-            &format!("table.{}.read", table_spec.table),
-        )?;
+        // Enforce the READ grant: the subscription's query must satisfy it. The
+        // grant predicate is the security ceiling; an under-scoped `.live()` is
+        // rejected at subscribe time (operator / no-auth bypasses).
+        if store.config().auth.enabled {
+            if let Some(p) = principal {
+                let conds: Vec<crate::grants::ResolvedCond> = table_spec
+                    .where_conditions
+                    .iter()
+                    .filter(|(_, op, _)| {
+                        matches!(op.as_str(), "=" | "!=" | ">" | "<" | ">=" | "<=")
+                    })
+                    .map(|(field, op, val)| crate::grants::ResolvedCond {
+                        column: field.clone(),
+                        op: op.clone(),
+                        value: live_value_to_token(val),
+                    })
+                    .collect();
+                crate::auth::check_read(store, cache, p, &table_spec.table, &conds, Instant::now())
+                    .map_err(|e| live_error("FORBIDDEN", &e))?;
+            }
+        }
         let receivers = vec![
             broker.ksubscribe(&table_spec.table),
             broker.ksubscribe(&format!("_t:{}:row:*", table_spec.table)),
@@ -1158,7 +1275,7 @@ async fn build_live_subscription(
     }
     if kind == "vector.near" {
         let vector_spec = parse_live_vector_near_spec(spec)?;
-        require_live_capability(store, cache, principal, "vector.search")?;
+        require_live_operator(store, principal)?;
         let rows = fetch_live_vector_rows(store, &vector_spec);
         let query =
             json!({"type":"vector.near","k":vector_spec.k,"threshold":vector_spec.threshold});
@@ -1989,8 +2106,8 @@ fn route_request_with_auth(
         &segments[..]
     };
 
-    if let Some(capability) = required_capability_for_route(method, base) {
-        if let Err(response) = require_http_capability(store, cache, auth, &capability) {
+    if route_requires_operator(method, base) {
+        if let Err(response) = require_operator(store, auth) {
             return response;
         }
     }
@@ -2144,14 +2261,21 @@ fn route_request_with_auth(
                 ),
             }
         }
-        ("POST", ["tables", table]) => route_table_insert(table, body, store, broker, cache),
+        ("POST", ["tables", table]) => route_table_insert(table, body, store, broker, cache, auth),
         // Bulk update via PATCH (requires where parameter for safety)
-        ("PATCH", ["tables", table]) => {
-            route_table_update(table, params, body, store, broker, cache, script_engine)
-        }
+        ("PATCH", ["tables", table]) => route_table_update(
+            table,
+            params,
+            body,
+            store,
+            broker,
+            cache,
+            script_engine,
+            auth,
+        ),
         // Bulk delete via DELETE with where parameter (TDROP is separate)
         ("DELETE", ["tables", table]) => {
-            route_table_delete(table, params, store, broker, cache, script_engine)
+            route_table_delete(table, params, store, broker, cache, script_engine, auth)
         }
 
         // ── Time Series routes ──
@@ -2284,51 +2408,37 @@ fn route_request_with_auth(
     }
 }
 
-fn required_capability_for_route(method: &str, base: &[&str]) -> Option<String> {
-    match (method, base) {
-        ("GET", ["ping"]) => None,
-        ("POST", ["exec"]) => Some("exec".to_string()),
-        ("GET", ["dbsize"]) => Some("db.read".to_string()),
-        ("GET", ["keys"]) | ("GET", ["keys", _]) => Some("kv.*.read".to_string()),
-
-        ("GET", ["kv", key])
-        | ("GET", ["kv", key, "hash"])
-        | ("GET", ["kv", key, "list"])
-        | ("GET", ["kv", key, "set"])
-        | ("GET", ["kv", key, "zset"])
-        | ("GET", ["get", key])
-        | ("GET", ["hgetall", key]) => Some(format!("kv.{key}.read")),
-
-        ("PUT", ["kv", key])
-        | ("DELETE", ["kv", key])
-        | ("POST", ["kv", key, "incr"])
-        | ("POST", ["kv", key, "decr"])
-        | ("POST", ["set", key])
-        | ("POST", ["del", key])
-        | ("POST", ["incr", key])
-        | ("POST", ["decr", key]) => Some(format!("kv.{key}.write")),
-
-        ("GET", ["tables"]) => Some("table.*.read".to_string()),
-        ("POST", ["tables"]) => Some("table.*.write".to_string()),
-        ("GET", ["tables", table])
-        | ("GET", ["tables", table, "schema"])
-        | ("GET", ["tables", table, "count"]) => Some(format!("table.{table}.read")),
-        ("POST", ["tables", table])
-        | ("PATCH", ["tables", table])
-        | ("DELETE", ["tables", table]) => Some(format!("table.{table}.write")),
-
-        ("GET", ["ts"]) => Some("ts.*.read".to_string()),
-        ("GET", ["ts", key]) | ("GET", ["ts", key, "info"]) | ("GET", ["ts", key, "latest"]) => {
-            Some(format!("ts.{key}.read"))
-        }
-        ("POST", ["ts", key]) => Some(format!("ts.{key}.write")),
-
-        ("POST", ["vectors", "search"]) => Some("vector.search".to_string()),
-        ("POST", ["vectors", _]) | ("DELETE", ["vectors", _]) => Some("vector.write".to_string()),
-        ("GET", ["vectors"]) | ("GET", ["vectors", _]) => Some("vector.read".to_string()),
-
-        _ => None,
-    }
+/// Routes that are operator-only under the grant model. Token (end-user)
+/// principals reach the database *only* through per-table data routes, which are
+/// gated inline by their read/write grants; everything privileged below (raw KV,
+/// exec, time-series, vectors, table catalog) is off-limits to them. Per-table
+/// data routes (`/tables/{table}` GET/POST/PATCH/DELETE) deliberately return
+/// `false` here so the generic gate defers to the inline grant check.
+fn route_requires_operator(method: &str, base: &[&str]) -> bool {
+    matches!(
+        (method, base),
+        ("POST", ["exec"])
+            | ("GET", ["dbsize"])
+            | ("GET", ["keys"])
+            | ("GET", ["keys", _])
+            | ("GET", ["kv", ..])
+            | ("GET", ["get", _])
+            | ("GET", ["hgetall", _])
+            | ("PUT", ["kv", _])
+            | ("DELETE", ["kv", _])
+            | ("POST", ["kv", ..])
+            | ("POST", ["set", _])
+            | ("POST", ["del", _])
+            | ("POST", ["incr", _])
+            | ("POST", ["decr", _])
+            | ("GET", ["tables"])
+            | ("POST", ["tables"])
+            | ("GET", ["ts", ..])
+            | ("POST", ["ts", _])
+            | ("GET", ["vectors", ..])
+            | ("POST", ["vectors", ..])
+            | ("DELETE", ["vectors", _])
+    )
 }
 
 fn ok(result: String) -> (u16, &'static str, String) {
@@ -2465,6 +2575,7 @@ fn route_table_insert(
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
 ) -> (u16, &'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -2487,6 +2598,10 @@ fn route_table_insert(
             )
         }
     };
+
+    if let Err((status, status_text, body)) = enforce_table_insert(store, cache, auth, table, obj) {
+        return (status, status_text, body);
+    }
 
     // Build field-value pairs directly - avoids RESP encode/decode round-trip through exec_simple
     let val_strings: Vec<(String, String)> = obj
@@ -2522,6 +2637,7 @@ fn route_table_insert(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn route_table_update(
     table: &str,
     params: &[(String, String)],
@@ -2530,6 +2646,7 @@ fn route_table_update(
     broker: &Broker,
     cache: &SharedSchemaCache,
     script_engine: &Arc<lua::ScriptEngine>,
+    auth: &HttpAuthContext,
 ) -> (u16, &'static str, String) {
     // Require where parameter for safety (prevents accidental full table updates)
     let where_clause = match get_param(params, "where") {
@@ -2542,6 +2659,12 @@ fn route_table_update(
             )
         }
     };
+
+    if let Err((status, status_text, body)) =
+        enforce_table_write_where(store, cache, auth, table, where_clause)
+    {
+        return (status, status_text, body);
+    }
 
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -2600,10 +2723,15 @@ fn route_table_delete(
     broker: &Broker,
     cache: &SharedSchemaCache,
     script_engine: &Arc<lua::ScriptEngine>,
+    auth: &HttpAuthContext,
 ) -> (u16, &'static str, String) {
-    // Check for drop=true parameter to distinguish from delete
+    // Check for drop=true parameter to distinguish from delete. Dropping a table
+    // is a schema operation, not row access: operator-only.
     if let Some(val) = get_param(params, "drop") {
         if val == "true" {
+            if let Err((status, status_text, body)) = require_operator(store, auth) {
+                return (status, status_text, body);
+            }
             return ok(exec_json(
                 store,
                 broker,
@@ -2625,6 +2753,12 @@ fn route_table_delete(
                     .to_string(),
             ),
         };
+
+    if let Err((status, status_text, body)) =
+        enforce_table_write_where(store, cache, auth, table, where_clause)
+    {
+        return (status, status_text, body);
+    }
 
     // Build TDELETE command: TDELETE FROM <table> WHERE <conditions>
     let mut args: Vec<String> = vec!["TDELETE".to_string(), "FROM".to_string(), table.to_string()];
@@ -3203,6 +3337,54 @@ fn escape_json(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::tables::JoinType;
+
+    #[test]
+    fn per_table_data_routes_are_not_operator_only() {
+        // Token principals reach the DB only through these; they must defer to
+        // the inline grant check, never the operator gate.
+        for (m, base) in [
+            ("GET", vec!["tables", "messages"]),
+            ("GET", vec!["tables", "messages", "count"]),
+            ("GET", vec!["tables", "messages", "schema"]),
+            ("GET", vec!["tables", "messages", "42"]),
+            ("POST", vec!["tables", "messages"]),
+            ("PATCH", vec!["tables", "messages"]),
+            ("DELETE", vec!["tables", "messages"]),
+        ] {
+            assert!(
+                !route_requires_operator(m, &base),
+                "{m} /{} should be grant-gated, not operator-only",
+                base.join("/")
+            );
+        }
+    }
+
+    #[test]
+    fn privileged_routes_are_operator_only() {
+        // A bug here hands token users raw KV / exec / catalog. Lock it down.
+        for (m, base) in [
+            ("POST", vec!["exec"]),
+            ("GET", vec!["dbsize"]),
+            ("GET", vec!["keys"]),
+            ("GET", vec!["kv", "secret"]),
+            ("PUT", vec!["kv", "secret"]),
+            ("DELETE", vec!["kv", "secret"]),
+            ("POST", vec!["set", "secret"]),
+            ("GET", vec!["tables"]),
+            ("POST", vec!["tables"]),
+            ("GET", vec!["ts", "metric"]),
+            ("POST", vec!["ts", "metric"]),
+            ("GET", vec!["vectors", "idx"]),
+            ("POST", vec!["vectors", "idx"]),
+            ("DELETE", vec!["vectors", "idx"]),
+        ] {
+            assert!(
+                route_requires_operator(m, &base),
+                "{m} /{} must be operator-only",
+                base.join("/")
+            );
+        }
+    }
 
     #[test]
     fn parse_http_table_query_supports_structured_left_join() {

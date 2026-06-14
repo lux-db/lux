@@ -2942,6 +2942,25 @@ fn candidates_from_implicit_id(
 ///   [OFFSET n]
 ///
 /// The args slice should start at the first token AFTER "TSELECT".
+/// Extract simple `(column, op, value)` comparison conditions from a WHERE-param
+/// string, for grant enforcement. Scans for `col <cmp> value` triples; complex
+/// conditions (IN, IS VALID, dot-paths) are ignored - they simply won't match a
+/// grant condition, so a query relying on them won't satisfy a grant.
+pub fn where_param_conditions(where_clause: &str) -> Vec<(String, String, String)> {
+    let t: Vec<&str> = where_clause.split_whitespace().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 2 < t.len() {
+        if matches!(t[i + 1], "=" | "!=" | ">" | "<" | ">=" | "<=") {
+            out.push((t[i].to_string(), t[i + 1].to_string(), t[i + 2].to_string()));
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 pub fn parse_select(args: &[&str]) -> Result<SelectPlan, String> {
     if args.is_empty() {
         return Err("ERR TSELECT requires a column list".to_string());

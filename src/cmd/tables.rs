@@ -259,6 +259,49 @@ pub fn cmd_tdropindex(
     CmdResult::Written
 }
 
+/// GRANT <read[, write]> ON <table> [WHERE <predicate>] - operator-issued.
+pub fn cmd_grant(
+    args: &[&[u8]],
+    store: &Store,
+    cache: &SharedSchemaCache,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    let toks: Vec<&str> = args[1..].iter().map(|a| arg_str(a)).collect();
+    match crate::grants::parse_grant(&toks) {
+        Ok(grant) => match crate::auth::put_grant(store, cache, &grant, now) {
+            Ok(()) => resp::write_ok(out),
+            Err(e) => resp::write_error(out, &e),
+        },
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+/// REVOKE <read[, write]> ON <table> - operator-issued.
+pub fn cmd_revoke(
+    args: &[&[u8]],
+    store: &Store,
+    cache: &SharedSchemaCache,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    let toks: Vec<&str> = args[1..].iter().map(|a| arg_str(a)).collect();
+    match crate::grants::parse_revoke(&toks) {
+        Ok((table, scopes)) => {
+            for scope in scopes {
+                if let Err(e) = crate::auth::delete_grant(store, cache, &table, scope, now) {
+                    resp::write_error(out, &e);
+                    return CmdResult::Written;
+                }
+            }
+            resp::write_ok(out);
+        }
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
 pub fn cmd_tcount(
     args: &[&[u8]],
     store: &Store,

@@ -964,6 +964,14 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 3,
     },
     CommandSpec {
+        name: b"GRANT",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"REVOKE",
+        min_arity: 4,
+    },
+    CommandSpec {
         name: b"TCOUNT",
         min_arity: 2,
     },
@@ -1593,6 +1601,9 @@ pub fn execute(
             if cmd_eq(cmd, b"GEOSEARCH_RO") {
                 return geo::cmd_geosearch(args, store, out, now);
             }
+            if cmd_eq(cmd, b"GRANT") {
+                return tables::cmd_grant(args, store, cache, out, now);
+            }
         }
         b'H' => {
             if cmd_eq(cmd, b"HSET") || cmd_eq(cmd, b"HMSET") {
@@ -1806,6 +1817,9 @@ pub fn execute(
             }
             if cmd_eq(cmd, b"RESET") {
                 return server::cmd_noop_ok(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"REVOKE") {
+                return tables::cmd_revoke(args, store, cache, out, now);
             }
         }
         b'S' => {

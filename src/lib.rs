@@ -12,6 +12,7 @@ mod disk;
 mod embedded;
 mod eviction;
 mod geo;
+mod grants;
 mod hll;
 mod hnsw;
 mod http;
