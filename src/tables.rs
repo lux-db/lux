@@ -4004,6 +4004,26 @@ fn build_candidates(
     }
 }
 
+/// True when range-scanning or ordering `col` should use the table's `ids`
+/// sorted set rather than a per-column secondary index.
+///
+/// The `ids` set holds every row keyed by its primary key, with the numeric PK
+/// as the score, so it is the authoritative, always-populated index for the
+/// primary key column. The per-column index (`idx_sorted_key`) is only written
+/// by `add_to_index` when a value is explicitly supplied to TINSERT, so an
+/// auto-increment INT primary key has no entries there and any range/order over
+/// it would otherwise come back empty. This covers both the implicit auto-
+/// increment `id` (no declared PK) and an explicit INT primary key of any name.
+fn pk_served_by_ids_set(schema: &[FieldDef], col: &str) -> bool {
+    let has_explicit_pk = schema.iter().any(|f| f.primary_key);
+    if !has_explicit_pk {
+        return col == "id";
+    }
+    schema
+        .iter()
+        .any(|f| f.primary_key && f.name == col && matches!(f.field_type, FieldType::Int))
+}
+
 fn build_candidate_set(
     store: &Store,
     table: &str,
@@ -4061,7 +4081,7 @@ fn build_candidate_set(
                 Some(existing) => existing.intersection(&pk_set).cloned().collect(),
                 None => pk_set,
             });
-        } else if !schema.iter().any(|f| f.primary_key) && bare == "id" {
+        } else if pk_served_by_ids_set(schema, bare) {
             if let Some(pks) = candidates_from_implicit_id(
                 store,
                 table,
@@ -4113,8 +4133,7 @@ fn candidates_from_order_index(
     scan: OrderScan<'_>,
     now: Instant,
 ) -> Option<Vec<String>> {
-    let has_explicit_pk = schema.iter().any(|f| f.primary_key);
-    let zkey = if !has_explicit_pk && scan.column == "id" {
+    let zkey = if pk_served_by_ids_set(schema, scan.column) {
         ids_key(table)
     } else {
         let field = schema.iter().find(|f| f.name == scan.column)?;
@@ -5755,6 +5774,142 @@ mod tests {
             }
             _ => panic!("expected rows"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Auto-increment primary key: ordering and range scans must use the `ids`
+    // set, not the per-column secondary index (which auto-increment never
+    // populates). Regression for "table has N rows but ORDER BY id / WHERE id
+    // range returns nothing". seed_users provides explicit ids, so these cases
+    // insert WITHOUT an id to exercise the auto-increment path specifically.
+    // -------------------------------------------------------------------------
+
+    /// Read one column's value from a result row (rows are field/value pairs).
+    fn cell<'a>(row: &'a [(String, String)], col: &str) -> &'a str {
+        row.iter()
+            .find(|(k, _)| k == col)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    }
+
+    fn seed_autoinc(store: &Arc<Store>, cache: &SharedSchemaCache, now: Instant, pk: &str) {
+        table_create(
+            store,
+            cache,
+            "t",
+            &[format!("{pk} INT PRIMARY KEY,").as_str(), "owner STR"],
+            now,
+        )
+        .unwrap();
+        for owner in ["a", "b", "c", "d", "e"] {
+            // No pk value provided -> engine assigns the auto-increment id.
+            table_insert(store, cache, "t", &[("owner", owner)], now).unwrap();
+        }
+    }
+
+    fn rows_of(result: SelectResult) -> Vec<Vec<(String, String)>> {
+        match result {
+            SelectResult::Rows(rows) => rows,
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn order_by_autoincrement_pk_named_id_desc() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_autoinc(&store, &cache, now, "id");
+
+        let plan = parse_select(&["*", "FROM", "t", "ORDER", "BY", "id", "DESC"]).unwrap();
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        let ids: Vec<&str> = rows.iter().map(|r| cell(r, "id")).collect();
+        assert_eq!(ids, vec!["5", "4", "3", "2", "1"]);
+    }
+
+    #[test]
+    fn order_by_autoincrement_pk_named_id_asc_with_limit() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_autoinc(&store, &cache, now, "id");
+
+        let plan =
+            parse_select(&["*", "FROM", "t", "ORDER", "BY", "id", "ASC", "LIMIT", "2"]).unwrap();
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        let ids: Vec<&str> = rows.iter().map(|r| cell(r, "id")).collect();
+        assert_eq!(ids, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn order_by_autoincrement_pk_custom_name() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_autoinc(&store, &cache, now, "pid");
+
+        let plan = parse_select(&["*", "FROM", "t", "ORDER", "BY", "pid", "DESC"]).unwrap();
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        let ids: Vec<&str> = rows.iter().map(|r| cell(r, "pid")).collect();
+        assert_eq!(ids, vec!["5", "4", "3", "2", "1"]);
+    }
+
+    #[test]
+    fn where_range_on_autoincrement_pk() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_autoinc(&store, &cache, now, "id");
+
+        // Strict greater-than.
+        let plan = parse_select(&["*", "FROM", "t", "WHERE", "id", ">", "3"]).unwrap();
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        let mut ids: Vec<&str> = rows.iter().map(|r| cell(r, "id")).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["4", "5"]);
+
+        // Inclusive lower bound returns the whole table.
+        let plan = parse_select(&["*", "FROM", "t", "WHERE", "id", ">=", "1"]).unwrap();
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        assert_eq!(rows.len(), 5);
+    }
+
+    #[test]
+    fn eq_on_autoincrement_pk_still_works() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_autoinc(&store, &cache, now, "id");
+
+        let plan = parse_select(&["*", "FROM", "t", "WHERE", "id", "=", "3"]).unwrap();
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cell(&rows[0], "owner"), "c");
+    }
+
+    #[test]
+    fn order_by_string_pk_sorts_lexically() {
+        // A non-numeric PK has no `ids`-set ordering by value; it must fall
+        // through to the in-memory sort and still come back sorted (not empty).
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "t",
+            &["slug STR PRIMARY KEY,", "n STR"],
+            now,
+        )
+        .unwrap();
+        for slug in ["mango", "apple", "cherry"] {
+            table_insert(&store, &cache, "t", &[("slug", slug), ("n", "x")], now).unwrap();
+        }
+
+        let plan = parse_select(&["*", "FROM", "t", "ORDER", "BY", "slug", "ASC"]).unwrap();
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        let slugs: Vec<&str> = rows.iter().map(|r| cell(r, "slug")).collect();
+        assert_eq!(slugs, vec!["apple", "cherry", "mango"]);
     }
 
     // -------------------------------------------------------------------------
