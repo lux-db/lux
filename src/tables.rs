@@ -521,13 +521,13 @@ fn parse_field_def(spec: &str) -> Result<FieldDef, String> {
             }
             "PRIMARY" => {
                 i += 1;
-                if i >= tokens.len() || tokens[i].to_uppercase() != "KEY" {
-                    return Err("ERR expected KEY after PRIMARY".to_string());
+                // Accept both "PRIMARY KEY" and a bare "PRIMARY".
+                if i < tokens.len() && tokens[i].eq_ignore_ascii_case("KEY") {
+                    i += 1;
                 }
                 primary_key = true;
                 unique = true;
                 nullable = false;
-                i += 1;
             }
             "UNIQUE" => {
                 unique = true;
@@ -652,6 +652,8 @@ pub fn parse_column_list(args: &[&str]) -> Result<Vec<FieldDef>, String> {
     // regardless of how the client tokenized the command
     let raw = args.join(" ");
     let raw = raw.trim();
+    // Tolerate a trailing statement terminator (`TCREATE t a int, b str;`).
+    let raw = raw.strip_suffix(';').unwrap_or(raw).trim();
 
     // Strip optional outer parentheses
     let inner = if raw.starts_with('(') && raw.ends_with(')') {
@@ -5033,8 +5035,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_field_primary_key_missing_key_errors() {
-        assert!(parse_field_def("id INT PRIMARY").is_err());
+    fn parse_field_bare_primary_is_primary_key() {
+        // A bare `PRIMARY` (no `KEY`) is accepted as a primary key.
+        let f = parse_field_def("id INT PRIMARY").unwrap();
+        assert!(f.primary_key);
+        assert!(f.unique);
+        assert!(!f.nullable);
     }
 
     // -------------------------------------------------------------------------
@@ -5047,6 +5053,25 @@ mod tests {
         assert_eq!(fields.len(), 3);
         assert!(fields[0].primary_key);
         assert_eq!(fields[1].name, "name");
+    }
+
+    #[test]
+    fn column_list_unquoted_lowercase_with_trailing_semicolon() {
+        // Mirrors what a developer naturally types: lowercase types, bare
+        // `primary`, unquoted commas, trailing `;`.
+        let fields = parse_column_list(&[
+            "id",
+            "int",
+            "primary,",
+            "owner",
+            "str,",
+            "created_at",
+            "str;",
+        ])
+        .unwrap();
+        assert_eq!(fields.len(), 3);
+        assert!(fields[0].primary_key);
+        assert_eq!(fields[2].name, "created_at");
     }
 
     #[test]

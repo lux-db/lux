@@ -257,7 +257,7 @@ Built-in relational tables with typed fields, indexes, unique constraints, forei
 
 ```bash
 # Create a table with typed fields
-redis-cli TCREATE users "id INT PRIMARY KEY," "name STR," "email STR UNIQUE," "age INT," "active BOOL"
+redis-cli TCREATE users id INT PRIMARY KEY, name STR, email STR UNIQUE, age INT, active BOOL
 
 # Insert rows (* auto-generates timestamp)
 redis-cli TINSERT users name Alice email alice@example.com age 28 active true created_at *
@@ -267,7 +267,7 @@ redis-cli TINSERT users name Bob email bob@example.com age 35 active false creat
 redis-cli TSELECT '*' FROM users WHERE age '>' 25 ORDER BY age DESC LIMIT 10
 
 # Foreign keys and joins
-redis-cli TCREATE posts "id INT PRIMARY KEY," "title STR," "author_id INT REFERENCES users(id)"
+redis-cli TCREATE posts id INT PRIMARY KEY, title STR, author_id INT REFERENCES users(id)
 redis-cli TINSERT posts id 1 title "Hello World" author_id 1
 redis-cli TSELECT '*' FROM posts p JOIN users u ON p.author_id = u.id
 
@@ -276,7 +276,7 @@ redis-cli TSELECT author_id, COUNT(*) AS post_count FROM posts GROUP BY author_i
 redis-cli TSELECT '*' FROM posts p LEFT JOIN users u ON p.author_id = u.id
 
 # Vector fields compose with table filters
-redis-cli TCREATE messages "id INT PRIMARY KEY," "channel STR," "body STR," "embedding VECTOR(3)"
+redis-cli TCREATE messages id INT PRIMARY KEY, channel STR, body STR, embedding VECTOR(3)
 redis-cli TINSERT messages id 1 channel general body hello embedding "[0.1,0.2,0.3]"
 redis-cli TSELECT id, body, _similarity FROM messages WHERE channel = general NEAR embedding "[0.1,0.2,0.3]" K 10 THRESHOLD 0.8
 
@@ -288,7 +288,7 @@ redis-cli TDELETE FROM users WHERE id = 2
 redis-cli TSELECT '*' FROM users WHERE id IN '(' 1 2 3 ')'
 
 # JSON and ARRAY columns, queried by dot-path like a JS object
-redis-cli TCREATE events "id INT PRIMARY KEY," "metadata JSON," "tags ARRAY"
+redis-cli TCREATE events id INT PRIMARY KEY, metadata JSON, tags ARRAY
 redis-cli TINSERT events id 1 metadata '{"plan":{"tier":"pro"},"count":0}' tags '["a","b"]'
 redis-cli TSELECT '*' FROM events WHERE metadata.plan.tier = pro      # non-resolving path = non-match, never an error
 redis-cli TSELECT '*' FROM events WHERE metadata.count IS VALID       # existence (0/false/"" are valid), not truthiness
