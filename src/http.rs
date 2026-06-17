@@ -345,18 +345,17 @@ async fn handle_request(
                         return send_json(socket, status, status_text, &body).await;
                     }
                 };
-                if let Err((status, status_text, body)) = deny_if_row_scoped(&filter) {
-                    return send_json(socket, status, status_text, &body).await;
-                }
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
                     let body = format!(r#"{{"error":"{}"}}"#, escape_json(&err));
                     return send_json(socket, 403, "Forbidden", &body).await;
                 }
                 let now = std::time::Instant::now();
-                let body = match crate::tables::table_count(store, cache, table, now) {
-                    Ok(n) => format!(r#"{{"result":{n}}}"#),
-                    Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
-                };
+                let scope = filter.as_deref().unwrap_or("");
+                let body =
+                    match crate::tables::table_count_filtered(store, cache, table, scope, now) {
+                        Ok(n) => format!(r#"{{"result":{n}}}"#),
+                        Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                    };
                 return send_json(socket, 200, "OK", &body).await;
             }
             ["v1", "tables", table, "schema"] => {
@@ -391,20 +390,21 @@ async fn handle_request(
                         return send_json(socket, status, status_text, &body).await;
                     }
                 };
-                // Fetch-by-id can't yet apply a row filter; deny row-scoped
-                // callers here and steer them to the filtered query route.
-                if let Err((status, status_text, body)) = deny_if_row_scoped(&filter) {
-                    return send_json(socket, status, status_text, &body).await;
-                }
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
                     let body = format!(r#"{{"error":"{}"}}"#, escape_json(&err));
                     return send_json(socket, 403, "Forbidden", &body).await;
                 }
                 let now = std::time::Instant::now();
+                let scope = filter.as_deref().unwrap_or("");
                 let body = match id.parse::<i64>() {
                     Ok(id_i64) => {
-                        match crate::tables::table_get(store, cache, table, id_i64, now) {
-                            Ok(row) => row_to_json_object(&row),
+                        match crate::tables::table_get_filtered(
+                            store, cache, table, id_i64, scope, now,
+                        ) {
+                            // A row that exists but is out of grant scope reads as
+                            // not-found, so we don't leak that it exists.
+                            Ok(Some(row)) => row_to_json_object(&row),
+                            Ok(None) => r#"{"error":"row not found"}"#.to_string(),
                             Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
                         }
                     }
@@ -907,22 +907,6 @@ fn params_with_where(params: &[(String, String)], where_value: &str) -> Vec<(Str
         out.push(("where".to_string(), where_value.to_string()));
     }
     out
-}
-
-/// A row-scoped grant filter can't yet be applied to `/count` or `/tables/:id`
-/// (those don't take a WHERE), so a token user with a row-scoped grant is denied
-/// there rather than leaking unfiltered data. Operator / unconditional grant
-/// (empty filter) is allowed. (Follow-up: filter these too.)
-fn deny_if_row_scoped(filter: &Option<String>) -> Result<(), (u16, &'static str, String)> {
-    match filter {
-        Some(f) if !f.trim().is_empty() => Err((
-            403,
-            "Forbidden",
-            r#"{"error":"row-scoped grant: use a filtered query instead of count/by-id"}"#
-                .to_string(),
-        )),
-        _ => Ok(()),
-    }
 }
 
 /// Gate an operator-only route. Under the grant model, token principals have no
@@ -1899,12 +1883,60 @@ struct HttpTableQueryParams {
 }
 
 fn parse_http_where_tokens(where_clause: &str) -> Result<Vec<String>, String> {
-    let tokens: Vec<String> = where_clause
-        .split_whitespace()
-        .map(ToString::to_string)
-        .collect();
+    let tokens = tokenize_where(where_clause)?;
     if tokens.is_empty() {
         return Err("invalid where parameter".to_string());
+    }
+    Ok(tokens)
+}
+
+/// Split a WHERE string on whitespace, but keep a single-quoted span as ONE
+/// token so values may contain spaces, SQL keywords, or newlines (e.g.
+/// `name = 'New York'`). Inside quotes, `\'` is a literal quote and `\\` a
+/// literal backslash. Without this, `split_whitespace` turns `New York` into two
+/// tokens and the query parser rejects `York` as an unexpected keyword.
+fn tokenize_where(s: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut building = false;
+    let mut in_quote = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if in_quote {
+            match c {
+                '\\' => match chars.next() {
+                    Some('\'') => cur.push('\''),
+                    Some('\\') => cur.push('\\'),
+                    Some(other) => {
+                        cur.push('\\');
+                        cur.push(other);
+                    }
+                    None => return Err("unterminated escape in where value".to_string()),
+                },
+                '\'' => in_quote = false,
+                _ => cur.push(c),
+            }
+        } else if c == '\'' && !building {
+            // A quote only opens at a token boundary, so a mid-token apostrophe
+            // stays literal (`O'Brien` is one token). This keeps unquoted values
+            // that worked before working; only whitespace values need quoting.
+            in_quote = true;
+            building = true;
+        } else if c.is_whitespace() {
+            if building {
+                tokens.push(std::mem::take(&mut cur));
+                building = false;
+            }
+        } else {
+            cur.push(c);
+            building = true;
+        }
+    }
+    if in_quote {
+        return Err("unterminated quote in where value".to_string());
+    }
+    if building {
+        tokens.push(cur);
     }
     Ok(tokens)
 }
@@ -2303,9 +2335,6 @@ fn route_request_with_auth(
                 Ok(f) => f,
                 Err(resp) => return resp,
             };
-            if let Err(resp) = deny_if_row_scoped(&filter) {
-                return resp;
-            }
             if let Some(err) = crate::auth::reserved_table_access_error(table) {
                 return (
                     403,
@@ -2314,7 +2343,8 @@ fn route_request_with_auth(
                 );
             }
             let now = std::time::Instant::now();
-            match crate::tables::table_count(store, cache, table, now) {
+            let scope = filter.as_deref().unwrap_or("");
+            match crate::tables::table_count_filtered(store, cache, table, scope, now) {
                 Ok(n) => ok(format!(r#"{{"result":{n}}}"#)),
                 Err(e) => (
                     400,
@@ -3642,6 +3672,46 @@ mod tests {
         assert_eq!(plan.having[0].field, "count");
     }
 
+    // ── WHERE tokenizer (quoted values) ──
+
+    #[test]
+    fn tokenize_where_keeps_quoted_spans_whole() {
+        assert_eq!(tokenize_where("a = 1").unwrap(), vec!["a", "=", "1"]);
+        // value with a space stays one token
+        assert_eq!(
+            tokenize_where("name = 'New York'").unwrap(),
+            vec!["name", "=", "New York"]
+        );
+        // quoted value containing a SQL keyword is not re-tokenized
+        assert_eq!(
+            tokenize_where("title = 'a OR b' AND n > 5").unwrap(),
+            vec!["title", "=", "a OR b", "AND", "n", ">", "5"]
+        );
+        // a mid-token apostrophe stays literal when UNQUOTED (back-compat: this
+        // worked before and must keep working without the SDK quoting it)
+        assert_eq!(
+            tokenize_where("name = O'Brien").unwrap(),
+            vec!["name", "=", "O'Brien"]
+        );
+        // escapes inside an opened quote: \' -> ' and \\ -> \
+        assert_eq!(
+            tokenize_where(r"name = 'O\'Brien'").unwrap(),
+            vec!["name", "=", "O'Brien"]
+        );
+        // quoted empty string is a present (empty) token
+        assert_eq!(tokenize_where("x = ''").unwrap(), vec!["x", "=", ""]);
+        // newline inside quotes is preserved
+        assert_eq!(
+            tokenize_where("b = 'l1\nl2'").unwrap(),
+            vec!["b", "=", "l1\nl2"]
+        );
+    }
+
+    #[test]
+    fn tokenize_where_rejects_unterminated_quote() {
+        assert!(tokenize_where("name = 'unclosed").is_err());
+    }
+
     // ── RLS auto-filter (USING) helpers ──
 
     #[test]
@@ -3675,17 +3745,6 @@ mod tests {
         let params = vec![("where".to_string(), "old = 1".to_string())];
         let out = params_with_where(&params, "");
         assert_eq!(get_param(&out, "where"), None);
-    }
-
-    #[test]
-    fn deny_if_row_scoped_blocks_only_nonempty_filters() {
-        // Operator / unconditional grant -> allowed.
-        assert!(deny_if_row_scoped(&None).is_ok());
-        assert!(deny_if_row_scoped(&Some(String::new())).is_ok());
-        assert!(deny_if_row_scoped(&Some("   ".to_string())).is_ok());
-        // Row-scoped grant -> 403 (can't filter count/by-id yet).
-        let denied = deny_if_row_scoped(&Some("user_id = u1".to_string()));
-        assert_eq!(denied.unwrap_err().0, 403);
     }
 
     // ── RLS auto-filter end-to-end through the table routes ──
@@ -3907,16 +3966,62 @@ mod tests {
     }
 
     #[test]
-    fn rls_count_and_by_id_deny_row_scoped_token_user() {
+    fn rls_count_respects_row_scoped_grant() {
+        let (store, _broker, cache, _se) = rls_fixture();
+        put_read_write_grant(&store, &cache);
+        // messages fixture: 2 alice rows + 1 bob row.
+        let alice = user_ctx("alice");
+        let now = Instant::now();
+
+        // Operator counts the whole table.
+        let op_filter =
+            enforce_table_read(&store, &cache, &HttpAuthContext::Operator, "messages").unwrap();
+        assert_eq!(
+            crate::tables::table_count_filtered(
+                &store,
+                &cache,
+                "messages",
+                op_filter.as_deref().unwrap_or(""),
+                now
+            )
+            .unwrap(),
+            3
+        );
+
+        // A row-scoped token user counts only their own rows (no more 403).
+        let filter = enforce_table_read(&store, &cache, &alice, "messages").unwrap();
+        assert_eq!(
+            crate::tables::table_count_filtered(
+                &store,
+                &cache,
+                "messages",
+                filter.as_deref().unwrap_or(""),
+                now
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn rls_by_id_hides_out_of_scope_rows() {
         let (store, _broker, cache, _se) = rls_fixture();
         put_read_write_grant(&store, &cache);
         let alice = user_ctx("alice");
-        // Row-scoped read grant -> count / by-id are denied (stopgap) until they
-        // can apply the filter; operator still passes.
+        let now = Instant::now();
         let filter = enforce_table_read(&store, &cache, &alice, "messages").unwrap();
-        assert_eq!(deny_if_row_scoped(&filter).unwrap_err().0, 403);
-        let op_filter =
-            enforce_table_read(&store, &cache, &HttpAuthContext::Operator, "messages").unwrap();
-        assert!(deny_if_row_scoped(&op_filter).is_ok());
+        let scope = filter.as_deref().unwrap_or("");
+
+        // id=1 is alice's -> visible; id=3 is bob's -> reads as not-found.
+        assert!(
+            crate::tables::table_get_filtered(&store, &cache, "messages", 1, scope, now)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            crate::tables::table_get_filtered(&store, &cache, "messages", 3, scope, now)
+                .unwrap()
+                .is_none()
+        );
     }
 }

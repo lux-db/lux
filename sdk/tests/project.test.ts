@@ -145,6 +145,31 @@ describe('Lux project client', () => {
 		]);
 	});
 
+	test('string filter values are single-quoted so spaces/keywords survive', async () => {
+		const seen: string[] = [];
+		const fetchImpl = async (input: RequestInfo | URL) => {
+			seen.push(new URL(String(input)).searchParams.get('where') ?? '');
+			return new Response(JSON.stringify({ result: [] }), { status: 200 });
+		};
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		await client.table('cities').select().eq('name', 'New York');
+		await client.table('posts').select().eq('title', 'a OR b').gt('rank', 5);
+		await client.table('people').select().eq('name', "O'Brien");
+		await client.table('nums').select().eq('id', 42); // numbers stay bare
+
+		expect(seen).toEqual([
+			"name = 'New York'",
+			"title = 'a OR b' AND rank > 5",
+			"name = 'O\\'Brien'",
+			'id = 42',
+		]);
+	});
+
 	test('single returns one row through the data/error envelope', async () => {
 		const fetchImpl = async () => {
 			return new Response(JSON.stringify({ result: [{ id: 1, body: 'hello' }] }), { status: 200 });

@@ -895,18 +895,12 @@ function unwrapResult<T>(payload: unknown): T | undefined {
 	return payload as T;
 }
 
-function normalizeWhere(where: string): string {
-	return where.trim().replace(/\s*(>=|<=|!=|=|>|<)\s*/g, ' $1 ');
-}
-
 function filtersToWhere(filters: QueryFilter[]): string {
 	return filters.map((filter) => {
 		const op = filterOperatorToWhere(filter.operator);
 		if (filter.operator === 'in' || filter.operator === 'notIn') {
 			const values = Array.isArray(filter.value) ? filter.value : [filter.value];
-			return normalizeWhere(
-				`${filter.column} ${op} ( ${values.map(formatWhereValue).join(' ')} )`,
-			);
+			return `${filter.column} ${op} ( ${values.map(formatWhereValue).join(' ')} )`;
 		}
 		if (
 			filter.operator === 'isValid' ||
@@ -914,16 +908,16 @@ function filtersToWhere(filters: QueryFilter[]): string {
 			filter.operator === 'isNull' ||
 			filter.operator === 'isNotNull'
 		) {
-			return normalizeWhere(`${filter.column} ${op}`);
+			return `${filter.column} ${op}`;
 		}
-		return normalizeWhere(`${filter.column} ${op} ${formatWhereValue(filter.value as QueryValue)}`);
+		return `${filter.column} ${op} ${formatWhereValue(filter.value as QueryValue)}`;
 	}).join(' AND ');
 }
 
 function havingToWhere(filters: QueryHaving[]): string {
 	return filters.map((filter) => {
 		const op = filterOperatorToWhere(filter.operator);
-		return normalizeWhere(`${filter.column} ${op} ${formatWhereValue(filter.value)}`);
+		return `${filter.column} ${op} ${formatWhereValue(filter.value)}`;
 	}).join(' AND ');
 }
 
@@ -961,7 +955,12 @@ function filterOperatorToWhere(operator: FilterOperator): string {
 
 function formatWhereValue(value: QueryValue): string {
 	if (value === null) return '';
-	return String(value);
+	if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+	// Single-quote string values (escaping \ and ') so values containing spaces,
+	// SQL keywords, quotes, or newlines survive the engine's WHERE tokenizer
+	// instead of being split into bogus extra tokens.
+	const escaped = String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+	return `'${escaped}'`;
 }
 
 export function createProjectClient(options: LuxProjectOptions): LuxProjectClient {

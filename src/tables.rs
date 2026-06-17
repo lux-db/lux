@@ -2458,6 +2458,83 @@ pub fn table_count(
     store.zcard(ikey.as_bytes(), now)
 }
 
+/// Count rows matching a bare WHERE `filter` (e.g. a resolved row-scoped read
+/// grant like `owner = abc123`). An empty filter counts the whole table. Used so
+/// `/count` respects a row-scoped grant instead of refusing it.
+pub fn table_count_filtered(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    filter: &str,
+    now: Instant,
+) -> Result<i64, String> {
+    if filter.trim().is_empty() {
+        return table_count(store, cache, table, now);
+    }
+    let mut toks: Vec<String> = vec![
+        "COUNT(*)".to_string(),
+        "FROM".to_string(),
+        table.to_string(),
+        "WHERE".to_string(),
+    ];
+    toks.extend(filter.split_whitespace().map(ToString::to_string));
+    let refs: Vec<&str> = toks.iter().map(|s| s.as_str()).collect();
+    let plan = parse_select(&refs)?;
+    match table_select(store, cache, &plan, now)? {
+        SelectResult::Aggregate(row) => row
+            .iter()
+            .find_map(|(_, v)| v.parse::<i64>().ok())
+            .ok_or_else(|| "ERR count failed".to_string()),
+        SelectResult::Rows(rows) => Ok(rows.len() as i64),
+    }
+}
+
+/// Fetch a row by primary key, but only when it also satisfies `filter` (a
+/// resolved row-scoped read grant). `Ok(None)` means the row is absent or out of
+/// scope, so the caller can 404 without leaking that it exists.
+pub fn table_get_filtered(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    id: i64,
+    filter: &str,
+    now: Instant,
+) -> Result<Option<Vec<(String, String)>>, String> {
+    // No filter (operator / unconditional grant): direct PK fetch, no plan.
+    if filter.trim().is_empty() {
+        return match table_get(store, cache, table, id, now) {
+            Ok(row) => Ok(Some(row)),
+            Err(e) if e.contains("not found") => Ok(None),
+            Err(e) => Err(e),
+        };
+    }
+    let schema = load_schema(store, cache, table, now)?;
+    let pk = schema
+        .iter()
+        .find(|f| f.primary_key)
+        .map(|f| f.name.clone())
+        .ok_or_else(|| format!("ERR table '{}' has no primary key", table))?;
+    let mut toks: Vec<String> = vec![
+        "*".to_string(),
+        "FROM".to_string(),
+        table.to_string(),
+        "WHERE".to_string(),
+        pk,
+        "=".to_string(),
+        id.to_string(),
+    ];
+    if !filter.trim().is_empty() {
+        toks.push("AND".to_string());
+        toks.extend(filter.split_whitespace().map(ToString::to_string));
+    }
+    let refs: Vec<&str> = toks.iter().map(|s| s.as_str()).collect();
+    let plan = parse_select(&refs)?;
+    match table_select(store, cache, &plan, now)? {
+        SelectResult::Rows(mut rows) => Ok(rows.drain(..).next()),
+        SelectResult::Aggregate(_) => Ok(None),
+    }
+}
+
 pub fn table_schema(
     store: &Store,
     cache: &SharedSchemaCache,
