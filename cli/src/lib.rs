@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const DEFAULT_API_URL: &str = "https://api.luxdb.dev";
@@ -24,6 +24,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Init,
+    /// Start a local Lux engine in Docker (Supabase-style local dev).
+    Start {
+        #[arg(long, help = "Recreate from a fresh data volume (drops local data)")]
+        fresh: bool,
+    },
+    /// Stop the local Lux engine.
+    Stop {
+        #[arg(long, help = "Also delete the local data volume (fresh DB next start)")]
+        clear: bool,
+    },
     Login,
     Logout,
     Link {
@@ -32,8 +42,14 @@ enum Commands {
     },
     Projects,
     Status {
-        #[arg(help = "Project name or ID")]
+        #[arg(help = "Project name or ID (omit for the local engine)")]
         project: Option<String>,
+        #[arg(
+            short = 'o',
+            long,
+            help = "Output format: env (prints LUX_* env lines for the local engine)"
+        )]
+        output: Option<String>,
     },
     Exec {
         #[arg(help = "Project name, ID, or connection URL")]
@@ -225,6 +241,291 @@ struct Config {
 struct LocalConfig {
     project_id: Option<String>,
     project_name: Option<String>,
+    /// Optional host port overrides for `lux start` (engine listens on 6379/8080
+    /// inside the container; these map to the host).
+    local_http_port: Option<u16>,
+    local_resp_port: Option<u16>,
+}
+
+/// Pinned engine image `lux start` pulls. Bump alongside engine releases.
+const LOCAL_ENGINE_IMAGE: &str = "ghcr.io/lux-db/lux:0.20.0";
+const LOCAL_CONTAINER: &str = "lux-local";
+const LOCAL_VOLUME: &str = "lux-local-data";
+const DEFAULT_HTTP_PORT: u16 = 8080;
+const DEFAULT_RESP_PORT: u16 = 6379;
+
+/// Persisted local-dev credentials + runtime knobs for the Docker engine. Lives
+/// in the gitignored `lux/.lux-local.json` and is reused across restarts so keys
+/// and data stay stable. `password` is intentionally equal to `secret_key`: the
+/// engine treats a Bearer == password as the operator (full access), which is
+/// exactly how the prod gateway maps a secret key. So a secret-key SDK client
+/// gets operator access locally, while a publishable-key client must sign in
+/// (JWT -> grant-enforced user), mirroring production.
+#[derive(Serialize, Deserialize)]
+struct LocalState {
+    password: String,
+    publishable_key: String,
+    secret_key: String,
+    http_port: u16,
+    resp_port: u16,
+    container: String,
+    volume: String,
+    image: String,
+}
+
+fn local_state_path() -> PathBuf {
+    PathBuf::from("lux").join(".lux-local.json")
+}
+
+fn load_local_state() -> Option<LocalState> {
+    let data = std::fs::read_to_string(local_state_path()).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn save_local_state(state: &LocalState) {
+    let path = local_state_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let data = serde_json::to_string_pretty(state).unwrap();
+    std::fs::write(path, data).unwrap_or_else(|e| {
+        eprintln!("{} {e}", "Failed to write lux/.lux-local.json:".red());
+        std::process::exit(1);
+    });
+}
+
+/// Hex-encode `bytes` of OS randomness. Local-dev keys don't need to be
+/// cryptographic, but should be unguessable; `/dev/urandom` avoids a new crate
+/// dependency (the CLI only targets unix).
+fn random_hex(bytes: usize) -> String {
+    use std::io::Read;
+    let mut buf = vec![0u8; bytes];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_err()
+    {
+        // Fallback: derive from a per-process/time hash. Good enough for a local
+        // dev credential if /dev/urandom is somehow unavailable.
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut h);
+        std::time::SystemTime::now().hash(&mut h);
+        let seed = h.finish().to_le_bytes();
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = seed[i % seed.len()] ^ (i as u8);
+        }
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Load the persisted local state, generating + saving fresh creds on first use.
+fn ensure_local_state() -> LocalState {
+    if let Some(state) = load_local_state() {
+        return state;
+    }
+    let local = load_local_config();
+    let state = LocalState {
+        password: format!("lux_sec_local_{}", random_hex(24)),
+        publishable_key: format!("lux_pub_local_{}", random_hex(24)),
+        secret_key: String::new(), // filled below to equal password
+        http_port: local
+            .as_ref()
+            .and_then(|c| c.local_http_port)
+            .unwrap_or(DEFAULT_HTTP_PORT),
+        resp_port: local
+            .as_ref()
+            .and_then(|c| c.local_resp_port)
+            .unwrap_or(DEFAULT_RESP_PORT),
+        container: LOCAL_CONTAINER.to_string(),
+        volume: LOCAL_VOLUME.to_string(),
+        image: LOCAL_ENGINE_IMAGE.to_string(),
+    };
+    // secret_key == password: the operator credential and the SDK secret key are
+    // the same value locally (see LocalState doc comment).
+    let state = LocalState {
+        secret_key: state.password.clone(),
+        ..state
+    };
+    save_local_state(&state);
+    state
+}
+
+impl LocalState {
+    fn lux_url(&self) -> String {
+        format!("http://localhost:{}", self.http_port)
+    }
+    fn direct_url(&self) -> String {
+        format!("lux://:{}@localhost:{}", self.password, self.resp_port)
+    }
+    /// The LUX_* lines for `.env.local` / `lux status -o env`.
+    fn env_lines(&self) -> Vec<String> {
+        vec![
+            format!("LUX_URL={}", self.lux_url()),
+            format!("LUX_DIRECT_URL={}", self.direct_url()),
+            format!("LUX_PUBLISHABLE_KEY={}", self.publishable_key),
+            format!("LUX_SECRET_KEY={}", self.secret_key),
+        ]
+    }
+}
+
+/// Run a `docker` subcommand, capturing stdout. Returns Err on spawn failure or
+/// a non-zero exit (with stderr).
+fn docker_output(args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("docker")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run docker: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Preflight: Docker installed and the daemon reachable.
+fn docker_preflight() -> Result<(), String> {
+    docker_output(&["info"]).map(|_| ()).map_err(|_| {
+        "Docker is not available. Install Docker Desktop and make sure it is running.".to_string()
+    })
+}
+
+/// Container state: "running", "exited", "created", ... or None if absent.
+fn docker_container_state(name: &str) -> Option<String> {
+    docker_output(&["inspect", "-f", "{{.State.Status}}", name]).ok()
+}
+
+fn docker_volume_exists(name: &str) -> bool {
+    docker_output(&["volume", "inspect", name]).is_ok()
+}
+
+/// Merge `entries` into existing `.gitignore` content, appending only the ones
+/// not already present. Returns `None` when nothing needs adding (so the caller
+/// can skip the write). Pure (no IO) so it's unit-testable.
+fn gitignore_merge(existing: &str, entries: &[&str]) -> Option<String> {
+    let present: std::collections::HashSet<&str> = existing.lines().map(|l| l.trim()).collect();
+    let missing: Vec<&str> = entries
+        .iter()
+        .copied()
+        .filter(|e| !present.contains(e))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let mut data = existing.to_string();
+    if !data.is_empty() && !data.ends_with('\n') {
+        data.push('\n');
+    }
+    for e in missing {
+        data.push_str(e);
+        data.push('\n');
+    }
+    Some(data)
+}
+
+/// Append missing entries to `.gitignore` (creating it if absent). Idempotent.
+fn ensure_gitignore(entries: &[&str]) {
+    let path = PathBuf::from(".gitignore");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let Some(data) = gitignore_merge(&existing, entries) else {
+        return;
+    };
+    std::fs::write(&path, data).ok();
+}
+
+fn write_env_local(state: &LocalState) {
+    let mut lines = state.env_lines();
+    lines.push(String::new());
+    std::fs::write(".env.local", lines.join("\n")).unwrap_or_else(|e| {
+        eprintln!("{} {e}", "Failed to write .env.local:".red());
+    });
+}
+
+fn print_connection_block(state: &LocalState) {
+    println!();
+    println!("{}", "  Local Lux engine".bold());
+    println!("  {}  {}", "LUX_URL          ".dimmed(), state.lux_url());
+    println!("  {}  {}", "LUX_DIRECT_URL   ".dimmed(), state.direct_url());
+    println!(
+        "  {}  {}",
+        "LUX_PUBLISHABLE_KEY".dimmed(),
+        state.publishable_key
+    );
+    println!("  {}  {}", "LUX_SECRET_KEY   ".dimmed(), state.secret_key);
+    println!("  {}  {}", "Data volume      ".dimmed(), state.volume);
+    println!();
+    println!(
+        "  Written to {}. Point the SDK at {}.",
+        ".env.local".cyan(),
+        "LUX_URL".cyan()
+    );
+}
+
+/// Poll the local RESP port until the engine answers an authed PING (or timeout).
+fn wait_for_local_ready(state: &LocalState) -> bool {
+    for _ in 0..40 {
+        if let Ok(mut conn) = DirectConn::connect("localhost", state.resp_port, &state.password) {
+            if conn.exec("PING").is_ok() {
+                return true;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    false
+}
+
+/// Apply pending migrations from `dir` against a local Direct target. Returns the
+/// count applied. Exits the process on a migration error (mirrors `migrate run`).
+async fn apply_pending_migrations(target: &mut MigrateTarget, dir: &Path) -> usize {
+    ensure_migrations_table(target).await;
+    let applied = get_applied_migrations(target).await;
+    let local = get_local_migrations(dir);
+    let pending: Vec<_> = local
+        .iter()
+        .filter(|(name, _)| !applied.contains(name))
+        .collect();
+    if pending.is_empty() {
+        return 0;
+    }
+    println!(
+        "{} {} pending migration(s)",
+        "Running".bold(),
+        pending.len()
+    );
+    for (filename, content) in &pending {
+        print!("  {} {}...", "Applying".dimmed(), filename);
+        std::io::stdout().flush().ok();
+        let commands = parse_migration_commands(content).unwrap_or_else(|e| {
+            println!(" {}", "FAILED".red());
+            eprintln!("    {} {}", "Error:".red(), e);
+            std::process::exit(1);
+        });
+        for command in &commands {
+            if let Err(e) = target.exec_args(command).await {
+                println!(" {}", "FAILED".red());
+                eprintln!("    {} {}", "Command:".dimmed(), command.join(" "));
+                eprintln!("    {} {}", "Error:".red(), e);
+                std::process::exit(1);
+            }
+        }
+        let record_cmd = vec![
+            "TINSERT".to_string(),
+            "__migrations".to_string(),
+            "filename".to_string(),
+            filename.to_string(),
+            "checksum".to_string(),
+            simple_hash(content),
+            "applied_at".to_string(),
+            chrono::Utc::now().timestamp().to_string(),
+            "body".to_string(),
+            content.to_string(),
+        ];
+        if let Err(e) = target.exec_args(&record_cmd).await {
+            println!(" {}", "FAILED".red());
+            eprintln!("    {} Failed to record migration: {}", "Error:".red(), e);
+            std::process::exit(1);
+        }
+        println!(" {}", "OK".green());
+    }
+    pending.len()
 }
 
 #[derive(Deserialize)]
@@ -333,6 +634,8 @@ fn load_local_config() -> Option<LocalConfig> {
         match key.trim() {
             "project_id" => config.project_id = parse_config_string(value),
             "project_name" => config.project_name = parse_config_string(value),
+            "local_http_port" => config.local_http_port = parse_config_u16(value),
+            "local_resp_port" => config.local_resp_port = parse_config_u16(value),
             _ => {}
         }
     }
@@ -345,15 +648,30 @@ fn save_local_config(config: &LocalConfig) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let data = format!(
+    let mut data = format!(
         "project_id = \"{}\"\nproject_name = \"{}\"\n",
         escape_config_string(config.project_id.as_deref().unwrap_or("")),
         escape_config_string(config.project_name.as_deref().unwrap_or(""))
     );
+    if let Some(p) = config.local_http_port {
+        data.push_str(&format!("local_http_port = {p}\n"));
+    }
+    if let Some(p) = config.local_resp_port {
+        data.push_str(&format!("local_resp_port = {p}\n"));
+    }
     std::fs::write(path, data).unwrap_or_else(|e| {
         eprintln!("{} {e}", "Failed to write lux/config.toml:".red());
         std::process::exit(1);
     });
+}
+
+fn parse_config_u16(value: &str) -> Option<u16> {
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value);
+    value.trim().parse().ok()
 }
 
 fn parse_config_string(value: &str) -> Option<String> {
@@ -535,9 +853,161 @@ pub async fn run() {
                 });
             }
 
+            ensure_gitignore(&[".env.local", "lux/.lux-local.json"]);
+
             println!("{}", "Initialized Lux project.".green());
             println!("{} {}", "Migrations:".bold(), migrations_dir.display());
             println!("{} {}", "Config:".bold(), config_path.display());
+            println!();
+            println!("Next: {} to boot a local engine.", "lux start".cyan());
+        }
+
+        Commands::Start { fresh } => {
+            if let Err(e) = docker_preflight() {
+                eprintln!("{} {e}", "Error:".red());
+                std::process::exit(1);
+            }
+
+            let state = ensure_local_state();
+            ensure_gitignore(&[".env.local", "lux/.lux-local.json"]);
+
+            // Already running? Just reprint the connection block.
+            if docker_container_state(&state.container).as_deref() == Some("running") && !fresh {
+                println!("{}", "Local Lux engine already running.".green());
+                write_env_local(&state);
+                print_connection_block(&state);
+                return;
+            }
+
+            // Remove any stale container (stopped, or `--fresh`).
+            if docker_container_state(&state.container).is_some() {
+                let _ = docker_output(&["rm", "-f", &state.container]);
+            }
+            let volume_existed = docker_volume_exists(&state.volume);
+            if fresh && volume_existed {
+                let _ = docker_output(&["volume", "rm", &state.volume]);
+            }
+            let fresh_volume = fresh || !volume_existed;
+
+            println!("{} {}", "Pulling".bold(), state.image.dimmed());
+            // Pull is best-effort: `docker run` will pull too, but doing it up
+            // front gives clearer progress/errors.
+            let _ = std::process::Command::new("docker")
+                .args(["pull", &state.image])
+                .status();
+
+            let resp_map = format!("{}:6379", state.resp_port);
+            let http_map = format!("{}:8080", state.http_port);
+            let vol_map = format!("{}:/data", state.volume);
+            let issuer = format!(
+                "LUX_AUTH_ISSUER=http://localhost:{}/auth/v1",
+                state.http_port
+            );
+            let e_pass = format!("LUX_PASSWORD={}", state.password);
+            let e_pub = format!("LUX_AUTH_PUBLISHABLE_KEY={}", state.publishable_key);
+            let e_sec = format!("LUX_AUTH_SECRET_KEY={}", state.secret_key);
+
+            let run_args: Vec<&str> = vec![
+                "run",
+                "-d",
+                "--name",
+                &state.container,
+                "-p",
+                &resp_map,
+                "-p",
+                &http_map,
+                "-v",
+                &vol_map,
+                "-e",
+                "LUX_AUTH_ENABLED=1",
+                "-e",
+                &e_pass,
+                "-e",
+                &e_pub,
+                "-e",
+                &e_sec,
+                "-e",
+                "LUX_PORT=6379",
+                "-e",
+                "LUX_HTTP_PORT=8080",
+                "-e",
+                "LUX_BIND_HOST=0.0.0.0",
+                "-e",
+                "LUX_DATA_DIR=/data",
+                "-e",
+                &issuer,
+                "--restart",
+                "unless-stopped",
+                &state.image,
+            ];
+            if let Err(e) = docker_output(&run_args) {
+                eprintln!("{} Failed to start container: {e}", "Error:".red());
+                std::process::exit(1);
+            }
+
+            print!("{}", "Waiting for engine...".dimmed());
+            std::io::stdout().flush().ok();
+            if !wait_for_local_ready(&state) {
+                println!(" {}", "TIMEOUT".red());
+                eprintln!(
+                    "{} Engine did not become ready. Check {}.",
+                    "Error:".red(),
+                    format!("docker logs {}", state.container).cyan()
+                );
+                std::process::exit(1);
+            }
+            println!(" {}", "ready".green());
+
+            // Apply migrations (idempotent). Seed only on a fresh volume, since
+            // seed scripts generally aren't idempotent.
+            let conn = match DirectConn::connect("localhost", state.resp_port, &state.password) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{} {e}", "Error:".red());
+                    std::process::exit(1);
+                }
+            };
+            let mut target = MigrateTarget::Direct(Box::new(conn));
+            let migrations_dir = PathBuf::from("lux/migrations");
+            if migrations_dir.exists() {
+                let n = apply_pending_migrations(&mut target, &migrations_dir).await;
+                if n > 0 {
+                    println!("{} Applied {n} migration(s).", "Done.".green());
+                }
+            }
+            let seed_path = PathBuf::from("lux/seed.lux");
+            if fresh_volume
+                && seed_path.exists()
+                && !std::fs::read_to_string(&seed_path)
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            {
+                run_command_file(&mut target, &seed_path, "Seed").await;
+            }
+
+            write_env_local(&state);
+            print_connection_block(&state);
+        }
+
+        Commands::Stop { clear } => {
+            let state = load_local_state().unwrap_or_else(|| {
+                eprintln!(
+                    "{} No local engine state found. Nothing to stop.",
+                    "Error:".red()
+                );
+                std::process::exit(1);
+            });
+            if docker_container_state(&state.container).is_some() {
+                let _ = docker_output(&["rm", "-f", &state.container]);
+                println!("{} Stopped local Lux engine.", "Done.".green());
+            } else {
+                println!("{}", "Local Lux engine is not running.".yellow());
+            }
+            if clear && docker_volume_exists(&state.volume) {
+                let _ = docker_output(&["volume", "rm", &state.volume]);
+                println!("{} Cleared data volume {}.", "Done.".green(), state.volume);
+            }
         }
 
         Commands::Login => {
@@ -593,9 +1063,12 @@ pub async fn run() {
         Commands::Link { project } => {
             let (client, api_url, token) = get_client(&api_url_override);
             let inst = find_project(&client, &api_url, &token, &project).await;
+            let existing = load_local_config().unwrap_or_default();
             save_local_config(&LocalConfig {
                 project_id: Some(inst.id.clone()),
                 project_name: Some(inst.name.clone()),
+                local_http_port: existing.local_http_port,
+                local_resp_port: existing.local_resp_port,
             });
             println!("{} Linked to project '{}'", "Done.".green(), inst.name);
             println!("{} {}", "ID:".bold(), inst.id);
@@ -647,7 +1120,43 @@ pub async fn run() {
             }
         }
 
-        Commands::Status { project } => {
+        Commands::Status { project, output } => {
+            // No project arg -> report on the local engine (Supabase parity).
+            if project.is_none() {
+                let Some(state) = load_local_state() else {
+                    eprintln!(
+                        "{} No project specified and no local engine. Run {} or {}.",
+                        "Error:".red(),
+                        "lux start".bold(),
+                        "lux status <project>".bold()
+                    );
+                    std::process::exit(1);
+                };
+                // `-o env` prints just the env lines, for `eval $(lux status -o env)`.
+                if output.as_deref() == Some("env") {
+                    for line in state.env_lines() {
+                        println!("{line}");
+                    }
+                    return;
+                }
+                let running =
+                    docker_container_state(&state.container).as_deref() == Some("running");
+                let status = if running {
+                    "running".green().to_string()
+                } else {
+                    "stopped".yellow().to_string()
+                };
+                println!("{} {status}", "Local engine:".bold());
+                println!("{} {}", "Image:".bold(), state.image.dimmed());
+                println!("{} {}", "LUX_URL:".bold(), state.lux_url());
+                println!("{} {}", "Direct:".bold(), state.direct_url());
+                println!("{} {}", "Data volume:".bold(), state.volume);
+                if !running {
+                    println!("\nRun {} to boot it.", "lux start".cyan());
+                }
+                return;
+            }
+
             let (client, api_url, token) = get_client(&api_url_override);
             let project = require_project_arg(project.as_deref());
             let inst = find_project(&client, &api_url, &token, &project).await;
@@ -2227,10 +2736,16 @@ async fn resolve_migrate_target(
     password: Option<&str>,
     api_url_override: &Option<String>,
 ) -> MigrateTarget {
+    // For local targets, fall back to the password persisted by `lux start`
+    // (fixes the NOAUTH that bit Jack when no password was passed).
+    let local_state = load_local_state();
+    let local_pw = || local_state.as_ref().map(|s| s.password.clone());
+
     if host.is_some() || port.is_some() {
         let h = host.unwrap_or("localhost");
-        let p = port.unwrap_or(6379);
-        let pw = password.unwrap_or("");
+        let p = port.unwrap_or(DEFAULT_RESP_PORT);
+        let owned_pw = password.map(str::to_string).or_else(local_pw);
+        let pw = owned_pw.as_deref().unwrap_or("");
         match DirectConn::connect(h, p, pw) {
             Ok(conn) => return MigrateTarget::Direct(Box::new(conn)),
             Err(e) => {
@@ -2244,8 +2759,15 @@ async fn resolve_migrate_target(
     let project = match linked.as_deref() {
         Some(p) if !p.is_empty() => p,
         _ => {
-            // No project and no host/port: default to localhost
-            match DirectConn::connect("localhost", 6379, password.unwrap_or("")) {
+            // No project and no host/port: default to the local engine, using
+            // its persisted port + password when `lux start` has run.
+            let local_port = local_state
+                .as_ref()
+                .map(|s| s.resp_port)
+                .unwrap_or(DEFAULT_RESP_PORT);
+            let owned_pw = password.map(str::to_string).or_else(local_pw);
+            let pw = owned_pw.as_deref().unwrap_or("");
+            match DirectConn::connect("localhost", local_port, pw) {
                 Ok(conn) => return MigrateTarget::Direct(Box::new(conn)),
                 Err(e) => {
                     eprintln!(
@@ -2440,7 +2962,7 @@ async fn get_remote_migrations(target: &mut MigrateTarget) -> Vec<(String, Strin
     out
 }
 
-fn get_local_migrations(dir: &PathBuf) -> Vec<(String, String)> {
+fn get_local_migrations(dir: &Path) -> Vec<(String, String)> {
     if !dir.exists() {
         return vec![];
     }
@@ -2730,5 +3252,138 @@ mod tests {
     fn simple_hash_is_stable() {
         assert_eq!(simple_hash("PING\n"), simple_hash("PING\n"));
         assert_ne!(simple_hash("PING\n"), simple_hash("PONG\n"));
+    }
+
+    // ── Local engine (lux start/stop/status) ──
+
+    fn sample_state() -> LocalState {
+        LocalState {
+            password: "lux_sec_local_deadbeef".to_string(),
+            publishable_key: "lux_pub_local_cafef00d".to_string(),
+            secret_key: "lux_sec_local_deadbeef".to_string(),
+            http_port: 8080,
+            resp_port: 6379,
+            container: LOCAL_CONTAINER.to_string(),
+            volume: LOCAL_VOLUME.to_string(),
+            image: LOCAL_ENGINE_IMAGE.to_string(),
+        }
+    }
+
+    #[test]
+    fn local_state_urls_and_env_lines() {
+        let s = sample_state();
+        assert_eq!(s.lux_url(), "http://localhost:8080");
+        assert_eq!(
+            s.direct_url(),
+            "lux://:lux_sec_local_deadbeef@localhost:6379"
+        );
+        let env = s.env_lines();
+        assert_eq!(env[0], "LUX_URL=http://localhost:8080");
+        assert_eq!(
+            env[1],
+            "LUX_DIRECT_URL=lux://:lux_sec_local_deadbeef@localhost:6379"
+        );
+        assert_eq!(env[2], "LUX_PUBLISHABLE_KEY=lux_pub_local_cafef00d");
+        assert_eq!(env[3], "LUX_SECRET_KEY=lux_sec_local_deadbeef");
+    }
+
+    #[test]
+    fn local_state_round_trips_through_json() {
+        let s = sample_state();
+        let json = serde_json::to_string(&s).unwrap();
+        let back: LocalState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.password, s.password);
+        assert_eq!(back.http_port, s.http_port);
+        assert_eq!(back.resp_port, s.resp_port);
+        assert_eq!(back.image, s.image);
+    }
+
+    #[test]
+    fn secret_key_equals_password_for_operator_mapping() {
+        // The operator credential (LUX_PASSWORD) must equal the SDK secret key so
+        // a secret-key Bearer is treated as operator by the engine (prod parity).
+        let s = sample_state();
+        assert_eq!(s.secret_key, s.password);
+        // Publishable key is distinct (deny-by-default until the user signs in).
+        assert_ne!(s.publishable_key, s.secret_key);
+    }
+
+    #[test]
+    fn gitignore_merge_appends_only_missing() {
+        // Empty file -> both entries added.
+        let merged = gitignore_merge("", &[".env.local", "lux/.lux-local.json"]).unwrap();
+        assert!(merged.contains(".env.local"));
+        assert!(merged.contains("lux/.lux-local.json"));
+        assert!(merged.ends_with('\n'));
+
+        // One already present -> only the other is appended, no dupes.
+        let merged = gitignore_merge(
+            "node_modules\n.env.local\n",
+            &[".env.local", "lux/.lux-local.json"],
+        )
+        .unwrap();
+        assert_eq!(merged.matches(".env.local").count(), 1);
+        assert!(merged.contains("lux/.lux-local.json"));
+
+        // All present -> None (caller skips the write).
+        assert!(gitignore_merge(
+            ".env.local\nlux/.lux-local.json\n",
+            &[".env.local", "lux/.lux-local.json"]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn gitignore_merge_inserts_newline_before_appending() {
+        // Existing content without a trailing newline must not get glued onto.
+        let merged = gitignore_merge("dist", &[".env.local"]).unwrap();
+        assert_eq!(merged, "dist\n.env.local\n");
+    }
+
+    #[test]
+    fn random_hex_has_expected_length_and_charset() {
+        let h = random_hex(16);
+        assert_eq!(h.len(), 32); // 2 hex chars per byte
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        // Two draws should differ (astronomically unlikely to collide).
+        assert_ne!(random_hex(16), random_hex(16));
+    }
+
+    #[test]
+    fn parses_config_port_override() {
+        assert_eq!(parse_config_u16("9000"), Some(9000));
+        assert_eq!(parse_config_u16(" \"7777\" "), Some(7777));
+        assert_eq!(parse_config_u16("notaport"), None);
+    }
+
+    #[test]
+    fn local_config_round_trips_port_overrides() {
+        let cfg = LocalConfig {
+            project_id: Some("p".to_string()),
+            project_name: Some("n".to_string()),
+            local_http_port: Some(9090),
+            local_resp_port: Some(6400),
+        };
+        // Re-parse the lines save_local_config would emit.
+        let serialized = format!(
+            "project_id = \"{}\"\nproject_name = \"{}\"\nlocal_http_port = {}\nlocal_resp_port = {}\n",
+            cfg.project_id.as_deref().unwrap(),
+            cfg.project_name.as_deref().unwrap(),
+            cfg.local_http_port.unwrap(),
+            cfg.local_resp_port.unwrap(),
+        );
+        let mut parsed = LocalConfig::default();
+        for line in serialized.lines() {
+            let (k, v) = line.split_once('=').unwrap();
+            match k.trim() {
+                "project_id" => parsed.project_id = parse_config_string(v),
+                "project_name" => parsed.project_name = parse_config_string(v),
+                "local_http_port" => parsed.local_http_port = parse_config_u16(v),
+                "local_resp_port" => parsed.local_resp_port = parse_config_u16(v),
+                _ => {}
+            }
+        }
+        assert_eq!(parsed.local_http_port, Some(9090));
+        assert_eq!(parsed.local_resp_port, Some(6400));
     }
 }
