@@ -40,6 +40,8 @@ type FilterOperator =
 	| 'notIn'
 	| 'isValid'
 	| 'isNotValid'
+	| 'isNull'
+	| 'isNotNull'
 	| 'contains';
 type ProjectRowInput<T extends object> = Partial<T> & Record<string, QueryValue>;
 type ProjectSelectSingle<TResult> = TResult extends readonly (infer Row)[] ? Row : TResult;
@@ -441,7 +443,17 @@ abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenabl
 	}
 
 	is(column: string, value: QueryValue): TSelf {
+		// `.is(col, null)` is the Supabase-style spelling of an IS NULL check.
+		if (value === null) return this.addFilter(column, 'isNull', '');
 		return this.addFilter(column, 'is', value);
+	}
+
+	isNull(column: string): TSelf {
+		return this.addFilter(column, 'isNull', '');
+	}
+
+	isNotNull(column: string): TSelf {
+		return this.addFilter(column, 'isNotNull', '');
 	}
 
 	in(column: string, values: QueryValue[]): TSelf {
@@ -872,7 +884,12 @@ function filtersToWhere(filters: QueryFilter[]): string {
 				`${filter.column} ${op} ( ${values.map(formatWhereValue).join(' ')} )`,
 			);
 		}
-		if (filter.operator === 'isValid' || filter.operator === 'isNotValid') {
+		if (
+			filter.operator === 'isValid' ||
+			filter.operator === 'isNotValid' ||
+			filter.operator === 'isNull' ||
+			filter.operator === 'isNotNull'
+		) {
 			return normalizeWhere(`${filter.column} ${op}`);
 		}
 		return normalizeWhere(`${filter.column} ${op} ${formatWhereValue(filter.value as QueryValue)}`);
@@ -909,6 +926,10 @@ function filterOperatorToWhere(operator: FilterOperator): string {
 			return 'IS VALID';
 		case 'isNotValid':
 			return 'IS NOT VALID';
+		case 'isNull':
+			return 'IS NULL';
+		case 'isNotNull':
+			return 'IS NOT NULL';
 		case 'contains':
 			return 'CONTAINS';
 	}

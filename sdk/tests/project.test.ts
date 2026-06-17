@@ -129,6 +129,9 @@ describe('Lux project client', () => {
 			.leftJoin('teams', 't', 'team_id', 'id')
 			.group('team_id')
 			.having('count', 'gt', 1);
+		await client.table('tasks').select().isNull('deleted_at');
+		await client.table('tasks').select().is('deleted_at', null);
+		await client.table('tasks').select().isNotNull('deleted_at');
 
 		expect(seen).toEqual([
 			'http://localhost:3957/v1/project/tables/messages?where=id+%3D+1&limit=10',
@@ -136,6 +139,9 @@ describe('Lux project client', () => {
 			'http://localhost:3957/v1/project/tables/messages?where=age+%3E+25&order=age+DESC&limit=10&offset=5',
 			'http://localhost:3957/v1/project/tables/messages?near_field=embedding&near_vector=%5B1%2C0%5D&near_k=5&near_threshold=0.8&select=id%2Cbody%2C_similarity',
 			'http://localhost:3957/v1/project/tables/members?join=teams%3At%3Aleft%3Aon%28team_id%3Did%29&group=team_id&having=count+%3E+1&select=team_id%2CCOUNT%28*%29+AS+count',
+			'http://localhost:3957/v1/project/tables/tasks?where=deleted_at+IS+NULL',
+			'http://localhost:3957/v1/project/tables/tasks?where=deleted_at+IS+NULL',
+			'http://localhost:3957/v1/project/tables/tasks?where=deleted_at+IS+NOT+NULL',
 		]);
 	});
 
