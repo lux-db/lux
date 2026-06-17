@@ -905,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "lux"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "argon2",
  "base64",
