@@ -7,6 +7,56 @@ use crate::tables::{self, SelectResult, SharedSchemaCache};
 
 use super::{arg_str, CmdResult};
 
+/// Split a trailing `RETURNING * | col [col ...]` (commas optional) off a
+/// command. Returns the args before RETURNING and the projection, where a
+/// projection of `["*"]` (or an empty list) means "all columns".
+fn split_returning<'a>(args: &'a [&'a [u8]]) -> (&'a [&'a [u8]], Option<Vec<String>>) {
+    let Some(idx) = args
+        .iter()
+        .position(|a| arg_str(a).eq_ignore_ascii_case("RETURNING"))
+    else {
+        return (args, None);
+    };
+    let cols: Vec<String> = args[idx + 1..]
+        .iter()
+        .flat_map(|a| {
+            arg_str(a)
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    let cols = if cols.is_empty() || cols.iter().any(|c| c == "*") {
+        vec!["*".to_string()]
+    } else {
+        cols
+    };
+    (&args[..idx], Some(cols))
+}
+
+/// Write rows (optionally projected to `projection`) as a RESP array-of-rows,
+/// each row a flat array of field/value pairs, matching TSELECT's shape.
+fn write_rows(out: &mut BytesMut, rows: &[Vec<(String, String)>], projection: &[String]) {
+    let all = matches!(projection, [c] if c == "*");
+    resp::write_array_header(out, rows.len());
+    for row in rows {
+        let fields: Vec<&(String, String)> = if all {
+            row.iter().collect()
+        } else {
+            projection
+                .iter()
+                .filter_map(|c| row.iter().find(|(k, _)| k == c))
+                .collect()
+        };
+        resp::write_array_header(out, fields.len() * 2);
+        for (k, v) in fields {
+            resp::write_bulk(out, k);
+            resp::write_bulk(out, v);
+        }
+    }
+}
+
 pub fn cmd_tcreate(
     args: &[&[u8]],
     store: &Store,
@@ -42,6 +92,7 @@ pub fn cmd_tinsert(
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
+    let (args, returning) = split_returning(args);
     // Allow `TINSERT table` with no field pairs: a row whose columns are all
     // auto-generated (uuid PK, DEFAULT now(), etc.) is fully valid.
     if args.len() < 2 || !(args.len() - 2).is_multiple_of(2) {
@@ -59,9 +110,16 @@ pub fn cmd_tinsert(
         field_values.push((arg_str(args[i]), arg_str(args[i + 1])));
         i += 2;
     }
-    match tables::table_insert(store, cache, table, &field_values, now) {
-        Ok(id) => resp::write_integer(out, id),
-        Err(e) => resp::write_error(out, &e),
+    match returning {
+        Some(proj) => match tables::table_insert_returning(store, cache, table, &field_values, now)
+        {
+            Ok(row) => write_rows(out, &[row], &proj),
+            Err(e) => resp::write_error(out, &e),
+        },
+        None => match tables::table_insert(store, cache, table, &field_values, now) {
+            Ok(id) => resp::write_integer(out, id),
+            Err(e) => resp::write_error(out, &e),
+        },
     }
     CmdResult::Written
 }
@@ -73,8 +131,9 @@ pub fn cmd_tupdate(
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
-    // TUPDATE <table> SET <col> <val> [<col> <val> ...] WHERE <conditions>
+    // TUPDATE <table> SET <col> <val> [<col> <val> ...] WHERE <conditions> [RETURNING ...]
     // Minimum: TUPDATE users SET name John WHERE id = 1
+    let (args, returning) = split_returning(args);
     if args.len() < 7 {
         resp::write_error(
             out,
@@ -130,9 +189,24 @@ pub fn cmd_tupdate(
     // Parse WHERE clause
     let where_args: Vec<&str> = args[where_pos + 1..].iter().map(|a| arg_str(a)).collect();
 
-    match tables::table_update_where(store, cache, table, &field_values, &where_args, now) {
-        Ok(count) => resp::write_integer(out, count),
-        Err(e) => resp::write_error(out, &e),
+    match returning {
+        Some(proj) => match tables::table_update_where_returning(
+            store,
+            cache,
+            table,
+            &field_values,
+            &where_args,
+            now,
+        ) {
+            Ok(rows) => write_rows(out, &rows, &proj),
+            Err(e) => resp::write_error(out, &e),
+        },
+        None => {
+            match tables::table_update_where(store, cache, table, &field_values, &where_args, now) {
+                Ok(count) => resp::write_integer(out, count),
+                Err(e) => resp::write_error(out, &e),
+            }
+        }
     }
     CmdResult::Written
 }
@@ -144,8 +218,9 @@ pub fn cmd_tdelete(
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
-    // TDELETE FROM <table> WHERE <conditions>
+    // TDELETE FROM <table> WHERE <conditions> [RETURNING ...]
     // Minimum: TDELETE FROM users WHERE id = 1
+    let (args, returning) = split_returning(args);
     if args.len() < 6 {
         resp::write_error(out, "ERR usage: TDELETE FROM <table> WHERE <conditions>");
         return CmdResult::Written;
@@ -182,9 +257,17 @@ pub fn cmd_tdelete(
     // Parse WHERE clause
     let where_args: Vec<&str> = args[where_pos + 1..].iter().map(|a| arg_str(a)).collect();
 
-    match tables::table_delete_where(store, cache, table, &where_args, now) {
-        Ok(count) => resp::write_integer(out, count),
-        Err(e) => resp::write_error(out, &e),
+    match returning {
+        Some(proj) => {
+            match tables::table_delete_where_returning(store, cache, table, &where_args, now) {
+                Ok(rows) => write_rows(out, &rows, &proj),
+                Err(e) => resp::write_error(out, &e),
+            }
+        }
+        None => match tables::table_delete_where(store, cache, table, &where_args, now) {
+            Ok(count) => resp::write_integer(out, count),
+            Err(e) => resp::write_error(out, &e),
+        },
     }
     CmdResult::Written
 }

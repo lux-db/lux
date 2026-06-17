@@ -2624,10 +2624,10 @@ fn route_table_insert(
         .collect();
 
     let now = Instant::now();
-    match crate::tables::table_insert(store, cache, table, &field_values, now) {
-        Ok(id) => {
+    match crate::tables::table_insert_returning(store, cache, table, &field_values, now) {
+        Ok(row) => {
             broker.enqueue_key_event(table.as_bytes(), b"TINSERT");
-            ok(format!(r#"{{"result":{}}}"#, id))
+            ok(row_to_json_object(&row))
         }
         Err(e) => (
             400,
@@ -2645,7 +2645,7 @@ fn route_table_update(
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
-    script_engine: &Arc<lua::ScriptEngine>,
+    _script_engine: &Arc<lua::ScriptEngine>,
     auth: &HttpAuthContext,
 ) -> (u16, &'static str, String) {
     // Require where parameter for safety (prevents accidental full table updates)
@@ -2688,18 +2688,24 @@ fn route_table_update(
         }
     };
 
-    // Build TUPDATE command: TUPDATE <table> SET <col> <val> ... WHERE <conditions>
-    let mut args: Vec<String> = vec!["TUPDATE".to_string(), table.to_string(), "SET".to_string()];
-    for (k, v) in obj {
-        args.push(k.clone());
-        match v {
-            serde_json::Value::String(s) => args.push(s.clone()),
-            serde_json::Value::Number(n) => args.push(n.to_string()),
-            serde_json::Value::Bool(b) => args.push(b.to_string()),
-            _ => args.push(v.to_string()),
-        }
-    }
-    args.push("WHERE".to_string());
+    let val_strings: Vec<(String, String)> = obj
+        .iter()
+        .map(|(k, v)| {
+            let val = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Null => String::new(),
+                _ => v.to_string(),
+            };
+            (k.clone(), val)
+        })
+        .collect();
+    let field_values: Vec<(&str, &str)> = val_strings
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
     let where_tokens = match parse_http_where_tokens(where_clause) {
         Ok(tokens) => tokens,
         Err(e) => {
@@ -2710,10 +2716,27 @@ fn route_table_update(
             )
         }
     };
-    args.extend(where_tokens);
+    let where_args: Vec<&str> = where_tokens.iter().map(|s| s.as_str()).collect();
 
-    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_json(store, broker, cache, script_engine, &refs))
+    let now = Instant::now();
+    match crate::tables::table_update_where_returning(
+        store,
+        cache,
+        table,
+        &field_values,
+        &where_args,
+        now,
+    ) {
+        Ok(rows) => {
+            broker.enqueue_key_event(table.as_bytes(), b"TUPDATE");
+            ok(rows_to_json_array(&rows))
+        }
+        Err(e) => (
+            400,
+            "Bad Request",
+            format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+        ),
+    }
 }
 
 fn route_table_delete(
@@ -2760,9 +2783,6 @@ fn route_table_delete(
         return (status, status_text, body);
     }
 
-    // Build TDELETE command: TDELETE FROM <table> WHERE <conditions>
-    let mut args: Vec<String> = vec!["TDELETE".to_string(), "FROM".to_string(), table.to_string()];
-    args.push("WHERE".to_string());
     let where_tokens = match parse_http_where_tokens(where_clause) {
         Ok(tokens) => tokens,
         Err(e) => {
@@ -2773,10 +2793,20 @@ fn route_table_delete(
             )
         }
     };
-    args.extend(where_tokens);
+    let where_args: Vec<&str> = where_tokens.iter().map(|s| s.as_str()).collect();
 
-    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_json(store, broker, cache, script_engine, &refs))
+    let now = Instant::now();
+    match crate::tables::table_delete_where_returning(store, cache, table, &where_args, now) {
+        Ok(rows) => {
+            broker.enqueue_key_event(table.as_bytes(), b"TDELETE");
+            ok(rows_to_json_array(&rows))
+        }
+        Err(e) => (
+            400,
+            "Bad Request",
+            format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+        ),
+    }
 }
 
 // ── Time Series handlers ──
@@ -3072,9 +3102,9 @@ fn select_result_to_json(result: crate::tables::SelectResult) -> String {
 }
 
 /// Serialize a single row (from table_get) as a JSON object.
-fn row_to_json_object(row: &[(String, String)]) -> String {
-    let mut out = String::with_capacity(row.len() * 32);
-    out.push_str(r#"{"result":{"#);
+/// Append a single row as a bare JSON object `{...}` (no `result` wrapper).
+fn push_row_object(out: &mut String, row: &[(String, String)]) {
+    out.push('{');
     let mut first = true;
     for (k, v) in row {
         if !first {
@@ -3082,17 +3112,38 @@ fn row_to_json_object(row: &[(String, String)]) -> String {
         }
         first = false;
         out.push('"');
-        push_escaped(&mut out, k);
+        push_escaped(out, k);
         out.push_str(r#"":"#);
         if looks_numeric(v) || v == "true" || v == "false" {
             out.push_str(v);
         } else {
             out.push('"');
-            push_escaped(&mut out, v);
+            push_escaped(out, v);
             out.push('"');
         }
     }
-    out.push_str("}}");
+    out.push('}');
+}
+
+fn row_to_json_object(row: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(row.len() * 32 + 12);
+    out.push_str(r#"{"result":"#);
+    push_row_object(&mut out, row);
+    out.push('}');
+    out
+}
+
+/// `{"result":[{...},{...}]}` for the rows affected by an insert/update/delete.
+fn rows_to_json_array(rows: &[Vec<(String, String)>]) -> String {
+    let mut out = String::with_capacity(rows.len() * 64 + 12);
+    out.push_str(r#"{"result":["#);
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_row_object(&mut out, row);
+    }
+    out.push_str("]}");
     out
 }
 

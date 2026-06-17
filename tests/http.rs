@@ -1216,8 +1216,8 @@ fn http_tables_constraint_errors() {
         "",
     );
     assert!(
-        resp.contains("error") || resp.contains("0"),
-        "patch to duplicate unique should error or return 0: {resp}"
+        resp.contains("error") || resp.contains(r#""result":[]"#),
+        "patch to duplicate unique should error or affect no rows: {resp}"
     );
 
     // Insert with invalid type - should return error body

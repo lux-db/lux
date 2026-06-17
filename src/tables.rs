@@ -1356,6 +1356,37 @@ pub fn table_insert(
     field_values: &[(&str, &str)],
     now: Instant,
 ) -> Result<i64, String> {
+    // Back-compat numeric reply: 0 for non-numeric (UUID/STR) primary keys.
+    Ok(table_insert_pk(store, cache, table, field_values, now)?
+        .parse()
+        .unwrap_or(0))
+}
+
+/// Insert a row and return the full stored row (sorted by column), used by the
+/// RETURNING clause and the HTTP API which returns the inserted record.
+pub fn table_insert_returning(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    now: Instant,
+) -> Result<Vec<(String, String)>, String> {
+    let schema = load_schema(store, cache, table, now)?;
+    let pk_str = table_insert_pk(store, cache, table, field_values, now)?;
+    let mut row = get_row(store, table, &schema, &pk_str, now)
+        .ok_or_else(|| format!("ERR inserted row not found in table '{}'", table))?;
+    row.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(row)
+}
+
+/// Core insert: returns the primary-key string of the new row.
+fn table_insert_pk(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    now: Instant,
+) -> Result<String, String> {
     let schema = load_schema(store, cache, table, now)?;
 
     let mut provided: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
@@ -1589,8 +1620,7 @@ pub fn table_insert(
         }
     }
 
-    let ret_id: i64 = pk_str.parse().unwrap_or(0);
-    Ok(ret_id)
+    Ok(pk_str)
 }
 
 pub fn table_get(
@@ -2082,29 +2112,20 @@ fn is_json_path_field(field: &str, schema: &[FieldDef]) -> bool {
         .unwrap_or(false)
 }
 
-pub fn table_update_where(
+/// Resolve the primary keys of rows matching a WHERE clause. Shared by the
+/// count and RETURNING variants of UPDATE and DELETE.
+fn scan_matching_pks(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
-    field_values: &[(&str, &str)],
-    where_args: &[&str],
+    conditions: &[WhereClause],
     now: Instant,
-) -> Result<i64, String> {
+) -> Result<(Vec<FieldDef>, Vec<String>), String> {
     let schema = load_schema(store, cache, table, now)?;
-    let conditions = parse_where_conditions(where_args)?;
 
-    // Validate all fields to update exist
-    for (fname, _) in field_values {
-        schema
-            .iter()
-            .find(|f| f.name == *fname)
-            .ok_or_else(|| format!("ERR unknown field '{}'", fname))?;
-    }
-
-    // Validate all WHERE fields exist (allow "id" for implicit-PK tables and
-    // JSON dot-paths whose root is a JSON column).
+    // Validate WHERE fields (allow "id" for implicit-PK tables and JSON dot-paths).
     let has_implicit_pk = !schema.iter().any(|f| f.primary_key);
-    for cond in &conditions {
+    for cond in conditions {
         let is_implicit_id = has_implicit_pk && cond.field == "id";
         if !is_implicit_id && !is_json_path_field(&cond.field, &schema) {
             schema
@@ -2120,7 +2141,7 @@ pub fn table_update_where(
         table,
         &schema,
         TableScanPlan {
-            conditions: &conditions,
+            conditions,
             order_by: None,
             limit: None,
             offset: None,
@@ -2130,37 +2151,102 @@ pub fn table_update_where(
         now,
     )
     .row_ids;
-    let mut updated_count = 0i64;
 
+    let mut matched = Vec::new();
     for pk_str in row_ids {
         let Some(row) = get_row(store, table, &schema, &pk_str, now) else {
             continue;
         };
-
-        if !row_matches_base_conditions(&row, &schema, implicit_id.as_ref(), &conditions) {
-            continue;
+        if row_matches_base_conditions(&row, &schema, implicit_id.as_ref(), conditions) {
+            matched.push(pk_str);
         }
+    }
+    Ok((schema, matched))
+}
 
-        // table_update takes i64 - only valid for auto-increment (int) PKs.
-        // For UUID/STR PKs, update the row hash directly.
-        let has_int_pk = schema
+/// Fetch and column-sort the rows for a set of primary keys.
+fn rows_for_pks(
+    store: &Store,
+    table: &str,
+    schema: &[FieldDef],
+    pks: &[String],
+    now: Instant,
+) -> Vec<Vec<(String, String)>> {
+    pks.iter()
+        .filter_map(|pk| {
+            get_row(store, table, schema, pk, now).map(|mut r| {
+                r.sort_by(|a, b| a.0.cmp(&b.0));
+                r
+            })
+        })
+        .collect()
+}
+
+pub fn table_update_where(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    where_args: &[&str],
+    now: Instant,
+) -> Result<i64, String> {
+    Ok(
+        table_update_where_pks(store, cache, table, field_values, where_args, now)?
+            .1
+            .len() as i64,
+    )
+}
+
+/// UPDATE returning the updated rows (for RETURNING and the HTTP API).
+pub fn table_update_where_returning(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    where_args: &[&str],
+    now: Instant,
+) -> Result<Vec<Vec<(String, String)>>, String> {
+    let (schema, pks) = table_update_where_pks(store, cache, table, field_values, where_args, now)?;
+    Ok(rows_for_pks(store, table, &schema, &pks, now))
+}
+
+/// Apply an UPDATE, returning (schema, primary keys of the updated rows).
+fn table_update_where_pks(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    where_args: &[&str],
+    now: Instant,
+) -> Result<(Vec<FieldDef>, Vec<String>), String> {
+    let conditions = parse_where_conditions(where_args)?;
+    let (schema, matched) = scan_matching_pks(store, cache, table, &conditions, now)?;
+
+    // Validate fields to update exist.
+    for (fname, _) in field_values {
+        schema
             .iter()
-            .any(|f| f.primary_key && f.field_type == FieldType::Int);
-        let has_implicit_pk = !schema.iter().any(|f| f.primary_key);
+            .find(|f| f.name == *fname)
+            .ok_or_else(|| format!("ERR unknown field '{}'", fname))?;
+    }
 
+    // table_update takes i64 (valid for auto-increment INT / implicit PKs);
+    // UUID/STR PKs update the row hash directly.
+    let has_int_pk = schema
+        .iter()
+        .any(|f| f.primary_key && f.field_type == FieldType::Int);
+    let has_implicit_pk = !schema.iter().any(|f| f.primary_key);
+    for pk_str in &matched {
         if has_int_pk || has_implicit_pk {
             let id: i64 = pk_str
                 .parse()
                 .map_err(|_| format!("ERR invalid row id '{}'", pk_str))?;
             table_update(store, cache, table, id, field_values, now)?;
         } else {
-            // UUID/STR primary key - update directly
-            table_update_by_pk_str(store, cache, table, &pk_str, field_values, now)?;
+            table_update_by_pk_str(store, cache, table, pk_str, field_values, now)?;
         }
-        updated_count += 1;
     }
-
-    Ok(updated_count)
+    Ok((schema, matched))
 }
 
 /// Delete rows matching WHERE conditions, returns count of deleted rows
@@ -2171,60 +2257,29 @@ pub fn table_delete_where(
     where_args: &[&str],
     now: Instant,
 ) -> Result<i64, String> {
-    let schema = load_schema(store, cache, table, now)?;
     let conditions = parse_where_conditions(where_args)?;
-
-    // Validate all WHERE fields exist (allow "id" for implicit-PK tables and
-    // JSON dot-paths whose root is a JSON column).
-    let has_implicit_pk = !schema.iter().any(|f| f.primary_key);
-    for cond in &conditions {
-        let is_implicit_id = has_implicit_pk && cond.field == "id";
-        if !is_implicit_id && !is_json_path_field(&cond.field, &schema) {
-            schema
-                .iter()
-                .find(|f| f.name == cond.field)
-                .ok_or_else(|| format!("ERR unknown field '{}' in WHERE clause", cond.field))?;
-        }
+    let (_schema, matched) = scan_matching_pks(store, cache, table, &conditions, now)?;
+    for pk_str in &matched {
+        table_delete_inner(store, cache, table, pk_str, now, 0)?;
     }
-    let implicit_id = implicit_id_field_for(&schema);
+    Ok(matched.len() as i64)
+}
 
-    let row_ids = plan_table_scan(
-        store,
-        table,
-        &schema,
-        TableScanPlan {
-            conditions: &conditions,
-            order_by: None,
-            limit: None,
-            offset: None,
-            allow_order_pushdown: false,
-            early_limit: None,
-        },
-        now,
-    )
-    .row_ids;
-    let mut deleted_count = 0i64;
-
-    // Collect PKs to delete first (to avoid modifying while iterating)
-    let mut pks_to_delete: Vec<String> = Vec::new();
-
-    for pk_str in row_ids {
-        let Some(row) = get_row(store, table, &schema, &pk_str, now) else {
-            continue;
-        };
-
-        if row_matches_base_conditions(&row, &schema, implicit_id.as_ref(), &conditions) {
-            pks_to_delete.push(pk_str);
-        }
+/// DELETE returning the deleted rows (captured before removal).
+pub fn table_delete_where_returning(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    where_args: &[&str],
+    now: Instant,
+) -> Result<Vec<Vec<(String, String)>>, String> {
+    let conditions = parse_where_conditions(where_args)?;
+    let (schema, matched) = scan_matching_pks(store, cache, table, &conditions, now)?;
+    let rows = rows_for_pks(store, table, &schema, &matched, now);
+    for pk_str in &matched {
+        table_delete_inner(store, cache, table, pk_str, now, 0)?;
     }
-
-    // Now delete them - works for any PK type (int, uuid, str)
-    for pk_str in pks_to_delete {
-        table_delete_inner(store, cache, table, &pk_str, now, 0)?;
-        deleted_count += 1;
-    }
-
-    Ok(deleted_count)
+    Ok(rows)
 }
 
 pub fn table_drop(
@@ -6311,6 +6366,62 @@ mod tests {
         let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
         assert_eq!(rows.len(), 1);
         assert_eq!(cell(&rows[0], "title"), "gamma");
+    }
+
+    // -------------------------------------------------------------------------
+    // RETURNING: insert/update/delete surface the affected rows
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn insert_returning_includes_generated_columns() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "m",
+            &["id UUID PRIMARY KEY,", "body STR"],
+            now,
+        )
+        .unwrap();
+        let row = table_insert_returning(&store, &cache, "m", &[("body", "hi")], now).unwrap();
+        assert_eq!(cell(&row, "body"), "hi");
+        assert!(is_uuid_v7(cell(&row, "id")));
+    }
+
+    #[test]
+    fn update_returning_yields_updated_rows() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_soft_delete(&store, &cache, now);
+        let rows = table_update_where_returning(
+            &store,
+            &cache,
+            "tasks",
+            &[("title", "renamed")],
+            &["title", "=", "alpha"],
+            now,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cell(&rows[0], "title"), "renamed");
+    }
+
+    #[test]
+    fn delete_returning_yields_deleted_rows_and_removes_them() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_soft_delete(&store, &cache, now);
+        let rows =
+            table_delete_where_returning(&store, &cache, "tasks", &["title", "=", "beta"], now)
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cell(&rows[0], "title"), "beta");
+        // The row is gone afterward.
+        assert_eq!(table_count(&store, &cache, "tasks", now).unwrap(), 2);
     }
 
     // -------------------------------------------------------------------------
