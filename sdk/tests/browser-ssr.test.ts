@@ -65,4 +65,24 @@ describe('browser and SSR clients', () => {
 		await restored.auth.clearSession();
 		expect(cookies.has('lux-auth-session')).toBe(false);
 	});
+
+	test('server client works without cookies (stateless backend)', async () => {
+		// A backend with the secret key has no cookies to plumb; createServerClient
+		// must not require them.
+		const client = createServerClient('http://localhost:3957/v1/project', 'lux_sec_test');
+
+		// setSession is in-memory only (no persistence), but must not throw.
+		await client.auth.setSession({
+			access_token: 'access-token',
+			refresh_token: 'refresh-token',
+			expires_in: 3600,
+			token_type: 'bearer',
+			user: { id: 'usr_123', email: 'user@example.com' },
+		});
+		expect((await client.auth.getSession()).data?.session?.access_token).toBe('access-token');
+
+		// A fresh stateless client has nothing persisted to restore.
+		const fresh = createServerClient('http://localhost:3957/v1/project', 'lux_sec_test');
+		expect((await fresh.auth.getSession()).data?.session).toBeNull();
+	});
 });

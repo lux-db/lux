@@ -21,7 +21,12 @@ export interface LuxServerClientOptions extends Omit<LuxProjectOptions, 'url' | 
 	auth?: Omit<NonNullable<LuxProjectOptions['auth']>, 'storage'> & {
 		cookieOptions?: LuxCookieOptions;
 	};
-	cookies: LuxCookieMethods;
+	/**
+	 * Cookie adapter for SSR session persistence (Next/SvelteKit/etc). Omit it
+	 * for a stateless backend client (secret key, or `setSession` per request):
+	 * `createServerClient(url, key)` then works with no cookie plumbing.
+	 */
+	cookies?: LuxCookieMethods;
 }
 
 const DEFAULT_COOKIE = 'lux-auth-session';
@@ -29,7 +34,7 @@ const DEFAULT_COOKIE = 'lux-auth-session';
 export function createServerClient(
 	url: string,
 	key: string,
-	options: LuxServerClientOptions,
+	options: LuxServerClientOptions = {},
 ) {
 	const storageKey = options.auth?.storageKey ?? DEFAULT_COOKIE;
 	const cookieOptions = options.auth?.cookieOptions ?? {
@@ -38,14 +43,18 @@ export function createServerClient(
 	};
 	const { cookieOptions: _cookieOptions, ...authOptions } = options.auth ?? {};
 
+	// With cookies -> cookie-backed session (SSR). Without -> stateless backend
+	// client: no session storage, nothing to persist.
+	const hasCookies = options.cookies !== undefined;
+
 	return createClient(url, key, {
 		fetch: options.fetch,
 		auth: {
-			persistSession: true,
+			persistSession: hasCookies,
 			autoRefreshToken: false,
 			...authOptions,
 			storageKey,
-			storage: cookieStorage(options.cookies, cookieOptions),
+			storage: hasCookies ? cookieStorage(options.cookies as LuxCookieMethods, cookieOptions) : null,
 		},
 	});
 }
