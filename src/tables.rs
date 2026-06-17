@@ -262,6 +262,10 @@ pub enum CmpOp {
     NotIn,
     IsValid,
     IsNotValid,
+    /// `col IS NULL`: the column is absent / not stored for the row.
+    IsNull,
+    /// `col IS NOT NULL`: the column is present for the row.
+    IsNotNull,
     /// Array membership: `col CONTAINS value` (array column or array-valued path).
     Contains,
 }
@@ -1990,6 +1994,10 @@ fn parse_where_condition(args: &[&str], i: &mut usize) -> Result<WhereClause, St
             *i += 1;
             return Ok(WhereClause::single(field, CmpOp::IsValid, String::new()));
         }
+        if *i < args.len() && args[*i].eq_ignore_ascii_case("NULL") {
+            *i += 1;
+            return Ok(WhereClause::single(field, CmpOp::IsNull, String::new()));
+        }
         if *i + 1 < args.len()
             && args[*i].eq_ignore_ascii_case("NOT")
             && args[*i + 1].eq_ignore_ascii_case("VALID")
@@ -1997,7 +2005,16 @@ fn parse_where_condition(args: &[&str], i: &mut usize) -> Result<WhereClause, St
             *i += 2;
             return Ok(WhereClause::single(field, CmpOp::IsNotValid, String::new()));
         }
-        return Err("ERR expected 'VALID' or 'NOT VALID' after 'IS'".to_string());
+        if *i + 1 < args.len()
+            && args[*i].eq_ignore_ascii_case("NOT")
+            && args[*i + 1].eq_ignore_ascii_case("NULL")
+        {
+            *i += 2;
+            return Ok(WhereClause::single(field, CmpOp::IsNotNull, String::new()));
+        }
+        return Err(
+            "ERR expected 'VALID', 'NOT VALID', 'NULL' or 'NOT NULL' after 'IS'".to_string(),
+        );
     }
 
     // Array membership: `field CONTAINS value`.
@@ -2777,7 +2794,7 @@ fn row_passes_conditions(
                         fd,
                     )
                 }
-                None => cond.op == CmpOp::Ne,
+                None => matches!(cond.op, CmpOp::Ne | CmpOp::IsNull),
             };
         }
         if bare == "id" {
@@ -2797,7 +2814,7 @@ fn row_passes_conditions(
                             fd,
                         )
                     }
-                    None => cond.op == CmpOp::Ne,
+                    None => matches!(cond.op, CmpOp::Ne | CmpOp::IsNull),
                 };
             }
             return true;
@@ -2810,11 +2827,16 @@ fn row_passes_conditions(
 fn matches_condition(row: &[(String, String)], cond: &WhereClause, field_def: &FieldDef) -> bool {
     let val = match row.iter().find(|(k, _)| k == &cond.field) {
         Some((_, v)) => v.as_str(),
-        None => return cond.op == CmpOp::Ne,
+        // Column absent from the row: it is NULL. `!=` and `IS NULL` match;
+        // everything else (including `IS NOT NULL`) does not.
+        None => return matches!(cond.op, CmpOp::Ne | CmpOp::IsNull),
     };
 
-    // List-membership and VALID ops are handled before the per-type comparison.
+    // List-membership and VALID/NULL ops are handled before the per-type comparison.
     match cond.op {
+        // Column is present, so it is not NULL.
+        CmpOp::IsNull => return false,
+        CmpOp::IsNotNull => return true,
         CmpOp::In => {
             return cond
                 .values
@@ -2937,6 +2959,8 @@ fn candidates_from_index(
                 | CmpOp::NotIn
                 | CmpOp::IsValid
                 | CmpOp::IsNotValid
+                | CmpOp::IsNull
+                | CmpOp::IsNotNull
                 | CmpOp::Contains => return None,
             };
             // Pass limit directly to zrangebyscore - avoids fetching all matching IDs
@@ -2983,6 +3007,8 @@ fn candidates_from_implicit_id(
         | CmpOp::NotIn
         | CmpOp::IsValid
         | CmpOp::IsNotValid
+        | CmpOp::IsNull
+        | CmpOp::IsNotNull
         | CmpOp::Contains => return None,
     };
 
@@ -3724,7 +3750,7 @@ pub fn table_select(
                     })
                     .map(|(_, v)| v.as_str());
                 match val {
-                    None => cond.op == CmpOp::Ne,
+                    None => matches!(cond.op, CmpOp::Ne | CmpOp::IsNull),
                     Some(v) => compare_condition_value(v, &cond.op, &cond.value),
                 }
             })
@@ -4059,6 +4085,8 @@ fn score_range_from_conditions(order_col: &str, conditions: &[WhereClause]) -> O
             | CmpOp::NotIn
             | CmpOp::IsValid
             | CmpOp::IsNotValid
+            | CmpOp::IsNull
+            | CmpOp::IsNotNull
             | CmpOp::Contains => return None,
         }
     }
@@ -4599,6 +4627,8 @@ fn try_fast_aggregate(
                                 | CmpOp::NotIn
                                 | CmpOp::IsValid
                                 | CmpOp::IsNotValid
+                                | CmpOp::IsNull
+                                | CmpOp::IsNotNull
                                 | CmpOp::Contains => return None,
                             }
                         }
@@ -4929,13 +4959,19 @@ fn matches_all_having(row: &[(String, String)], having: &[WhereClause]) -> bool 
             .find(|(k, _)| k == &cond.field || k.eq_ignore_ascii_case(&cond.field))
             .map(|(_, v)| v.as_str());
         match actual {
-            None => cond.op == CmpOp::Ne,
+            None => matches!(cond.op, CmpOp::Ne | CmpOp::IsNull),
             Some(value) => compare_condition_value(value, &cond.op, &cond.value),
         }
     })
 }
 
 fn compare_condition_value(actual: &str, op: &CmpOp, expected: &str) -> bool {
+    // The caller only reaches here with a present value, which is never NULL.
+    match op {
+        CmpOp::IsNull => return false,
+        CmpOp::IsNotNull => return true,
+        _ => {}
+    }
     if let (Ok(a), Ok(e)) = (actual.parse::<f64>(), expected.parse::<f64>()) {
         return match op {
             CmpOp::Eq => a == e,
@@ -6178,6 +6214,103 @@ mod tests {
         let ts = u64::from_str_radix(&hex, 16).unwrap();
         let now_ms = current_epoch_ms();
         assert!(ts <= now_ms && now_ms - ts < 5_000, "ts={ts} now={now_ms}");
+    }
+
+    // -------------------------------------------------------------------------
+    // IS NULL / IS NOT NULL (a column is NULL when absent from the row)
+    // -------------------------------------------------------------------------
+
+    fn seed_soft_delete(store: &Arc<Store>, cache: &SharedSchemaCache, now: Instant) {
+        table_create(
+            store,
+            cache,
+            "tasks",
+            &["id INT PRIMARY KEY,", "title STR,", "deleted_at TIMESTAMP"],
+            now,
+        )
+        .unwrap();
+        table_insert(store, cache, "tasks", &[("title", "alpha")], now).unwrap();
+        table_insert(
+            store,
+            cache,
+            "tasks",
+            &[("title", "beta"), ("deleted_at", "1781700000000")],
+            now,
+        )
+        .unwrap();
+        table_insert(store, cache, "tasks", &[("title", "gamma")], now).unwrap();
+    }
+
+    #[test]
+    fn where_is_null_matches_absent_column() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_soft_delete(&store, &cache, now);
+
+        let plan = parse_select(&[
+            "title",
+            "FROM",
+            "tasks",
+            "WHERE",
+            "deleted_at",
+            "IS",
+            "NULL",
+        ])
+        .unwrap();
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        let mut titles: Vec<&str> = rows.iter().map(|r| cell(r, "title")).collect();
+        titles.sort();
+        assert_eq!(titles, vec!["alpha", "gamma"]);
+    }
+
+    #[test]
+    fn where_is_not_null_matches_present_column() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_soft_delete(&store, &cache, now);
+
+        let plan = parse_select(&[
+            "title",
+            "FROM",
+            "tasks",
+            "WHERE",
+            "deleted_at",
+            "IS",
+            "NOT",
+            "NULL",
+        ])
+        .unwrap();
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        let titles: Vec<&str> = rows.iter().map(|r| cell(r, "title")).collect();
+        assert_eq!(titles, vec!["beta"]);
+    }
+
+    #[test]
+    fn where_is_null_combines_with_and() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_soft_delete(&store, &cache, now);
+
+        let plan = parse_select(&[
+            "title",
+            "FROM",
+            "tasks",
+            "WHERE",
+            "deleted_at",
+            "IS",
+            "NULL",
+            "AND",
+            "title",
+            "=",
+            "gamma",
+        ])
+        .unwrap();
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cell(&rows[0], "title"), "gamma");
     }
 
     // -------------------------------------------------------------------------
