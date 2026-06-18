@@ -2492,6 +2492,38 @@ pub(crate) fn check_write_row(
     }
 }
 
+/// WITH CHECK on UPDATE: the values an UPDATE *sets* must not move a row out of
+/// the write grant (e.g. you can't change a row you own to set `owner` to
+/// someone else). The USING filter already guarantees the existing row is in
+/// scope, so only grant conditions on columns being set can be violated -
+/// conditions on untouched columns are unchanged and remain valid. `Err` when a
+/// set value breaks the grant, or when no write grant exists.
+pub(crate) fn check_update_set(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    principal: &AuthPrincipal,
+    table: &str,
+    set_fields: &[(&str, &str)],
+    now: Instant,
+) -> Result<(), String> {
+    let Some(pred) = load_grant_predicate(store, cache, table, crate::grants::Scope::Write, now)?
+    else {
+        return Err(format!("no write access to '{table}'"));
+    };
+    let resolved = resolve_for_principal(&pred, principal)?;
+    for cond in &resolved {
+        if let Some((_, new_val)) = set_fields.iter().find(|(c, _)| *c == cond.column) {
+            if !crate::grants::cond_matches(cond, new_val) {
+                return Err(format!(
+                    "update would move a row outside the write grant on '{table}' ({} {} {})",
+                    cond.column, cond.op, cond.value
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve the WRITE grant for `principal` into a WHERE filter fragment that
 /// scopes an UPDATE/DELETE to the rows the grant allows (RLS `USING`). The
 /// caller ANDs this onto the statement's WHERE so only in-scope rows are
@@ -2808,6 +2840,100 @@ mod tests {
         assert_eq!(filter, "user_id = 123abc");
         // No write grant on another table -> deny-by-default (Err).
         assert!(write_filter(&store, &cache, &p, "other", now).is_err());
+    }
+
+    #[test]
+    fn update_with_check_single_condition() {
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        grant(
+            &store,
+            &cache,
+            &["write", "ON", "t", "WHERE", "owner", "=", "auth.uid()"],
+            now,
+        );
+        let p = principal("u1");
+        // moving ownership away -> rejected
+        assert!(check_update_set(&store, &cache, &p, "t", &[("owner", "u2")], now).is_err());
+        // setting owner to self -> ok
+        assert!(check_update_set(&store, &cache, &p, "t", &[("owner", "u1")], now).is_ok());
+        // a non-grant column -> ok (grant column untouched)
+        assert!(check_update_set(&store, &cache, &p, "t", &[("body", "hi")], now).is_ok());
+        // empty set -> ok
+        assert!(check_update_set(&store, &cache, &p, "t", &[], now).is_ok());
+        // no write grant on another table -> deny-by-default
+        assert!(check_update_set(&store, &cache, &p, "other", &[("x", "y")], now).is_err());
+    }
+
+    #[test]
+    fn update_with_check_multi_condition_enforces_each() {
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        grant(
+            &store,
+            &cache,
+            &[
+                "write",
+                "ON",
+                "t",
+                "WHERE",
+                "owner",
+                "=",
+                "auth.uid()",
+                "AND",
+                "status",
+                "=",
+                "active",
+            ],
+            now,
+        );
+        let p = principal("u1");
+        // changing a *second* grant column to an invalid value is caught even
+        // though owner is untouched (every condition is enforced, not just the first)
+        assert!(check_update_set(&store, &cache, &p, "t", &[("status", "archived")], now).is_err());
+        assert!(check_update_set(&store, &cache, &p, "t", &[("status", "active")], now).is_ok());
+        assert!(check_update_set(&store, &cache, &p, "t", &[("owner", "u2")], now).is_err());
+        // both set validly -> ok; one of them invalid -> rejected
+        assert!(check_update_set(
+            &store,
+            &cache,
+            &p,
+            "t",
+            &[("owner", "u1"), ("status", "active")],
+            now
+        )
+        .is_ok());
+        assert!(check_update_set(
+            &store,
+            &cache,
+            &p,
+            "t",
+            &[("owner", "u1"), ("status", "x")],
+            now
+        )
+        .is_err());
+        // touching neither grant column -> ok
+        assert!(check_update_set(&store, &cache, &p, "t", &[("body", "z")], now).is_ok());
+    }
+
+    #[test]
+    fn update_with_check_comparison_operator() {
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        grant(
+            &store,
+            &cache,
+            &["write", "ON", "t", "WHERE", "priority", ">=", "5"],
+            now,
+        );
+        let p = principal("u1");
+        // the >= operator is applied to the set value, numerically
+        assert!(check_update_set(&store, &cache, &p, "t", &[("priority", "3")], now).is_err());
+        assert!(check_update_set(&store, &cache, &p, "t", &[("priority", "5")], now).is_ok());
+        assert!(check_update_set(&store, &cache, &p, "t", &[("priority", "9")], now).is_ok());
     }
 
     #[test]

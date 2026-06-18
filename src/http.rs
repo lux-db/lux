@@ -884,6 +884,44 @@ fn enforce_table_write_where(
     }
 }
 
+/// WITH CHECK on UPDATE: reject a SET whose values would move a row out of the
+/// caller's write grant (e.g. changing `owner` away from the caller). Operator /
+/// auth-off bypass; anonymous is already blocked by `enforce_table_write_where`.
+fn enforce_table_update_check(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+    table: &str,
+    set_fields: &[(&str, &str)],
+) -> Result<(), (u16, &'static str, String)> {
+    if !store.config().auth.enabled {
+        return Ok(());
+    }
+    match auth {
+        HttpAuthContext::Operator => Ok(()),
+        HttpAuthContext::Anonymous => Err((
+            401,
+            "Unauthorized",
+            r#"{"error":"unauthorized"}"#.to_string(),
+        )),
+        HttpAuthContext::User(principal) => crate::auth::check_update_set(
+            store,
+            cache,
+            principal,
+            table,
+            set_fields,
+            Instant::now(),
+        )
+        .map_err(|e| {
+            (
+                403,
+                "Forbidden",
+                format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+            )
+        }),
+    }
+}
+
 /// AND a grant filter onto a user-supplied WHERE clause. Either side may be
 /// empty. Both are flat AND-chains of `col op value`, so plain concatenation is
 /// safe (no OR-precedence concerns).
@@ -2854,6 +2892,14 @@ fn route_table_update(
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
+    // WITH CHECK: a token user may only set values that keep the row inside its
+    // write grant (USING above already restricts which rows can be touched).
+    if let Err((status, status_text, body)) =
+        enforce_table_update_check(store, cache, auth, table, &field_values)
+    {
+        return (status, status_text, body);
+    }
+
     let where_tokens = match parse_http_where_tokens(&effective_where) {
         Ok(tokens) => tokens,
         Err(e) => {
@@ -3919,6 +3965,61 @@ mod tests {
         );
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("bobupdated"), "{body}");
+    }
+
+    #[test]
+    fn rls_update_with_check_blocks_ownership_change() {
+        let (store, broker, cache, se) = rls_fixture();
+        put_read_write_grant(&store, &cache); // GRANT ... WHERE user_id = auth.uid()
+        let bob = user_ctx("bob");
+        let now = Instant::now();
+
+        // Bob owns row id=3. He may NOT update it to set user_id=alice (that would
+        // move the row outside his write grant) -> WITH CHECK rejects with 403.
+        let params = vec![("where".to_string(), "id = 3".to_string())];
+        let (status, _, body) = route_table_update(
+            "messages",
+            &params,
+            r#"{"user_id":"alice"}"#,
+            &store,
+            &broker,
+            &cache,
+            &se,
+            &bob,
+        );
+        assert_eq!(status, 403, "ownership change must be rejected: {body}");
+        // The row is untouched (still bob's).
+        let row = crate::tables::table_get(&store, &cache, "messages", 3, now).unwrap();
+        let owner = row
+            .iter()
+            .find(|(k, _)| k == "user_id")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(owner, Some("bob"), "row owner must be unchanged");
+
+        // But setting a non-grant column (body) on his own row still works.
+        let (status, _, body) = route_table_update(
+            "messages",
+            &params,
+            r#"{"body":"edited"}"#,
+            &store,
+            &broker,
+            &cache,
+            &se,
+            &bob,
+        );
+        assert_eq!(status, 200, "{body}");
+        // And re-asserting his own ownership (user_id=bob) is fine.
+        let (status, _, _) = route_table_update(
+            "messages",
+            &params,
+            r#"{"user_id":"bob"}"#,
+            &store,
+            &broker,
+            &cache,
+            &se,
+            &bob,
+        );
+        assert_eq!(status, 200);
     }
 
     #[test]

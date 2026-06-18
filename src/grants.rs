@@ -258,6 +258,13 @@ fn cmp(actual: &str, op: &str, target: &str) -> bool {
     }
 }
 
+/// True if a single concrete `value` satisfies one resolved grant condition.
+/// Used by the UPDATE WITH CHECK, which only needs to validate the columns a
+/// statement actually sets.
+pub fn cond_matches(cond: &ResolvedCond, value: &str) -> bool {
+    cmp(value, &cond.op, &cond.value)
+}
+
 /// WITH CHECK: true if the row (looked up by `value(column)`) satisfies every
 /// resolved grant condition. Used on writes - the new row must fall inside the
 /// grant (e.g. you can't insert a row with someone else's `user_id`).
