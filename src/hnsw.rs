@@ -420,7 +420,27 @@ fn cosine_unit_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
     }
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    // Dot product (vectors are pre-normalized, so cosine == dot). This is the
+    // single hottest op in both HNSW build and search. A plain `.sum()` is a
+    // serial f32 reduction the compiler can't vectorize (f32 add isn't
+    // associative); 8 independent accumulators break that dependency chain so it
+    // can use SIMD lanes. The accumulation order changes, so the result differs
+    // by a rounding epsilon — fine for similarity ranking.
+    let mut acc = [0f32; 8];
+    let ca = a.chunks_exact(8);
+    let cb = b.chunks_exact(8);
+    let ra = ca.remainder();
+    let rb = cb.remainder();
+    for (x, y) in ca.zip(cb) {
+        for j in 0..8 {
+            acc[j] += x[j] * y[j];
+        }
+    }
+    let mut sum = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+    for (x, y) in ra.iter().zip(rb.iter()) {
+        sum += x * y;
+    }
+    sum
 }
 
 #[cfg(test)]
