@@ -1,4 +1,5 @@
 import { LuxAuthClient, type LuxAuthOptions } from './auth';
+import { LuxStorageNamespace } from './storage';
 import type { LuxError, LuxResult, LuxTypedRow } from './types';
 import { err, ok, toLuxError } from './utils';
 
@@ -115,6 +116,7 @@ export class LuxProjectClient {
 	readonly url: string;
 	readonly key: string;
 	readonly auth: LuxAuthClient;
+	readonly storage: LuxStorageNamespace;
 	private fetchImpl: typeof fetch;
 	private WebSocketImpl?: typeof WebSocket;
 	private liveSocket: WebSocket | null = null;
@@ -132,6 +134,7 @@ export class LuxProjectClient {
 			apiKey: this.key,
 			fetch: this.fetchImpl,
 		});
+		this.storage = new LuxStorageNamespace(this);
 	}
 
 	table<T extends object | readonly object[] = Record<string, unknown>>(name: string): LuxProjectTable<LuxTypedRow<T>> {
@@ -209,6 +212,10 @@ export class LuxProjectClient {
 		} catch (error) {
 			return err('LUX_PROJECT_REQUEST_ERROR', 'Lux request failed', toLuxError(error));
 		}
+	}
+
+	async fetchRaw(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+		return this.fetchImpl(input, init);
 	}
 
 	async _subscribeLive(

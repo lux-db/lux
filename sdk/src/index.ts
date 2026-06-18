@@ -46,6 +46,7 @@ export {
 };
 export { LuxProjectLiveSubscription } from './project';
 export { createBrowserClient } from './browser';
+export { LuxStorageBucketClient, LuxStorageNamespace } from './storage';
 export type { LuxBrowserClientOptions } from './browser';
 export { createServerClient } from './ssr';
 export type { LuxCookieMethods, LuxCookieOptions, LuxServerClientOptions } from './ssr';
@@ -57,6 +58,12 @@ export type {
 	LuxTableColumn,
 	LuxVectorSearchOptions,
 } from './project';
+export type {
+	LuxStorageListOptions,
+	LuxStorageObject,
+	LuxStorageSignOptions,
+	LuxStorageUploadOptions,
+} from './storage';
 export type {
 	KSubEvent,
 	LuxAggregateRow,
