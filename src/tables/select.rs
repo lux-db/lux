@@ -1,5 +1,9 @@
 use super::*;
 
+/// Candidate count at or above which a full scan fans its per-row work out
+/// across cores (below this, the rayon overhead isn't worth it).
+const PARALLEL_SCAN_MIN: usize = 1024;
+
 pub(crate) fn get_row(
     store: &Store,
     table: &str,
@@ -1129,73 +1133,78 @@ pub fn table_select(
         }
     }
 
-    let mut rows: Vec<Vec<(String, String)>> = scan
-        .row_ids
-        .into_iter()
-        // Filter first (per-field reads + zero-alloc JSON binary walk), then
-        // hydrate the full row only for the survivors.
-        .filter(|pk_str| {
-            row_passes_conditions(
-                store,
-                &plan.table,
-                &schema,
-                implicit_id_field.as_ref(),
-                pk_str,
-                &conditions,
-                now,
-            )
-        })
-        .filter_map(|pk_str| {
-            get_row_with_map(store, &plan.table, &type_map, &pk_str, now).map(|row| (pk_str, row))
-        })
-        // Fix 3: project down to only needed columns before prefixing.
-        // Only prefix with alias when there's an explicit alias or a join -
-        // bare queries (no alias, no join) keep column names clean.
-        .map(|(pk_str, mut row)| {
-            if let Some(similarity) = vector_similarity
-                .as_ref()
-                .and_then(|scores| scores.get(&pk_str))
-            {
-                row.push(("_similarity".to_string(), similarity.to_string()));
-            }
-            let ob_col = plan.order_by.as_ref().map(|(c, _)| c.as_str());
-            // Also retain join key and WHERE columns so the hash join probe and
-            // post-join filters can find them after projection pushdown.
-            let join_keys: Vec<&str> = plan
-                .joins
-                .iter()
-                .flat_map(|j| [j.left_col.as_str(), j.right_col.as_str()])
-                .map(bare_col)
-                .collect();
-            let condition_keys: Vec<&str> = plan
-                .conditions
-                .iter()
-                .map(|condition| bare_col(&condition.field))
-                .collect();
-            let mut projected = if plan.group_by.is_empty() {
-                project_row_fields(&row, &plan.projections, &plan.aggregates, ob_col)
-            } else {
-                row.clone()
-            };
-            for jk in join_keys.iter().chain(condition_keys.iter()) {
-                if !projected.iter().any(|(k, _)| k == jk) {
-                    if let Some(val) = row.iter().find(|(k, _)| k == jk) {
-                        projected.push(val.clone());
-                    }
+    // Per-candidate work: filter (per-field reads + zero-alloc JSON binary
+    // walk), hydrate survivors, then project. Read-only over `store` (shard read
+    // locks), so it's `Sync` and safe to fan out across cores.
+    let process = |pk_str: String| -> Option<Vec<(String, String)>> {
+        if !row_passes_conditions(
+            store,
+            &plan.table,
+            &schema,
+            implicit_id_field.as_ref(),
+            &pk_str,
+            &conditions,
+            now,
+        ) {
+            return None;
+        }
+        let mut row = get_row_with_map(store, &plan.table, &type_map, &pk_str, now)?;
+        if let Some(similarity) = vector_similarity
+            .as_ref()
+            .and_then(|scores| scores.get(&pk_str))
+        {
+            row.push(("_similarity".to_string(), similarity.to_string()));
+        }
+        let ob_col = plan.order_by.as_ref().map(|(c, _)| c.as_str());
+        // Also retain join key and WHERE columns so the hash join probe and
+        // post-join filters can find them after projection pushdown.
+        let join_keys: Vec<&str> = plan
+            .joins
+            .iter()
+            .flat_map(|j| [j.left_col.as_str(), j.right_col.as_str()])
+            .map(bare_col)
+            .collect();
+        let condition_keys: Vec<&str> = plan
+            .conditions
+            .iter()
+            .map(|condition| bare_col(&condition.field))
+            .collect();
+        let mut projected = if plan.group_by.is_empty() {
+            project_row_fields(&row, &plan.projections, &plan.aggregates, ob_col)
+        } else {
+            row.clone()
+        };
+        for jk in join_keys.iter().chain(condition_keys.iter()) {
+            if !projected.iter().any(|(k, _)| k == jk) {
+                if let Some(val) = row.iter().find(|(k, _)| k == jk) {
+                    projected.push(val.clone());
                 }
             }
-            if plan.alias.is_some() || !plan.joins.is_empty() {
-                projected
-                    .into_iter()
-                    .map(|(k, v)| (format!("{}.{}", table_alias, k), v))
-                    .collect()
-            } else {
-                projected
-            }
+        }
+        Some(if plan.alias.is_some() || !plan.joins.is_empty() {
+            projected
+                .into_iter()
+                .map(|(k, v)| (format!("{}.{}", table_alias, k), v))
+                .collect()
+        } else {
+            projected
         })
-        // Fix 2: early LIMIT when no join - stop fetching rows once we have enough
-        .take(early_limit.unwrap_or(usize::MAX))
-        .collect();
+    };
+
+    // A big full scan (no early LIMIT to exploit) is embarrassingly parallel —
+    // fan the filter+hydrate+project out across cores. rayon's indexed collect
+    // preserves scan order, so ORDER BY pushdown and pagination stay correct.
+    let mut rows: Vec<Vec<(String, String)>> =
+        if early_limit.is_none() && scan.row_ids.len() >= PARALLEL_SCAN_MIN {
+            use rayon::prelude::*;
+            scan.row_ids.into_par_iter().filter_map(&process).collect()
+        } else {
+            scan.row_ids
+                .into_iter()
+                .filter_map(&process)
+                .take(early_limit.unwrap_or(usize::MAX))
+                .collect()
+        };
 
     // ---- Hash Joins ----
     for join in &plan.joins {
@@ -2025,12 +2034,18 @@ pub(crate) fn count_matching_rows(
     now: Instant,
 ) -> i64 {
     let implicit = implicit_id_field_for(schema);
-    build_candidates(store, table, schema, conditions, None, now)
-        .iter()
-        .filter(|pk| {
-            row_passes_conditions(store, table, schema, implicit.as_ref(), pk, conditions, now)
-        })
-        .count() as i64
+    let candidates = build_candidates(store, table, schema, conditions, None, now);
+    let passes = |pk: &String| {
+        row_passes_conditions(store, table, schema, implicit.as_ref(), pk, conditions, now)
+    };
+    // A big filtered count is the canonical bulk-scan query — fan the per-row
+    // predicate check across cores (read-only over `store`).
+    if candidates.len() >= PARALLEL_SCAN_MIN {
+        use rayon::prelude::*;
+        candidates.par_iter().filter(|pk| passes(pk)).count() as i64
+    } else {
+        candidates.iter().filter(|pk| passes(pk)).count() as i64
+    }
 }
 
 pub(crate) fn try_fast_aggregate(
