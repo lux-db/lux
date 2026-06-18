@@ -10,7 +10,8 @@
             "browser": {
                 "types": "./dist/types/index.browser.d.ts",
                 "import": "./dist/esm/index.browser.js",
-                "require": "./dist/cjs/index.browser.js"
+                "require": "./dist/cjs/index.browser.js",
+                "default": "./dist/esm/index.browser.js"
             },
             "types": "./dist/types/index.d.ts",
             "import": "./dist/esm/index.js",
@@ -41,6 +42,10 @@
             "require": "./dist/cjs/ssr.js",
             "default": "./dist/esm/ssr.js"
         }
+    },
+    "browser": {
+        "./dist/esm/index.js": "./dist/esm/index.browser.js",
+        "./dist/cjs/index.js": "./dist/cjs/index.browser.js"
     },
     "files": ["dist"],
     "scripts": {

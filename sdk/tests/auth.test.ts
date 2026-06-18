@@ -69,6 +69,83 @@ describe('LuxAuthClient session state', () => {
 		expect(events).toContain('SIGNED_OUT:none');
 	});
 
+	test('broadcasts browser auth changes across clients', async () => {
+		const originalDocument = (globalThis as any).document;
+		const originalBroadcastChannel = (globalThis as any).BroadcastChannel;
+		const channels = new Map<string, Set<FakeBroadcastChannel>>();
+		(globalThis as any).document = {
+			visibilityState: 'visible',
+			addEventListener() {},
+		};
+		(globalThis as any).BroadcastChannel = class extends FakeBroadcastChannel {
+			constructor(name: string) {
+				super(name, channels);
+			}
+		};
+
+		try {
+			const sharedStorage = memoryStorage();
+			const first = new LuxAuthClient({
+				persistSession: true,
+				autoRefreshToken: false,
+				storage: sharedStorage,
+				storageKey: 'lux.broadcast.session',
+			});
+			const second = new LuxAuthClient({
+				persistSession: true,
+				autoRefreshToken: false,
+				storage: sharedStorage,
+				storageKey: 'lux.broadcast.session',
+			});
+			const events: string[] = [];
+			let resolveInitial!: () => void;
+			const initial = new Promise<void>((resolve) => {
+				resolveInitial = resolve;
+			});
+			second.onAuthStateChange((event, nextSession) => {
+				events.push(`${event}:${nextSession?.access_token ?? 'none'}`);
+				if (event === 'INITIAL_SESSION') resolveInitial();
+			});
+			await initial;
+
+			await first.setSession(session({ access_token: 'broadcast-token' }));
+			await Promise.resolve();
+
+			expect(events).toContain('SESSION_UPDATED:broadcast-token');
+			expect((await second.getSession()).data?.session?.access_token)
+				.toBe('broadcast-token');
+		} finally {
+			if (originalDocument === undefined) delete (globalThis as any).document;
+			else (globalThis as any).document = originalDocument;
+			if (originalBroadcastChannel === undefined) delete (globalThis as any).BroadcastChannel;
+			else (globalThis as any).BroadcastChannel = originalBroadcastChannel;
+		}
+	});
+
+	test('signOut clears local state when remote logout fails', async () => {
+		const storage = memoryStorage();
+		const auth = new LuxAuthClient({
+			httpUrl: 'http://localhost:3957/v1/project',
+			fetch: (async () => new Response(
+				JSON.stringify({ error: 'session already revoked' }),
+				{ status: 401 },
+			)) as typeof fetch,
+			persistSession: true,
+			autoRefreshToken: false,
+			storage,
+		});
+		await auth.setSession(session());
+
+		const events: string[] = [];
+		auth.onAuthStateChange((event) => events.push(event));
+		const result = await auth.signOut();
+
+		expect(result.error?.code).toBe('LUX_AUTH_LOGOUT_ERROR');
+		expect(storage.data.has('lux.auth.session')).toBe(false);
+		expect((await auth.getSession()).data?.session).toBeNull();
+		expect(events).toContain('SIGNED_OUT');
+	});
+
 	test('signInWithPassword stores returned session and sends project apikey', async () => {
 		const storage = memoryStorage();
 		let seen: { url: string; headers: Record<string, string>; body: any } | null = null;
@@ -192,4 +269,37 @@ describe('LuxAuthClient session state', () => {
 		expect(authorization).toBe('Bearer access');
 		expect(storage.data.has('lux.auth.session')).toBe(true);
 	});
+
+	test('consumeOAuthRedirect returns an error when callback tokens are missing', async () => {
+		const auth = new LuxAuthClient();
+
+		const result = await auth.consumeOAuthRedirect('https://app.example.com/auth/callback');
+
+		expect(result.data).toBeNull();
+		expect(result.error?.code).toBe('LUX_AUTH_OAUTH_ERROR');
+	});
 });
+
+class FakeBroadcastChannel {
+	private listeners = new Set<(event: { data?: unknown }) => void>();
+
+	constructor(
+		private name: string,
+		private channels: Map<string, Set<FakeBroadcastChannel>>,
+	) {
+		const peers = channels.get(name) ?? new Set();
+		peers.add(this);
+		channels.set(name, peers);
+	}
+
+	addEventListener(_type: string, listener: (event: { data?: unknown }) => void) {
+		this.listeners.add(listener);
+	}
+
+	postMessage(data: unknown) {
+		for (const peer of this.channels.get(this.name) ?? []) {
+			if (peer === this) continue;
+			for (const listener of peer.listeners) listener({ data });
+		}
+	}
+}

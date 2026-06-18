@@ -45,7 +45,14 @@ export { createBrowserClient } from './browser';
 export { LuxStorageBucketClient, LuxStorageNamespace } from './storage';
 export type { LuxBrowserClientOptions } from './browser';
 export { createServerClient } from './ssr';
-export type { LuxCookieMethods, LuxCookieOptions, LuxServerClientOptions } from './ssr';
+export type {
+	LuxBrowserCookieMethods,
+	LuxCookie,
+	LuxCookieOptions,
+	LuxCookieToSet,
+	LuxServerCookieMethods,
+	LuxServerClientOptions,
+} from './ssr';
 export type {
 	LuxLiveResult,
 	LuxProjectLiveEvent,
