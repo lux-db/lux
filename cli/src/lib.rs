@@ -248,7 +248,7 @@ struct LocalConfig {
 }
 
 /// Pinned engine image `lux start` pulls. Bump alongside engine releases.
-const LOCAL_ENGINE_IMAGE: &str = "ghcr.io/lux-db/lux:0.20.3";
+const LOCAL_ENGINE_IMAGE: &str = "ghcr.io/lux-db/lux:0.20.4";
 const LOCAL_CONTAINER: &str = "lux-local";
 const LOCAL_VOLUME: &str = "lux-local-data";
 const DEFAULT_HTTP_PORT: u16 = 8080;
