@@ -456,6 +456,70 @@ fn tselect_with_join() {
 }
 
 #[test]
+fn tselect_join_with_in_filter() {
+    // Regression: a `col IN (...)` WHERE on a joined query (e.g. an injected
+    // grant predicate `team_id IN (subquery)`) was evaluated as false in the
+    // post-join filter, dropping every row.
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    send(
+        &mut s,
+        &["TCREATE", "teams", "id INT PRIMARY KEY,", "name STR"],
+    );
+    send(
+        &mut s,
+        &[
+            "TCREATE",
+            "members",
+            "id INT PRIMARY KEY,",
+            "team_id INT,",
+            "user_id STR",
+        ],
+    );
+    send(&mut s, &["TINSERT", "teams", "id", "1", "name", "acme"]);
+    send(
+        &mut s,
+        &[
+            "TINSERT", "members", "id", "1", "team_id", "1", "user_id", "alice",
+        ],
+    );
+
+    let base = [
+        "TSELECT", "t.name", "FROM", "members", "JOIN", "teams", "t", "ON", "team_id", "=", "t.id",
+        "WHERE", "team_id",
+    ];
+
+    // IN containing the row's team => row returned.
+    let mut q = base.to_vec();
+    q.extend(["IN", "(", "1", "2", ")"]);
+    let r = send(&mut s, &q);
+    assert!(r.contains("acme"), "join + IN should return the row: {r}");
+
+    // IN excluding the row's team => empty.
+    let mut q = base.to_vec();
+    q.extend(["IN", "(", "99", ")"]);
+    let r = send(&mut s, &q);
+    assert!(
+        !r.contains("acme"),
+        "join + IN excluding team => empty: {r}"
+    );
+
+    // NOT IN excluding a different team => row returned.
+    let mut q = base.to_vec();
+    q.extend(["NOT", "IN", "(", "2", ")"]);
+    let r = send(&mut s, &q);
+    assert!(
+        r.contains("acme"),
+        "join + NOT IN should return the row: {r}"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
 fn tselect_near_vector_field() {
     let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();

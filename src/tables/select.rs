@@ -1224,7 +1224,21 @@ pub fn table_select(
                     .map(|(_, v)| v.as_str());
                 match val {
                     None => matches!(cond.op, CmpOp::Ne | CmpOp::IsNull),
-                    Some(v) => compare_condition_value(v, &cond.op, &cond.value),
+                    // IN / NOT IN carry their operands in `values`, not `value`;
+                    // compare_condition_value only knows scalar ops and would
+                    // return false for them, dropping every joined row (e.g. a
+                    // grant predicate `col IN (subquery)` on a joined query).
+                    Some(v) => match cond.op {
+                        CmpOp::In => cond
+                            .values
+                            .iter()
+                            .any(|x| compare_condition_value(v, &CmpOp::Eq, x)),
+                        CmpOp::NotIn => !cond
+                            .values
+                            .iter()
+                            .any(|x| compare_condition_value(v, &CmpOp::Eq, x)),
+                        _ => compare_condition_value(v, &cond.op, &cond.value),
+                    },
                 }
             })
         });
