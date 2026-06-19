@@ -112,12 +112,22 @@ function createAuthNamespace(redis: Redis, options: LuxAuthOptions): LuxAuthName
 	}) as LuxAuthNamespace;
 }
 
+const EMPTY_COLS: ReadonlySet<string> = new Set<string>();
+
+/** Pull the table name out of TSELECT args (the token after `FROM`). */
+function tableFromSelectArgs(args: string[]): string | null {
+	const i = args.findIndex((a) => String(a).toUpperCase() === 'FROM');
+	return i >= 0 && i + 1 < args.length ? String(args[i + 1]) : null;
+}
+
 export class Lux extends Redis {
 	vectors: VectorNamespace;
 	timeseries: TimeSeriesNamespace;
 	auth: LuxAuthNamespace;
 	authApi: LuxAuthClient;
 	private realtimeManager?: LuxRealtimeManager;
+	/** Per-table set of JSON/ARRAY column names, so reads decode them to objects. */
+	private jsonColsCache = new Map<string, Set<string>>();
 
 	constructor(options?: LuxClientOptions | RedisOptions | string) {
 		let authOptions: LuxAuthOptions = {};
@@ -153,16 +163,27 @@ export class Lux extends Redis {
 		const result = await this.call('TSELECT', ...args) as any;
 		if (!result || !Array.isArray(result)) return [];
 
+		const jsonCols = await this.jsonColumns(tableFromSelectArgs(args));
+
 		const rows: TableRow[] = [];
 		for (const item of result) {
 			if (Array.isArray(item)) {
 				const row: TableRow = {};
 				for (let i = 0; i < item.length - 1; i += 2) {
 					const key = String(item[i]);
-					const val = item[i + 1];
-					row[key] = val;
+					let val: unknown = item[i + 1];
+					// JSON / ARRAY columns come back as JSON text over RESP; decode
+					// them to real objects/arrays. Leave malformed values as-is.
+					if (jsonCols.has(key) && typeof val === 'string' && val !== '') {
+						try {
+							val = JSON.parse(val);
+						} catch {
+							/* not valid JSON - keep the raw string */
+						}
+					}
+					row[key] = val as TableRow[string];
 				}
-				if (row.id != null) {
+				if (row.id != null && typeof row.id === 'string') {
 					const parsed = Number(row.id);
 					if (!Number.isNaN(parsed) && Number.isFinite(parsed)) {
 						row.id = parsed;
@@ -172,6 +193,29 @@ export class Lux extends Redis {
 			}
 		}
 		return rows;
+	}
+
+	/** Resolve (and cache) the JSON/ARRAY column names for a table via TSCHEMA. */
+	private async jsonColumns(table: string | null): Promise<ReadonlySet<string>> {
+		if (!table) return EMPTY_COLS;
+		const cached = this.jsonColsCache.get(table);
+		if (cached) return cached;
+		const set = new Set<string>();
+		try {
+			const schema = await this.call('TSCHEMA', table) as any;
+			if (Array.isArray(schema)) {
+				for (const entry of schema) {
+					const parts = String(entry).trim().split(/\s+/);
+					const name = parts[0];
+					const type = (parts[1] || '').toUpperCase();
+					if (name && (type === 'JSON' || type === 'ARRAY')) set.add(name);
+				}
+			}
+		} catch {
+			/* schema unavailable - values stay as strings */
+		}
+		this.jsonColsCache.set(table, set);
+		return set;
 	}
 
 	// Vector methods (keep for backward compat)

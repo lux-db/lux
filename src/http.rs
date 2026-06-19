@@ -541,6 +541,9 @@ async fn stream_table_query(
             return send_json(socket, 200, "OK", &body).await;
         }
         Ok(crate::tables::SelectResult::Rows(rows)) => {
+            // JSON / ARRAY columns hold valid JSON text; emit them raw (as nested
+            // objects/arrays) instead of quoting them into escaped strings.
+            let json_cols = json_columns(store, cache, table, now);
             let returned = rows.len();
             let range_end = if returned == 0 {
                 offset
@@ -616,7 +619,14 @@ async fn stream_table_query(
                     buf.push('"');
                     push_escaped(&mut buf, k);
                     buf.push_str(r#"":"#);
-                    if looks_numeric(v) || v == "true" || v == "false" {
+                    if json_cols.contains(k.as_str()) {
+                        // Already canonical JSON text; emit raw (null if unset).
+                        if v.is_empty() {
+                            buf.push_str("null");
+                        } else {
+                            buf.push_str(v);
+                        }
+                    } else if looks_numeric(v) || v == "true" || v == "false" {
                         buf.push_str(v);
                     } else {
                         buf.push('"');
@@ -2718,9 +2728,10 @@ fn route_table_query(
 
     let now = std::time::Instant::now();
 
+    let json_cols = json_columns(store, cache, table, now);
     match parse_http_table_query(params, table, None) {
         Ok((_, plan)) => match crate::tables::table_select(store, cache, &plan, now) {
-            Ok(result) => ok(select_result_to_json(result)),
+            Ok(result) => ok(select_result_to_json(result, &json_cols)),
             Err(e) => (
                 400,
                 "Bad Request",
@@ -3268,7 +3279,34 @@ fn handle_exec(
 // ---------------------------------------------------------------------------
 
 /// Serialize a SelectResult straight to JSON without touching RESP.
-fn select_result_to_json(result: crate::tables::SelectResult) -> String {
+/// Names of a table's JSON / ARRAY columns, so serializers can emit their
+/// (already-canonical JSON) values raw instead of quoting them into strings.
+fn json_columns(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    now: std::time::Instant,
+) -> std::collections::HashSet<String> {
+    crate::tables::load_schema(store, cache, table, now)
+        .map(|fields| {
+            fields
+                .into_iter()
+                .filter(|f| {
+                    matches!(
+                        f.field_type,
+                        crate::tables::FieldType::Json | crate::tables::FieldType::Array
+                    )
+                })
+                .map(|f| f.name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn select_result_to_json(
+    result: crate::tables::SelectResult,
+    json_cols: &std::collections::HashSet<String>,
+) -> String {
     match result {
         crate::tables::SelectResult::Rows(rows) => {
             // Estimate ~80 bytes per field, 4 fields avg per row - better than 64 flat
@@ -3291,8 +3329,15 @@ fn select_result_to_json(result: crate::tables::SelectResult) -> String {
                     out.push('"');
                     push_escaped(&mut out, k);
                     out.push_str(r#"":"#);
-                    // Try to emit numbers unquoted, everything else quoted
-                    if looks_numeric(v) || v == "true" || v == "false" {
+                    // JSON/ARRAY columns are canonical JSON text - emit raw.
+                    // Otherwise emit numbers/bools unquoted, everything else quoted.
+                    if json_cols.contains(k.as_str()) {
+                        if v.is_empty() {
+                            out.push_str("null");
+                        } else {
+                            out.push_str(v);
+                        }
+                    } else if looks_numeric(v) || v == "true" || v == "false" {
                         out.push_str(v);
                     } else {
                         out.push('"');
@@ -3618,6 +3663,27 @@ fn escape_json(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::tables::JoinType;
+
+    #[test]
+    fn json_columns_emit_raw_str_columns_quoted() {
+        let rows = vec![vec![
+            ("id".to_string(), "1".to_string()),
+            ("payload".to_string(), r#"{"a":1}"#.to_string()),
+            ("tags".to_string(), "[1,2]".to_string()),
+            // A STR column whose value happens to look like JSON must stay quoted.
+            ("note".to_string(), r#"{"x":"y"}"#.to_string()),
+        ]];
+        let mut json_cols = std::collections::HashSet::new();
+        json_cols.insert("payload".to_string());
+        json_cols.insert("tags".to_string());
+        let out = select_result_to_json(crate::tables::SelectResult::Rows(rows), &json_cols);
+        assert!(out.contains(r#""payload":{"a":1}"#), "json raw: {out}");
+        assert!(out.contains(r#""tags":[1,2]"#), "array raw: {out}");
+        assert!(
+            out.contains(r#""note":"{\"x\":\"y\"}""#),
+            "str quoted: {out}"
+        );
+    }
 
     #[test]
     fn per_table_data_routes_are_not_operator_only() {

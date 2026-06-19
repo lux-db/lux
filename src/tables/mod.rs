@@ -811,7 +811,7 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
     }
 }
 
-fn load_schema(
+pub(crate) fn load_schema(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
