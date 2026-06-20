@@ -34,6 +34,11 @@ enum Commands {
         #[arg(long, help = "Also delete the local data volume (fresh DB next start)")]
         clear: bool,
     },
+    /// Open Lux Studio (local web UI) against the running local engine.
+    Studio {
+        #[arg(long, help = "Don't open a browser window")]
+        no_open: bool,
+    },
     Login,
     Logout,
     Link {
@@ -269,6 +274,17 @@ const LOCAL_ENGINE_IMAGE: &str = "ghcr.io/lux-db/lux:latest";
 const DEFAULT_HTTP_PORT: u16 = 8080;
 const DEFAULT_RESP_PORT: u16 = 6379;
 
+/// Lux Studio image `lux studio` runs (tracks `:latest`, pulled each run, like
+/// the engine image). Serves the local web UI; talks to the engine from the
+/// browser over the engine's CORS-`*` HTTP API.
+const STUDIO_IMAGE: &str = "ghcr.io/lux-db/lux-studio:latest";
+/// Default host port for Studio (Supabase Studio uses 54323; we follow suit).
+const DEFAULT_STUDIO_PORT: u16 = 54323;
+
+fn default_studio_port() -> u16 {
+    DEFAULT_STUDIO_PORT
+}
+
 /// Persisted local-dev credentials + runtime knobs for the Docker engine. Lives
 /// in the gitignored `lux/.lux-local.json` and is reused across restarts so keys
 /// and data stay stable. `password` is intentionally equal to `secret_key`: the
@@ -286,6 +302,12 @@ struct LocalState {
     container: String,
     volume: String,
     image: String,
+    // serde defaults so a `.lux-local.json` written before Studio existed still
+    // loads; backfilled in ensure_local_state.
+    #[serde(default = "default_studio_port")]
+    studio_port: u16,
+    #[serde(default)]
+    studio_container: String,
 }
 
 fn local_state_path() -> PathBuf {
@@ -398,10 +420,23 @@ fn free_port_from(preferred: u16) -> u16 {
 /// Load the persisted local state, generating + saving fresh creds on first use.
 fn ensure_local_state() -> LocalState {
     if let Some(mut state) = load_local_state() {
+        let mut dirty = false;
         // Track the current engine image (`:latest`) even for projects created
         // before the CLI stopped pinning a specific version.
         if state.image != LOCAL_ENGINE_IMAGE {
             state.image = LOCAL_ENGINE_IMAGE.to_string();
+            dirty = true;
+        }
+        // Backfill Studio fields for states written before Studio existed.
+        if state.studio_container.is_empty() {
+            state.studio_container = format!("lux-{}-studio", project_slug());
+            dirty = true;
+        }
+        if state.studio_port == 0 {
+            state.studio_port = DEFAULT_STUDIO_PORT;
+            dirty = true;
+        }
+        if dirty {
             save_local_state(&state);
         }
         return state;
@@ -423,6 +458,8 @@ fn ensure_local_state() -> LocalState {
         container: format!("lux-{slug}"),
         volume: format!("lux-{slug}-data"),
         image: LOCAL_ENGINE_IMAGE.to_string(),
+        studio_port: DEFAULT_STUDIO_PORT,
+        studio_container: format!("lux-{slug}-studio"),
     };
     // secret_key == password: the operator credential and the SDK secret key are
     // the same value locally (see LocalState doc comment).
@@ -550,6 +587,20 @@ fn wait_for_local_ready(state: &LocalState) -> bool {
             if conn.exec("PING").is_ok() {
                 return true;
             }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    false
+}
+
+/// Poll until the Studio container's HTTP port accepts connections (nginx up).
+fn wait_for_studio_ready(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    for _ in 0..40 {
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300))
+            .is_ok()
+        {
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
@@ -1100,6 +1151,94 @@ pub async fn run() {
             print_connection_block(&state);
         }
 
+        Commands::Studio { no_open } => {
+            if let Err(e) = docker_preflight() {
+                eprintln!("{} {e}", "Error:".red());
+                std::process::exit(1);
+            }
+            let mut state = ensure_local_state();
+
+            // Studio needs a running engine to talk to.
+            if docker_container_state(&state.container).as_deref() != Some("running") {
+                eprintln!(
+                    "{} The local engine isn't running. Start it first with {}.",
+                    "Error:".red(),
+                    "lux start".cyan()
+                );
+                std::process::exit(1);
+            }
+
+            // Already up? Just reprint + reopen.
+            if docker_container_state(&state.studio_container).as_deref() == Some("running") {
+                let url = format!("http://localhost:{}", state.studio_port);
+                println!("{} {}", "Lux Studio:".bold(), url.cyan());
+                if !no_open {
+                    let _ = open::that(&url);
+                }
+                return;
+            }
+
+            // Clear any stale container, then pick a free host port.
+            if docker_container_state(&state.studio_container).is_some() {
+                let _ = docker_output(&["rm", "-f", &state.studio_container]);
+            }
+            let studio_port = free_port_from(state.studio_port);
+            if studio_port != state.studio_port {
+                state.studio_port = studio_port;
+                save_local_state(&state);
+            }
+
+            println!("{} {}", "Pulling".bold(), STUDIO_IMAGE.dimmed());
+            let _ = std::process::Command::new("docker")
+                .args(["pull", STUDIO_IMAGE])
+                .status();
+
+            // The SPA runs in the browser, so the engine URL must be host-visible
+            // (localhost), not a container-internal address. LUX_KEY is the
+            // operator secret; everything stays on localhost.
+            let port_map = format!("{studio_port}:80");
+            let e_url = format!("LUX_URL=http://localhost:{}", state.http_port);
+            let e_key = format!("LUX_KEY={}", state.secret_key);
+            let run_args: Vec<&str> = vec![
+                "run",
+                "-d",
+                "--name",
+                &state.studio_container,
+                "-p",
+                &port_map,
+                "-e",
+                &e_url,
+                "-e",
+                &e_key,
+                "--restart",
+                "unless-stopped",
+                STUDIO_IMAGE,
+            ];
+            if let Err(e) = docker_output(&run_args) {
+                eprintln!("{} Failed to start Studio: {e}", "Error:".red());
+                std::process::exit(1);
+            }
+
+            print!("{}", "Waiting for Studio...".dimmed());
+            std::io::stdout().flush().ok();
+            if !wait_for_studio_ready(studio_port) {
+                println!(" {}", "TIMEOUT".red());
+                eprintln!(
+                    "{} Studio did not become ready. Check {}.",
+                    "Error:".red(),
+                    format!("docker logs {}", state.studio_container).cyan()
+                );
+                std::process::exit(1);
+            }
+            println!(" {}", "ready".green());
+
+            let url = format!("http://localhost:{studio_port}");
+            println!("{} {}", "Lux Studio:".bold(), url.cyan());
+            if !no_open {
+                let _ = open::that(&url);
+            }
+        }
+
         Commands::Stop { clear } => {
             let state = load_local_state().unwrap_or_else(|| {
                 eprintln!(
@@ -1113,6 +1252,13 @@ pub async fn run() {
                 println!("{} Stopped local Lux engine.", "Done.".green());
             } else {
                 println!("{}", "Local Lux engine is not running.".yellow());
+            }
+            // Tear down Studio alongside the engine if it's up.
+            if !state.studio_container.is_empty()
+                && docker_container_state(&state.studio_container).is_some()
+            {
+                let _ = docker_output(&["rm", "-f", &state.studio_container]);
+                println!("{} Stopped Lux Studio.", "Done.".green());
             }
             if clear && docker_volume_exists(&state.volume) {
                 let _ = docker_output(&["volume", "rm", &state.volume]);
@@ -3832,6 +3978,8 @@ mod tests {
             container: "lux-sample-abc123".to_string(),
             volume: "lux-sample-abc123-data".to_string(),
             image: LOCAL_ENGINE_IMAGE.to_string(),
+            studio_port: DEFAULT_STUDIO_PORT,
+            studio_container: "lux-sample-abc123-studio".to_string(),
         }
     }
 
