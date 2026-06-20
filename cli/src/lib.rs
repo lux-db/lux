@@ -279,7 +279,7 @@ const DEFAULT_RESP_PORT: u16 = 6379;
 /// Lux Studio image `lux studio` runs (tracks `:latest`, pulled each run, like
 /// the engine image). Serves the local web UI; talks to the engine from the
 /// browser over the engine's CORS-`*` HTTP API.
-const STUDIO_IMAGE: &str = "ghcr.io/lux-db/lux-studio:latest";
+const STUDIO_IMAGE: &str = "ghcr.io/lux-db/studio:latest";
 /// Default host port for Studio (Supabase Studio uses 54323; we follow suit).
 const DEFAULT_STUDIO_PORT: u16 = 54323;
 

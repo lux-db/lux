@@ -312,6 +312,9 @@ curl -fsSL https://luxdb.dev/install.sh | sh
 
 ```bash
 lux init                               # scaffold local Lux project files
+lux start                              # run a local engine + Studio (web UI) in Docker
+lux studio                             # open Lux Studio against the local engine
+lux stop                               # stop the local engine + Studio
 lux login                              # authenticate with a lux_ token
 lux link my-app                        # save a default project for this repo
 lux projects                           # list projects

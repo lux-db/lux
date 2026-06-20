@@ -47,6 +47,9 @@ Token and API URL are stored in `~/.lux/config.json`.
 
 ```bash
 lux init                                      # scaffold lux/config.toml and lux/migrations
+lux start                                     # run a local engine + Studio in Docker
+lux studio                                    # open Lux Studio (local web UI)
+lux stop                                      # stop the local engine + Studio
 lux login                                     # authenticate
 lux logout                                    # clear credentials
 lux link my-app                               # save a default project for this repo
@@ -71,6 +74,32 @@ lux migrate run my-app                        # run against a cloud project
 lux seed run                                  # run lux/seed.lux against the linked project
 lux types                                     # generate TypeScript types from your schema
 ```
+
+## Local development
+
+Run a full local stack in Docker, Supabase-style. `lux start` boots a local
+engine, applies your migrations (and seeds on a fresh volume), then launches
+**Lux Studio** — a local web UI to browse/edit tables, run console commands, and
+manage auth — pointed at that engine.
+
+```bash
+lux start                  # engine + Studio; prints connection info + the Studio URL
+lux start --no-studio      # engine only
+lux start --fresh          # recreate from a clean data volume (drops local data)
+lux studio                 # open Lux Studio in your browser (starts it if needed)
+lux status                 # show local engine status
+lux status -o env          # print LUX_* env lines for `eval`
+lux stop                   # stop the engine + Studio
+lux stop --clear           # also delete the local data volume
+```
+
+`lux start` writes `.env.local` with `LUX_URL`, `LUX_PUBLISHABLE_KEY`,
+`LUX_SECRET_KEY`, and `LUX_DIRECT_URL` so the SDK connects with no extra config.
+The local secret key equals the engine password, so a secret-key client gets
+operator access while a publishable-key client must sign in (JWT → grant-enforced
+user), mirroring production. Studio runs as a container
+(`ghcr.io/lux-db/studio`), pulled on each `lux start`, and talks to the engine
+directly from your browser; credentials never leave your machine.
 
 ## Local Connections
 
