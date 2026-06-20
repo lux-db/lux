@@ -133,6 +133,19 @@ enum Commands {
         #[command(subcommand)]
         action: SeedAction,
     },
+    /// Generate TypeScript types from your project schema.
+    Types {
+        #[arg(help = "Project name or ID (omit for the local engine)")]
+        project: Option<String>,
+        #[arg(short = 'H', long, help = "Host (for direct connection)")]
+        host: Option<String>,
+        #[arg(short, long, help = "Port (for direct connection)")]
+        port: Option<u16>,
+        #[arg(short = 'a', long, help = "Password (for direct connection)")]
+        password: Option<String>,
+        #[arg(short, long, help = "Write to a file instead of stdout")]
+        out: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2207,6 +2220,72 @@ pub async fn run() {
                 run_command_file(&mut target, &file, "Seed").await;
             }
         },
+        Commands::Types {
+            project,
+            host,
+            port,
+            password,
+            out,
+        } => {
+            let mut target = resolve_migrate_target(
+                project.as_deref(),
+                host.as_deref(),
+                port,
+                password.as_deref(),
+                &api_url_override,
+            )
+            .await;
+
+            let tlist = match target.exec("TLIST").await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".red(), e);
+                    std::process::exit(1);
+                }
+            };
+
+            let mut tables: Vec<TableModel> = Vec::new();
+            for table in parse_resp_array(&tlist) {
+                if is_system_table(&table) {
+                    continue;
+                }
+                match target.exec(&format!("TSCHEMA {table}")).await {
+                    Ok(schema) => {
+                        let cols = parse_resp_array(&schema)
+                            .iter()
+                            .filter_map(|line| parse_field_spec(line))
+                            .collect();
+                        tables.push((table, cols));
+                    }
+                    Err(e) => {
+                        eprintln!("{} reading schema for {table}: {e}", "Error:".red());
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            if tables.is_empty() {
+                eprintln!("{} no user tables found", "Warning:".yellow());
+            }
+
+            let ts = generate_types(&tables);
+            match out {
+                Some(path) => match std::fs::write(&path, &ts) {
+                    Ok(()) => println!(
+                        "{} wrote {} ({} table{})",
+                        "✓".green(),
+                        path,
+                        tables.len(),
+                        if tables.len() == 1 { "" } else { "s" }
+                    ),
+                    Err(e) => {
+                        eprintln!("{} writing {path}: {e}", "Error:".red());
+                        std::process::exit(1);
+                    }
+                },
+                None => print!("{ts}"),
+            }
+        }
     }
 }
 
@@ -3083,6 +3162,143 @@ fn get_local_migrations(dir: &Path) -> Vec<(String, String)> {
     files
 }
 
+// ---------------------------------------------------------------------------
+// `lux types` — TypeScript codegen from the project schema (TLIST + TSCHEMA)
+// ---------------------------------------------------------------------------
+
+/// Parse a rendered array response back into its string elements. Handles both
+/// the local RESP rendering ("1) a\n2) b") and the cloud rendering (plain
+/// newline-joined elements). Empty/sentinel lines are skipped.
+fn parse_resp_array(rendered: &str) -> Vec<String> {
+    rendered
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line == "(empty array)" || line == "(nil)" {
+                return None;
+            }
+            // Strip a leading "N) " index prefix (local RESP rendering only).
+            if let Some(idx) = line.find(") ") {
+                let prefix = &line[..idx];
+                if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
+                    return Some(line[idx + 2..].to_string());
+                }
+            }
+            Some(line.to_string())
+        })
+        .collect()
+}
+
+/// One generated column: (name, ts_type, nullable).
+type TsColumn = (String, &'static str, bool);
+/// One table model: (table_name, columns).
+type TableModel = (String, Vec<TsColumn>);
+
+/// Map a Lux column type token (STR, INT, UUID, VECTOR(384), JSON, ...) to a TS type.
+fn lux_type_to_ts(token: &str) -> &'static str {
+    let t = token.to_uppercase();
+    if t.starts_with("VECTOR") {
+        return "number[]";
+    }
+    match t.as_str() {
+        "STR" => "string",
+        "INT" | "FLOAT" => "number",
+        "BOOL" => "boolean",
+        "TIMESTAMP" => "number",
+        "UUID" => "string",
+        "JSON" => "Json",
+        "ARRAY" => "Json[]",
+        "REFERENCES" => "string", // legacy ref column (FK to id)
+        _ => "unknown",
+    }
+}
+
+/// Parse one TSCHEMA field spec ("email STR UNIQUE NOT NULL") into
+/// (name, ts_type, nullable).
+fn parse_field_spec(spec: &str) -> Option<TsColumn> {
+    let mut tokens = spec.split_whitespace();
+    let name = tokens.next()?.to_string();
+    let type_token = tokens.next()?;
+    let ts = lux_type_to_ts(type_token);
+    let upper = spec.to_uppercase();
+    // PRIMARY KEY and NOT NULL both make a column required (non-null). "SET NULL"
+    // (on-delete) does not contain "NOT NULL", so this stays correct for FKs.
+    let required = upper.contains("PRIMARY KEY") || upper.contains("NOT NULL");
+    Some((name, ts, !required))
+}
+
+/// snake_case / dotted table name -> PascalCase interface name.
+fn to_pascal_case(name: &str) -> String {
+    name.split(['_', '.', '-'])
+        .filter(|s| !s.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => {
+                    first.to_uppercase().collect::<String>()
+                        + &chars.as_str().to_lowercase()
+                }
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+/// True if `s` is a valid bare TS identifier (else the key needs quoting).
+fn is_ts_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Render the full `.ts` output: a `Json` alias, a Row interface per table,
+/// and a `Database` map keyed by table name.
+fn generate_types(tables: &[TableModel]) -> String {
+    let mut out = String::new();
+    out.push_str("// Generated by Lux — `lux types`. Do not edit by hand.\n\n");
+    out.push_str(
+        "export type Json =\n  | string\n  | number\n  | boolean\n  | null\n  | Json[]\n  | { [key: string]: Json };\n\n",
+    );
+    for (table, cols) in tables {
+        let iface = to_pascal_case(table);
+        out.push_str(&format!("export interface {iface} {{\n"));
+        for (name, ts, nullable) in cols {
+            let ty = if *nullable {
+                format!("{ts} | null")
+            } else {
+                (*ts).to_string()
+            };
+            let key = if is_ts_ident(name) {
+                name.clone()
+            } else {
+                format!("\"{name}\"")
+            };
+            out.push_str(&format!("  {key}: {ty};\n"));
+        }
+        out.push_str("}\n\n");
+    }
+    out.push_str("export interface Database {\n");
+    for (table, _) in tables {
+        let iface = to_pascal_case(table);
+        let key = if is_ts_ident(table) {
+            table.clone()
+        } else {
+            format!("\"{table}\"")
+        };
+        out.push_str(&format!("  {key}: {iface};\n"));
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// True for engine-internal tables that should not appear in generated types.
+fn is_system_table(name: &str) -> bool {
+    name.starts_with("auth.") || name.starts_with("__") || name.starts_with("_t:")
+}
+
 fn parse_migration_commands(content: &str) -> Result<Vec<Vec<String>>, String> {
     let (statements, saw_semicolon) = split_statements(content);
     if !saw_semicolon {
@@ -3252,6 +3468,66 @@ fn simple_hash(content: &str) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn resp_array_strips_index_prefixes() {
+        assert_eq!(
+            parse_resp_array("1) authors\n2) posts\n3) post_tags"),
+            vec!["authors", "posts", "post_tags"]
+        );
+        // Cloud rendering: plain newline-joined elements (no index prefix).
+        assert_eq!(parse_resp_array("authors\nposts"), vec!["authors", "posts"]);
+        // Non-array renderings produce nothing.
+        assert!(parse_resp_array("(empty array)").is_empty());
+        assert!(parse_resp_array("").is_empty());
+        // The `) ` inside a schema line isn't mistaken for the index prefix.
+        assert_eq!(
+            parse_resp_array("1) author_id UUID REFERENCES authors(id) ON DELETE CASCADE"),
+            vec!["author_id UUID REFERENCES authors(id) ON DELETE CASCADE"]
+        );
+    }
+
+    #[test]
+    fn field_spec_to_ts_column() {
+        assert_eq!(parse_field_spec("id UUID PRIMARY KEY"), Some(("id".into(), "string", false)));
+        assert_eq!(parse_field_spec("email STR UNIQUE NOT NULL"), Some(("email".into(), "string", false)));
+        assert_eq!(parse_field_spec("age INT"), Some(("age".into(), "number", true)));
+        assert_eq!(parse_field_spec("active BOOL"), Some(("active".into(), "boolean", true)));
+        assert_eq!(parse_field_spec("meta JSON"), Some(("meta".into(), "Json", true)));
+        assert_eq!(parse_field_spec("tags ARRAY"), Some(("tags".into(), "Json[]", true)));
+        assert_eq!(parse_field_spec("embedding VECTOR(384)"), Some(("embedding".into(), "number[]", true)));
+        // FK column: nullable (ON DELETE SET NULL must not read as NOT NULL).
+        assert_eq!(
+            parse_field_spec("author_id UUID REFERENCES authors(id) ON DELETE SET NULL"),
+            Some(("author_id".into(), "string", true))
+        );
+    }
+
+    #[test]
+    fn pascal_case_table_names() {
+        assert_eq!(to_pascal_case("authors"), "Authors");
+        assert_eq!(to_pascal_case("post_tags"), "PostTags");
+        assert_eq!(to_pascal_case("auth.users"), "AuthUsers");
+    }
+
+    #[test]
+    fn generate_types_output() {
+        let tables = vec![(
+            "authors".to_string(),
+            vec![
+                ("id".to_string(), "string", false),
+                ("name".to_string(), "string", false),
+                ("bio".to_string(), "string", true),
+            ],
+        )];
+        let ts = generate_types(&tables);
+        assert!(ts.contains("export type Json"));
+        assert!(ts.contains("export interface Authors {"));
+        assert!(ts.contains("  id: string;"));
+        assert!(ts.contains("  bio: string | null;"));
+        assert!(ts.contains("export interface Database {"));
+        assert!(ts.contains("  authors: Authors;"));
+    }
 
     #[test]
     fn parses_lux_connection_urls_with_password() {
