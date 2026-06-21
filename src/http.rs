@@ -1035,6 +1035,10 @@ struct LiveVectorNearSpec {
 struct LiveQueryState {
     query: Value,
     rows: HashMap<String, Value>,
+    /// Column that identifies a row for diffing. Resolved from the table's
+    /// primary key so `.live()` works for any PK name, not just `id`. `None`
+    /// for non-table queries (vector/raw), which fall back to `id`/`key`.
+    pk_field: Option<String>,
 }
 
 enum LiveSubscription {
@@ -1363,10 +1367,12 @@ async fn build_live_subscription(
             broker.ksubscribe(&format!("_t:{}:row:*", table_spec.table)),
         ];
         let rows = fetch_live_table_rows(store, cache, &table_spec)?;
+        let pk_field = live_table_pk_field(store, cache, &table_spec.table);
         let query = json!({"type":"table","table":table_spec.table});
         let state = LiveQueryState {
             query: query.clone(),
-            rows: index_live_rows(rows.clone()),
+            rows: index_live_rows(rows.clone(), pk_field.as_deref()),
+            pk_field,
         };
         return Ok((
             LiveSubscription::Table {
@@ -1385,7 +1391,8 @@ async fn build_live_subscription(
             json!({"type":"vector.near","k":vector_spec.k,"threshold":vector_spec.threshold});
         let state = LiveQueryState {
             query: query.clone(),
-            rows: index_live_rows(rows.clone()),
+            rows: index_live_rows(rows.clone(), None),
+            pk_field: None,
         };
         return Ok((
             LiveSubscription::VectorNear {
@@ -1558,7 +1565,7 @@ fn diff_live_query(
     cause: Option<Value>,
 ) -> Vec<(String, Value)> {
     let previous = std::mem::take(&mut state.rows);
-    let next = index_live_rows(next_rows);
+    let next = index_live_rows(next_rows, state.pk_field.as_deref());
     let mut events = Vec::new();
 
     for (pk, row) in &next {
@@ -1923,19 +1930,40 @@ fn live_value_to_token(value: &Value) -> String {
     }
 }
 
-fn index_live_rows(rows: Vec<Value>) -> HashMap<String, Value> {
+/// Resolve a table's primary key column so live diffs can identify rows. Falls
+/// back to `None` (the `id`/`key` default) when the schema can't be loaded.
+fn live_table_pk_field(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    table: &str,
+) -> Option<String> {
+    crate::tables::load_schema(store, cache, table, Instant::now())
+        .ok()?
+        .into_iter()
+        .find(|f| f.primary_key)
+        .map(|f| f.name)
+}
+
+fn index_live_rows(rows: Vec<Value>, pk_field: Option<&str>) -> HashMap<String, Value> {
     let mut indexed = HashMap::new();
     for row in rows {
-        let Some(id) = row.get("id").or_else(|| row.get("key")).and_then(|value| {
-            value
-                .as_str()
-                .map(String::from)
-                .or_else(|| value.as_i64().map(|n| n.to_string()))
-                .or_else(|| value.as_u64().map(|n| n.to_string()))
-        }) else {
+        // Key by the table's actual PK column when known, else fall back to
+        // `id`/`key` (vector and raw-key subscriptions).
+        let key = pk_field
+            .and_then(|f| row.get(f))
+            .or_else(|| row.get("id"))
+            .or_else(|| row.get("key"))
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .map(String::from)
+                    .or_else(|| value.as_i64().map(|n| n.to_string()))
+                    .or_else(|| value.as_u64().map(|n| n.to_string()))
+            });
+        let Some(key) = key else {
             continue;
         };
-        indexed.insert(id, row);
+        indexed.insert(key, row);
     }
     indexed
 }

@@ -458,3 +458,79 @@ async fn live_websocket_vector_near_receives_vector_changes() {
     assert_eq!(insert["cause"]["kind"], "vector.set");
     assert_eq!(insert["cause"]["key"], "doc:1");
 }
+
+// Regression: a table whose primary key is not literally `id` must still get
+// live insert/update/delete events. The diff used to index rows by a hardcoded
+// `id`/`key` field, so any custom PK (e.g. `user_id`) silently produced no
+// change events even though the snapshot worked. Covers the `cursors` shape
+// (custom PK + FLOAT column) used by realtime apps.
+#[tokio::test]
+async fn live_table_events_with_custom_pk() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let pw = "secret-pw-live";
+    let _server = start_lux_with_env(
+        resp_port,
+        http_port,
+        Some(pw),
+        &[("LUX_AUTH_ENABLED", "true")],
+    );
+
+    let (status, created) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"cursors","columns":[{"name":"user_id","type":"STR","primaryKey":true},{"name":"x","type":"FLOAT"},{"name":"name","type":"STR"}]}"#,
+        Some(pw),
+    );
+    assert_eq!(status, 200, "create: {created}");
+
+    let mut ws = connect_live(http_port, Some(pw)).await;
+    send_json(
+        &mut ws,
+        json!({"type":"live.subscribe","id":"c","spec":{"kind":"table","table":"cursors"}}),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws).await["type"], "live.subscribed");
+    assert_eq!(recv_live_event(&mut ws, "c").await["kind"], "snapshot");
+
+    // insert
+    let (status, _) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/cursors",
+        r#"{"user_id":"u1","x":0.5,"name":"otter"}"#,
+        Some(pw),
+    );
+    assert_eq!(status, 200);
+    let insert = recv_live_event(&mut ws, "c").await;
+    assert_eq!(insert["kind"], "insert");
+    assert_eq!(insert["pk"], "u1");
+    assert_eq!(insert["row"]["name"], "otter");
+
+    // update (PATCH keyed on the custom PK)
+    let (status, _) = http_json_request(
+        http_port,
+        "PATCH",
+        "/v1/tables/cursors?where=user_id=u1",
+        r#"{"x":0.9}"#,
+        Some(pw),
+    );
+    assert_eq!(status, 200);
+    let update = recv_live_event(&mut ws, "c").await;
+    assert_eq!(update["kind"], "update");
+    assert_eq!(update["pk"], "u1");
+
+    // delete
+    let (status, _) = http_json_request(
+        http_port,
+        "DELETE",
+        "/v1/tables/cursors?where=user_id=u1",
+        "",
+        Some(pw),
+    );
+    assert_eq!(status, 200);
+    let delete = recv_live_event(&mut ws, "c").await;
+    assert_eq!(delete["kind"], "delete");
+    assert_eq!(delete["pk"], "u1");
+}
