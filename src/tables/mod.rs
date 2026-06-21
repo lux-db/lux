@@ -2056,6 +2056,14 @@ fn parse_in_list(args: &[&str], i: &mut usize) -> Result<Vec<String>, String> {
         return Err("ERR IN operator requires a parenthesized list, e.g. IN ( a b c )".to_string());
     }
     *i += 1; // consume "("
+             // A subquery (`IN ( SELECT ... )`) is only resolvable inside a grant
+             // predicate, not a user query. Reject it explicitly rather than treating the
+             // SELECT keywords as literal values (which silently matched nothing).
+    if *i < args.len() && args[*i].eq_ignore_ascii_case("SELECT") {
+        return Err(
+            "ERR subqueries (IN ( SELECT ... )) are only supported in grant predicates, not in a query WHERE".to_string(),
+        );
+    }
     let mut values = Vec::new();
     while *i < args.len() && args[*i] != ")" {
         values.push(args[*i].to_string());

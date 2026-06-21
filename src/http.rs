@@ -1972,17 +1972,19 @@ fn parse_http_where_tokens(where_clause: &str) -> Result<Vec<String>, String> {
     Ok(tokens)
 }
 
-/// Split a WHERE string on whitespace, but keep a single-quoted span as ONE
-/// token so values may contain spaces, SQL keywords, or newlines (e.g.
-/// `name = 'New York'`). Inside quotes, `\'` is a literal quote and `\\` a
-/// literal backslash. Without this, `split_whitespace` turns `New York` into two
-/// tokens and the query parser rejects `York` as an unexpected keyword.
+/// Split a WHERE string into tokens. Whitespace separates tokens, a single-quoted
+/// span stays ONE token so values may contain spaces/keywords/newlines (e.g.
+/// `name = 'New York'`), and a glued comparison operator (`=`, `!=`, `>`, `<`,
+/// `>=`, `<=`) is split out so the natural `col=value` form works the same as the
+/// spaced `col = value` form. Inside quotes, `\'` is a literal quote and `\\` a
+/// literal backslash. (A value that must contain a raw operator char should be
+/// single-quoted, the same rule as values with spaces.)
 fn tokenize_where(s: &str) -> Result<Vec<String>, String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
     let mut building = false;
     let mut in_quote = false;
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if in_quote {
             match c {
@@ -2004,6 +2006,23 @@ fn tokenize_where(s: &str) -> Result<Vec<String>, String> {
             // that worked before working; only whitespace values need quoting.
             in_quote = true;
             building = true;
+        } else if matches!(c, '=' | '<' | '>') || (c == '!' && chars.peek() == Some(&'=')) {
+            // A comparison operator at any position ends the current token (the
+            // field/value) and becomes its own token, so `col=value`,
+            // `col>=value`, `col != value` all tokenize uniformly.
+            if building {
+                tokens.push(std::mem::take(&mut cur));
+                building = false;
+            }
+            let mut op = String::from(c);
+            if c == '!' {
+                chars.next(); // consume '=' (peeked above)
+                op.push('=');
+            } else if (c == '<' || c == '>') && chars.peek() == Some(&'=') {
+                chars.next();
+                op.push('=');
+            }
+            tokens.push(op);
         } else if c.is_whitespace() {
             if building {
                 tokens.push(std::mem::take(&mut cur));
@@ -3850,6 +3869,36 @@ mod tests {
         assert_eq!(
             tokenize_where("b = 'l1\nl2'").unwrap(),
             vec!["b", "=", "l1\nl2"]
+        );
+    }
+
+    #[test]
+    fn tokenize_where_splits_glued_operators() {
+        // The natural `col=value` form tokenizes like the spaced form.
+        assert_eq!(
+            tokenize_where("status=active").unwrap(),
+            vec!["status", "=", "active"]
+        );
+        assert_eq!(tokenize_where("qty>=5").unwrap(), vec!["qty", ">=", "5"]);
+        assert_eq!(tokenize_where("qty<=5").unwrap(), vec!["qty", "<=", "5"]);
+        assert_eq!(tokenize_where("a!=b").unwrap(), vec!["a", "!=", "b"]);
+        assert_eq!(tokenize_where("a>b").unwrap(), vec!["a", ">", "b"]);
+        // glued conditions joined by AND
+        assert_eq!(
+            tokenize_where("status=active AND qty>=5").unwrap(),
+            vec!["status", "=", "active", "AND", "qty", ">=", "5"]
+        );
+        // negative numbers survive (only =,<,>,! are operators)
+        assert_eq!(tokenize_where("qty=-5").unwrap(), vec!["qty", "=", "-5"]);
+        // a lone '!' in an unquoted value is preserved (only != is an operator)
+        assert_eq!(
+            tokenize_where("msg = hi!").unwrap(),
+            vec!["msg", "=", "hi!"]
+        );
+        // an operator char inside a quoted value is NOT split
+        assert_eq!(
+            tokenize_where("expr = 'a=b'").unwrap(),
+            vec!["expr", "=", "a=b"]
         );
     }
 
