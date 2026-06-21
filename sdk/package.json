@@ -1,12 +1,17 @@
 {
     "name": "@luxdb/sdk",
-    "version": "2.4.0",
+    "version": "2.5.0",
     "description": "Official Lux TypeScript SDK for app data, auth, tables, vectors, realtime, and Redis-compatible direct access",
     "main": "./dist/cjs/index.js",
     "module": "./dist/esm/index.js",
     "types": "./dist/types/index.d.ts",
     "exports": {
         ".": {
+            "browser": {
+                "types": "./dist/types/index.browser.d.ts",
+                "import": "./dist/esm/index.browser.js",
+                "require": "./dist/cjs/index.browser.js"
+            },
             "types": "./dist/types/index.d.ts",
             "import": "./dist/esm/index.js",
             "require": "./dist/cjs/index.js",
