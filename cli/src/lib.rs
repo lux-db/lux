@@ -397,10 +397,14 @@ fn project_slug() -> String {
     )
 }
 
-/// True if `port` is bindable on localhost right now (so we can detect a port
-/// already taken by another local engine and pick a free one instead).
+/// True if `port` is bindable right now (so we can detect a port already taken
+/// and pick a free one instead). Binds `0.0.0.0` to match how Docker publishes
+/// ports (`-p host:container` binds all interfaces): a check against `127.0.0.1`
+/// can pass while another container already holds `0.0.0.0:port` (common on
+/// macOS), and then `docker run` fails to bind. `0.0.0.0` is the bind that
+/// actually conflicts with Docker's, so it's the correct probe.
 fn port_is_free(port: u16) -> bool {
-    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+    std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
 
 /// Return `preferred` if free, else the next free port above it. Lets multiple
@@ -3792,8 +3796,9 @@ mod tests {
 
     #[test]
     fn free_port_returns_preferred_when_open() {
-        // Bind a port, then confirm free_port_from skips it to a higher one.
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        // Bind on 0.0.0.0 (what `port_is_free` probes, matching Docker's publish
+        // bind), then confirm free_port_from skips it to a higher free one.
+        let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
         let taken = listener.local_addr().unwrap().port();
         let chosen = free_port_from(taken);
         assert_ne!(chosen, taken, "should not pick the bound port");
