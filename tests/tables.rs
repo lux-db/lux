@@ -1459,3 +1459,251 @@ fn tselect_aggregates_integration() {
     child.kill().ok();
     child.wait().ok();
 }
+
+// --- Row TTL ---------------------------------------------------------------
+
+#[test]
+fn ttl_row_expires_and_frees_pk() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    assert_eq!(
+        send(
+            &mut s,
+            &["TCREATE", "pres", "user_id STR PRIMARY KEY,", "room STR"]
+        ),
+        "+OK"
+    );
+    let r = send(
+        &mut s,
+        &[
+            "TINSERT", "pres", "user_id", "u1", "room", "main", "TTL", "1",
+        ],
+    );
+    assert!(!r.starts_with('-'), "tinsert ttl: {}", r);
+
+    let r = send(&mut s, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(
+        r.contains("u1"),
+        "row should be present before expiry: {}",
+        r
+    );
+    // hidden ttl field must not leak into the projection
+    assert!(!r.contains("ttl"), "hidden ttl field leaked: {}", r);
+
+    std::thread::sleep(Duration::from_millis(1400));
+
+    let r = send(&mut s, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(
+        r.starts_with("*0"),
+        "table should be empty after expiry: {}",
+        r
+    );
+
+    // No orphan: the PK is reusable and a fresh insert (no TTL) survives.
+    let r = send(
+        &mut s,
+        &["TINSERT", "pres", "user_id", "u1", "room", "again"],
+    );
+    assert!(
+        !r.starts_with('-'),
+        "PK should be reusable after expiry: {}",
+        r
+    );
+    let r = send(&mut s, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(
+        r.contains("again"),
+        "reinserted row should be present: {}",
+        r
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn ttl_bare_update_keeps_deadline() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    assert_eq!(
+        send(
+            &mut s,
+            &["TCREATE", "pres", "user_id STR PRIMARY KEY,", "room STR"]
+        ),
+        "+OK"
+    );
+    send(
+        &mut s,
+        &[
+            "TINSERT", "pres", "user_id", "u1", "room", "main", "TTL", "1",
+        ],
+    );
+    // A bare update (no TTL) must leave the deadline untouched.
+    let r = send(
+        &mut s,
+        &[
+            "TUPDATE", "pres", "SET", "room", "moved", "WHERE", "user_id", "=", "u1",
+        ],
+    );
+    assert!(!r.starts_with('-'), "tupdate: {}", r);
+
+    std::thread::sleep(Duration::from_millis(1400));
+    let r = send(&mut s, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(
+        r.starts_with("*0"),
+        "row should still expire after a bare update: {}",
+        r
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn ttl_zero_clears_deadline() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    assert_eq!(
+        send(
+            &mut s,
+            &["TCREATE", "pres", "user_id STR PRIMARY KEY,", "room STR"]
+        ),
+        "+OK"
+    );
+    send(
+        &mut s,
+        &[
+            "TINSERT", "pres", "user_id", "u1", "room", "main", "TTL", "1",
+        ],
+    );
+    // TTL 0 clears the deadline -> the row becomes permanent.
+    let r = send(
+        &mut s,
+        &[
+            "TUPDATE", "pres", "SET", "room", "kept", "WHERE", "user_id", "=", "u1", "TTL", "0",
+        ],
+    );
+    assert!(!r.starts_with('-'), "tupdate ttl 0: {}", r);
+
+    std::thread::sleep(Duration::from_millis(1400));
+    let r = send(&mut s, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(
+        r.contains("kept"),
+        "row should survive after TTL 0 cleared it: {}",
+        r
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn ttl_upsert_refresh_keeps_alive() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    assert_eq!(
+        send(
+            &mut s,
+            &["TCREATE", "pres", "user_id STR PRIMARY KEY,", "x STR"]
+        ),
+        "+OK"
+    );
+    // Re-upsert with TTL faster than it expires -> the row stays alive.
+    for i in 0..6 {
+        let r = send(
+            &mut s,
+            &[
+                "TUPSERT",
+                "pres",
+                "user_id",
+                "u1",
+                "x",
+                &i.to_string(),
+                "ON",
+                "CONFLICT",
+                "user_id",
+                "TTL",
+                "1",
+            ],
+        );
+        assert!(!r.starts_with('-'), "tupsert refresh: {}", r);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let r = send(&mut s, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(
+        r.contains("u1"),
+        "refreshed row should still be alive: {}",
+        r
+    );
+
+    // Stop refreshing -> it expires.
+    std::thread::sleep(Duration::from_millis(1400));
+    let r = send(&mut s, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(
+        r.starts_with("*0"),
+        "row should expire once refresh stops: {}",
+        r
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn ttl_table_default_applies() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // WITH TTL gives every row a default expiry.
+    assert_eq!(
+        send(
+            &mut s,
+            &[
+                "TCREATE",
+                "pres",
+                "user_id STR PRIMARY KEY,",
+                "room STR",
+                "WITH",
+                "TTL",
+                "1"
+            ]
+        ),
+        "+OK"
+    );
+    // No explicit TTL -> inherits the table default.
+    let r = send(
+        &mut s,
+        &["TINSERT", "pres", "user_id", "u1", "room", "main"],
+    );
+    assert!(!r.starts_with('-'), "tinsert: {}", r);
+    std::thread::sleep(Duration::from_millis(1400));
+    let r = send(&mut s, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(r.starts_with("*0"), "default-TTL row should expire: {}", r);
+
+    // Explicit TTL 0 opts a row out of the table default -> permanent.
+    let r = send(
+        &mut s,
+        &[
+            "TINSERT", "pres", "user_id", "u2", "room", "main", "TTL", "0",
+        ],
+    );
+    assert!(!r.starts_with('-'), "tinsert ttl 0: {}", r);
+    std::thread::sleep(Duration::from_millis(1400));
+    let r = send(&mut s, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(
+        r.contains("u2"),
+        "TTL 0 should override the table default: {}",
+        r
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}

@@ -2997,6 +2997,23 @@ impl Runtime {
             });
         }
 
+        // Table-row TTL sweep: expire due rows (full delete bookkeeping) and fire
+        // one `.live()` key-event per affected table so subscribers get a delete.
+        {
+            let store = runtime.store.clone();
+            let cache = runtime.schema_cache.clone();
+            let broker = runtime.broker.clone();
+            background_tasks.spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let now = Instant::now();
+                    for table in tables::expire_due_rows(&store, &cache, now) {
+                        broker.enqueue_key_event(table.as_bytes(), b"TEXPIRE");
+                    }
+                }
+            });
+        }
+
         if runtime.config.storage.mode == StorageMode::Tiered {
             {
                 let store = runtime.store.clone();

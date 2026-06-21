@@ -50,6 +50,28 @@ fn split_on_conflict<'a>(args: &'a [&'a [u8]]) -> (&'a [&'a [u8]], Option<String
     (args, None)
 }
 
+/// Split a trailing `TTL <seconds>` off a write command, returning the
+/// remaining args and the TTL op. `TTL 0` clears any existing TTL; a positive
+/// value sets/refreshes it. Must be stripped before `ON CONFLICT` (upsert) and
+/// before WHERE detection (update), and after RETURNING — i.e. `TTL` is the last
+/// clause except for a trailing RETURNING. (Like `RETURNING`/`ON CONFLICT`, a
+/// literal column named `ttl` at the tail would collide; use the HTTP `?ttl=`
+/// form to avoid that.)
+fn split_ttl<'a>(args: &'a [&'a [u8]]) -> (&'a [&'a [u8]], Option<tables::TtlOp>) {
+    let n = args.len();
+    if n >= 2 && arg_str(args[n - 2]).eq_ignore_ascii_case("TTL") {
+        if let Ok(secs) = arg_str(args[n - 1]).parse::<u64>() {
+            let op = if secs == 0 {
+                tables::TtlOp::Clear
+            } else {
+                tables::TtlOp::Set(secs)
+            };
+            return (&args[..n - 2], Some(op));
+        }
+    }
+    (args, None)
+}
+
 /// Write rows (optionally projected to `projection`) as a RESP array-of-rows,
 /// each row a flat array of field/value pairs, matching TSELECT's shape.
 fn write_rows(out: &mut BytesMut, rows: &[Vec<(String, String)>], projection: &[String]) {
@@ -108,6 +130,7 @@ pub fn cmd_tinsert(
     now: Instant,
 ) -> CmdResult {
     let (args, returning) = split_returning(args);
+    let (args, ttl) = split_ttl(args);
     // Allow `TINSERT table` with no field pairs: a row whose columns are all
     // auto-generated (uuid PK, DEFAULT now(), etc.) is fully valid.
     if args.len() < 2 || !(args.len() - 2).is_multiple_of(2) {
@@ -126,12 +149,13 @@ pub fn cmd_tinsert(
         i += 2;
     }
     match returning {
-        Some(proj) => match tables::table_insert_returning(store, cache, table, &field_values, now)
-        {
-            Ok(row) => write_rows(out, &[row], &proj),
-            Err(e) => resp::write_error(out, &e),
-        },
-        None => match tables::table_insert(store, cache, table, &field_values, now) {
+        Some(proj) => {
+            match tables::table_insert_returning_ttl(store, cache, table, &field_values, ttl, now) {
+                Ok(row) => write_rows(out, &[row], &proj),
+                Err(e) => resp::write_error(out, &e),
+            }
+        }
+        None => match tables::table_insert_ttl(store, cache, table, &field_values, ttl, now) {
             Ok(id) => resp::write_integer(out, id),
             Err(e) => resp::write_error(out, &e),
         },
@@ -146,8 +170,9 @@ pub fn cmd_tupsert(
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
-    // TUPSERT <table> <col> <val> ... [ON CONFLICT <col>] [RETURNING *|cols]
+    // TUPSERT <table> <col> <val> ... [ON CONFLICT <col>] [TTL <secs>] [RETURNING *|cols]
     let (args, returning) = split_returning(args);
+    let (args, ttl) = split_ttl(args);
     let (args, conflict_col) = split_on_conflict(args);
     if args.len() < 2 || !(args.len() - 2).is_multiple_of(2) {
         resp::write_error(out, "ERR wrong number of arguments for 'tupsert' command");
@@ -166,12 +191,13 @@ pub fn cmd_tupsert(
     }
     // Upsert always returns the resulting row; RETURNING can project it.
     let proj = returning.unwrap_or_else(|| vec!["*".to_string()]);
-    match tables::table_upsert_returning(
+    match tables::table_upsert_returning_ttl(
         store,
         cache,
         table,
         &field_values,
         conflict_col.as_deref(),
+        ttl,
         now,
     ) {
         Ok(row) => write_rows(out, &[row], &proj),
@@ -187,9 +213,10 @@ pub fn cmd_tupdate(
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
-    // TUPDATE <table> SET <col> <val> [<col> <val> ...] WHERE <conditions> [RETURNING ...]
+    // TUPDATE <table> SET <col> <val> [<col> <val> ...] WHERE <conditions> [TTL <secs>] [RETURNING ...]
     // Minimum: TUPDATE users SET name John WHERE id = 1
     let (args, returning) = split_returning(args);
+    let (args, ttl) = split_ttl(args);
     if args.len() < 7 {
         resp::write_error(
             out,
@@ -246,23 +273,30 @@ pub fn cmd_tupdate(
     let where_args: Vec<&str> = args[where_pos + 1..].iter().map(|a| arg_str(a)).collect();
 
     match returning {
-        Some(proj) => match tables::table_update_where_returning(
+        Some(proj) => match tables::table_update_where_returning_ttl(
             store,
             cache,
             table,
             &field_values,
             &where_args,
+            ttl,
             now,
         ) {
             Ok(rows) => write_rows(out, &rows, &proj),
             Err(e) => resp::write_error(out, &e),
         },
-        None => {
-            match tables::table_update_where(store, cache, table, &field_values, &where_args, now) {
-                Ok(count) => resp::write_integer(out, count),
-                Err(e) => resp::write_error(out, &e),
-            }
-        }
+        None => match tables::table_update_where_ttl(
+            store,
+            cache,
+            table,
+            &field_values,
+            &where_args,
+            ttl,
+            now,
+        ) {
+            Ok(count) => resp::write_integer(out, count),
+            Err(e) => resp::write_error(out, &e),
+        },
     }
     CmdResult::Written
 }

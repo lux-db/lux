@@ -2809,6 +2809,17 @@ fn json_obj_to_pairs(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<(S
         .collect()
 }
 
+/// Parse `?ttl=<secs>` into a row-TTL op. Absent => `None` (inherit existing);
+/// `0` => clear; positive => set/refresh to now + secs.
+fn parse_ttl_param(params: &[(String, String)]) -> Option<crate::tables::TtlOp> {
+    let secs = get_param(params, "ttl")?.parse::<u64>().ok()?;
+    Some(if secs == 0 {
+        crate::tables::TtlOp::Clear
+    } else {
+        crate::tables::TtlOp::Set(secs)
+    })
+}
+
 fn route_table_insert(
     table: &str,
     params: &[(String, String)],
@@ -2833,6 +2844,7 @@ fn route_table_insert(
     // that column (default: the primary key).
     let conflict = get_param(params, "on_conflict");
     let is_upsert = conflict.is_some() || get_param(params, "upsert") == Some("true");
+    let ttl = parse_ttl_param(params);
 
     let write_one = |obj: &serde_json::Map<String, serde_json::Value>| {
         let pairs = json_obj_to_pairs(obj);
@@ -2841,9 +2853,9 @@ fn route_table_insert(
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         if is_upsert {
-            crate::tables::table_upsert_returning(store, cache, table, &fv, conflict, now)
+            crate::tables::table_upsert_returning_ttl(store, cache, table, &fv, conflict, ttl, now)
         } else {
-            crate::tables::table_insert_returning(store, cache, table, &fv, now)
+            crate::tables::table_insert_returning_ttl(store, cache, table, &fv, ttl, now)
         }
     };
 
@@ -2871,11 +2883,13 @@ fn route_table_insert(
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str()))
                         .collect();
-                    crate::tables::table_upsert_returning(store, cache, table, &fv, conflict, now)
+                    crate::tables::table_upsert_returning_ttl(
+                        store, cache, table, &fv, conflict, ttl, now,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()
         } else {
-            crate::tables::table_insert_many_returning(store, cache, table, &rows_in, now)
+            crate::tables::table_insert_many_returning_ttl(store, cache, table, &rows_in, ttl, now)
         };
         return match result {
             Ok(rows) => {
@@ -3005,12 +3019,14 @@ fn route_table_update(
     let where_args: Vec<&str> = where_tokens.iter().map(|s| s.as_str()).collect();
 
     let now = Instant::now();
-    match crate::tables::table_update_where_returning(
+    let ttl = parse_ttl_param(params);
+    match crate::tables::table_update_where_returning_ttl(
         store,
         cache,
         table,
         &field_values,
         &where_args,
+        ttl,
         now,
     ) {
         Ok(rows) => {

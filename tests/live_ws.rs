@@ -534,3 +534,50 @@ async fn live_table_events_with_custom_pk() {
     assert_eq!(delete["kind"], "delete");
     assert_eq!(delete["pk"], "u1");
 }
+
+// Row TTL: an expiring row must push a `.live()` delete to subscribers, the same
+// way an explicit TDELETE does. Covers the realtime half of table-row TTL.
+#[tokio::test]
+async fn live_table_row_ttl_emits_delete() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, None);
+
+    let (status, created) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"pres","columns":[{"name":"user_id","type":"STR","primaryKey":true},{"name":"room","type":"STR"}]}"#,
+        None,
+    );
+    assert_eq!(status, 200, "create: {created}");
+
+    let mut ws = connect_live(http_port, None).await;
+    send_json(
+        &mut ws,
+        json!({"type":"live.subscribe","id":"p","spec":{"kind":"table","table":"pres"}}),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws).await["type"], "live.subscribed");
+    assert_eq!(recv_live_event(&mut ws, "p").await["kind"], "snapshot");
+
+    let (status, inserted) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/pres?ttl=1",
+        r#"{"user_id":"u1","room":"main"}"#,
+        None,
+    );
+    assert_eq!(status, 200, "insert: {inserted}");
+    let insert = recv_live_event(&mut ws, "p").await;
+    assert_eq!(insert["kind"], "insert");
+    assert_eq!(insert["pk"], "u1");
+
+    // The TTL sweep should expire the row ~1s later and emit a delete.
+    let delete = recv_live_event(&mut ws, "p").await;
+    assert_eq!(
+        delete["kind"], "delete",
+        "expected expiry delete, got {delete}"
+    );
+    assert_eq!(delete["pk"], "u1");
+}

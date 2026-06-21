@@ -374,29 +374,34 @@ export class LuxProjectTable<T extends object> {
 		return this.select<T>().live() as Promise<LuxLiveResult<T>>;
 	}
 
-	insert(row: ProjectRowInput<T>): LuxProjectInsertBuilder<unknown>;
-	insert(rows: Array<ProjectRowInput<T>>): LuxProjectInsertBuilder<unknown[]>;
+	insert(row: ProjectRowInput<T>, options?: { ttl?: number }): LuxProjectInsertBuilder<unknown>;
+	insert(
+		rows: Array<ProjectRowInput<T>>,
+		options?: { ttl?: number },
+	): LuxProjectInsertBuilder<unknown[]>;
 	insert(
 		rowOrRows: ProjectRowInput<T> | Array<ProjectRowInput<T>>,
+		options?: { ttl?: number },
 	): LuxProjectInsertBuilder<unknown | unknown[]> {
-		return new LuxProjectInsertBuilder(this.client, this.name, rowOrRows);
+		return new LuxProjectInsertBuilder(this.client, this.name, rowOrRows, { ttl: options?.ttl });
 	}
 
 	upsert(
 		row: ProjectRowInput<T>,
-		options?: { onConflict?: string },
+		options?: { onConflict?: string; ttl?: number },
 	): LuxProjectInsertBuilder<unknown>;
 	upsert(
 		rows: Array<ProjectRowInput<T>>,
-		options?: { onConflict?: string },
+		options?: { onConflict?: string; ttl?: number },
 	): LuxProjectInsertBuilder<unknown[]>;
 	upsert(
 		rowOrRows: ProjectRowInput<T> | Array<ProjectRowInput<T>>,
-		options?: { onConflict?: string },
+		options?: { onConflict?: string; ttl?: number },
 	): LuxProjectInsertBuilder<unknown | unknown[]> {
 		return new LuxProjectInsertBuilder(this.client, this.name, rowOrRows, {
 			upsert: true,
 			onConflict: options?.onConflict,
+			ttl: options?.ttl,
 		});
 	}
 
@@ -844,7 +849,7 @@ export class LuxProjectInsertBuilder<TResult> extends LuxProjectThenable<TResult
 		private client: LuxProjectClient<any>,
 		private tableName: string,
 		private rowOrRows: Record<string, QueryValue> | Array<Record<string, QueryValue>>,
-		private upsertOptions?: { upsert: boolean; onConflict?: string },
+		private writeOptions?: { upsert?: boolean; onConflict?: string; ttl?: number },
 	) {
 		super();
 	}
@@ -854,12 +859,15 @@ export class LuxProjectInsertBuilder<TResult> extends LuxProjectThenable<TResult
 		// in a single round-trip. The server returns the affected row(s)
 		// ({result: row} for a single row, {result: [rows]} for an array).
 		let path = `/tables/${encodeURIComponent(this.tableName)}`;
-		if (this.upsertOptions?.upsert) {
-			const params = new URLSearchParams();
-			if (this.upsertOptions.onConflict) params.set('on_conflict', this.upsertOptions.onConflict);
+		const params = new URLSearchParams();
+		if (this.writeOptions?.upsert) {
+			if (this.writeOptions.onConflict) params.set('on_conflict', this.writeOptions.onConflict);
 			else params.set('upsert', 'true');
-			path += `?${params.toString()}`;
 		}
+		// `ttl` seconds: a row that auto-expires; `0` clears any existing TTL.
+		if (this.writeOptions?.ttl != null) params.set('ttl', String(this.writeOptions.ttl));
+		const query = params.toString();
+		if (query) path += `?${query}`;
 		const res = await this.client.request('POST', path, this.rowOrRows);
 		if (res.error) return res as LuxResult<TResult>;
 		return ok(unwrapResult<TResult>(res.data) as TResult);

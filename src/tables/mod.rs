@@ -30,6 +30,9 @@ pub struct PathIndex {
 pub struct SchemaCache {
     schemas: hashbrown::HashMap<String, Vec<FieldDef>>,
     path_indexes: hashbrown::HashMap<String, Vec<PathIndex>>,
+    /// Per-table default row TTL (seconds). Cached alongside `schemas` (both are
+    /// populated/cleared together) so the insert path can read it lock-cheap.
+    default_ttls: hashbrown::HashMap<String, Option<u64>>,
 }
 
 impl SchemaCache {
@@ -37,6 +40,7 @@ impl SchemaCache {
         Self {
             schemas: hashbrown::HashMap::new(),
             path_indexes: hashbrown::HashMap::new(),
+            default_ttls: hashbrown::HashMap::new(),
         }
     }
 
@@ -46,6 +50,14 @@ impl SchemaCache {
 
     fn insert(&mut self, table: &str, fields: Vec<FieldDef>) {
         self.schemas.insert(table.to_string(), fields);
+    }
+
+    fn default_ttl(&self, table: &str) -> Option<u64> {
+        self.default_ttls.get(table).copied().flatten()
+    }
+
+    fn insert_default_ttl(&mut self, table: &str, secs: Option<u64>) {
+        self.default_ttls.insert(table.to_string(), secs);
     }
 
     fn get_path_indexes(&self, table: &str) -> Option<Vec<PathIndex>> {
@@ -59,6 +71,7 @@ impl SchemaCache {
     fn remove(&mut self, table: &str) {
         self.schemas.remove(table);
         self.path_indexes.remove(table);
+        self.default_ttls.remove(table);
     }
 
     fn remove_path_indexes(&mut self, table: &str) {
@@ -444,6 +457,179 @@ fn pk_key(table: &str) -> String {
 /// vs a sequence id (for tables without a PK)
 fn row_key_for_pk(table: &str, pk_value: &str) -> String {
     format!("_t:{}:row:{}", table, pk_value)
+}
+
+// ---- Row TTL ---------------------------------------------------------------
+// A table row can expire. Unlike KV TTL (which sets `Entry.expires_at` on a
+// single key), a row is a composite (row hash + the `_t:{table}:ids` zset +
+// unique/field indexes), and KV expiry is silent (no key-event). So row TTL is
+// owned here: a global deadline-ordered zset `_t:_ttl` (member `{table}\0{pk}`,
+// score = absolute epoch-ms deadline) drives a table-aware sweep, and a hidden
+// `\0ttl` field on the row hash carries the deadline for read-time hiding.
+
+/// Hidden hash field carrying a row's absolute expiry (epoch ms, ASCII). The
+/// NUL prefix means it can never collide with a real column (names are
+/// alphanumeric/underscore) and `get_row_with_map` filters it from output.
+const HIDDEN_TTL_FIELD: &[u8] = b"\x00ttl";
+
+/// Reserved schema-hash field carrying a table's default row TTL (seconds,
+/// ASCII). Stored in `_t:{table}:schema` alongside columns; the NUL prefix keeps
+/// it from colliding with a column and `load_schema` filters it out.
+const HIDDEN_DEFAULT_TTL_FIELD: &[u8] = b"\x00default_ttl";
+
+/// Global deadline index: a sorted set scored by absolute epoch-ms deadline.
+fn ttl_index_key() -> &'static str {
+    "_t:_ttl"
+}
+
+/// A table's default row TTL (seconds), if it was created `WITH TTL`. Resolved
+/// from the schema cache (populated by `load_schema`).
+pub(crate) fn table_default_ttl(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    now: Instant,
+) -> Option<u64> {
+    // Ensure the schema (and thus the cached default) is loaded.
+    if load_schema(store, cache, table, now).is_err() {
+        return None;
+    }
+    cache.read().default_ttl(table)
+}
+
+/// Split a trailing `WITH TTL <seconds>` off a TCREATE column list.
+fn split_with_ttl<'a>(col_args: &'a [&'a str]) -> (&'a [&'a str], Option<u64>) {
+    let n = col_args.len();
+    if n >= 3
+        && col_args[n - 3].eq_ignore_ascii_case("WITH")
+        && col_args[n - 2].eq_ignore_ascii_case("TTL")
+    {
+        if let Ok(secs) = col_args[n - 1].parse::<u64>() {
+            return (&col_args[..n - 3], Some(secs));
+        }
+    }
+    (col_args, None)
+}
+
+fn ttl_member(table: &str, pk: &str) -> String {
+    format!("{}\x00{}", table, pk)
+}
+
+/// What a write does to a row's TTL. `None` (absent) = inherit: leave any
+/// existing deadline untouched (so a bare update doesn't drop the TTL).
+#[derive(Clone, Copy, Debug)]
+pub enum TtlOp {
+    /// Set/refresh the deadline to now + this many seconds.
+    Set(u64),
+    /// Remove the TTL (e.g. `TTL 0`): the row becomes permanent.
+    Clear,
+}
+
+fn set_row_ttl(store: &Store, table: &str, pk: &str, secs: u64, now: Instant) {
+    let deadline_ms = current_epoch_ms().saturating_add(secs.saturating_mul(1000));
+    let rk = row_key_for_pk(table, pk);
+    let dl = deadline_ms.to_string();
+    let _ = store.hset(rk.as_bytes(), &[(HIDDEN_TTL_FIELD, dl.as_bytes())], now);
+    let member = ttl_member(table, pk);
+    let _ = store.zadd(
+        ttl_index_key().as_bytes(),
+        &[(member.as_bytes(), deadline_ms as f64)],
+        false,
+        false,
+        false,
+        false,
+        false,
+        now,
+    );
+}
+
+fn clear_row_ttl(store: &Store, table: &str, pk: &str, now: Instant) {
+    let rk = row_key_for_pk(table, pk);
+    let _ = store.hdel(rk.as_bytes(), &[HIDDEN_TTL_FIELD], now);
+    let member = ttl_member(table, pk);
+    let _ = store.zrem(ttl_index_key().as_bytes(), &[member.as_bytes()], now);
+}
+
+fn apply_row_ttl(store: &Store, table: &str, pk: &str, ttl: Option<TtlOp>, now: Instant) {
+    match ttl {
+        Some(TtlOp::Set(secs)) => set_row_ttl(store, table, pk, secs, now),
+        Some(TtlOp::Clear) => clear_row_ttl(store, table, pk, now),
+        None => {}
+    }
+}
+
+/// If the row at `pk` exists but has expired, physically remove it (full delete
+/// bookkeeping) so a fresh insert/upsert can take its place; this closes the
+/// sub-sweep-interval window where an expired-but-not-yet-swept row would still
+/// occupy its key. Returns true if the row is now absent (never existed, or was
+/// just purged), false if a live (non-expired) row is present.
+fn purge_if_expired(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk: &str,
+    now: Instant,
+) -> bool {
+    let rk = row_key_for_pk(table, pk);
+    let pairs = store.hgetall(rk.as_bytes(), now).unwrap_or_default();
+    if pairs.is_empty() {
+        return true;
+    }
+    if row_map_expired(&pairs) {
+        let _ = table_delete_inner(store, cache, table, pk, now, 0);
+        return true;
+    }
+    false
+}
+
+/// True if a raw row-hash field map carries an expired `\0ttl` deadline.
+fn row_map_expired(pairs: &[(String, bytes::Bytes)]) -> bool {
+    let now_ms = current_epoch_ms();
+    pairs.iter().any(|(k, v)| {
+        k.as_bytes() == HIDDEN_TTL_FIELD
+            && std::str::from_utf8(v)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_some_and(|deadline| now_ms >= deadline)
+    })
+}
+
+/// Expire all rows whose deadline has passed. Runs the full per-row delete
+/// bookkeeping (so indexes stay consistent) and returns the distinct tables
+/// touched, so the caller can fire one `.live()` key-event per table.
+pub fn expire_due_rows(store: &Store, cache: &SharedSchemaCache, now: Instant) -> Vec<String> {
+    let key = ttl_index_key();
+    let now_ms = current_epoch_ms() as f64;
+    let due = store
+        .zrangebyscore(
+            key.as_bytes(),
+            0.0,
+            now_ms,
+            false,
+            false,
+            false,
+            Some(0),
+            Some(512),
+            false,
+            now,
+        )
+        .unwrap_or_default();
+    let mut affected: Vec<String> = Vec::new();
+    for (member, _score) in due {
+        let Some((table, pk)) = member.split_once('\u{0}') else {
+            let _ = store.zrem(key.as_bytes(), &[member.as_bytes()], now);
+            continue;
+        };
+        if table_delete_inner(store, cache, table, pk, now, 0).is_ok()
+            && !affected.iter().any(|t| t == table)
+        {
+            affected.push(table.to_string());
+        }
+        // table_delete_inner clears the TTL entry on success; on error (e.g. an
+        // FK RESTRICT) drop it anyway so the sweep doesn't spin on it.
+        let _ = store.zrem(key.as_bytes(), &[member.as_bytes()], now);
+    }
+    affected
 }
 
 fn is_valid_name(name: &str) -> bool {
@@ -832,14 +1018,23 @@ pub(crate) fn load_schema(
         return Err(format!("ERR table '{}' does not exist", table));
     }
     let mut fields = Vec::new();
+    let mut default_ttl: Option<u64> = None;
     for (name, val) in pairs {
+        if name.as_bytes() == HIDDEN_DEFAULT_TTL_FIELD {
+            default_ttl = std::str::from_utf8(&val).ok().and_then(|s| s.parse().ok());
+            continue;
+        }
         let encoded = String::from_utf8_lossy(&val).to_string();
         fields.push(decode_field_def(&name, &encoded));
     }
     fields.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // Write through to the cache
-    cache.write().insert(table, fields.clone());
+    // Write through to the cache (schema + default TTL together).
+    {
+        let mut w = cache.write();
+        w.insert(table, fields.clone());
+        w.insert_default_ttl(table, default_ttl);
+    }
 
     Ok(fields)
 }
@@ -1262,6 +1457,8 @@ pub fn table_create(
         return Err(format!("ERR table '{}' already exists", table));
     }
 
+    // `... WITH TTL <secs>` gives every row in the table a default expiry.
+    let (col_args, default_ttl) = split_with_ttl(col_args);
     let fields = parse_column_list(col_args)?;
 
     // Validate that referenced tables exist
@@ -1280,13 +1477,16 @@ pub fn table_create(
         }
     }
 
-    let pairs: Vec<(&[u8], Vec<u8>)> = fields
+    let mut pairs: Vec<(&[u8], Vec<u8>)> = fields
         .iter()
         .map(|f| {
             let encoded = encode_field_def(f);
             (f.name.as_bytes() as &[u8], encoded.into_bytes())
         })
         .collect();
+    if let Some(secs) = default_ttl {
+        pairs.push((HIDDEN_DEFAULT_TTL_FIELD, secs.to_string().into_bytes()));
+    }
     let pair_refs: Vec<(&[u8], &[u8])> = pairs.iter().map(|(k, v)| (*k, v.as_slice())).collect();
     store.hset(key.as_bytes(), &pair_refs, now)?;
 
@@ -1302,7 +1502,11 @@ pub fn table_create(
     }
 
     // Populate the cache immediately so the first insert doesn't miss
-    cache.write().insert(table, fields);
+    {
+        let mut w = cache.write();
+        w.insert(table, fields);
+        w.insert_default_ttl(table, default_ttl);
+    }
 
     Ok(())
 }
@@ -1358,14 +1562,29 @@ pub fn table_insert(
     field_values: &[(&str, &str)],
     now: Instant,
 ) -> Result<i64, String> {
-    // Back-compat numeric reply: 0 for non-numeric (UUID/STR) primary keys.
-    Ok(table_insert_pk(store, cache, table, field_values, now)?
-        .parse()
-        .unwrap_or(0))
+    table_insert_ttl(store, cache, table, field_values, None, now)
 }
 
-/// Insert a row and return the full stored row (sorted by column), used by the
-/// RETURNING clause and the HTTP API which returns the inserted record.
+/// `table_insert` with a TTL op applied to the new row.
+pub fn table_insert_ttl(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    ttl: Option<TtlOp>,
+    now: Instant,
+) -> Result<i64, String> {
+    // Back-compat numeric reply: 0 for non-numeric (UUID/STR) primary keys.
+    Ok(
+        table_insert_pk(store, cache, table, field_values, ttl, now)?
+            .parse()
+            .unwrap_or(0),
+    )
+}
+
+/// Insert a row and return the full stored row (sorted by column). Production
+/// callers use `table_insert_returning_ttl`; this no-TTL form is kept for tests.
+#[cfg(test)]
 pub fn table_insert_returning(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -1373,16 +1592,29 @@ pub fn table_insert_returning(
     field_values: &[(&str, &str)],
     now: Instant,
 ) -> Result<Vec<(String, String)>, String> {
+    table_insert_returning_ttl(store, cache, table, field_values, None, now)
+}
+
+/// `table_insert_returning` with a TTL op applied to the new row.
+pub fn table_insert_returning_ttl(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    ttl: Option<TtlOp>,
+    now: Instant,
+) -> Result<Vec<(String, String)>, String> {
     let schema = load_schema(store, cache, table, now)?;
-    let pk_str = table_insert_pk(store, cache, table, field_values, now)?;
+    let pk_str = table_insert_pk(store, cache, table, field_values, ttl, now)?;
     let mut row = get_row(store, table, &schema, &pk_str, now)
         .ok_or_else(|| format!("ERR inserted row not found in table '{}'", table))?;
     row.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(row)
 }
 
-/// Insert multiple rows, returning the inserted rows. Not atomic: if a row
-/// fails, the rows inserted before it remain (Lux has no multi-row transaction).
+/// Insert multiple rows, returning the inserted rows. Production callers use
+/// `table_insert_many_returning_ttl`; this no-TTL form is kept for tests.
+#[cfg(test)]
 pub fn table_insert_many_returning(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -1390,10 +1622,24 @@ pub fn table_insert_many_returning(
     rows: &[Vec<(String, String)>],
     now: Instant,
 ) -> Result<Vec<Vec<(String, String)>>, String> {
+    table_insert_many_returning_ttl(store, cache, table, rows, None, now)
+}
+
+/// `table_insert_many_returning` with a TTL op applied to every inserted row.
+pub fn table_insert_many_returning_ttl(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    rows: &[Vec<(String, String)>],
+    ttl: Option<TtlOp>,
+    now: Instant,
+) -> Result<Vec<Vec<(String, String)>>, String> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let fv: Vec<(&str, &str)> = row.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        out.push(table_insert_returning(store, cache, table, &fv, now)?);
+        out.push(table_insert_returning_ttl(
+            store, cache, table, &fv, ttl, now,
+        )?);
     }
     Ok(out)
 }
@@ -1402,12 +1648,28 @@ pub fn table_insert_many_returning(
 /// conflict column. `conflict_col` defaults to the primary key (implicit `id`
 /// when there is no declared PK). Returns the resulting row. The conflict
 /// column must carry the value to match on; without it this is a plain insert.
+#[cfg(test)]
 pub fn table_upsert_returning(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
     field_values: &[(&str, &str)],
     conflict_col: Option<&str>,
+    now: Instant,
+) -> Result<Vec<(String, String)>, String> {
+    table_upsert_returning_ttl(store, cache, table, field_values, conflict_col, None, now)
+}
+
+/// `table_upsert_returning` with a TTL op applied to the resulting row. A bare
+/// op (`None`) leaves any existing deadline untouched, so re-upserting a row
+/// without a TTL keeps it alive on its current schedule.
+pub fn table_upsert_returning_ttl(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    conflict_col: Option<&str>,
+    ttl: Option<TtlOp>,
     now: Instant,
 ) -> Result<Vec<(String, String)>, String> {
     let schema = load_schema(store, cache, table, now)?;
@@ -1423,24 +1685,28 @@ pub fn table_upsert_returning(
         .map(|(_, v)| *v)
     else {
         // No value to conflict on -> behaves as a plain insert.
-        return table_insert_returning(store, cache, table, field_values, now);
+        return table_insert_returning_ttl(store, cache, table, field_values, ttl, now);
     };
 
     let conflict_is_pk = schema.iter().any(|f| f.primary_key && f.name == conflict)
         || (pk_name.is_none() && conflict == "id");
     let existing_pk: Option<String> = if conflict_is_pk {
-        let rk = row_key_for_pk(table, cval);
-        (!store
-            .hgetall(rk.as_bytes(), now)
-            .unwrap_or_default()
-            .is_empty())
-        .then(|| cval.to_string())
+        // An expired row is purged and treated as absent (-> insert branch).
+        if purge_if_expired(store, cache, table, cval, now) {
+            None
+        } else {
+            Some(cval.to_string())
+        }
     } else {
         // Match via the column's unique index (only present for UNIQUE columns).
         let ukey = uniq_key(table, conflict);
-        store
+        match store
             .hget(ukey.as_bytes(), cval.as_bytes(), now)
             .map(|b| String::from_utf8_lossy(&b).to_string())
+        {
+            Some(pk) if !purge_if_expired(store, cache, table, &pk, now) => Some(pk),
+            _ => None,
+        }
     };
 
     match existing_pk {
@@ -1454,12 +1720,13 @@ pub fn table_upsert_returning(
             if !updates.is_empty() {
                 table_update_by_pk_str(store, cache, table, &pk, &updates, now)?;
             }
+            apply_row_ttl(store, table, &pk, ttl, now);
             let mut row = get_row(store, table, &schema, &pk, now)
                 .ok_or_else(|| format!("ERR upserted row not found in table '{}'", table))?;
             row.sort_by(|a, b| a.0.cmp(&b.0));
             Ok(row)
         }
-        None => table_insert_returning(store, cache, table, field_values, now),
+        None => table_insert_returning_ttl(store, cache, table, field_values, ttl, now),
     }
 }
 
@@ -1469,6 +1736,7 @@ fn table_insert_pk(
     cache: &SharedSchemaCache,
     table: &str,
     field_values: &[(&str, &str)],
+    ttl: Option<TtlOp>,
     now: Instant,
 ) -> Result<String, String> {
     let schema = load_schema(store, cache, table, now)?;
@@ -1565,14 +1833,18 @@ fn table_insert_pk(
             }
         }
 
-        // UNIQUE / PRIMARY KEY uniqueness check
+        // UNIQUE / PRIMARY KEY uniqueness check. A value held only by an expired
+        // (not-yet-swept) row is freed by purging that row first.
         if field.unique {
             let ukey = uniq_key(table, &field.name);
-            if store.hget(ukey.as_bytes(), value.as_bytes(), now).is_some() {
-                return Err(format!(
-                    "ERR unique constraint violation on column '{}': value '{}' already exists",
-                    field.name, value
-                ));
+            if let Some(holder) = store.hget(ukey.as_bytes(), value.as_bytes(), now) {
+                let holder_pk = String::from_utf8_lossy(&holder).to_string();
+                if !purge_if_expired(store, cache, table, &holder_pk, now) {
+                    return Err(format!(
+                        "ERR unique constraint violation on column '{}': value '{}' already exists",
+                        field.name, value
+                    ));
+                }
             }
         }
     }
@@ -1585,13 +1857,9 @@ fn table_insert_pk(
     let pk_str: String = if let Some(pk) = pk_field {
         match provided.get(pk.name.as_str()) {
             Some(pk_val) => {
-                // Check the row doesn't already exist
-                let rk = row_key_for_pk(table, pk_val);
-                if !store
-                    .hgetall(rk.as_bytes(), now)
-                    .unwrap_or_default()
-                    .is_empty()
-                {
+                // Check the row doesn't already exist (an expired row is purged
+                // and treated as absent).
+                if !purge_if_expired(store, cache, table, pk_val, now) {
                     return Err(format!(
                         "ERR primary key violation: '{}' already exists",
                         pk_val
@@ -1704,6 +1972,10 @@ fn table_insert_pk(
         }
     }
 
+    // An explicit write TTL wins; otherwise a new row inherits the table default
+    // (`TCREATE ... WITH TTL`). An explicit `TTL 0` (Clear) does not fall back.
+    let effective_ttl = ttl.or_else(|| table_default_ttl(store, cache, table, now).map(TtlOp::Set));
+    apply_row_ttl(store, table, &pk_str, effective_ttl, now);
     Ok(pk_str)
 }
 
@@ -1874,8 +2146,10 @@ fn table_delete_inner(
     let schema = load_schema(store, cache, table, now)?;
     let rk = row_key_for_pk(table, pk_str);
 
+    // Read the row even if its TTL has lapsed: the sweep/purge path must clean
+    // the indexes of an expired-but-not-yet-removed row.
     let row_map: std::collections::HashMap<String, String> =
-        get_row(store, table, &schema, pk_str, now)
+        get_row_including_expired(store, table, &schema, pk_str, now)
             .ok_or_else(|| format!("ERR row '{}' not found in table '{}'", pk_str, table))?
             .into_iter()
             .collect();
@@ -2043,6 +2317,10 @@ fn table_delete_inner(
 
     let ikey = ids_key(table);
     let _ = store.zrem(ikey.as_bytes(), &[pk_str.as_bytes()], now);
+
+    // Drop any TTL bookkeeping for this row (hidden field is removed with the
+    // hash below; this clears the `_t:_ttl` deadline member).
+    clear_row_ttl(store, table, pk_str, now);
 
     store.del(&[rk.as_bytes()]);
 
@@ -2214,14 +2492,29 @@ pub fn table_update_where(
     where_args: &[&str],
     now: Instant,
 ) -> Result<i64, String> {
+    table_update_where_ttl(store, cache, table, field_values, where_args, None, now)
+}
+
+/// `table_update_where` with a TTL op applied to every matched row.
+pub fn table_update_where_ttl(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    where_args: &[&str],
+    ttl: Option<TtlOp>,
+    now: Instant,
+) -> Result<i64, String> {
     Ok(
-        table_update_where_pks(store, cache, table, field_values, where_args, now)?
+        table_update_where_pks(store, cache, table, field_values, where_args, ttl, now)?
             .1
             .len() as i64,
     )
 }
 
-/// UPDATE returning the updated rows (for RETURNING and the HTTP API).
+/// UPDATE returning the updated rows. Production callers use
+/// `table_update_where_returning_ttl`; this no-TTL form is kept for tests.
+#[cfg(test)]
 pub fn table_update_where_returning(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -2230,7 +2523,21 @@ pub fn table_update_where_returning(
     where_args: &[&str],
     now: Instant,
 ) -> Result<Vec<Vec<(String, String)>>, String> {
-    let (schema, pks) = table_update_where_pks(store, cache, table, field_values, where_args, now)?;
+    table_update_where_returning_ttl(store, cache, table, field_values, where_args, None, now)
+}
+
+/// `table_update_where_returning` with a TTL op applied to every matched row.
+pub fn table_update_where_returning_ttl(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    where_args: &[&str],
+    ttl: Option<TtlOp>,
+    now: Instant,
+) -> Result<Vec<Vec<(String, String)>>, String> {
+    let (schema, pks) =
+        table_update_where_pks(store, cache, table, field_values, where_args, ttl, now)?;
     Ok(rows_for_pks(store, table, &schema, &pks, now))
 }
 
@@ -2241,6 +2548,7 @@ fn table_update_where_pks(
     table: &str,
     field_values: &[(&str, &str)],
     where_args: &[&str],
+    ttl: Option<TtlOp>,
     now: Instant,
 ) -> Result<(Vec<FieldDef>, Vec<String>), String> {
     let conditions = parse_where_conditions(where_args)?;
@@ -2268,6 +2576,11 @@ fn table_update_where_pks(
             table_update(store, cache, table, id, field_values, now)?;
         } else {
             table_update_by_pk_str(store, cache, table, pk_str, field_values, now)?;
+        }
+    }
+    if ttl.is_some() {
+        for pk_str in &matched {
+            apply_row_ttl(store, table, pk_str, ttl, now);
         }
     }
     Ok((schema, matched))

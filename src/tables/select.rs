@@ -20,6 +20,23 @@ pub(crate) fn get_row(
     get_row_with_map(store, table, &type_map, pk_str, now)
 }
 
+/// Like `get_row`, but returns the row even when its TTL has expired. The
+/// delete/expiry path must still read an expired-but-not-yet-swept row to clean
+/// up its indexes before removing it.
+pub(crate) fn get_row_including_expired(
+    store: &Store,
+    table: &str,
+    schema: &[FieldDef],
+    pk_str: &str,
+    now: Instant,
+) -> Option<Vec<(String, String)>> {
+    let type_map: hashbrown::HashMap<&str, &FieldType> = schema
+        .iter()
+        .map(|f| (f.name.as_str(), &f.field_type))
+        .collect();
+    get_row_with_map_impl(store, table, &type_map, pk_str, now, true)
+}
+
 /// Hot-path row fetch: takes a pre-built field-type map to avoid O(N) schema scan per field.
 #[inline]
 pub(crate) fn get_row_with_map(
@@ -29,13 +46,42 @@ pub(crate) fn get_row_with_map(
     pk_str: &str,
     now: Instant,
 ) -> Option<Vec<(String, String)>> {
+    get_row_with_map_impl(store, table, type_map, pk_str, now, false)
+}
+
+#[inline]
+fn get_row_with_map_impl(
+    store: &Store,
+    table: &str,
+    type_map: &hashbrown::HashMap<&str, &FieldType>,
+    pk_str: &str,
+    now: Instant,
+    include_expired: bool,
+) -> Option<Vec<(String, String)>> {
     let rk = row_key_for_pk(table, pk_str);
     let pairs = store.hgetall(rk.as_bytes(), now).unwrap_or_default();
     if pairs.is_empty() {
         return None;
     }
+    // Single pass: decode columns, and when we hit the hidden `\0ttl` field check
+    // the deadline. The clock is only read for rows that actually carry a TTL, so
+    // non-TTL tables pay nothing beyond a per-field byte compare. The delete path
+    // passes `include_expired` so it can still read an expired row to clean it.
     let mut out = Vec::with_capacity(pairs.len());
     for (k, v) in pairs {
+        if k.as_bytes() == HIDDEN_TTL_FIELD {
+            if !include_expired {
+                if let Some(deadline) = std::str::from_utf8(&v)
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    if current_epoch_ms() >= deadline {
+                        return None; // expired -> treated as already gone
+                    }
+                }
+            }
+            continue; // never expose the hidden TTL field
+        }
         let decoded = match type_map.get(k.as_str()) {
             Some(ft) => ft.decode_value(&v),
             None => String::from_utf8_lossy(&v).to_string(),
