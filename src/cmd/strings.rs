@@ -7,6 +7,7 @@ use crate::store::{Entry, Store, StoreValue};
 use super::{arg_str, cmd_eq, parse_i64, parse_u64, CmdResult};
 
 const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
+const VALUE_TOO_LARGE_ERR: &str = "ERR string exceeds maximum allowed size";
 
 fn parse_i64_arg(arg: &[u8], out: &mut BytesMut) -> Option<i64> {
     match parse_i64(arg) {
@@ -324,9 +325,18 @@ pub fn cmd_setrange(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
             return CmdResult::Written;
         }
     };
-    if offset.checked_add(args[3].len()).is_none() {
-        resp::write_error(out, INTEGER_ERR);
-        return CmdResult::Written;
+    match offset.checked_add(args[3].len()) {
+        None => {
+            resp::write_error(out, INTEGER_ERR);
+            return CmdResult::Written;
+        }
+        // Cap the resulting string so SETRANGE at a huge offset can't balloon a
+        // value past the configured request ceiling and exhaust memory.
+        Some(end) if end > store.config().max_resp_request => {
+            resp::write_error(out, VALUE_TOO_LARGE_ERR);
+            return CmdResult::Written;
+        }
+        Some(_) => {}
     }
     resp::write_integer(out, store.setrange(args[1], offset, args[3], now));
     CmdResult::Written
@@ -380,6 +390,13 @@ pub fn cmd_strlen(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
 pub fn cmd_append(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 3 {
         resp::write_error(out, "ERR wrong number of arguments for 'append' command");
+        return CmdResult::Written;
+    }
+    // Cap repeated APPENDs so a value can't be grown without bound past the
+    // configured request ceiling (each call is RESP-bounded, the running total is not).
+    let projected = (store.strlen(args[1], now) as usize).saturating_add(args[2].len());
+    if projected > store.config().max_resp_request {
+        resp::write_error(out, VALUE_TOO_LARGE_ERR);
         return CmdResult::Written;
     }
     resp::write_integer(out, store.append(args[1], args[2], now));

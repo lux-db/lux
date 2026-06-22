@@ -3663,6 +3663,34 @@ mod tests {
     }
 
     #[test]
+    fn string_growth_commands_respect_max_size() {
+        // Small ceiling so the cap is cheap to hit; the byte-string growth paths
+        // (APPEND/SETRANGE/SETBIT) must all reject growth past it.
+        let cfg = crate::ServerConfig {
+            max_resp_request: 16,
+            ..Default::default()
+        };
+        let store = Store::new_with_config(std::sync::Arc::new(cfg));
+
+        // SETRANGE at a large offset.
+        let out = exec_str(&store, &[b"SETRANGE", b"k", b"1000", b"x"]);
+        assert!(out.contains("string exceeds maximum"), "setrange: {out}");
+
+        // SETBIT at a large bit offset.
+        let out = exec_str(&store, &[b"SETBIT", b"b", b"100000", b"1"]);
+        assert!(out.contains("string exceeds maximum"), "setbit: {out}");
+
+        // APPEND past the ceiling in steps: the running total is what matters.
+        exec(&store, &[b"SET", b"a", b"0123456789"]); // 10 bytes, under 16
+        let out = exec_str(&store, &[b"APPEND", b"a", b"0123456789"]); // would be 20
+        assert!(out.contains("string exceeds maximum"), "append: {out}");
+
+        // A small write within the ceiling still works.
+        let out = exec_str(&store, &[b"SETRANGE", b"ok", b"0", b"hi"]);
+        assert!(out.contains(":2"), "small setrange should succeed: {out}");
+    }
+
+    #[test]
     fn command_specs_cover_dispatched_commands() {
         for cmd in [
             b"GEOADD" as &[u8],
