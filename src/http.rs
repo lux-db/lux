@@ -993,13 +993,25 @@ struct LiveTableSpec {
     table: String,
     select: String,
     where_conditions: Vec<(String, String, Value)>,
+    joins: Vec<LiveTableJoin>,
+    principal: Option<crate::auth::AuthPrincipal>,
+    auth_dependencies: Vec<String>,
     near: Option<LiveTableNearSpec>,
     order_by: Option<(String, String)>,
     limit: Option<usize>,
     offset: Option<usize>,
-    /// Set when a grant's membership set is empty: the subscriber may see no
-    /// rows, so both the snapshot and every streamed diff resolve to nothing.
+    /// Explicit deny used by internal callers/tests. Dynamic grant membership
+    /// is reevaluated by `fetch_live_table_rows` for every snapshot and diff.
     deny_all: bool,
+}
+
+#[derive(Clone)]
+struct LiveTableJoin {
+    join_type: crate::tables::JoinType,
+    table: String,
+    alias: String,
+    left_col: String,
+    right_col: String,
 }
 
 #[derive(Clone)]
@@ -1307,7 +1319,12 @@ async fn build_live_subscription(
         // read grant -> deny (operator / no-auth bypasses).
         if store.config().auth.enabled {
             if let Some(p) = principal {
-                let grant_conds = crate::auth::read_filter_conds(
+                // Validate access at subscribe time, but do not freeze the
+                // resolved conditions here: membership subqueries can change
+                // while the socket remains open.
+                crate::auth::read_filter_conds(store, cache, p, &table_spec.table, Instant::now())
+                    .map_err(|e| live_error("FORBIDDEN", &e))?;
+                table_spec.auth_dependencies = crate::auth::read_filter_dependencies(
                     store,
                     cache,
                     p,
@@ -1315,43 +1332,18 @@ async fn build_live_subscription(
                     Instant::now(),
                 )
                 .map_err(|e| live_error("FORBIDDEN", &e))?;
-                for c in grant_conds {
-                    match c {
-                        crate::grants::EnforcedCondition::Cmp(rc) => {
-                            table_spec.where_conditions.push((
-                                rc.column,
-                                rc.op,
-                                Value::String(rc.value),
-                            ));
-                        }
-                        crate::grants::EnforcedCondition::InSet {
-                            column,
-                            negated,
-                            values,
-                        } => {
-                            if values.is_empty() {
-                                // empty positive set -> see nothing; empty NOT IN
-                                // -> matches everything, so just drop it.
-                                if !negated {
-                                    table_spec.deny_all = true;
-                                }
-                            } else {
-                                let op = if negated { "NOT IN" } else { "IN" };
-                                let arr =
-                                    Value::Array(values.into_iter().map(Value::String).collect());
-                                table_spec
-                                    .where_conditions
-                                    .push((column, op.to_string(), arr));
-                            }
-                        }
-                    }
-                }
+                table_spec.principal = Some(p.clone());
             }
         }
-        let receivers = vec![
-            broker.ksubscribe(&table_spec.table),
-            broker.ksubscribe(&format!("_t:{}:row:*", table_spec.table)),
-        ];
+        let receivers = live_table_dependencies(&table_spec)
+            .into_iter()
+            .flat_map(|table| {
+                [
+                    broker.ksubscribe(&table),
+                    broker.ksubscribe(&format!("_t:{table}:row:*")),
+                ]
+            })
+            .collect();
         let rows = fetch_live_table_rows(store, cache, &table_spec)?;
         let pk_field = live_table_pk_field(store, cache, &table_spec.table);
         let query = json!({"type":"table","table":table_spec.table});
@@ -1492,13 +1484,13 @@ where
                 LiveSubscription::Table { spec, state, .. },
                 LiveBrokerEvent::Key { key, operation, .. },
             ) => {
-                if key == &spec.table || key.starts_with(&format!("_t:{}:row:", spec.table)) {
+                if let Some(changed_table) = live_table_for_key(spec, key) {
                     let next = fetch_live_table_rows(store, cache, spec).unwrap_or_default();
                     outgoing.extend(diff_live_query(
                         id,
                         state,
                         next,
-                        Some(json!({"kind":table_cause_kind(operation),"table":spec.table,"operation":operation,"raw":{"pattern":format!("_t:{}:row:*", spec.table),"key":key,"operation":operation}})),
+                        Some(json!({"kind":table_cause_kind(operation),"table":changed_table,"operation":operation,"raw":{"pattern":format!("_t:{changed_table}:row:*"),"key":key,"operation":operation}})),
                     ));
                 }
             }
@@ -1537,8 +1529,10 @@ fn stop_live_subscription(
         LiveSubscription::Channel { channel, .. } => broker.unsubscribe_channel(&channel),
         LiveSubscription::PubSubPattern { pattern, .. } => broker.punsubscribe_pattern(&pattern),
         LiveSubscription::Table { spec, .. } => {
-            broker.kunsub(&spec.table);
-            broker.kunsub(&format!("_t:{}:row:*", spec.table));
+            for table in live_table_dependencies(&spec) {
+                broker.kunsub(&table);
+                broker.kunsub(&format!("_t:{table}:row:*"));
+            }
         }
         LiveSubscription::VectorNear { .. } => broker.kunsub("*"),
     }
@@ -1608,6 +1602,31 @@ fn parse_live_table_spec(spec: &Value) -> Result<LiveTableSpec, Value> {
             }
         }
     }
+    let mut joins = Vec::new();
+    if let Some(join_values) = spec.get("joins") {
+        let join_values = join_values
+            .as_array()
+            .ok_or_else(|| live_error("INVALID_SPEC", "table joins must be an array"))?;
+        for join in join_values {
+            let join_type = match join.get("type").and_then(Value::as_str).unwrap_or("inner") {
+                "inner" => crate::tables::JoinType::Inner,
+                "left" => crate::tables::JoinType::Left,
+                _ => {
+                    return Err(live_error(
+                        "INVALID_SPEC",
+                        "table join type must be 'inner' or 'left'",
+                    ))
+                }
+            };
+            joins.push(LiveTableJoin {
+                join_type,
+                table: required_str(join, "table")?.to_string(),
+                alias: required_str(join, "alias")?.to_string(),
+                left_col: required_str(join, "onLeft")?.to_string(),
+                right_col: required_str(join, "onRight")?.to_string(),
+            });
+        }
+    }
     let order_by = spec.get("orderBy").and_then(|value| {
         Some((
             value.get("field")?.as_str()?.to_string(),
@@ -1634,6 +1653,9 @@ fn parse_live_table_spec(spec: &Value) -> Result<LiveTableSpec, Value> {
         table,
         select,
         where_conditions,
+        joins,
+        principal: None,
+        auth_dependencies: Vec::new(),
         near,
         order_by,
         limit,
@@ -1674,10 +1696,31 @@ fn fetch_live_table_rows(
     if spec.deny_all {
         return Ok(Vec::new());
     }
+    let Some(where_conditions) = live_table_where_conditions(store, cache, spec)? else {
+        return Ok(Vec::new());
+    };
     let mut tokens = vec![spec.select.clone(), "FROM".to_string(), spec.table.clone()];
-    if !spec.where_conditions.is_empty() {
+    for join in &spec.joins {
+        if join.join_type == crate::tables::JoinType::Left {
+            tokens.push("LEFT".to_string());
+        }
+        tokens.extend([
+            "JOIN".to_string(),
+            join.table.clone(),
+            join.alias.clone(),
+            "ON".to_string(),
+            join.left_col.clone(),
+            "=".to_string(),
+            if join.right_col.contains('.') {
+                join.right_col.clone()
+            } else {
+                format!("{}.{}", join.alias, join.right_col)
+            },
+        ]);
+    }
+    if !where_conditions.is_empty() {
         tokens.push("WHERE".to_string());
-        for (index, (field, op, value)) in spec.where_conditions.iter().enumerate() {
+        for (index, (field, op, value)) in where_conditions.iter().enumerate() {
             if index > 0 {
                 tokens.push("AND".to_string());
             }
@@ -1755,6 +1798,82 @@ fn fetch_live_table_rows(
         }
         crate::tables::SelectResult::Aggregate(row) => Ok(vec![table_row_to_value(row)]),
     }
+}
+
+fn live_table_where_conditions(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    spec: &LiveTableSpec,
+) -> Result<Option<Vec<(String, String, Value)>>, Value> {
+    let mut conditions = spec.where_conditions.clone();
+    let Some(principal) = &spec.principal else {
+        return Ok(Some(conditions));
+    };
+    let grant_conds =
+        crate::auth::read_filter_conds(store, cache, principal, &spec.table, Instant::now())
+            .map_err(|e| live_error("FORBIDDEN", &e))?;
+    for condition in grant_conds {
+        match condition {
+            crate::grants::EnforcedCondition::Cmp(rc) => {
+                conditions.push((rc.column, rc.op, Value::String(rc.value)));
+            }
+            crate::grants::EnforcedCondition::InSet {
+                column,
+                negated,
+                values,
+            } => {
+                if values.is_empty() {
+                    if !negated {
+                        return Ok(None);
+                    }
+                } else {
+                    conditions.push((
+                        column,
+                        if negated { "NOT IN" } else { "IN" }.to_string(),
+                        Value::Array(values.into_iter().map(Value::String).collect()),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(Some(conditions))
+}
+
+fn live_table_dependencies(spec: &LiveTableSpec) -> Vec<String> {
+    let mut tables = vec![spec.table.clone()];
+    for table in spec
+        .joins
+        .iter()
+        .map(|join| &join.table)
+        .chain(spec.auth_dependencies.iter())
+    {
+        if !tables.iter().any(|existing| existing == table) {
+            tables.push(table.clone());
+        }
+    }
+    tables
+}
+
+fn live_table_for_key<'a>(spec: &'a LiveTableSpec, key: &str) -> Option<&'a str> {
+    live_table_dependencies(spec)
+        .into_iter()
+        .find(|table| key == table || key.starts_with(&format!("_t:{table}:row:")))
+        .and_then(|matched| {
+            if matched == spec.table {
+                Some(spec.table.as_str())
+            } else {
+                spec.joins
+                    .iter()
+                    .find(|join| join.table == matched)
+                    .map(|join| join.table.as_str())
+                    .or_else(|| {
+                        spec.auth_dependencies
+                            .iter()
+                            .find(|table| **table == matched)
+                            .map(String::as_str)
+                    })
+            }
+        })
 }
 
 fn parse_live_vector_near_spec(spec: &Value) -> Result<LiveVectorNearSpec, Value> {
@@ -4377,6 +4496,9 @@ mod tests {
                 "IN".to_string(),
                 Value::Array(vec![Value::from("w1"), Value::from("w3")]),
             )],
+            joins: vec![],
+            principal: None,
+            auth_dependencies: vec![],
             near: None,
             order_by: None,
             limit: None,
@@ -4402,6 +4524,61 @@ mod tests {
         };
         let rows = fetch_live_table_rows(&store, &cache, &denied).unwrap();
         assert!(rows.is_empty(), "deny_all must yield no rows");
+    }
+
+    #[test]
+    fn membership_live_grant_refreshes_after_membership_insert() {
+        let (store, _broker, cache) = membership_fixture();
+        let principal = match user_ctx("alice") {
+            HttpAuthContext::User(principal) => principal,
+            _ => unreachable!(),
+        };
+        let spec = LiveTableSpec {
+            table: "messages".to_string(),
+            select: "*".to_string(),
+            where_conditions: vec![],
+            joins: vec![],
+            principal: Some(principal),
+            auth_dependencies: vec!["members".to_string()],
+            near: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            deny_all: false,
+        };
+
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "messages",
+            &[("id", "5"), ("workspace_id", "w4"), ("body", "new-team")],
+            Instant::now(),
+        )
+        .unwrap();
+        let before = fetch_live_table_rows(&store, &cache, &spec).unwrap();
+        assert!(
+            !serde_json::to_string(&before).unwrap().contains("new-team"),
+            "row must stay hidden before membership exists"
+        );
+
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "members",
+            &[("id", "4"), ("user_id", "alice"), ("workspace_id", "w4")],
+            Instant::now(),
+        )
+        .unwrap();
+        let after = fetch_live_table_rows(&store, &cache, &spec).unwrap();
+        assert!(
+            serde_json::to_string(&after).unwrap().contains("new-team"),
+            "live grant must include membership added after subscription"
+        );
+        assert_eq!(
+            live_table_for_key(&spec, "_t:members:row:4"),
+            Some("members"),
+            "grant dependency changes must wake the live query"
+        );
     }
 
     #[test]

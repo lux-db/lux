@@ -405,6 +405,81 @@ async fn live_websocket_table_subscription_receives_http_insert() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_join_reacts_to_joined_table_insert() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, None);
+
+    let (status, created) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"live_teams","columns":[{"name":"id","type":"STR","primaryKey":true},{"name":"name","type":"STR","notNull":true}]}"#,
+        None,
+    );
+    assert_eq!(status, 200, "create teams: {created}");
+    let (status, created) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"live_members","columns":[{"name":"id","type":"STR","primaryKey":true},{"name":"team_id","type":"STR","notNull":true},{"name":"user_id","type":"STR","notNull":true}]}"#,
+        None,
+    );
+    assert_eq!(status, 200, "create members: {created}");
+
+    let (status, inserted) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/live_members",
+        r#"{"id":"member-1","team_id":"team-1","user_id":"user-1"}"#,
+        None,
+    );
+    assert_eq!(status, 200, "insert member: {inserted}");
+
+    let mut ws = connect_live(http_port, None).await;
+    send_json(
+        &mut ws,
+        json!({
+            "type":"live.subscribe",
+            "id":"teams",
+            "spec":{
+                "kind":"table",
+                "table":"live_members",
+                "select":"t.id AS id,t.name AS name",
+                "where":[{"field":"user_id","op":"=","value":"user-1"}],
+                "joins":[{
+                    "type":"inner",
+                    "table":"live_teams",
+                    "alias":"t",
+                    "onLeft":"team_id",
+                    "onRight":"id"
+                }]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws).await["type"], "live.subscribed");
+    let snapshot = recv_live_event(&mut ws, "teams").await;
+    assert_eq!(snapshot["kind"], "snapshot");
+    assert_eq!(snapshot["rows"].as_array().unwrap().len(), 0);
+
+    let (status, inserted) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/live_teams",
+        r#"{"id":"team-1","name":"Realtime Team"}"#,
+        None,
+    );
+    assert_eq!(status, 200, "insert team: {inserted}");
+
+    let event = recv_live_event(&mut ws, "teams").await;
+    assert_eq!(event["kind"], "insert");
+    assert_eq!(event["pk"], "team-1");
+    assert_eq!(event["row"]["name"], "Realtime Team");
+    assert_eq!(event["cause"]["table"], "live_teams");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_websocket_unsubscribe_stops_delivery() {
     let resp_port = free_port();
     let http_port = free_port();
