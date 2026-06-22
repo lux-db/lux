@@ -259,7 +259,7 @@ fn crash_recovery_all_types() {
 // ---------------------------------------------------------------------------
 #[test]
 fn crash_recovery_lua_script_writes() {
-    let mut srv = TestServer::start(17207);
+    let mut srv = TestServer::start(17210);
     let mut c = srv.conn();
 
     // A script that performs several KV writes via redis.call. None of these go
