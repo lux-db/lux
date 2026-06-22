@@ -1,3 +1,5 @@
+mod common;
+use common::LuxServer;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -145,67 +147,13 @@ fn extract_bulk_strings(data: &[u8]) -> Vec<String> {
     vals
 }
 
-fn find_lux_binary() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let target_dir = exe.parent()?.parent()?.parent()?;
-    let debug = target_dir.join("debug").join("lux");
-    if debug.exists() {
-        return Some(debug);
-    }
-    let release = target_dir.join("release").join("lux");
-    if release.exists() {
-        return Some(release);
-    }
-    None
-}
-
-struct LuxServer {
-    child: std::process::Child,
-    tmpdir: std::path::PathBuf,
-}
-
-impl Drop for LuxServer {
-    fn drop(&mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
-        let _ = std::fs::remove_dir_all(&self.tmpdir);
-    }
-}
-
-fn start_lux(port: u16, shards: u16) -> LuxServer {
-    let bin = find_lux_binary().expect("no lux binary found - run `cargo build` first");
-    let tmpdir =
-        std::env::temp_dir().join(format!("lux_order_test_{}_{}", std::process::id(), port));
-    std::fs::create_dir_all(&tmpdir).unwrap();
-    let child = std::process::Command::new(&bin)
-        .env("LUX_PORT", port.to_string())
-        .env("LUX_SHARDS", shards.to_string())
-        .env("LUX_SAVE_INTERVAL", "0")
-        .env("LUX_DATA_DIR", tmpdir.to_str().unwrap())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("failed to start lux");
-
-    let server = LuxServer { child, tmpdir };
-
-    for _ in 0..40 {
-        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return server;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("lux did not start within 2 seconds on port {port}");
-}
-
 #[test]
 fn pipeline_set_ordering_simple_path() {
-    let port: u16 = 16379;
     let iterations: i64 = 10_000;
     let num_readers = 4;
 
-    let _server = start_lux(port, 2);
-    let addr = format!("127.0.0.1:{port}");
+    let server = LuxServer::builder().shards(2).start();
+    let addr = format!("127.0.0.1:{}", server.port());
 
     {
         let mut conn = TcpStream::connect(&addr).unwrap();
@@ -294,12 +242,11 @@ fn pipeline_set_ordering_simple_path() {
 
 #[test]
 fn pipeline_mixed_commands_ordering() {
-    let port: u16 = 16380;
     let iterations: i64 = 10_000;
     let num_readers = 4;
 
-    let _server = start_lux(port, 2);
-    let addr = format!("127.0.0.1:{port}");
+    let server = LuxServer::builder().shards(2).start();
+    let addr = format!("127.0.0.1:{}", server.port());
 
     {
         let mut conn = TcpStream::connect(&addr).unwrap();
@@ -388,12 +335,11 @@ fn pipeline_mixed_commands_ordering() {
 
 #[test]
 fn pipeline_high_contention_ordering() {
-    let port: u16 = 16381;
     let num_writers = 4;
     let iterations_per_writer: i64 = 5_000;
 
-    let _server = start_lux(port, 2);
-    let addr = format!("127.0.0.1:{port}");
+    let server = LuxServer::builder().shards(2).start();
+    let addr = format!("127.0.0.1:{}", server.port());
 
     for i in 0..num_writers {
         let mut conn = TcpStream::connect(&addr).unwrap();
@@ -490,11 +436,10 @@ fn pipeline_high_contention_ordering() {
 
 #[test]
 fn large_memory_pipeline_preserves_response_order() {
-    let port: u16 = 16382;
     let commands = 160usize;
 
-    let _server = start_lux(port, 16);
-    let addr = format!("127.0.0.1:{port}");
+    let server = LuxServer::builder().shards(16).start();
+    let addr = format!("127.0.0.1:{}", server.port());
     let mut conn = TcpStream::connect(&addr).unwrap();
     conn.set_nodelay(true).unwrap();
 

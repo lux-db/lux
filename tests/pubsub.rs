@@ -1,3 +1,5 @@
+mod common;
+use common::LuxServer;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::thread;
@@ -65,72 +67,10 @@ fn send_raw(stream: &mut TcpStream, args: &[&[u8]]) {
     stream.write_all(&resp_cmd_raw(args)).unwrap();
 }
 
-fn find_lux_binary() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let target_dir = exe.parent()?.parent()?.parent()?;
-    let release = target_dir.join("release").join("lux");
-    if release.exists() {
-        return Some(release);
-    }
-    let debug = target_dir.join("debug").join("lux");
-    if debug.exists() {
-        return Some(debug);
-    }
-    None
-}
-
-struct LuxServer {
-    child: std::process::Child,
-    tmpdir: std::path::PathBuf,
-}
-
-impl Drop for LuxServer {
-    fn drop(&mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
-        let _ = std::fs::remove_dir_all(&self.tmpdir);
-    }
-}
-
-fn start_lux(port: u16) -> LuxServer {
-    let bin = find_lux_binary().expect("no lux binary found");
-    let tmpdir =
-        std::env::temp_dir().join(format!("lux_pubsub_test_{}_{}", std::process::id(), port));
-    std::fs::create_dir_all(&tmpdir).unwrap();
-    let child = std::process::Command::new(&bin)
-        .env("LUX_PORT", port.to_string())
-        .env("LUX_SHARDS", "4")
-        .env("LUX_SAVE_INTERVAL", "0")
-        .env("LUX_DATA_DIR", tmpdir.to_str().unwrap())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("failed to start lux");
-
-    let server = LuxServer { child, tmpdir };
-    for _ in 0..40 {
-        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return server;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("lux did not start on port {port}");
-}
-
-fn connect(port: u16) -> TcpStream {
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-    stream.set_nodelay(true).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
-    stream
-}
-
 #[test]
 fn subscribe_confirms_channel() {
-    let port: u16 = 16700;
-    let _server = start_lux(port);
-    let mut conn = connect(port);
+    let server = LuxServer::start();
+    let mut conn = server.conn();
 
     let resp = send_and_read(&mut conn, &["SUBSCRIBE", "mychan"]);
     assert!(resp.contains("subscribe"), "subscribe confirmation: {resp}");
@@ -140,9 +80,8 @@ fn subscribe_confirms_channel() {
 
 #[test]
 fn subscribe_multiple_channels() {
-    let port: u16 = 16701;
-    let _server = start_lux(port);
-    let mut conn = connect(port);
+    let server = LuxServer::start();
+    let mut conn = server.conn();
 
     let resp = send_and_read(&mut conn, &["SUBSCRIBE", "ch1", "ch2", "ch3"]);
     assert!(resp.contains("ch1"), "ch1: {resp}");
@@ -153,9 +92,8 @@ fn subscribe_multiple_channels() {
 
 #[test]
 fn publish_returns_subscriber_count() {
-    let port: u16 = 16702;
-    let _server = start_lux(port);
-    let mut pub_conn = connect(port);
+    let server = LuxServer::start();
+    let mut pub_conn = server.conn();
 
     let resp = send_and_read(&mut pub_conn, &["PUBLISH", "nochan", "msg"]);
     assert!(resp.contains(":0"), "no subscribers: {resp}");
@@ -163,10 +101,9 @@ fn publish_returns_subscriber_count() {
 
 #[test]
 fn publish_delivers_message_to_subscriber() {
-    let port: u16 = 16703;
-    let _server = start_lux(port);
-    let mut sub_conn = connect(port);
-    let mut pub_conn = connect(port);
+    let server = LuxServer::start();
+    let mut sub_conn = server.conn();
+    let mut pub_conn = server.conn();
 
     send(&mut sub_conn, &["SUBSCRIBE", "events"]);
     thread::sleep(Duration::from_millis(100));
@@ -182,10 +119,9 @@ fn publish_delivers_message_to_subscriber() {
 
 #[test]
 fn publish_preserves_binary_payload_bytes() {
-    let port: u16 = 16710;
-    let _server = start_lux(port);
-    let mut sub_conn = connect(port);
-    let mut pub_conn = connect(port);
+    let server = LuxServer::start();
+    let mut sub_conn = server.conn();
+    let mut pub_conn = server.conn();
 
     send(&mut sub_conn, &["SUBSCRIBE", "events"]);
     thread::sleep(Duration::from_millis(100));
@@ -217,10 +153,9 @@ fn publish_preserves_binary_payload_bytes() {
 
 #[test]
 fn publish_to_correct_channel_only() {
-    let port: u16 = 16704;
-    let _server = start_lux(port);
-    let mut sub_conn = connect(port);
-    let mut pub_conn = connect(port);
+    let server = LuxServer::start();
+    let mut sub_conn = server.conn();
+    let mut pub_conn = server.conn();
 
     send(&mut sub_conn, &["SUBSCRIBE", "chan_a"]);
     thread::sleep(Duration::from_millis(100));
@@ -237,10 +172,9 @@ fn publish_to_correct_channel_only() {
 
 #[test]
 fn unsubscribe_stops_delivery() {
-    let port: u16 = 16705;
-    let _server = start_lux(port);
-    let mut sub_conn = connect(port);
-    let mut pub_conn = connect(port);
+    let server = LuxServer::start();
+    let mut sub_conn = server.conn();
+    let mut pub_conn = server.conn();
 
     send(&mut sub_conn, &["SUBSCRIBE", "events"]);
     thread::sleep(Duration::from_millis(100));
@@ -261,9 +195,8 @@ fn unsubscribe_stops_delivery() {
 
 #[test]
 fn subscriber_rejects_non_pubsub_commands() {
-    let port: u16 = 16706;
-    let _server = start_lux(port);
-    let mut conn = connect(port);
+    let server = LuxServer::start();
+    let mut conn = server.conn();
 
     send(&mut conn, &["SUBSCRIBE", "ch"]);
     thread::sleep(Duration::from_millis(100));
@@ -278,9 +211,8 @@ fn subscriber_rejects_non_pubsub_commands() {
 
 #[test]
 fn ping_allowed_in_subscribe_mode() {
-    let port: u16 = 16707;
-    let _server = start_lux(port);
-    let mut conn = connect(port);
+    let server = LuxServer::start();
+    let mut conn = server.conn();
 
     send(&mut conn, &["SUBSCRIBE", "ch"]);
     thread::sleep(Duration::from_millis(100));
@@ -292,11 +224,10 @@ fn ping_allowed_in_subscribe_mode() {
 
 #[test]
 fn multiple_subscribers_receive_message() {
-    let port: u16 = 16708;
-    let _server = start_lux(port);
-    let mut sub1 = connect(port);
-    let mut sub2 = connect(port);
-    let mut pub_conn = connect(port);
+    let server = LuxServer::start();
+    let mut sub1 = server.conn();
+    let mut sub2 = server.conn();
+    let mut pub_conn = server.conn();
 
     send(&mut sub1, &["SUBSCRIBE", "shared"]);
     send(&mut sub2, &["SUBSCRIBE", "shared"]);
@@ -316,9 +247,8 @@ fn multiple_subscribers_receive_message() {
 
 #[test]
 fn unsubscribe_all_exits_sub_mode() {
-    let port: u16 = 16709;
-    let _server = start_lux(port);
-    let mut conn = connect(port);
+    let server = LuxServer::start();
+    let mut conn = server.conn();
 
     send(&mut conn, &["SUBSCRIBE", "ch1", "ch2"]);
     thread::sleep(Duration::from_millis(100));

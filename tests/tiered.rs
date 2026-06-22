@@ -1,143 +1,7 @@
-use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::thread;
-use std::time::Duration;
 
-fn resp_cmd(args: &[&str]) -> Vec<u8> {
-    let mut buf = format!("*{}\r\n", args.len());
-    for arg in args {
-        buf.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
-    }
-    buf.into_bytes()
-}
-
-fn read_all(stream: &mut TcpStream) -> String {
-    let mut data = Vec::with_capacity(4096);
-    let mut buf = [0u8; 8192];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(len) => data.extend_from_slice(&buf[..len]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(_) => break,
-        }
-    }
-    String::from_utf8_lossy(&data).to_string()
-}
-
-fn send(stream: &mut TcpStream, args: &[&str]) -> String {
-    stream.write_all(&resp_cmd(args)).unwrap();
-    thread::sleep(Duration::from_millis(50));
-    read_all(stream)
-}
-
-fn find_lux_binary() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let target_dir = exe.parent()?.parent()?.parent()?;
-    let release = target_dir.join("release").join("lux");
-    if release.exists() {
-        return Some(release);
-    }
-    let debug = target_dir.join("debug").join("lux");
-    if debug.exists() {
-        return Some(debug);
-    }
-    None
-}
-
-fn connect(port: u16) -> TcpStream {
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-    stream.set_nodelay(true).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
-    stream
-}
-
-fn wait_for_port(port: u16) {
-    for _ in 0..40 {
-        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("server did not start on port {port}");
-}
-
-struct TestServer {
-    port: u16,
-    child: std::process::Child,
-    tmpdir: std::path::PathBuf,
-}
-
-impl TestServer {
-    fn start(port: u16) -> Self {
-        let bin = find_lux_binary().expect("no lux binary found");
-        let tmpdir = std::env::temp_dir().join(format!("lux_tiered_test_{port}"));
-        let _ = std::fs::remove_dir_all(&tmpdir);
-        std::fs::create_dir_all(&tmpdir).unwrap();
-
-        let child = std::process::Command::new(&bin)
-            .env("LUX_PORT", port.to_string())
-            .env("LUX_SHARDS", "4")
-            .env("LUX_MAXMEMORY", "100kb")
-            .env("LUX_MAXMEMORY_POLICY", "allkeys-lru")
-            .env("LUX_STORAGE_MODE", "tiered")
-            .env("LUX_STORAGE_DIR", tmpdir.join("storage").to_str().unwrap())
-            .env("LUX_DATA_DIR", tmpdir.to_str().unwrap())
-            .env("LUX_SAVE_INTERVAL", "0")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to start lux");
-
-        wait_for_port(port);
-        TestServer {
-            port,
-            child,
-            tmpdir,
-        }
-    }
-
-    fn restart(&mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
-        thread::sleep(Duration::from_millis(500));
-
-        let bin = find_lux_binary().expect("no lux binary found");
-        self.child = std::process::Command::new(&bin)
-            .env("LUX_PORT", self.port.to_string())
-            .env("LUX_SHARDS", "4")
-            .env("LUX_MAXMEMORY", "10mb")
-            .env("LUX_MAXMEMORY_POLICY", "allkeys-lru")
-            .env("LUX_STORAGE_MODE", "tiered")
-            .env(
-                "LUX_STORAGE_DIR",
-                self.tmpdir.join("storage").to_str().unwrap(),
-            )
-            .env("LUX_DATA_DIR", self.tmpdir.to_str().unwrap())
-            .env("LUX_SAVE_INTERVAL", "0")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to restart lux");
-
-        wait_for_port(self.port);
-    }
-
-    fn conn(&self) -> TcpStream {
-        connect(self.port)
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
-        let _ = std::fs::remove_dir_all(&self.tmpdir);
-    }
-}
+mod common;
+use common::{send, LuxServer};
 
 fn fill_memory(conn: &mut TcpStream, count: usize) {
     let val = "x".repeat(10000);
@@ -148,7 +12,7 @@ fn fill_memory(conn: &mut TcpStream, count: usize) {
 
 #[test]
 fn tiered_cold_string_read() {
-    let srv = TestServer::start(17100);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["SET", "mykey", "myvalue"]);
     fill_memory(&mut c, 20);
@@ -158,7 +22,7 @@ fn tiered_cold_string_read() {
 
 #[test]
 fn tiered_cold_hash_read() {
-    let srv = TestServer::start(17101);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(
         &mut c,
@@ -173,7 +37,7 @@ fn tiered_cold_hash_read() {
 
 #[test]
 fn tiered_cold_list_read() {
-    let srv = TestServer::start(17102);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["LPUSH", "mylist", "a", "b", "c"]);
     fill_memory(&mut c, 20);
@@ -185,7 +49,7 @@ fn tiered_cold_list_read() {
 
 #[test]
 fn tiered_cold_set_read() {
-    let srv = TestServer::start(17103);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["SADD", "myset", "x", "y", "z"]);
     fill_memory(&mut c, 20);
@@ -196,7 +60,7 @@ fn tiered_cold_set_read() {
 
 #[test]
 fn tiered_cold_sorted_set_read() {
-    let srv = TestServer::start(17104);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["ZADD", "myzset", "1.5", "alpha", "2.5", "beta"]);
     fill_memory(&mut c, 20);
@@ -207,7 +71,7 @@ fn tiered_cold_sorted_set_read() {
 
 #[test]
 fn tiered_cold_key_mutation() {
-    let srv = TestServer::start(17105);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["HSET", "h", "f1", "v1", "f2", "v2"]);
     fill_memory(&mut c, 20);
@@ -220,7 +84,7 @@ fn tiered_cold_key_mutation() {
 
 #[test]
 fn tiered_cold_list_mutation() {
-    let srv = TestServer::start(17106);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["LPUSH", "l", "a", "b", "c"]);
     fill_memory(&mut c, 20);
@@ -231,7 +95,7 @@ fn tiered_cold_list_mutation() {
 
 #[test]
 fn tiered_cold_incr() {
-    let srv = TestServer::start(17107);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["SET", "counter", "100"]);
     fill_memory(&mut c, 20);
@@ -244,7 +108,7 @@ fn tiered_cold_incr() {
 
 #[test]
 fn tiered_del_cold_key() {
-    let srv = TestServer::start(17108);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["SET", "delme", "exists"]);
     fill_memory(&mut c, 20);
@@ -262,7 +126,7 @@ fn tiered_del_cold_key() {
 
 #[test]
 fn tiered_exists_cold_key() {
-    let srv = TestServer::start(17109);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["SET", "ekey", "val"]);
     fill_memory(&mut c, 20);
@@ -272,7 +136,7 @@ fn tiered_exists_cold_key() {
 
 #[test]
 fn tiered_type_cold_key() {
-    let srv = TestServer::start(17110);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["HSET", "tyh", "f", "v"]);
     fill_memory(&mut c, 20);
@@ -282,7 +146,7 @@ fn tiered_type_cold_key() {
 
 #[test]
 fn tiered_keys_includes_cold() {
-    let srv = TestServer::start(17111);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["SET", "coldpattern:1", "a"]);
     send(&mut c, &["SET", "coldpattern:2", "b"]);
@@ -300,7 +164,7 @@ fn tiered_keys_includes_cold() {
 
 #[test]
 fn tiered_dbsize_includes_cold() {
-    let srv = TestServer::start(17112);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     for i in 0..10 {
         send(&mut c, &["SET", &format!("dbkey:{i}"), "val"]);
@@ -319,7 +183,7 @@ fn tiered_dbsize_includes_cold() {
 
 #[test]
 fn tiered_wal_crash_recovery() {
-    let mut srv = TestServer::start(17113);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["SET", "wal_str", "survives"]);
     send(&mut c, &["HSET", "wal_hash", "f1", "v1", "f2", "v2"]);
@@ -350,7 +214,7 @@ fn tiered_wal_crash_recovery() {
 
 #[test]
 fn tiered_wal_overwrite_ordering() {
-    let mut srv = TestServer::start(17114);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["SET", "ow", "first"]);
     send(&mut c, &["SET", "ow", "second"]);
@@ -368,7 +232,7 @@ fn tiered_wal_overwrite_ordering() {
 
 #[test]
 fn tiered_wal_set_then_del() {
-    let mut srv = TestServer::start(17115);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["SET", "delwal", "exists"]);
     send(&mut c, &["DEL", "delwal"]);
@@ -385,7 +249,7 @@ fn tiered_wal_set_then_del() {
 
 #[test]
 fn tiered_snapshot_includes_cold() {
-    let mut srv = TestServer::start(17116);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["SET", "snapcold", "value"]);
     fill_memory(&mut c, 20);
@@ -405,7 +269,7 @@ fn tiered_snapshot_includes_cold() {
 
 #[test]
 fn tiered_flushdb_clears_disk() {
-    let srv = TestServer::start(17117);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(&mut c, &["SET", "fkey", "fval"]);
     fill_memory(&mut c, 20);
