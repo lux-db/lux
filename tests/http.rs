@@ -276,6 +276,34 @@ fn http_restore_requires_operator_and_validates_payload() {
 }
 
 #[test]
+fn http_admin_endpoints_open_when_no_password_set() {
+    // With no password, Lux only binds loopback (the non-loopback guard), so the
+    // instance has no auth boundary: data endpoints are already fully open.
+    // Gating snapshot/restore behind operator creds nobody can present would only
+    // lock the legitimate local operator out, so they must stay reachable.
+    let _server = start_lux(17754, 17755, "");
+
+    // Snapshot streams without any credentials.
+    let (status, body) = http_request(17755, "GET", "/v1/snapshot", None, None);
+    assert_eq!(
+        status, 200,
+        "no-password snapshot should be allowed: {body}"
+    );
+    assert!(body.starts_with("LUX"), "snapshot header: {body:?}");
+
+    // Restore reaches payload validation (500), not an operator 403/401 wall.
+    let (status, body) = http_request(17755, "POST", "/v1/restore", Some("not-a-dump"), None);
+    assert_eq!(
+        status, 500,
+        "no-password restore should reach validation: {body}"
+    );
+    assert!(
+        body.contains("not a lux snapshot"),
+        "validation msg: {body}"
+    );
+}
+
+#[test]
 fn http_auth_required() {
     let _server = start_lux(17602, 17603, "secret");
 

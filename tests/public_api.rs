@@ -164,6 +164,28 @@ async fn run_with_config_rejects_unauthenticated_non_loopback_listener() {
 }
 
 #[tokio::test]
+async fn run_with_config_rejects_invalid_shard_counts() {
+    for shards in [0, 65_537] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = lux::ServerConfig {
+            enable_resp: false,
+            shards,
+            data_dir: tmp.path().display().to_string(),
+            ..Default::default()
+        };
+
+        let err = match lux::run_with_config(cfg).await {
+            Ok(handle) => {
+                handle.shutdown_and_wait().await.unwrap();
+                panic!("run_with_config should reject shard count {shards}");
+            }
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}
+
+#[tokio::test]
 async fn embedded_client_rejects_invalid_utf8_key_identity() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = lux::ServerConfig {

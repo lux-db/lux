@@ -388,6 +388,25 @@ fn validate_auth_config(config: &ServerConfig) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Reject shard counts that would crash or misbehave at runtime: zero shards
+/// makes the `fx_hash(key) % shards.len()` routing divide by zero, and an
+/// absurdly large count wastes memory on per-shard locks for no benefit.
+fn validate_shard_count(config: &ServerConfig) -> std::io::Result<()> {
+    if config.shards == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "shard count must be greater than zero",
+        ));
+    }
+    if config.shards > 65_536 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "shard count must not exceed 65536",
+        ));
+    }
+    Ok(())
+}
+
 pub struct ServerHandle {
     #[allow(dead_code)]
     runtime: Arc<Runtime>,
@@ -2786,6 +2805,7 @@ pub async fn run() -> std::io::Result<()> {
 pub async fn run_with_config(config: ServerConfig) -> std::io::Result<ServerHandle> {
     validate_listener_security(&config)?;
     validate_auth_config(&config)?;
+    validate_shard_count(&config)?;
     let listener = if config.enable_resp {
         let addr = config.listen_addr();
         Some(TcpListener::bind(&addr).await?)
