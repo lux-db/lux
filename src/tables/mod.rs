@@ -1,4 +1,4 @@
-mod select;
+pub(crate) mod select;
 pub(crate) use select::*;
 use std::collections::HashSet;
 use std::sync::Arc;

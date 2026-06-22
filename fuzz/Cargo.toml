@@ -1,0 +1,57 @@
+[package]
+name = "lux-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detach from the parent crate so a normal `cargo build` ignores the fuzzers;
+# they are built only via `cargo +nightly fuzz run <target>`.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.lux]
+path = ".."
+features = ["fuzzing"]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "snapshot"
+path = "fuzz_targets/snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resp"
+path = "fuzz_targets/resp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "msgpack"
+path = "fuzz_targets/msgpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "table_query"
+path = "fuzz_targets/table_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "command"
+path = "fuzz_targets/command.rs"
+test = false
+doc = false
+bench = false

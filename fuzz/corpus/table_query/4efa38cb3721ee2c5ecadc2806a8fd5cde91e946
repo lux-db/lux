@@ -1,0 +1,1 @@
+* FROM t WHERE id IN 1 SELECT%z

@@ -55,6 +55,14 @@ fn write_f64(w: &mut impl Write, v: f64) -> io::Result<()> {
 const MAX_SNAPSHOT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_SNAPSHOT_ITEMS: usize = 64 * 1024 * 1024;
 
+// Upper bound on how many elements we pre-allocate from an untrusted collection
+// count. The count is validated as a loop bound, but a corrupt snapshot can
+// *claim* tens of millions of items in a few bytes; pre-allocating that count
+// times the element size is a multi-GB OOM. Reserve modestly and let the vec
+// grow as real elements are actually read (a short/corrupt input hits EOF and
+// errors long before the vec grows).
+const SNAPSHOT_PREALLOC_CAP: usize = 64 * 1024;
+
 fn read_bytes(r: &mut impl Read) -> io::Result<Vec<u8>> {
     let len = read_u32(r)? as usize;
     if len > MAX_SNAPSHOT_BYTES {
@@ -364,7 +372,7 @@ fn load_from_reader(store: &Store, mut file: fs::File) -> io::Result<usize> {
     }
 }
 
-fn load_binary(
+pub(crate) fn load_binary(
     store: &Store,
     r: &mut impl Read,
     stream_groups: bool,
@@ -401,7 +409,7 @@ fn load_binary(
             b'S' => DumpValue::Str(read_bytes(r)?),
             b'L' => {
                 let len = read_count(r, "list item")?;
-                let mut items = Vec::with_capacity(len);
+                let mut items = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
                 for _ in 0..len {
                     items.push(read_bytes(r)?);
                 }
@@ -409,7 +417,7 @@ fn load_binary(
             }
             b'H' => {
                 let len = read_count(r, "hash field")?;
-                let mut pairs = Vec::with_capacity(len);
+                let mut pairs = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
                 for _ in 0..len {
                     let k = read_string(r)?;
                     let v = read_bytes(r)?;
@@ -419,7 +427,7 @@ fn load_binary(
             }
             b'T' => {
                 let len = read_count(r, "set member")?;
-                let mut members = Vec::with_capacity(len);
+                let mut members = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
                 for _ in 0..len {
                     members.push(read_string(r)?);
                 }
@@ -427,7 +435,7 @@ fn load_binary(
             }
             b'Z' => {
                 let len = read_count(r, "sorted set member")?;
-                let mut members = Vec::with_capacity(len);
+                let mut members = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
                 for _ in 0..len {
                     let m = read_string(r)?;
                     let s = read_f64(r)?;
@@ -438,11 +446,11 @@ fn load_binary(
             b'X' => {
                 let last_id = read_string(r)?;
                 let entry_count = read_count(r, "stream entry")?;
-                let mut entries = Vec::with_capacity(entry_count);
+                let mut entries = Vec::with_capacity(entry_count.min(SNAPSHOT_PREALLOC_CAP));
                 for _ in 0..entry_count {
                     let id = read_string(r)?;
                     let field_count = read_count(r, "stream field")?;
-                    let mut fields = Vec::with_capacity(field_count);
+                    let mut fields = Vec::with_capacity(field_count.min(SNAPSHOT_PREALLOC_CAP));
                     for _ in 0..field_count {
                         let k = read_string(r)?;
                         let v = read_bytes(r)?;
@@ -453,23 +461,26 @@ fn load_binary(
                 let mut groups = Vec::new();
                 if stream_groups {
                     let group_count = read_count(r, "stream group")?;
-                    groups.reserve(group_count);
+                    groups.reserve(group_count.min(SNAPSHOT_PREALLOC_CAP));
                     for _ in 0..group_count {
                         let name = read_string(r)?;
                         let last_delivered_id = read_string(r)?;
                         let consumer_count = read_count(r, "stream consumer")?;
-                        let mut consumers = Vec::with_capacity(consumer_count);
+                        let mut consumers =
+                            Vec::with_capacity(consumer_count.min(SNAPSHOT_PREALLOC_CAP));
                         for _ in 0..consumer_count {
                             let consumer = read_string(r)?;
                             let pending_count = read_count(r, "stream consumer pending")?;
-                            let mut pending_ids = Vec::with_capacity(pending_count);
+                            let mut pending_ids =
+                                Vec::with_capacity(pending_count.min(SNAPSHOT_PREALLOC_CAP));
                             for _ in 0..pending_count {
                                 pending_ids.push(read_string(r)?);
                             }
                             consumers.push((consumer, pending_ids));
                         }
                         let pending_count = read_count(r, "stream group pending")?;
-                        let mut pending = Vec::with_capacity(pending_count);
+                        let mut pending =
+                            Vec::with_capacity(pending_count.min(SNAPSHOT_PREALLOC_CAP));
                         for _ in 0..pending_count {
                             let id = read_string(r)?;
                             let consumer = read_string(r)?;
@@ -483,7 +494,7 @@ fn load_binary(
             }
             b'V' => {
                 let dims = read_sized_count(r, "vector dimension", std::mem::size_of::<f32>())?;
-                let mut data = Vec::with_capacity(dims);
+                let mut data = Vec::with_capacity(dims.min(SNAPSHOT_PREALLOC_CAP));
                 for _ in 0..dims {
                     let mut buf = [0u8; 4];
                     r.read_exact(&mut buf)?;
@@ -511,7 +522,7 @@ fn load_binary(
                     "timeseries sample",
                     std::mem::size_of::<i64>() + std::mem::size_of::<f64>(),
                 )?;
-                let mut samples = Vec::with_capacity(sample_count);
+                let mut samples = Vec::with_capacity(sample_count.min(SNAPSHOT_PREALLOC_CAP));
                 for _ in 0..sample_count {
                     let ts = read_i64(r)?;
                     let val = read_f64(r)?;
@@ -519,7 +530,7 @@ fn load_binary(
                 }
                 let retention = read_i64(r)? as u64;
                 let label_count = read_count(r, "timeseries label")?;
-                let mut labels = Vec::with_capacity(label_count);
+                let mut labels = Vec::with_capacity(label_count.min(SNAPSHOT_PREALLOC_CAP));
                 for _ in 0..label_count {
                     let k = read_string(r)?;
                     let v = read_string(r)?;
@@ -1151,6 +1162,24 @@ mod tests {
         let err = load_binary(&store, &mut Cursor::new(huge_bytes.as_slice()), true, true)
             .expect_err("huge byte string length must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // Found by the fuzzer: a hash entry whose pair count is ~50M (under the item
+    // cap) drove Vec::with_capacity(count) into a 2.4GB allocation, OOMing on a
+    // 24-byte input. Pre-allocation must be bounded, so this returns an error
+    // (EOF) without a giant up-front malloc.
+    #[test]
+    fn malformed_snapshot_large_count_does_not_oom() {
+        let data = [
+            0x48u8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x61, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0xf5, 0xff, 0x02, 0x00, 0xff, 0xff, 0xff,
+        ];
+        let store = Store::new();
+        let result = load_binary(&store, &mut std::io::Cursor::new(&data[..]), true, true);
+        assert!(
+            result.is_err(),
+            "truncated huge-count hash must error, not OOM"
+        );
     }
 
     fn store_in_temp_dir() -> (Arc<Store>, std::path::PathBuf, impl Drop) {

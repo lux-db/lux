@@ -599,7 +599,7 @@ fn read_raw_bytes(cursor: &mut Cursor<&Vec<u8>>, len: usize) -> Result<Vec<u8>, 
     Ok(buf)
 }
 
-fn msgpack_unpack_value(
+pub(crate) fn msgpack_unpack_value(
     lua: &mlua::Lua,
     cursor: &mut Cursor<&Vec<u8>>,
     depth: usize,

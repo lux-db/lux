@@ -11,6 +11,8 @@ mod command;
 mod disk;
 mod embedded;
 mod eviction;
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_api;
 mod geo;
 mod grants;
 mod hll;
