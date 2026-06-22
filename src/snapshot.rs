@@ -1219,4 +1219,21 @@ mod tests {
         assert!(storage_dir.join("keep.txt").exists(), "unrelated file kept");
         assert!(storage_dir.exists(), "storage dir itself kept");
     }
+
+    // Fuzz: arbitrary bytes fed to the binary snapshot loader must never panic
+    // or OOM -- only return cleanly (Ok or InvalidData). Guards the fail-closed
+    // length/count bounds against attacker-chosen prefixes.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2000))]
+
+        #[test]
+        fn fuzz_snapshot_load_no_panic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)
+        ) {
+            let store = Store::new();
+            let _ = load_binary(&store, &mut std::io::Cursor::new(&data), true, true);
+            let store2 = Store::new();
+            let _ = load_binary(&store2, &mut std::io::Cursor::new(&data), false, false);
+        }
+    }
 }

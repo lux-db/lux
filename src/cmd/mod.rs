@@ -4310,4 +4310,32 @@ mod tests {
             );
         }
     }
+
+    // Fuzz: arbitrary argument vectors through the command dispatch/lowering must
+    // never panic. Uses an in-memory store (no disk) and skips commands with side
+    // effects or that block, so the fuzzer can't write files or hang.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2000))]
+
+        #[test]
+        fn fuzz_command_execute_no_panic(
+            argv in proptest::collection::vec(
+                proptest::collection::vec(proptest::prelude::any::<u8>(), 0..12),
+                1..6,
+            )
+        ) {
+            const SKIP: &[&[u8]] = &[
+                b"SAVE", b"BGSAVE", b"BGREWRITEAOF", b"FLUSHALL", b"FLUSHDB", b"DEBUG",
+                b"SHUTDOWN", b"BLPOP", b"BRPOP", b"BLMOVE", b"BRPOPLPUSH", b"BLMPOP",
+                b"BZPOPMIN", b"BZPOPMAX", b"BZMPOP", b"WAIT", b"SUBSCRIBE", b"PSUBSCRIBE",
+                b"MONITOR",
+            ];
+            let first_upper: Vec<u8> = argv[0].iter().map(u8::to_ascii_uppercase).collect();
+            if !SKIP.contains(&first_upper.as_slice()) {
+                let refs: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+                let store = Store::new();
+                let _ = exec(&store, &refs);
+            }
+        }
+    }
 }
