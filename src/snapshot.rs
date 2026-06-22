@@ -48,11 +48,50 @@ fn write_f64(w: &mut impl Write, v: f64) -> io::Result<()> {
     w.write_all(&v.to_le_bytes())
 }
 
+// Fail-closed bounds for snapshot loading: a corrupt or hostile snapshot must
+// not be able to drive a huge up-front allocation (OOM) from an attacker-chosen
+// length prefix. These cap a single byte string and a single collection's item
+// count; loads that exceed them are rejected as InvalidData (no panic, no OOM).
+const MAX_SNAPSHOT_BYTES: usize = 512 * 1024 * 1024;
+const MAX_SNAPSHOT_ITEMS: usize = 64 * 1024 * 1024;
+
 fn read_bytes(r: &mut impl Read) -> io::Result<Vec<u8>> {
     let len = read_u32(r)? as usize;
+    if len > MAX_SNAPSHOT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot byte string length exceeds maximum",
+        ));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+/// Read a u32 collection length, bounded so a corrupt count can't drive a huge
+/// `Vec::with_capacity`. `label` names the collection for the error message.
+fn read_count(r: &mut impl Read, label: &str) -> io::Result<usize> {
+    let count = read_u32(r)? as usize;
+    if count > MAX_SNAPSHOT_ITEMS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("snapshot {label} count exceeds maximum"),
+        ));
+    }
+    Ok(count)
+}
+
+/// Like `read_count` but also caps `count * item_size` against the byte budget,
+/// for collections of fixed-size elements (vectors, HLL registers, TS samples).
+fn read_sized_count(r: &mut impl Read, label: &str, item_size: usize) -> io::Result<usize> {
+    let count = read_count(r, label)?;
+    if count.saturating_mul(item_size) > MAX_SNAPSHOT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("snapshot {label} byte size exceeds maximum"),
+        ));
+    }
+    Ok(count)
 }
 
 fn read_u32(r: &mut impl Read) -> io::Result<u32> {
@@ -333,7 +372,7 @@ fn load_binary(
         let value = match type_buf[0] {
             b'S' => DumpValue::Str(read_bytes(r)?),
             b'L' => {
-                let len = read_u32(r)? as usize;
+                let len = read_count(r, "list item")?;
                 let mut items = Vec::with_capacity(len);
                 for _ in 0..len {
                     items.push(read_bytes(r)?);
@@ -341,7 +380,7 @@ fn load_binary(
                 DumpValue::List(items)
             }
             b'H' => {
-                let len = read_u32(r)? as usize;
+                let len = read_count(r, "hash field")?;
                 let mut pairs = Vec::with_capacity(len);
                 for _ in 0..len {
                     let k = read_string(r)?;
@@ -351,7 +390,7 @@ fn load_binary(
                 DumpValue::Hash(pairs)
             }
             b'T' => {
-                let len = read_u32(r)? as usize;
+                let len = read_count(r, "set member")?;
                 let mut members = Vec::with_capacity(len);
                 for _ in 0..len {
                     members.push(read_string(r)?);
@@ -359,7 +398,7 @@ fn load_binary(
                 DumpValue::Set(members)
             }
             b'Z' => {
-                let len = read_u32(r)? as usize;
+                let len = read_count(r, "sorted set member")?;
                 let mut members = Vec::with_capacity(len);
                 for _ in 0..len {
                     let m = read_string(r)?;
@@ -370,11 +409,11 @@ fn load_binary(
             }
             b'X' => {
                 let last_id = read_string(r)?;
-                let entry_count = read_u32(r)? as usize;
+                let entry_count = read_count(r, "stream entry")?;
                 let mut entries = Vec::with_capacity(entry_count);
                 for _ in 0..entry_count {
                     let id = read_string(r)?;
-                    let field_count = read_u32(r)? as usize;
+                    let field_count = read_count(r, "stream field")?;
                     let mut fields = Vec::with_capacity(field_count);
                     for _ in 0..field_count {
                         let k = read_string(r)?;
@@ -385,23 +424,23 @@ fn load_binary(
                 }
                 let mut groups = Vec::new();
                 if stream_groups {
-                    let group_count = read_u32(r)? as usize;
+                    let group_count = read_count(r, "stream group")?;
                     groups.reserve(group_count);
                     for _ in 0..group_count {
                         let name = read_string(r)?;
                         let last_delivered_id = read_string(r)?;
-                        let consumer_count = read_u32(r)? as usize;
+                        let consumer_count = read_count(r, "stream consumer")?;
                         let mut consumers = Vec::with_capacity(consumer_count);
                         for _ in 0..consumer_count {
                             let consumer = read_string(r)?;
-                            let pending_count = read_u32(r)? as usize;
+                            let pending_count = read_count(r, "stream consumer pending")?;
                             let mut pending_ids = Vec::with_capacity(pending_count);
                             for _ in 0..pending_count {
                                 pending_ids.push(read_string(r)?);
                             }
                             consumers.push((consumer, pending_ids));
                         }
-                        let pending_count = read_u32(r)? as usize;
+                        let pending_count = read_count(r, "stream group pending")?;
                         let mut pending = Vec::with_capacity(pending_count);
                         for _ in 0..pending_count {
                             let id = read_string(r)?;
@@ -415,7 +454,7 @@ fn load_binary(
                 DumpValue::Stream(entries, last_id, groups)
             }
             b'V' => {
-                let dims = read_u32(r)? as usize;
+                let dims = read_sized_count(r, "vector dimension", std::mem::size_of::<f32>())?;
                 let mut data = Vec::with_capacity(dims);
                 for _ in 0..dims {
                     let mut buf = [0u8; 4];
@@ -432,14 +471,18 @@ fn load_binary(
                 DumpValue::Vector(data, metadata)
             }
             b'P' => {
-                let len = read_u32(r)? as usize;
+                let len = read_sized_count(r, "hyperloglog register", 1)?;
                 let mut regs = vec![0u8; len];
                 r.read_exact(&mut regs)?;
                 let cached = crate::hll::hll_count(&regs);
                 DumpValue::HyperLogLog(regs, cached)
             }
             b'I' => {
-                let sample_count = read_u32(r)? as usize;
+                let sample_count = read_sized_count(
+                    r,
+                    "timeseries sample",
+                    std::mem::size_of::<i64>() + std::mem::size_of::<f64>(),
+                )?;
                 let mut samples = Vec::with_capacity(sample_count);
                 for _ in 0..sample_count {
                     let ts = read_i64(r)?;
@@ -447,7 +490,7 @@ fn load_binary(
                     samples.push((ts, val));
                 }
                 let retention = read_i64(r)? as u64;
-                let label_count = read_u32(r)? as usize;
+                let label_count = read_count(r, "timeseries label")?;
                 let mut labels = Vec::with_capacity(label_count);
                 for _ in 0..label_count {
                     let k = read_string(r)?;
@@ -1051,5 +1094,34 @@ mod tests {
         let n = Instant::now();
         assert_eq!(store2.get(b"key1", n).unwrap(), &b"col1\tcol2\tcol3"[..]);
         assert_eq!(store2.get(b"key2", n).unwrap(), &b"safe"[..]);
+    }
+
+    // A corrupt/hostile snapshot with an attacker-chosen huge length prefix must
+    // fail closed (InvalidData), not OOM or panic trying to pre-allocate.
+    #[test]
+    fn malformed_snapshot_huge_lengths_fail_closed() {
+        use std::io::Cursor;
+
+        let mut huge_count = Vec::new();
+        huge_count.push(b'L');
+        huge_count.extend_from_slice(&3u32.to_le_bytes());
+        huge_count.extend_from_slice(b"abc");
+        huge_count.extend_from_slice(&(-1i64).to_le_bytes()); // ttl: none
+        huge_count.extend_from_slice(&u32::MAX.to_le_bytes()); // list count: huge
+        let store = Store::new();
+        let err = load_binary(&store, &mut Cursor::new(huge_count.as_slice()), true, true)
+            .expect_err("huge list count must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let mut huge_bytes = Vec::new();
+        huge_bytes.push(b'S');
+        huge_bytes.extend_from_slice(&3u32.to_le_bytes());
+        huge_bytes.extend_from_slice(b"abc");
+        huge_bytes.extend_from_slice(&(-1i64).to_le_bytes());
+        huge_bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // str byte len: huge
+        let store = Store::new();
+        let err = load_binary(&store, &mut Cursor::new(huge_bytes.as_slice()), true, true)
+            .expect_err("huge byte string length must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
