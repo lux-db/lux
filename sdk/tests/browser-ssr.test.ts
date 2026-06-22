@@ -108,6 +108,89 @@ describe('browser and SSR clients', () => {
 		expect(cookies.has('lux-auth-session')).toBe(false);
 	});
 
+	test('server client chunks large session cookies and restores them', async () => {
+		const cookies = new Map<string, string>();
+		const client = createServerClient('http://localhost:3957/v1/project', 'lux_pub_test', {
+			cookies: cookieMethods(cookies),
+		});
+		const largeAccessToken = 'access-token-'.repeat(400);
+
+		await client.auth.setSession({
+			access_token: largeAccessToken,
+			refresh_token: 'refresh-token',
+			expires_in: 3600,
+			token_type: 'bearer',
+			user: { id: 'usr_chunked', email: 'chunked@example.com' },
+		});
+
+		expect(cookies.has('lux-auth-session')).toBe(false);
+		expect(cookies.has('lux-auth-session.0')).toBe(true);
+		expect(cookies.has('lux-auth-session.1')).toBe(true);
+		for (const [name, value] of cookies) {
+			if (name.startsWith('lux-auth-session.')) {
+				expect(value.length).toBeLessThanOrEqual(3180);
+			}
+		}
+
+		const restored = createServerClient('http://localhost:3957/v1/project', 'lux_pub_test', {
+			cookies: cookieMethods(cookies),
+		});
+		expect((await restored.auth.getSession()).data?.session?.access_token)
+			.toBe(largeAccessToken);
+	});
+
+	test('session cookie updates remove stale chunks', async () => {
+		const cookies = new Map<string, string>();
+		const client = createServerClient('http://localhost:3957/v1/project', 'lux_pub_test', {
+			cookies: cookieMethods(cookies),
+		});
+
+		await client.auth.setSession({
+			access_token: 'large-'.repeat(1200),
+			refresh_token: 'refresh-token',
+			expires_in: 3600,
+			token_type: 'bearer',
+			user: { id: 'usr_chunks', email: 'chunks@example.com' },
+		});
+		expect(cookies.has('lux-auth-session.2')).toBe(true);
+
+		await client.auth.setSession({
+			access_token: 'small-access-token',
+			refresh_token: 'refresh-token',
+			expires_in: 3600,
+			token_type: 'bearer',
+			user: { id: 'usr_chunks', email: 'chunks@example.com' },
+		});
+
+		expect(cookies.has('lux-auth-session')).toBe(true);
+		expect([...cookies.keys()].some((name) => name.startsWith('lux-auth-session.')))
+			.toBe(false);
+		expect((await client.auth.getSession()).data?.session?.access_token)
+			.toBe('small-access-token');
+	});
+
+	test('clearing a session removes every cookie chunk', async () => {
+		const cookies = new Map<string, string>();
+		const client = createServerClient('http://localhost:3957/v1/project', 'lux_pub_test', {
+			cookies: cookieMethods(cookies),
+		});
+
+		await client.auth.setSession({
+			access_token: 'large-'.repeat(1200),
+			refresh_token: 'refresh-token',
+			expires_in: 3600,
+			token_type: 'bearer',
+			user: { id: 'usr_clear_chunks', email: 'clear-chunks@example.com' },
+		});
+		expect([...cookies.keys()].some((name) => name.startsWith('lux-auth-session.')))
+			.toBe(true);
+
+		await client.auth.clearSession();
+
+		expect([...cookies.keys()].some((name) => name === 'lux-auth-session' ||
+			name.startsWith('lux-auth-session.'))).toBe(false);
+	});
+
 	test('server client can read cookies when setAll is unavailable', async () => {
 		const cookies = new Map<string, string>();
 		const writer = createServerClient('http://localhost:3957/v1/project', 'lux_pub_test', {

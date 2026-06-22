@@ -50,6 +50,7 @@ export const AUTH_COOKIE_RESPONSE_HEADERS: Record<string, string> = {
 };
 
 const BASE64_PREFIX = 'base64-';
+const MAX_COOKIE_CHUNK_SIZE = 3180;
 
 export function browserCookieStorage(
 	options: LuxCookieOptions,
@@ -75,29 +76,83 @@ export function cookieStorage(
 	return {
 		async getItem(key) {
 			const allCookies = await cookies.getAll() ?? [];
-			const cookie = allCookies.find(({ name }) => name === key);
-			if (!cookie) return null;
-			return decodeCookieValue(cookie.value);
+			const value = combineCookieChunks(key, allCookies);
+			if (value == null) return null;
+			return decodeCookieValue(value);
 		},
 		async setItem(key, value) {
+			const allCookies = await cookies.getAll() ?? [];
+			const encodedValue = encodeCookieValue(value);
+			const chunks = createCookieChunks(key, encodedValue);
+			const chunkNames = new Set(chunks.map(({ name }) => name));
+			const staleCookies = allCookies
+				.filter(({ name }) => isCookieChunk(name, key) && !chunkNames.has(name))
+				.map(({ name }) => expiredCookie(name, options));
 			await setAll(
-				[{ name: key, value: encodeCookieValue(value), options }],
+				[
+					...staleCookies,
+					...chunks.map(({ name, value }) => ({ name, value, options })),
+				],
 				AUTH_COOKIE_RESPONSE_HEADERS,
 			);
 		},
 		async removeItem(key) {
+			const allCookies = await cookies.getAll() ?? [];
+			const cookieNames = allCookies
+				.filter(({ name }) => isCookieChunk(name, key))
+				.map(({ name }) => name);
+			if (cookieNames.length === 0) cookieNames.push(key);
 			await setAll(
-				[{
-					name: key,
-					value: '',
-					options: {
-						...options,
-						expires: new Date(0),
-						maxAge: 0,
-					},
-				}],
+				cookieNames.map((name) => expiredCookie(name, options)),
 				AUTH_COOKIE_RESPONSE_HEADERS,
 			);
+		},
+	};
+}
+
+function createCookieChunks(key: string, value: string): LuxCookie[] {
+	if (value.length <= MAX_COOKIE_CHUNK_SIZE) {
+		return [{ name: key, value }];
+	}
+	const chunks: LuxCookie[] = [];
+	for (let offset = 0; offset < value.length; offset += MAX_COOKIE_CHUNK_SIZE) {
+		chunks.push({
+			name: `${key}.${chunks.length}`,
+			value: value.slice(offset, offset + MAX_COOKIE_CHUNK_SIZE),
+		});
+	}
+	return chunks;
+}
+
+function combineCookieChunks(key: string, cookies: LuxCookie[]): string | null {
+	const cookieByName = new Map(cookies.map(({ name, value }) => [name, value]));
+	const unchunked = cookieByName.get(key);
+	if (unchunked != null) return unchunked;
+
+	const chunks: string[] = [];
+	for (let index = 0; ; index++) {
+		const chunk = cookieByName.get(`${key}.${index}`);
+		if (chunk == null) break;
+		chunks.push(chunk);
+	}
+	return chunks.length > 0 ? chunks.join('') : null;
+}
+
+function isCookieChunk(name: string, key: string): boolean {
+	if (name === key) return true;
+	if (!name.startsWith(`${key}.`)) return false;
+	const suffix = name.slice(key.length + 1);
+	return suffix === '0' || /^[1-9][0-9]*$/.test(suffix);
+}
+
+function expiredCookie(name: string, options: LuxCookieOptions): LuxCookieToSet {
+	return {
+		name,
+		value: '',
+		options: {
+			...options,
+			expires: new Date(0),
+			maxAge: 0,
 		},
 	};
 }
