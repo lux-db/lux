@@ -68,9 +68,12 @@ export interface LuxError {
 	details?: unknown;
 }
 
-export interface LuxResult<T> {
-	data: T | null;
-	error: LuxError | null;
+export type LuxResult<T> = {
+	data: T;
+	error: null;
+} | {
+	data: null;
+	error: LuxError;
 }
 
 type SchemaSafeParse<T> = { success: true; data: T } | { success: false; error: unknown };

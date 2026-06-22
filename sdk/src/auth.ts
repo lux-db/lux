@@ -117,8 +117,8 @@ export interface LuxAuthSession {
 }
 
 export interface LuxAuthSessionResult {
-	session: LuxAuthSession | null;
-	user: LuxAuthUser | null;
+	session: LuxAuthSession;
+	user: LuxAuthUser;
 }
 
 export interface LuxAuthKey {
@@ -218,8 +218,13 @@ export class LuxAuthClient {
 	private refreshMarginSeconds: number;
 	private currentSession: LuxAuthSession | null = null;
 	private loadedSession = false;
+	private storedSessionRaw: string | null = null;
 	private refreshTimer: ReturnType<typeof setTimeout> | null = null;
 	private listeners = new Set<LuxAuthStateChangeCallback>();
+	private broadcastChannel?: {
+		postMessage(message: unknown): void;
+		addEventListener(type: string, listener: (event: { data?: unknown }) => void): void;
+	};
 
 	constructor(options: LuxAuthOptions = {}) {
 		this.httpUrl = options.httpUrl?.replace(/\/+$/, '');
@@ -234,6 +239,7 @@ export class LuxAuthClient {
 		if (this.authToken) {
 			this.currentSession = null;
 		}
+		this.initializeBrowserLifecycle();
 	}
 
 	async getSession(): Promise<LuxResult<{ session: LuxAuthSession | null }>> {
@@ -245,11 +251,19 @@ export class LuxAuthClient {
 	}
 
 	private async getSessionValue(): Promise<LuxAuthSession | null> {
-		await this.loadStoredSession();
+		if (this.loadedSession) {
+			// Reconcile storage before auth operations, but do not emit a
+			// synthetic event. For example, signOut after an SSR redirect must
+			// emit only SIGNED_OUT; emitting SIGNED_IN first can start a
+			// competing SvelteKit invalidation while the cookie still exists.
+			await this.recoverStoredSession(false);
+		} else {
+			await this.loadStoredSession();
+		}
 		if (this.currentSession && isExpired(this.currentSession, this.refreshMarginSeconds)) {
 			if (this.autoRefreshToken && this.currentSession.refresh_token) {
 				const refreshed = await this.refreshSession(this.currentSession.refresh_token);
-				return refreshed.data?.session ?? null;
+				return refreshed.error ? null : refreshed.data.session;
 			}
 			await this.clearSessionValue();
 			return null;
@@ -284,10 +298,10 @@ export class LuxAuthClient {
 		return this.currentSession;
 	}
 
-	async clearSession(): Promise<LuxResult<null>> {
+	async clearSession(): Promise<LuxResult<true>> {
 		try {
 			await this.clearSessionValue();
-			return ok(null);
+			return ok(true);
 		} catch (error) {
 			return err('LUX_AUTH_SESSION_ERROR', 'Failed to clear auth session', toLuxError(error));
 		}
@@ -297,11 +311,13 @@ export class LuxAuthClient {
 		this.authToken = undefined;
 		this.currentSession = null;
 		this.loadedSession = true;
+		this.storedSessionRaw = null;
 		this.clearRefreshTimer();
 		if (this.persistSession && this.storage) {
 			await this.storage.removeItem(this.storageKey);
 		}
 		this.emit('SIGNED_OUT', null);
+		this.broadcast('SIGNED_OUT', null);
 	}
 
 	onAuthStateChange(callback: LuxAuthStateChangeCallback): LuxAuthSubscription {
@@ -372,12 +388,16 @@ export class LuxAuthClient {
 
 	async consumeOAuthRedirect(url = browserLocation()): Promise<LuxResult<LuxAuthSessionResult>> {
 		try {
-			if (!url) return ok({ session: null, user: null });
+			if (!url) {
+				return err('LUX_AUTH_OAUTH_ERROR', 'OAuth redirect URL is missing');
+			}
 			const parsed = new URL(url);
 			const params = new URLSearchParams(parsed.hash.replace(/^#/, ''));
 			const accessToken = params.get('access_token');
 			const refreshToken = params.get('refresh_token');
-			if (!accessToken || !refreshToken) return ok({ session: null, user: null });
+			if (!accessToken || !refreshToken) {
+				return err('LUX_AUTH_OAUTH_ERROR', 'OAuth redirect is missing session tokens');
+			}
 			const session = normalizeSession({
 				access_token: accessToken,
 				refresh_token: refreshToken,
@@ -385,16 +405,13 @@ export class LuxAuthClient {
 				token_type: 'bearer',
 				user: { id: '', email: '' },
 			});
-				if (this.httpUrl) {
-					const user = await this.getUser(accessToken);
-					if (user.error) return user as LuxResult<LuxAuthSessionResult>;
-					if (!user.data?.user) {
-						return err('LUX_AUTH_USER_ERROR', 'OAuth redirect token did not resolve to a user');
-					}
-					session.user = user.data.user;
-				}
+			if (this.httpUrl) {
+				const user = await this.getUser(accessToken);
+				if (user.error) return user as LuxResult<LuxAuthSessionResult>;
+				session.user = user.data.user;
+			}
 			await this.saveSession(session, 'SIGNED_IN');
-			return ok({ session: this.currentSession, user: this.currentSession?.user ?? null });
+			return ok({ session, user: session.user });
 		} catch (error) {
 			return err('LUX_AUTH_OAUTH_ERROR', 'Failed to consume OAuth redirect', toLuxError(error));
 		}
@@ -417,12 +434,12 @@ export class LuxAuthClient {
 		}
 	}
 
-	async getUser(session?: Pick<LuxAuthSession, 'access_token'> | string): Promise<LuxResult<{ user: LuxAuthUser | null }>> {
+	async getUser(session?: Pick<LuxAuthSession, 'access_token'> | string): Promise<LuxResult<{ user: LuxAuthUser }>> {
 		if (!session) {
 			await this.getSessionValue();
 		}
 		try {
-			return ok(await this.requestRaw<{ user: LuxAuthUser | null }>('/auth/v1/user', {
+			return ok(await this.requestRaw<{ user: LuxAuthUser }>('/auth/v1/user', {
 				method: 'GET',
 				token: this.tokenFrom(session),
 			}));
@@ -431,7 +448,7 @@ export class LuxAuthClient {
 		}
 	}
 
-	async logout(sessionOrRefreshToken?: Pick<LuxAuthSession, 'access_token' | 'refresh_token'> | string): Promise<LuxResult<null>> {
+	async logout(sessionOrRefreshToken?: Pick<LuxAuthSession, 'access_token' | 'refresh_token'> | string): Promise<LuxResult<true>> {
 		if (!sessionOrRefreshToken) {
 			sessionOrRefreshToken = await this.getSessionValue() ?? undefined;
 		}
@@ -441,20 +458,35 @@ export class LuxAuthClient {
 		const refreshToken = typeof sessionOrRefreshToken === 'string'
 			? undefined
 			: sessionOrRefreshToken?.refresh_token;
+		let logoutError: unknown;
 		try {
 			await this.requestRaw('/auth/v1/logout', {
 				method: 'POST',
 				token,
 				body: JSON.stringify(refreshToken ? { refresh_token: refreshToken } : {}),
 			});
-			await this.clearSessionValue();
-			return ok(null);
 		} catch (error) {
-			return err('LUX_AUTH_LOGOUT_ERROR', 'Failed to log out', toLuxError(error));
+			logoutError = error;
 		}
+
+		try {
+			// Local sign-out must not depend on the remote session still being
+			// valid. The server may already have revoked or expired it.
+			await this.clearSessionValue();
+		} catch (error) {
+			return err('LUX_AUTH_LOGOUT_ERROR', 'Failed to clear the local auth session', {
+				logout: logoutError ? toLuxError(logoutError) : null,
+				storage: toLuxError(error),
+			});
+		}
+
+		if (logoutError) {
+			return err('LUX_AUTH_LOGOUT_ERROR', 'Remote logout failed; local session was cleared', toLuxError(logoutError));
+		}
+		return ok(true);
 	}
 
-	async signOut(): Promise<LuxResult<null>> {
+	async signOut(): Promise<LuxResult<true>> {
 		return this.logout();
 	}
 
@@ -495,13 +527,13 @@ export class LuxAuthClient {
 		}
 	}
 
-	async revokeGrant(grantId: string): Promise<LuxResult<null>> {
+	async revokeGrant(grantId: string): Promise<LuxResult<true>> {
 		try {
 			await this.requestRaw(`/auth/v1/admin/grants/${encodeURIComponent(grantId)}`, {
 				method: 'DELETE',
 				secret: true,
 			});
-			return ok(null);
+			return ok(true);
 		} catch (error) {
 			return err('LUX_AUTH_ADMIN_ERROR', 'Failed to revoke grant', toLuxError(error));
 		}
@@ -559,13 +591,13 @@ export class LuxAuthClient {
 		}
 	}
 
-	async revokeApiKey(keyId: string): Promise<LuxResult<null>> {
+	async revokeApiKey(keyId: string): Promise<LuxResult<true>> {
 		try {
 			await this.requestRaw(`/auth/v1/admin/keys/${encodeURIComponent(keyId)}`, {
 				method: 'DELETE',
 				secret: true,
 			});
-			return ok(null);
+			return ok(true);
 		} catch (error) {
 			return err('LUX_AUTH_ADMIN_ERROR', 'Failed to revoke API key', toLuxError(error));
 		}
@@ -604,6 +636,7 @@ export class LuxAuthClient {
 		this.loadedSession = true;
 		if (!this.persistSession || !this.storage) return;
 		const raw = await this.storage.getItem(this.storageKey);
+		this.storedSessionRaw = raw;
 		if (!raw) return;
 		try {
 			const session = normalizeSession(JSON.parse(raw));
@@ -619,11 +652,14 @@ export class LuxAuthClient {
 		this.currentSession = session;
 		this.authToken = session.access_token;
 		this.loadedSession = true;
+		const raw = JSON.stringify(session);
+		this.storedSessionRaw = raw;
 		if (this.persistSession && this.storage) {
-			await this.storage.setItem(this.storageKey, JSON.stringify(session));
+			await this.storage.setItem(this.storageKey, raw);
 		}
 		this.scheduleRefresh(session);
 		this.emit(event, session);
+		this.broadcast(event, raw);
 	}
 
 	private scheduleRefresh(session: LuxAuthSession): void {
@@ -642,6 +678,84 @@ export class LuxAuthClient {
 			clearTimeout(this.refreshTimer);
 			this.refreshTimer = null;
 		}
+	}
+
+	private initializeBrowserLifecycle(): void {
+		if (!this.persistSession || typeof globalThis === 'undefined') return;
+		const document = (globalThis as any).document;
+		if (!document) return;
+
+		const BroadcastChannelImpl = (globalThis as any).BroadcastChannel;
+		if (BroadcastChannelImpl) {
+			this.broadcastChannel = new BroadcastChannelImpl(this.storageKey);
+			this.broadcastChannel?.addEventListener('message', (event) => {
+				const message = event.data as {
+					event?: LuxAuthChangeEvent;
+					raw?: string | null;
+				} | undefined;
+				if (!message || !('raw' in message)) return;
+				void this.applyExternalSession(message.raw ?? null, message.event);
+			});
+		}
+
+		if (document?.addEventListener) {
+			document.addEventListener('visibilitychange', () => {
+				if (document.visibilityState === 'visible') {
+					void this.recoverStoredSession(true);
+				}
+			});
+		}
+	}
+
+	private async recoverStoredSession(notify: boolean): Promise<void> {
+		if (!this.persistSession || !this.storage) return;
+		const raw = await this.storage.getItem(this.storageKey);
+		await this.applyExternalSession(
+			raw,
+			undefined,
+			notify,
+		);
+	}
+
+	private async applyExternalSession(
+		raw: string | null,
+		event?: LuxAuthChangeEvent,
+		notify = true,
+	): Promise<void> {
+		if (raw === this.storedSessionRaw) return;
+
+		const previousSession = this.currentSession;
+		this.storedSessionRaw = raw;
+		this.loadedSession = true;
+
+		if (!raw) {
+			this.currentSession = null;
+			this.authToken = undefined;
+			this.clearRefreshTimer();
+			if (notify && previousSession) this.emit('SIGNED_OUT', null);
+			return;
+		}
+
+		try {
+			const session = normalizeSession(JSON.parse(raw));
+			this.currentSession = session;
+			this.authToken = session.access_token;
+			this.scheduleRefresh(session);
+			if (notify) {
+				this.emit(event ?? (previousSession ? 'SESSION_UPDATED' : 'SIGNED_IN'), session);
+			}
+		} catch {
+			this.currentSession = null;
+			this.authToken = undefined;
+			this.clearRefreshTimer();
+			this.storedSessionRaw = null;
+			await this.storage?.removeItem(this.storageKey);
+			if (notify && previousSession) this.emit('SIGNED_OUT', null);
+		}
+	}
+
+	private broadcast(event: LuxAuthChangeEvent, raw: string | null): void {
+		this.broadcastChannel?.postMessage({ event, raw });
 	}
 
 	private emit(event: LuxAuthChangeEvent, session: LuxAuthSession | null): void {

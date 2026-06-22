@@ -12,10 +12,14 @@ bun i @luxdb/sdk
 
 ## Browser app client
 
-Use a publishable key in browser code. The browser client persists auth sessions in browser storage by default.
+Use a publishable key in browser code. The browser client persists auth sessions
+in the shared `lux-auth-session` cookie by default.
+Like Supabase's SSR client, `createBrowserClient` returns a singleton in browser
+environments, broadcasts auth changes across tabs, and recovers the cookie-backed
+session when the document becomes visible.
 
 ```ts
-import { createBrowserClient } from "@luxdb/sdk";
+import { createBrowserClient } from "@luxdb/sdk/browser";
 
 const lux = createBrowserClient(
   "https://api.luxdb.dev/v1/my-project",
@@ -251,9 +255,12 @@ const { data: users, error } = await admin.auth.listUsers();
 ## SSR client
 
 Use `createServerClient` with your framework's cookie methods to persist sessions on the server.
+The SSR and browser clients share the `lux-auth-session` cookie by default, so a
+session created in a SvelteKit action is available to the browser client after
+the response is applied.
 
 ```ts
-import { createServerClient } from "@luxdb/sdk";
+import { createServerClient } from "@luxdb/sdk/ssr";
 
 const lux = createServerClient(
   "https://api.luxdb.dev/v1/my-project",
@@ -261,6 +268,35 @@ const lux = createServerClient(
   { cookies }
 );
 ```
+
+In SvelteKit, create the server client with the request-local `cookies` object:
+
+```ts
+// src/hooks.server.ts or +page.server.ts
+const lux = createServerClient(url, publishableKey, {
+  cookies: {
+    getAll: () => cookies.getAll(),
+    setAll: (cookiesToSet) => {
+      cookiesToSet.forEach(({ name, value, options }) => {
+        cookies.set(name, value, options);
+      });
+    },
+  },
+});
+```
+
+`setAll` batches cookie updates and every item always includes concrete cookie
+options. When your framework adapter also controls response headers, apply the
+second `headers` argument to the response; Lux supplies private/no-store headers
+for responses that update auth cookies.
+
+On server contexts that can only read request cookies, `setAll` may be omitted.
+The client can read the existing session, but sign-in, refresh, and sign-out
+cookie changes cannot be persisted from that context.
+
+The default session cookie is intentionally not `HttpOnly`, because the browser
+client must read it and refresh the session. Override `auth.storage` on the
+browser client if you want a different persistence strategy.
 
 ## Direct Lux/Redis-compatible access
 

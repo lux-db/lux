@@ -1,22 +1,20 @@
 import { createClient, type LuxProjectOptions } from './project';
-import type { LuxAuthStorage } from './auth';
 import type { LuxSchema } from './types';
+import {
+	cookieStorage,
+	DEFAULT_SESSION_COOKIE,
+	DEFAULT_SESSION_COOKIE_OPTIONS,
+	type LuxServerCookieMethods,
+	type LuxCookieOptions,
+} from './cookies';
 
-export interface LuxCookieOptions {
-	domain?: string;
-	expires?: Date;
-	httpOnly?: boolean;
-	maxAge?: number;
-	path?: string;
-	sameSite?: 'lax' | 'strict' | 'none';
-	secure?: boolean;
-}
-
-export interface LuxCookieMethods {
-	get(name: string): string | null | undefined | Promise<string | null | undefined>;
-	set?(name: string, value: string, options?: LuxCookieOptions): void | Promise<void>;
-	remove?(name: string, options?: LuxCookieOptions): void | Promise<void>;
-}
+export type {
+	LuxBrowserCookieMethods,
+	LuxCookie,
+	LuxCookieOptions,
+	LuxCookieToSet,
+	LuxServerCookieMethods,
+} from './cookies';
 
 export interface LuxServerClientOptions extends Omit<LuxProjectOptions, 'url' | 'key' | 'auth'> {
 	auth?: Omit<NonNullable<LuxProjectOptions['auth']>, 'storage'> & {
@@ -27,20 +25,18 @@ export interface LuxServerClientOptions extends Omit<LuxProjectOptions, 'url' | 
 	 * for a stateless backend client (secret key, or `setSession` per request):
 	 * `createServerClient(url, key)` then works with no cookie plumbing.
 	 */
-	cookies?: LuxCookieMethods;
+	cookies?: LuxServerCookieMethods;
 }
-
-const DEFAULT_COOKIE = 'lux-auth-session';
 
 export function createServerClient<DB extends Record<string, object> = LuxSchema>(
 	url: string,
 	key: string,
 	options: LuxServerClientOptions = {},
 ) {
-	const storageKey = options.auth?.storageKey ?? DEFAULT_COOKIE;
-	const cookieOptions = options.auth?.cookieOptions ?? {
-		path: '/',
-		sameSite: 'lax',
+	const storageKey = options.auth?.storageKey ?? DEFAULT_SESSION_COOKIE;
+	const cookieOptions = {
+		...DEFAULT_SESSION_COOKIE_OPTIONS,
+		...options.auth?.cookieOptions,
 	};
 	const { cookieOptions: _cookieOptions, ...authOptions } = options.auth ?? {};
 
@@ -55,23 +51,7 @@ export function createServerClient<DB extends Record<string, object> = LuxSchema
 			autoRefreshToken: false,
 			...authOptions,
 			storageKey,
-			storage: hasCookies ? cookieStorage(options.cookies as LuxCookieMethods, cookieOptions) : null,
+			storage: hasCookies ? cookieStorage(options.cookies as LuxServerCookieMethods, cookieOptions) : null,
 		},
 	});
-}
-
-function cookieStorage(cookies: LuxCookieMethods, options: LuxCookieOptions): LuxAuthStorage {
-	return {
-		async getItem(key) {
-			return await cookies.get(key) ?? null;
-		},
-		async setItem(key, value) {
-			if (!cookies.set) return;
-			await cookies.set(key, value, options);
-		},
-		async removeItem(key) {
-			if (!cookies.remove) return;
-			await cookies.remove(key, { ...options, maxAge: 0, expires: new Date(0) });
-		},
-	};
 }
