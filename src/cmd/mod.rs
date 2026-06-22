@@ -2222,6 +2222,10 @@ pub fn execute_with_wal(
             resp::write_error(out, &err);
             return CmdResult::Written;
         }
+        if let Some(err) = crate::auth::reserved_key_mutation_error(args, store) {
+            resp::write_error(out, &err);
+            return CmdResult::Written;
+        }
         if let Err(e) = store.wal_log_command(args) {
             resp::write_error(out, &format!("ERR WAL append failed: {e}"));
             return CmdResult::Written;

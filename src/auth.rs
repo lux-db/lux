@@ -124,6 +124,42 @@ pub(crate) fn reserved_table_access_error(table: &str) -> Option<String> {
     }
 }
 
+/// Defense-in-depth: forbid raw KV mutation (HSET/HDEL/DEL/SET/...) of Lux Auth
+/// internal keys (`_t:auth.*`). The table-command guard above only covers
+/// `T*` commands, so without this an operator could tamper with / delete auth
+/// internals (users, sessions, keys, grants) via raw KV, bypassing the auth API.
+/// Internal engine writes use the store layer directly (not this command path),
+/// and WAL replay sets `wal_suppress`, so neither is affected.
+pub(crate) fn reserved_key_mutation_error(args: &[&[u8]], store: &Store) -> Option<String> {
+    if store
+        .wal_suppress
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    if args.is_empty() {
+        return None;
+    }
+    let cmd = std::str::from_utf8(args[0])
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    // `T*` table commands are handled by `reserved_table_mutation_error`.
+    if matches!(
+        cmd.as_str(),
+        "TINSERT" | "TUPSERT" | "TUPDATE" | "TDELETE" | "TCREATE" | "TDROP" | "TALTER"
+    ) {
+        return None;
+    }
+    for raw in &args[1..] {
+        if let Ok(k) = std::str::from_utf8(raw) {
+            if k.starts_with("_t:auth.") {
+                return Some("ERR access to Lux Auth internal keys is not permitted".to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Reject a read whose base table or any joined table is Lux Auth managed.
 /// The base-table guard alone leaves a bypass: `TSELECT ... FROM posts JOIN
 /// auth.users ...` could project `encrypted_password` through the join.

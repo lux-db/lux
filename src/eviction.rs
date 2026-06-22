@@ -116,6 +116,12 @@ fn evict_lru(store: &Store, sample_size: usize, volatile_only: bool) -> bool {
     let n = store.shard_count();
     let seed = store.approximate_memory();
     let start_shard = seed % n;
+    // In memory mode, eviction permanently removes a key. Table rows are a
+    // composite (`_t:{t}:row/ids/schema/idx/uniq`, `_t:_ttl`, `_t:auth.*`);
+    // dropping any one piece corrupts the table or loses data. So never evict a
+    // reserved `_t:*` key in memory mode. In tiered mode it is safe (the key is
+    // moved to disk and faulted back by `try_promote`).
+    let protect_tables = !store.is_tiered();
 
     let mut best_key: Option<Vec<u8>> = None;
     let mut best_clock: u32 = u32::MAX;
@@ -137,6 +143,9 @@ fn evict_lru(store: &Store, sample_size: usize, volatile_only: bool) -> bool {
                 continue;
             }
             if matches!(entry.value, StoreValue::Vector(_)) {
+                continue;
+            }
+            if protect_tables && key.starts_with(b"_t:") {
                 continue;
             }
             sampled += 1;
@@ -163,6 +172,8 @@ fn evict_random(store: &Store, volatile_only: bool) -> bool {
     let n = store.shard_count();
     let seed = store.approximate_memory();
     let start_shard = seed % n;
+    // See `evict_lru`: never permanently evict reserved `_t:*` keys in memory mode.
+    let protect_tables = !store.is_tiered();
 
     for offset in 0..n {
         let shard_idx = (start_shard + offset) % n;
@@ -175,13 +186,20 @@ fn evict_random(store: &Store, volatile_only: bool) -> bool {
             shard
                 .data
                 .iter()
-                .find(|(_, e)| e.expires_at.is_some() && !matches!(e.value, StoreValue::Vector(_)))
+                .find(|(k, e)| {
+                    e.expires_at.is_some()
+                        && !(matches!(e.value, StoreValue::Vector(_))
+                            || protect_tables && k.starts_with(b"_t:"))
+                })
                 .map(|(k, _)| k.clone())
         } else {
             shard
                 .data
                 .iter()
-                .find(|(_, e)| !matches!(e.value, StoreValue::Vector(_)))
+                .find(|(k, e)| {
+                    !(matches!(e.value, StoreValue::Vector(_))
+                        || protect_tables && k.starts_with(b"_t:"))
+                })
                 .map(|(k, _)| k.clone())
         };
         drop(shard);

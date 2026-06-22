@@ -581,3 +581,52 @@ async fn live_table_row_ttl_emits_delete() {
     );
     assert_eq!(delete["pk"], "u1");
 }
+
+// Multi-row insert (HTTP array body) with ?ttl applies the TTL to every row.
+#[tokio::test]
+async fn http_array_insert_applies_ttl_to_each() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, None);
+
+    let (status, _) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"pres","columns":[{"name":"user_id","type":"STR","primaryKey":true},{"name":"room","type":"STR"}]}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+
+    // The insert response returns both rows -> the TTL applied to each.
+    let (status, inserted) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/pres?ttl=1",
+        r#"[{"user_id":"a","room":"r"},{"user_id":"b","room":"r"}]"#,
+        None,
+    );
+    assert_eq!(status, 200, "array insert: {inserted}");
+    assert_eq!(
+        inserted["result"].as_array().map(|a| a.len()).unwrap_or(0),
+        2,
+        "two rows inserted: {inserted}"
+    );
+
+    // After the TTL lapses, a fresh subscription's snapshot is empty.
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    let mut ws = connect_live(http_port, None).await;
+    send_json(
+        &mut ws,
+        json!({"type":"live.subscribe","id":"p","spec":{"kind":"table","table":"pres"}}),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws).await["type"], "live.subscribed");
+    let snap = recv_live_event(&mut ws, "p").await;
+    assert_eq!(snap["kind"], "snapshot");
+    assert_eq!(
+        snap["rows"].as_array().map(|a| a.len()).unwrap_or(99),
+        0,
+        "both rows should expire: {snap}"
+    );
+}

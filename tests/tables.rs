@@ -1707,3 +1707,118 @@ fn ttl_table_default_applies() {
     child.kill().ok();
     child.wait().ok();
 }
+
+#[test]
+fn ttl_unique_value_reusable_after_expiry() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    assert_eq!(
+        send(
+            &mut s,
+            &["TCREATE", "u", "id STR PRIMARY KEY,", "email STR UNIQUE"]
+        ),
+        "+OK"
+    );
+    let r = send(
+        &mut s,
+        &["TINSERT", "u", "id", "a1", "email", "x@y.com", "TTL", "1"],
+    );
+    assert!(!r.starts_with('-'), "insert: {}", r);
+    std::thread::sleep(Duration::from_millis(1400));
+
+    // A different PK can reuse the expired row's UNIQUE value (its unique-index
+    // entry was purged with the row).
+    let r = send(&mut s, &["TINSERT", "u", "id", "a2", "email", "x@y.com"]);
+    assert!(
+        !r.starts_with('-'),
+        "unique value should be reusable after expiry: {}",
+        r
+    );
+    let r = send(&mut s, &["TSELECT", "*", "FROM", "u"]);
+    assert!(r.contains("a2"), "reinserted row present: {}", r);
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn raw_kv_cannot_mutate_auth_internals() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Raw KV mutation of Lux Auth internal keys must be rejected (defense-in-depth
+    // against bypassing the auth API via raw HSET/DEL on _t:auth.*).
+    let r = send(
+        &mut s,
+        &["HSET", "_t:auth.users:row:x", "encrypted_password", "pwned"],
+    );
+    assert!(
+        r.starts_with('-'),
+        "raw HSET of _t:auth.* must be blocked: {}",
+        r
+    );
+    let r = send(&mut s, &["DEL", "_t:auth.users:row:x"]);
+    assert!(
+        r.starts_with('-'),
+        "raw DEL of _t:auth.* must be blocked: {}",
+        r
+    );
+    // Normal keys are unaffected.
+    let r = send(&mut s, &["SET", "normal_key", "ok"]);
+    assert!(!r.starts_with('-'), "normal key write should work: {}", r);
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn ttl_table_drop_clears_stale_deadline() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Row with a 1s TTL, then drop the table.
+    assert_eq!(
+        send(
+            &mut s,
+            &[
+                "TCREATE",
+                "pres",
+                "user_id STR PRIMARY KEY,",
+                "room STR",
+                "WITH",
+                "TTL",
+                "1"
+            ]
+        ),
+        "+OK"
+    );
+    send(&mut s, &["TINSERT", "pres", "user_id", "u1", "room", "a"]);
+    assert_eq!(send(&mut s, &["TDROP", "pres"]), "+OK");
+
+    // Recreate WITHOUT a TTL and reinsert the same PK (permanent row).
+    assert_eq!(
+        send(
+            &mut s,
+            &["TCREATE", "pres", "user_id STR PRIMARY KEY,", "room STR"]
+        ),
+        "+OK"
+    );
+    send(&mut s, &["TINSERT", "pres", "user_id", "u1", "room", "b"]);
+
+    // Past the dropped table's original deadline: the re-created row must survive
+    // (the stale _t:_ttl member was cleared on drop).
+    std::thread::sleep(Duration::from_millis(1400));
+    let r = send(&mut s, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(
+        r.contains("u1") && r.contains("b"),
+        "re-created row must survive a dropped table's stale TTL: {}",
+        r
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}

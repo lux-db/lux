@@ -2663,6 +2663,9 @@ pub fn table_drop(
             }
         }
         let rk = row_key_for_pk(table, pk_str);
+        // Clear any row-TTL deadline so a dropped row's stale `_t:_ttl` member
+        // can't later expire a re-created row that reuses the same PK.
+        clear_row_ttl(store, table, pk_str, now);
         store.del(&[rk.as_bytes()]);
     }
 
