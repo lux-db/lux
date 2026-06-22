@@ -158,7 +158,11 @@ pub fn snapshot_for_backup(store: &Store) -> io::Result<String> {
 /// the process so the standard startup load reconstructs state from the dump.
 /// Used by `POST /v1/restore`.
 pub fn restore_to_disk(store: &Store, dump: &[u8]) -> io::Result<()> {
-    if dump.len() < 4 || (&dump[..4] != HEADER && &dump[..4] != HEADER_V1) {
+    let header_ok = dump.len() >= 4
+        && [HEADER, HEADER_V2, HEADER_V1]
+            .iter()
+            .any(|h| &dump[..4] == *h);
+    if !header_ok {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "restore payload is not a lux snapshot",
@@ -178,10 +182,34 @@ pub fn restore_to_disk(store: &Store, dump: &[u8]) -> io::Result<()> {
     }
     fs::rename(&tmp, &path)?;
 
-    // Drop the tiered storage tree (per-shard WAL + cold data) so startup loads
-    // only lux.dat, with no WAL replaying post-snapshot writes over the restore.
+    // Drop the Lux-owned per-shard dirs (WAL + cold data) so startup loads only
+    // lux.dat, with no WAL replaying post-snapshot writes over the restore. Only
+    // remove `shard_*` dirs we own, never the whole storage dir: in production
+    // storage.dir is a subdir of data_dir, but a misconfigured storage.dir that
+    // overlaps data_dir must never take lux.dat down with it.
     let storage_dir = store.config().storage.dir.clone();
-    let _ = fs::remove_dir_all(Path::new(&storage_dir));
+    purge_lux_storage_shards(Path::new(&storage_dir))?;
+    Ok(())
+}
+
+/// Remove only the `shard_*` directories Lux owns under `storage_dir`, leaving the
+/// directory itself and any unrelated contents intact. Missing dir is not an error.
+fn purge_lux_storage_shards(storage_dir: &Path) -> io::Result<()> {
+    let entries = match fs::read_dir(storage_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if name.starts_with("shard_") && entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
     Ok(())
 }
 
@@ -1123,5 +1151,72 @@ mod tests {
         let err = load_binary(&store, &mut Cursor::new(huge_bytes.as_slice()), true, true)
             .expect_err("huge byte string length must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    fn store_in_temp_dir() -> (Arc<Store>, std::path::PathBuf, impl Drop) {
+        let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("lux_restore_test_{}_{}", std::process::id(), id));
+        let storage_dir = dir.join("storage");
+        fs::create_dir_all(&storage_dir).unwrap();
+        let cfg = crate::ServerConfig {
+            data_dir: dir.to_str().unwrap().to_string(),
+            storage: crate::StorageConfig {
+                dir: storage_dir.to_str().unwrap().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let store = Arc::new(Store::new_with_config(Arc::new(cfg)));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        (store, dir.clone(), Cleanup(dir))
+    }
+
+    // Every snapshot header version we have ever written must be restorable. The
+    // guard once accepted only V1 and V3, silently rejecting V2 backups.
+    #[test]
+    fn restore_accepts_all_known_headers_rejects_junk() {
+        for header in [HEADER_V1, HEADER_V2, HEADER] {
+            let (store, dir, _g) = store_in_temp_dir();
+            let mut dump = header.to_vec();
+            dump.extend_from_slice(b"trailing-body-bytes");
+            restore_to_disk(&store, &dump)
+                .unwrap_or_else(|e| panic!("header {header:?} should restore: {e}"));
+            assert!(
+                dir.join("lux.dat").exists(),
+                "lux.dat written for {header:?}"
+            );
+        }
+
+        let (store, _dir, _g) = store_in_temp_dir();
+        let err = restore_to_disk(&store, b"XXXXnot-a-snapshot")
+            .expect_err("junk header must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // Restore must drop only the shard_* dirs Lux owns, never sibling files: a
+    // misconfigured storage.dir overlapping data_dir must not take lux.dat down.
+    #[test]
+    fn restore_purges_only_owned_shard_dirs() {
+        let (store, _dir, _g) = store_in_temp_dir();
+        let storage_dir = std::path::PathBuf::from(&store.config().storage.dir);
+        fs::create_dir_all(storage_dir.join("shard_0")).unwrap();
+        fs::create_dir_all(storage_dir.join("shard_1")).unwrap();
+        fs::write(storage_dir.join("shard_0").join("wal.log"), b"x").unwrap();
+        fs::write(storage_dir.join("keep.txt"), b"keep").unwrap();
+
+        let mut dump = HEADER.to_vec();
+        dump.extend_from_slice(b"body");
+        restore_to_disk(&store, &dump).unwrap();
+
+        assert!(!storage_dir.join("shard_0").exists(), "shard_0 purged");
+        assert!(!storage_dir.join("shard_1").exists(), "shard_1 purged");
+        assert!(storage_dir.join("keep.txt").exists(), "unrelated file kept");
+        assert!(storage_dir.exists(), "storage dir itself kept");
     }
 }
