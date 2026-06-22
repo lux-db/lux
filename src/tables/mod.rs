@@ -2390,6 +2390,13 @@ fn table_delete_inner(
                 let _ = store.hdel(ukey.as_bytes(), &[val.as_bytes()], now);
             }
         }
+        // A VECTOR column stores its embedding in a side key with its own ANN
+        // index; deleting the row must remove it too, or vector search keeps
+        // returning the deleted row (and the entry leaks).
+        if matches!(field.field_type, FieldType::Vector(_)) {
+            let vkey = table_vector_key(table, &field.name, pk_str);
+            store.del(&[vkey.as_bytes()]);
+        }
     }
 
     // Remove declared JSON path index entries for this row.
@@ -2772,6 +2779,13 @@ pub fn table_drop(
                     if let Some((_, value)) = row.iter().find(|(k, _)| k == &field.name) {
                         remove_from_index(store, table, field, value, pk_str, now);
                     }
+                }
+            }
+            // Remove each row's VECTOR side keys (+ their ANN index) on drop.
+            for field in &schema {
+                if matches!(field.field_type, FieldType::Vector(_)) {
+                    let vkey = table_vector_key(table, &field.name, pk_str);
+                    store.del(&[vkey.as_bytes()]);
                 }
             }
         }

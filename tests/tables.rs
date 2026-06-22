@@ -1822,3 +1822,64 @@ fn ttl_table_drop_clears_stale_deadline() {
     child.kill().ok();
     child.wait().ok();
 }
+
+#[test]
+fn vector_index_cleaned_on_delete_and_drop() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let near = |s: &mut TcpStream| {
+        send(
+            s,
+            &[
+                "TSELECT",
+                "id",
+                "FROM",
+                "docs",
+                "NEAR",
+                "emb",
+                "[1,0]",
+                "K",
+                "10",
+                "THRESHOLD",
+                "0.1",
+            ],
+        )
+    };
+
+    send(
+        &mut s,
+        &["TCREATE", "docs", "id INT PRIMARY KEY,", "emb VECTOR(2)"],
+    );
+    send(&mut s, &["TINSERT", "docs", "id", "1", "emb", "[1,0]"]);
+    send(&mut s, &["TINSERT", "docs", "id", "2", "emb", "[0,1]"]);
+
+    // Delete row 1: it must be gone from the table AND from vector search.
+    send(
+        &mut s,
+        &["TDELETE", "FROM", "docs", "WHERE", "id", "=", "1"],
+    );
+    let gone = send(
+        &mut s,
+        &["TSELECT", "*", "FROM", "docs", "WHERE", "id", "=", "1"],
+    );
+    assert!(gone.starts_with("*0"), "row 1 should be deleted: {}", gone);
+
+    // Drop the table, then recreate it empty. A leaked vector index from the old
+    // table would make a NEAR search on the fresh empty table return ghosts.
+    send(&mut s, &["TDROP", "docs"]);
+    send(
+        &mut s,
+        &["TCREATE", "docs", "id INT PRIMARY KEY,", "emb VECTOR(2)"],
+    );
+    let r = near(&mut s);
+    assert!(
+        r.starts_with("*0"),
+        "fresh table after drop must have no orphaned vectors: {}",
+        r
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
