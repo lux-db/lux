@@ -233,6 +233,7 @@ pub fn eval(
     now: Instant,
 ) -> Result<BytesMut, String> {
     let lua = mlua::Lua::new();
+    install_lua_sandbox(&lua)?;
 
     let keys_table = lua
         .create_table()
@@ -266,48 +267,22 @@ pub fn eval(
         .set("ARGV", argv_table)
         .map_err(|e| format!("ERR lua error: {}", e))?;
 
-    let store_clone = store.clone();
-    let broker_clone = broker.clone();
-    let redis_call = lua
-        .create_function(move |lua_ctx, args: mlua::MultiValue| {
-            let mut cmd_args: Vec<Vec<u8>> = Vec::new();
-            for arg in args {
-                match arg {
-                    mlua::Value::String(s) => cmd_args.push(s.as_bytes().to_vec()),
-                    mlua::Value::Integer(n) => cmd_args.push(n.to_string().into_bytes()),
-                    mlua::Value::Number(n) => cmd_args.push(n.to_string().into_bytes()),
-                    _ => cmd_args.push(b"".to_vec()),
-                }
-            }
-            if cmd_args.is_empty() {
-                return Err(mlua::Error::external(
-                    "ERR wrong number of arguments for redis.call",
-                ));
-            }
-            let refs: Vec<&[u8]> = cmd_args.iter().map(|v| v.as_slice()).collect();
-            let mut out = BytesMut::new();
-            let lua_cache =
-                std::sync::Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
-            crate::cmd::execute(
-                &store_clone,
-                &lua_cache,
-                &broker_clone,
-                &refs,
-                &mut out,
-                now,
-            );
-            resp_to_lua(lua_ctx, &out).map_err(|e| mlua::Error::external(format!("{}", e)))
-        })
+    // `redis.call` raises on a command error (aborting the script); `redis.pcall`
+    // returns the error as a `{err=...}` table. They were the same function before,
+    // so `pcall` wrongly aborted instead of returning the error table.
+    let redis_call = create_redis_call(&lua, store.clone(), broker.clone(), now, true)
+        .map_err(|e| format!("ERR lua error: {}", e))?;
+    let redis_pcall = create_redis_call(&lua, store.clone(), broker.clone(), now, false)
         .map_err(|e| format!("ERR lua error: {}", e))?;
 
     let redis = lua
         .create_table()
         .map_err(|e| format!("ERR lua error: {}", e))?;
     redis
-        .set("call", redis_call.clone())
+        .set("call", redis_call)
         .map_err(|e| format!("ERR lua error: {}", e))?;
     redis
-        .set("pcall", redis_call)
+        .set("pcall", redis_pcall)
         .map_err(|e| format!("ERR lua error: {}", e))?;
     lua.globals()
         .set("redis", redis)
@@ -403,6 +378,109 @@ pub fn eval(
     Ok(out)
 }
 
+/// Build a `redis.call`/`redis.pcall` function. When `raise_errors` is true a
+/// command error becomes a raised Lua error (aborts the script); when false the
+/// error is returned as a `{err=...}` table (pcall semantics).
+fn create_redis_call(
+    lua: &mlua::Lua,
+    store: Arc<Store>,
+    broker: Broker,
+    now: Instant,
+    raise_errors: bool,
+) -> mlua::Result<mlua::Function> {
+    lua.create_function(move |lua_ctx, args: mlua::MultiValue| {
+        let mut cmd_args: Vec<Vec<u8>> = Vec::new();
+        for arg in args {
+            match arg {
+                mlua::Value::String(s) => cmd_args.push(s.as_bytes().to_vec()),
+                mlua::Value::Integer(n) => cmd_args.push(n.to_string().into_bytes()),
+                mlua::Value::Number(n) => cmd_args.push(n.to_string().into_bytes()),
+                _ => cmd_args.push(b"".to_vec()),
+            }
+        }
+        if cmd_args.is_empty() {
+            return Err(mlua::Error::external(
+                "ERR wrong number of arguments for redis.call",
+            ));
+        }
+        // Scripts may not run admin/blocking/transaction/pubsub commands.
+        if let Some(err) = lua_disallowed_command_error(&cmd_args[0]) {
+            if raise_errors {
+                return Err(mlua::Error::external(err));
+            }
+            let tbl = lua_ctx.create_table()?;
+            tbl.set("err", err)?;
+            return Ok(mlua::Value::Table(tbl));
+        }
+        let refs: Vec<&[u8]> = cmd_args.iter().map(|v| v.as_slice()).collect();
+        let mut out = BytesMut::new();
+        let lua_cache =
+            std::sync::Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        crate::cmd::execute(&store, &lua_cache, &broker, &refs, &mut out, now);
+        if raise_errors && out.first() == Some(&b'-') {
+            return Err(mlua::Error::external(resp_error_message(&out)));
+        }
+        resp_to_lua(lua_ctx, &out).map_err(|e| mlua::Error::external(format!("{}", e)))
+    })
+}
+
+/// Commands a script must not run: admin/persistence, blocking, transaction
+/// control, and subscription commands.
+fn lua_disallowed_command_error(cmd: &[u8]) -> Option<&'static str> {
+    if crate::cmd::is_blocking_command(cmd)
+        || cmd.eq_ignore_ascii_case(b"SAVE")
+        || cmd.eq_ignore_ascii_case(b"BGSAVE")
+        || cmd.eq_ignore_ascii_case(b"MULTI")
+        || cmd.eq_ignore_ascii_case(b"EXEC")
+        || cmd.eq_ignore_ascii_case(b"DISCARD")
+        || cmd.eq_ignore_ascii_case(b"WATCH")
+        || cmd.eq_ignore_ascii_case(b"UNWATCH")
+        || cmd.eq_ignore_ascii_case(b"SUBSCRIBE")
+        || cmd.eq_ignore_ascii_case(b"UNSUBSCRIBE")
+        || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE")
+        || cmd.eq_ignore_ascii_case(b"PUNSUBSCRIBE")
+        || cmd.eq_ignore_ascii_case(b"KSUB")
+        || cmd.eq_ignore_ascii_case(b"KUNSUB")
+    {
+        Some("ERR This Redis command is not allowed from script")
+    } else {
+        None
+    }
+}
+
+/// Extract the human message from a RESP error reply (`-MSG\r\n`).
+fn resp_error_message(out: &[u8]) -> String {
+    let end = out.iter().position(|&b| b == b'\r').unwrap_or(out.len());
+    String::from_utf8_lossy(&out[1..end]).to_string()
+}
+
+/// Remove dangerous globals from the script environment: filesystem/process
+/// (`os`, `io`), module loading (`package`, `require`, `dofile`, `loadfile`),
+/// introspection (`debug`), GC control (`collectgarbage`), and dynamic code
+/// loading (`load`, `loadstring`) -- the last of which can load crafted bytecode
+/// and escape the VM. The engine's own helpers use the Rust `mlua` API, which is
+/// unaffected by nil-ing these Lua globals.
+fn install_lua_sandbox(lua: &mlua::Lua) -> Result<(), String> {
+    let globals = lua.globals();
+    for name in [
+        "os",
+        "io",
+        "package",
+        "require",
+        "dofile",
+        "loadfile",
+        "load",
+        "loadstring",
+        "debug",
+        "collectgarbage",
+    ] {
+        globals
+            .set(name, mlua::Value::Nil)
+            .map_err(|e| format!("ERR lua error: {}", e))?;
+    }
+    Ok(())
+}
+
 fn msgpack_pack_value(val: &mlua::Value, buf: &mut Vec<u8>) -> Result<(), String> {
     use rmp::encode;
     match val {
@@ -483,8 +561,29 @@ fn read_raw_u64(cursor: &mut Cursor<&Vec<u8>>) -> Result<u64, String> {
     Ok(u64::from_be_bytes(buf))
 }
 
+/// Max items in a single decoded msgpack array/map -- bounds a hostile container
+/// length prefix so cmsgpack.unpack can't be driven into runaway work.
+const MAX_MSGPACK_CONTAINER_ITEMS: usize = 1_000_000;
+
+fn check_msgpack_container_len(len: usize) -> Result<(), String> {
+    if len > MAX_MSGPACK_CONTAINER_ITEMS {
+        Err("msgpack container length exceeds maximum".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 fn read_raw_bytes(cursor: &mut Cursor<&Vec<u8>>, len: usize) -> Result<Vec<u8>, String> {
     use std::io::Read;
+    // A msgpack length prefix is attacker-controlled: never pre-allocate beyond
+    // the bytes actually remaining in the input.
+    let remaining = cursor
+        .get_ref()
+        .len()
+        .saturating_sub(cursor.position() as usize);
+    if len > remaining {
+        return Err("msgpack byte length exceeds input".to_string());
+    }
     let mut buf = vec![0u8; len];
     cursor.read_exact(&mut buf).map_err(|e| e.to_string())?;
     Ok(buf)
@@ -574,6 +673,7 @@ fn msgpack_unpack_value(
         }
         rmp::Marker::Array16 => {
             let len = read_raw_u16(cursor)? as usize;
+            check_msgpack_container_len(len)?;
             let tbl = lua.create_table().map_err(|e| e.to_string())?;
             for i in 0..len {
                 let v = msgpack_unpack_value(lua, cursor)?;
@@ -583,6 +683,7 @@ fn msgpack_unpack_value(
         }
         rmp::Marker::Array32 => {
             let len = read_raw_u32(cursor)? as usize;
+            check_msgpack_container_len(len)?;
             let tbl = lua.create_table().map_err(|e| e.to_string())?;
             for i in 0..len {
                 let v = msgpack_unpack_value(lua, cursor)?;
@@ -601,6 +702,7 @@ fn msgpack_unpack_value(
         }
         rmp::Marker::Map16 => {
             let len = read_raw_u16(cursor)? as usize;
+            check_msgpack_container_len(len)?;
             let tbl = lua.create_table().map_err(|e| e.to_string())?;
             for _ in 0..len {
                 let k = msgpack_unpack_value(lua, cursor)?;
@@ -611,6 +713,7 @@ fn msgpack_unpack_value(
         }
         rmp::Marker::Map32 => {
             let len = read_raw_u32(cursor)? as usize;
+            check_msgpack_container_len(len)?;
             let tbl = lua.create_table().map_err(|e| e.to_string())?;
             for _ in 0..len {
                 let k = msgpack_unpack_value(lua, cursor)?;

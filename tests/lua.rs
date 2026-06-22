@@ -216,3 +216,87 @@ fn eval_return_table() {
     assert!(resp.contains(":2"), "contains 2: {resp}");
     assert!(resp.contains(":3"), "contains 3: {resp}");
 }
+
+#[test]
+fn eval_sandbox_removes_dangerous_globals() {
+    let port: u16 = 17310;
+    let _server = start_lux(port);
+    let mut conn = connect(port);
+    // Each of these globals must be nil inside a script: no filesystem, process,
+    // bytecode loading, native modules, or debug introspection from user Lua.
+    for g in [
+        "os",
+        "io",
+        "package",
+        "require",
+        "dofile",
+        "loadfile",
+        "load",
+        "loadstring",
+        "debug",
+        "collectgarbage",
+    ] {
+        let src = format!("return type({g})");
+        let resp = send_and_read(&mut conn, &["EVAL", &src, "0"]);
+        assert!(
+            resp.contains("nil"),
+            "global `{g}` should be sandboxed to nil, got: {resp}"
+        );
+    }
+}
+
+#[test]
+fn eval_call_aborts_but_pcall_returns_error_table() {
+    let port: u16 = 17311;
+    let _server = start_lux(port);
+    let mut conn = connect(port);
+    // redis.pcall on a failing command returns an error table; the script keeps running.
+    let resp = send_and_read(
+        &mut conn,
+        &[
+            "EVAL",
+            "local r = redis.pcall('NOPE'); if type(r) == 'table' and r.err then return 'caught' else return 'leaked' end",
+            "0",
+        ],
+    );
+    assert!(
+        resp.contains("caught"),
+        "pcall should return an error table, not abort: {resp}"
+    );
+    // redis.call on the same failing command aborts the script with a RESP error.
+    let resp = send_and_read(&mut conn, &["EVAL", "redis.call('NOPE'); return 1", "0"]);
+    assert!(
+        resp.starts_with('-'),
+        "call on a bad command should abort with an error reply: {resp}"
+    );
+}
+
+#[test]
+fn eval_cmsgpack_unpack_rejects_oversized_declared_length() {
+    let port: u16 = 17313;
+    let _server = start_lux(port);
+    let mut conn = connect(port);
+    // Array32 marker (0xdd) declaring ~4 billion elements with no payload: the
+    // container-length cap must reject it (error), never pre-allocate or spin.
+    let src = "local ok = pcall(function() return cmsgpack.unpack(string.char(0xdd, 0xff, 0xff, 0xff, 0xff)) end); if ok then return 'unbounded' else return 'rejected' end";
+    let resp = send_and_read(&mut conn, &["EVAL", src, "0"]);
+    assert!(
+        resp.contains("rejected"),
+        "oversized msgpack container length must be rejected: {resp}"
+    );
+}
+
+#[test]
+fn eval_denies_admin_and_control_commands() {
+    let port: u16 = 17312;
+    let _server = start_lux(port);
+    let mut conn = connect(port);
+    for cmd in ["SAVE", "BGSAVE", "MULTI", "SUBSCRIBE", "WATCH"] {
+        let src = format!("return redis.call('{cmd}')");
+        let resp = send_and_read(&mut conn, &["EVAL", &src, "0"]);
+        assert!(
+            resp.to_lowercase().contains("not allowed"),
+            "`{cmd}` must be denied from scripts: {resp}"
+        );
+    }
+}
