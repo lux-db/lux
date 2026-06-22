@@ -4681,6 +4681,34 @@ mod tests {
         assert_eq!(plan.conditions[0].values, vec!["1", "2"]);
     }
 
+    // Fuzz: arbitrary token streams through the TSELECT query parser (including
+    // the WHERE/IN/subquery grammar) must never panic -- only return Ok/Err.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(3000))]
+
+        #[test]
+        fn fuzz_parse_select_no_panic(
+            tokens in proptest::collection::vec(
+                proptest::prelude::prop_oneof![
+                    proptest::prelude::Just("*".to_string()),
+                    proptest::prelude::Just("FROM".to_string()),
+                    proptest::prelude::Just("WHERE".to_string()),
+                    proptest::prelude::Just("IN".to_string()),
+                    proptest::prelude::Just("NOT".to_string()),
+                    proptest::prelude::Just("AND".to_string()),
+                    proptest::prelude::Just("(".to_string()),
+                    proptest::prelude::Just(")".to_string()),
+                    proptest::prelude::Just("SELECT".to_string()),
+                    "[a-zA-Z0-9_=<>!.*-]{0,8}",
+                ],
+                0..24,
+            )
+        ) {
+            let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            let _ = parse_select(&refs);
+        }
+    }
+
     #[test]
     fn parse_in_missing_close_paren_errors() {
         let err =

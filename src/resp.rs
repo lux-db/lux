@@ -581,4 +581,24 @@ mod tests {
         assert_eq!(buf.format_usize(0), "0");
         assert_eq!(buf.format_usize(12345), "12345");
     }
+
+    // Fuzz: arbitrary client bytes through the RESP parser must never panic --
+    // a malformed frame is a clean Err, never a crash. Drains the parser to EOF.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4000))]
+
+        #[test]
+        fn fuzz_resp_parse_no_panic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..2048)
+        ) {
+            let mut parser = Parser::new(&data);
+            // Pull commands until the parser stops yielding (Ok(None)) or errors.
+            for _ in 0..1024 {
+                match parser.parse_command() {
+                    Ok(Some(_)) => continue,
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+    }
 }

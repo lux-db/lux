@@ -308,7 +308,7 @@ pub fn eval(
         .create_function(|lua_ctx, data: mlua::String| {
             let bytes = data.as_bytes().to_vec();
             let mut cursor = Cursor::new(&bytes);
-            msgpack_unpack_value(lua_ctx, &mut cursor).map_err(mlua::Error::external)
+            msgpack_unpack_value(lua_ctx, &mut cursor, 0).map_err(mlua::Error::external)
         })
         .map_err(|e| format!("ERR lua error: {}", e))?;
     cmsgpack
@@ -571,6 +571,10 @@ fn read_raw_u64(cursor: &mut Cursor<&Vec<u8>>) -> Result<u64, String> {
 /// length prefix so cmsgpack.unpack can't be driven into runaway work.
 const MAX_MSGPACK_CONTAINER_ITEMS: usize = 1_000_000;
 
+/// Max msgpack nesting depth -- a hostile stream of nested array/map markers
+/// must not be able to recurse the decoder into a stack overflow.
+const MAX_MSGPACK_DEPTH: usize = 128;
+
 fn check_msgpack_container_len(len: usize) -> Result<(), String> {
     if len > MAX_MSGPACK_CONTAINER_ITEMS {
         Err("msgpack container length exceeds maximum".to_string())
@@ -598,7 +602,11 @@ fn read_raw_bytes(cursor: &mut Cursor<&Vec<u8>>, len: usize) -> Result<Vec<u8>, 
 fn msgpack_unpack_value(
     lua: &mlua::Lua,
     cursor: &mut Cursor<&Vec<u8>>,
+    depth: usize,
 ) -> Result<mlua::Value, String> {
+    if depth > MAX_MSGPACK_DEPTH {
+        return Err("msgpack nesting too deep".to_string());
+    }
     let pos = cursor.position() as usize;
     let buf = cursor.get_ref();
     if pos >= buf.len() {
@@ -672,7 +680,7 @@ fn msgpack_unpack_value(
         rmp::Marker::FixArray(len) => {
             let tbl = lua.create_table().map_err(|e| e.to_string())?;
             for i in 0..len as usize {
-                let v = msgpack_unpack_value(lua, cursor)?;
+                let v = msgpack_unpack_value(lua, cursor, depth + 1)?;
                 tbl.set(i + 1, v).map_err(|e| e.to_string())?;
             }
             Ok(mlua::Value::Table(tbl))
@@ -682,7 +690,7 @@ fn msgpack_unpack_value(
             check_msgpack_container_len(len)?;
             let tbl = lua.create_table().map_err(|e| e.to_string())?;
             for i in 0..len {
-                let v = msgpack_unpack_value(lua, cursor)?;
+                let v = msgpack_unpack_value(lua, cursor, depth + 1)?;
                 tbl.set(i + 1, v).map_err(|e| e.to_string())?;
             }
             Ok(mlua::Value::Table(tbl))
@@ -692,7 +700,7 @@ fn msgpack_unpack_value(
             check_msgpack_container_len(len)?;
             let tbl = lua.create_table().map_err(|e| e.to_string())?;
             for i in 0..len {
-                let v = msgpack_unpack_value(lua, cursor)?;
+                let v = msgpack_unpack_value(lua, cursor, depth + 1)?;
                 tbl.set(i + 1, v).map_err(|e| e.to_string())?;
             }
             Ok(mlua::Value::Table(tbl))
@@ -700,9 +708,16 @@ fn msgpack_unpack_value(
         rmp::Marker::FixMap(len) => {
             let tbl = lua.create_table().map_err(|e| e.to_string())?;
             for _ in 0..len {
-                let k = msgpack_unpack_value(lua, cursor)?;
-                let v = msgpack_unpack_value(lua, cursor)?;
-                tbl.set(k, v).map_err(|e| e.to_string())?;
+                let k = msgpack_unpack_value(lua, cursor, depth + 1)?;
+                let v = msgpack_unpack_value(lua, cursor, depth + 1)?;
+                // A nil or NaN key is not a valid Lua table index. Real
+                // msgpack never produces one, but corrupt/truncated input
+                // can -- skip it rather than let Lua abort the process.
+                let bad_key = matches!(k, mlua::Value::Nil)
+                    || matches!(k, mlua::Value::Number(n) if n.is_nan());
+                if !bad_key {
+                    tbl.set(k, v).map_err(|e| e.to_string())?;
+                }
             }
             Ok(mlua::Value::Table(tbl))
         }
@@ -711,9 +726,16 @@ fn msgpack_unpack_value(
             check_msgpack_container_len(len)?;
             let tbl = lua.create_table().map_err(|e| e.to_string())?;
             for _ in 0..len {
-                let k = msgpack_unpack_value(lua, cursor)?;
-                let v = msgpack_unpack_value(lua, cursor)?;
-                tbl.set(k, v).map_err(|e| e.to_string())?;
+                let k = msgpack_unpack_value(lua, cursor, depth + 1)?;
+                let v = msgpack_unpack_value(lua, cursor, depth + 1)?;
+                // A nil or NaN key is not a valid Lua table index. Real
+                // msgpack never produces one, but corrupt/truncated input
+                // can -- skip it rather than let Lua abort the process.
+                let bad_key = matches!(k, mlua::Value::Nil)
+                    || matches!(k, mlua::Value::Number(n) if n.is_nan());
+                if !bad_key {
+                    tbl.set(k, v).map_err(|e| e.to_string())?;
+                }
             }
             Ok(mlua::Value::Table(tbl))
         }
@@ -722,9 +744,16 @@ fn msgpack_unpack_value(
             check_msgpack_container_len(len)?;
             let tbl = lua.create_table().map_err(|e| e.to_string())?;
             for _ in 0..len {
-                let k = msgpack_unpack_value(lua, cursor)?;
-                let v = msgpack_unpack_value(lua, cursor)?;
-                tbl.set(k, v).map_err(|e| e.to_string())?;
+                let k = msgpack_unpack_value(lua, cursor, depth + 1)?;
+                let v = msgpack_unpack_value(lua, cursor, depth + 1)?;
+                // A nil or NaN key is not a valid Lua table index. Real
+                // msgpack never produces one, but corrupt/truncated input
+                // can -- skip it rather than let Lua abort the process.
+                let bad_key = matches!(k, mlua::Value::Nil)
+                    || matches!(k, mlua::Value::Number(n) if n.is_nan());
+                if !bad_key {
+                    tbl.set(k, v).map_err(|e| e.to_string())?;
+                }
             }
             Ok(mlua::Value::Table(tbl))
         }
@@ -965,4 +994,59 @@ fn json_find_colon(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+
+    // A hostile stream of nested array markers must be rejected by the depth
+    // guard, not stack-overflow the decoder.
+    #[test]
+    fn msgpack_deeply_nested_rejected_not_overflow() {
+        // 0x91 = fixarray of length 1; a long run nests one level per byte.
+        let data = vec![0x91u8; 100_000];
+        let lua = mlua::Lua::new();
+        let mut cursor = Cursor::new(&data);
+        let result = msgpack_unpack_value(&lua, &mut cursor, 0);
+        assert!(result.is_err(), "deeply nested msgpack must be rejected");
+    }
+
+    // A msgpack map whose key decodes to nil (e.g. truncated input) must not be
+    // forwarded to Lua as `table[nil] = v`, which aborts the process. Found by
+    // the fuzzer: 0x8c declares a 12-pair map but the stream runs out, so keys
+    // read back as nil.
+    #[test]
+    fn msgpack_map_with_nil_key_does_not_abort() {
+        let lua = mlua::Lua::new();
+        let data = vec![
+            0x8c_u8, 0x3e, 0x59, 0xe5, 0xc9, 0xfc, 0x9a, 0x7b, 0x05, 0x97, 0x9b, 0x5a,
+        ];
+        let mut cursor = Cursor::new(&data);
+        let _ = msgpack_unpack_value(&lua, &mut cursor, 0);
+
+        // Minimal explicit case: FixMap(1) with a nil key (0xc0) and value 1.
+        let data = vec![0x81_u8, 0xc0, 0x01];
+        let mut cursor = Cursor::new(&data);
+        let result = msgpack_unpack_value(&lua, &mut cursor, 0);
+        assert!(
+            result.is_ok(),
+            "nil-key map should decode with the key skipped: {result:?}"
+        );
+    }
+
+    // Fuzz: arbitrary bytes through the msgpack decoder must never panic, OOM,
+    // or overflow the stack -- only return Ok or a clean Err.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2000))]
+
+        #[test]
+        fn fuzz_msgpack_unpack_no_panic(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..2048)
+        ) {
+            let lua = mlua::Lua::new();
+            let mut cursor = Cursor::new(&data);
+            let _ = msgpack_unpack_value(&lua, &mut cursor, 0);
+        }
+    }
 }
