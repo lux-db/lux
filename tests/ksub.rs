@@ -1,3 +1,5 @@
+mod common;
+use common::LuxServer;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::thread;
@@ -36,73 +38,11 @@ fn send(stream: &mut TcpStream, args: &[&str]) {
     stream.write_all(&resp_cmd(args)).unwrap();
 }
 
-fn find_lux_binary() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let target_dir = exe.parent()?.parent()?.parent()?;
-    let release = target_dir.join("release").join("lux");
-    if release.exists() {
-        return Some(release);
-    }
-    let debug = target_dir.join("debug").join("lux");
-    if debug.exists() {
-        return Some(debug);
-    }
-    None
-}
-
-struct LuxServer {
-    child: std::process::Child,
-    tmpdir: std::path::PathBuf,
-}
-
-impl Drop for LuxServer {
-    fn drop(&mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
-        let _ = std::fs::remove_dir_all(&self.tmpdir);
-    }
-}
-
-fn start_lux(port: u16) -> LuxServer {
-    let bin = find_lux_binary().expect("no lux binary found");
-    let tmpdir =
-        std::env::temp_dir().join(format!("lux_ksub_test_{}_{}", std::process::id(), port));
-    std::fs::create_dir_all(&tmpdir).unwrap();
-    let child = std::process::Command::new(&bin)
-        .env("LUX_PORT", port.to_string())
-        .env("LUX_SHARDS", "4")
-        .env("LUX_SAVE_INTERVAL", "0")
-        .env("LUX_DATA_DIR", tmpdir.to_str().unwrap())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("failed to start lux");
-
-    let server = LuxServer { child, tmpdir };
-    for _ in 0..40 {
-        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return server;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("lux did not start on port {port}");
-}
-
-fn connect(port: u16) -> TcpStream {
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-    stream.set_nodelay(true).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
-    stream
-}
-
 #[test]
 fn ksub_basic_event_delivery() {
-    let port: u16 = 16800;
-    let _server = start_lux(port);
-    let mut sub_conn = connect(port);
-    let mut writer = connect(port);
+    let server = LuxServer::start();
+    let mut sub_conn = server.conn();
+    let mut writer = server.conn();
 
     let resp = send_and_read(&mut sub_conn, &["KSUB", "user:*"]);
     assert!(resp.contains("ksub"), "ksub confirmation: {resp}");
@@ -119,10 +59,9 @@ fn ksub_basic_event_delivery() {
 
 #[test]
 fn ksub_pattern_filtering() {
-    let port: u16 = 16801;
-    let _server = start_lux(port);
-    let mut sub_conn = connect(port);
-    let mut writer = connect(port);
+    let server = LuxServer::start();
+    let mut sub_conn = server.conn();
+    let mut writer = server.conn();
 
     send(&mut sub_conn, &["KSUB", "user:*"]);
     thread::sleep(Duration::from_millis(100));
@@ -148,10 +87,9 @@ fn ksub_pattern_filtering() {
 
 #[test]
 fn ksub_multiple_patterns() {
-    let port: u16 = 16802;
-    let _server = start_lux(port);
-    let mut sub_conn = connect(port);
-    let mut writer = connect(port);
+    let server = LuxServer::start();
+    let mut sub_conn = server.conn();
+    let mut writer = server.conn();
 
     send(&mut sub_conn, &["KSUB", "user:*", "order:*"]);
     thread::sleep(Duration::from_millis(100));
@@ -170,10 +108,9 @@ fn ksub_multiple_patterns() {
 
 #[test]
 fn kunsub_stops_events() {
-    let port: u16 = 16803;
-    let _server = start_lux(port);
-    let mut sub_conn = connect(port);
-    let mut writer = connect(port);
+    let server = LuxServer::start();
+    let mut sub_conn = server.conn();
+    let mut writer = server.conn();
 
     send(&mut sub_conn, &["KSUB", "key:*"]);
     thread::sleep(Duration::from_millis(100));
@@ -203,10 +140,9 @@ fn kunsub_stops_events() {
 
 #[test]
 fn ksub_hset_event() {
-    let port: u16 = 16804;
-    let _server = start_lux(port);
-    let mut sub_conn = connect(port);
-    let mut writer = connect(port);
+    let server = LuxServer::start();
+    let mut sub_conn = server.conn();
+    let mut writer = server.conn();
 
     send(&mut sub_conn, &["KSUB", "user:*"]);
     thread::sleep(Duration::from_millis(100));
@@ -222,10 +158,9 @@ fn ksub_hset_event() {
 
 #[test]
 fn ksub_del_event() {
-    let port: u16 = 16805;
-    let _server = start_lux(port);
-    let mut sub_conn = connect(port);
-    let mut writer = connect(port);
+    let server = LuxServer::start();
+    let mut sub_conn = server.conn();
+    let mut writer = server.conn();
 
     send_and_read(&mut writer, &["SET", "user:1", "alice"]);
 

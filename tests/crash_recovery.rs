@@ -10,28 +10,8 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 
-fn resp_cmd(args: &[&str]) -> Vec<u8> {
-    let mut buf = format!("*{}\r\n", args.len());
-    for arg in args {
-        buf.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
-    }
-    buf.into_bytes()
-}
-
-fn read_all(stream: &mut TcpStream) -> String {
-    let mut data = Vec::with_capacity(4096);
-    let mut buf = [0u8; 8192];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(len) => data.extend_from_slice(&buf[..len]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(_) => break,
-        }
-    }
-    String::from_utf8_lossy(&data).to_string()
-}
+mod common;
+use common::{read_all, resp_cmd, LuxServer};
 
 fn send(stream: &mut TcpStream, args: &[&str]) -> String {
     stream.write_all(&resp_cmd(args)).unwrap();
@@ -67,130 +47,6 @@ fn send(stream: &mut TcpStream, args: &[&str]) -> String {
     String::from_utf8_lossy(&data).to_string()
 }
 
-fn find_lux_binary() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let target_dir = exe.parent()?.parent()?.parent()?;
-    let release = target_dir.join("release").join("lux");
-    if release.exists() {
-        return Some(release);
-    }
-    let debug = target_dir.join("debug").join("lux");
-    if debug.exists() {
-        return Some(debug);
-    }
-    None
-}
-
-fn connect(port: u16) -> TcpStream {
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-    stream.set_nodelay(true).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
-    stream
-}
-
-fn wait_for_port(port: u16) {
-    for _ in 0..40 {
-        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("server did not start on port {port}");
-}
-
-struct TestServer {
-    port: u16,
-    child: std::process::Child,
-    tmpdir: std::path::PathBuf,
-}
-
-impl TestServer {
-    fn start(port: u16) -> Self {
-        Self::start_with_opts(port, "100kb", "0")
-    }
-
-    fn start_with_opts(port: u16, maxmemory: &str, save_interval: &str) -> Self {
-        let bin = find_lux_binary().expect("no lux binary found");
-        let tmpdir = std::env::temp_dir().join(format!("lux_crash_test_{port}"));
-        let _ = std::fs::remove_dir_all(&tmpdir);
-        std::fs::create_dir_all(&tmpdir).unwrap();
-
-        let child = std::process::Command::new(&bin)
-            .env("LUX_PORT", port.to_string())
-            .env("LUX_SHARDS", "4")
-            .env("LUX_MAXMEMORY", maxmemory)
-            .env("LUX_MAXMEMORY_POLICY", "allkeys-lru")
-            .env("LUX_STORAGE_MODE", "tiered")
-            .env("LUX_STORAGE_DIR", tmpdir.join("storage").to_str().unwrap())
-            .env("LUX_DATA_DIR", tmpdir.to_str().unwrap())
-            .env("LUX_SAVE_INTERVAL", save_interval)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to start lux");
-
-        wait_for_port(port);
-        TestServer {
-            port,
-            child,
-            tmpdir,
-        }
-    }
-
-    /// Kill the server without graceful shutdown (simulates crash / power loss).
-    fn kill(&mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
-        thread::sleep(Duration::from_millis(300));
-    }
-
-    /// Restart the server against the same data directory.
-    fn restart(&mut self) {
-        self.restart_with_memory("10mb");
-    }
-
-    fn restart_with_memory(&mut self, maxmemory: &str) {
-        // Ensure old process is dead.
-        self.child.kill().ok();
-        self.child.wait().ok();
-        thread::sleep(Duration::from_millis(500));
-
-        let bin = find_lux_binary().expect("no lux binary found");
-        self.child = std::process::Command::new(&bin)
-            .env("LUX_PORT", self.port.to_string())
-            .env("LUX_SHARDS", "4")
-            .env("LUX_MAXMEMORY", maxmemory)
-            .env("LUX_MAXMEMORY_POLICY", "allkeys-lru")
-            .env("LUX_STORAGE_MODE", "tiered")
-            .env(
-                "LUX_STORAGE_DIR",
-                self.tmpdir.join("storage").to_str().unwrap(),
-            )
-            .env("LUX_DATA_DIR", self.tmpdir.to_str().unwrap())
-            .env("LUX_SAVE_INTERVAL", "0")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to restart lux");
-
-        wait_for_port(self.port);
-    }
-
-    fn conn(&self) -> TcpStream {
-        connect(self.port)
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
-        let _ = std::fs::remove_dir_all(&self.tmpdir);
-    }
-}
-
 fn fill_memory(conn: &mut TcpStream, count: usize) {
     let val = "x".repeat(10000);
     for i in 0..count {
@@ -203,7 +59,7 @@ fn fill_memory(conn: &mut TcpStream, count: usize) {
 // ---------------------------------------------------------------------------
 #[test]
 fn crash_recovery_all_types() {
-    let mut srv = TestServer::start(17200);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
 
     // Write every data type.
@@ -259,7 +115,7 @@ fn crash_recovery_all_types() {
 // ---------------------------------------------------------------------------
 #[test]
 fn crash_recovery_lua_script_writes() {
-    let mut srv = TestServer::start(17210);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
 
     // A script that performs several KV writes via redis.call. None of these go
@@ -298,7 +154,7 @@ fn crash_recovery_lua_script_writes() {
 // ---------------------------------------------------------------------------
 #[test]
 fn crash_after_snapshot_before_wal_truncate() {
-    let mut srv = TestServer::start(17201);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
 
     // Phase 1: write data and snapshot it.
@@ -333,7 +189,7 @@ fn crash_after_snapshot_before_wal_truncate() {
 // ---------------------------------------------------------------------------
 #[test]
 fn crash_during_multi_exec() {
-    let mut srv = TestServer::start(17202);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
 
     // Write some baseline data.
@@ -382,7 +238,7 @@ fn crash_during_multi_exec() {
 // ---------------------------------------------------------------------------
 #[test]
 fn repeated_crash_restart_cycles() {
-    let mut srv = TestServer::start(17203);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
 
     for cycle in 0..3 {
         let mut c = srv.conn();
@@ -422,7 +278,7 @@ fn repeated_crash_restart_cycles() {
 // ---------------------------------------------------------------------------
 #[test]
 fn crash_with_hot_and_cold_data() {
-    let mut srv = TestServer::start(17204);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
 
     // Write a key that will be evicted to cold storage.
@@ -452,7 +308,7 @@ fn crash_with_hot_and_cold_data() {
 // ---------------------------------------------------------------------------
 #[test]
 fn crash_after_delete() {
-    let mut srv = TestServer::start(17205);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
 
     send(&mut c, &["SET", "keep_me", "yes"]);
@@ -480,7 +336,7 @@ fn crash_after_delete() {
 // ---------------------------------------------------------------------------
 #[test]
 fn crash_after_flushdb() {
-    let mut srv = TestServer::start(17206);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
 
     send(&mut c, &["SET", "k1", "v1"]);
@@ -502,7 +358,7 @@ fn crash_after_flushdb() {
 // ---------------------------------------------------------------------------
 #[test]
 fn rapid_writes_then_crash() {
-    let mut srv = TestServer::start(17207);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
 
     // Pipeline 100 writes as fast as possible.
@@ -551,7 +407,7 @@ fn rapid_writes_then_crash() {
 // ---------------------------------------------------------------------------
 #[test]
 fn corrupted_wal_frames_skipped_on_startup() {
-    let mut srv = TestServer::start(17208);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
 
     send(&mut c, &["SET", "good_key", "good_value"]);
@@ -561,7 +417,7 @@ fn corrupted_wal_frames_skipped_on_startup() {
     srv.kill();
 
     // Corrupt the WAL files by appending garbage.
-    let storage_dir = srv.tmpdir.join("storage");
+    let storage_dir = srv.data_dir().join("storage");
     if storage_dir.exists() {
         for entry in std::fs::read_dir(&storage_dir).unwrap() {
             let entry = entry.unwrap();
@@ -607,7 +463,7 @@ fn corrupted_wal_frames_skipped_on_startup() {
 // ---------------------------------------------------------------------------
 #[test]
 fn info_exposes_persistence_counters() {
-    let srv = TestServer::start(17209);
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
 
     let resp = send(&mut c, &["INFO"]);
@@ -633,7 +489,7 @@ fn info_exposes_persistence_counters() {
 // ---------------------------------------------------------------------------
 #[test]
 fn row_ttl_survives_restart() {
-    let mut srv = TestServer::start(17280);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
 
     send(
@@ -690,7 +546,7 @@ fn row_ttl_survives_restart() {
 // snapshot-only guarantee, covered by `row_ttl_survives_restart`.
 #[test]
 fn row_ttl_active_after_wal_replay() {
-    let mut srv = TestServer::start(17281);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(
         &mut c,
@@ -745,7 +601,7 @@ fn row_ttl_active_after_wal_replay() {
 // full-output equality check below.
 #[test]
 fn wal_replay_preserves_autogenerated_uuid_pk() {
-    let mut srv = TestServer::start(17282);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
     send(
         &mut c,
@@ -772,7 +628,7 @@ fn wal_replay_preserves_autogenerated_uuid_pk() {
 // is from the snapshot only -- the path under test.)
 #[test]
 fn snapshot_ttl_expires_across_downtime() {
-    let mut srv = TestServer::start(17283);
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
 
     send(&mut c, &["SET", "short", "v", "EX", "2"]); // expires during downtime

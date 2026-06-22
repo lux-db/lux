@@ -1,25 +1,8 @@
+mod common;
+use common::LuxServer;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command};
 use std::time::Duration;
-
-fn start_server(port: u16) -> Child {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lux"))
-        .env("LUX_PORT", port.to_string())
-        .env("LUX_SAVE_INTERVAL", "0")
-        .env("LUX_DATA_DIR", format!("/tmp/lux-test-{}", port))
-        .spawn()
-        .expect("failed to start lux");
-    for _ in 0..100 {
-        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return child;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    panic!("lux did not start within 5 seconds on port {port}");
-}
 
 fn send(stream: &mut TcpStream, args: &[&str]) -> String {
     let mut cmd = format!("*{}\r\n", args.len());
@@ -67,9 +50,8 @@ use std::io::Read as IoRead;
 
 #[test]
 fn vset_and_vget_basic() {
-    let port = 16400;
-    let mut child = start_server(port);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let server = LuxServer::start();
+    let mut s = server.conn();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     let r = send(&mut s, &["VSET", "myvec", "3", "1.0", "0.5", "0.25"]);
@@ -82,16 +64,12 @@ fn vset_and_vget_basic() {
         "expected dim=3: {}",
         r
     );
-
-    child.kill().ok();
-    child.wait().ok();
 }
 
 #[test]
 fn vset_with_metadata() {
-    let port = 16401;
-    let mut child = start_server(port);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let server = LuxServer::start();
+    let mut s = server.conn();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     let r = send(
@@ -110,16 +88,12 @@ fn vset_with_metadata() {
 
     let r = send(&mut s, &["VGET", "v1"]);
     assert!(r.contains("test"), "expected metadata: {}", r);
-
-    child.kill().ok();
-    child.wait().ok();
 }
 
 #[test]
 fn vset_with_ttl() {
-    let port = 16402;
-    let mut child = start_server(port);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let server = LuxServer::start();
+    let mut s = server.conn();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     let r = send(&mut s, &["VSET", "expire_me", "2", "1.0", "0.0", "EX", "1"]);
@@ -132,16 +106,12 @@ fn vset_with_ttl() {
 
     let r = send(&mut s, &["VGET", "expire_me"]);
     assert!(r.contains("-1"), "should be expired: {}", r);
-
-    child.kill().ok();
-    child.wait().ok();
 }
 
 #[test]
 fn vcard_counts_vectors() {
-    let port = 16403;
-    let mut child = start_server(port);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let server = LuxServer::start();
+    let mut s = server.conn();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     let r = send(&mut s, &["VCARD"]);
@@ -157,16 +127,12 @@ fn vcard_counts_vectors() {
     send(&mut s, &["DEL", "b"]);
     let r = send(&mut s, &["VCARD"]);
     assert_eq!(r, ":2");
-
-    child.kill().ok();
-    child.wait().ok();
 }
 
 #[test]
 fn vsearch_returns_nearest() {
-    let port = 16404;
-    let mut child = start_server(port);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let server = LuxServer::start();
+    let mut s = server.conn();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     send(&mut s, &["VSET", "x_axis", "3", "1.0", "0.0", "0.0"]);
@@ -182,16 +148,12 @@ fn vsearch_returns_nearest() {
         "y_axis should not be in top 2: {}",
         r
     );
-
-    child.kill().ok();
-    child.wait().ok();
 }
 
 #[test]
 fn vsearch_with_metadata_filter() {
-    let port = 16405;
-    let mut child = start_server(port);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let server = LuxServer::start();
+    let mut s = server.conn();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     send(
@@ -240,16 +202,12 @@ fn vsearch_with_metadata_filter() {
     assert!(r.contains("cat1"), "should find cat1: {}", r);
     assert!(r.contains("cat2"), "should find cat2: {}", r);
     assert!(!r.contains("dog1"), "should not find dog1: {}", r);
-
-    child.kill().ok();
-    child.wait().ok();
 }
 
 #[test]
 fn vsearch_filter_finds_match_beyond_unfiltered_top_k_window() {
-    let port = 16410;
-    let mut child = start_server(port);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let server = LuxServer::start();
+    let mut s = server.conn();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     for i in 0..25 {
@@ -288,16 +246,12 @@ fn vsearch_filter_finds_match_beyond_unfiltered_top_k_window() {
         ],
     );
     assert!(r.contains("cat:far"), "filtered result was missed: {r}");
-
-    child.kill().ok();
-    child.wait().ok();
 }
 
 #[test]
 fn vsearch_with_meta_flag() {
-    let port = 16406;
-    let mut child = start_server(port);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let server = LuxServer::start();
+    let mut s = server.conn();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     send(
@@ -322,30 +276,22 @@ fn vsearch_with_meta_flag() {
 
     let r = send(&mut s, &["VSEARCH", "2", "1.0", "0.0", "K", "1"]);
     assert!(!r.contains("hello"), "without META, no metadata: {}", r);
-
-    child.kill().ok();
-    child.wait().ok();
 }
 
 #[test]
 fn vset_dimension_mismatch() {
-    let port = 16407;
-    let mut child = start_server(port);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let server = LuxServer::start();
+    let mut s = server.conn();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     let r = send(&mut s, &["VSET", "bad", "3", "1.0", "0.0"]);
     assert!(r.starts_with("-"), "should error on dim mismatch: {}", r);
-
-    child.kill().ok();
-    child.wait().ok();
 }
 
 #[test]
 fn vset_overwrites_existing() {
-    let port = 16408;
-    let mut child = start_server(port);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let server = LuxServer::start();
+    let mut s = server.conn();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     send(&mut s, &["VSET", "v", "2", "1.0", "0.0"]);
@@ -356,22 +302,15 @@ fn vset_overwrites_existing() {
 
     let r = send(&mut s, &["VSEARCH", "2", "0.0", "1.0", "K", "1"]);
     assert!(r.contains("v"), "should find updated vector");
-
-    child.kill().ok();
-    child.wait().ok();
 }
 
 #[test]
 fn vector_type_command() {
-    let port = 16409;
-    let mut child = start_server(port);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let server = LuxServer::start();
+    let mut s = server.conn();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     send(&mut s, &["VSET", "typed", "2", "1.0", "0.0"]);
     let r = send(&mut s, &["TYPE", "typed"]);
     assert_eq!(r, "+vector");
-
-    child.kill().ok();
-    child.wait().ok();
 }

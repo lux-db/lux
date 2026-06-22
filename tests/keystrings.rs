@@ -1,38 +1,5 @@
 mod common;
-
-use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::thread;
-use std::time::Duration;
-
-fn resp_cmd(args: &[&str]) -> Vec<u8> {
-    let mut buf = format!("*{}\r\n", args.len());
-    for arg in args {
-        buf.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
-    }
-    buf.into_bytes()
-}
-
-fn read_all(stream: &mut TcpStream) -> String {
-    let mut data = Vec::with_capacity(4096);
-    let mut buf = [0u8; 8192];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(len) => data.extend_from_slice(&buf[..len]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(_) => break,
-        }
-    }
-    String::from_utf8_lossy(&data).to_string()
-}
-
-fn send(stream: &mut TcpStream, args: &[&str]) -> String {
-    stream.write_all(&resp_cmd(args)).unwrap();
-    thread::sleep(Duration::from_millis(50));
-    read_all(stream)
-}
+use common::{send, LuxServer};
 
 fn assert_has(resp: &str, needle: &str) {
     assert!(resp.contains(needle), "missing {needle:?}: {resp}");
@@ -42,59 +9,10 @@ fn assert_error(resp: &str) {
     assert!(resp.starts_with("-ERR"), "expected error, got: {resp}");
 }
 
-struct LuxServer {
-    child: std::process::Child,
-    tmpdir: std::path::PathBuf,
-}
-
-impl Drop for LuxServer {
-    fn drop(&mut self) {
-        common::terminate_child(&mut self.child);
-        let _ = std::fs::remove_dir_all(&self.tmpdir);
-    }
-}
-
-fn start_lux(port: u16) -> LuxServer {
-    let tmpdir = std::env::temp_dir().join(format!(
-        "lux_keystrings_test_{}_{}",
-        std::process::id(),
-        port
-    ));
-    std::fs::create_dir_all(&tmpdir).unwrap();
-    let child = common::lux_command(env!("CARGO_BIN_EXE_lux"))
-        .env("LUX_PORT", port.to_string())
-        .env("LUX_SHARDS", "4")
-        .env("LUX_SAVE_INTERVAL", "0")
-        .env("LUX_DATA_DIR", tmpdir.to_str().unwrap())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("failed to start lux");
-
-    let server = LuxServer { child, tmpdir };
-    for _ in 0..40 {
-        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return server;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("lux did not start on port {port}");
-}
-
-fn connect(port: u16) -> TcpStream {
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-    stream.set_nodelay(true).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
-    stream
-}
-
 #[test]
 fn string_command_surface() {
-    let port = 17830;
-    let _server = start_lux(port);
-    let mut conn = connect(port);
+    let server = LuxServer::start();
+    let mut conn = server.conn();
 
     assert_has(&send(&mut conn, &["SET", "s", "hello"]), "+OK");
     assert_has(&send(&mut conn, &["GET", "s"]), "hello");
@@ -115,9 +33,8 @@ fn string_command_surface() {
 
 #[test]
 fn numeric_string_commands_and_set_options() {
-    let port = 17831;
-    let _server = start_lux(port);
-    let mut conn = connect(port);
+    let server = LuxServer::start();
+    let mut conn = server.conn();
 
     assert_has(&send(&mut conn, &["INCR", "n"]), ":1");
     assert_has(&send(&mut conn, &["INCRBY", "n", "9"]), ":10");
@@ -137,9 +54,8 @@ fn numeric_string_commands_and_set_options() {
 
 #[test]
 fn string_commands_reject_invalid_arguments_without_mutating_state() {
-    let port = 17834;
-    let _server = start_lux(port);
-    let mut conn = connect(port);
+    let server = LuxServer::start();
+    let mut conn = server.conn();
 
     assert_has(&send(&mut conn, &["SET", "s", "hello"]), "+OK");
     assert_error(&send(&mut conn, &["GETRANGE", "s", "nope", "1"]));
@@ -176,9 +92,8 @@ fn string_commands_reject_invalid_arguments_without_mutating_state() {
 
 #[test]
 fn key_command_surface() {
-    let port = 17832;
-    let _server = start_lux(port);
-    let mut conn = connect(port);
+    let server = LuxServer::start();
+    let mut conn = server.conn();
 
     send(&mut conn, &["SET", "k1", "v1"]);
     send(&mut conn, &["SET", "k2", "v2"]);
@@ -206,9 +121,8 @@ fn key_command_surface() {
 
 #[test]
 fn scan_rejects_invalid_cursor_and_options() {
-    let port = 17835;
-    let _server = start_lux(port);
-    let mut conn = connect(port);
+    let server = LuxServer::start();
+    let mut conn = server.conn();
 
     send(&mut conn, &["SET", "k1", "v1"]);
     send(&mut conn, &["SET", "k2", "v2"]);
@@ -230,9 +144,8 @@ fn scan_rejects_invalid_cursor_and_options() {
 
 #[test]
 fn expire_ttl_and_persist_surface() {
-    let port = 17833;
-    let _server = start_lux(port);
-    let mut conn = connect(port);
+    let server = LuxServer::start();
+    let mut conn = server.conn();
 
     send(&mut conn, &["SET", "exp", "v"]);
     assert_has(&send(&mut conn, &["EXPIRE", "exp", "10"]), ":1");

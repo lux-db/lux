@@ -1,48 +1,8 @@
+mod common;
+use common::LuxServer;
 use std::io::{BufRead, BufReader, Read as IoRead, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command};
 use std::time::Duration;
-
-struct TestServer {
-    child: Child,
-}
-
-impl TestServer {
-    fn kill(&mut self) -> std::io::Result<()> {
-        self.child.kill()
-    }
-
-    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait()
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn start_server(port: u16) -> TestServer {
-    let child = Command::new(env!("CARGO_BIN_EXE_lux"))
-        .env("LUX_PORT", port.to_string())
-        .env("LUX_SAVE_INTERVAL", "0")
-        .env("LUX_MAXMEMORY", "64mb")
-        .env("LUX_DATA_DIR", format!("/tmp/lux-test-mem-{}", port))
-        .spawn()
-        .expect("failed to start lux");
-    let mut server = TestServer { child };
-    let addr = format!("127.0.0.1:{port}");
-    for _ in 0..100 {
-        if TcpStream::connect(&addr).is_ok() {
-            return server;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = server.kill();
-    panic!("lux did not start on port {port}");
-}
 
 fn send(stream: &mut TcpStream, args: &[&str]) -> String {
     let mut cmd = format!("*{}\r\n", args.len());
@@ -99,9 +59,8 @@ fn get_used_memory(stream: &mut TcpStream) -> u64 {
 /// Memory counter stays sane after adding and deleting collection data.
 #[test]
 fn memory_no_underflow_on_collection_delete() {
-    let port = 16600;
-    let mut child = start_server(port);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let server = LuxServer::builder().maxmemory("64mb").start();
+    let mut s = server.conn();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     // Add list data
@@ -171,17 +130,13 @@ fn memory_no_underflow_on_collection_delete() {
         "should be able to write after delete, got: {}",
         r
     );
-
-    child.kill().ok();
-    child.wait().ok();
 }
 
 /// Memory counter decreases when elements are popped or removed.
 #[test]
 fn memory_tracks_collection_removals() {
-    let port = 16601;
-    let mut child = start_server(port);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let server = LuxServer::builder().maxmemory("64mb").start();
+    let mut s = server.conn();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     // Fill a list
@@ -224,17 +179,13 @@ fn memory_tracks_collection_removals() {
         "no underflow: {}",
         mem_set_empty
     );
-
-    child.kill().ok();
-    child.wait().ok();
 }
 
 /// Memory counter does not underflow when list-only keys are deleted.
 #[test]
 fn memory_no_underflow_list_then_del() {
-    let port = 16602;
-    let mut child = start_server(port);
-    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let server = LuxServer::builder().maxmemory("64mb").start();
+    let mut s = server.conn();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     for i in 0..500 {
@@ -253,7 +204,4 @@ fn memory_no_underflow_list_then_del() {
     // Must be able to write
     let r = send(&mut s, &["SET", "test", "works"]);
     assert!(r.contains("OK"), "writes should work, got: {}", r);
-
-    child.kill().ok();
-    child.wait().ok();
 }
