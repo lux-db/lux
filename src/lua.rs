@@ -416,7 +416,13 @@ fn create_redis_call(
         let mut out = BytesMut::new();
         let lua_cache =
             std::sync::Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
-        crate::cmd::execute(&store, &lua_cache, &broker, &refs, &mut out, now);
+        // Route through execute_with_wal so a script's writes are durable:
+        // KV writes get logged (raw args are already concrete -> deterministic
+        // replay), table writes self-log their resolved command from the leaf,
+        // and the reserved-key/table guards apply so a script can't bypass them.
+        // We log effects, not the script, so replay never re-runs Lua and can't
+        // diverge on a generated PK or now()-default.
+        crate::cmd::execute_with_wal(&store, &lua_cache, &broker, &refs, &mut out, now);
         if raise_errors && out.first() == Some(&b'-') {
             return Err(mlua::Error::external(resp_error_message(&out)));
         }

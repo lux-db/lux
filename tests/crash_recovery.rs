@@ -254,6 +254,46 @@ fn crash_recovery_all_types() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: Writes performed inside a Lua script survive a crash (WAL-only, no
+// snapshot). EVAL logs effects, not the script, so the logged KV writes replay.
+// ---------------------------------------------------------------------------
+#[test]
+fn crash_recovery_lua_script_writes() {
+    let mut srv = TestServer::start(17207);
+    let mut c = srv.conn();
+
+    // A script that performs several KV writes via redis.call. None of these go
+    // through the top-level dispatch, so before the fix they were never WAL-logged.
+    let script = "redis.call('SET', KEYS[1], ARGV[1]); \
+         redis.call('HSET', KEYS[2], 'f', ARGV[2]); \
+         redis.call('RPUSH', KEYS[3], 'a', 'b', 'c'); \
+         return 'ok'";
+    let resp = send(
+        &mut c,
+        &[
+            "EVAL", script, "3", "lua_str", "lua_hash", "lua_list", "hello", "world",
+        ],
+    );
+    assert!(resp.contains("ok"), "eval ran: {resp}");
+    drop(c);
+
+    // Hard kill before any snapshot (save_interval=0), then recover from WAL only.
+    srv.kill();
+    srv.restart();
+
+    let mut c = srv.conn();
+    let resp = send(&mut c, &["GET", "lua_str"]);
+    assert!(resp.contains("hello"), "lua SET survived crash: {resp}");
+    let resp = send(&mut c, &["HGET", "lua_hash", "f"]);
+    assert!(resp.contains("world"), "lua HSET survived crash: {resp}");
+    let resp = send(&mut c, &["LRANGE", "lua_list", "0", "-1"]);
+    assert!(
+        resp.contains("a") && resp.contains("c"),
+        "lua RPUSH survived crash: {resp}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test: Crash after snapshot, before WAL truncate -- both sources recover
 // ---------------------------------------------------------------------------
 #[test]
