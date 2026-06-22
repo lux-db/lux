@@ -586,7 +586,7 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 | `LUX_MAXMEMORY_SAMPLES` | `5` | Keys sampled per eviction round |
 | `LUX_STORAGE_MODE` | `memory` | Set to `tiered` for hot/cold storage with disk-backed eviction |
 | `LUX_STORAGE_DIR` | `{LUX_DATA_DIR}/storage` | Directory for tiered storage data files |
-| `LUX_RESTRICTED` | (none) | Set to `1` to disable KEYS, FLUSHALL, FLUSHDB |
+| `LUX_RESTRICTED` | (none) | Set to `1` to disable `KEYS`, `FLUSHALL`, `FLUSHDB`, and `DEBUG` |
 | `LUX_AUTH_ENABLED` | `false` | Enable app auth tables and `/auth/v1` routes |
 | `LUX_AUTH_PUBLISHABLE_KEY` | (generated) | Browser-safe app auth key when auth is enabled |
 | `LUX_AUTH_SECRET_KEY` | (generated) | Server/admin app auth key when auth is enabled |
@@ -631,7 +631,8 @@ rdb.Set(ctx, "hello", "world", 0)
 
 ## Testing
 
-Lux has 617 tests across unit, integration, property-based, and crash recovery suites.
+Lux has 760+ Rust tests across unit, integration, property-based, and crash
+recovery suites.
 
 ```bash
 cargo test
@@ -685,6 +686,17 @@ Every push and pull request runs:
 - Integration tests against the Valkey test harness
 
 Release and Docker builds only proceed after tests pass.
+
+## 1.0 GA Readiness
+
+Lux 1.0 is defined by public contracts, not by an open-ended feature list:
+
+- [GA.md](GA.md) -- release criteria and 1.0 gate
+- [COMPATIBILITY.md](COMPATIBILITY.md) -- Redis-compatible, Lux-native, divergent, and unsupported behavior
+- [DURABILITY.md](DURABILITY.md) -- snapshot, WAL, restore, crash recovery, and data-loss expectations
+- [SECURITY.md](SECURITY.md) -- disclosure, deployment model, sensitive surfaces, and supported versions
+
+After 1.0, Lux follows semantic versioning for documented public APIs.
 
 ## Supported Commands
 
