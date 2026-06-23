@@ -652,6 +652,13 @@ impl EmbeddedClient {
             }
 
             self.runtime.store.add_total_commands(batch.len());
+            if has_write {
+                for command in batch {
+                    if command_is_fast_path_write(command) {
+                        notify_zset_waiters_for_command(&self.runtime.broker, command);
+                    }
+                }
+            }
             if emit_key_events {
                 for argv in &write_argvs {
                     let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
@@ -706,6 +713,9 @@ impl EmbeddedClient {
             }
         }
 
+        for command in commands {
+            notify_zset_waiters_for_command(&self.runtime.broker, command);
+        }
         if emit_key_events {
             for key in event_keys {
                 self.runtime.broker.enqueue_key_event(key, b"MSET");
@@ -1541,6 +1551,9 @@ impl EmbeddedClient {
         };
 
         self.runtime.store.add_total_commands(1);
+        if command_is_fast_path_write(command) && !matches!(command, Command::MSet { .. }) {
+            notify_zset_waiters_for_command(&self.runtime.broker, command);
+        }
         if let Some(argv) = write_argv.take() {
             let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
             fire_key_events(&self.runtime.broker, &refs);
@@ -2947,10 +2960,115 @@ fn cmd_eq_fast(input: &[u8], expected: &[u8]) -> bool {
 
 #[inline(always)]
 fn fire_key_events(broker: &Broker, args: &[&[u8]]) {
-    if args.len() < 2 || !broker.has_key_subs() {
+    if args.len() < 2 {
+        return;
+    }
+    if !broker.has_key_subs() {
         return;
     }
     fire_key_events_slow(broker, args);
+}
+
+#[inline(always)]
+fn wake_zset_waiters_for_key(broker: &Broker, key: &[u8]) {
+    broker.wake_zset_waiters(arg_str(key));
+}
+
+fn notify_zset_waiters_for_command(broker: &Broker, command: &Command<'_>) {
+    if !broker.has_zset_waiters() || !command_is_fast_path_write(command) {
+        return;
+    }
+
+    match command {
+        Command::FlushDb | Command::FlushAll => {}
+        Command::MSet { pairs } | Command::MSetNx { pairs } => {
+            for (key, _) in pairs {
+                wake_zset_waiters_for_key(broker, key);
+            }
+        }
+        Command::Del { keys } | Command::Unlink { keys } => {
+            for key in keys {
+                wake_zset_waiters_for_key(broker, key);
+            }
+        }
+        Command::Rename { key, new_key } | Command::RenameNx { key, new_key } => {
+            wake_zset_waiters_for_key(broker, key);
+            wake_zset_waiters_for_key(broker, new_key);
+        }
+        Command::Set { key, .. }
+        | Command::GetSet { key, .. }
+        | Command::SetNx { key, .. }
+        | Command::SetEx { key, .. }
+        | Command::PSetEx { key, .. }
+        | Command::Append { key, .. }
+        | Command::Incr { key }
+        | Command::Decr { key }
+        | Command::IncrBy { key, .. }
+        | Command::DecrBy { key, .. }
+        | Command::Expire { key, .. }
+        | Command::Persist { key }
+        | Command::LPush { key, .. }
+        | Command::RPush { key, .. }
+        | Command::LPop { key }
+        | Command::RPop { key }
+        | Command::HSet { key, .. }
+        | Command::HIncrBy { key, .. }
+        | Command::HDel { key, .. }
+        | Command::SAdd { key, .. }
+        | Command::SRem { key, .. }
+        | Command::SPop { key }
+        | Command::ZAdd { key, .. }
+        | Command::ZRem { key, .. }
+        | Command::ZIncrBy { key, .. }
+        | Command::GeoAdd { key, .. }
+        | Command::XAdd { key, .. } => wake_zset_waiters_for_key(broker, key),
+        _ => {}
+    }
+}
+
+fn notify_zset_waiters_for_script_keys(broker: &Broker, keys: &[Vec<u8>]) {
+    if !broker.has_zset_waiters() {
+        return;
+    }
+    for key in keys {
+        broker.wake_zset_waiters(arg_str(key));
+    }
+}
+
+fn notify_zset_waiters_for_write(broker: &Broker, args: &[&[u8]]) {
+    if !broker.has_zset_waiters() || args.len() < 2 || !crate::eviction::is_write_command(args[0]) {
+        return;
+    }
+
+    let cmd = args[0];
+    if cmd_eq_fast(cmd, b"FLUSHDB") || cmd_eq_fast(cmd, b"FLUSHALL") {
+        return;
+    }
+    if cmd_eq_fast(cmd, b"EVAL") || cmd_eq_fast(cmd, b"EVALSHA") {
+        let num_keys = args
+            .get(2)
+            .and_then(|value| arg_str(value).parse::<usize>().ok())
+            .unwrap_or(0);
+        let end = 3 + num_keys.min(args.len().saturating_sub(3));
+        for key in &args[3..end] {
+            wake_zset_waiters_for_key(broker, key);
+        }
+    } else if cmd_eq_fast(cmd, b"MSET") || cmd_eq_fast(cmd, b"MSETNX") {
+        let mut i = 1;
+        while i < args.len() {
+            wake_zset_waiters_for_key(broker, args[i]);
+            i += 2;
+        }
+    } else if cmd_eq_fast(cmd, b"DEL") || cmd_eq_fast(cmd, b"UNLINK") {
+        for key in &args[1..] {
+            wake_zset_waiters_for_key(broker, key);
+        }
+    } else if cmd_eq_fast(cmd, b"RENAME") && args.len() >= 3 {
+        wake_zset_waiters_for_key(broker, args[1]);
+        wake_zset_waiters_for_key(broker, args[2]);
+    } else {
+        wake_zset_waiters_for_key(broker, args[1]);
+    }
 }
 
 #[inline(never)]
@@ -3042,7 +3160,9 @@ fn handle_tx_cmd(
                         cmd::execute_with_wal(store, schema_cache, broker, &refs, write_buf, now)
                     };
                     match cmd_result {
-                        CmdResult::Written => {}
+                        CmdResult::Written => {
+                            notify_zset_waiters_for_write(broker, &refs);
+                        }
                         CmdResult::Authenticated => {
                             *authenticated = true;
                         }
@@ -3356,7 +3476,6 @@ impl CommandExecutor {
         }
 
         if has_special || !all_single_key_rw {
-            let script_guard = self.store.script_read_guard();
             for command in commands {
                 let args = command.argv();
                 if !session.authenticated && !is_public_without_auth_cmd(args[0]) {
@@ -3379,22 +3498,23 @@ impl CommandExecutor {
                     continue;
                 }
 
-                let cmd_result = cmd::execute_with_wal(
-                    &self.store,
-                    &self.schema_cache,
-                    &self.broker,
-                    args,
-                    write_buf,
-                    now,
-                );
+                let cmd_result = {
+                    let _guard = self.store.script_read_guard();
+                    cmd::execute_with_wal(
+                        &self.store,
+                        &self.schema_cache,
+                        &self.broker,
+                        args,
+                        write_buf,
+                        now,
+                    )
+                };
                 if let Some(action) =
                     self.apply_cmd_result(cmd_result, args, session, write_buf, now)
                 {
-                    drop(script_guard);
                     return Some(action);
                 }
             }
-            drop(script_guard);
             return None;
         }
 
@@ -3453,6 +3573,12 @@ impl CommandExecutor {
                     }
                 }
 
+                for (offset, command) in commands[i..batch_end].iter().enumerate() {
+                    if batch_flags[offset] == cmd::PipelineAccess::Write {
+                        let args = command.argv();
+                        notify_zset_waiters_for_write(&self.broker, args);
+                    }
+                }
                 if self.broker.has_key_subs() {
                     for (offset, command) in commands[i..batch_end].iter().enumerate() {
                         if batch_flags[offset] == cmd::PipelineAccess::Write {
@@ -3484,6 +3610,7 @@ impl CommandExecutor {
     ) -> Option<CmdResult> {
         match cmd_result {
             CmdResult::Written => {
+                notify_zset_waiters_for_write(&self.broker, args);
                 fire_key_events(&self.broker, args);
                 None
             }
@@ -3566,6 +3693,7 @@ impl CommandExecutor {
                     &argv,
                     now,
                 );
+                notify_zset_waiters_for_script_keys(&self.broker, &keys);
                 None
             }
             CmdResult::ScriptOp => {
@@ -3936,7 +4064,8 @@ async fn handle_connection(
                         timeout,
                         pop_min,
                     } => {
-                        handle_block_zpop(&mut socket, &store, &keys, timeout, pop_min).await?;
+                        handle_block_zpop(&mut socket, &store, &broker, &keys, timeout, pop_min)
+                            .await?;
                     }
                     _ => {}
                 }
@@ -4168,6 +4297,7 @@ fn handle_eval(
 async fn handle_block_zpop(
     socket: &mut tokio::net::TcpStream,
     store: &Arc<Store>,
+    broker: &Broker,
     keys: &[String],
     timeout: std::time::Duration,
     pop_min: bool,
@@ -4176,37 +4306,71 @@ async fn handle_block_zpop(
     let mut write_buf = BytesMut::new();
 
     loop {
-        let now = Instant::now();
-        for key in keys {
-            let result = if pop_min {
-                store.zpopmin(key.as_bytes(), 1, now)
-            } else {
-                store.zpopmax(key.as_bytes(), 1, now)
-            };
-            if let Ok(items) = result {
-                if !items.is_empty() {
-                    let (member, score) = &items[0];
-                    resp::write_array_header(&mut write_buf, 3);
-                    resp::write_bulk(&mut write_buf, key);
-                    resp::write_bulk(&mut write_buf, member);
-                    let score_str = if score.fract() == 0.0 && score.abs() < 1e15 {
-                        format!("{}", *score as i64)
-                    } else {
-                        format!("{}", score)
-                    };
-                    resp::write_bulk(&mut write_buf, &score_str);
-                    return socket.write_all(&write_buf).await;
-                }
-            }
+        if write_zpop_response(store, keys, pop_min, &mut write_buf) {
+            return socket.write_all(&write_buf).await;
         }
 
-        if tokio::time::Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
             resp::write_null_array(&mut write_buf);
             return socket.write_all(&write_buf).await;
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let waiter_id = broker.next_waiter_id();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+        for key in keys {
+            broker.register_zset_waiter(
+                key,
+                pubsub::BlockedZPopRequest {
+                    tx: tx.clone(),
+                    waiter_id,
+                },
+            );
+        }
+        drop(tx);
+
+        if write_zpop_response(store, keys, pop_min, &mut write_buf) {
+            broker.remove_zset_waiters_by_id(keys, waiter_id);
+            return socket.write_all(&write_buf).await;
+        }
+
+        let woke = tokio::select! {
+            val = rx.recv() => val.is_some(),
+            _ = tokio::time::sleep(remaining) => false,
+        };
+        broker.remove_zset_waiters_by_id(keys, waiter_id);
+        if !woke {
+            resp::write_null_array(&mut write_buf);
+            return socket.write_all(&write_buf).await;
+        }
     }
+}
+
+fn write_zpop_response(store: &Store, keys: &[String], pop_min: bool, out: &mut BytesMut) -> bool {
+    let now = Instant::now();
+    for key in keys {
+        let result = if pop_min {
+            store.zpopmin(key.as_bytes(), 1, now)
+        } else {
+            store.zpopmax(key.as_bytes(), 1, now)
+        };
+        if let Ok(items) = result {
+            if !items.is_empty() {
+                let (member, score) = &items[0];
+                resp::write_array_header(out, 3);
+                resp::write_bulk(out, key);
+                resp::write_bulk(out, member);
+                let score_str = if score.fract() == 0.0 && score.abs() < 1e15 {
+                    format!("{}", *score as i64)
+                } else {
+                    format!("{}", score)
+                };
+                resp::write_bulk(out, &score_str);
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn handle_script_op(out: &mut BytesMut, script_engine: &lua::ScriptEngine, args: &[&[u8]]) {

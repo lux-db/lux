@@ -34,7 +34,12 @@ fn send_and_read(stream: &mut TcpStream, args: &[&str]) -> String {
 
 fn find_lux_binary() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let target_dir = exe.parent()?.parent()?.parent()?;
+    let profile_dir = exe.parent()?.parent()?;
+    let same_profile = profile_dir.join("lux");
+    if same_profile.exists() {
+        return Some(same_profile);
+    }
+    let target_dir = profile_dir.parent()?;
     let release = target_dir.join("release").join("lux");
     if release.exists() {
         return Some(release);
@@ -170,4 +175,30 @@ fn blmove_immediate() {
     assert!(resp.contains("item"), "moved value: {resp}");
     let resp2 = send_and_read(&mut conn, &["LRANGE", "dst", "0", "-1"]);
     assert!(resp2.contains("item"), "dst has item: {resp2}");
+}
+
+#[test]
+fn bzpopmin_wait_does_not_block_other_clients() {
+    let port: u16 = 17106;
+    let _server = start_lux(port);
+    let mut blocker = connect(port);
+    blocker
+        .set_read_timeout(Some(Duration::from_millis(5000)))
+        .unwrap();
+
+    blocker
+        .write_all(&resp_cmd(&["BZPOPMIN", "marker", "5"]))
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+
+    let mut observer = connect(port);
+    let pong = send_and_read(&mut observer, &["PING"]);
+    assert!(pong.contains("PONG"), "PING while blocked: {pong}");
+
+    let mut pusher = connect(port);
+    send_and_read(&mut pusher, &["ZADD", "marker", "1", "wake"]);
+
+    let resp = read_all(&mut blocker);
+    assert!(resp.contains("marker"), "key: {resp}");
+    assert!(resp.contains("wake"), "member: {resp}");
 }

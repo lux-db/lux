@@ -34,7 +34,12 @@ fn send_and_read(stream: &mut TcpStream, args: &[&str]) -> String {
 
 fn find_lux_binary() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let target_dir = exe.parent()?.parent()?.parent()?;
+    let profile_dir = exe.parent()?.parent()?;
+    let same_profile = profile_dir.join("lux");
+    if same_profile.exists() {
+        return Some(same_profile);
+    }
+    let target_dir = profile_dir.parent()?;
     let release = target_dir.join("release").join("lux");
     if release.exists() {
         return Some(release);
@@ -153,6 +158,27 @@ fn evalsha_after_script_load() {
         .trim();
     let resp = send_and_read(&mut conn, &["EVALSHA", sha, "0"]);
     assert!(resp.contains(":99"), "evalsha returns 99: {resp}");
+}
+
+#[test]
+fn pipelined_evalsha_does_not_deadlock() {
+    let port: u16 = 17310;
+    let _server = start_lux(port);
+    let mut conn = connect(port);
+    let resp = send_and_read(&mut conn, &["SCRIPT", "LOAD", "return 123"]);
+    let sha = resp
+        .lines()
+        .find(|l| l.len() > 10 && !l.starts_with('$'))
+        .unwrap_or("")
+        .trim();
+
+    let mut pipeline = resp_cmd(&["EVALSHA", sha, "0"]);
+    pipeline.extend_from_slice(&resp_cmd(&["PING"]));
+    conn.write_all(&pipeline).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    let resp = read_all(&mut conn);
+    assert!(resp.contains(":123"), "evalsha response: {resp}");
+    assert!(resp.contains("PONG"), "ping response: {resp}");
 }
 
 #[test]
