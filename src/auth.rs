@@ -403,6 +403,12 @@ pub(crate) fn route_http(
             }
             signup(body, headers, store, cache)
         }
+        ("POST", ["signin", "anonymous"]) => {
+            if let Err(response) = require_publishable_or_secret(headers, store, cache) {
+                return response;
+            }
+            signin_anonymous(headers, store, cache)
+        }
         ("POST", ["token"]) => {
             if let Err(response) = require_publishable_or_secret(headers, store, cache) {
                 return response;
@@ -553,6 +559,51 @@ fn signup(
                 &["user_id", "=", &user_id],
                 now,
             );
+            let _ =
+                durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", &user_id], now);
+            response
+        }
+    }
+}
+
+// Accountless sign-in: mints a fresh user with no email/password and issues a
+// session, so a browser can hold a real principal (`auth.uid()`) for RLS-gated
+// reads and `.live()` without collecting credentials. The user is flagged via
+// `raw_app_meta_data.provider = "anonymous"` (no schema column, so existing
+// instances need no migration).
+fn signin_anonymous(
+    headers: &[(String, String)],
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    if !store.config().auth.anonymous_enabled {
+        return error(400, "Bad Request", "anonymous sign-in is disabled");
+    }
+
+    let now = Instant::now();
+    let now_sec = unix_seconds();
+    let user_id = tables::generate_uuid_v7();
+    let app_meta = json!({"provider":"anonymous","providers":["anonymous"]}).to_string();
+
+    if let Err(e) = durable_table_insert(
+        store,
+        cache,
+        USERS_TABLE,
+        &[
+            ("id", user_id.as_str()),
+            ("raw_user_meta_data", "{}"),
+            ("raw_app_meta_data", app_meta.as_str()),
+            ("created_at", &now_sec.to_string()),
+            ("updated_at", &now_sec.to_string()),
+        ],
+        now,
+    ) {
+        return error(400, "Bad Request", &e);
+    }
+
+    match issue_session_response(store, cache, headers, &user_id, "", now) {
+        response @ (200, _, _) => response,
+        response => {
             let _ =
                 durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", &user_id], now);
             response
@@ -2254,6 +2305,8 @@ fn sanitize_header_value(value: &str) -> String {
 }
 
 fn user_map_json(row: &HashMap<String, String>) -> Value {
+    let app_metadata = parse_json_string(row.get("raw_app_meta_data"));
+    let is_anonymous = app_metadata.get("provider").and_then(Value::as_str) == Some("anonymous");
     json!({
         "id": row.get("id").cloned().unwrap_or_default(),
         "email": row.get("email").cloned().unwrap_or_default(),
@@ -2264,7 +2317,8 @@ fn user_map_json(row: &HashMap<String, String>) -> Value {
         "created_at": parse_optional_int(row.get("created_at")),
         "updated_at": parse_optional_int(row.get("updated_at")),
         "user_metadata": parse_json_string(row.get("raw_user_meta_data")),
-        "app_metadata": parse_json_string(row.get("raw_app_meta_data")),
+        "app_metadata": app_metadata,
+        "is_anonymous": is_anonymous,
     })
 }
 

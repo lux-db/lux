@@ -267,6 +267,59 @@ fn http_auth_signup_login_user_logout_and_admin_routes() {
 }
 
 #[test]
+fn http_auth_anonymous_signin_issues_session() {
+    let server = LuxServer::builder()
+        .http()
+        .password("rootsecret")
+        .env("LUX_AUTH_ENABLED", "true")
+        .start();
+    let http = server.http_port();
+
+    // Accountless sign-in returns a session with a real principal but no email.
+    let (status, body) = http_request(http, "POST", "/auth/v1/signin/anonymous", Some("{}"), None);
+    assert_eq!(status, 200, "anon signin: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let access = json["access_token"]
+        .as_str()
+        .expect("anon signin returns access token");
+    assert_eq!(json["user"]["email"], "");
+    assert_eq!(json["user"]["is_anonymous"], true);
+    assert_eq!(json["user"]["app_metadata"]["provider"], "anonymous");
+    let first_id = json["user"]["id"].as_str().unwrap().to_string();
+    assert!(!first_id.is_empty(), "anon user has an id");
+
+    // The token resolves to a real User principal.
+    let (status, user_body) = http_request(http, "GET", "/auth/v1/user", None, Some(access));
+    assert_eq!(status, 200, "anon user lookup: {user_body}");
+    let user_json: serde_json::Value = serde_json::from_str(&user_body).unwrap();
+    assert_eq!(user_json["user"]["id"], first_id);
+    assert_eq!(user_json["user"]["is_anonymous"], true);
+
+    // A second anon sign-in must succeed and mint a distinct user despite the
+    // UNIQUE email column (omitted email must not collide).
+    let (status, body2) = http_request(http, "POST", "/auth/v1/signin/anonymous", Some("{}"), None);
+    assert_eq!(status, 200, "second anon signin: {body2}");
+    let json2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+    let second_id = json2["user"]["id"].as_str().unwrap().to_string();
+    assert_ne!(first_id, second_id, "anon users must be distinct");
+}
+
+#[test]
+fn http_auth_anonymous_signin_can_be_disabled() {
+    let server = LuxServer::builder()
+        .http()
+        .password("rootsecret")
+        .env("LUX_AUTH_ENABLED", "true")
+        .env("LUX_AUTH_ANONYMOUS", "false")
+        .start();
+    let http = server.http_port();
+
+    let (status, body) = http_request(http, "POST", "/auth/v1/signin/anonymous", Some("{}"), None);
+    assert_eq!(status, 400, "anon signin should be disabled: {body}");
+    assert!(body.contains("disabled"), "{body}");
+}
+
+#[test]
 fn http_auth_token_users_denied_data_apis() {
     let server = LuxServer::builder()
         .http()

@@ -91,6 +91,8 @@ pub struct AuthConfig {
     pub refresh_token_ttl: Duration,
     /// Enables native email/password signup and sign-in.
     pub email_password_enabled: bool,
+    /// Enables accountless `signInAnonymously` sessions.
+    pub anonymous_enabled: bool,
     /// Optional initial publishable key material for local/bootstrap use.
     pub initial_publishable_key: Option<String>,
     /// Optional initial secret key material for local/bootstrap use.
@@ -105,6 +107,7 @@ impl std::fmt::Debug for AuthConfig {
             .field("access_token_ttl", &self.access_token_ttl)
             .field("refresh_token_ttl", &self.refresh_token_ttl)
             .field("email_password_enabled", &self.email_password_enabled)
+            .field("anonymous_enabled", &self.anonymous_enabled)
             .field(
                 "initial_publishable_key",
                 &self.initial_publishable_key.as_ref().map(|_| "<redacted>"),
@@ -125,6 +128,7 @@ impl Default for AuthConfig {
             access_token_ttl: Duration::from_secs(3600),
             refresh_token_ttl: Duration::from_secs(30 * 24 * 60 * 60),
             email_password_enabled: true,
+            anonymous_enabled: true,
             initial_publishable_key: None,
             initial_secret_key: None,
         }

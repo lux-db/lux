@@ -630,3 +630,55 @@ async fn http_array_insert_applies_ttl_to_each() {
         "both rows should expire: {snap}"
     );
 }
+
+// The accountless-frontend path end to end: `signInAnonymously` yields a real
+// User principal that (a) passes the auth-on `/live` handshake (anonymous
+// sockets are 401'd) and (b) gets RLS-gated `.live()` rows via `auth.uid()`,
+// exactly like the swarm/cursors use case but with no signup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_anonymous_session_subscribes_granted_table() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux_with_env(
+        resp_port,
+        http_port,
+        Some("rootsecret"),
+        &[("LUX_AUTH_ENABLED", "true")],
+    );
+
+    let exec = |cmd: &str| {
+        let (s, b) = http_json_request(http_port, "POST", "/v1/exec", cmd, Some("rootsecret"));
+        assert_eq!(s, 200, "exec {cmd}: {b}");
+    };
+    exec(
+        r#"{"command":["TCREATE","notes","id","STR","PRIMARY","KEY",",","owner_id","STR",",","body","STR"]}"#,
+    );
+    exec(r#"{"command":["GRANT","read","ON","notes","WHERE","owner_id","=","auth.uid()"]}"#);
+
+    // Accountless sign-in: no email/password collected.
+    let (status, session) =
+        http_json_request(http_port, "POST", "/auth/v1/signin/anonymous", "{}", None);
+    assert_eq!(status, 200, "anon signin: {session}");
+    let access_token = session["access_token"].as_str().unwrap().to_string();
+    let uid = session["user"]["id"].as_str().unwrap().to_string();
+    assert_eq!(session["user"]["is_anonymous"], true);
+
+    // The anon token passes the /live handshake that 401s anonymous sockets.
+    let mut ws = connect_live(http_port, Some(&access_token)).await;
+    send_json(
+        &mut ws,
+        json!({"type":"live.subscribe","id":"n","spec":{"kind":"table","table":"notes"}}),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws).await["type"], "live.subscribed");
+    assert_eq!(recv_live_event(&mut ws, "n").await["kind"], "snapshot");
+
+    // A row owned by the anon principal arrives as a live insert (RLS via uid).
+    exec(&format!(
+        r#"{{"command":["TINSERT","notes","id","n1","owner_id","{uid}","body","hello"]}}"#
+    ));
+    let insert = recv_live_event(&mut ws, "n").await;
+    assert_eq!(insert["kind"], "insert");
+    assert_eq!(insert["pk"], "n1");
+    assert_eq!(insert["row"]["body"], "hello");
+}

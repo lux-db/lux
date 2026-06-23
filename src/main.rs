@@ -123,6 +123,10 @@ async fn async_main() -> std::io::Result<()> {
                 let v = v.to_ascii_lowercase();
                 !(v == "0" || v == "false")
             }),
+            anonymous_enabled: std::env::var("LUX_AUTH_ANONYMOUS").map_or(true, |v| {
+                let v = v.to_ascii_lowercase();
+                !(v == "0" || v == "false")
+            }),
             initial_publishable_key: std::env::var("LUX_AUTH_PUBLISHABLE_KEY").ok(),
             initial_secret_key: std::env::var("LUX_AUTH_SECRET_KEY").ok(),
         },
