@@ -2677,6 +2677,33 @@ pub(crate) fn read_filter_conds(
     Ok(conds)
 }
 
+/// Return tables consulted by READ-grant membership subqueries. Live queries
+/// subscribe to these tables as authorization dependencies so gaining or losing
+/// membership wakes the query even when its base table did not change.
+pub(crate) fn read_filter_dependencies(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    principal: &AuthPrincipal,
+    table: &str,
+    now: Instant,
+) -> Result<Vec<String>, String> {
+    let Some(pred) = load_grant_predicate(store, cache, table, crate::grants::Scope::Read, now)?
+    else {
+        return Err(format!("no read access to '{table}'"));
+    };
+    let resolved = resolve_for_principal(&pred, principal)?;
+    let mut tables = Vec::new();
+    for condition in resolved {
+        if let crate::grants::ResolvedCondition::InSubqueryResolved { inner_table, .. } = condition
+        {
+            if !tables.iter().any(|table| table == &inner_table) {
+                tables.push(inner_table);
+            }
+        }
+    }
+    Ok(tables)
+}
+
 /// Enforce a WRITE grant on a new/updated row (WITH CHECK).
 pub(crate) fn check_write_row(
     store: &Store,

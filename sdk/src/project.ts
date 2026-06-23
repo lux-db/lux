@@ -642,6 +642,7 @@ export class LuxProjectSelectBuilder<T extends object, TResult> extends LuxProje
 			this.tableName,
 			this.columns,
 			this.filters,
+			this.joins,
 			this.nearQuery,
 			this.orderBy,
 			this.limitCount,
@@ -677,6 +678,7 @@ export class LuxProjectLiveSubscription<T extends object> {
 		private table: string,
 		private columns: string,
 		private filters: QueryFilter[],
+		private joins: QueryJoin[],
 		private nearQuery?: QueryNear,
 		private orderBy?: QueryOrder,
 		private limitCount?: number,
@@ -778,6 +780,15 @@ export class LuxProjectLiveSubscription<T extends object> {
 				field: filter.column,
 				op: filterOperatorToWhere(filter.operator),
 				value: filter.value,
+			}));
+		}
+		if (this.joins.length) {
+			spec.joins = this.joins.map((join) => ({
+				type: join.type,
+				table: join.table,
+				alias: join.alias,
+				onLeft: join.onLeft,
+				onRight: join.onRight,
 			}));
 		}
 		if (this.nearQuery) {

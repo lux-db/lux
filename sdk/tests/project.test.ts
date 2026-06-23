@@ -498,6 +498,8 @@ describe('Lux project client', () => {
 		// subscription (initial snapshot). Drive the socket before awaiting.
 		const livePromise = client
 			.table<{ id: number; channel_id: string; body: string }>('messages')
+			.select()
+			.join('channels', 'c', 'channel_id', 'id')
 			.eq('channel_id', 'room-1')
 			.near('embedding', [1, 0], { k: 3, threshold: 0.75 })
 			.live();
@@ -517,6 +519,13 @@ describe('Lux project client', () => {
 				table: 'messages',
 				select: '*',
 				where: [{ field: 'channel_id', op: '=', value: 'room-1' }],
+				joins: [{
+					type: 'inner',
+					table: 'channels',
+					alias: 'c',
+					onLeft: 'channel_id',
+					onRight: 'id',
+				}],
 				near: { field: 'embedding', vector: [1, 0], k: 3, threshold: 0.75 },
 			},
 		});
