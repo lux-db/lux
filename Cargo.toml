@@ -1,6 +1,6 @@
 [package]
 name = "lux"
-version = "0.24.0"
+version = "0.24.1"
 edition = "2021"
 description = "An open-source application database engine with tables, cache, vectors, auth, realtime, queues, time series, and Redis-compatible commands."
 license = "MIT"
