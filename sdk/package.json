@@ -1,6 +1,6 @@
 {
     "name": "@luxdb/sdk",
-    "version": "2.7.0",
+    "version": "2.8.0",
     "description": "Official Lux TypeScript SDK for app data, auth, tables, vectors, realtime, and Redis-compatible direct access",
     "main": "./dist/cjs/index.js",
     "module": "./dist/esm/index.js",
