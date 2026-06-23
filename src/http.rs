@@ -3757,6 +3757,37 @@ mod tests {
         );
     }
 
+    // The insert/update RETURNING echo must render JSON/ARRAY columns the same
+    // way SELECT does -- raw objects/arrays, not quoted strings -- so a row reads
+    // back identically no matter which operation returned it.
+    #[test]
+    fn json_array_columns_same_shape_in_returning_path() {
+        let mut cols = RenderCols::default();
+        cols.json.insert("payload".to_string());
+        cols.json.insert("tags".to_string());
+        let rows = vec![vec![
+            ("id".to_string(), "1".to_string()),
+            ("payload".to_string(), r#"{"a":1}"#.to_string()),
+            ("tags".to_string(), "[1,2]".to_string()),
+        ]];
+        // RETURNING-array path (insert/update/delete returning).
+        let arr = rows_to_json_array(&rows, &cols);
+        assert!(
+            arr.contains(r#""payload":{"a":1}"#),
+            "returning json raw: {arr}"
+        );
+        assert!(
+            arr.contains(r#""tags":[1,2]"#),
+            "returning array raw: {arr}"
+        );
+        // Single-row RETURNING path (insert one / get by pk).
+        let one = row_to_json_object(&rows[0], &cols);
+        assert!(
+            one.contains(r#""payload":{"a":1}"#),
+            "single-row json raw: {one}"
+        );
+    }
+
     // A VECTOR column is stored comma-joined but must read back as a JSON array
     // (the SDK types it `number[]`), via both the SELECT and RETURNING renderers.
     #[test]
