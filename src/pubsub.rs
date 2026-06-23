@@ -55,6 +55,11 @@ pub struct BlockedPopRequest {
     pub waiter_id: u64,
 }
 
+pub struct BlockedZPopRequest {
+    pub tx: mpsc::Sender<()>,
+    pub waiter_id: u64,
+}
+
 #[derive(Clone)]
 pub struct Broker {
     channels: Arc<parking_lot::RwLock<HashMap<String, broadcast::Sender<Message>>>>,
@@ -71,6 +76,8 @@ pub struct Broker {
     key_event_counters: Arc<KeyEventCounters>,
     list_waiters: Arc<parking_lot::Mutex<HashMap<String, VecDeque<BlockedPopRequest>>>>,
     list_waiter_count: Arc<AtomicU64>,
+    zset_waiters: Arc<parking_lot::Mutex<HashMap<String, Vec<BlockedZPopRequest>>>>,
+    zset_waiter_count: Arc<AtomicU64>,
     stream_waiters: Arc<parking_lot::Mutex<HashMap<String, Vec<mpsc::Sender<()>>>>>,
     waiter_counter: Arc<AtomicU64>,
 }
@@ -117,6 +124,8 @@ impl Broker {
             key_event_counters: Arc::new(KeyEventCounters::new()),
             list_waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             list_waiter_count: Arc::new(AtomicU64::new(0)),
+            zset_waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            zset_waiter_count: Arc::new(AtomicU64::new(0)),
             stream_waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             waiter_counter: Arc::new(AtomicU64::new(0)),
         }
@@ -188,6 +197,46 @@ impl Broker {
                 let removed = before - queue.len();
                 if removed > 0 {
                     self.list_waiter_count
+                        .fetch_sub(removed as u64, Ordering::Relaxed);
+                }
+                if queue.is_empty() {
+                    waiters.remove(key);
+                }
+            }
+        }
+    }
+
+    pub fn has_zset_waiters(&self) -> bool {
+        self.zset_waiter_count.load(Ordering::Relaxed) > 0
+    }
+
+    pub fn register_zset_waiter(&self, key: &str, req: BlockedZPopRequest) {
+        let mut waiters = self.zset_waiters.lock();
+        waiters.entry(key.to_string()).or_default().push(req);
+        self.zset_waiter_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn wake_zset_waiters(&self, key: &str) {
+        let mut waiters = self.zset_waiters.lock();
+        let Some(senders) = waiters.remove(key) else {
+            return;
+        };
+        self.zset_waiter_count
+            .fetch_sub(senders.len() as u64, Ordering::Relaxed);
+        for req in senders {
+            let _ = req.tx.try_send(());
+        }
+    }
+
+    pub fn remove_zset_waiters_by_id(&self, keys: &[String], id: u64) {
+        let mut waiters = self.zset_waiters.lock();
+        for key in keys {
+            if let Some(queue) = waiters.get_mut(key) {
+                let before = queue.len();
+                queue.retain(|r| r.waiter_id != id);
+                let removed = before - queue.len();
+                if removed > 0 {
+                    self.zset_waiter_count
                         .fetch_sub(removed as u64, Ordering::Relaxed);
                 }
                 if queue.is_empty() {

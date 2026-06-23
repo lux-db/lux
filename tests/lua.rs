@@ -1,5 +1,8 @@
 mod common;
-use common::{send_and_read, LuxServer};
+use common::{read_all, resp_cmd, send_and_read, LuxServer};
+use std::io::Write;
+use std::thread;
+use std::time::Duration;
 
 #[test]
 fn eval_return_integer() {
@@ -57,6 +60,26 @@ fn evalsha_after_script_load() {
         .trim();
     let resp = send_and_read(&mut conn, &["EVALSHA", sha, "0"]);
     assert!(resp.contains(":99"), "evalsha returns 99: {resp}");
+}
+
+#[test]
+fn pipelined_evalsha_does_not_deadlock() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    let resp = send_and_read(&mut conn, &["SCRIPT", "LOAD", "return 123"]);
+    let sha = resp
+        .lines()
+        .find(|l| l.len() > 10 && !l.starts_with('$'))
+        .unwrap_or("")
+        .trim();
+
+    let mut pipeline = resp_cmd(&["EVALSHA", sha, "0"]);
+    pipeline.extend_from_slice(&resp_cmd(&["PING"]));
+    conn.write_all(&pipeline).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    let resp = read_all(&mut conn);
+    assert!(resp.contains(":123"), "evalsha response: {resp}");
+    assert!(resp.contains("PONG"), "ping response: {resp}");
 }
 
 #[test]
