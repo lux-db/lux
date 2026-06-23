@@ -12,6 +12,7 @@ export interface LuxAuthUser {
 	updated_at?: number | null;
 	user_metadata?: Record<string, unknown>;
 	app_metadata?: Record<string, unknown>;
+	is_anonymous?: boolean;
 }
 
 export type LuxUser = LuxAuthUser;
@@ -363,6 +364,20 @@ export class LuxAuthClient {
 			return ok({ session: this.currentSession!, user: this.currentSession!.user });
 		} catch (error) {
 			return err('LUX_AUTH_SIGNIN_ERROR', 'Failed to sign in', toLuxError(error));
+		}
+	}
+
+	async signInAnonymously(): Promise<LuxResult<LuxAuthSessionResult>> {
+		try {
+			const session = await this.requestRaw<LuxAuthSession>('/auth/v1/signin/anonymous', {
+				method: 'POST',
+				body: '{}',
+				apiKey: true,
+			});
+			await this.saveSession(normalizeSession(session), 'SIGNED_IN');
+			return ok({ session: this.currentSession!, user: this.currentSession!.user });
+		} catch (error) {
+			return err('LUX_AUTH_SIGNIN_ERROR', 'Failed to sign in anonymously', toLuxError(error));
 		}
 	}
 
