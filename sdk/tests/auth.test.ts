@@ -122,6 +122,72 @@ describe('LuxAuthClient session state', () => {
 		}
 	});
 
+	test('broadcast sign-in survives storage reconciliation in the receiving tab', async () => {
+		const originalDocument = (globalThis as any).document;
+		const originalBroadcastChannel = (globalThis as any).BroadcastChannel;
+		const channels = new Map<string, Set<FakeBroadcastChannel>>();
+		(globalThis as any).document = {
+			visibilityState: 'visible',
+			addEventListener() {},
+		};
+		(globalThis as any).BroadcastChannel = class extends FakeBroadcastChannel {
+			constructor(name: string) {
+				super(name, channels);
+			}
+		};
+
+		try {
+			const firstStorage = memoryStorage();
+			const secondBacking = new Map<string, string>();
+			const writes: string[] = [];
+			const secondStorage: LuxAuthStorage = {
+				getItem: (key) => secondBacking.get(key) ?? null,
+				setItem: (key, value) => {
+					writes.push(value);
+					secondBacking.set(key, value);
+				},
+				removeItem: (key) => {
+					secondBacking.delete(key);
+				},
+			};
+			const first = new LuxAuthClient({
+				persistSession: true,
+				autoRefreshToken: false,
+				storage: firstStorage,
+				storageKey: 'lux.broadcast.reconcile',
+			});
+			const second = new LuxAuthClient({
+				persistSession: true,
+				autoRefreshToken: false,
+				storage: secondStorage,
+				storageKey: 'lux.broadcast.reconcile',
+			});
+			const events: string[] = [];
+			let resolveInitial!: () => void;
+			const initial = new Promise<void>((resolve) => {
+				resolveInitial = resolve;
+			});
+			second.onAuthStateChange((event, nextSession) => {
+				events.push(`${event}:${nextSession?.access_token ?? 'none'}`);
+				if (event === 'INITIAL_SESSION') resolveInitial();
+			});
+			await initial;
+
+			await first.setSession(session({ access_token: 'broadcast-token' }));
+			await Promise.resolve();
+
+			expect(events).toContain('SESSION_UPDATED:broadcast-token');
+			expect(writes).toHaveLength(1);
+			expect((await second.getSession()).data?.session?.access_token)
+				.toBe('broadcast-token');
+		} finally {
+			if (originalDocument === undefined) delete (globalThis as any).document;
+			else (globalThis as any).document = originalDocument;
+			if (originalBroadcastChannel === undefined) delete (globalThis as any).BroadcastChannel;
+			else (globalThis as any).BroadcastChannel = originalBroadcastChannel;
+		}
+	});
+
 	test('signOut clears local state when remote logout fails', async () => {
 		const storage = memoryStorage();
 		const auth = new LuxAuthClient({

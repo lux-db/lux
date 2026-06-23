@@ -42,7 +42,13 @@ export function createBrowserClient<DB extends Record<string, object> = LuxSchem
 	const usesDefaultCookieStorage = authOptions.storage === undefined;
 	const isBrowser = typeof globalThis !== 'undefined' && Boolean((globalThis as any).document);
 	const isSingleton = options.isSingleton ?? isBrowser;
-	if (isSingleton && browserClient) return browserClient as LuxProjectClient<DB>;
+	const storageKey = authOptions.storageKey ?? (
+		usesDefaultCookieStorage ? DEFAULT_SESSION_COOKIE : 'lux.auth.session'
+	);
+	if (isSingleton && browserClient) {
+		syncBrowserClient(browserClient);
+		return browserClient as LuxProjectClient<DB>;
+	}
 
 	const client = createClient<DB>(url, key, {
 		fetch: options.fetch,
@@ -51,14 +57,17 @@ export function createBrowserClient<DB extends Record<string, object> = LuxSchem
 			persistSession: true,
 			autoRefreshToken: true,
 			...authOptions,
-			storageKey: authOptions.storageKey ?? (
-				usesDefaultCookieStorage ? DEFAULT_SESSION_COOKIE : 'lux.auth.session'
-			),
+			storageKey,
 			storage: usesDefaultCookieStorage
 				? browserCookieStorage(resolvedCookieOptions, options.cookies)
 				: authOptions.storage,
 		},
 	});
+	syncBrowserClient(client);
 	if (isSingleton) browserClient = client;
 	return client;
+}
+
+function syncBrowserClient(client: LuxProjectClient<any>): void {
+	void client.auth.syncSessionFromStorage(undefined, { broadcast: true });
 }

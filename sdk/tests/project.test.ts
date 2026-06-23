@@ -577,6 +577,161 @@ describe('Lux project client', () => {
 		expect(JSON.parse(sockets[0].sent[1])).toEqual({ type: 'live.unsubscribe', id });
 	});
 
+	test('live subscriptions reconnect when auth signs in after subscribe', async () => {
+		const sockets: FakeWebSocket[] = [];
+		class FakeWebSocket {
+			static CONNECTING = 0;
+			static OPEN = 1;
+			static CLOSED = 3;
+			readonly url: string;
+			readyState = FakeWebSocket.CONNECTING;
+			onopen: (() => void) | null = null;
+			onmessage: ((event: { data: string }) => void) | null = null;
+			onerror: (() => void) | null = null;
+			onclose: (() => void) | null = null;
+			sent: string[] = [];
+
+			constructor(url: string) {
+				this.url = url;
+				sockets.push(this);
+			}
+
+			send(message: string) {
+				this.sent.push(message);
+			}
+
+			close() {
+				this.readyState = FakeWebSocket.CLOSED;
+				this.onclose?.();
+			}
+
+			open() {
+				this.readyState = FakeWebSocket.OPEN;
+				this.onopen?.();
+			}
+
+			emit(message: unknown) {
+				this.onmessage?.({ data: JSON.stringify(message) });
+			}
+		}
+
+		const client = createClient('http://localhost:3957/v1/project', 'lux_pub_test', {
+			websocket: FakeWebSocket as unknown as typeof WebSocket,
+			auth: { persistSession: false, autoRefreshToken: false },
+		});
+
+		const livePromise = client.table('messages').live();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(sockets).toHaveLength(1);
+		expect(sockets[0].url).toBe('ws://localhost:3957/v1/project/live?apikey=lux_pub_test');
+
+		sockets[0].open();
+		const firstSubscribe = JSON.parse(sockets[0].sent[0]);
+		sockets[0].emit({
+			type: 'live.event',
+			id: firstSubscribe.id,
+			event: { kind: 'snapshot', rows: [] },
+		});
+		const { live, error } = await livePromise;
+		expect(error).toBeNull();
+		expect(live).not.toBeNull();
+
+		await client.auth.setSession({
+			access_token: 'user-jwt',
+			refresh_token: 'refresh',
+			expires_in: 3600,
+			token_type: 'bearer',
+			user: { id: 'usr_1', email: 'user@example.com' },
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(sockets).toHaveLength(2);
+		expect(sockets[1].url).toBe(
+			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&access_token=user-jwt',
+		);
+		sockets[1].open();
+		expect(JSON.parse(sockets[1].sent[0])).toEqual(firstSubscribe);
+
+		await live!.unsubscribe();
+	});
+
+	test('live subscriptions close without anonymous reconnect on sign out', async () => {
+		const sockets: FakeWebSocket[] = [];
+		class FakeWebSocket {
+			static CONNECTING = 0;
+			static OPEN = 1;
+			static CLOSED = 3;
+			readonly url: string;
+			readyState = FakeWebSocket.CONNECTING;
+			onopen: (() => void) | null = null;
+			onmessage: ((event: { data: string }) => void) | null = null;
+			onerror: (() => void) | null = null;
+			onclose: (() => void) | null = null;
+			sent: string[] = [];
+
+			constructor(url: string) {
+				this.url = url;
+				sockets.push(this);
+			}
+
+			send(message: string) {
+				this.sent.push(message);
+			}
+
+			close() {
+				this.readyState = FakeWebSocket.CLOSED;
+				this.onclose?.();
+			}
+
+			open() {
+				this.readyState = FakeWebSocket.OPEN;
+				this.onopen?.();
+			}
+
+			emit(message: unknown) {
+				this.onmessage?.({ data: JSON.stringify(message) });
+			}
+		}
+
+		const client = createClient('http://localhost:3957/v1/project', 'lux_pub_test', {
+			websocket: FakeWebSocket as unknown as typeof WebSocket,
+			auth: { persistSession: false, autoRefreshToken: false },
+		});
+		await client.auth.setSession({
+			access_token: 'user-jwt',
+			refresh_token: 'refresh',
+			expires_in: 3600,
+			token_type: 'bearer',
+			user: { id: 'usr_1', email: 'user@example.com' },
+		});
+
+		const livePromise = client.table('messages').live();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(sockets).toHaveLength(1);
+		expect(sockets[0].url).toBe(
+			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&access_token=user-jwt',
+		);
+
+		sockets[0].open();
+		const firstSubscribe = JSON.parse(sockets[0].sent[0]);
+		sockets[0].emit({
+			type: 'live.event',
+			id: firstSubscribe.id,
+			event: { kind: 'snapshot', rows: [] },
+		});
+		const { live, error } = await livePromise;
+		expect(error).toBeNull();
+		expect(live).not.toBeNull();
+
+		await client.auth.clearSession();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(sockets).toHaveLength(1);
+		expect(sockets[0].readyState).toBe(FakeWebSocket.CLOSED);
+
+		await live!.unsubscribe();
+	});
+
 	test('live() surfaces a rejected subscription as { error }', async () => {
 		const sockets: any[] = [];
 		class FakeWebSocket {
