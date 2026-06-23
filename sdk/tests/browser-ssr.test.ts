@@ -314,6 +314,109 @@ describe('browser and SSR clients', () => {
 		}
 	});
 
+	test('browser auth broadcasts cookie changes from client load', async () => {
+		const originalDocument = (globalThis as any).document;
+		const originalBroadcastChannel = (globalThis as any).BroadcastChannel;
+		const browserCookies = new Map<string, string>();
+		const channels = new Map<string, Set<FakeBroadcastChannel>>();
+		const document = createCookieDocument(browserCookies);
+		(globalThis as any).document = document;
+		(globalThis as any).BroadcastChannel = class extends FakeBroadcastChannel {
+			constructor(name: string) {
+				super(name, channels);
+			}
+		};
+
+		try {
+			const receiver = createBrowserClient(
+				'http://localhost:3957/v1/project',
+				'lux_pub_test',
+				{ isSingleton: false, auth: { autoRefreshToken: false } },
+			);
+			const events: string[] = [];
+			const subscription = receiver.auth.onAuthStateChange((event, session) => {
+				events.push(`${event}:${session?.access_token ?? 'none'}`);
+			});
+
+			await waitFor(() => events.includes('INITIAL_SESSION:none'));
+
+			const value = encodeSessionCookie({
+				access_token: 'server-load-access-token',
+				refresh_token: 'server-load-refresh-token',
+				expires_in: 3600,
+				token_type: 'bearer',
+				user: { id: 'usr_server_load', email: 'server-load@example.com' },
+			});
+			browserCookies.set('lux-auth-session', value);
+			createBrowserClient(
+				'http://localhost:3957/v1/project',
+				'lux_pub_test',
+				{
+					isSingleton: false,
+					auth: { autoRefreshToken: false },
+				},
+			);
+
+			await waitFor(() => events.includes('SIGNED_IN:server-load-access-token'));
+			subscription.unsubscribe();
+		} finally {
+			if (originalDocument === undefined) {
+				delete (globalThis as any).document;
+			} else {
+				(globalThis as any).document = originalDocument;
+			}
+			if (originalBroadcastChannel === undefined) {
+				delete (globalThis as any).BroadcastChannel;
+			} else {
+				(globalThis as any).BroadcastChannel = originalBroadcastChannel;
+			}
+		}
+	});
+
+	test('browser singleton syncs cookie changes on repeated client load', async () => {
+		const originalDocument = (globalThis as any).document;
+		const browserCookies = new Map<string, string>();
+		const document = createCookieDocument(browserCookies);
+		(globalThis as any).document = document;
+
+		try {
+			const browser = createBrowserClient(
+				'http://localhost:3957/v1/project-singleton-sync',
+				'lux_pub_sync',
+				{ auth: { autoRefreshToken: false } },
+			);
+			const events: string[] = [];
+			const subscription = browser.auth.onAuthStateChange((event, session) => {
+				events.push(`${event}:${session?.access_token ?? 'none'}`);
+			});
+
+			await waitFor(() => events.includes('INITIAL_SESSION:none'));
+
+			browserCookies.set('lux-auth-session', encodeSessionCookie({
+				access_token: 'singleton-sync-access-token',
+				refresh_token: 'singleton-sync-refresh-token',
+				expires_in: 3600,
+				token_type: 'bearer',
+				user: { id: 'usr_singleton_sync', email: 'singleton-sync@example.com' },
+			}));
+			const sameBrowser = createBrowserClient(
+				'http://localhost:3957/v1/project-singleton-sync',
+				'lux_pub_sync',
+				{ auth: { autoRefreshToken: false } },
+			);
+
+			expect(sameBrowser).toBe(browser);
+			await waitFor(() => events.includes('SIGNED_IN:singleton-sync-access-token'));
+			subscription.unsubscribe();
+		} finally {
+			if (originalDocument === undefined) {
+				delete (globalThis as any).document;
+			} else {
+				(globalThis as any).document = originalDocument;
+			}
+		}
+	});
+
 	test('client sign out reconciles a session created by an SSR redirect', async () => {
 		const originalDocument = (globalThis as any).document;
 		const browserCookies = new Map<string, string>();
@@ -442,6 +545,30 @@ function createCookieDocument(cookies: Map<string, string>): {
 			for (const listener of listeners) listener();
 		},
 	};
+}
+
+class FakeBroadcastChannel {
+	private listeners = new Set<(event: { data?: unknown }) => void>();
+
+	constructor(
+		private name: string,
+		private channels: Map<string, Set<FakeBroadcastChannel>>,
+	) {
+		const peers = channels.get(name) ?? new Set();
+		peers.add(this);
+		channels.set(name, peers);
+	}
+
+	addEventListener(_type: string, listener: (event: { data?: unknown }) => void) {
+		this.listeners.add(listener);
+	}
+
+	postMessage(data: unknown) {
+		for (const peer of this.channels.get(this.name) ?? []) {
+			if (peer === this) continue;
+			for (const listener of peer.listeners) listener({ data });
+		}
+	}
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {

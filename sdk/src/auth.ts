@@ -331,6 +331,30 @@ export class LuxAuthClient {
 		};
 	}
 
+	async syncSessionFromStorage(
+		storage: LuxAuthStorage | null = this.storage,
+		options: { broadcast?: boolean } = {},
+	): Promise<LuxResult<{ session: LuxAuthSession | null }>> {
+		try {
+			if (!this.persistSession || !storage) return ok({ session: this.currentSession });
+			const previousSession = this.currentSession;
+			const previousRaw = this.storedSessionRaw;
+			const raw = await storage.getItem(this.storageKey);
+			const event: LuxAuthChangeEvent = raw
+				? (previousSession ? 'SESSION_UPDATED' : 'SIGNED_IN')
+				: 'SIGNED_OUT';
+
+			await this.applyExternalSession(raw, undefined, true);
+			if (options.broadcast && raw !== previousRaw) {
+				if (raw && this.currentSession) this.broadcast(event, raw);
+				else if (!raw && previousSession) this.broadcast('SIGNED_OUT', null);
+			}
+			return ok({ session: this.currentSession });
+		} catch (error) {
+			return err('LUX_AUTH_SESSION_ERROR', 'Failed to sync auth session', toLuxError(error));
+		}
+	}
+
 	async signUp(options: LuxSignUpOptions): Promise<LuxResult<LuxAuthSessionResult>> {
 		try {
 			const session = await this.requestRaw<LuxAuthSession>('/auth/v1/signup', {
@@ -709,7 +733,7 @@ export class LuxAuthClient {
 					raw?: string | null;
 				} | undefined;
 				if (!message || !('raw' in message)) return;
-				void this.applyExternalSession(message.raw ?? null, message.event);
+				void this.applyBroadcastSession(message.raw ?? null, message.event);
 			});
 		}
 
@@ -730,6 +754,22 @@ export class LuxAuthClient {
 			undefined,
 			notify,
 		);
+	}
+
+	private async applyBroadcastSession(
+		raw: string | null,
+		event?: LuxAuthChangeEvent,
+	): Promise<void> {
+		if (this.persistSession && this.storage) {
+			try {
+				if (raw) await this.storage.setItem(this.storageKey, raw);
+				else await this.storage.removeItem(this.storageKey);
+			} catch {
+				// A broadcast should still update the live client state even if
+				// this tab cannot persist the mirrored storage write.
+			}
+		}
+		await this.applyExternalSession(raw, event);
 	}
 
 	private async applyExternalSession(

@@ -134,6 +134,11 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 			apiKey: this.key,
 			fetch: this.fetchImpl,
 		});
+		this.auth.onAuthStateChange((event) => {
+			if (event === 'INITIAL_SESSION') return;
+			if (event === 'SIGNED_OUT') this.closeLiveSocket();
+			else this.restartLiveSocket();
+		});
 		this.storage = new LuxStorageNamespace(this);
 	}
 
@@ -304,20 +309,42 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 		};
 
 		socket.onclose = () => {
-			if (this.liveSocket === socket) this.liveSocket = null;
-			if (this.liveSubscriptions.size > 0) {
-				for (const subscription of this.liveSubscriptions.values()) {
-					this.livePending.push(JSON.stringify({
-						type: 'live.subscribe',
-						id: subscription.id,
-						spec: subscription.spec,
-					}));
-				}
+			const isActiveSocket = this.liveSocket === socket;
+			if (isActiveSocket) this.liveSocket = null;
+			if (isActiveSocket && this.liveSubscriptions.size > 0) {
+				this.queueLiveResubscriptions();
 				setTimeout(() => {
 					void this.ensureLiveSocket();
 				}, 1000);
 			}
 		};
+	}
+
+	private restartLiveSocket(): void {
+		if (this.liveSubscriptions.size === 0) return;
+		const socket = this.liveSocket;
+		this.liveSocket = null;
+		this.livePending = [];
+		this.queueLiveResubscriptions();
+		socket?.close();
+		void this.ensureLiveSocket();
+	}
+
+	private closeLiveSocket(): void {
+		const socket = this.liveSocket;
+		this.liveSocket = null;
+		this.livePending = [];
+		socket?.close();
+	}
+
+	private queueLiveResubscriptions(): void {
+		for (const subscription of this.liveSubscriptions.values()) {
+			this.livePending.push(JSON.stringify({
+				type: 'live.subscribe',
+				id: subscription.id,
+				spec: subscription.spec,
+			}));
+		}
 	}
 
 	private sendLive(message: Record<string, unknown>): void {
