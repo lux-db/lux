@@ -992,7 +992,7 @@ fn require_live_operator(
 struct LiveTableSpec {
     table: String,
     select: String,
-    where_conditions: Vec<(String, String, Value)>,
+    where_conditions: LiveTableWhereConditions,
     joins: Vec<LiveTableJoin>,
     principal: Option<crate::auth::AuthPrincipal>,
     auth_dependencies: Vec<String>,
@@ -1004,6 +1004,8 @@ struct LiveTableSpec {
     /// is reevaluated by `fetch_live_table_rows` for every snapshot and diff.
     deny_all: bool,
 }
+
+type LiveTableWhereConditions = Vec<(String, String, Value)>;
 
 #[derive(Clone)]
 struct LiveTableJoin {
@@ -1053,7 +1055,7 @@ enum LiveSubscription {
         receiver: broadcast::Receiver<crate::pubsub::Message>,
     },
     Table {
-        spec: LiveTableSpec,
+        spec: Box<LiveTableSpec>,
         state: LiveQueryState,
         receivers: Vec<broadcast::Receiver<crate::pubsub::Message>>,
     },
@@ -1354,7 +1356,7 @@ async fn build_live_subscription(
         };
         return Ok((
             LiveSubscription::Table {
-                spec: table_spec,
+                spec: Box::new(table_spec),
                 state,
                 receivers,
             },
@@ -1804,7 +1806,7 @@ fn live_table_where_conditions(
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
     spec: &LiveTableSpec,
-) -> Result<Option<Vec<(String, String, Value)>>, Value> {
+) -> Result<Option<LiveTableWhereConditions>, Value> {
     let mut conditions = spec.where_conditions.clone();
     let Some(principal) = &spec.principal else {
         return Ok(Some(conditions));
