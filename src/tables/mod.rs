@@ -1437,6 +1437,27 @@ fn next_id(store: &Store, table: &str, now: Instant) -> i64 {
     }
 }
 
+/// Advance an INT auto-increment counter so it is at least `id`. Called whenever a
+/// row lands with an explicit numeric PK so a later auto-generated id never
+/// collides. The seq counter is a direct store write that is NOT WAL-logged, so on
+/// crash recovery it must be rebuilt from the explicit ids carried in replayed
+/// TINSERT commands -- otherwise the next live insert reuses an id and silently
+/// overwrites a recovered row.
+fn bump_seq_to_at_least(store: &Store, table: &str, id: i64, now: Instant) {
+    let key = seq_key(table);
+    let current = store
+        .get(key.as_bytes(), now)
+        .and_then(|v| {
+            std::str::from_utf8(&v)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+        })
+        .unwrap_or(0);
+    if id > current {
+        store.set(key.as_bytes(), id.to_string().as_bytes(), None, now);
+    }
+}
+
 /// Add a field value to the appropriate index.
 /// pk_str is the row's primary key string (used as the member in the index).
 /// score is a numeric representation of the value for sorted set indexes.
@@ -1840,9 +1861,15 @@ fn table_insert_pk(
 ) -> Result<String, String> {
     let schema = load_schema(store, cache, table, now)?;
 
+    // A table with no declared PK stores rows under an implicit auto-increment
+    // "id". That id is a valid insert/replay column even though it is not part of
+    // the declared schema -- replayed TINSERTs carry it so the row keeps identity.
+    let has_declared_pk = schema.iter().any(|f| f.primary_key);
+
     let mut provided: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for (k, v) in field_values {
-        if !schema.iter().any(|f| f.name == *k) {
+        let known = schema.iter().any(|f| f.name == *k) || (!has_declared_pk && *k == "id");
+        if !known {
             return Err(format!("ERR unknown column '{}'", k));
         }
         provided.insert(k, v);
@@ -1971,6 +1998,12 @@ fn table_insert_pk(
                         pk_val
                     ));
                 }
+                // Keep the auto-increment counter ahead of explicit/replayed ids.
+                if pk.field_type == FieldType::Int {
+                    if let Ok(id) = pk_val.parse::<i64>() {
+                        bump_seq_to_at_least(store, table, id, now);
+                    }
+                }
                 pk_val.to_string()
             }
             None if pk.field_type == FieldType::Int => {
@@ -1992,6 +2025,14 @@ fn table_insert_pk(
                 ));
             }
         }
+    } else if let Some(id) = provided.get("id") {
+        // Implicit-id table carrying an explicit id (WAL replay, or a client that
+        // supplied one): honor it and keep the counter ahead so a later
+        // auto-generated id never reuses it.
+        if let Ok(parsed) = id.parse::<i64>() {
+            bump_seq_to_at_least(store, table, parsed, now);
+        }
+        id.to_string()
     } else {
         next_id(store, table, now).to_string()
     };
