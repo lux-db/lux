@@ -594,6 +594,56 @@ fn row_ttl_active_after_wal_replay() {
     );
 }
 
+// A TTL set by an UPDATE must survive WAL replay. The update path applies the TTL
+// in the leaf and logs it as a trailing `TTL <secs>` on the TUPDATE, so replay
+// re-applies it. Without that, the update's TTL is dropped on replay and the row
+// lives forever. Guarantee (WAL-only, relative TTL refreshes on replay): the row
+// recovers AND its TTL stays active, so it still expires.
+#[test]
+fn update_ttl_active_after_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    send(
+        &mut c,
+        &["TCREATE", "pres", "user_id STR PRIMARY KEY,", "room STR"],
+    );
+    // Insert WITHOUT a TTL, then set the TTL via UPDATE.
+    send(&mut c, &["TINSERT", "pres", "user_id", "keep", "room", "a"]);
+    send(&mut c, &["TINSERT", "pres", "user_id", "gone", "room", "a"]);
+    send(
+        &mut c,
+        &[
+            "TUPDATE", "pres", "SET", "room", "b", "WHERE", "user_id", "=", "keep", "TTL", "60",
+        ],
+    );
+    send(
+        &mut c,
+        &[
+            "TUPDATE", "pres", "SET", "room", "b", "WHERE", "user_id", "=", "gone", "TTL", "2",
+        ],
+    );
+    // NO SAVE -> recovery is from WAL replay only.
+    drop(c);
+    srv.kill();
+    srv.restart();
+    let mut c = srv.conn();
+
+    // Both rows recover; the update's TTL came back with them.
+    let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(resp.contains("keep"), "long-TTL row recovers: {resp}");
+    assert!(resp.contains("gone"), "short-TTL row recovers: {resp}");
+
+    // The update's TTL is still active: `gone` expires, `keep` stays. Before the
+    // fix `gone` had no TTL after replay and would still be present here.
+    thread::sleep(Duration::from_millis(2600));
+    let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(resp.contains("keep"), "long-TTL row still present: {resp}");
+    assert!(
+        !resp.contains("gone"),
+        "update-set TTL must survive replay and expire the row: {resp}"
+    );
+}
+
 // A row with an auto-generated UUID primary key must keep the SAME id across a
 // WAL-replay recovery. The table layer logs the RESOLVED insert (explicit uuid),
 // so replay reproduces the exact row instead of regenerating it. This also guards
