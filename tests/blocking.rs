@@ -76,3 +76,28 @@ fn blmove_immediate() {
     let resp2 = send_and_read(&mut conn, &["LRANGE", "dst", "0", "-1"]);
     assert!(resp2.contains("item"), "dst has item: {resp2}");
 }
+
+#[test]
+fn bzpopmin_wait_does_not_block_other_clients() {
+    let server = LuxServer::start();
+    let mut blocker = server.conn();
+    blocker
+        .set_read_timeout(Some(Duration::from_millis(5000)))
+        .unwrap();
+
+    blocker
+        .write_all(&resp_cmd(&["BZPOPMIN", "marker", "5"]))
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+
+    let mut observer = server.conn();
+    let pong = send_and_read(&mut observer, &["PING"]);
+    assert!(pong.contains("PONG"), "PING while blocked: {pong}");
+
+    let mut pusher = server.conn();
+    send_and_read(&mut pusher, &["ZADD", "marker", "1", "wake"]);
+
+    let resp = read_all(&mut blocker);
+    assert!(resp.contains("marker"), "key: {resp}");
+    assert!(resp.contains("wake"), "member: {resp}");
+}
