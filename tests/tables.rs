@@ -918,6 +918,104 @@ fn on_delete_cascade() {
     child.wait().ok();
 }
 
+// AUDIT PROBE: ON DELETE CASCADE must work for a non-INT (UUID) foreign key. The
+// cascade scan decodes child FK bytes as FieldType::Int regardless of the column's
+// real type (tables/mod.rs:2469), so a UUID FK never matches -> cascade is a no-op
+// and children are orphaned (referential-integrity corruption).
+#[test]
+#[ignore = "ENG-1278: FK cascade/restrict/set-null broken for non-INT FKs until fixed"]
+fn on_delete_cascade_uuid_fk() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    send(
+        &mut s,
+        &["TCREATE", "u", "id UUID PRIMARY KEY,", "name STR"],
+    );
+    send(
+        &mut s,
+        &[
+            "TCREATE",
+            "p",
+            "id UUID PRIMARY KEY,",
+            "author UUID REFERENCES u(id) ON DELETE CASCADE",
+        ],
+    );
+    send(
+        &mut s,
+        &[
+            "TINSERT",
+            "u",
+            "id",
+            "11111111-1111-7111-8111-111111111111",
+            "name",
+            "a",
+        ],
+    );
+    send(
+        &mut s,
+        &[
+            "TINSERT",
+            "p",
+            "id",
+            "22222222-2222-7222-8222-222222222222",
+            "author",
+            "11111111-1111-7111-8111-111111111111",
+        ],
+    );
+
+    send(
+        &mut s,
+        &[
+            "TDELETE",
+            "FROM",
+            "u",
+            "WHERE",
+            "id",
+            "=",
+            "11111111-1111-7111-8111-111111111111",
+        ],
+    );
+
+    // The child post must be cascade-deleted with its parent.
+    let r = send(&mut s, &["TCOUNT", "p"]);
+    assert_eq!(
+        r, ":0",
+        "UUID FK cascade must delete the child (orphaned if not): {r}"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+// AUDIT PROBE: SMOVE must not remove the member from the source when the
+// destination is the wrong type. The store removes from src BEFORE validating dst
+// (store/mod.rs:3858+), so a WRONGTYPE dst loses the element from src entirely.
+#[test]
+#[ignore = "ENG-1279: SMOVE loses source member on wrong-type dst until fixed"]
+fn smove_wrong_type_dst_preserves_source() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    send(&mut s, &["SET", "dstk", "hello"]); // dst is a string, not a set
+    send(&mut s, &["SADD", "srck", "m"]);
+    let mv = send(&mut s, &["SMOVE", "srck", "dstk", "m"]); // should error, no mutation
+    assert!(
+        mv.to_ascii_uppercase().contains("WRONGTYPE") || mv.starts_with('-'),
+        "SMOVE to wrong-type dst should error: {mv:?}"
+    );
+    let members = send(&mut s, &["SMEMBERS", "srck"]);
+    assert!(
+        members.contains('m'),
+        "member must remain in source after a failed SMOVE: {members:?}"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
 #[test]
 fn on_delete_set_null() {
     let (port, mut child) = start_server();

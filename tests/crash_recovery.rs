@@ -109,6 +109,106 @@ fn crash_recovery_all_types() {
     assert!(resp.contains("42.5"), "timeseries recovery: {resp}");
 }
 
+// AUDIT PROBE: XADD with a `*` server-generated ID must keep the SAME id across a
+// WAL-only recovery. execute_with_wal logs the RAW command (literal `*`), so replay
+// regenerates a new time-based id and the entry's identity changes.
+//
+// QUARANTINED repro for ENG-1276 (un-ignore when fixing). Run with:
+//   cargo test --release --test crash_recovery -- --ignored xadd_star_id_stable_after_wal_replay
+#[test]
+#[ignore = "ENG-1276: XADD * id is non-deterministic across WAL replay until fixed"]
+fn xadd_star_id_stable_after_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let resp = send(&mut c, &["XADD", "s", "*", "f", "v"]);
+    // Pull the generated id (a bulk line containing the ms-seq form `<ms>-<seq>`).
+    let id = resp
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| l.contains('-') && l.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
+        .unwrap_or("")
+        .to_string();
+    assert!(!id.is_empty(), "captured an XADD id: {resp:?}");
+    drop(c);
+
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    let range = send(&mut c, &["XRANGE", "s", "-", "+"]);
+    assert!(
+        range.contains(&id),
+        "XADD * id must be stable across WAL replay: was {id}, after = {range:?}"
+    );
+}
+
+// AUDIT PROBE: TSADD with a `*` server-generated timestamp must keep the SAME
+// timestamp across WAL replay. Same class as XADD * -- the raw `*` is logged and
+// replay resolves it to a different wall-clock time.
+//
+// QUARANTINED repro for ENG-1277 (un-ignore when fixing; shares the fix with
+// ENG-1276). Run with:
+//   cargo test --release --test crash_recovery -- --ignored tsadd_star_timestamp_stable_after_wal_replay
+#[test]
+#[ignore = "ENG-1277: TSADD * timestamp is non-deterministic across WAL replay until fixed"]
+fn tsadd_star_timestamp_stable_after_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let resp = send(&mut c, &["TSADD", "temps", "*", "42.5"]);
+    // TSADD * returns the resolved ms timestamp.
+    let ts = resp
+        .lines()
+        .map(|l| l.trim().trim_start_matches(':'))
+        .find(|l| l.len() >= 10 && l.chars().all(|ch| ch.is_ascii_digit()))
+        .unwrap_or("")
+        .to_string();
+    assert!(!ts.is_empty(), "captured a TSADD timestamp: {resp:?}");
+    drop(c);
+
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    let range = send(&mut c, &["TSRANGE", "temps", "-", "+"]);
+    assert!(
+        range.contains(&ts),
+        "TSADD * timestamp must be stable across WAL replay: was {ts}, after = {range:?}"
+    );
+}
+
+// AUDIT PROBE: SPOP removes a RANDOM member. The raw command is WAL-logged, so
+// replay re-runs SPOP and may remove a DIFFERENT member than the client saw,
+// leaving the recovered set inconsistent with the acknowledged result.
+#[test]
+fn spop_deterministic_after_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    send(
+        &mut c,
+        &["SADD", "myset", "a", "b", "c", "d", "e", "f", "g", "h"],
+    );
+    send(&mut c, &["SPOP", "myset"]);
+    let mut before: Vec<String> = send(&mut c, &["SMEMBERS", "myset"])
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| l.len() == 1 && l.chars().all(|ch| ch.is_ascii_lowercase()))
+        .collect();
+    before.sort();
+    drop(c);
+
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    let mut after: Vec<String> = send(&mut c, &["SMEMBERS", "myset"])
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| l.len() == 1 && l.chars().all(|ch| ch.is_ascii_lowercase()))
+        .collect();
+    after.sort();
+    assert_eq!(
+        before, after,
+        "SPOP must remove the same member on replay as the client observed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test: Writes performed inside a Lua script survive a crash (WAL-only, no
 // snapshot). EVAL logs effects, not the script, so the logged KV writes replay.
@@ -594,6 +694,101 @@ fn row_ttl_active_after_wal_replay() {
     );
 }
 
+// A TTL set by an UPDATE must survive WAL replay. The update path applies the TTL
+// in the leaf and logs it as a trailing `TTL <secs>` on the TUPDATE, so replay
+// re-applies it. Without that, the update's TTL is dropped on replay and the row
+// lives forever. Guarantee (WAL-only, relative TTL refreshes on replay): the row
+// recovers AND its TTL stays active, so it still expires.
+#[test]
+fn update_ttl_active_after_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    send(
+        &mut c,
+        &["TCREATE", "pres", "user_id STR PRIMARY KEY,", "room STR"],
+    );
+    // Insert WITHOUT a TTL, then set the TTL via UPDATE.
+    send(&mut c, &["TINSERT", "pres", "user_id", "keep", "room", "a"]);
+    send(&mut c, &["TINSERT", "pres", "user_id", "gone", "room", "a"]);
+    send(
+        &mut c,
+        &[
+            "TUPDATE", "pres", "SET", "room", "b", "WHERE", "user_id", "=", "keep", "TTL", "60",
+        ],
+    );
+    send(
+        &mut c,
+        &[
+            "TUPDATE", "pres", "SET", "room", "b", "WHERE", "user_id", "=", "gone", "TTL", "2",
+        ],
+    );
+    // NO SAVE -> recovery is from WAL replay only.
+    drop(c);
+    srv.kill();
+    srv.restart();
+    let mut c = srv.conn();
+
+    // Both rows recover; the update's TTL came back with them.
+    let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(resp.contains("keep"), "long-TTL row recovers: {resp}");
+    assert!(resp.contains("gone"), "short-TTL row recovers: {resp}");
+
+    // The update's TTL is still active: `gone` expires, `keep` stays. Before the
+    // fix `gone` had no TTL after replay and would still be present here.
+    thread::sleep(Duration::from_millis(2600));
+    let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(resp.contains("keep"), "long-TTL row still present: {resp}");
+    assert!(
+        !resp.contains("gone"),
+        "update-set TTL must survive replay and expire the row: {resp}"
+    );
+}
+
+// A TTL set by an UPSERT onto an existing (conflicting) row must survive WAL
+// replay. Covers both shapes: an upsert that also writes a non-key field, and a
+// TTL-only refresh (no non-key fields) -- the latter previously logged no command
+// at all, so its deadline vanished on replay and the row lived forever.
+#[test]
+fn upsert_ttl_active_after_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    send(
+        &mut c,
+        &["TCREATE", "pres", "user_id STR PRIMARY KEY,", "room STR"],
+    );
+    send(&mut c, &["TINSERT", "pres", "user_id", "keep", "room", "a"]);
+    send(&mut c, &["TINSERT", "pres", "user_id", "gone", "room", "a"]);
+    // `keep`: upsert that also updates a field. `gone`: TTL-only upsert (conflict
+    // key is the sole field) -- the case that logged nothing before the fix.
+    send(
+        &mut c,
+        &[
+            "TUPSERT", "pres", "user_id", "keep", "room", "b", "TTL", "60",
+        ],
+    );
+    send(&mut c, &["TUPSERT", "pres", "user_id", "gone", "TTL", "2"]);
+    // NO SAVE -> recovery is from WAL replay only.
+    drop(c);
+    srv.kill();
+    srv.restart();
+    let mut c = srv.conn();
+
+    let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(resp.contains("keep"), "long-TTL row recovers: {resp}");
+    assert!(
+        resp.contains("gone"),
+        "TTL-only-upsert row recovers: {resp}"
+    );
+
+    thread::sleep(Duration::from_millis(2600));
+    let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
+    assert!(resp.contains("keep"), "long-TTL row still present: {resp}");
+    assert!(
+        !resp.contains("gone"),
+        "upsert-set TTL must survive replay and expire the row: {resp}"
+    );
+}
+
 // A row with an auto-generated UUID primary key must keep the SAME id across a
 // WAL-replay recovery. The table layer logs the RESOLVED insert (explicit uuid),
 // so replay reproduces the exact row instead of regenerating it. This also guards
@@ -619,6 +814,69 @@ fn wal_replay_preserves_autogenerated_uuid_pk() {
     assert_eq!(
         before, after,
         "auto-uuid PK identity must be stable across WAL replay"
+    );
+}
+
+// Auto-increment INT PK sequence must survive WAL replay. The seq counter
+// (_t:<table>:seq) is bumped by next_id() via a direct store.incr that is NOT
+// WAL-logged; the resolved id is only carried inside the replayed TINSERT, which
+// skips next_id() on the explicit-PK path. So after a WAL-only recovery the
+// counter is stale and the next live insert reuses an id -> PK collision.
+#[test]
+fn wal_replay_restores_autoincrement_seq() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    send(
+        &mut c,
+        &["TCREATE", "ai", "id INT PRIMARY KEY,", "name STR"],
+    );
+    send(&mut c, &["TINSERT", "ai", "name", "a"]); // id 1
+    send(&mut c, &["TINSERT", "ai", "name", "b"]); // id 2
+    send(&mut c, &["TINSERT", "ai", "name", "c"]); // id 3, NO snapshot
+    drop(c);
+
+    srv.kill();
+    srv.restart(); // recovery is WAL replay only
+    let mut c = srv.conn();
+
+    // The next auto-increment insert must get id 4, not collide with 1.
+    let reply = send(&mut c, &["TINSERT", "ai", "name", "d"]);
+    assert!(
+        !reply.to_ascii_lowercase().contains("err"),
+        "post-replay auto-increment insert must not error: {reply}"
+    );
+    let rows = send(&mut c, &["TSELECT", "*", "FROM", "ai"]);
+    let count = rows.matches("name").count();
+    assert_eq!(
+        count, 4,
+        "all four rows must coexist after replay (no id reuse): {rows}"
+    );
+}
+
+// A table with no declared PK uses an implicit auto-increment id. Its rows must
+// survive WAL-only recovery with stable identity and no later id reuse.
+#[test]
+fn wal_replay_no_pk_table_implicit_id() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    send(&mut c, &["TCREATE", "np", "name STR"]); // no PRIMARY KEY
+    send(&mut c, &["TINSERT", "np", "name", "a"]);
+    send(&mut c, &["TINSERT", "np", "name", "b"]);
+    let before = send(&mut c, &["TSELECT", "*", "FROM", "np"]);
+    drop(c);
+
+    srv.kill();
+    srv.restart(); // recovery is WAL replay only
+    let mut c = srv.conn();
+    let after = send(&mut c, &["TSELECT", "*", "FROM", "np"]);
+    assert_eq!(before, after, "no-PK rows must be stable across WAL replay");
+
+    send(&mut c, &["TINSERT", "np", "name", "c"]);
+    let rows = send(&mut c, &["TSELECT", "*", "FROM", "np"]);
+    assert_eq!(
+        rows.matches("name").count(),
+        3,
+        "post-replay insert must not reuse an implicit id: {rows}"
     );
 }
 

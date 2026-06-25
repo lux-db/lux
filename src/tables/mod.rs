@@ -1437,6 +1437,27 @@ fn next_id(store: &Store, table: &str, now: Instant) -> i64 {
     }
 }
 
+/// Advance an INT auto-increment counter so it is at least `id`. Called whenever a
+/// row lands with an explicit numeric PK so a later auto-generated id never
+/// collides. The seq counter is a direct store write that is NOT WAL-logged, so on
+/// crash recovery it must be rebuilt from the explicit ids carried in replayed
+/// TINSERT commands -- otherwise the next live insert reuses an id and silently
+/// overwrites a recovered row.
+fn bump_seq_to_at_least(store: &Store, table: &str, id: i64, now: Instant) {
+    let key = seq_key(table);
+    let current = store
+        .get(key.as_bytes(), now)
+        .and_then(|v| {
+            std::str::from_utf8(&v)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+        })
+        .unwrap_or(0);
+    if id > current {
+        store.set(key.as_bytes(), id.to_string().as_bytes(), None, now);
+    }
+}
+
 /// Add a field value to the appropriate index.
 /// pk_str is the row's primary key string (used as the member in the index).
 /// score is a numeric representation of the value for sorted set indexes.
@@ -1811,15 +1832,22 @@ pub fn table_upsert_returning_ttl(
     match existing_pk {
         Some(pk) => {
             // Update the conflicting row with the non-key fields, then return it.
-            let updates: Vec<(&str, &str)> = field_values
+            let mut updates: Vec<(&str, &str)> = field_values
                 .iter()
                 .copied()
                 .filter(|(k, _)| *k != conflict)
                 .collect();
-            if !updates.is_empty() {
-                table_update_by_pk_str(store, cache, table, &pk, &updates, now)?;
+            // A TTL-only upsert (no non-key fields) still needs a logged command so
+            // the refreshed deadline survives WAL replay. Carry it on a no-op write
+            // of the conflict column to its matched value.
+            if updates.is_empty() && ttl.is_some() {
+                updates.push((conflict, cval));
             }
-            apply_row_ttl(store, table, &pk, ttl, now);
+            // The leaf applies AND WAL-logs the TTL atomically with the row update,
+            // so replay preserves the deadline instead of dropping it.
+            if !updates.is_empty() {
+                table_update_by_pk_str(store, cache, table, &pk, &updates, ttl, now)?;
+            }
             let mut row = get_row(store, table, &schema, &pk, now)
                 .ok_or_else(|| format!("ERR upserted row not found in table '{}'", table))?;
             row.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1840,9 +1868,15 @@ fn table_insert_pk(
 ) -> Result<String, String> {
     let schema = load_schema(store, cache, table, now)?;
 
+    // A table with no declared PK stores rows under an implicit auto-increment
+    // "id". That id is a valid insert/replay column even though it is not part of
+    // the declared schema -- replayed TINSERTs carry it so the row keeps identity.
+    let has_declared_pk = schema.iter().any(|f| f.primary_key);
+
     let mut provided: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for (k, v) in field_values {
-        if !schema.iter().any(|f| f.name == *k) {
+        let known = schema.iter().any(|f| f.name == *k) || (!has_declared_pk && *k == "id");
+        if !known {
             return Err(format!("ERR unknown column '{}'", k));
         }
         provided.insert(k, v);
@@ -1971,6 +2005,12 @@ fn table_insert_pk(
                         pk_val
                     ));
                 }
+                // Keep the auto-increment counter ahead of explicit/replayed ids.
+                if pk.field_type == FieldType::Int {
+                    if let Ok(id) = pk_val.parse::<i64>() {
+                        bump_seq_to_at_least(store, table, id, now);
+                    }
+                }
                 pk_val.to_string()
             }
             None if pk.field_type == FieldType::Int => {
@@ -1992,6 +2032,14 @@ fn table_insert_pk(
                 ));
             }
         }
+    } else if let Some(id) = provided.get("id") {
+        // Implicit-id table carrying an explicit id (WAL replay, or a client that
+        // supplied one): honor it and keep the counter ahead so a later
+        // auto-generated id never reuses it.
+        if let Ok(parsed) = id.parse::<i64>() {
+            bump_seq_to_at_least(store, table, parsed, now);
+        }
+        id.to_string()
     } else {
         next_id(store, table, now).to_string()
     };
@@ -2142,6 +2190,8 @@ pub fn table_get(
     Ok(result)
 }
 
+/// Convenience wrapper used by tests: update by integer id, no TTL change.
+#[cfg(test)]
 pub fn table_update(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -2150,7 +2200,15 @@ pub fn table_update(
     field_values: &[(&str, &str)],
     now: Instant,
 ) -> Result<(), String> {
-    table_update_by_pk_str(store, cache, table, &id.to_string(), field_values, now)
+    table_update_by_pk_str(
+        store,
+        cache,
+        table,
+        &id.to_string(),
+        field_values,
+        None,
+        now,
+    )
 }
 
 /// Update a row identified by its raw PK string - works for any PK type (INT, UUID, STR).
@@ -2160,6 +2218,7 @@ fn table_update_by_pk_str(
     table: &str,
     pk_str: &str,
     field_values: &[(&str, &str)],
+    ttl: Option<TtlOp>,
     now: Instant,
 ) -> Result<(), String> {
     let schema = load_schema(store, cache, table, now)?;
@@ -2260,14 +2319,18 @@ fn table_update_by_pk_str(
         .collect();
     store.hset(rk.as_bytes(), &pair_refs, now)?;
 
+    // Apply any TTL op for this row before logging, so the row state matches the
+    // command we record.
+    apply_row_ttl(store, table, pk_str, ttl, now);
+
     // WAL: log the resolved per-row update so crash replay re-applies it. SET
     // values are already explicit; keyed by the actual PK so it never re-matches
     // a different row on replay. (A WHERE-update logs one such command per matched
-    // row.) Row-TTL refresh on an update is applied by the caller and is the known
-    // replay-resets-TTL limitation, not logged here.
+    // row.) The TTL op is logged as a trailing `TTL <secs>` clause so replay
+    // preserves the row's deadline instead of resetting it.
     if store.wal_enabled() {
         let pkcol = pk_column_name(&schema);
-        let mut a: Vec<Vec<u8>> = Vec::with_capacity(field_values.len() * 2 + 7);
+        let mut a: Vec<Vec<u8>> = Vec::with_capacity(field_values.len() * 2 + 9);
         a.push(b"TUPDATE".to_vec());
         a.push(table.as_bytes().to_vec());
         a.push(b"SET".to_vec());
@@ -2279,6 +2342,10 @@ fn table_update_by_pk_str(
         a.push(pkcol.as_bytes().to_vec());
         a.push(b"=".to_vec());
         a.push(pk_str.as_bytes().to_vec());
+        if let Some((tok, val)) = ttl_wal_tokens(ttl) {
+            a.push(tok.to_vec());
+            a.push(val);
+        }
         let refs: Vec<&[u8]> = a.iter().map(|v| v.as_slice()).collect();
         let _ = store.wal_log_command(&refs);
     }
@@ -2757,26 +2824,11 @@ fn table_update_where_pks(
             .ok_or_else(|| format!("ERR unknown field '{}'", fname))?;
     }
 
-    // table_update takes i64 (valid for auto-increment INT / implicit PKs);
-    // UUID/STR PKs update the row hash directly.
-    let has_int_pk = schema
-        .iter()
-        .any(|f| f.primary_key && f.field_type == FieldType::Int);
-    let has_implicit_pk = !schema.iter().any(|f| f.primary_key);
+    // The matched PKs come from the table's own index, so they are valid for any
+    // PK type; update each by its raw PK string. The TTL op rides into the leaf so
+    // it is applied and WAL-logged atomically with the row update (replay-safe).
     for pk_str in &matched {
-        if has_int_pk || has_implicit_pk {
-            let id: i64 = pk_str
-                .parse()
-                .map_err(|_| format!("ERR invalid row id '{}'", pk_str))?;
-            table_update(store, cache, table, id, field_values, now)?;
-        } else {
-            table_update_by_pk_str(store, cache, table, pk_str, field_values, now)?;
-        }
-    }
-    if ttl.is_some() {
-        for pk_str in &matched {
-            apply_row_ttl(store, table, pk_str, ttl, now);
-        }
+        table_update_by_pk_str(store, cache, table, pk_str, field_values, ttl, now)?;
     }
     Ok((schema, matched))
 }
