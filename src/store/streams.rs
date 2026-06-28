@@ -316,6 +316,39 @@ impl Store {
         }
     }
 
+    pub fn xgroup_setid(
+        &self,
+        key: &[u8],
+        group: &str,
+        id: &str,
+        now: Instant,
+    ) -> Result<(), String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        shard.version += 1;
+        match shard.data.get_mut(key) {
+            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+                StoreValue::Stream(s) => {
+                    let Some(group) = s.groups.get_mut(group) else {
+                        return Err(format!(
+                            "NOGROUP No such consumer group '{}' for key name '{}'",
+                            group,
+                            key_str(key)
+                        ));
+                    };
+                    group.last_delivered_id = if id == "$" {
+                        s.last_id
+                    } else {
+                        StreamId::parse(id).ok_or_else(|| "ERR Invalid stream ID".to_string())?
+                    };
+                    Ok(())
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Err("ERR no such key".to_string()),
+        }
+    }
+
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn xreadgroup(
         &self,

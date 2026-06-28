@@ -318,6 +318,18 @@ pub fn cmd_xgroup(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
             Ok(removed) => resp::write_integer(out, if removed { 1 } else { 0 }),
             Err(e) => resp::write_error(out, &e),
         }
+    } else if cmd_eq(args[1], b"SETID") {
+        if args.len() < 5 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'xgroup|setid' command",
+            );
+            return CmdResult::Written;
+        }
+        match store.xgroup_setid(args[2], arg_str(args[3]), arg_str(args[4]), now) {
+            Ok(()) => resp::write_ok(out),
+            Err(e) => resp::write_error(out, &e),
+        }
     } else if cmd_eq(args[1], b"CREATECONSUMER") {
         resp::write_integer(out, 1);
     } else if cmd_eq(args[1], b"DELCONSUMER") {
