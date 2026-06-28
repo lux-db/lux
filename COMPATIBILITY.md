@@ -74,6 +74,28 @@ known command as one of:
 - **Excluded**: Redis OSS command intentionally outside this project.
 - **Lux-native**: public Lux command with no Redis compatibility claim.
 
+For local compatibility exploration, run selected Valkey Tcl suites against a
+running Lux RESP listener:
+
+```sh
+# Terminal 1
+cargo build
+LUX_PORT=6379 ./target/debug/lux
+
+# Terminal 2
+VALKEY_DIR=/tmp/valkey LUX_PORT=6379 just valkey-compat
+```
+
+The recipe is intentionally local/manual. It runs Redis OSS/core-oriented suites
+for strings, keyspace, lists, hashes, sets, sorted sets, streams, scripting, and
+transactions in durable mode so one missing command does not stop the whole
+report, with `VALKEY_TIMEOUT` defaulting to 60 seconds to keep blocking-command
+failures bounded. It does not run Redis Stack/module suites, cluster suites,
+replication suites, or CI gates. It ignores Valkey internal encoding checks and
+skips individual tests whose assertions are about replication, command
+propagation, or Valkey's exact expiry scheduling; those are separate
+compatibility targets from single-node command semantics.
+
 Current partial/stub surfaces:
 
 - `CLIENT` -- common client-library subcommands only.
