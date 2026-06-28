@@ -3527,9 +3527,9 @@ fn push_field_value(out: &mut String, key: &str, v: &str, cols: &RenderCols) {
         } else {
             out.push_str(v);
         }
-    } else if cols.number.contains(key) && looks_numeric(v) {
-        out.push_str(v);
-    } else if cols.bool_.contains(key) && (v == "true" || v == "false") {
+    } else if (cols.number.contains(key) && looks_numeric(v))
+        || (cols.bool_.contains(key) && (v == "true" || v == "false"))
+    {
         out.push_str(v);
     } else {
         out.push('"');
