@@ -124,6 +124,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 2,
     },
     CommandSpec {
+        name: b"DELIFEQ",
+        min_arity: 3,
+    },
+    CommandSpec {
         name: b"PING",
         min_arity: 1,
     },
@@ -241,6 +245,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: b"RPUSH",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"LCS",
         min_arity: 3,
     },
     CommandSpec {
@@ -1572,6 +1580,9 @@ pub fn execute(
             if cmd_eq(cmd, b"DECRBY") {
                 return strings::cmd_decrby(args, store, out, now);
             }
+            if cmd_eq(cmd, b"DELIFEQ") {
+                return strings::cmd_delifeq(args, store, out, now);
+            }
             if cmd_eq(cmd, b"DEBUG") || cmd_eq(cmd, b"DUMP") {
                 return server::cmd_noop_ok(args, store, out, now);
             }
@@ -1744,6 +1755,9 @@ pub fn execute(
             }
         }
         b'L' => {
+            if cmd_eq(cmd, b"LCS") {
+                return strings::cmd_lcs(args, store, out, now);
+            }
             if cmd_eq(cmd, b"LPUSH") {
                 return lists::cmd_lpush(args, store, broker, out, now);
             }
@@ -3618,6 +3632,181 @@ mod tests {
     }
 
     #[test]
+    fn set_get_option_returns_old_value_and_updates() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"foo", b"bar"]);
+
+        let out = exec_str(&store, &[b"SET", b"foo", b"bar2", b"GET"]);
+        assert!(out.contains("bar"), "old value: {out}");
+        let out = exec_str(&store, &[b"GET", b"foo"]);
+        assert!(out.contains("bar2"), "new value: {out}");
+    }
+
+    #[test]
+    fn set_get_option_honors_nx_and_xx() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"foo", b"bar"]);
+
+        let out = exec_str(&store, &[b"SET", b"foo", b"baz", b"GET", b"NX"]);
+        assert!(
+            out.contains("bar"),
+            "NX failure should return old value: {out}"
+        );
+        let out = exec_str(&store, &[b"GET", b"foo"]);
+        assert!(
+            out.contains("bar"),
+            "NX failure should not overwrite: {out}"
+        );
+
+        let out = exec_str(&store, &[b"SET", b"missing", b"baz", b"GET", b"XX"]);
+        assert_eq!(out, "$-1\r\n");
+        let out = exec_str(&store, &[b"GET", b"missing"]);
+        assert_eq!(out, "$-1\r\n");
+    }
+
+    #[test]
+    fn set_get_wrongtype_does_not_overwrite() {
+        let store = Store::new();
+        exec(&store, &[b"RPUSH", b"foo", b"waffle"]);
+
+        let out = exec_str(&store, &[b"SET", b"foo", b"bar", b"GET"]);
+        assert!(out.contains("WRONGTYPE"), "wrong type: {out}");
+        let out = exec_str(&store, &[b"RPOP", b"foo"]);
+        assert!(out.contains("waffle"), "list should remain intact: {out}");
+    }
+
+    #[test]
+    fn set_ifeq_condition_matches_valkey() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"foo", b"initial_value"]);
+
+        let out = exec_str(&store, &[b"SET", b"foo", b"new_value", b"IFEQ", b"wrong"]);
+        assert_eq!(out, "$-1\r\n");
+        let out = exec_str(&store, &[b"GET", b"foo"]);
+        assert!(
+            out.contains("initial_value"),
+            "IFEQ mismatch changed key: {out}"
+        );
+
+        let out = exec_str(
+            &store,
+            &[
+                b"SET",
+                b"foo",
+                b"new_value",
+                b"IFEQ",
+                b"initial_value",
+                b"GET",
+            ],
+        );
+        assert!(out.contains("initial_value"), "IFEQ GET old value: {out}");
+        let out = exec_str(&store, &[b"GET", b"foo"]);
+        assert!(
+            out.contains("new_value"),
+            "IFEQ match did not update: {out}"
+        );
+    }
+
+    #[test]
+    fn setrange_deoptimizes_integer_encoding_only_when_mutating() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"foo", b"1234"]);
+
+        let out = exec_str(&store, &[b"OBJECT", b"ENCODING", b"foo"]);
+        assert!(out.contains("int"), "initial encoding: {out}");
+
+        let out = exec_str(&store, &[b"SETRANGE", b"foo", b"0", b"2"]);
+        assert!(out.contains(":4"), "setrange length: {out}");
+        let out = exec_str(&store, &[b"OBJECT", b"ENCODING", b"foo"]);
+        assert!(out.contains("raw"), "mutated encoding: {out}");
+
+        exec(&store, &[b"SET", b"foo", b"1234"]);
+        let out = exec_str(&store, &[b"SETRANGE", b"foo", b"0", b""]);
+        assert!(out.contains(":4"), "empty setrange length: {out}");
+        let out = exec_str(&store, &[b"OBJECT", b"ENCODING", b"foo"]);
+        assert!(
+            out.contains("int"),
+            "empty setrange should not mutate: {out}"
+        );
+    }
+
+    #[test]
+    fn set_exat_pxat_in_the_past_expires_immediately() {
+        let store = Store::new();
+        let past_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(100)
+            .to_string();
+        let past_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .saturating_sub(100_000))
+        .to_string();
+
+        exec(
+            &store,
+            &[b"SET", b"foo", b"bar", b"EXAT", past_secs.as_bytes()],
+        );
+        let out = exec_str(&store, &[b"GET", b"foo"]);
+        assert_eq!(out, "$-1\r\n");
+
+        exec(
+            &store,
+            &[b"SET", b"foo", b"bar", b"PXAT", past_ms.as_bytes()],
+        );
+        let out = exec_str(&store, &[b"GET", b"foo"]);
+        assert_eq!(out, "$-1\r\n");
+    }
+
+    #[test]
+    fn lcs_basic_len_idx_and_wrongtype() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"left", b"abcdef"]);
+        exec(&store, &[b"SET", b"right", b"acdf"]);
+
+        let out = exec_str(&store, &[b"LCS", b"left", b"right"]);
+        assert!(out.contains("acdf"), "basic LCS: {out}");
+        let out = exec_str(&store, &[b"LCS", b"left", b"right", b"LEN"]);
+        assert!(out.contains(":4"), "LCS LEN: {out}");
+        let out = exec_str(
+            &store,
+            &[b"LCS", b"left", b"right", b"IDX", b"WITHMATCHLEN"],
+        );
+        assert!(out.contains("matches"), "LCS IDX: {out}");
+        assert!(out.contains("len"), "LCS IDX len: {out}");
+
+        exec(&store, &[b"RPUSH", b"list", b"value"]);
+        let out = exec_str(&store, &[b"LCS", b"list", b"right"]);
+        assert!(out.contains("WRONGTYPE"), "LCS wrong type: {out}");
+    }
+
+    #[test]
+    fn delifeq_deletes_only_matching_strings() {
+        let store = Store::new();
+
+        let out = exec_str(&store, &[b"DELIFEQ", b"foo", b"test"]);
+        assert!(out.contains(":0"), "missing key: {out}");
+
+        exec(&store, &[b"SET", b"foo", b"nope"]);
+        let out = exec_str(&store, &[b"DELIFEQ", b"foo", b"test"]);
+        assert!(out.contains(":0"), "non-matching value: {out}");
+        let out = exec_str(&store, &[b"GET", b"foo"]);
+        assert!(out.contains("nope"), "non-match should remain: {out}");
+
+        let out = exec_str(&store, &[b"DELIFEQ", b"foo", b"nope"]);
+        assert!(out.contains(":1"), "matching value: {out}");
+        let out = exec_str(&store, &[b"GET", b"foo"]);
+        assert_eq!(out, "$-1\r\n");
+
+        exec(&store, &[b"SADD", b"foo", b"test"]);
+        let out = exec_str(&store, &[b"DELIFEQ", b"foo", b"test"]);
+        assert!(out.contains("WRONGTYPE"), "wrong type: {out}");
+    }
+
+    #[test]
     fn setex_negative_time() {
         let store = Store::new();
         let out = exec_str(&store, &[b"SETEX", b"key", b"-1", b"val"]);
@@ -3680,7 +3869,7 @@ mod tests {
 
         // SETBIT at a large bit offset.
         let out = exec_str(&store, &[b"SETBIT", b"b", b"100000", b"1"]);
-        assert!(out.contains("string exceeds maximum"), "setbit: {out}");
+        assert!(out.contains("out of range"), "setbit: {out}");
 
         // APPEND past the ceiling in steps: the running total is what matters.
         exec(&store, &[b"SET", b"a", b"0123456789"]); // 10 bytes, under 16
