@@ -1,4 +1,5 @@
 use bytes::BytesMut;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::pubsub::Broker;
@@ -6,6 +7,12 @@ use crate::resp;
 use crate::store::Store;
 
 use super::{arg_str, cmd_eq, is_restricted, CmdResult};
+
+static ZSET_MAX_ZIPLIST_ENTRIES: AtomicUsize = AtomicUsize::new(128);
+
+pub(crate) fn zset_max_ziplist_entries() -> usize {
+    ZSET_MAX_ZIPLIST_ENTRIES.load(Ordering::Relaxed)
+}
 
 pub fn cmd_ping(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
     if args.len() > 1 {
@@ -193,8 +200,30 @@ pub fn cmd_auth(args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instant
 }
 
 pub fn cmd_config(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
-    if args.len() > 1 && cmd_eq(args[1], b"GET") {
-        resp::write_array_header(out, 0);
+    if args.len() > 2 && cmd_eq(args[1], b"GET") {
+        if cmd_eq(args[2], b"zset-max-ziplist-entries")
+            || cmd_eq(args[2], b"zset-max-listpack-entries")
+        {
+            resp::write_array_header(out, 2);
+            resp::write_bulk(out, arg_str(args[2]));
+            resp::write_bulk(out, &zset_max_ziplist_entries().to_string());
+        } else {
+            resp::write_array_header(out, 0);
+        }
+    } else if args.len() > 3 && cmd_eq(args[1], b"SET") {
+        if cmd_eq(args[2], b"zset-max-ziplist-entries")
+            || cmd_eq(args[2], b"zset-max-listpack-entries")
+        {
+            match arg_str(args[3]).parse::<usize>() {
+                Ok(value) => {
+                    ZSET_MAX_ZIPLIST_ENTRIES.store(value, Ordering::Relaxed);
+                    resp::write_ok(out);
+                }
+                Err(_) => resp::write_error(out, "ERR invalid argument"),
+            }
+        } else {
+            resp::write_ok(out);
+        }
     } else {
         resp::write_ok(out);
     }
