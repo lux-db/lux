@@ -113,7 +113,7 @@ fn crash_recovery_all_types() {
 // WAL-only recovery. execute_with_wal logs the RAW command (literal `*`), so replay
 // regenerates a new time-based id and the entry's identity changes.
 //
-// QUARANTINED repro for ENG-1276 (un-ignore when fixing). Run with:
+// QUARANTINED repro for row TTL WAL replay drift (un-ignore when fixing). Run with:
 //   cargo test --release --test crash_recovery -- --ignored xadd_star_id_stable_after_wal_replay
 #[test]
 fn xadd_star_id_stable_after_wal_replay() {
@@ -144,11 +144,11 @@ fn xadd_star_id_stable_after_wal_replay() {
 // timestamp across WAL replay. Same class as XADD * -- the raw `*` is logged and
 // replay resolves it to a different wall-clock time.
 //
-// QUARANTINED repro for ENG-1277 (un-ignore when fixing; shares the fix with
-// ENG-1276). Run with:
+// QUARANTINED repro for TSADD * WAL replay drift (un-ignore when fixing; shares
+// the fix with row TTL WAL replay drift). Run with:
 //   cargo test --release --test crash_recovery -- --ignored tsadd_star_timestamp_stable_after_wal_replay
 #[test]
-#[ignore = "ENG-1277: TSADD * timestamp is non-deterministic across WAL replay until fixed"]
+#[ignore = "TSADD * timestamp is non-deterministic across WAL replay until fixed"]
 fn tsadd_star_timestamp_stable_after_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
