@@ -62,6 +62,24 @@ fn xgroup_create_and_xreadgroup() {
 }
 
 #[test]
+fn xgroup_setid_moves_group_cursor() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    send_and_read(&mut conn, &["XADD", "s", "1-0", "f", "v1"]);
+    send_and_read(&mut conn, &["XADD", "s", "2-0", "f", "v2"]);
+    send_and_read(&mut conn, &["XGROUP", "CREATE", "s", "g", "0"]);
+
+    let resp = send_and_read(&mut conn, &["XGROUP", "SETID", "s", "g", "1-0"]);
+    assert!(resp.contains("OK"), "setid ok: {resp}");
+    let resp = send_and_read(
+        &mut conn,
+        &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+    );
+    assert!(!resp.contains("v1"), "setid skipped v1: {resp}");
+    assert!(resp.contains("v2"), "setid reads v2: {resp}");
+}
+
+#[test]
 fn xack_removes_pending() {
     let server = LuxServer::start();
     let mut conn = server.conn();
