@@ -3467,6 +3467,8 @@ fn handle_exec(
 #[derive(Default)]
 struct RenderCols {
     json: std::collections::HashSet<String>,
+    number: std::collections::HashSet<String>,
+    bool_: std::collections::HashSet<String>,
     vector: std::collections::HashSet<String>,
 }
 
@@ -3483,6 +3485,15 @@ fn render_columns(
                 crate::tables::FieldType::Json | crate::tables::FieldType::Array => {
                     cols.json.insert(f.name);
                 }
+                crate::tables::FieldType::Int
+                | crate::tables::FieldType::Float
+                | crate::tables::FieldType::Timestamp
+                | crate::tables::FieldType::Ref(_) => {
+                    cols.number.insert(f.name);
+                }
+                crate::tables::FieldType::Bool => {
+                    cols.bool_.insert(f.name);
+                }
                 crate::tables::FieldType::Vector(_) => {
                     cols.vector.insert(f.name);
                 }
@@ -3493,10 +3504,10 @@ fn render_columns(
     cols
 }
 
-/// Append `"key":value` to a JSON object with type-correct encoding: VECTOR as a
-/// numeric array, JSON/ARRAY raw, numbers/bools bare, everything else a quoted
-/// string. The single source of truth for table-row JSON across the read,
-/// streaming, and write-RETURNING paths.
+/// Append `"key":value` to a JSON object with schema-correct encoding: VECTOR as
+/// a numeric array, JSON/ARRAY raw, declared numbers/bools bare, everything else
+/// a quoted string. The single source of truth for table-row JSON across the
+/// read, streaming, and write-RETURNING paths.
 fn push_field_value(out: &mut String, key: &str, v: &str, cols: &RenderCols) {
     out.push('"');
     push_escaped(out, key);
@@ -3516,7 +3527,9 @@ fn push_field_value(out: &mut String, key: &str, v: &str, cols: &RenderCols) {
         } else {
             out.push_str(v);
         }
-    } else if looks_numeric(v) || v == "true" || v == "false" {
+    } else if cols.number.contains(key) && looks_numeric(v) {
+        out.push_str(v);
+    } else if cols.bool_.contains(key) && (v == "true" || v == "false") {
         out.push_str(v);
     } else {
         out.push('"');
@@ -3636,9 +3649,12 @@ fn push_escaped(out: &mut String, s: &str) {
 /// Returns true if s looks like a JSON number (integer or float).
 #[inline]
 fn looks_numeric(s: &str) -> bool {
-    // Only emit as a bare JSON number if it actually parses as one.
-    // This prevents invalid JSON for strings like "-", "1.2.3", "1e", "1-2".
-    s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok()
+    // Only emit as a bare JSON number if it is valid JSON number syntax.
+    // This prevents invalid JSON for strings like "0123", "-", "1e", "1-2".
+    matches!(
+        serde_json::from_str::<serde_json::Value>(s),
+        Ok(serde_json::Value::Number(_))
+    )
 }
 
 fn exec_json(
@@ -3876,6 +3892,25 @@ mod tests {
             out.contains(r#""note":"{\"x\":\"y\"}""#),
             "str quoted: {out}"
         );
+    }
+
+    #[test]
+    fn str_columns_that_look_numeric_stay_quoted_json() {
+        let rows = vec![vec![
+            ("code".to_string(), "0123".to_string()),
+            ("pin".to_string(), "1111".to_string()),
+            ("count".to_string(), "123".to_string()),
+            ("enabled".to_string(), "true".to_string()),
+        ]];
+        let mut cols = RenderCols::default();
+        cols.number.insert("count".to_string());
+        cols.bool_.insert("enabled".to_string());
+
+        let out = rows_to_json_array(&rows, &cols);
+        assert!(out.contains(r#""code":"0123""#), "str quoted: {out}");
+        assert!(out.contains(r#""pin":"1111""#), "str quoted: {out}");
+        assert!(out.contains(r#""count":123"#), "number bare: {out}");
+        assert!(out.contains(r#""enabled":true"#), "bool bare: {out}");
     }
 
     // The insert/update RETURNING echo must render JSON/ARRAY columns the same
