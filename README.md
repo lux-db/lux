@@ -668,7 +668,7 @@ cargo test
 | **Integration: http** | 21 | HTTP REST API: health, auth, auth grants/admin keys, KV CRUD, tables REST, time series REST, vectors REST, data types, exec, CORS |
 | **Integration: live websocket** | 6 | `/live` auth, key/pubsub events, table subscriptions, vector-near subscriptions, unsubscribe |
 | **Integration: tables** | 26 | TCREATE, TINSERT, TSELECT, TUPDATE, TDELETE, TDROP, TCOUNT, TLIST, TSCHEMA, joins, grouped aggregates, NEAR, foreign keys, unique constraints |
-| **Redis/Valkey compat** | external | Dedicated scanner workflow for focused Redis/Valkey suite slices against Lux |
+| **Valkey compat** | 10+ | Valkey multi.tcl test suite run against Lux |
 
 Run the benchmark against Redis:
 
@@ -683,11 +683,7 @@ Every push and pull request runs:
 - `cargo fmt -- --check`
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo test --all-targets`
-
-Redis/Valkey compatibility scanning runs separately in the `Redis Compat`
-workflow. It is scheduled and can also be run manually with selected Valkey
-suite slices. During baseline work it records findings and uploads logs without
-making ordinary push/PR CI depend on external compatibility suites.
+- Integration tests against the Valkey test harness
 
 Release and Docker builds only proceed after tests pass.
 

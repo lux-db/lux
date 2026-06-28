@@ -58,32 +58,6 @@ following areas are intended to be Redis-compatible for normal client use:
 Compatibility must be backed by integration tests and, where practical,
 Redis/Valkey differential tests.
 
-## Compatibility Scanning
-
-External Redis/Valkey suites are used as gap-finders, not as the sole regression
-oracle. The workflow is:
-
-- Run a focused Valkey/Redis suite against Lux.
-- Classify each finding as a supported-behavior bug, planned command/option,
-  unsupported-by-design behavior, or a Redis-internals assumption Lux does not
-  emulate.
-- Add or update an in-repo Rust regression test for each supported-behavior bug.
-- Patch Lux and rerun the focused suite.
-- Expand the scanned suites only after the current slice has a clear baseline.
-
-The `Redis Compat` GitHub Actions workflow runs this scanner separately from
-required push/PR CI. It is scheduled and can also be run manually with selected
-Valkey suites. During baseline work it records findings and uploads logs without
-failing by default; once a suite is blessed, run it with `fail_on_findings=true`
-or move it into a required gate.
-
-Initial scanner seed suites:
-
-- `unit/type/string`: currently reaches Valkey replication propagation checks
-  and stops on unsupported `SYNC` replication behavior.
-- `unit/keyspace`: currently reaches `COPY ... DB <n>` and stops on Redis
-  logical-database behavior that Lux does not yet emulate.
-
 ## Documented Redis Differences
 
 Known 1.0 differences:
