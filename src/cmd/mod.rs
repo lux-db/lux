@@ -4177,6 +4177,50 @@ mod tests {
         exec(&store, &[b"LPUSH", b"list", b"a"]);
         let out = exec_str(&store, &[b"OBJECT", b"ENCODING", b"list"]);
         assert!(out.contains("listpack"), "list encoding: {out}");
+
+        let huge = vec![b'x'; 8192];
+        exec(&store, &[b"LPUSH", b"biglist", huge.as_slice()]);
+        let out = exec_str(&store, &[b"OBJECT", b"ENCODING", b"biglist"]);
+        assert!(out.contains("quicklist"), "large list encoding: {out}");
+    }
+
+    #[test]
+    fn object_encoding_respects_zset_config_threshold() {
+        let store = Store::new();
+        exec(
+            &store,
+            &[b"CONFIG", b"SET", b"zset-max-ziplist-entries", b"128"],
+        );
+        exec(&store, &[b"ZADD", b"z", b"1", b"a", b"2", b"b"]);
+        let out = exec_str(&store, &[b"OBJECT", b"ENCODING", b"z"]);
+        assert!(out.contains("listpack"), "default zset encoding: {out}");
+
+        exec(
+            &store,
+            &[b"CONFIG", b"SET", b"zset-max-ziplist-entries", b"0"],
+        );
+        let out = exec_str(&store, &[b"OBJECT", b"ENCODING", b"z"]);
+        assert!(out.contains("skiplist"), "configured zset encoding: {out}");
+        exec(
+            &store,
+            &[b"CONFIG", b"SET", b"zset-max-ziplist-entries", b"128"],
+        );
+    }
+
+    #[test]
+    fn randomkey_visits_multiple_keys() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"foo", b"x"]);
+        exec(&store, &[b"SET", b"bar", b"y"]);
+
+        let mut seen_foo = false;
+        let mut seen_bar = false;
+        for _ in 0..8 {
+            let out = exec_str(&store, &[b"RANDOMKEY"]);
+            seen_foo |= out.contains("foo");
+            seen_bar |= out.contains("bar");
+        }
+        assert!(seen_foo && seen_bar, "foo={seen_foo} bar={seen_bar}");
     }
 
     #[test]

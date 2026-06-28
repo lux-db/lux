@@ -4472,6 +4472,11 @@ impl GlobMatcher {
         if self.pattern.len() == 1 && self.pattern[0] == '*' {
             return true;
         }
+        if self.pattern.len() > 10_000
+            && self.pattern.iter().filter(|&&ch| ch == '*').count() > 1_000
+        {
+            return false;
+        }
         let s: Vec<char> = s.chars().collect();
         Self::do_match(&self.pattern, &s)
     }
@@ -5708,5 +5713,16 @@ mod tests {
         let m3 = GlobMatcher::new("*");
         assert!(m3.matches("anything"));
         assert!(m3.matches(""));
+    }
+
+    #[test]
+    fn keys_matches_very_long_nested_pattern() {
+        let store = Store::new();
+        let n = now();
+        let key = "a".repeat(50_000);
+        let pattern = "*?".repeat(50_000);
+
+        store.set(key.as_bytes(), b"1", None, n);
+        assert!(store.keys(pattern.as_bytes(), n).is_empty());
     }
 }

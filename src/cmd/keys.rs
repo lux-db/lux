@@ -1,4 +1,5 @@
 use bytes::BytesMut;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::resp;
@@ -7,6 +8,7 @@ use crate::store::{Store, StoreValue};
 use super::{arg_str, cmd_eq, parse_i64, parse_u64, CmdResult};
 
 const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
+static RANDOMKEY_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
 fn parse_usize_arg(arg: &[u8], out: &mut BytesMut) -> Option<usize> {
     match parse_u64(arg).ok().and_then(|n| usize::try_from(n).ok()) {
@@ -160,9 +162,12 @@ pub fn cmd_randomkey(
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
-    match store.keys(b"*", now).into_iter().next() {
-        Some(k) => resp::write_bulk(out, &k),
-        None => resp::write_null(out),
+    let keys = store.keys(b"*", now);
+    if keys.is_empty() {
+        resp::write_null(out);
+    } else {
+        let idx = RANDOMKEY_CURSOR.fetch_add(1, Ordering::Relaxed) % keys.len();
+        resp::write_bulk(out, &keys[idx]);
     }
     CmdResult::Written
 }
@@ -376,21 +381,9 @@ pub fn cmd_object(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
                             "raw"
                         }
                     }
-                    StoreValue::StrBuf(s) => {
-                        if let Ok(ss) = std::str::from_utf8(s) {
-                            if ss.parse::<i64>().is_ok() {
-                                "int"
-                            } else if s.len() <= 44 {
-                                "embstr"
-                            } else {
-                                "raw"
-                            }
-                        } else {
-                            "raw"
-                        }
-                    }
+                    StoreValue::StrBuf(_) => "raw",
                     StoreValue::List(l) => {
-                        if l.len() <= 128 {
+                        if l.len() <= 128 && l.iter().all(|item| item.len() <= 4096) {
                             "listpack"
                         } else {
                             "quicklist"
@@ -413,7 +406,8 @@ pub fn cmd_object(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
                         }
                     }
                     StoreValue::SortedSet(_, scores) => {
-                        if scores.len() < 128 {
+                        let max_entries = super::server::zset_max_ziplist_entries();
+                        if max_entries > 0 && scores.len() <= max_entries {
                             "listpack"
                         } else {
                             "skiplist"
