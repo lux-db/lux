@@ -401,30 +401,30 @@ export class LuxProjectTable<T extends object> {
 		return this.select<T>().live() as Promise<LuxLiveResult<T>>;
 	}
 
-	insert(row: ProjectRowInput<T>, options?: { ttl?: number }): LuxProjectInsertBuilder<unknown>;
+	insert(row: ProjectRowInput<T>, options?: { ttl?: number }): LuxProjectInsertBuilder<T>;
 	insert(
 		rows: Array<ProjectRowInput<T>>,
 		options?: { ttl?: number },
-	): LuxProjectInsertBuilder<unknown[]>;
+	): LuxProjectInsertBuilder<T[]>;
 	insert(
 		rowOrRows: ProjectRowInput<T> | Array<ProjectRowInput<T>>,
 		options?: { ttl?: number },
-	): LuxProjectInsertBuilder<unknown | unknown[]> {
+	): LuxProjectInsertBuilder<T | T[]> {
 		return new LuxProjectInsertBuilder(this.client, this.name, rowOrRows, { ttl: options?.ttl });
 	}
 
 	upsert(
 		row: ProjectRowInput<T>,
 		options?: { onConflict?: string; ttl?: number },
-	): LuxProjectInsertBuilder<unknown>;
+	): LuxProjectInsertBuilder<T>;
 	upsert(
 		rows: Array<ProjectRowInput<T>>,
 		options?: { onConflict?: string; ttl?: number },
-	): LuxProjectInsertBuilder<unknown[]>;
+	): LuxProjectInsertBuilder<T[]>;
 	upsert(
 		rowOrRows: ProjectRowInput<T> | Array<ProjectRowInput<T>>,
 		options?: { onConflict?: string; ttl?: number },
-	): LuxProjectInsertBuilder<unknown | unknown[]> {
+	): LuxProjectInsertBuilder<T | T[]> {
 		return new LuxProjectInsertBuilder(this.client, this.name, rowOrRows, {
 			upsert: true,
 			onConflict: options?.onConflict,
@@ -432,11 +432,11 @@ export class LuxProjectTable<T extends object> {
 		});
 	}
 
-	update(patch: ProjectRowInput<T>): LuxProjectMutationBuilder<unknown> {
+	update(patch: ProjectRowInput<T>): LuxProjectMutationBuilder<T[]> {
 		return new LuxProjectMutationBuilder(this.client, this.name, 'PATCH', patch);
 	}
 
-	delete(): LuxProjectMutationBuilder<unknown> {
+	delete(): LuxProjectMutationBuilder<T[]> {
 		return new LuxProjectMutationBuilder(this.client, this.name, 'DELETE');
 	}
 
