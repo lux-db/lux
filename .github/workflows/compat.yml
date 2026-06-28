@@ -1,0 +1,115 @@
+name: Redis Compat
+
+on:
+  workflow_dispatch:
+    inputs:
+      valkey_ref:
+        description: "Valkey git ref to run tests from"
+        required: false
+        default: "9.0.3"
+      valkey_suites:
+        description: "Space-separated Valkey test suites"
+        required: false
+        default: "unit/type/string unit/keyspace"
+      fail_on_findings:
+        description: "Fail the workflow when a Valkey suite finds a gap"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 7 * * 1"
+
+jobs:
+  valkey:
+    name: Valkey scanner
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LUX_COMPAT_PORT: "6381"
+      VALKEY_REF: ${{ github.event.inputs.valkey_ref || '9.0.3' }}
+      VALKEY_SUITES: ${{ github.event.inputs.valkey_suites || 'unit/type/string unit/keyspace' }}
+      FAIL_ON_FINDINGS: ${{ github.event.inputs.fail_on_findings || 'false' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Lux
+        run: cargo build --release
+      - name: Install compat dependencies
+        run: sudo apt-get update && sudo apt-get install -y redis-tools tcl
+      - name: Fetch Valkey test suite
+        run: git clone --depth 1 --branch "$VALKEY_REF" https://github.com/valkey-io/valkey.git /tmp/valkey
+      - name: Start Lux
+        run: |
+          mkdir -p "$LUX_DATA_DIR"
+          ./target/release/lux &
+          for _ in $(seq 1 100); do
+            if redis-cli -p "$LUX_COMPAT_PORT" PING | grep -q PONG; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          echo "Lux did not become ready on port $LUX_COMPAT_PORT" >&2
+          exit 1
+        env:
+          LUX_PORT: ${{ env.LUX_COMPAT_PORT }}
+          LUX_DATA_DIR: ${{ runner.temp }}/lux-compat-data
+          LUX_SAVE_INTERVAL: "0"
+      - name: Run Lux smoke compat
+        run: tests/compat.sh "$LUX_COMPAT_PORT"
+      - name: Run Valkey scanner
+        run: |
+          mkdir -p compat-results
+          summary="compat-results/summary.md"
+          status=0
+
+          {
+            echo "# Redis/Valkey compatibility scan"
+            echo ""
+            echo "- Valkey ref: \`$VALKEY_REF\`"
+            echo "- Lux port: \`$LUX_COMPAT_PORT\`"
+            echo "- Fail on findings: \`$FAIL_ON_FINDINGS\`"
+            echo ""
+            echo "| Suite | Result | Exit | Log |"
+            echo "|---|---:|---:|---|"
+          } > "$summary"
+
+          for suite in $VALKEY_SUITES; do
+            safe_suite="$(printf '%s' "$suite" | tr '/ ' '__')"
+            log="$GITHUB_WORKSPACE/compat-results/${safe_suite}.log"
+            echo "::group::Valkey $suite"
+            redis-cli -p "$LUX_COMPAT_PORT" FLUSHALL >/dev/null || true
+            set +e
+            (
+              cd /tmp/valkey
+              tclsh tests/test_helper.tcl \
+                --host 127.0.0.1 \
+                --port "$LUX_COMPAT_PORT" \
+                --single "$suite"
+            ) > "$log" 2>&1
+            code=$?
+            set -e
+            tail -80 "$log"
+            echo "::endgroup::"
+
+            if [ "$code" -eq 0 ]; then
+              result="PASS"
+            else
+              result="FINDING"
+              if [ "$FAIL_ON_FINDINGS" = "true" ]; then
+                status=1
+              fi
+            fi
+
+            echo "| \`$suite\` | $result | $code | \`${safe_suite}.log\` |" >> "$summary"
+          done
+
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - name: Upload compat logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: valkey-compat-results
+          path: compat-results/
+          if-no-files-found: error
