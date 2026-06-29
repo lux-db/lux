@@ -132,6 +132,8 @@ describe('Lux project client', () => {
 		await client.table('tasks').select().isNull('deleted_at');
 		await client.table('tasks').select().is('deleted_at', null);
 		await client.table('tasks').select().isNotNull('deleted_at');
+		await client.table('profiles').select().ilike('display_name', '%mat%');
+		await client.table('profiles').select().or('display_name.ilike.%mat%,email.eq.m@example.com');
 
 		expect(seen).toEqual([
 			'http://localhost:3957/v1/project/tables/messages?where=id+%3D+1&limit=10',
@@ -142,6 +144,8 @@ describe('Lux project client', () => {
 			'http://localhost:3957/v1/project/tables/tasks?where=deleted_at+IS+NULL',
 			'http://localhost:3957/v1/project/tables/tasks?where=deleted_at+IS+NULL',
 			'http://localhost:3957/v1/project/tables/tasks?where=deleted_at+IS+NOT+NULL',
+			'http://localhost:3957/v1/project/tables/profiles?where=display_name+ILIKE+%25mat%25',
+			'http://localhost:3957/v1/project/tables/profiles?where=display_name+ILIKE+%25mat%25+OR+email+%3D+m%40example.com',
 		]);
 	});
 
@@ -187,6 +191,25 @@ describe('Lux project client', () => {
 
 		expect(result).toEqual({
 			data: { id: 1, body: 'hello' },
+			error: null,
+		});
+	});
+
+	test('maybeSingle returns null for an empty result', async () => {
+		const fetchImpl = async () => {
+			return new Response(JSON.stringify({ result: [] }), { status: 200 });
+		};
+
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const result = await client.table<{ id: number; body: string }>('messages').select().eq('id', 99).maybeSingle();
+
+		expect(result).toEqual({
+			data: null,
 			error: null,
 		});
 	});

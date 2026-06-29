@@ -4,7 +4,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use base64::Engine;
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::jwk::{Jwk, KeyAlgorithm, PublicKeyUse};
+use jsonwebtoken::{
+    decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+};
+use p256::pkcs8::{EncodePrivateKey, LineEnding};
+use p256::SecretKey;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -33,6 +38,21 @@ const ACCESS_REVOKED_AFTER_PREFIX: &[u8] = b"_auth:access_revoked_after:";
 enum ApiKeyKind {
     Publishable,
     Secret,
+}
+
+#[derive(Clone, Debug)]
+struct SigningKey {
+    kid: String,
+    algorithm: String,
+    public_jwk: String,
+    private_key: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PasswordVerification {
+    Invalid,
+    Valid,
+    ValidNeedsRehash,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -397,6 +417,7 @@ pub(crate) fn route_http(
 
     match (method, base) {
         ("GET", ["health"]) => ok(json!({"result":"ok"})),
+        ("GET", [".well-known", "jwks.json"]) => jwks(store, cache),
         ("POST", ["signup"]) => {
             if let Err(response) = require_publishable_or_secret(headers, store, cache) {
                 return response;
@@ -424,11 +445,29 @@ pub(crate) fn route_http(
             }
             admin_list_users(store, cache)
         }
+        ("GET", ["admin", "users", user_id]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_get_user(user_id, store, cache)
+        }
         ("POST", ["admin", "users"]) => {
             if let Err(response) = require_secret(headers, store, cache) {
                 return response;
             }
             admin_create_user(body, store, cache)
+        }
+        ("PATCH", ["admin", "users", user_id]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_update_user(user_id, body, store, cache)
+        }
+        ("DELETE", ["admin", "users", user_id]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_delete_user(user_id, store, cache)
         }
         ("GET", ["admin", "keys"]) => {
             if let Err(response) = require_secret(headers, store, cache) {
@@ -664,9 +703,32 @@ fn password_grant(
     if let Err(response) = validate_user_active(&user, unix_seconds()) {
         return response;
     }
-    match verify_password(password, password_hash) {
-        Ok(true) => {}
-        Ok(false) => return error(400, "Bad Request", "invalid login credentials"),
+    match verify_password_state(password, password_hash) {
+        Ok(PasswordVerification::Valid) => {}
+        Ok(PasswordVerification::ValidNeedsRehash) => {
+            if let Some(user_id) = user.get("id") {
+                match hash_password(password) {
+                    Ok(hash) => {
+                        let now_sec = unix_seconds().to_string();
+                        let _ = durable_table_update_where(
+                            store,
+                            cache,
+                            USERS_TABLE,
+                            &[
+                                ("encrypted_password", hash.as_str()),
+                                ("updated_at", now_sec.as_str()),
+                            ],
+                            &["id", "=", user_id],
+                            now,
+                        );
+                    }
+                    Err(e) => return error(500, "Internal Server Error", &e),
+                }
+            }
+        }
+        Ok(PasswordVerification::Invalid) => {
+            return error(400, "Bad Request", "invalid login credentials")
+        }
         Err(e) => return error(500, "Internal Server Error", &e),
     }
     let Some(user_id) = user.get("id") else {
@@ -888,6 +950,42 @@ fn logout(
     error(401, "Unauthorized", "missing bearer token or refresh_token")
 }
 
+fn jwks(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
+    let plan = SelectPlan {
+        table: SIGNING_KEYS_TABLE.to_string(),
+        alias: None,
+        projections: Vec::new(),
+        aggregates: Vec::new(),
+        joins: Vec::new(),
+        conditions: Vec::new(),
+        group_by: Vec::new(),
+        having: Vec::new(),
+        near: None,
+        order_by: None,
+        limit: Some(100),
+        offset: None,
+    };
+    match tables::table_select(store, cache, &plan, Instant::now()) {
+        Ok(SelectResult::Rows(rows)) => {
+            let keys = rows
+                .into_iter()
+                .map(|row| row.into_iter().collect::<HashMap<_, _>>())
+                .filter(|row| {
+                    parse_bool(row.get("active"))
+                        && row.get("algorithm").map(String::as_str) != Some("HS256")
+                })
+                .filter_map(|row| {
+                    row.get("public_jwk")
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                })
+                .collect::<Vec<_>>();
+            ok(json!({"keys": keys}))
+        }
+        Ok(SelectResult::Aggregate(_)) => ok(json!({"keys": []})),
+        Err(e) => error(400, "Bad Request", &e),
+    }
+}
+
 fn admin_list_users(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
     let plan = SelectPlan {
         table: USERS_TABLE.to_string(),
@@ -918,7 +1016,300 @@ fn admin_create_user(
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
-    signup(body, &[], store, cache)
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let email = match required_string(&parsed, "email") {
+        Ok(email) => normalize_email(email),
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    if find_row_by_field(store, cache, USERS_TABLE, "email", &email, now)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return error(409, "Conflict", "user already exists");
+    }
+
+    let user_id = parsed
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(tables::generate_uuid_v7);
+    let password_hash = match admin_password_hash(&parsed) {
+        Ok(hash) => hash,
+        Err(response) => return response,
+    };
+    let now_sec = unix_seconds();
+    let now_sec_str = now_sec.to_string();
+    let email_confirmed_at = admin_confirmed_at(&parsed, "email_confirmed_at", "email_confirmed")
+        .unwrap_or_else(|| now_sec.to_string());
+    let phone = optional_json_string(&parsed, "phone");
+    let phone_confirmed_at =
+        admin_confirmed_at(&parsed, "phone_confirmed_at", "phone_confirmed").unwrap_or_default();
+    let user_meta = parsed
+        .get("user_metadata")
+        .or_else(|| parsed.get("data"))
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+        .to_string();
+    let app_meta = parsed
+        .get("app_metadata")
+        .cloned()
+        .unwrap_or_else(|| json!({"provider":"email","providers":["email"]}))
+        .to_string();
+    let banned_until = optional_json_string(&parsed, "banned_until");
+
+    let mut fields = vec![
+        ("id", user_id.as_str()),
+        ("email", email.as_str()),
+        ("email_confirmed_at", email_confirmed_at.as_str()),
+        ("raw_user_meta_data", user_meta.as_str()),
+        ("raw_app_meta_data", app_meta.as_str()),
+        ("created_at", now_sec_str.as_str()),
+        ("updated_at", now_sec_str.as_str()),
+    ];
+    if let Some(password_hash) = password_hash.as_deref() {
+        fields.push(("encrypted_password", password_hash));
+    }
+    if let Some(phone) = phone.as_deref() {
+        fields.push(("phone", phone));
+    }
+    if !phone_confirmed_at.is_empty() {
+        fields.push(("phone_confirmed_at", phone_confirmed_at.as_str()));
+    }
+    if let Some(banned_until) = banned_until.as_deref() {
+        fields.push(("banned_until", banned_until));
+    }
+
+    if let Err(e) = durable_table_insert(store, cache, USERS_TABLE, &fields, now) {
+        return error(400, "Bad Request", &e);
+    }
+    if let Err(e) = durable_table_insert(
+        store,
+        cache,
+        IDENTITIES_TABLE,
+        &[
+            ("id", random_id("idn").as_str()),
+            ("user_id", user_id.as_str()),
+            ("provider", "email"),
+            ("provider_id", email.as_str()),
+            ("identity_data", json!({"email":email}).to_string().as_str()),
+            ("created_at", now_sec_str.as_str()),
+            ("updated_at", now_sec_str.as_str()),
+        ],
+        now,
+    ) {
+        let _ = durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", &user_id], now);
+        return error(400, "Bad Request", &e);
+    }
+
+    ok(
+        json!({"user": user_json(store, cache, &user_id, now).unwrap_or_else(|| json!({"id":user_id,"email":email}))}),
+    )
+}
+
+fn admin_get_user(
+    user_id: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    match user_json(store, cache, user_id, Instant::now()) {
+        Some(user) => ok(json!({"user": user})),
+        None => error(404, "Not Found", "user not found"),
+    }
+}
+
+fn admin_update_user(
+    user_id: &str,
+    body: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    let Some(existing) = find_row_by_field(store, cache, USERS_TABLE, "id", user_id, now)
+        .ok()
+        .flatten()
+    else {
+        return error(404, "Not Found", "user not found");
+    };
+
+    let mut updates: Vec<(String, String)> = Vec::new();
+    let mut new_email = None;
+    if let Some(email) = parsed.get("email").and_then(Value::as_str) {
+        let email = normalize_email(email);
+        if email.is_empty() {
+            return error(400, "Bad Request", "email cannot be empty");
+        }
+        if existing.get("email").map(String::as_str) != Some(email.as_str()) {
+            if let Some(row) = find_row_by_field(store, cache, USERS_TABLE, "email", &email, now)
+                .ok()
+                .flatten()
+            {
+                if row.get("id").map(String::as_str) != Some(user_id) {
+                    return error(409, "Conflict", "user already exists");
+                }
+            }
+        }
+        updates.push(("email".to_string(), email.clone()));
+        new_email = Some(email);
+    }
+    if let Some(phone) = optional_json_string(&parsed, "phone") {
+        updates.push(("phone".to_string(), phone));
+    }
+    match admin_password_hash(&parsed) {
+        Ok(Some(hash)) => updates.push(("encrypted_password".to_string(), hash)),
+        Ok(None) => {}
+        Err(response) => return response,
+    }
+    if let Some(value) = parsed.get("user_metadata").or_else(|| parsed.get("data")) {
+        updates.push(("raw_user_meta_data".to_string(), value.clone().to_string()));
+    }
+    if let Some(value) = parsed.get("app_metadata") {
+        updates.push(("raw_app_meta_data".to_string(), value.clone().to_string()));
+    }
+    if let Some(value) = admin_confirmed_at(&parsed, "email_confirmed_at", "email_confirmed") {
+        updates.push(("email_confirmed_at".to_string(), value));
+    }
+    if let Some(value) = admin_confirmed_at(&parsed, "phone_confirmed_at", "phone_confirmed") {
+        updates.push(("phone_confirmed_at".to_string(), value));
+    }
+    if let Some(value) = optional_json_string(&parsed, "banned_until") {
+        updates.push(("banned_until".to_string(), value));
+    }
+    if let Some(value) = optional_json_string(&parsed, "deleted_at") {
+        updates.push(("deleted_at".to_string(), value));
+    }
+    let now_sec = unix_seconds().to_string();
+    updates.push(("updated_at".to_string(), now_sec.clone()));
+
+    let refs: Vec<(&str, &str)> = updates
+        .iter()
+        .map(|(field, value)| (field.as_str(), value.as_str()))
+        .collect();
+    if let Err(e) =
+        durable_table_update_where(store, cache, USERS_TABLE, &refs, &["id", "=", user_id], now)
+    {
+        return error(400, "Bad Request", &e);
+    }
+    if let Some(email) = new_email {
+        let identity_data = json!({"email":email}).to_string();
+        let _ = durable_table_update_where(
+            store,
+            cache,
+            IDENTITIES_TABLE,
+            &[
+                ("provider_id", email.as_str()),
+                ("identity_data", identity_data.as_str()),
+                ("updated_at", now_sec.as_str()),
+            ],
+            &["user_id", "=", user_id],
+            now,
+        );
+    }
+
+    match user_json(store, cache, user_id, now) {
+        Some(user) => ok(json!({"user": user})),
+        None => error(404, "Not Found", "user not found"),
+    }
+}
+
+fn admin_delete_user(
+    user_id: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let now = Instant::now();
+    let Some(user) = user_json(store, cache, user_id, now) else {
+        return error(404, "Not Found", "user not found");
+    };
+    if let Err(e) = durable_table_delete_where(
+        store,
+        cache,
+        IDENTITIES_TABLE,
+        &["user_id", "=", user_id],
+        now,
+    ) {
+        return error(400, "Bad Request", &e);
+    }
+    if let Err(e) = durable_table_delete_where(
+        store,
+        cache,
+        SESSIONS_TABLE,
+        &["user_id", "=", user_id],
+        now,
+    ) {
+        return error(400, "Bad Request", &e);
+    }
+    match durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", user_id], now) {
+        Ok(0) => error(404, "Not Found", "user not found"),
+        Ok(_) => ok(json!({"user": user})),
+        Err(e) => error(400, "Bad Request", &e),
+    }
+}
+
+fn admin_password_hash(parsed: &Value) -> Result<Option<String>, (u16, &'static str, String)> {
+    if let Some(hash) = parsed
+        .get("encrypted_password")
+        .and_then(Value::as_str)
+        .filter(|hash| !hash.is_empty())
+    {
+        return Ok(Some(hash.to_string()));
+    }
+    if let Some(password) = parsed
+        .get("password")
+        .and_then(Value::as_str)
+        .filter(|password| !password.is_empty())
+    {
+        if password.len() < 8 {
+            return Err(error(
+                400,
+                "Bad Request",
+                "password must be at least 8 characters",
+            ));
+        }
+        return hash_password(password)
+            .map(Some)
+            .map_err(|e| error(500, "Internal Server Error", &e));
+    }
+    Ok(None)
+}
+
+fn admin_confirmed_at(parsed: &Value, timestamp_field: &str, bool_field: &str) -> Option<String> {
+    if let Some(value) = parsed.get(timestamp_field) {
+        return json_scalar_to_string(value);
+    }
+    parsed
+        .get(bool_field)
+        .and_then(Value::as_bool)
+        .map(|confirmed| {
+            if confirmed {
+                unix_seconds().to_string()
+            } else {
+                String::new()
+            }
+        })
+}
+
+fn optional_json_string(parsed: &Value, field: &str) -> Option<String> {
+    parsed.get(field).and_then(json_scalar_to_string)
+}
+
+fn json_scalar_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Null => Some(String::new()),
+        _ => None,
+    }
 }
 
 fn admin_list_providers(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
@@ -1525,9 +1916,10 @@ fn ensure_signing_key(
     cache: &SharedSchemaCache,
     now: Instant,
 ) -> Result<(), String> {
-    if active_signing_secret(store, cache, now)?.is_some() {
+    if active_signing_key(store, cache, now)?.is_some() {
         return Ok(());
     }
+    let key = generate_es256_signing_key()?;
     let now_sec = unix_seconds().to_string();
     durable_table_insert(
         store,
@@ -1535,16 +1927,39 @@ fn ensure_signing_key(
         SIGNING_KEYS_TABLE,
         &[
             ("id", random_id("sgn").as_str()),
-            ("kid", random_id("kid").as_str()),
-            ("algorithm", "HS256"),
-            ("public_jwk", ""),
-            ("private_key_encrypted", random_token(48).as_str()),
+            ("kid", key.kid.as_str()),
+            ("algorithm", key.algorithm.as_str()),
+            ("public_jwk", key.public_jwk.as_str()),
+            ("private_key_encrypted", key.private_key.as_str()),
             ("active", "true"),
             ("created_at", now_sec.as_str()),
         ],
         now,
     )?;
     Ok(())
+}
+
+fn generate_es256_signing_key() -> Result<SigningKey, String> {
+    let kid = random_id("kid");
+    let secret = SecretKey::random(&mut OsRng);
+    let private_pem = secret
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|e| e.to_string())?
+        .to_string();
+    let encoding_key =
+        EncodingKey::from_ec_pem(private_pem.as_bytes()).map_err(|e| e.to_string())?;
+    let mut jwk =
+        Jwk::from_encoding_key(&encoding_key, Algorithm::ES256).map_err(|e| e.to_string())?;
+    jwk.common.key_id = Some(kid.clone());
+    jwk.common.public_key_use = Some(PublicKeyUse::Signature);
+    jwk.common.key_algorithm = Some(KeyAlgorithm::ES256);
+    let public_jwk = serde_json::to_string(&jwk).map_err(|e| e.to_string())?;
+    Ok(SigningKey {
+        kid,
+        algorithm: "ES256".to_string(),
+        public_jwk,
+        private_key: private_pem,
+    })
 }
 
 fn ensure_api_key(
@@ -1694,14 +2109,29 @@ fn sign_access_token(
         iat: now as usize,
         exp: exp as usize,
     };
-    let secret = active_signing_secret(store, cache, Instant::now())?
+    let signing_key = active_signing_key(store, cache, Instant::now())?
         .ok_or_else(|| "missing active auth signing key".to_string())?;
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .map_err(|e| e.to_string())
+    match signing_key.algorithm.as_str() {
+        "ES256" => {
+            let mut header = Header::new(Algorithm::ES256);
+            header.kid = Some(signing_key.kid);
+            let key = EncodingKey::from_ec_pem(signing_key.private_key.as_bytes())
+                .map_err(|e| e.to_string())?;
+            encode(&header, &claims, &key).map_err(|e| e.to_string())
+        }
+        _ => {
+            let mut header = Header::new(Algorithm::HS256);
+            if !signing_key.kid.is_empty() {
+                header.kid = Some(signing_key.kid);
+            }
+            encode(
+                &header,
+                &claims,
+                &EncodingKey::from_secret(signing_key.private_key.as_bytes()),
+            )
+            .map_err(|e| e.to_string())
+        }
+    }
 }
 
 fn claims_from_bearer(
@@ -1735,25 +2165,42 @@ fn claims_from_access_token(
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> Result<AccessClaims, (u16, &'static str, String)> {
-    let secret = active_signing_secret(store, cache, Instant::now())
-        .map_err(|e| error(500, "Internal Server Error", &e))?
-        .ok_or_else(|| {
-            error(
-                500,
-                "Internal Server Error",
-                "missing active auth signing key",
-            )
-        })?;
-    let mut validation = Validation::new(Algorithm::HS256);
+    let header =
+        decode_header(token).map_err(|_| error(401, "Unauthorized", "invalid bearer token"))?;
+    let signing_key = match header.alg {
+        Algorithm::ES256 => {
+            let kid = header
+                .kid
+                .as_deref()
+                .ok_or_else(|| error(401, "Unauthorized", "invalid bearer token"))?;
+            signing_key_by_kid(store, cache, kid, Instant::now())
+                .map_err(|e| error(500, "Internal Server Error", &e))?
+        }
+        Algorithm::HS256 => active_signing_key(store, cache, Instant::now())
+            .map_err(|e| error(500, "Internal Server Error", &e))?,
+        _ => None,
+    }
+    .ok_or_else(|| error(401, "Unauthorized", "invalid bearer token"))?;
+
+    let (algorithm, decoding_key) = match signing_key.algorithm.as_str() {
+        "ES256" => {
+            let jwk = serde_json::from_str::<Jwk>(&signing_key.public_jwk)
+                .map_err(|_| error(500, "Internal Server Error", "invalid auth signing key"))?;
+            let key = DecodingKey::from_jwk(&jwk)
+                .map_err(|_| error(500, "Internal Server Error", "invalid auth signing key"))?;
+            (Algorithm::ES256, key)
+        }
+        _ => (
+            Algorithm::HS256,
+            DecodingKey::from_secret(signing_key.private_key.as_bytes()),
+        ),
+    };
+    let mut validation = Validation::new(algorithm);
     validation.set_issuer(&[store.config().auth.issuer.as_str()]);
-    decode::<AccessClaims>(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &validation,
-    )
-    .map(|token| token.claims)
-    .map_err(|_| error(401, "Unauthorized", "invalid bearer token"))
-    .and_then(|claims| validate_access_claims(claims, store, cache))
+    decode::<AccessClaims>(token, &decoding_key, &validation)
+        .map(|token| token.claims)
+        .map_err(|_| error(401, "Unauthorized", "invalid bearer token"))
+        .and_then(|claims| validate_access_claims(claims, store, cache))
 }
 
 fn validate_access_claims(
@@ -1901,13 +2348,39 @@ fn row_field_is_set(row: &HashMap<String, String>, field: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn active_signing_secret(
+fn active_signing_key(
     store: &Store,
     cache: &SharedSchemaCache,
     now: Instant,
-) -> Result<Option<String>, String> {
+) -> Result<Option<SigningKey>, String> {
     let row = find_row_by_field(store, cache, SIGNING_KEYS_TABLE, "active", "true", now)?;
-    Ok(row.and_then(|row| row.get("private_key_encrypted").cloned()))
+    Ok(row.map(signing_key_from_row))
+}
+
+fn signing_key_by_kid(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    kid: &str,
+    now: Instant,
+) -> Result<Option<SigningKey>, String> {
+    let row = find_row_by_field(store, cache, SIGNING_KEYS_TABLE, "kid", kid, now)?;
+    Ok(row.map(signing_key_from_row))
+}
+
+fn signing_key_from_row(row: HashMap<String, String>) -> SigningKey {
+    SigningKey {
+        kid: row.get("kid").cloned().unwrap_or_default(),
+        algorithm: row
+            .get("algorithm")
+            .cloned()
+            .filter(|algorithm| !algorithm.is_empty())
+            .unwrap_or_else(|| "HS256".to_string()),
+        public_jwk: row.get("public_jwk").cloned().unwrap_or_default(),
+        private_key: row
+            .get("private_key_encrypted")
+            .cloned()
+            .unwrap_or_default(),
+    }
 }
 
 fn user_json(
@@ -2837,15 +3310,40 @@ fn hash_password(password: &str) -> Result<String, String> {
     })
 }
 
+#[cfg(test)]
 fn verify_password(password: &str, hash: &str) -> Result<bool, String> {
+    verify_password_state(password, hash).map(|state| state != PasswordVerification::Invalid)
+}
+
+fn verify_password_state(password: &str, hash: &str) -> Result<PasswordVerification, String> {
     let password = password.to_string();
     let hash = hash.to_string();
     run_password_work(move || {
+        if is_bcrypt_hash(&hash) {
+            return bcrypt::verify(&password, &hash)
+                .map(|valid| {
+                    if valid {
+                        PasswordVerification::ValidNeedsRehash
+                    } else {
+                        PasswordVerification::Invalid
+                    }
+                })
+                .map_err(|e| e.to_string());
+        }
         let parsed = PasswordHash::new(&hash).map_err(|e| e.to_string())?;
-        Ok(Argon2::default()
+        let valid = Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
-            .is_ok())
+            .is_ok();
+        Ok(if valid {
+            PasswordVerification::Valid
+        } else {
+            PasswordVerification::Invalid
+        })
     })
+}
+
+fn is_bcrypt_hash(hash: &str) -> bool {
+    hash.starts_with("$2a$") || hash.starts_with("$2b$") || hash.starts_with("$2y$")
 }
 
 fn run_password_work<T, F>(work: F) -> T
@@ -3392,6 +3890,19 @@ mod tests {
     }
 
     #[test]
+    fn bcrypt_password_hashes_verify_and_request_rehash() {
+        let hash = bcrypt::hash("correct horse battery staple", 4).unwrap();
+        assert_eq!(
+            verify_password_state("correct horse battery staple", &hash).unwrap(),
+            PasswordVerification::ValidNeedsRehash
+        );
+        assert_eq!(
+            verify_password_state("wrong password", &hash).unwrap(),
+            PasswordVerification::Invalid
+        );
+    }
+
+    #[test]
     fn reserved_table_mutations_are_blocked_for_client_commands() {
         let store = Store::new();
         let err = reserved_table_mutation_error(&[b"TINSERT", b"auth.users"], &store).unwrap();
@@ -3404,14 +3915,15 @@ mod tests {
     }
 
     #[test]
-    fn reserved_auth_tables_are_blocked_from_generic_table_reads() {
+    fn reserved_auth_tables_are_readable_through_direct_table_commands() {
         let store = Store::new();
         let cache = Arc::new(RwLock::new(SchemaCache::new()));
         bootstrap(&store, &cache, &AuthConfig::default()).unwrap();
 
         let broker = crate::pubsub::Broker::new();
-        // Both schema introspection and row reads of auth.* via the generic
-        // table commands must be refused; clients use /auth/v1 instead.
+        // Direct operator command surfaces (CLI/cloud command prompt/RESP) can
+        // inspect auth internals. Public REST/table/live paths still carry their
+        // own reserved-table guards, and mutations remain blocked.
         for cmd in [
             &[b"TSCHEMA".as_ref(), b"auth.users".as_ref()][..],
             &[
@@ -3424,8 +3936,10 @@ mod tests {
             let mut out = bytes::BytesMut::new();
             crate::cmd::execute(&store, &cache, &broker, cmd, &mut out, Instant::now());
             let response = std::str::from_utf8(&out).unwrap();
-            assert!(response.starts_with("-ERR"), "{response}");
-            assert!(response.contains("managed by Lux Auth"), "{response}");
+            assert!(
+                !response.starts_with("-ERR"),
+                "direct auth table read should be allowed: {response}"
+            );
         }
     }
 

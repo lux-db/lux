@@ -489,10 +489,6 @@ pub fn cmd_tcount(
         return CmdResult::Written;
     }
     let table = arg_str(args[1]);
-    if let Some(err) = crate::auth::reserved_table_access_error(table) {
-        resp::write_error(out, &err);
-        return CmdResult::Written;
-    }
     match tables::table_count(store, cache, table, now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
@@ -512,10 +508,6 @@ pub fn cmd_tschema(
         return CmdResult::Written;
     }
     let table = arg_str(args[1]);
-    if let Some(err) = crate::auth::reserved_table_access_error(table) {
-        resp::write_error(out, &err);
-        return CmdResult::Written;
-    }
     match tables::table_schema(store, cache, table, now) {
         Ok(fields) => {
             resp::write_array_header(out, fields.len());
@@ -597,10 +589,6 @@ pub fn cmd_tselect(
             return CmdResult::Written;
         }
     };
-    if let Some(err) = crate::auth::reserved_plan_access_error(&plan) {
-        resp::write_error(out, &err);
-        return CmdResult::Written;
-    }
     match tables::table_select(store, cache, &plan, now) {
         Ok(SelectResult::Rows(rows)) => {
             resp::write_array_header(out, rows.len());
