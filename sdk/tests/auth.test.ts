@@ -269,6 +269,56 @@ describe('LuxAuthClient session state', () => {
 		expect(authorization).toBe('Bearer stored-token');
 	});
 
+	test('admin user facade calls Supabase-compatible admin routes', async () => {
+		const calls: Array<{ url: string; method?: string; headers: Record<string, string>; body?: unknown }> = [];
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({
+				url: String(input),
+				method: init?.method,
+				headers: init?.headers as Record<string, string>,
+				body: init?.body ? JSON.parse(String(init.body)) : undefined,
+			});
+			if (init?.method === 'GET' && String(input).endsWith('/admin/users')) {
+				return new Response(JSON.stringify({ users: [{ id: 'usr_123', email: 'user@example.com' }] }), { status: 200 });
+			}
+			return new Response(JSON.stringify({ user: { id: 'usr_123', email: 'user@example.com' } }), { status: 200 });
+		};
+		const auth = new LuxAuthClient({
+			httpUrl: 'http://localhost:3957/v1/project',
+			apiKey: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+			persistSession: false,
+			autoRefreshToken: false,
+		});
+
+		await auth.admin.createUser({
+			id: 'usr_123',
+			email: 'user@example.com',
+			encrypted_password: '$2b$04$hash',
+			email_confirmed: true,
+		});
+		await auth.admin.getUserById('usr_123');
+		await auth.admin.updateUserById('usr_123', { email: 'next@example.com' });
+		await auth.admin.deleteUser('usr_123');
+		await auth.admin.listUsers();
+
+		expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
+			'POST http://localhost:3957/v1/project/auth/v1/admin/users',
+			'GET http://localhost:3957/v1/project/auth/v1/admin/users/usr_123',
+			'PATCH http://localhost:3957/v1/project/auth/v1/admin/users/usr_123',
+			'DELETE http://localhost:3957/v1/project/auth/v1/admin/users/usr_123',
+			'GET http://localhost:3957/v1/project/auth/v1/admin/users',
+		]);
+		expect(calls.every((call) => call.headers.apikey === 'lux_sec_test')).toBe(true);
+		expect(calls[0].body).toEqual({
+			id: 'usr_123',
+			email: 'user@example.com',
+			encrypted_password: '$2b$04$hash',
+			email_confirmed: true,
+		});
+		expect(calls[2].body).toEqual({ email: 'next@example.com' });
+	});
+
 	test('default fetch is bound for browser auth requests', async () => {
 		const originalFetch = globalThis.fetch;
 		let receiver: unknown;

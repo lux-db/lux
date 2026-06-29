@@ -293,6 +293,19 @@ pub(crate) fn row_passes_conditions(
 ) -> bool {
     let rk = row_key_for_pk(table, pk);
     conditions.iter().all(|cond| {
+        if cond.op == CmpOp::Or {
+            return cond.or_clauses.iter().any(|clause| {
+                row_passes_conditions(
+                    store,
+                    table,
+                    schema,
+                    implicit_id,
+                    pk,
+                    std::slice::from_ref(clause),
+                    now,
+                )
+            });
+        }
         // JSON/ARRAY dot-path => walk the stored binary.
         if let Some((root, rest)) = cond.field.split_once('.') {
             if schema.iter().any(|f| {
@@ -319,6 +332,7 @@ pub(crate) fn row_passes_conditions(
                             op: cond.op.clone(),
                             value: cond.value.clone(),
                             values: cond.values.clone(),
+                            or_clauses: Vec::new(),
                         },
                         fd,
                     )
@@ -339,6 +353,7 @@ pub(crate) fn row_passes_conditions(
                                 op: cond.op.clone(),
                                 value: cond.value.clone(),
                                 values: cond.values.clone(),
+                                or_clauses: Vec::new(),
                             },
                             fd,
                         )
@@ -358,6 +373,12 @@ pub(crate) fn matches_condition(
     cond: &WhereClause,
     field_def: &FieldDef,
 ) -> bool {
+    if cond.op == CmpOp::Or {
+        return cond
+            .or_clauses
+            .iter()
+            .any(|clause| matches_condition(row, clause, field_def));
+    }
     let val = match row.iter().find(|(k, _)| k == &cond.field) {
         Some((_, v)) => v.as_str(),
         // Column absent from the row: it is NULL. `!=` and `IS NULL` match;
@@ -442,6 +463,8 @@ pub(crate) fn matches_condition(
             CmpOp::Lt => val < cond.value.as_str(),
             CmpOp::Ge => val >= cond.value.as_str(),
             CmpOp::Le => val <= cond.value.as_str(),
+            CmpOp::Like => sql_like_matches(val, &cond.value, false),
+            CmpOp::ILike => sql_like_matches(val, &cond.value, true),
             _ => false,
         },
     }
@@ -494,7 +517,10 @@ pub(crate) fn candidates_from_index(
                 | CmpOp::IsNotValid
                 | CmpOp::IsNull
                 | CmpOp::IsNotNull
-                | CmpOp::Contains => return None,
+                | CmpOp::Contains
+                | CmpOp::Like
+                | CmpOp::ILike
+                | CmpOp::Or => return None,
             };
             // Pass limit directly to zrangebyscore - avoids fetching all matching IDs
             // when we only need the first N (e.g. WHERE age > 40 LIMIT 100)
@@ -542,7 +568,10 @@ pub(crate) fn candidates_from_implicit_id(
         | CmpOp::IsNotValid
         | CmpOp::IsNull
         | CmpOp::IsNotNull
-        | CmpOp::Contains => return None,
+        | CmpOp::Contains
+        | CmpOp::Like
+        | CmpOp::ILike
+        | CmpOp::Or => return None,
     };
 
     let results = store
@@ -673,7 +702,7 @@ pub fn parse_select(args: &[&str]) -> Result<SelectPlan, String> {
             "WHERE" => {
                 i += 1;
                 loop {
-                    conditions.push(parse_where_condition(rest, &mut i)?);
+                    conditions.push(parse_where_or_group(rest, &mut i)?);
                     if i < rest.len() && rest[i].eq_ignore_ascii_case("AND") {
                         i += 1;
                     } else {
@@ -869,6 +898,8 @@ pub(crate) fn parse_cmp_op(s: &str) -> Result<CmpOp, String> {
         "<" => Ok(CmpOp::Lt),
         ">=" => Ok(CmpOp::Ge),
         "<=" => Ok(CmpOp::Le),
+        op if op.eq_ignore_ascii_case("LIKE") => Ok(CmpOp::Like),
+        op if op.eq_ignore_ascii_case("ILIKE") => Ok(CmpOp::ILike),
         other => Err(format!("ERR unknown operator '{}'", other)),
     }
 }
@@ -1055,6 +1086,7 @@ pub fn table_select(
                 op: c.op.clone(),
                 value: c.value.clone(),
                 values: c.values.clone(),
+                or_clauses: c.or_clauses.clone(),
             }
         })
         .collect();
@@ -1103,6 +1135,7 @@ pub fn table_select(
             unique: true,
             nullable: false,
             default_value: None,
+            sequence_partition: None,
             references: None,
         })
     };
@@ -1261,32 +1294,9 @@ pub fn table_select(
     // ---- Post-join WHERE filter (for conditions referencing join columns) ----
     if !plan.joins.is_empty() {
         rows.retain(|row| {
-            plan.conditions.iter().all(|cond| {
-                let val = row
-                    .iter()
-                    .find(|(k, _)| {
-                        k == &cond.field || k.ends_with(&format!(".{}", bare_col(&cond.field)))
-                    })
-                    .map(|(_, v)| v.as_str());
-                match val {
-                    None => matches!(cond.op, CmpOp::Ne | CmpOp::IsNull),
-                    // IN / NOT IN carry their operands in `values`, not `value`;
-                    // compare_condition_value only knows scalar ops and would
-                    // return false for them, dropping every joined row (e.g. a
-                    // grant predicate `col IN (subquery)` on a joined query).
-                    Some(v) => match cond.op {
-                        CmpOp::In => cond
-                            .values
-                            .iter()
-                            .any(|x| compare_condition_value(v, &CmpOp::Eq, x)),
-                        CmpOp::NotIn => !cond
-                            .values
-                            .iter()
-                            .any(|x| compare_condition_value(v, &CmpOp::Eq, x)),
-                        _ => compare_condition_value(v, &cond.op, &cond.value),
-                    },
-                }
-            })
+            plan.conditions
+                .iter()
+                .all(|cond| joined_row_matches_condition(row, cond))
         });
     }
 
@@ -1526,6 +1536,16 @@ pub(crate) fn row_matches_base_conditions(
     conditions: &[WhereClause],
 ) -> bool {
     conditions.iter().all(|cond| {
+        if cond.op == CmpOp::Or {
+            return cond.or_clauses.iter().any(|clause| {
+                row_matches_base_conditions(
+                    row,
+                    schema,
+                    implicit_id_field,
+                    std::slice::from_ref(clause),
+                )
+            });
+        }
         // JSON dot-path: `jsoncol.a.b` where the leading segment is a JSON
         // column. Must run BEFORE bare_col, which would collapse the path to
         // its leaf and silently match every row.
@@ -1545,6 +1565,7 @@ pub(crate) fn row_matches_base_conditions(
                     op: cond.op.clone(),
                     value: cond.value.clone(),
                     values: cond.values.clone(),
+                    or_clauses: Vec::new(),
                 },
                 fd,
             )
@@ -1557,6 +1578,7 @@ pub(crate) fn row_matches_base_conditions(
                         op: cond.op.clone(),
                         value: cond.value.clone(),
                         values: cond.values.clone(),
+                        or_clauses: Vec::new(),
                     },
                     fd,
                 )
@@ -1623,7 +1645,10 @@ pub(crate) fn score_range_from_conditions(
             | CmpOp::IsNotValid
             | CmpOp::IsNull
             | CmpOp::IsNotNull
-            | CmpOp::Contains => return None,
+            | CmpOp::Contains
+            | CmpOp::Like
+            | CmpOp::ILike
+            | CmpOp::Or => return None,
         }
     }
 
@@ -1692,6 +1717,7 @@ pub(crate) fn build_candidate_set(
                     unique: false,
                     nullable: true,
                     default_value: None,
+                    sequence_partition: None,
                     references: None,
                 };
                 if let Some(pks) =
@@ -1731,6 +1757,7 @@ pub(crate) fn build_candidate_set(
                     op: cond.op.clone(),
                     value: cond.value.clone(),
                     values: cond.values.clone(),
+                    or_clauses: Vec::new(),
                 },
                 index_limit,
                 now,
@@ -1750,6 +1777,7 @@ pub(crate) fn build_candidate_set(
                     op: cond.op.clone(),
                     value: cond.value.clone(),
                     values: cond.values.clone(),
+                    or_clauses: Vec::new(),
                 },
                 fd,
                 index_limit,
@@ -2175,7 +2203,10 @@ pub(crate) fn try_fast_aggregate(
                                 | CmpOp::IsNotValid
                                 | CmpOp::IsNull
                                 | CmpOp::IsNotNull
-                                | CmpOp::Contains => return None,
+                                | CmpOp::Contains
+                                | CmpOp::Like
+                                | CmpOp::ILike
+                                | CmpOp::Or => return None,
                             }
                         }
                         // Conditions on other columns - fall through to slow path
@@ -2511,6 +2542,33 @@ pub(crate) fn matches_all_having(row: &[(String, String)], having: &[WhereClause
     })
 }
 
+fn joined_row_matches_condition(row: &[(String, String)], cond: &WhereClause) -> bool {
+    if cond.op == CmpOp::Or {
+        return cond
+            .or_clauses
+            .iter()
+            .any(|clause| joined_row_matches_condition(row, clause));
+    }
+    let val = row
+        .iter()
+        .find(|(k, _)| k == &cond.field || k.ends_with(&format!(".{}", bare_col(&cond.field))))
+        .map(|(_, v)| v.as_str());
+    match val {
+        None => matches!(cond.op, CmpOp::Ne | CmpOp::IsNull),
+        Some(v) => match cond.op {
+            CmpOp::In => cond
+                .values
+                .iter()
+                .any(|x| compare_condition_value(v, &CmpOp::Eq, x)),
+            CmpOp::NotIn => !cond
+                .values
+                .iter()
+                .any(|x| compare_condition_value(v, &CmpOp::Eq, x)),
+            _ => compare_condition_value(v, &cond.op, &cond.value),
+        },
+    }
+}
+
 pub(crate) fn compare_condition_value(actual: &str, op: &CmpOp, expected: &str) -> bool {
     // The caller only reaches here with a present value, which is never NULL.
     match op {
@@ -2536,8 +2594,37 @@ pub(crate) fn compare_condition_value(actual: &str, op: &CmpOp, expected: &str) 
         CmpOp::Lt => actual < expected,
         CmpOp::Ge => actual >= expected,
         CmpOp::Le => actual <= expected,
+        CmpOp::Like => sql_like_matches(actual, expected, false),
+        CmpOp::ILike => sql_like_matches(actual, expected, true),
         _ => false,
     }
+}
+
+fn sql_like_matches(actual: &str, pattern: &str, case_insensitive: bool) -> bool {
+    let (actual, pattern) = if case_insensitive {
+        (actual.to_lowercase(), pattern.to_lowercase())
+    } else {
+        (actual.to_string(), pattern.to_string())
+    };
+    let text: Vec<char> = actual.chars().collect();
+    let pat: Vec<char> = pattern.chars().collect();
+    let mut dp = vec![vec![false; text.len() + 1]; pat.len() + 1];
+    dp[0][0] = true;
+    for i in 1..=pat.len() {
+        if pat[i - 1] == '%' {
+            dp[i][0] = dp[i - 1][0];
+        }
+    }
+    for i in 1..=pat.len() {
+        for j in 1..=text.len() {
+            dp[i][j] = match pat[i - 1] {
+                '%' => dp[i - 1][j] || dp[i][j - 1],
+                '_' => dp[i - 1][j - 1],
+                ch => dp[i - 1][j - 1] && ch == text[j - 1],
+            };
+        }
+    }
+    dp[pat.len()][text.len()]
 }
 
 pub(crate) fn scan_matching_pks(
@@ -2552,13 +2639,7 @@ pub(crate) fn scan_matching_pks(
     // Validate WHERE fields (allow "id" for implicit-PK tables and JSON dot-paths).
     let has_implicit_pk = !schema.iter().any(|f| f.primary_key);
     for cond in conditions {
-        let is_implicit_id = has_implicit_pk && cond.field == "id";
-        if !is_implicit_id && !is_json_path_field(&cond.field, &schema) {
-            schema
-                .iter()
-                .find(|f| f.name == cond.field)
-                .ok_or_else(|| format!("ERR unknown field '{}' in WHERE clause", cond.field))?;
-        }
+        validate_where_field(cond, &schema, has_implicit_pk)?;
     }
     let implicit_id = implicit_id_field_for(&schema);
 
@@ -2588,6 +2669,27 @@ pub(crate) fn scan_matching_pks(
         }
     }
     Ok((schema, matched))
+}
+
+fn validate_where_field(
+    cond: &WhereClause,
+    schema: &[FieldDef],
+    has_implicit_pk: bool,
+) -> Result<(), String> {
+    if cond.op == CmpOp::Or {
+        for clause in &cond.or_clauses {
+            validate_where_field(clause, schema, has_implicit_pk)?;
+        }
+        return Ok(());
+    }
+    let is_implicit_id = has_implicit_pk && cond.field == "id";
+    if !is_implicit_id && !is_json_path_field(&cond.field, schema) {
+        schema
+            .iter()
+            .find(|f| f.name == cond.field)
+            .ok_or_else(|| format!("ERR unknown field '{}' in WHERE clause", cond.field))?;
+    }
+    Ok(())
 }
 
 /// Fetch and column-sort the rows for a set of primary keys.

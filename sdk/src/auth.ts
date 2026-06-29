@@ -156,6 +156,46 @@ export interface LuxSignInOptions {
 	password: string;
 }
 
+export interface LuxAdminCreateUserOptions {
+	id?: string;
+	email: string;
+	password?: string;
+	encrypted_password?: string;
+	email_confirmed?: boolean;
+	email_confirmed_at?: number | string | null;
+	phone?: string;
+	phone_confirmed?: boolean;
+	phone_confirmed_at?: number | string | null;
+	user_metadata?: Record<string, unknown>;
+	data?: Record<string, unknown>;
+	app_metadata?: Record<string, unknown>;
+	banned_until?: number | string | null;
+}
+
+export interface LuxAdminUpdateUserOptions {
+	email?: string;
+	password?: string;
+	encrypted_password?: string;
+	email_confirmed?: boolean;
+	email_confirmed_at?: number | string | null;
+	phone?: string;
+	phone_confirmed?: boolean;
+	phone_confirmed_at?: number | string | null;
+	user_metadata?: Record<string, unknown>;
+	data?: Record<string, unknown>;
+	app_metadata?: Record<string, unknown>;
+	banned_until?: number | string | null;
+	deleted_at?: number | string | null;
+}
+
+export interface LuxAuthAdminClient {
+	createUser(options: LuxAdminCreateUserOptions): Promise<LuxResult<LuxAuthUser>>;
+	getUserById(userId: string): Promise<LuxResult<LuxAuthUser>>;
+	updateUserById(userId: string, options: LuxAdminUpdateUserOptions): Promise<LuxResult<LuxAuthUser>>;
+	deleteUser(userId: string): Promise<LuxResult<LuxAuthUser>>;
+	listUsers(): Promise<LuxResult<LuxAuthUser[]>>;
+}
+
 export type LuxOAuthProvider = 'google' | 'github';
 
 export interface LuxSignInWithOAuthOptions {
@@ -208,6 +248,7 @@ export interface LuxAuthSubscription {
 }
 
 export class LuxAuthClient {
+	readonly admin: LuxAuthAdminClient;
 	private httpUrl?: string;
 	private apiKey?: string;
 	private authToken?: string;
@@ -240,6 +281,13 @@ export class LuxAuthClient {
 		if (this.authToken) {
 			this.currentSession = null;
 		}
+		this.admin = {
+			createUser: (options) => this.createAdminUser(options),
+			getUserById: (userId) => this.getAdminUserById(userId),
+			updateUserById: (userId, options) => this.updateAdminUserById(userId, options),
+			deleteUser: (userId) => this.deleteAdminUser(userId),
+			listUsers: () => this.listUsers(),
+		};
 		this.initializeBrowserLifecycle();
 	}
 
@@ -527,6 +575,56 @@ export class LuxAuthClient {
 
 	async signOut(): Promise<LuxResult<true>> {
 		return this.logout();
+	}
+
+	private async createAdminUser(options: LuxAdminCreateUserOptions): Promise<LuxResult<LuxAuthUser>> {
+		try {
+			const result = await this.requestRaw<{ user: LuxAuthUser }>('/auth/v1/admin/users', {
+				method: 'POST',
+				secret: true,
+				body: JSON.stringify(options),
+			});
+			return ok(result.user);
+		} catch (error) {
+			return err('LUX_AUTH_ADMIN_ERROR', 'Failed to create auth user', toLuxError(error));
+		}
+	}
+
+	private async getAdminUserById(userId: string): Promise<LuxResult<LuxAuthUser>> {
+		try {
+			const result = await this.requestRaw<{ user: LuxAuthUser }>(`/auth/v1/admin/users/${encodeURIComponent(userId)}`, {
+				method: 'GET',
+				secret: true,
+			});
+			return ok(result.user);
+		} catch (error) {
+			return err('LUX_AUTH_ADMIN_ERROR', 'Failed to get auth user', toLuxError(error));
+		}
+	}
+
+	private async updateAdminUserById(userId: string, options: LuxAdminUpdateUserOptions): Promise<LuxResult<LuxAuthUser>> {
+		try {
+			const result = await this.requestRaw<{ user: LuxAuthUser }>(`/auth/v1/admin/users/${encodeURIComponent(userId)}`, {
+				method: 'PATCH',
+				secret: true,
+				body: JSON.stringify(options),
+			});
+			return ok(result.user);
+		} catch (error) {
+			return err('LUX_AUTH_ADMIN_ERROR', 'Failed to update auth user', toLuxError(error));
+		}
+	}
+
+	private async deleteAdminUser(userId: string): Promise<LuxResult<LuxAuthUser>> {
+		try {
+			const result = await this.requestRaw<{ user: LuxAuthUser }>(`/auth/v1/admin/users/${encodeURIComponent(userId)}`, {
+				method: 'DELETE',
+				secret: true,
+			});
+			return ok(result.user);
+		} catch (error) {
+			return err('LUX_AUTH_ADMIN_ERROR', 'Failed to delete auth user', toLuxError(error));
+		}
 	}
 
 	async listUsers(): Promise<LuxResult<LuxAuthUser[]>> {

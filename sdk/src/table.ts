@@ -17,6 +17,8 @@ type TableWhereOp =
 	| '<'
 	| '>='
 	| '<='
+	| 'LIKE'
+	| 'ILIKE'
 	| 'IN'
 	| 'NOT IN'
 	| 'IS VALID'
@@ -268,6 +270,7 @@ export class TableQueryBuilder<T extends object = TableRow> {
 	private havingConditions: TableHavingCondition[] = [];
 	private selectClause = '*';
 	private expectSingle = false;
+	private allowEmptySingle = false;
 	private schema?: TableSchema<T>;
 
 	constructor(client: TableClient, name: string, options?: TableQueryBuilderOptions<T>) {
@@ -359,6 +362,16 @@ export class TableQueryBuilder<T extends object = TableRow> {
 
 	single(): this {
 		this.expectSingle = true;
+		this.allowEmptySingle = false;
+		if (this.limitCount == null) {
+			this.limitCount = 1;
+		}
+		return this;
+	}
+
+	maybeSingle(): this {
+		this.expectSingle = true;
+		this.allowEmptySingle = true;
 		if (this.limitCount == null) {
 			this.limitCount = 1;
 		}
@@ -392,6 +405,14 @@ export class TableQueryBuilder<T extends object = TableRow> {
 
 	lte(field: string, value: TableWhereValue): this {
 		return this.where(field, '<=', value);
+	}
+
+	like(field: string, value: string): this {
+		return this.where(field, 'LIKE', value);
+	}
+
+	ilike(field: string, value: string): this {
+		return this.where(field, 'ILIKE', value);
 	}
 
 	in(field: string, values: TableWhereValue[]): this {
@@ -490,6 +511,7 @@ export class TableQueryBuilder<T extends object = TableRow> {
 
 			if (this.expectSingle) {
 				if (validated.length === 0) {
+					if (this.allowEmptySingle) return ok(null as unknown as T);
 					return err('NOT_FOUND', `No rows found in table '${this.name}'`);
 				}
 				return ok(validated[0]);

@@ -262,6 +262,7 @@ pub struct FieldDef {
     pub unique: bool,
     pub nullable: bool, // true = nullable (default), false = NOT NULL
     pub default_value: Option<String>, // DEFAULT value for the column
+    pub sequence_partition: Option<String>, // SEQUENCE PARTITION BY <column>
     pub references: Option<ForeignKey>,
 }
 
@@ -273,6 +274,8 @@ pub enum CmpOp {
     Lt,
     Ge,
     Le,
+    Like,
+    ILike,
     In,
     NotIn,
     IsValid,
@@ -283,6 +286,7 @@ pub enum CmpOp {
     IsNotNull,
     /// Array membership: `col CONTAINS value` (array column or array-valued path).
     Contains,
+    Or,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +298,8 @@ pub struct WhereClause {
     pub value: String,
     /// Operand list for In/NotIn. Empty for every other op.
     pub values: Vec<String>,
+    /// Nested disjuncts for OR groups. Empty for every other op.
+    pub or_clauses: Vec<WhereClause>,
 }
 
 impl WhereClause {
@@ -305,6 +311,7 @@ impl WhereClause {
             op,
             value,
             values: Vec::new(),
+            or_clauses: Vec::new(),
         }
     }
 
@@ -315,6 +322,17 @@ impl WhereClause {
             op,
             value: String::new(),
             values,
+            or_clauses: Vec::new(),
+        }
+    }
+
+    pub fn or_group(or_clauses: Vec<WhereClause>) -> Self {
+        WhereClause {
+            field: String::new(),
+            op: CmpOp::Or,
+            value: String::new(),
+            values: Vec::new(),
+            or_clauses,
         }
     }
 }
@@ -415,6 +433,13 @@ fn schema_key(table: &str) -> String {
 
 fn seq_key(table: &str) -> String {
     format!("_t:{}:seq", table)
+}
+
+fn scoped_seq_key(table: &str, field: &str, partition_col: &str, partition_val: &str) -> String {
+    format!(
+        "_t:{}:seq:{}:{}:{}",
+        table, field, partition_col, partition_val
+    )
 }
 
 fn row_key(table: &str, id: i64) -> String {
@@ -739,8 +764,48 @@ fn is_valid_table_name(name: &str) -> bool {
 ///   "age INT"
 ///   "team_id INT REFERENCES teams(id) ON DELETE CASCADE"
 ///   "score FLOAT NOT NULL"
+fn tokenize_field_def(spec: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for ch in spec.chars() {
+        if let Some(q) = quote {
+            current.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            current.push(ch);
+            quote = Some(ch);
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+
+    if quote.is_some() {
+        return Err(format!("ERR unterminated quoted literal in '{}'", spec));
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
 fn parse_field_def(spec: &str) -> Result<FieldDef, String> {
-    let tokens: Vec<&str> = spec.split_whitespace().collect();
+    let tokens = tokenize_field_def(spec)?;
     if tokens.len() < 2 {
         return Err(format!(
             "ERR invalid field definition '{}', expected: <name> <type> [constraints...]",
@@ -783,6 +848,7 @@ fn parse_field_def(spec: &str) -> Result<FieldDef, String> {
     let mut unique = false;
     let mut nullable = true;
     let mut default_value: Option<String> = None;
+    let mut sequence_partition: Option<String> = None;
     let mut references: Option<ForeignKey> = None;
 
     let mut i = 2;
@@ -795,6 +861,21 @@ fn parse_field_def(spec: &str) -> Result<FieldDef, String> {
                 }
                 default_value = Some(tokens[i].to_string());
                 i += 1;
+            }
+            "SEQUENCE" => {
+                i += 1;
+                if i + 2 >= tokens.len()
+                    || !tokens[i].eq_ignore_ascii_case("PARTITION")
+                    || !tokens[i + 1].eq_ignore_ascii_case("BY")
+                {
+                    return Err("ERR SEQUENCE requires PARTITION BY <column>".to_string());
+                }
+                let partition = tokens[i + 2].to_string();
+                if !is_valid_name(&partition) {
+                    return Err(format!("ERR invalid sequence partition '{}'", partition));
+                }
+                sequence_partition = Some(partition);
+                i += 3;
             }
             "PRIMARY" => {
                 i += 1;
@@ -828,7 +909,7 @@ fn parse_field_def(spec: &str) -> Result<FieldDef, String> {
                     return Err("ERR REFERENCES requires a table(column) argument".to_string());
                 }
                 // Parse "table(column)" - may have spaces around parens
-                let ref_spec = tokens[i];
+                let ref_spec = &tokens[i];
                 let (ref_table, ref_col) = parse_ref_spec(ref_spec)?;
                 i += 1;
 
@@ -892,6 +973,7 @@ fn parse_field_def(spec: &str) -> Result<FieldDef, String> {
         unique,
         nullable,
         default_value,
+        sequence_partition,
         references,
     })
 }
@@ -1007,6 +1089,9 @@ fn encode_field_def(def: &FieldDef) -> String {
         let escaped = default.replace('\\', "\\\\").replace('|', "\\|");
         parts.push(format!("default:{}", escaped));
     }
+    if let Some(partition) = &def.sequence_partition {
+        parts.push(format!("seqpart:{}", partition));
+    }
     parts.join("|")
 }
 
@@ -1036,6 +1121,7 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
     let mut unique = false;
     let mut nullable = true;
     let mut default_value: Option<String> = None;
+    let mut sequence_partition: Option<String> = None;
     let mut references: Option<ForeignKey> = None;
 
     for flag in &parts[1..] {
@@ -1067,6 +1153,9 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
                 let unescaped = raw.replace("\\|", "|").replace("\\\\", "\\");
                 default_value = Some(unescaped);
             }
+            s if s.starts_with("seqpart:") => {
+                sequence_partition = Some(s[8..].to_string());
+            }
             _ => {}
         }
     }
@@ -1078,6 +1167,7 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
         unique,
         nullable,
         default_value,
+        sequence_partition,
         references,
     }
 }
@@ -1159,6 +1249,7 @@ fn synthetic_path_fielddef(pi: &PathIndex) -> FieldDef {
         unique: false,
         nullable: true,
         default_value: None,
+        sequence_partition: None,
         references: None,
     }
 }
@@ -1437,6 +1528,24 @@ fn next_id(store: &Store, table: &str, now: Instant) -> i64 {
     }
 }
 
+fn next_scoped_id(
+    store: &Store,
+    table: &str,
+    field: &str,
+    partition_col: &str,
+    partition_val: &str,
+    now: Instant,
+) -> i64 {
+    let key = scoped_seq_key(table, field, partition_col, partition_val);
+    match store.incr(key.as_bytes(), 1, now) {
+        Ok(id) => id,
+        Err(_) => {
+            store.set(key.as_bytes(), b"1", None, now);
+            1
+        }
+    }
+}
+
 /// Advance an INT auto-increment counter so it is at least `id`. Called whenever a
 /// row lands with an explicit numeric PK so a later auto-generated id never
 /// collides. The seq counter is a direct store write that is NOT WAL-logged, so on
@@ -1456,6 +1565,50 @@ fn bump_seq_to_at_least(store: &Store, table: &str, id: i64, now: Instant) {
     if id > current {
         store.set(key.as_bytes(), id.to_string().as_bytes(), None, now);
     }
+}
+
+fn bump_scoped_seq_to_at_least(
+    store: &Store,
+    table: &str,
+    field: &str,
+    partition_col: &str,
+    partition_val: &str,
+    id: i64,
+    now: Instant,
+) {
+    let key = scoped_seq_key(table, field, partition_col, partition_val);
+    let current = store
+        .get(key.as_bytes(), now)
+        .and_then(|v| {
+            std::str::from_utf8(&v)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+        })
+        .unwrap_or(0);
+    if id > current {
+        store.set(key.as_bytes(), id.to_string().as_bytes(), None, now);
+    }
+}
+
+fn find_row_by_fields(
+    store: &Store,
+    table: &str,
+    schema: &[FieldDef],
+    fields: &[(&str, &str)],
+    now: Instant,
+) -> Option<String> {
+    for pk_str in get_all_row_ids(store, table, now) {
+        let Some(row) = get_row(store, table, schema, &pk_str, now) else {
+            continue;
+        };
+        if fields
+            .iter()
+            .all(|(field, value)| row.iter().any(|(k, v)| k == field && v == value))
+        {
+            return Some(pk_str);
+        }
+    }
+    None
 }
 
 /// Add a field value to the appropriate index.
@@ -1764,10 +1917,19 @@ pub fn table_insert_many_returning_ttl(
     Ok(out)
 }
 
+fn parse_conflict_columns(conflict_col: Option<&str>, pk_name: Option<&str>) -> Vec<String> {
+    let raw = conflict_col.or(pk_name).unwrap_or("id");
+    raw.split(',')
+        .map(str::trim)
+        .filter(|column| !column.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Insert a row, or update the conflicting row if one already exists on the
-/// conflict column. `conflict_col` defaults to the primary key (implicit `id`
-/// when there is no declared PK). Returns the resulting row. The conflict
-/// column must carry the value to match on; without it this is a plain insert.
+/// conflict column(s). `conflict_col` defaults to the primary key (implicit `id`
+/// when there is no declared PK). Returns the resulting row. Every conflict
+/// column must carry a value; otherwise this is a plain insert.
 #[cfg(test)]
 pub fn table_upsert_returning(
     store: &Store,
@@ -1797,37 +1959,49 @@ pub fn table_upsert_returning_ttl(
         .iter()
         .find(|f| f.primary_key)
         .map(|f| f.name.as_str());
-    let conflict = conflict_col.or(pk_name).unwrap_or("id");
+    let conflicts = parse_conflict_columns(conflict_col, pk_name);
+    let mut conflict_values: Vec<(&str, &str)> = Vec::with_capacity(conflicts.len());
+    for conflict in &conflicts {
+        let Some(cval) = field_values
+            .iter()
+            .find(|(k, _)| *k == conflict.as_str())
+            .map(|(_, v)| *v)
+        else {
+            // No value to conflict on -> behaves as a plain insert.
+            return table_insert_returning_ttl(store, cache, table, field_values, ttl, now);
+        };
+        conflict_values.push((conflict.as_str(), cval));
+    }
 
-    let Some(cval) = field_values
-        .iter()
-        .find(|(k, _)| *k == conflict)
-        .map(|(_, v)| *v)
-    else {
-        // No value to conflict on -> behaves as a plain insert.
-        return table_insert_returning_ttl(store, cache, table, field_values, ttl, now);
-    };
-
-    let conflict_is_pk = schema.iter().any(|f| f.primary_key && f.name == conflict)
-        || (pk_name.is_none() && conflict == "id");
-    let existing_pk: Option<String> = if conflict_is_pk {
-        // An expired row is purged and treated as absent (-> insert branch).
-        if purge_if_expired(store, cache, table, cval, now) {
-            None
+    let existing_pk: Option<String> = if conflicts.len() == 1 {
+        let conflict = conflicts[0].as_str();
+        let cval = conflict_values[0].1;
+        let conflict_is_pk = schema.iter().any(|f| f.primary_key && f.name == conflict)
+            || (pk_name.is_none() && conflict == "id");
+        if conflict_is_pk {
+            // An expired row is purged and treated as absent (-> insert branch).
+            if purge_if_expired(store, cache, table, cval, now) {
+                None
+            } else {
+                Some(cval.to_string())
+            }
         } else {
-            Some(cval.to_string())
+            // Match via the unique index when present; otherwise scan rows for
+            // compatibility with unconstrained conflict targets.
+            let ukey = uniq_key(table, conflict);
+            match store
+                .hget(ukey.as_bytes(), cval.as_bytes(), now)
+                .map(|b| String::from_utf8_lossy(&b).to_string())
+            {
+                Some(pk) if !purge_if_expired(store, cache, table, &pk, now) => Some(pk),
+                _ => find_row_by_fields(store, table, &schema, &[(conflict, cval)], now),
+            }
         }
     } else {
-        // Match via the column's unique index (only present for UNIQUE columns).
-        let ukey = uniq_key(table, conflict);
-        match store
-            .hget(ukey.as_bytes(), cval.as_bytes(), now)
-            .map(|b| String::from_utf8_lossy(&b).to_string())
-        {
-            Some(pk) if !purge_if_expired(store, cache, table, &pk, now) => Some(pk),
-            _ => None,
-        }
+        find_row_by_fields(store, table, &schema, &conflict_values, now)
     };
+    let conflict = conflict_values[0].0;
+    let cval = conflict_values[0].1;
 
     match existing_pk {
         Some(pk) => {
@@ -1835,7 +2009,7 @@ pub fn table_upsert_returning_ttl(
             let mut updates: Vec<(&str, &str)> = field_values
                 .iter()
                 .copied()
-                .filter(|(k, _)| *k != conflict)
+                .filter(|(k, _)| !conflicts.iter().any(|conflict| conflict == *k))
                 .collect();
             // A TTL-only upsert (no non-key fields) still needs a logged command so
             // the refreshed deadline survives WAL replay. Carry it on a no-op write
@@ -1896,6 +2070,44 @@ fn table_insert_pk(
         .collect();
     for (name, val) in &generated_defaults {
         provided.insert(name.as_str(), val.as_str());
+    }
+
+    let mut generated_sequences: Vec<(String, String)> = Vec::new();
+    for field in schema.iter().filter(|f| f.sequence_partition.is_some()) {
+        if field.field_type != FieldType::Int {
+            return Err(format!(
+                "ERR SEQUENCE column '{}' must use INT type",
+                field.name
+            ));
+        }
+        let partition_col = field.sequence_partition.as_deref().unwrap();
+        let partition_val = provided.get(partition_col).copied().ok_or_else(|| {
+            format!(
+                "ERR SEQUENCE column '{}' requires partition column '{}'",
+                field.name, partition_col
+            )
+        })?;
+        if let Some(value) = provided.get(field.name.as_str()).copied() {
+            let parsed = value
+                .parse::<i64>()
+                .map_err(|_| format!("ERR invalid int '{}'", value))?;
+            bump_scoped_seq_to_at_least(
+                store,
+                table,
+                &field.name,
+                partition_col,
+                partition_val,
+                parsed,
+                now,
+            );
+        } else {
+            let next = next_scoped_id(store, table, &field.name, partition_col, partition_val, now)
+                .to_string();
+            generated_sequences.push((field.name.clone(), next));
+        }
+    }
+    for (name, value) in &generated_sequences {
+        provided.insert(name.as_str(), value.as_str());
     }
 
     // Determine the PK column (if any) and its value
@@ -1985,6 +2197,26 @@ fn table_insert_pk(
                 // Stale entry -> drop it so it doesn't block this (valid) insert,
                 // which writes the fresh holder below.
                 let _ = store.hdel(ukey.as_bytes(), &[value.as_bytes()], now);
+            }
+        }
+
+        if let Some(partition_col) = field.sequence_partition.as_deref() {
+            let Some(partition_val) = provided.get(partition_col).copied() else {
+                continue;
+            };
+            if let Some(existing_pk) = find_row_by_fields(
+                store,
+                table,
+                &schema,
+                &[(partition_col, partition_val), (&field.name, value)],
+                now,
+            ) {
+                if !purge_if_expired(store, cache, table, &existing_pk, now) {
+                    return Err(format!(
+                        "ERR unique constraint violation on columns '{}', '{}'",
+                        partition_col, field.name
+                    ));
+                }
             }
         }
     }
@@ -2706,12 +2938,25 @@ fn parse_where_conditions(args: &[&str]) -> Result<Vec<WhereClause>, String> {
     let mut conditions = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        conditions.push(parse_where_condition(args, &mut i)?);
+        conditions.push(parse_where_or_group(args, &mut i)?);
         if i < args.len() && args[i].eq_ignore_ascii_case("AND") {
             i += 1;
         }
     }
     Ok(conditions)
+}
+
+fn parse_where_or_group(args: &[&str], i: &mut usize) -> Result<WhereClause, String> {
+    let mut clauses = vec![parse_where_condition(args, i)?];
+    while *i < args.len() && args[*i].eq_ignore_ascii_case("OR") {
+        *i += 1;
+        clauses.push(parse_where_condition(args, i)?);
+    }
+    if clauses.len() == 1 {
+        Ok(clauses.remove(0))
+    } else {
+        Ok(WhereClause::or_group(clauses))
+    }
 }
 
 /// Update rows matching WHERE conditions, returns count of updated rows
@@ -2727,6 +2972,7 @@ fn implicit_id_field_for(schema: &[FieldDef]) -> Option<FieldDef> {
             unique: true,
             nullable: false,
             default_value: None,
+            sequence_partition: None,
             references: None,
         })
     }
@@ -4172,6 +4418,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn select_where_or_and_ilike_filter() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        seed_users(&store, &cache, now);
+
+        let plan = parse_select(&[
+            "*", "FROM", "users", "WHERE", "name", "ILIKE", "%ali%", "OR", "name", "LIKE", "D_ve",
+            "ORDER", "BY", "id",
+        ])
+        .unwrap();
+        assert_eq!(plan.conditions[0].op, CmpOp::Or);
+
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        let names: Vec<&str> = rows.iter().map(|row| cell(row, "name")).collect();
+        assert_eq!(names, vec!["Alice", "Dave"]);
+    }
+
     // -------------------------------------------------------------------------
     // Auto-increment primary key: ordering and range scans must use the `ids`
     // set, not the per-column secondary index (which auto-increment never
@@ -4352,6 +4617,33 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(cell(&rows[0], "status"), "active");
         assert_eq!(cell(&rows[0], "n"), "5");
+    }
+
+    #[test]
+    fn empty_string_default_applied_on_insert() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "t",
+            &["id INT PRIMARY KEY,", "label STR DEFAULT ''"],
+            now,
+        )
+        .unwrap();
+
+        table_insert(&store, &cache, "t", &[], now).unwrap();
+        let rows = rows_of(
+            table_select(
+                &store,
+                &cache,
+                &parse_select(&["*", "FROM", "t"]).unwrap(),
+                now,
+            )
+            .unwrap(),
+        );
+        assert_eq!(cell(&rows[0], "label"), "");
     }
 
     #[test]
@@ -4681,6 +4973,145 @@ mod tests {
         assert_eq!(cell(&row, "name"), "Bob");
         assert_eq!(cell(&row, "id"), "1");
         assert_eq!(table_count(&store, &cache, "u", now).unwrap(), 1);
+    }
+
+    #[test]
+    fn upsert_updates_on_composite_conflict_target() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "tasks",
+            &[
+                "id INT PRIMARY KEY,",
+                "workspace_id STR,",
+                "slug STR,",
+                "title STR",
+            ],
+            now,
+        )
+        .unwrap();
+
+        table_upsert_returning(
+            &store,
+            &cache,
+            "tasks",
+            &[("workspace_id", "w1"), ("slug", "same"), ("title", "first")],
+            Some("workspace_id,slug"),
+            now,
+        )
+        .unwrap();
+        let row = table_upsert_returning(
+            &store,
+            &cache,
+            "tasks",
+            &[
+                ("workspace_id", "w1"),
+                ("slug", "same"),
+                ("title", "updated"),
+            ],
+            Some("workspace_id,slug"),
+            now,
+        )
+        .unwrap();
+        table_upsert_returning(
+            &store,
+            &cache,
+            "tasks",
+            &[
+                ("workspace_id", "w2"),
+                ("slug", "same"),
+                ("title", "other workspace"),
+            ],
+            Some("workspace_id,slug"),
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(cell(&row, "title"), "updated");
+        assert_eq!(table_count(&store, &cache, "tasks", now).unwrap(), 2);
+    }
+
+    #[test]
+    fn sequence_partition_assigns_monotonic_values_per_partition() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "tickets",
+            &[
+                "id INT PRIMARY KEY,",
+                "workspace_id STR,",
+                "serial INT SEQUENCE PARTITION BY workspace_id,",
+                "title STR",
+            ],
+            now,
+        )
+        .unwrap();
+
+        let first = table_insert_returning(
+            &store,
+            &cache,
+            "tickets",
+            &[("workspace_id", "w1"), ("title", "first")],
+            now,
+        )
+        .unwrap();
+        let second = table_insert_returning(
+            &store,
+            &cache,
+            "tickets",
+            &[("workspace_id", "w1"), ("title", "second")],
+            now,
+        )
+        .unwrap();
+        let other = table_insert_returning(
+            &store,
+            &cache,
+            "tickets",
+            &[("workspace_id", "w2"), ("title", "other")],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "tickets",
+            &[
+                ("workspace_id", "w1"),
+                ("serial", "10"),
+                ("title", "manual"),
+            ],
+            now,
+        )
+        .unwrap();
+        let after_manual = table_insert_returning(
+            &store,
+            &cache,
+            "tickets",
+            &[("workspace_id", "w1"), ("title", "after")],
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(cell(&first, "serial"), "1");
+        assert_eq!(cell(&second, "serial"), "2");
+        assert_eq!(cell(&other, "serial"), "1");
+        assert_eq!(cell(&after_manual, "serial"), "11");
+
+        let err = table_insert(
+            &store,
+            &cache,
+            "tickets",
+            &[("workspace_id", "w1"), ("serial", "2"), ("title", "dup")],
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("unique constraint"), "{err}");
     }
 
     #[test]
