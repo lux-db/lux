@@ -319,6 +319,141 @@ describe('LuxAuthClient session state', () => {
 		expect(calls[2].body).toEqual({ email: 'next@example.com' });
 	});
 
+	test('admin settings facade uses secret-key settings routes', async () => {
+		const calls: Array<{ url: string; method?: string; headers: Record<string, string>; body?: unknown }> = [];
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({
+				url: String(input),
+				method: init?.method,
+				headers: init?.headers as Record<string, string>,
+				body: init?.body ? JSON.parse(String(init.body)) : undefined,
+			});
+			return new Response(
+				JSON.stringify({
+					settings: {
+						email_confirmation_required: true,
+						flow_token_ttl_seconds: 120,
+						site_url: 'http://app.test/auth',
+					},
+				}),
+				{ status: 200 },
+			);
+		};
+		const auth = new LuxAuthClient({
+			httpUrl: 'http://localhost:3957/v1/project',
+			apiKey: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+			persistSession: false,
+			autoRefreshToken: false,
+		});
+
+		const getResult = await auth.admin.getSettings();
+		const updateResult = await auth.admin.updateSettings({
+			email_confirmation_required: true,
+			flow_token_ttl_seconds: 120,
+			site_url: 'http://app.test/auth',
+		});
+
+		expect(getResult.data?.email_confirmation_required).toBe(true);
+		expect(updateResult.data?.flow_token_ttl_seconds).toBe(120);
+		expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
+			'GET http://localhost:3957/v1/project/auth/v1/admin/settings',
+			'PATCH http://localhost:3957/v1/project/auth/v1/admin/settings',
+		]);
+		expect(calls.every((call) => call.headers.apikey === 'lux_sec_test')).toBe(true);
+		expect(calls[1].body).toEqual({
+			email_confirmation_required: true,
+			flow_token_ttl_seconds: 120,
+			site_url: 'http://app.test/auth',
+		});
+	});
+
+	test('signup accepts Supabase options shape and nullable confirmation session', async () => {
+		let body: any;
+		const fetchImpl = async (_input: RequestInfo | URL, init?: RequestInit) => {
+			body = init?.body ? JSON.parse(String(init.body)) : undefined;
+			return new Response(JSON.stringify({
+				access_token: null,
+				refresh_token: null,
+				token_type: 'bearer',
+				expires_in: 0,
+				user: { id: 'usr_confirm', email: 'confirm@example.com' },
+			}), { status: 200 });
+		};
+		const auth = new LuxAuthClient({
+			httpUrl: 'http://localhost:3957/v1/project',
+			apiKey: 'lux_pub_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const result = await auth.signUp({
+			email: 'confirm@example.com',
+			password: 'password123',
+			options: {
+				data: { name: 'Confirm Me' },
+				emailRedirectTo: 'http://app.test/confirm',
+			},
+		});
+
+		expect(result.error).toBeNull();
+		expect(result.data?.session).toBeNull();
+		expect(result.data?.user.email).toBe('confirm@example.com');
+		expect(body).toEqual({
+			email: 'confirm@example.com',
+			password: 'password123',
+			data: { name: 'Confirm Me' },
+			email_redirect_to: 'http://app.test/confirm',
+		});
+	});
+
+	test('password recovery, verifyOtp, updateUser, and getClaims use Lux auth routes', async () => {
+		const calls: Array<{ url: string; method?: string; headers: Record<string, string>; body?: unknown }> = [];
+		const payload = { sub: 'usr_123', email: 'user@example.com', role: 'authenticated' };
+		const token = `h.${btoa(JSON.stringify(payload)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}.s`;
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({
+				url: String(input),
+				method: init?.method,
+				headers: init?.headers as Record<string, string>,
+				body: init?.body ? JSON.parse(String(init.body)) : undefined,
+			});
+			if (String(input).endsWith('/recover')) {
+				return new Response(JSON.stringify({}), { status: 200 });
+			}
+			if (String(input).endsWith('/verify')) {
+				return new Response(JSON.stringify(session({ access_token: token })), { status: 200 });
+			}
+			return new Response(JSON.stringify({ user: { id: 'usr_123', email: 'user@example.com' } }), { status: 200 });
+		};
+		const auth = new LuxAuthClient({
+			httpUrl: 'http://localhost:3957/v1/project',
+			apiKey: 'lux_pub_test',
+			fetch: fetchImpl as typeof fetch,
+			persistSession: true,
+			autoRefreshToken: false,
+			storage: memoryStorage(),
+		});
+
+		await auth.resetPasswordForEmail('user@example.com', { redirectTo: 'http://app.test/update-password' });
+		await auth.verifyOtp({ type: 'recovery', token_hash: 'tok_123' });
+		await auth.updateUser({ password: 'newpassword123', data: { name: 'Updated' } });
+		const claims = await auth.getClaims();
+
+		expect(claims.data?.claims).toEqual(payload);
+		expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
+			'POST http://localhost:3957/v1/project/auth/v1/recover',
+			'POST http://localhost:3957/v1/project/auth/v1/verify',
+			'PUT http://localhost:3957/v1/project/auth/v1/user',
+		]);
+		expect(calls[0].body).toEqual({
+			email: 'user@example.com',
+			redirect_to: 'http://app.test/update-password',
+		});
+		expect(calls[1].body).toEqual({ type: 'recovery', token_hash: 'tok_123' });
+		expect(calls[2].headers.Authorization).toBe(`Bearer ${token}`);
+		expect(calls[2].body).toEqual({ password: 'newpassword123', data: { name: 'Updated' } });
+	});
+
 	test('default fetch is bound for browser auth requests', async () => {
 		const originalFetch = globalThis.fetch;
 		let receiver: unknown;
@@ -359,6 +494,28 @@ describe('LuxAuthClient session state', () => {
 		expect(result.error).toBeNull();
 	});
 
+	test('signInWithOAuth accepts nested Supabase options and code flow', async () => {
+		const auth = new LuxAuthClient({
+			httpUrl: 'http://localhost:3957/v1/project',
+			persistSession: false,
+			autoRefreshToken: false,
+		});
+
+		const result = await auth.signInWithOAuth({
+			provider: 'github',
+			options: {
+				redirectTo: 'http://localhost:5173/callback',
+				skipRedirect: true,
+				flow: 'code',
+			},
+		});
+
+		expect(result.data?.url).toBe(
+			'http://localhost:3957/v1/project/auth/v1/authorize?provider=github&redirect_to=http%3A%2F%2Flocalhost%3A5173%2Fcallback&flow=code',
+		);
+		expect(result.error).toBeNull();
+	});
+
 	test('consumeOAuthRedirect stores access, refresh, and loaded user from hash', async () => {
 		const storage = memoryStorage();
 		let authorization = '';
@@ -393,6 +550,28 @@ describe('LuxAuthClient session state', () => {
 
 		expect(result.data).toBeNull();
 		expect(result.error?.code).toBe('LUX_AUTH_OAUTH_ERROR');
+	});
+
+	test('consumeOAuthRedirect exchanges code callbacks for sessions', async () => {
+		let seenBody: unknown;
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			seenBody = init?.body ? JSON.parse(String(init.body)) : undefined;
+			expect(String(input)).toBe('http://localhost:3957/v1/project/auth/v1/token?grant_type=authorization_code');
+			return new Response(JSON.stringify(session({ access_token: 'code-access' })), { status: 200 });
+		};
+		const auth = new LuxAuthClient({
+			httpUrl: 'http://localhost:3957/v1/project',
+			apiKey: 'lux_pub_test',
+			fetch: fetchImpl as typeof fetch,
+			persistSession: false,
+			autoRefreshToken: false,
+		});
+
+		const result = await auth.consumeOAuthRedirect('https://app.example.com/auth/callback?code=auth-code');
+
+		expect(result.error).toBeNull();
+		expect(result.data?.session?.access_token).toBe('code-access');
+		expect(seenBody).toEqual({ grant_type: 'authorization_code', code: 'auth-code' });
 	});
 });
 
