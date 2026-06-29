@@ -91,8 +91,17 @@ pub struct AuthConfig {
     pub refresh_token_ttl: Duration,
     /// Enables native email/password signup and sign-in.
     pub email_password_enabled: bool,
+    /// When true, email/password signup creates an unconfirmed user and requires
+    /// a confirmation token before password sign-in.
+    pub email_confirmation_required: bool,
     /// Enables accountless `signInAnonymously` sessions.
     pub anonymous_enabled: bool,
+    /// Lifetime for one-time auth flow tokens such as recovery links,
+    /// confirmation links, and OAuth authorization codes.
+    pub flow_token_ttl: Duration,
+    /// Base URL used when Lux needs to construct auth action links and no
+    /// explicit redirect target was supplied.
+    pub site_url: String,
     /// Optional initial publishable key material for local/bootstrap use.
     pub initial_publishable_key: Option<String>,
     /// Optional initial secret key material for local/bootstrap use.
@@ -107,7 +116,13 @@ impl std::fmt::Debug for AuthConfig {
             .field("access_token_ttl", &self.access_token_ttl)
             .field("refresh_token_ttl", &self.refresh_token_ttl)
             .field("email_password_enabled", &self.email_password_enabled)
+            .field(
+                "email_confirmation_required",
+                &self.email_confirmation_required,
+            )
             .field("anonymous_enabled", &self.anonymous_enabled)
+            .field("flow_token_ttl", &self.flow_token_ttl)
+            .field("site_url", &self.site_url)
             .field(
                 "initial_publishable_key",
                 &self.initial_publishable_key.as_ref().map(|_| "<redacted>"),
@@ -128,7 +143,10 @@ impl Default for AuthConfig {
             access_token_ttl: Duration::from_secs(3600),
             refresh_token_ttl: Duration::from_secs(30 * 24 * 60 * 60),
             email_password_enabled: true,
+            email_confirmation_required: false,
             anonymous_enabled: true,
+            flow_token_ttl: Duration::from_secs(24 * 60 * 60),
+            site_url: "http://localhost:7379".to_string(),
             initial_publishable_key: None,
             initial_secret_key: None,
         }

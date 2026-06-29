@@ -98,6 +98,25 @@ export interface LuxAuthProviderRow {
 	updated_at?: number | null;
 }
 
+export interface LuxAuthFlowTokenRow {
+	id: string;
+	type: string;
+	token_hash: string;
+	user_id?: string;
+	email?: string;
+	redirect_to?: string;
+	metadata?: string;
+	expires_at?: number | null;
+	consumed_at?: number | null;
+	created_at?: number | null;
+}
+
+export interface LuxAuthSettingRow {
+	key: string;
+	value?: string;
+	updated_at?: number | null;
+}
+
 export interface LuxAuthTables {
 	'auth.users': LuxAuthUserRow;
 	'auth.identities': LuxAuthIdentityRow;
@@ -106,6 +125,8 @@ export interface LuxAuthTables {
 	'auth.signing_keys': LuxAuthSigningKeyRow;
 	'auth.grants': LuxAuthGrantRow;
 	'auth.providers': LuxAuthProviderRow;
+	'auth.flow_tokens': LuxAuthFlowTokenRow;
+	'auth.settings': LuxAuthSettingRow;
 }
 
 export interface LuxAuthSession {
@@ -118,7 +139,7 @@ export interface LuxAuthSession {
 }
 
 export interface LuxAuthSessionResult {
-	session: LuxAuthSession;
+	session: LuxAuthSession | null;
 	user: LuxAuthUser;
 }
 
@@ -149,6 +170,11 @@ export interface LuxSignUpOptions {
 	email: string;
 	password: string;
 	data?: Record<string, unknown>;
+	options?: {
+		data?: Record<string, unknown>;
+		emailRedirectTo?: string;
+		redirectTo?: string;
+	};
 }
 
 export interface LuxSignInOptions {
@@ -194,6 +220,8 @@ export interface LuxAuthAdminClient {
 	updateUserById(userId: string, options: LuxAdminUpdateUserOptions): Promise<LuxResult<LuxAuthUser>>;
 	deleteUser(userId: string): Promise<LuxResult<LuxAuthUser>>;
 	listUsers(): Promise<LuxResult<LuxAuthUser[]>>;
+	getSettings(): Promise<LuxResult<LuxAuthSettings>>;
+	updateSettings(settings: LuxAuthSettingsUpdate): Promise<LuxResult<LuxAuthSettings>>;
 }
 
 export type LuxOAuthProvider = 'google' | 'github';
@@ -202,10 +230,33 @@ export interface LuxSignInWithOAuthOptions {
 	provider: LuxOAuthProvider;
 	redirectTo?: string;
 	skipRedirect?: boolean;
+	flow?: 'code' | 'implicit';
+	options?: {
+		redirectTo?: string;
+		skipRedirect?: boolean;
+		flow?: 'code' | 'implicit';
+	};
 }
 
 export interface LuxOAuthUrl {
 	url: string;
+}
+
+export interface LuxResetPasswordOptions {
+	redirectTo?: string;
+	emailRedirectTo?: string;
+}
+
+export interface LuxVerifyOtpOptions {
+	token_hash: string;
+	type: 'signup' | 'email' | 'email_change' | 'recovery' | string;
+}
+
+export interface LuxUpdateUserOptions {
+	email?: string;
+	password?: string;
+	data?: Record<string, unknown>;
+	user_metadata?: Record<string, unknown>;
 }
 
 export interface LuxCreateApiKeyOptions {
@@ -231,6 +282,18 @@ export interface LuxUpsertProviderOptions {
 	redirect_uri: string;
 	scopes?: string;
 	enabled?: boolean;
+}
+
+export interface LuxAuthSettings {
+	email_confirmation_required: boolean;
+	flow_token_ttl_seconds: number;
+	site_url: string;
+}
+
+export interface LuxAuthSettingsUpdate {
+	email_confirmation_required?: boolean;
+	flow_token_ttl_seconds?: number;
+	site_url?: string;
 }
 
 export type LuxAuthChangeEvent = 'INITIAL_SESSION' | 'SIGNED_IN' | 'TOKEN_REFRESHED' | 'SIGNED_OUT' | 'SESSION_UPDATED';
@@ -287,6 +350,8 @@ export class LuxAuthClient {
 			updateUserById: (userId, options) => this.updateAdminUserById(userId, options),
 			deleteUser: (userId) => this.deleteAdminUser(userId),
 			listUsers: () => this.listUsers(),
+			getSettings: () => this.getSettings(),
+			updateSettings: (settings) => this.updateSettings(settings),
 		};
 		this.initializeBrowserLifecycle();
 	}
@@ -405,17 +470,21 @@ export class LuxAuthClient {
 
 	async signUp(options: LuxSignUpOptions): Promise<LuxResult<LuxAuthSessionResult>> {
 		try {
-			const session = await this.requestRaw<LuxAuthSession>('/auth/v1/signup', {
+			const payload = await this.requestRaw<LuxAuthSession>('/auth/v1/signup', {
 				method: 'POST',
 				body: JSON.stringify({
 					email: options.email,
 					password: options.password,
-					data: options.data,
+					data: options.options?.data ?? options.data,
+					email_redirect_to: options.options?.emailRedirectTo ?? options.options?.redirectTo,
 				}),
 				apiKey: true,
 			});
-			await this.saveSession(normalizeSession(session), 'SIGNED_IN');
-			return ok({ session: this.currentSession!, user: this.currentSession!.user });
+			if (payload.access_token && payload.refresh_token) {
+				await this.saveSession(normalizeSession(payload), 'SIGNED_IN');
+				return ok({ session: this.currentSession!, user: this.currentSession!.user });
+			}
+			return ok({ session: null, user: payload.user });
 		} catch (error) {
 			return err('LUX_AUTH_SIGNUP_ERROR', 'Failed to sign up', toLuxError(error));
 		}
@@ -458,12 +527,14 @@ export class LuxAuthClient {
 			if (!this.httpUrl) {
 				throw new Error('Lux auth requires httpUrl');
 			}
-			const redirectTo = options.redirectTo ?? browserLocation();
+			const redirectTo = options.options?.redirectTo ?? options.redirectTo ?? browserLocation();
+			const flow = options.options?.flow ?? options.flow;
 			const url = new URL(`${this.httpUrl}/auth/v1/authorize`);
 			url.searchParams.set('provider', options.provider);
 			if (redirectTo) url.searchParams.set('redirect_to', redirectTo);
+			if (flow) url.searchParams.set('flow', flow);
 			const target = url.toString();
-			if (!options.skipRedirect && typeof globalThis !== 'undefined') {
+			if (!(options.options?.skipRedirect ?? options.skipRedirect) && typeof globalThis !== 'undefined') {
 				const location = (globalThis as any).location;
 				if (location?.assign) location.assign(target);
 			}
@@ -480,6 +551,8 @@ export class LuxAuthClient {
 			}
 			const parsed = new URL(url);
 			const params = new URLSearchParams(parsed.hash.replace(/^#/, ''));
+			const code = parsed.searchParams.get('code');
+			if (code) return this.exchangeCodeForSession(code);
 			const accessToken = params.get('access_token');
 			const refreshToken = params.get('refresh_token');
 			if (!accessToken || !refreshToken) {
@@ -502,6 +575,61 @@ export class LuxAuthClient {
 		} catch (error) {
 			return err('LUX_AUTH_OAUTH_ERROR', 'Failed to consume OAuth redirect', toLuxError(error));
 		}
+	}
+
+	async exchangeCodeForSession(code: string): Promise<LuxResult<LuxAuthSessionResult>> {
+		try {
+			const session = await this.requestRaw<LuxAuthSession>('/auth/v1/token?grant_type=authorization_code', {
+				method: 'POST',
+				body: JSON.stringify({
+					grant_type: 'authorization_code',
+					code,
+				}),
+				apiKey: true,
+			});
+			await this.saveSession(normalizeSession(session), 'SIGNED_IN');
+			return ok({ session: this.currentSession!, user: this.currentSession!.user });
+		} catch (error) {
+			return err('LUX_AUTH_OAUTH_ERROR', 'Failed to exchange auth code for session', toLuxError(error));
+		}
+	}
+
+	async resetPasswordForEmail(email: string, options: LuxResetPasswordOptions = {}): Promise<LuxResult<true>> {
+		try {
+			await this.requestRaw('/auth/v1/recover', {
+				method: 'POST',
+				body: JSON.stringify({
+					email,
+					redirect_to: options.emailRedirectTo ?? options.redirectTo,
+				}),
+				apiKey: true,
+			});
+			return ok(true);
+		} catch (error) {
+			return err('LUX_AUTH_RECOVERY_ERROR', 'Failed to start password recovery', toLuxError(error));
+		}
+	}
+
+	async verifyOtp(options: LuxVerifyOtpOptions): Promise<LuxResult<LuxAuthSessionResult>> {
+		try {
+			const session = await this.requestRaw<LuxAuthSession>('/auth/v1/verify', {
+				method: 'POST',
+				body: JSON.stringify(options),
+				apiKey: true,
+			});
+			await this.saveSession(normalizeSession(session), 'SIGNED_IN');
+			return ok({ session: this.currentSession!, user: this.currentSession!.user });
+		} catch (error) {
+			return err('LUX_AUTH_VERIFY_ERROR', 'Failed to verify auth token', toLuxError(error));
+		}
+	}
+
+	async updateUser(options: LuxUpdateUserOptions): Promise<LuxResult<{ user: LuxAuthUser }>> {
+		return this.requestResult<{ user: LuxAuthUser }>('/auth/v1/user', {
+			method: 'PUT',
+			token: await this.getAccessToken(),
+			body: JSON.stringify(options),
+		});
 	}
 
 	async refreshSession(refreshToken: string): Promise<LuxResult<LuxAuthSessionResult>> {
@@ -532,6 +660,24 @@ export class LuxAuthClient {
 			}));
 		} catch (error) {
 			return err('LUX_AUTH_USER_ERROR', 'Failed to get auth user', toLuxError(error));
+		}
+	}
+
+	async getClaims(): Promise<LuxResult<{ claims: Record<string, unknown> | null }>> {
+		const session = await this.getSessionValue();
+		if (!session?.access_token) return ok({ claims: null });
+		const [, payload] = session.access_token.split('.');
+		if (!payload) return err('LUX_AUTH_SESSION_ERROR', 'Invalid access token');
+		try {
+			const normalized = payload.replace(/-/g, '+').replace(/_/g, '/');
+			const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+			const BufferCtor = (globalThis as any).Buffer;
+			const decoded = typeof atob === 'function'
+				? atob(padded)
+				: BufferCtor.from(padded, 'base64').toString('utf8');
+			return ok({ claims: JSON.parse(decoded) });
+		} catch (error) {
+			return err('LUX_AUTH_SESSION_ERROR', 'Failed to decode access token claims', toLuxError(error));
 		}
 	}
 
@@ -697,6 +843,31 @@ export class LuxAuthClient {
 			return ok(result.providers);
 		} catch (error) {
 			return err('LUX_AUTH_ADMIN_ERROR', 'Failed to list auth providers', toLuxError(error));
+		}
+	}
+
+	async getSettings(): Promise<LuxResult<LuxAuthSettings>> {
+		try {
+			const result = await this.requestRaw<{ settings: LuxAuthSettings }>('/auth/v1/admin/settings', {
+				method: 'GET',
+				secret: true,
+			});
+			return ok(result.settings);
+		} catch (error) {
+			return err('LUX_AUTH_ADMIN_ERROR', 'Failed to get auth settings', toLuxError(error));
+		}
+	}
+
+	async updateSettings(settings: LuxAuthSettingsUpdate): Promise<LuxResult<LuxAuthSettings>> {
+		try {
+			const result = await this.requestRaw<{ settings: LuxAuthSettings }>('/auth/v1/admin/settings', {
+				method: 'PATCH',
+				secret: true,
+				body: JSON.stringify(settings),
+			});
+			return ok(result.settings);
+		} catch (error) {
+			return err('LUX_AUTH_ADMIN_ERROR', 'Failed to update auth settings', toLuxError(error));
 		}
 	}
 

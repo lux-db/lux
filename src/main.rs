@@ -123,10 +123,23 @@ async fn async_main() -> std::io::Result<()> {
                 let v = v.to_ascii_lowercase();
                 !(v == "0" || v == "false")
             }),
+            email_confirmation_required: std::env::var("LUX_AUTH_EMAIL_CONFIRMATION_REQUIRED")
+                .is_ok_and(|v| {
+                    let v = v.to_ascii_lowercase();
+                    v == "1" || v == "true"
+                }),
             anonymous_enabled: std::env::var("LUX_AUTH_ANONYMOUS").map_or(true, |v| {
                 let v = v.to_ascii_lowercase();
                 !(v == "0" || v == "false")
             }),
+            flow_token_ttl: std::time::Duration::from_secs(
+                std::env::var("LUX_AUTH_FLOW_TOKEN_TTL_SECONDS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(24 * 60 * 60),
+            ),
+            site_url: std::env::var("LUX_AUTH_SITE_URL")
+                .unwrap_or_else(|_| "http://localhost:7379".to_string()),
             initial_publishable_key: std::env::var("LUX_AUTH_PUBLISHABLE_KEY").ok(),
             initial_secret_key: std::env::var("LUX_AUTH_SECRET_KEY").ok(),
         },
