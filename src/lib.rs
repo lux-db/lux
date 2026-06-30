@@ -106,6 +106,40 @@ pub struct AuthConfig {
     pub initial_publishable_key: Option<String>,
     /// Optional initial secret key material for local/bootstrap use.
     pub initial_secret_key: Option<String>,
+    /// Optional Cloud-managed email delivery config. This is intentionally not
+    /// seeded into `auth.settings`, so managed provider secrets can live
+    /// outside customer-readable project auth tables.
+    pub managed_email: Option<AuthManagedEmailConfig>,
+}
+
+/// Email delivery config injected by a host environment such as Lux Cloud.
+#[derive(Clone)]
+pub struct AuthManagedEmailConfig {
+    /// Delivery provider name. Supported today: `postmark`.
+    pub provider: String,
+    /// Sender address, optionally already formatted as `Name <email@example.com>`.
+    pub from: String,
+    /// Optional Reply-To address.
+    pub reply_to: Option<String>,
+    /// Postmark server token for managed delivery.
+    pub postmark_server_token: Option<String>,
+    /// Optional Postmark message stream. Defaults to `outbound`.
+    pub postmark_message_stream: Option<String>,
+}
+
+impl std::fmt::Debug for AuthManagedEmailConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthManagedEmailConfig")
+            .field("provider", &self.provider)
+            .field("from", &self.from)
+            .field("reply_to", &self.reply_to)
+            .field(
+                "postmark_server_token",
+                &self.postmark_server_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("postmark_message_stream", &self.postmark_message_stream)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for AuthConfig {
@@ -131,6 +165,7 @@ impl std::fmt::Debug for AuthConfig {
                 "initial_secret_key",
                 &self.initial_secret_key.as_ref().map(|_| "<redacted>"),
             )
+            .field("managed_email", &self.managed_email)
             .finish()
     }
 }
@@ -149,6 +184,7 @@ impl Default for AuthConfig {
             site_url: "http://localhost:7379".to_string(),
             initial_publishable_key: None,
             initial_secret_key: None,
+            managed_email: None,
         }
     }
 }

@@ -288,12 +288,28 @@ export interface LuxAuthSettings {
 	email_confirmation_required: boolean;
 	flow_token_ttl_seconds: number;
 	site_url: string;
+	email_provider: 'console' | 'postmark' | 'managed' | string;
+	email_delivery_managed: boolean;
+	email_delivery_configured: boolean;
+	email_from: string | null;
+	email_reply_to: string | null;
+	email_postmark_message_stream: string | null;
+	has_email_postmark_server_token: boolean;
+	email_app_name: string;
+	email_from_name: string | null;
 }
 
 export interface LuxAuthSettingsUpdate {
 	email_confirmation_required?: boolean;
 	flow_token_ttl_seconds?: number;
 	site_url?: string;
+	email_provider?: 'console' | 'postmark' | string;
+	email_from?: string | null;
+	email_reply_to?: string | null;
+	email_postmark_server_token?: string | null;
+	email_postmark_message_stream?: string | null;
+	email_app_name?: string | null;
+	email_from_name?: string | null;
 }
 
 export type LuxAuthChangeEvent = 'INITIAL_SESSION' | 'SIGNED_IN' | 'TOKEN_REFRESHED' | 'SIGNED_OUT' | 'SESSION_UPDATED';

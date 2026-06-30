@@ -334,6 +334,15 @@ describe('LuxAuthClient session state', () => {
 						email_confirmation_required: true,
 						flow_token_ttl_seconds: 120,
 						site_url: 'http://app.test/auth',
+						email_provider: 'postmark',
+						email_delivery_managed: false,
+						email_delivery_configured: true,
+						email_from: 'Auth <auth@app.test>',
+						email_reply_to: null,
+						email_postmark_message_stream: 'outbound',
+						has_email_postmark_server_token: true,
+						email_app_name: 'App',
+						email_from_name: null,
 					},
 				}),
 				{ status: 200 },
@@ -352,10 +361,15 @@ describe('LuxAuthClient session state', () => {
 			email_confirmation_required: true,
 			flow_token_ttl_seconds: 120,
 			site_url: 'http://app.test/auth',
+			email_provider: 'postmark',
+			email_from: 'Auth <auth@app.test>',
+			email_postmark_server_token: 'server-token',
+			email_app_name: 'App',
 		});
 
 		expect(getResult.data?.email_confirmation_required).toBe(true);
 		expect(updateResult.data?.flow_token_ttl_seconds).toBe(120);
+		expect(updateResult.data?.has_email_postmark_server_token).toBe(true);
 		expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
 			'GET http://localhost:3957/v1/project/auth/v1/admin/settings',
 			'PATCH http://localhost:3957/v1/project/auth/v1/admin/settings',
@@ -365,6 +379,10 @@ describe('LuxAuthClient session state', () => {
 			email_confirmation_required: true,
 			flow_token_ttl_seconds: 120,
 			site_url: 'http://app.test/auth',
+			email_provider: 'postmark',
+			email_from: 'Auth <auth@app.test>',
+			email_postmark_server_token: 'server-token',
+			email_app_name: 'App',
 		});
 	});
 

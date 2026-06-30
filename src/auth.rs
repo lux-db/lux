@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -19,7 +20,7 @@ use tokio::task::block_in_place;
 
 use crate::store::Store;
 use crate::tables::{self, CmpOp, SelectPlan, SelectResult, SharedSchemaCache, WhereClause};
-use crate::AuthConfig;
+use crate::{AuthConfig, AuthManagedEmailConfig};
 
 pub(crate) const USERS_TABLE: &str = "auth.users";
 pub(crate) const IDENTITIES_TABLE: &str = "auth.identities";
@@ -55,6 +56,13 @@ struct AuthSettings {
     email_confirmation_required: bool,
     flow_token_ttl: Duration,
     site_url: String,
+    email_provider: String,
+    email_from: Option<String>,
+    email_reply_to: Option<String>,
+    email_postmark_server_token: Option<String>,
+    email_postmark_message_stream: String,
+    email_app_name: String,
+    email_from_name: Option<String>,
 }
 
 struct FlowTokenInsert<'a> {
@@ -64,6 +72,45 @@ struct FlowTokenInsert<'a> {
     email: &'a str,
     redirect_to: &'a str,
     metadata: Value,
+}
+
+#[derive(Clone, Debug)]
+struct EffectiveEmailDelivery {
+    provider: String,
+    from: Option<String>,
+    reply_to: Option<String>,
+    postmark_server_token: Option<String>,
+    postmark_message_stream: String,
+    app_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthEmailMessage {
+    from: String,
+    to: String,
+    reply_to: Option<String>,
+    subject: String,
+    text_body: String,
+    html_body: String,
+    message_stream: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PostmarkEmailPayload {
+    #[serde(rename = "From")]
+    from: String,
+    #[serde(rename = "To")]
+    to: String,
+    #[serde(rename = "Subject")]
+    subject: String,
+    #[serde(rename = "TextBody")]
+    text_body: String,
+    #[serde(rename = "HtmlBody")]
+    html_body: String,
+    #[serde(rename = "MessageStream")]
+    message_stream: String,
+    #[serde(rename = "ReplyTo", skip_serializing_if = "Option::is_none")]
+    reply_to: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -441,6 +488,15 @@ pub(crate) fn bootstrap_runtime(
         now,
     )?;
     ensure_auth_setting(store, cache, "site_url", &config.site_url, now)?;
+    ensure_auth_setting(store, cache, "email_provider", "console", now)?;
+    ensure_auth_setting(
+        store,
+        cache,
+        "email_postmark_message_stream",
+        "outbound",
+        now,
+    )?;
+    ensure_auth_setting(store, cache, "email_app_name", "Lux", now)?;
     if let Some(key) = config.initial_publishable_key.as_deref() {
         ensure_api_key(
             store,
@@ -1012,7 +1068,7 @@ fn recover(body: &str, store: &Store, cache: &SharedSchemaCache) -> (u16, &'stat
         if validate_user_active(&user, unix_seconds()).is_ok() {
             if let Some(user_id) = user.get("id") {
                 let redirect_to = auth_redirect_to_with_default(&parsed, &settings.site_url);
-                let _ = create_email_flow_token(
+                if let Err(response) = create_email_flow_token(
                     store,
                     cache,
                     "recovery",
@@ -1020,7 +1076,9 @@ fn recover(body: &str, store: &Store, cache: &SharedSchemaCache) -> (u16, &'stat
                     &email,
                     &redirect_to,
                     now,
-                );
+                ) {
+                    return response;
+                }
             }
         }
     }
@@ -1678,7 +1736,9 @@ fn admin_list_providers(store: &Store, cache: &SharedSchemaCache) -> (u16, &'sta
 
 fn admin_get_settings(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
     match auth_settings(store, cache, Instant::now()) {
-        Ok(settings) => ok(json!({"settings": auth_settings_json(&settings)})),
+        Ok(settings) => ok(
+            json!({"settings": auth_settings_json(&settings, store.config().auth.managed_email.as_ref())}),
+        ),
         Err(e) => error(400, "Bad Request", &e),
     }
 }
@@ -1696,6 +1756,24 @@ fn admin_update_settings(
         return error(400, "Bad Request", "settings payload must be an object");
     };
     let now = Instant::now();
+    let managed_email = store.config().auth.managed_email.as_ref();
+    if managed_email.is_some()
+        && [
+            "email_provider",
+            "email_from",
+            "email_reply_to",
+            "email_postmark_server_token",
+            "email_postmark_message_stream",
+        ]
+        .iter()
+        .any(|field| object.contains_key(*field))
+    {
+        return error(
+            400,
+            "Bad Request",
+            "managed email delivery settings cannot be changed on this project",
+        );
+    }
 
     if let Some(value) = object.get("email_confirmation_required") {
         let Some(enabled) = value.as_bool() else {
@@ -1748,6 +1826,50 @@ fn admin_update_settings(
         };
         if let Err(e) = set_auth_setting(store, cache, "site_url", site_url, now) {
             return error(400, "Bad Request", &e);
+        }
+    }
+
+    if let Some(value) = object.get("email_provider") {
+        let Some(provider) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) else {
+            return error(
+                400,
+                "Bad Request",
+                "email_provider must be a non-empty string",
+            );
+        };
+        let provider = provider.to_ascii_lowercase();
+        if !matches!(provider.as_str(), "console" | "log" | "postmark") {
+            return error(400, "Bad Request", "unsupported email_provider");
+        }
+        let provider = if provider == "log" {
+            "console".to_string()
+        } else {
+            provider
+        };
+        if let Err(e) = set_auth_setting(store, cache, "email_provider", &provider, now) {
+            return error(400, "Bad Request", &e);
+        }
+    }
+
+    for field in [
+        "email_from",
+        "email_reply_to",
+        "email_postmark_server_token",
+        "email_postmark_message_stream",
+        "email_app_name",
+        "email_from_name",
+    ] {
+        if let Some(value) = object.get(field) {
+            let Some(value) = optional_setting_string(value) else {
+                return error(
+                    400,
+                    "Bad Request",
+                    &format!("{field} must be a string or null"),
+                );
+            };
+            if let Err(e) = set_auth_setting(store, cache, field, &value, now) {
+                return error(400, "Bad Request", &e);
+            }
         }
     }
 
@@ -3335,8 +3457,181 @@ fn create_email_flow_token(
         now,
     )
     .map_err(|e| error(400, "Bad Request", &e))?;
-    eprintln!("Lux Auth {kind} link for {email}: {action_link}");
+    if let Err(e) = send_auth_email(store, &settings, kind, email, &action_link) {
+        let _ = durable_table_delete_where(
+            store,
+            cache,
+            FLOW_TOKENS_TABLE,
+            &["token_hash", "=", &hash_secret(&token)],
+            now,
+        );
+        return Err(error(502, "Bad Gateway", &e));
+    }
     Ok(token)
+}
+
+fn send_auth_email(
+    store: &Store,
+    settings: &AuthSettings,
+    kind: &str,
+    email: &str,
+    action_link: &str,
+) -> Result<(), String> {
+    validate_auth_email_settings(settings, store.config().auth.managed_email.as_ref())?;
+    let delivery = effective_email_delivery(settings, store.config().auth.managed_email.as_ref())?;
+    match delivery.provider.as_str() {
+        "console" | "log" => {
+            eprintln!("Lux Auth {kind} link for {email}: {action_link}");
+            Ok(())
+        }
+        "postmark" => {
+            let token = delivery
+                .postmark_server_token
+                .clone()
+                .ok_or_else(|| "postmark email delivery requires a server token".to_string())?;
+            let message = auth_email_message(kind, email, action_link, &delivery)?;
+            run_async_work(send_postmark_email(token, message))
+        }
+        _ => Err("unsupported email_provider".to_string()),
+    }
+}
+
+fn effective_email_delivery(
+    settings: &AuthSettings,
+    managed_email: Option<&AuthManagedEmailConfig>,
+) -> Result<EffectiveEmailDelivery, String> {
+    if let Some(managed) = managed_email {
+        let provider = managed.provider.trim().to_ascii_lowercase();
+        let from = apply_email_from_name(&managed.from, settings.email_from_name.as_deref());
+        return Ok(EffectiveEmailDelivery {
+            provider,
+            from: Some(from),
+            reply_to: managed.reply_to.clone(),
+            postmark_server_token: managed.postmark_server_token.clone(),
+            postmark_message_stream: managed
+                .postmark_message_stream
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "outbound".to_string()),
+            app_name: settings.email_app_name.clone(),
+        });
+    }
+    Ok(EffectiveEmailDelivery {
+        provider: settings.email_provider.clone(),
+        from: settings.email_from.clone(),
+        reply_to: settings.email_reply_to.clone(),
+        postmark_server_token: settings.email_postmark_server_token.clone(),
+        postmark_message_stream: settings.email_postmark_message_stream.clone(),
+        app_name: settings.email_app_name.clone(),
+    })
+}
+
+fn auth_email_message(
+    kind: &str,
+    email: &str,
+    action_link: &str,
+    delivery: &EffectiveEmailDelivery,
+) -> Result<AuthEmailMessage, String> {
+    let from = delivery
+        .from
+        .clone()
+        .ok_or_else(|| "email delivery requires a from address".to_string())?;
+    let app_name = delivery.app_name.trim();
+    let app_name = if app_name.is_empty() { "Lux" } else { app_name };
+    let (subject, text_intro, html_heading) = match kind {
+        "signup" => (
+            format!("Confirm your email for {app_name}"),
+            format!("Confirm your email for {app_name} by opening this link:"),
+            "Confirm your email",
+        ),
+        "recovery" => (
+            format!("Reset your password for {app_name}"),
+            format!("Reset your password for {app_name} by opening this link:"),
+            "Reset your password",
+        ),
+        _ => (
+            format!("Continue signing in to {app_name}"),
+            format!("Continue signing in to {app_name} by opening this link:"),
+            "Continue signing in",
+        ),
+    };
+    let escaped_link = html_escape(action_link);
+    let escaped_heading = html_escape(html_heading);
+    let escaped_app = html_escape(app_name);
+    Ok(AuthEmailMessage {
+        from,
+        to: email.to_string(),
+        reply_to: delivery.reply_to.clone(),
+        subject,
+        text_body: format!("{text_intro}\n\n{action_link}\n\nIf you did not request this, you can ignore this email."),
+        html_body: format!(
+            "<h2>{escaped_heading}</h2><p>Use this link to continue with {escaped_app}:</p><p><a href=\"{escaped_link}\">{escaped_link}</a></p><p>If you did not request this, you can ignore this email.</p>"
+        ),
+        message_stream: delivery.postmark_message_stream.clone(),
+    })
+}
+
+fn postmark_payload(message: &AuthEmailMessage) -> PostmarkEmailPayload {
+    PostmarkEmailPayload {
+        from: message.from.clone(),
+        to: message.to.clone(),
+        subject: message.subject.clone(),
+        text_body: message.text_body.clone(),
+        html_body: message.html_body.clone(),
+        message_stream: message.message_stream.clone(),
+        reply_to: message.reply_to.clone(),
+    }
+}
+
+async fn send_postmark_email(
+    server_token: String,
+    message: AuthEmailMessage,
+) -> Result<(), String> {
+    let response = reqwest::Client::new()
+        .post("https://api.postmarkapp.com/email")
+        .header("Accept", "application/json")
+        .header("X-Postmark-Server-Token", server_token)
+        .json(&postmark_payload(&message))
+        .send()
+        .await
+        .map_err(|_| "postmark email request failed".to_string())?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "postmark email request failed with status {}",
+            response.status().as_u16()
+        ))
+    }
+}
+
+fn apply_email_from_name(from: &str, from_name: Option<&str>) -> String {
+    let Some(name) = from_name.map(str::trim).filter(|value| !value.is_empty()) else {
+        return sanitize_header_value(from);
+    };
+    let safe_name = sanitize_header_value(name)
+        .replace(['<', '>'], "")
+        .trim()
+        .to_string();
+    if safe_name.is_empty() {
+        return sanitize_header_value(from);
+    }
+    let safe_from = sanitize_header_value(from);
+    if let Some((_, rest)) = safe_from.split_once('<') {
+        if let Some((address, _)) = rest.split_once('>') {
+            return format!("{safe_name} <{}>", address.trim());
+        }
+    }
+    format!("{safe_name} <{}>", safe_from.trim())
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn create_flow_token(
@@ -3370,12 +3665,36 @@ fn create_flow_token(
     Ok(token)
 }
 
-fn auth_settings_json(settings: &AuthSettings) -> Value {
+fn auth_settings_json(
+    settings: &AuthSettings,
+    managed_email: Option<&AuthManagedEmailConfig>,
+) -> Value {
+    let managed = managed_email.is_some();
     json!({
         "email_confirmation_required": settings.email_confirmation_required,
         "flow_token_ttl_seconds": settings.flow_token_ttl.as_secs(),
         "site_url": settings.site_url,
+        "email_provider": if managed { "managed" } else { settings.email_provider.as_str() },
+        "email_delivery_managed": managed,
+        "email_delivery_configured": managed || matches!(settings.email_provider.as_str(), "console" | "log") || settings.email_postmark_server_token.is_some(),
+        "email_from": if managed { Value::Null } else { optional_string_json(settings.email_from.as_deref()) },
+        "email_reply_to": if managed { Value::Null } else { optional_string_json(settings.email_reply_to.as_deref()) },
+        "email_postmark_message_stream": if managed {
+            Value::Null
+        } else {
+            Value::String(settings.email_postmark_message_stream.clone())
+        },
+        "has_email_postmark_server_token": !managed && settings.email_postmark_server_token.is_some(),
+        "email_app_name": settings.email_app_name,
+        "email_from_name": optional_string_json(settings.email_from_name.as_deref()),
     })
+}
+
+fn optional_string_json(value: Option<&str>) -> Value {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| Value::String(value.to_string()))
+        .unwrap_or(Value::Null)
 }
 
 fn ensure_auth_setting(
@@ -3448,6 +3767,41 @@ fn auth_settings(
         site_url: auth_setting_value(store, cache, "site_url", now)?
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| store.config().auth.site_url.clone()),
+        email_provider: auth_setting_value(store, cache, "email_provider", now)?
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.to_ascii_lowercase())
+            .map(|value| {
+                if value == "log" {
+                    "console".to_string()
+                } else {
+                    value
+                }
+            })
+            .unwrap_or_else(|| "console".to_string()),
+        email_from: auth_setting_value(store, cache, "email_from", now)?
+            .filter(|value| !value.trim().is_empty()),
+        email_reply_to: auth_setting_value(store, cache, "email_reply_to", now)?
+            .filter(|value| !value.trim().is_empty()),
+        email_postmark_server_token: auth_setting_value(
+            store,
+            cache,
+            "email_postmark_server_token",
+            now,
+        )?
+        .filter(|value| !value.trim().is_empty()),
+        email_postmark_message_stream: auth_setting_value(
+            store,
+            cache,
+            "email_postmark_message_stream",
+            now,
+        )?
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "outbound".to_string()),
+        email_app_name: auth_setting_value(store, cache, "email_app_name", now)?
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "Lux".to_string()),
+        email_from_name: auth_setting_value(store, cache, "email_from_name", now)?
+            .filter(|value| !value.trim().is_empty()),
     })
 }
 
@@ -3468,6 +3822,52 @@ fn parse_setting_bool(value: &str) -> bool {
         value.to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn optional_setting_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.trim().to_string()),
+        Value::Null => Some(String::new()),
+        _ => None,
+    }
+}
+
+fn validate_auth_email_settings(
+    settings: &AuthSettings,
+    managed_email: Option<&AuthManagedEmailConfig>,
+) -> Result<(), String> {
+    if let Some(managed) = managed_email {
+        if managed.provider.trim().eq_ignore_ascii_case("postmark")
+            && managed
+                .postmark_server_token
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+        {
+            return Err("managed postmark email delivery requires a server token".to_string());
+        }
+        return Ok(());
+    }
+    match settings.email_provider.as_str() {
+        "console" | "log" => Ok(()),
+        "postmark" => {
+            if settings.email_from.as_deref().unwrap_or("").is_empty() {
+                return Err("postmark email delivery requires email_from".to_string());
+            }
+            if settings
+                .email_postmark_server_token
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(
+                    "postmark email delivery requires email_postmark_server_token".to_string(),
+                );
+            }
+            Ok(())
+        }
+        _ => Err("unsupported email_provider".to_string()),
+    }
 }
 
 fn consume_flow_token(
@@ -4112,6 +4512,32 @@ where
     }
 }
 
+fn run_async_work<T, F>(future: F) -> T
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            block_in_place(|| handle.block_on(future))
+        }
+        Ok(_) => std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build auth email runtime")
+                .block_on(future)
+        })
+        .join()
+        .expect("auth email runtime thread panicked"),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build auth email runtime")
+            .block_on(future),
+    }
+}
+
 fn hash_secret(secret: &str) -> String {
     let digest = Sha256::digest(secret.as_bytes());
     let mut out = String::with_capacity(digest.len() * 2);
@@ -4628,12 +5054,20 @@ mod tests {
             enabled: true,
             initial_publishable_key: Some("lux_pub_secret".to_string()),
             initial_secret_key: Some("lux_sec_secret".to_string()),
+            managed_email: Some(crate::AuthManagedEmailConfig {
+                provider: "postmark".to_string(),
+                from: "auth@app.test".to_string(),
+                reply_to: None,
+                postmark_server_token: Some("pm_secret".to_string()),
+                postmark_message_stream: None,
+            }),
             ..AuthConfig::default()
         };
         let debug = format!("{config:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("lux_pub_secret"));
         assert!(!debug.contains("lux_sec_secret"));
+        assert!(!debug.contains("pm_secret"));
     }
 
     #[test]
@@ -4897,6 +5331,217 @@ mod tests {
                 .starts_with("http://updated.test/auth?token_hash="),
             "{metadata}"
         );
+    }
+
+    #[test]
+    fn postmark_payload_renders_builtin_signup_and_recovery_emails() {
+        let delivery = EffectiveEmailDelivery {
+            provider: "postmark".to_string(),
+            from: Some("Auth <auth@app.test>".to_string()),
+            reply_to: Some("support@app.test".to_string()),
+            postmark_server_token: Some("server-token".to_string()),
+            postmark_message_stream: "outbound".to_string(),
+            app_name: "Pompeii".to_string(),
+        };
+
+        let signup = auth_email_message(
+            "signup",
+            "user@app.test",
+            "http://app.test/confirm",
+            &delivery,
+        )
+        .unwrap();
+        let signup_payload = postmark_payload(&signup);
+        assert_eq!(signup_payload.from, "Auth <auth@app.test>");
+        assert_eq!(signup_payload.to, "user@app.test");
+        assert_eq!(signup_payload.reply_to.as_deref(), Some("support@app.test"));
+        assert_eq!(signup_payload.subject, "Confirm your email for Pompeii");
+        assert!(signup_payload.text_body.contains("http://app.test/confirm"));
+        assert!(signup_payload.html_body.contains("Confirm your email"));
+
+        let recovery = auth_email_message(
+            "recovery",
+            "user@app.test",
+            "http://app.test/reset",
+            &delivery,
+        )
+        .unwrap();
+        let recovery_payload = postmark_payload(&recovery);
+        assert_eq!(recovery_payload.subject, "Reset your password for Pompeii");
+        assert!(recovery_payload.text_body.contains("http://app.test/reset"));
+        assert!(recovery_payload.html_body.contains("Reset your password"));
+    }
+
+    #[test]
+    fn admin_settings_redacts_and_preserves_postmark_token() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                initial_secret_key: Some("lux_sec_test".to_string()),
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let (status, _, body) = route_http(
+            "PATCH",
+            "/auth/v1/admin/settings",
+            r#"{"email_provider":"postmark","email_from":"Auth <auth@app.test>","email_postmark_server_token":"server-token","email_postmark_message_stream":"outbound","email_app_name":"Pompeii"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "settings update: {body}");
+        assert!(!body.contains("server-token"), "{body}");
+        let settings: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(settings["settings"]["email_provider"], "postmark");
+        assert_eq!(
+            settings["settings"]["has_email_postmark_server_token"],
+            true
+        );
+
+        let (status, _, body) = route_http(
+            "PATCH",
+            "/auth/v1/admin/settings",
+            r#"{"email_app_name":"Pompeii AI"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "settings update without token: {body}");
+        let settings: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            settings["settings"]["has_email_postmark_server_token"],
+            true
+        );
+        assert_eq!(settings["settings"]["email_app_name"], "Pompeii AI");
+        assert!(!body.contains("server-token"), "{body}");
+    }
+
+    #[test]
+    fn signup_delivery_failure_invalidates_flow_token() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                initial_secret_key: Some("lux_sec_test".to_string()),
+                email_confirmation_required: true,
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let (status, _, body) = route_http(
+            "PATCH",
+            "/auth/v1/admin/settings",
+            r#"{"email_provider":"postmark","email_from":"Auth <auth@app.test>"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "settings update: {body}");
+
+        let (status, _, body) = route_http(
+            "POST",
+            "/auth/v1/signup",
+            r#"{"email":"sendfail@example.com","password":"password123"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(
+            status, 502,
+            "signup should fail when delivery fails: {body}"
+        );
+        assert!(
+            find_rows_by_field(
+                &store,
+                &cache,
+                FLOW_TOKENS_TABLE,
+                "email",
+                "sendfail@example.com",
+                Instant::now(),
+            )
+            .unwrap()
+            .is_empty(),
+            "unsent flow token should be removed"
+        );
+    }
+
+    #[test]
+    fn managed_email_delivery_overrides_project_provider_settings() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                initial_secret_key: Some("lux_sec_test".to_string()),
+                managed_email: Some(crate::AuthManagedEmailConfig {
+                    provider: "postmark".to_string(),
+                    from: "managed@app.test".to_string(),
+                    reply_to: None,
+                    postmark_server_token: Some("managed-token".to_string()),
+                    postmark_message_stream: Some("broadcast".to_string()),
+                }),
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let (status, _, body) = route_http(
+            "PATCH",
+            "/auth/v1/admin/settings",
+            r#"{"email_provider":"postmark"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 400, "managed provider should be immutable: {body}");
+
+        let (status, _, body) = route_http(
+            "PATCH",
+            "/auth/v1/admin/settings",
+            r#"{"email_from_name":"Pompeii","email_app_name":"Pompeii"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "safe branding update: {body}");
+        let settings_json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(settings_json["settings"]["email_provider"], "managed");
+        assert_eq!(settings_json["settings"]["email_delivery_managed"], true);
+        assert_eq!(
+            settings_json["settings"]["has_email_postmark_server_token"],
+            false
+        );
+        assert!(!body.contains("managed-token"), "{body}");
+
+        let settings = auth_settings(&store, &cache, Instant::now()).unwrap();
+        let delivery =
+            effective_email_delivery(&settings, store.config().auth.managed_email.as_ref())
+                .unwrap();
+        assert_eq!(delivery.provider, "postmark");
+        assert_eq!(delivery.from.as_deref(), Some("Pompeii <managed@app.test>"));
+        assert_eq!(
+            delivery.postmark_server_token.as_deref(),
+            Some("managed-token")
+        );
+        assert_eq!(delivery.postmark_message_stream, "broadcast");
     }
 
     #[test]
