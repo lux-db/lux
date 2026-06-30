@@ -2441,10 +2441,17 @@ pub(crate) fn put_grant(
     now: Instant,
 ) -> Result<(), String> {
     ensure_grants_table(store, cache, now)?;
-    let predicate = crate::grants::predicate_to_string(&grant.predicate);
     let created = unix_seconds().to_string();
     for scope in &grant.scopes {
         let id = format!("{}:{}", grant.table, scope.as_str());
+        let predicate = match load_grant_predicate(store, cache, &grant.table, *scope, now)? {
+            Some(mut predicate) => {
+                predicate.append_alternatives(&grant.predicate);
+                predicate
+            }
+            None => grant.predicate.clone(),
+        };
+        let predicate = crate::grants::predicate_to_string(&predicate);
         let _ =
             tables::table_delete_where(store, cache, GRANTS_TABLE, &["id", "=", id.as_str()], now);
         tables::table_insert(
@@ -2504,8 +2511,8 @@ fn load_grant_predicate(
 fn resolve_for_principal(
     pred: &crate::grants::Predicate,
     principal: &AuthPrincipal,
-) -> Result<Vec<crate::grants::ResolvedCondition>, String> {
-    crate::grants::resolve(pred, &principal.user_id, |claim| match claim {
+) -> Result<Vec<Vec<crate::grants::ResolvedCondition>>, String> {
+    crate::grants::resolve_clauses(pred, &principal.user_id, |claim| match claim {
         "role" => Some(principal.role.clone()),
         "email" => Some(principal.email.clone()),
         "sub" | "uid" => Some(principal.user_id.clone()),
@@ -2513,18 +2520,54 @@ fn resolve_for_principal(
     })
 }
 
-/// Convert a subquery's resolved inner conditions into query `WhereClause`s.
-fn inner_conds_to_where(conds: &[crate::grants::ResolvedCond]) -> Result<Vec<WhereClause>, String> {
-    conds
-        .iter()
-        .map(|rc| {
-            Ok(WhereClause::single(
-                rc.column.clone(),
-                tables::parse_cmp_op(&rc.op)?,
-                rc.value.clone(),
-            ))
-        })
-        .collect()
+/// Convert a subquery's enforced inner conditions into query `WhereClause`s.
+fn inner_conds_to_where(
+    conds: &[crate::grants::EnforcedCondition],
+) -> Result<Vec<WhereClause>, String> {
+    use crate::grants::EnforcedCondition;
+    let mut out = Vec::new();
+    for cond in conds {
+        match cond {
+            EnforcedCondition::Cmp(rc) => {
+                out.push(WhereClause::single(
+                    rc.column.clone(),
+                    tables::parse_cmp_op(&rc.op)?,
+                    rc.value.clone(),
+                ));
+            }
+            EnforcedCondition::InSet {
+                column,
+                negated,
+                values,
+            } => {
+                if values.is_empty() {
+                    if !negated {
+                        out.push(WhereClause::single(
+                            column.clone(),
+                            tables::CmpOp::IsNull,
+                            String::new(),
+                        ));
+                        out.push(WhereClause::single(
+                            column.clone(),
+                            tables::CmpOp::IsNotNull,
+                            String::new(),
+                        ));
+                    }
+                } else {
+                    out.push(WhereClause::in_list(
+                        column.clone(),
+                        if *negated {
+                            tables::CmpOp::NotIn
+                        } else {
+                            tables::CmpOp::In
+                        },
+                        values.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Execute any subquery conditions (once) against the store, turning resolved
@@ -2551,7 +2594,8 @@ fn execute_resolved(
                 if let Some(err) = reserved_table_access_error(&inner_table) {
                     return Err(err);
                 }
-                let where_clauses = inner_conds_to_where(&inner_conds)?;
+                let inner_enforced = execute_resolved(store, cache, inner_conds, now)?;
+                let where_clauses = inner_conds_to_where(&inner_enforced)?;
                 let values = tables::scan_projected_column(
                     store,
                     cache,
@@ -2571,6 +2615,39 @@ fn execute_resolved(
     Ok(out)
 }
 
+fn execute_resolved_clauses(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    clauses: Vec<Vec<crate::grants::ResolvedCondition>>,
+    now: Instant,
+) -> Result<Vec<Vec<crate::grants::EnforcedCondition>>, String> {
+    clauses
+        .into_iter()
+        .map(|conds| execute_resolved(store, cache, conds, now))
+        .collect()
+}
+
+fn collect_resolved_subquery_tables(
+    clauses: &[Vec<crate::grants::ResolvedCondition>],
+    tables: &mut Vec<String>,
+) {
+    for conds in clauses {
+        for condition in conds {
+            if let crate::grants::ResolvedCondition::InSubqueryResolved {
+                inner_table,
+                inner_conds,
+                ..
+            } = condition
+            {
+                if !tables.iter().any(|table| table == inner_table) {
+                    tables.push(inner_table.clone());
+                }
+                collect_resolved_subquery_tables(std::slice::from_ref(inner_conds), tables);
+            }
+        }
+    }
+}
+
 /// Render enforced conditions into a WHERE fragment that the query path ANDs
 /// onto the caller's own WHERE (RLS `USING`). `IN`/`NOT IN` sets render as
 /// `col IN ( a b c )` - the engine's WHERE parser already handles these.
@@ -2581,7 +2658,7 @@ fn execute_resolved(
 ///   render an always-false, type-agnostic contradiction `col IS NULL AND col
 ///   IS NOT NULL` so the query matches nothing.
 /// - empty negated set (`NOT IN ( )` matches everything): omit it.
-fn render_enforced(conds: &[crate::grants::EnforcedCondition]) -> String {
+fn render_enforced_clause(conds: &[crate::grants::EnforcedCondition]) -> String {
     use crate::grants::EnforcedCondition;
     let mut parts: Vec<String> = Vec::new();
     for c in conds {
@@ -2609,6 +2686,76 @@ fn render_enforced(conds: &[crate::grants::EnforcedCondition]) -> String {
     parts.join(" AND ")
 }
 
+fn collapse_or_clauses(
+    clauses: &[Vec<crate::grants::EnforcedCondition>],
+) -> Result<Option<crate::grants::EnforcedCondition>, String> {
+    use crate::grants::EnforcedCondition;
+    let mut column: Option<String> = None;
+    let mut values: Vec<String> = Vec::new();
+    for clause in clauses {
+        if clause.is_empty() {
+            return Ok(None);
+        }
+        if clause.len() != 1 {
+            return Err(
+                "OR grants with multi-condition branches are not supported yet".to_string(),
+            );
+        }
+        match &clause[0] {
+            EnforcedCondition::Cmp(rc) if rc.op == "=" => {
+                if column.as_deref().is_some_and(|c| c != rc.column) {
+                    return Err("OR grants must target the same column".to_string());
+                }
+                column.get_or_insert_with(|| rc.column.clone());
+                if !values.iter().any(|value| value == &rc.value) {
+                    values.push(rc.value.clone());
+                }
+            }
+            EnforcedCondition::InSet {
+                column: c,
+                negated: false,
+                values: set,
+            } => {
+                if column.as_deref().is_some_and(|column| column != c) {
+                    return Err("OR grants must target the same column".to_string());
+                }
+                column.get_or_insert_with(|| c.clone());
+                for value in set {
+                    if !values.iter().any(|existing| existing == value) {
+                        values.push(value.clone());
+                    }
+                }
+            }
+            _ => {
+                return Err(
+                    "OR grants only support '=' and positive IN branches on the same column"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let Some(column) = column else {
+        return Ok(None);
+    };
+    Ok(Some(EnforcedCondition::InSet {
+        column,
+        negated: false,
+        values,
+    }))
+}
+
+fn render_enforced_clauses(
+    clauses: &[Vec<crate::grants::EnforcedCondition>],
+) -> Result<String, String> {
+    if clauses.len() == 1 {
+        return Ok(render_enforced_clause(&clauses[0]));
+    }
+    match collapse_or_clauses(clauses)? {
+        Some(cond) => Ok(render_enforced_clause(&[cond])),
+        None => Ok(String::new()),
+    }
+}
+
 /// Resolve + execute the grant for `(table, scope)` into enforced conditions.
 /// `Ok(None)` means no grant exists (deny-by-default).
 fn enforced_conds(
@@ -2618,12 +2765,12 @@ fn enforced_conds(
     table: &str,
     scope: crate::grants::Scope,
     now: Instant,
-) -> Result<Option<Vec<crate::grants::EnforcedCondition>>, String> {
+) -> Result<Option<Vec<Vec<crate::grants::EnforcedCondition>>>, String> {
     let Some(pred) = load_grant_predicate(store, cache, table, scope, now)? else {
         return Ok(None);
     };
     let resolved = resolve_for_principal(&pred, principal)?;
-    Ok(Some(execute_resolved(store, cache, resolved, now)?))
+    Ok(Some(execute_resolved_clauses(store, cache, resolved, now)?))
 }
 
 /// Resolve the READ grant for `principal` into a WHERE filter fragment that
@@ -2649,7 +2796,7 @@ pub(crate) fn read_filter(
     else {
         return Err(format!("no read access to '{table}'"));
     };
-    Ok(render_enforced(&conds))
+    render_enforced_clauses(&conds)
 }
 
 /// Like `read_filter`, but returns the resolved conditions as structured tuples
@@ -2674,7 +2821,13 @@ pub(crate) fn read_filter_conds(
     else {
         return Err(format!("no read access to '{table}'"));
     };
-    Ok(conds)
+    if conds.len() == 1 {
+        return Ok(conds.into_iter().next().unwrap_or_default());
+    }
+    match collapse_or_clauses(&conds)? {
+        Some(cond) => Ok(vec![cond]),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Return tables consulted by READ-grant membership subqueries. Live queries
@@ -2693,14 +2846,7 @@ pub(crate) fn read_filter_dependencies(
     };
     let resolved = resolve_for_principal(&pred, principal)?;
     let mut tables = Vec::new();
-    for condition in resolved {
-        if let crate::grants::ResolvedCondition::InSubqueryResolved { inner_table, .. } = condition
-        {
-            if !tables.iter().any(|table| table == &inner_table) {
-                tables.push(inner_table);
-            }
-        }
-    }
+    collect_resolved_subquery_tables(&resolved, &mut tables);
     Ok(tables)
 }
 
@@ -2724,7 +2870,10 @@ pub(crate) fn check_write_row(
     else {
         return Err(format!("no write access to '{table}'"));
     };
-    if crate::grants::enforced_row_satisfies(&conds, row_value) {
+    if conds
+        .iter()
+        .any(|clause| crate::grants::enforced_row_satisfies(clause, &row_value))
+    {
         Ok(())
     } else {
         Err(format!("row not permitted by write grant on '{table}'"))
@@ -2756,7 +2905,10 @@ pub(crate) fn check_update_set(
     else {
         return Err(format!("no write access to '{table}'"));
     };
-    if crate::grants::enforced_set_satisfies(&conds, set_fields) {
+    if conds
+        .iter()
+        .any(|clause| crate::grants::enforced_set_satisfies(clause, set_fields))
+    {
         Ok(())
     } else {
         Err(format!(
@@ -2788,7 +2940,7 @@ pub(crate) fn write_filter(
     else {
         return Err(format!("no write access to '{table}'"));
     };
-    Ok(render_enforced(&conds))
+    render_enforced_clauses(&conds)
 }
 
 fn find_rows_by_field(
@@ -3204,6 +3356,203 @@ mod tests {
         delete_grant(&store, &cache, "messages", crate::grants::Scope::Read, now).unwrap();
         // After revoke -> deny-by-default.
         assert!(read_filter(&store, &cache, &p, "messages", now).is_err());
+    }
+
+    #[test]
+    fn nested_membership_subquery_read_filter_resolves() {
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "profiles",
+            &["id", "STR", "PRIMARY", "KEY,", "name", "STR"],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "members",
+            &[
+                "id", "STR", "PRIMARY", "KEY,", "user_id", "STR,", "team_id", "STR",
+            ],
+            now,
+        )
+        .unwrap();
+        for (id, name) in [("alice", "Alice"), ("bob", "Bob"), ("cyd", "Cyd")] {
+            crate::tables::table_insert(
+                &store,
+                &cache,
+                "profiles",
+                &[("id", id), ("name", name)],
+                now,
+            )
+            .unwrap();
+        }
+        for (id, uid, team) in [
+            ("1", "alice", "team-a"),
+            ("2", "bob", "team-a"),
+            ("3", "cyd", "team-b"),
+        ] {
+            crate::tables::table_insert(
+                &store,
+                &cache,
+                "members",
+                &[("id", id), ("user_id", uid), ("team_id", team)],
+                now,
+            )
+            .unwrap();
+        }
+        grant(
+            &store,
+            &cache,
+            &[
+                "read",
+                "ON",
+                "profiles",
+                "WHERE",
+                "id",
+                "IN",
+                "(",
+                "SELECT",
+                "user_id",
+                "FROM",
+                "members",
+                "WHERE",
+                "team_id",
+                "IN",
+                "(",
+                "SELECT",
+                "team_id",
+                "FROM",
+                "members",
+                "WHERE",
+                "user_id",
+                "=",
+                "auth.uid()",
+                ")",
+                ")",
+            ],
+            now,
+        );
+        let filter = read_filter(&store, &cache, &principal("alice"), "profiles", now).unwrap();
+        assert!(filter.starts_with("id IN ( "), "got: {filter}");
+        assert!(filter.contains("alice"), "got: {filter}");
+        assert!(filter.contains("bob"), "got: {filter}");
+        assert!(!filter.contains("cyd"), "got: {filter}");
+
+        let deps =
+            read_filter_dependencies(&store, &cache, &principal("alice"), "profiles", now).unwrap();
+        assert_eq!(deps, vec!["members".to_string()]);
+    }
+
+    #[test]
+    fn repeated_profile_read_grants_accumulate_as_alternatives() {
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "profiles",
+            &["id", "STR", "PRIMARY", "KEY,", "name", "STR"],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "members",
+            &[
+                "id", "STR", "PRIMARY", "KEY,", "user_id", "STR,", "team_id", "STR",
+            ],
+            now,
+        )
+        .unwrap();
+
+        grant(
+            &store,
+            &cache,
+            &[
+                "read,",
+                "write",
+                "ON",
+                "profiles",
+                "WHERE",
+                "id",
+                "=",
+                "auth.uid()",
+            ],
+            now,
+        );
+        grant(
+            &store,
+            &cache,
+            &[
+                "read",
+                "ON",
+                "profiles",
+                "WHERE",
+                "id",
+                "IN",
+                "(",
+                "SELECT",
+                "user_id",
+                "FROM",
+                "members",
+                "WHERE",
+                "team_id",
+                "IN",
+                "(",
+                "SELECT",
+                "team_id",
+                "FROM",
+                "members",
+                "WHERE",
+                "user_id",
+                "=",
+                "auth.uid()",
+                ")",
+                ")",
+            ],
+            now,
+        );
+
+        let alice_filter =
+            read_filter(&store, &cache, &principal("alice"), "profiles", now).unwrap();
+        assert_eq!(alice_filter, "id IN ( alice )");
+        assert_eq!(
+            write_filter(&store, &cache, &principal("alice"), "profiles", now).unwrap(),
+            "id = alice"
+        );
+
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "members",
+            &[("id", "1"), ("user_id", "alice"), ("team_id", "team-a")],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "members",
+            &[("id", "2"), ("user_id", "bob"), ("team_id", "team-a")],
+            now,
+        )
+        .unwrap();
+
+        let teamed_filter =
+            read_filter(&store, &cache, &principal("alice"), "profiles", now).unwrap();
+        assert!(
+            teamed_filter.starts_with("id IN ( "),
+            "got: {teamed_filter}"
+        );
+        assert!(teamed_filter.contains("alice"), "got: {teamed_filter}");
+        assert!(teamed_filter.contains("bob"), "got: {teamed_filter}");
     }
 
     // ── RLS auto-filter (USING) coverage ──
