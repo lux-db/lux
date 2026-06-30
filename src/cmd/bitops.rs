@@ -7,7 +7,6 @@ use crate::store::Store;
 use super::{arg_str, cmd_eq, parse_i64, CmdResult};
 
 const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
-const VALUE_TOO_LARGE_ERR: &str = "ERR string exceeds maximum allowed size";
 
 fn parse_i64_arg(arg: &[u8], out: &mut BytesMut) -> Option<i64> {
     match parse_i64(arg) {
@@ -42,7 +41,7 @@ pub fn cmd_setbit(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
     // A bit offset implies a byte string of (offset/8 + 1) bytes. Cap it so a
     // huge SETBIT offset can't allocate an enormous backing string.
     if (offset / 8) as usize + 1 > store.config().max_resp_request {
-        resp::write_error(out, VALUE_TOO_LARGE_ERR);
+        resp::write_error(out, "ERR bit offset is not an integer or out of range");
         return CmdResult::Written;
     }
     match store.setbit(args[1], offset, value, now) {

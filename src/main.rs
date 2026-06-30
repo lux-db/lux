@@ -68,6 +68,7 @@ async fn async_main() -> std::io::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(30 * 24 * 60 * 60);
+    let managed_email = managed_auth_email_from_env();
 
     let config = lux::ServerConfig {
         bind_host: std::env::var("LUX_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
@@ -123,12 +124,26 @@ async fn async_main() -> std::io::Result<()> {
                 let v = v.to_ascii_lowercase();
                 !(v == "0" || v == "false")
             }),
+            email_confirmation_required: std::env::var("LUX_AUTH_EMAIL_CONFIRMATION_REQUIRED")
+                .is_ok_and(|v| {
+                    let v = v.to_ascii_lowercase();
+                    v == "1" || v == "true"
+                }),
             anonymous_enabled: std::env::var("LUX_AUTH_ANONYMOUS").map_or(true, |v| {
                 let v = v.to_ascii_lowercase();
                 !(v == "0" || v == "false")
             }),
+            flow_token_ttl: std::time::Duration::from_secs(
+                std::env::var("LUX_AUTH_FLOW_TOKEN_TTL_SECONDS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(24 * 60 * 60),
+            ),
+            site_url: std::env::var("LUX_AUTH_SITE_URL")
+                .unwrap_or_else(|_| "http://localhost:7379".to_string()),
             initial_publishable_key: std::env::var("LUX_AUTH_PUBLISHABLE_KEY").ok(),
             initial_secret_key: std::env::var("LUX_AUTH_SECRET_KEY").ok(),
+            managed_email,
         },
         // The library is quiet by default; the binary maps severity-specific
         // callbacks back to the previous stdout/stderr behavior.
@@ -144,6 +159,21 @@ async fn async_main() -> std::io::Result<()> {
         println!("lux v{} ready", env!("CARGO_PKG_VERSION"));
     }
     handle.wait().await
+}
+
+fn managed_auth_email_from_env() -> Option<lux::AuthManagedEmailConfig> {
+    let token = std::env::var("LUX_AUTH_MANAGED_POSTMARK_SERVER_TOKEN").ok();
+    let provider = std::env::var("LUX_AUTH_MANAGED_EMAIL_PROVIDER")
+        .ok()
+        .or_else(|| token.as_ref().map(|_| "postmark".to_string()))?;
+    let from = std::env::var("LUX_AUTH_MANAGED_EMAIL_FROM").ok()?;
+    Some(lux::AuthManagedEmailConfig {
+        provider,
+        from,
+        reply_to: std::env::var("LUX_AUTH_MANAGED_EMAIL_REPLY_TO").ok(),
+        postmark_server_token: token,
+        postmark_message_stream: std::env::var("LUX_AUTH_MANAGED_POSTMARK_MESSAGE_STREAM").ok(),
+    })
 }
 
 fn print_info_event(event: lux::ServerInfoEvent) {

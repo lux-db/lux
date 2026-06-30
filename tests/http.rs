@@ -3,6 +3,8 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 
+use jsonwebtoken::decode_header;
+
 mod common;
 use common::{http_request, http_request_with_headers, read_all, resp_cmd, LuxServer};
 
@@ -297,6 +299,130 @@ fn http_auth_signup_login_user_logout_and_admin_routes() {
     assert_eq!(
         status, 401,
         "revoked refresh token should not refresh: {refresh_body}"
+    );
+}
+
+#[test]
+fn http_auth_admin_crud_preserves_imported_users_without_session() {
+    let server = LuxServer::builder()
+        .http()
+        .password("rootsecret")
+        .env("LUX_AUTH_ENABLED", "true")
+        .start();
+    let http = server.http_port();
+    let imported_id = "018f8d64-9000-7000-8000-000000000123";
+    let bcrypt_hash = bcrypt::hash("password123", 4).unwrap();
+
+    let (status, create_body) = http_request(
+        http,
+        "POST",
+        "/auth/v1/admin/users",
+        Some(&format!(
+            r#"{{
+                "id":"{imported_id}",
+                "email":"imported@example.com",
+                "encrypted_password":"{bcrypt_hash}",
+                "email_confirmed":true,
+                "user_metadata":{{"source":"migration"}}
+            }}"#
+        )),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "admin create: {create_body}");
+    let created: serde_json::Value = serde_json::from_str(&create_body).unwrap();
+    assert_eq!(created["user"]["id"], imported_id);
+    assert_eq!(created["user"]["email"], "imported@example.com");
+    assert_eq!(created["access_token"], serde_json::Value::Null);
+
+    let (status, get_body) = http_request(
+        http,
+        "GET",
+        &format!("/auth/v1/admin/users/{imported_id}"),
+        None,
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "admin get: {get_body}");
+    assert!(get_body.contains("migration"), "{get_body}");
+
+    let (status, login_body) = http_request(
+        http,
+        "POST",
+        "/auth/v1/token",
+        Some(
+            r#"{"grant_type":"password","email":"imported@example.com","password":"password123"}"#,
+        ),
+        None,
+    );
+    assert_eq!(status, 200, "bcrypt imported login: {login_body}");
+    let login: serde_json::Value = serde_json::from_str(&login_body).unwrap();
+    assert_eq!(login["user"]["id"], imported_id);
+
+    let (status, update_body) = http_request(
+        http,
+        "PATCH",
+        &format!("/auth/v1/admin/users/{imported_id}"),
+        Some(r#"{"email":"renamed@example.com","user_metadata":{"source":"updated"}}"#),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "admin update: {update_body}");
+    let updated: serde_json::Value = serde_json::from_str(&update_body).unwrap();
+    assert_eq!(updated["user"]["email"], "renamed@example.com");
+    assert_eq!(updated["user"]["user_metadata"]["source"], "updated");
+
+    let (status, delete_body) = http_request(
+        http,
+        "DELETE",
+        &format!("/auth/v1/admin/users/{imported_id}"),
+        None,
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "admin delete: {delete_body}");
+
+    let (status, missing_body) = http_request(
+        http,
+        "GET",
+        &format!("/auth/v1/admin/users/{imported_id}"),
+        None,
+        Some("rootsecret"),
+    );
+    assert_eq!(
+        status, 404,
+        "deleted user should be missing: {missing_body}"
+    );
+}
+
+#[test]
+fn http_auth_tokens_are_es256_and_jwks_exposes_public_key() {
+    let server = LuxServer::builder()
+        .http()
+        .password("rootsecret")
+        .env("LUX_AUTH_ENABLED", "true")
+        .start();
+    let http = server.http_port();
+
+    let (status, signup_body) = http_request(
+        http,
+        "POST",
+        "/auth/v1/signup",
+        Some(r#"{"email":"jwks@example.com","password":"password123"}"#),
+        None,
+    );
+    assert_eq!(status, 200, "signup: {signup_body}");
+    let signup: serde_json::Value = serde_json::from_str(&signup_body).unwrap();
+    let access = signup["access_token"].as_str().unwrap();
+    let header = decode_header(access).unwrap();
+    assert_eq!(header.alg, jsonwebtoken::Algorithm::ES256);
+    let kid = header.kid.expect("ES256 token carries kid");
+
+    let (status, jwks_body) =
+        http_request(http, "GET", "/auth/v1/.well-known/jwks.json", None, None);
+    assert_eq!(status, 200, "jwks: {jwks_body}");
+    let jwks: serde_json::Value = serde_json::from_str(&jwks_body).unwrap();
+    let keys = jwks["keys"].as_array().expect("jwks keys array");
+    assert!(
+        keys.iter()
+            .any(|key| key["kid"] == kid && key["alg"] == "ES256"),
+        "jwks should include token kid {kid}: {jwks_body}"
     );
 }
 
@@ -1317,7 +1443,11 @@ fn http_tables_constraint_errors() {
 
 #[test]
 fn http_auth_tables_blocked_from_table_api() {
-    let server = LuxServer::builder().http().password("secret").start();
+    let server = LuxServer::builder()
+        .http()
+        .password("secret")
+        .env("LUX_AUTH_ENABLED", "true")
+        .start();
     let http = server.http_port();
 
     // Direct read of a Lux Auth managed table is refused even for the operator:
@@ -1326,16 +1456,17 @@ fn http_auth_tables_blocked_from_table_api() {
     assert_eq!(status, 403, "auth.users direct read: {status} {body}");
     assert!(body.contains("Lux Auth"), "auth.users error body: {body}");
 
-    // The same table is unreachable through the exec escape hatch via TSELECT.
+    // HTTP exec is SDK-accessible, so it keeps the public reserved-table guard.
+    // Direct RESP/CLI command handlers allow operator introspection separately.
     let (_status, body) = http_request(
         http,
         "POST",
         "/v1/exec",
-        Some(r#"{"command":["TSELECT","*","FROM","auth.users"]}"#),
+        Some(r#"{"command":["TSELECT","kid,algorithm","FROM","auth.signing_keys"]}"#),
         Some("secret"),
     );
     assert!(
         body.contains("Lux Auth"),
-        "exec TSELECT auth.users body: {body}"
+        "exec TSELECT auth.signing_keys body: {body}"
     );
 }

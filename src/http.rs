@@ -3446,6 +3446,9 @@ fn handle_exec(
     if command.is_empty() {
         return r#"{"error":"empty command"}"#.to_string();
     }
+    if let Some(err) = reserved_auth_table_exec_read_error(&command) {
+        return format!(r#"{{"error":"{}"}}"#, escape_json(&err));
+    }
 
     exec_json(
         store,
@@ -3454,6 +3457,22 @@ fn handle_exec(
         script_engine,
         &command.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
     )
+}
+
+fn reserved_auth_table_exec_read_error(command: &[String]) -> Option<String> {
+    let cmd = command.first()?.to_ascii_uppercase();
+    match cmd.as_str() {
+        "TCOUNT" | "TSCHEMA" => {
+            let table = command.get(1)?;
+            crate::auth::reserved_table_access_error(table)
+        }
+        "TSELECT" => {
+            let refs: Vec<&str> = command.iter().skip(1).map(String::as_str).collect();
+            let plan = crate::tables::parse_select(&refs).ok()?;
+            crate::auth::reserved_plan_access_error(&plan)
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -36,6 +36,8 @@ type FilterOperator =
 	| 'gte'
 	| 'lt'
 	| 'lte'
+	| 'like'
+	| 'ilike'
 	| 'is'
 	| 'in'
 	| 'notIn'
@@ -46,6 +48,7 @@ type FilterOperator =
 	| 'contains';
 type ProjectRowInput<T extends object> = Partial<T> & Record<string, QueryValue>;
 type ProjectSelectSingle<TResult> = TResult extends readonly (infer Row)[] ? Row : TResult;
+type ProjectSelectMaybeSingle<TResult> = ProjectSelectSingle<TResult> | null;
 
 interface QueryFilter {
 	column: string;
@@ -470,6 +473,7 @@ abstract class LuxProjectThenable<TResult> implements PromiseLike<LuxResult<TRes
 
 abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenable<TResult> {
 	protected filters: QueryFilter[] = [];
+	protected orFilters: string[] = [];
 	protected orderBy?: QueryOrder;
 	protected joins: QueryJoin[] = [];
 	protected groupColumns: string[] = [];
@@ -507,6 +511,19 @@ abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenabl
 
 	lte(column: string, value: QueryValue): TSelf {
 		return this.addFilter(column, 'lte', value);
+	}
+
+	like(column: string, value: string): TSelf {
+		return this.addFilter(column, 'like', value);
+	}
+
+	ilike(column: string, value: string): TSelf {
+		return this.addFilter(column, 'ilike', value);
+	}
+
+	or(filters: string): TSelf {
+		this.orFilters.push(filters);
+		return this as unknown as TSelf;
 	}
 
 	is(column: string, value: QueryValue): TSelf {
@@ -576,7 +593,11 @@ abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenabl
 
 	protected filteredQueryParams(): URLSearchParams {
 		const params = new URLSearchParams();
-		if (this.filters.length) params.set('where', filtersToWhere(this.filters));
+		const whereParts = [
+			this.filters.length ? filtersToWhere(this.filters) : '',
+			...this.orFilters.map(orFiltersToWhere),
+		].filter(Boolean);
+		if (whereParts.length) params.set('where', whereParts.join(' AND '));
 		for (const join of this.joins) {
 			const kind = join.type === 'left' ? ':left' : '';
 			params.append('join', `${join.table}:${join.alias}${kind}:on(${join.onLeft}=${join.onRight})`);
@@ -602,6 +623,7 @@ abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenabl
 
 export class LuxProjectSelectBuilder<T extends object, TResult> extends LuxProjectFilterBuilder<TResult, LuxProjectSelectBuilder<T, TResult>> {
 	private expectSingle = false;
+	private allowEmptySingle = false;
 
 	constructor(
 		client: LuxProjectClient<any>,
@@ -639,8 +661,16 @@ export class LuxProjectSelectBuilder<T extends object, TResult> extends LuxProje
 
 	single(): LuxProjectSelectBuilder<T, ProjectSelectSingle<TResult>> {
 		this.expectSingle = true;
+		this.allowEmptySingle = false;
 		if (this.limitCount == null) this.limitCount = 1;
 		return this as unknown as LuxProjectSelectBuilder<T, ProjectSelectSingle<TResult>>;
+	}
+
+	maybeSingle(): LuxProjectSelectBuilder<T, ProjectSelectMaybeSingle<TResult>> {
+		this.expectSingle = true;
+		this.allowEmptySingle = true;
+		if (this.limitCount == null) this.limitCount = 1;
+		return this as unknown as LuxProjectSelectBuilder<T, ProjectSelectMaybeSingle<TResult>>;
 	}
 
 	async execute(): Promise<LuxResult<TResult>> {
@@ -658,6 +688,7 @@ export class LuxProjectSelectBuilder<T extends object, TResult> extends LuxProje
 			return ok(rows as TResult);
 		}
 		if (rows.length === 0) {
+			if (this.allowEmptySingle) return ok(null as TResult);
 			return err('NOT_FOUND', `No rows found in table '${this.tableName}'`);
 		}
 		return ok(rows[0] as unknown as TResult);
@@ -999,6 +1030,10 @@ function filterOperatorToWhere(operator: FilterOperator): string {
 			return '<';
 		case 'lte':
 			return '<=';
+		case 'like':
+			return 'LIKE';
+		case 'ilike':
+			return 'ILIKE';
 		case 'in':
 			return 'IN';
 		case 'notIn':
@@ -1014,6 +1049,61 @@ function filterOperatorToWhere(operator: FilterOperator): string {
 		case 'contains':
 			return 'CONTAINS';
 	}
+}
+
+function orFiltersToWhere(filters: string): string {
+	const clauses = splitTopLevel(filters, ',').map((filter) => filter.trim()).filter(Boolean);
+	return clauses.map(parseOrFilter).join(' OR ');
+}
+
+function parseOrFilter(filter: string): string {
+	const firstDot = filter.indexOf('.');
+	if (firstDot === -1) throw new Error(`Invalid or() filter '${filter}'`);
+	const secondDot = filter.indexOf('.', firstDot + 1);
+	if (secondDot === -1) throw new Error(`Invalid or() filter '${filter}'`);
+	const column = filter.slice(0, firstDot);
+	const operator = filter.slice(firstDot + 1, secondDot) as FilterOperator;
+	const rawValue = filter.slice(secondDot + 1);
+	const op = filterOperatorToWhere(operator);
+	if (operator === 'in' || operator === 'notIn') {
+		const values = parseListValue(rawValue);
+		return `${column} ${op} ( ${values.map(formatWhereValue).join(' ')} )`;
+	}
+	if (operator === 'is' && rawValue === 'null') return `${column} IS NULL`;
+	return `${column} ${op} ${formatWhereValue(parseQueryValue(rawValue))}`;
+}
+
+function splitTopLevel(value: string, separator: string): string[] {
+	const parts: string[] = [];
+	let start = 0;
+	let depth = 0;
+	for (let i = 0; i < value.length; i++) {
+		const ch = value[i];
+		if (ch === '(') depth++;
+		if (ch === ')' && depth > 0) depth--;
+		if (ch === separator && depth === 0) {
+			parts.push(value.slice(start, i));
+			start = i + 1;
+		}
+	}
+	parts.push(value.slice(start));
+	return parts;
+}
+
+function parseListValue(value: string): QueryValue[] {
+	const trimmed = value.trim();
+	const inner = trimmed.startsWith('(') && trimmed.endsWith(')')
+		? trimmed.slice(1, -1)
+		: trimmed;
+	return splitTopLevel(inner, ',').map((item) => parseQueryValue(item.trim()));
+}
+
+function parseQueryValue(value: string): QueryValue {
+	if (value === 'null') return null;
+	if (value === 'true') return true;
+	if (value === 'false') return false;
+	if (/^-?\d+(\.\d+)?$/.test(value)) return Number(value);
+	return value;
 }
 
 function formatWhereValue(value: QueryValue): string {

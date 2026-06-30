@@ -58,6 +58,80 @@ following areas are intended to be Redis-compatible for normal client use:
 Compatibility must be backed by integration tests and, where practical,
 Redis/Valkey differential tests.
 
+## Redis OSS/Core Inventory
+
+The pinned Redis OSS/core command inventory lives in
+`tests/redis_parity_inventory.rs`. It derives Lux's implemented RESP surface by
+parsing the in-repo command registry in `src/cmd/mod.rs`, then classifies each
+known command as one of:
+
+- **Supported**: registered by Lux and expected to behave like Redis for normal
+  client use.
+- **Partial**: registered by Lux, but currently a compatibility shim, partial
+  implementation, or documented semantic difference.
+- **Missing**: Redis OSS/core command not currently registered by Lux and
+  tracked for this parity project.
+- **Excluded**: Redis OSS command intentionally outside this project.
+- **Lux-native**: public Lux command with no Redis compatibility claim.
+
+For local compatibility exploration, run selected Valkey Tcl suites against a
+running Lux RESP listener:
+
+```sh
+# Terminal 1
+cargo build
+LUX_PORT=6379 ./target/debug/lux
+
+# Terminal 2
+VALKEY_DIR=/tmp/valkey LUX_PORT=6379 just valkey-compat
+```
+
+The recipe is intentionally local/manual. It runs Redis OSS/core-oriented suites
+for strings, keyspace, lists, hashes, sets, sorted sets, streams, scripting, and
+transactions in durable mode so one missing command does not stop the whole
+report, with `VALKEY_TIMEOUT` defaulting to 60 seconds to keep blocking-command
+failures bounded. It does not run Redis Stack/module suites, cluster suites,
+replication suites, or CI gates. It ignores Valkey internal encoding checks and
+skips individual tests whose assertions are about replication, command
+propagation, or Valkey's exact expiry scheduling; those are separate
+compatibility targets from single-node command semantics.
+
+Current partial/stub surfaces:
+
+- `CLIENT` -- common client-library subcommands only.
+- `COMMAND` -- metadata parity incomplete.
+- `CONFIG`, `INFO`, `LATENCY`, `MEMORY`, `OBJECT` -- server/admin metadata
+  needs audit.
+- `DEBUG`, `DUMP`, `RESET`, `WAIT` -- compatibility behavior needs explicit
+  implementation or rejection.
+- `FUNCTION` -- Redis Functions decision pending.
+- `SWAPDB`/multi-DB behavior -- product decision pending.
+
+Current missing Redis OSS/core command groups:
+
+- Bitmaps: `BITFIELD`, `BITFIELD_RO`.
+- Lists: `LMPOP`, `BLMPOP`, `BRPOPLPUSH`.
+- Hash field TTL/value helpers: `HEXPIRE`, `HPEXPIRE`, `HEXPIREAT`,
+  `HPEXPIREAT`, `HTTL`, `HPTTL`, `HEXPIRETIME`, `HPEXPIRETIME`, `HPERSIST`,
+  `HGETEX`, `HGETDEL`.
+- Sorted sets: `ZRANDMEMBER`, `ZMPOP`, `BZMPOP`, `ZRANGESTORE`, `ZUNION`,
+  `ZINTER`, `ZDIFF`, `ZINTERCARD`.
+- Streams: `XSETID` and option-level stream parity audits.
+- Scripting/functions: `EVAL_RO`, `EVALSHA_RO`, `FCALL`, `FCALL_RO`.
+- Pub/Sub introspection/sharded Pub/Sub: `PUBSUB`, `SPUBLISH`, `SSUBSCRIBE`,
+  `SUNSUBSCRIBE`.
+- Admin/diagnostics and key migration: `ACL`, `BGREWRITEAOF`, `LOLWUT`,
+  `MIGRATE`, `MONITOR`, `MOVE`, `RESTORE`, `ROLE`, `SLOWLOG`, `TOUCH`,
+  `WAITAOF`.
+
+Explicitly excluded from this parity project:
+
+- Redis Cluster commands and cluster routing behavior.
+- Redis multi-node replication/failover commands and Sentinel behavior.
+- Redis module APIs and Redis Stack/module command families.
+- Exact Redis AOF/RDB persistence semantics.
+- Process lifecycle commands such as `SHUTDOWN`.
+
 ## Documented Redis Differences
 
 Known 1.0 differences:

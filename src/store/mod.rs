@@ -69,6 +69,15 @@ pub struct StreamData {
     pub groups: std::collections::HashMap<String, ConsumerGroup>,
 }
 
+pub struct SetOptions<'a> {
+    pub ttl: Option<Duration>,
+    pub keep_ttl: bool,
+    pub nx: bool,
+    pub xx: bool,
+    pub ifeq: Option<&'a [u8]>,
+    pub get: bool,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct FxBuildHasher;
 
@@ -1306,6 +1315,80 @@ impl Store {
         self.remove_from_disk(key);
     }
 
+    pub fn set_conditional(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        options: SetOptions<'_>,
+        now: Instant,
+    ) -> Result<(bool, Option<Bytes>), String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        let mut exists = false;
+        let mut old = None;
+        let mut old_expires_at = None;
+        let mut ifeq_matches = options.ifeq.is_none();
+        if let Some(entry) = shard
+            .data
+            .get(key)
+            .filter(|entry| !entry.is_expired_at(now))
+        {
+            exists = true;
+            old_expires_at = entry.expires_at;
+            if options.get {
+                old = Some(
+                    entry
+                        .value
+                        .string_to_bytes()
+                        .ok_or_else(|| WRONGTYPE.to_string())?,
+                );
+            }
+            if let Some(expected) = options.ifeq {
+                let current = entry
+                    .value
+                    .string_bytes()
+                    .ok_or_else(|| WRONGTYPE.to_string())?;
+                ifeq_matches = current == expected;
+            }
+        }
+        let should_set = if options.ifeq.is_some() {
+            ifeq_matches
+        } else {
+            (!options.nx || !exists) && (!options.xx || exists)
+        };
+        if should_set {
+            shard.version += 1;
+            let expires_at = if options.keep_ttl {
+                old_expires_at
+            } else {
+                options.ttl.map(|d| now + d)
+            };
+            let new_value = StoreValue::Str(Bytes::copy_from_slice(value));
+            let mem = estimate_entry_memory(key, &new_value);
+            let old_entry = shard.data.insert(
+                key_bytes(key),
+                Entry {
+                    value: new_value,
+                    expires_at,
+                    lru_clock: self.lru_clock(),
+                },
+            );
+            if let Some(old_entry) = old_entry {
+                let old_mem = estimate_entry_memory(key, &old_entry.value);
+                if mem >= old_mem {
+                    self.mem_add(mem - old_mem);
+                } else {
+                    self.mem_sub(old_mem - mem);
+                }
+            } else {
+                self.mem_add(mem);
+                self.key_added();
+            }
+            self.remove_from_disk(key);
+        }
+        Ok((should_set, old))
+    }
+
     pub fn set_nx(&self, key: &[u8], value: &[u8], now: Instant) -> bool {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
@@ -1512,6 +1595,41 @@ impl Store {
             }
         }
         count
+    }
+
+    pub fn delifeq(&self, key: &[u8], expected: &[u8], now: Instant) -> Result<bool, String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        let action = match shard.data.get(key) {
+            Some(entry) if entry.is_expired_at(now) => Some(false),
+            Some(entry) => {
+                let current = entry
+                    .value
+                    .string_bytes()
+                    .ok_or_else(|| WRONGTYPE.to_string())?;
+                if current == expected {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
+        match action {
+            Some(should_count) => {
+                shard.version += 1;
+                if let Some(entry) = shard.data.remove(key) {
+                    self.key_removed();
+                    let mem = estimate_entry_memory(key, &entry.value);
+                    shard.used_memory = shard.used_memory.saturating_sub(mem);
+                    self.mem_sub(mem);
+                    self.remove_from_disk(key);
+                }
+                Ok(should_count)
+            }
+            None => Ok(false),
+        }
     }
 
     pub(crate) fn del_on_shard(&self, shard: &mut Shard, key: &[u8], now: Instant) -> i64 {
@@ -2895,7 +3013,13 @@ impl Store {
         }
     }
 
-    pub fn getrange(&self, key: &[u8], start: i64, end: i64, now: Instant) -> Bytes {
+    pub fn getrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        end: i64,
+        now: Instant,
+    ) -> Result<Bytes, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key) {
@@ -2913,57 +3037,101 @@ impl Store {
                         (end + 1).min(len) as usize
                     };
                     if s_i >= e_i {
-                        Bytes::new()
+                        Ok(Bytes::new())
                     } else {
-                        Bytes::copy_from_slice(&s[s_i..e_i])
+                        Ok(Bytes::copy_from_slice(&s[s_i..e_i]))
                     }
                 } else {
-                    Bytes::new()
+                    Err(WRONGTYPE.to_string())
                 }
             }
-            _ => Bytes::new(),
+            _ => Ok(Bytes::new()),
         }
     }
 
-    pub fn setrange(&self, key: &[u8], offset: usize, value: &[u8], now: Instant) -> i64 {
+    pub fn setrange(
+        &self,
+        key: &[u8],
+        offset: usize,
+        value: &[u8],
+        now: Instant,
+    ) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
-        shard.version += 1;
         let ks = key_bytes(key);
-        let existed = shard.data.contains_key(&ks);
-        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::Str(Bytes::new()),
-            expires_at: None,
-            lru_clock: self.lru_clock(),
-        });
-        if !existed {
-            self.key_added();
+        let expired = shard
+            .data
+            .get(&ks)
+            .is_some_and(|entry| entry.is_expired_at(now));
+        if expired {
+            shard.data.remove(&ks);
+            self.key_removed();
         }
-        if entry.is_expired_at(now) {
-            entry.value = StoreValue::Str(Bytes::new());
-            entry.expires_at = None;
-        }
-        if let Some(s) = entry.value.string_bytes() {
-            let old_len = s.len();
-            let mut buf = s.to_vec();
-            let needed = offset + value.len();
-            if buf.len() < needed {
-                buf.resize(needed, 0);
+
+        let Some(entry) = shard.data.get(&ks) else {
+            if value.is_empty() {
+                return Ok(0);
             }
-            buf[offset..offset + value.len()].copy_from_slice(value);
-            let new_len = buf.len();
-            let len = new_len as i64;
-            entry.value = StoreValue::StrBuf(buf);
-            if new_len > old_len {
-                let added = new_len - old_len;
-                let _ = entry;
+            shard.version += 1;
+            let needed = offset + value.len();
+            let mut buf = vec![0; needed];
+            buf[offset..needed].copy_from_slice(value);
+            let new_value = StoreValue::StrBuf(buf);
+            let mem = estimate_entry_memory(&ks, &new_value);
+            shard.data.insert(
+                ks,
+                Entry {
+                    value: new_value,
+                    expires_at: None,
+                    lru_clock: self.lru_clock(),
+                },
+            );
+            shard.used_memory += mem;
+            self.mem_add(mem);
+            self.key_added();
+            return Ok(needed as i64);
+        };
+
+        let (expires_at, mut buf) = {
+            let Some(s) = entry.value.string_bytes() else {
+                return Err(WRONGTYPE.to_string());
+            };
+            if value.is_empty() {
+                return Ok(s.len() as i64);
+            }
+            (entry.expires_at, s.to_vec())
+        };
+
+        shard.version += 1;
+        let needed = offset + value.len();
+        if buf.len() < needed {
+            buf.resize(needed, 0);
+        }
+        buf[offset..offset + value.len()].copy_from_slice(value);
+        let len = buf.len() as i64;
+        let new_value = StoreValue::StrBuf(buf);
+        let mem = estimate_entry_memory(&ks, &new_value);
+        let old_entry = shard.data.insert(
+            ks,
+            Entry {
+                value: new_value,
+                expires_at,
+                lru_clock: self.lru_clock(),
+            },
+        );
+        if let Some(old_entry) = old_entry {
+            let old_mem = estimate_entry_memory(key, &old_entry.value);
+            if mem >= old_mem {
+                let added = mem - old_mem;
                 shard.used_memory += added;
                 self.mem_add(added);
+            } else {
+                let freed = old_mem - mem;
+                shard.used_memory = shard.used_memory.saturating_sub(freed);
+                self.mem_sub(freed);
             }
-            len
-        } else {
-            0
         }
+        Ok(len)
     }
 
     pub fn msetnx(&self, pairs: &[(&[u8], &[u8])], now: Instant) -> bool {
@@ -4304,6 +4472,11 @@ impl GlobMatcher {
         if self.pattern.len() == 1 && self.pattern[0] == '*' {
             return true;
         }
+        if self.pattern.len() > 10_000
+            && self.pattern.iter().filter(|&&ch| ch == '*').count() > 1_000
+        {
+            return false;
+        }
         let s: Vec<char> = s.chars().collect();
         Self::do_match(&self.pattern, &s)
     }
@@ -4628,7 +4801,7 @@ mod tests {
         assert_eq!(store.append(b"key", b" world", n), 11);
         assert_eq!(store.get(b"key", n).unwrap(), &b"hello world"[..]);
         assert_eq!(store.strlen(b"key", n), 11);
-        assert_eq!(store.getrange(b"key", 6, -1, n), &b"world"[..]);
+        assert_eq!(store.getrange(b"key", 6, -1, n).unwrap(), &b"world"[..]);
     }
 
     #[test]
@@ -4785,8 +4958,8 @@ mod tests {
         let store = Store::new();
         let n = now();
         store.set(b"key", b"Hello, World!", None, n);
-        assert_eq!(store.getrange(b"key", 0, 4, n), &b"Hello"[..]);
-        assert_eq!(store.getrange(b"key", -6, -1, n), &b"World!"[..]);
+        assert_eq!(store.getrange(b"key", 0, 4, n).unwrap(), &b"Hello"[..]);
+        assert_eq!(store.getrange(b"key", -6, -1, n).unwrap(), &b"World!"[..]);
     }
 
     #[test]
@@ -4794,10 +4967,36 @@ mod tests {
         let store = Store::new();
         let n = now();
         store.set(b"key", b"Hello", None, n);
-        store.setrange(b"key", 6, b"World", n);
+        store.setrange(b"key", 6, b"World", n).unwrap();
         let val = store.get(b"key", n).unwrap();
         assert_eq!(val.len(), 11);
         assert_eq!(val[5], 0);
+    }
+
+    #[test]
+    fn setrange_empty_missing_does_not_create_key() {
+        let store = Store::new();
+        let n = now();
+
+        assert_eq!(store.setrange(b"key", 0, b"", n).unwrap(), 0);
+        assert!(store.get(b"key", n).is_none());
+        assert_eq!(store.dbsize(n), 0);
+    }
+
+    #[test]
+    fn range_commands_error_on_wrong_type() {
+        let store = Store::new();
+        let n = now();
+
+        store.lpush(b"list", &[b"value"], n).unwrap();
+        assert!(store
+            .getrange(b"list", 0, -1, n)
+            .unwrap_err()
+            .contains("WRONGTYPE"));
+        assert!(store
+            .setrange(b"list", 0, b"", n)
+            .unwrap_err()
+            .contains("WRONGTYPE"));
     }
 
     #[test]
@@ -5514,5 +5713,16 @@ mod tests {
         let m3 = GlobMatcher::new("*");
         assert!(m3.matches("anything"));
         assert!(m3.matches(""));
+    }
+
+    #[test]
+    fn keys_matches_very_long_nested_pattern() {
+        let store = Store::new();
+        let n = now();
+        let key = "a".repeat(50_000);
+        let pattern = "*?".repeat(50_000);
+
+        store.set(key.as_bytes(), b"1", None, n);
+        assert!(store.keys(pattern.as_bytes(), n).is_empty());
     }
 }

@@ -91,12 +91,55 @@ pub struct AuthConfig {
     pub refresh_token_ttl: Duration,
     /// Enables native email/password signup and sign-in.
     pub email_password_enabled: bool,
+    /// When true, email/password signup creates an unconfirmed user and requires
+    /// a confirmation token before password sign-in.
+    pub email_confirmation_required: bool,
     /// Enables accountless `signInAnonymously` sessions.
     pub anonymous_enabled: bool,
+    /// Lifetime for one-time auth flow tokens such as recovery links,
+    /// confirmation links, and OAuth authorization codes.
+    pub flow_token_ttl: Duration,
+    /// Base URL used when Lux needs to construct auth action links and no
+    /// explicit redirect target was supplied.
+    pub site_url: String,
     /// Optional initial publishable key material for local/bootstrap use.
     pub initial_publishable_key: Option<String>,
     /// Optional initial secret key material for local/bootstrap use.
     pub initial_secret_key: Option<String>,
+    /// Optional Cloud-managed email delivery config. This is intentionally not
+    /// seeded into `auth.settings`, so managed provider secrets can live
+    /// outside customer-readable project auth tables.
+    pub managed_email: Option<AuthManagedEmailConfig>,
+}
+
+/// Email delivery config injected by a host environment such as Lux Cloud.
+#[derive(Clone)]
+pub struct AuthManagedEmailConfig {
+    /// Delivery provider name. Supported today: `postmark`.
+    pub provider: String,
+    /// Sender address, optionally already formatted as `Name <email@example.com>`.
+    pub from: String,
+    /// Optional Reply-To address.
+    pub reply_to: Option<String>,
+    /// Postmark server token for managed delivery.
+    pub postmark_server_token: Option<String>,
+    /// Optional Postmark message stream. Defaults to `outbound`.
+    pub postmark_message_stream: Option<String>,
+}
+
+impl std::fmt::Debug for AuthManagedEmailConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthManagedEmailConfig")
+            .field("provider", &self.provider)
+            .field("from", &self.from)
+            .field("reply_to", &self.reply_to)
+            .field(
+                "postmark_server_token",
+                &self.postmark_server_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("postmark_message_stream", &self.postmark_message_stream)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for AuthConfig {
@@ -107,7 +150,13 @@ impl std::fmt::Debug for AuthConfig {
             .field("access_token_ttl", &self.access_token_ttl)
             .field("refresh_token_ttl", &self.refresh_token_ttl)
             .field("email_password_enabled", &self.email_password_enabled)
+            .field(
+                "email_confirmation_required",
+                &self.email_confirmation_required,
+            )
             .field("anonymous_enabled", &self.anonymous_enabled)
+            .field("flow_token_ttl", &self.flow_token_ttl)
+            .field("site_url", &self.site_url)
             .field(
                 "initial_publishable_key",
                 &self.initial_publishable_key.as_ref().map(|_| "<redacted>"),
@@ -116,6 +165,7 @@ impl std::fmt::Debug for AuthConfig {
                 "initial_secret_key",
                 &self.initial_secret_key.as_ref().map(|_| "<redacted>"),
             )
+            .field("managed_email", &self.managed_email)
             .finish()
     }
 }
@@ -128,9 +178,13 @@ impl Default for AuthConfig {
             access_token_ttl: Duration::from_secs(3600),
             refresh_token_ttl: Duration::from_secs(30 * 24 * 60 * 60),
             email_password_enabled: true,
+            email_confirmation_required: false,
             anonymous_enabled: true,
+            flow_token_ttl: Duration::from_secs(24 * 60 * 60),
+            site_url: "http://localhost:7379".to_string(),
             initial_publishable_key: None,
             initial_secret_key: None,
+            managed_email: None,
         }
     }
 }

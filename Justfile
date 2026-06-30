@@ -46,6 +46,25 @@ check:
 test:
     cargo test --all-targets
 
+# Run selected Valkey Tcl compatibility suites against a running Lux RESP port.
+# Example: LUX_PORT=6379 VALKEY_DIR=/tmp/valkey just valkey-compat
+valkey-compat:
+    #!/usr/bin/env sh
+    set -eu
+    cd "${VALKEY_DIR:-/tmp/valkey}"
+    ./runtest \
+        --host "${LUX_HOST:-127.0.0.1}" --port "${LUX_PORT:-6379}" \
+        --timeout "${VALKEY_TIMEOUT:-60}" \
+        --singledb --no-latency --ignore-encoding --durable \
+        --skiptest '/.*replica.*' \
+        --skiptest '/.*replication.*' \
+        --skiptest '/.*propagate.*' \
+        --skiptest '/.*Expiration time is expired.*' \
+        --single unit/type/string --single unit/keyspace \
+        --single unit/type/list --single unit/type/hash --single unit/type/set \
+        --single unit/type/zset --single unit/type/stream \
+        --single unit/scripting --single unit/multi
+
 # Automatically fix lint issues.
 fix:
     cargo fix --allow-staged --all-targets --all-features

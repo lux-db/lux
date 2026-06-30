@@ -1,10 +1,16 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use base64::Engine;
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::jwk::{Jwk, KeyAlgorithm, PublicKeyUse};
+use jsonwebtoken::{
+    decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+};
+use p256::pkcs8::{EncodePrivateKey, LineEnding};
+use p256::SecretKey;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,7 +20,7 @@ use tokio::task::block_in_place;
 
 use crate::store::Store;
 use crate::tables::{self, CmpOp, SelectPlan, SelectResult, SharedSchemaCache, WhereClause};
-use crate::AuthConfig;
+use crate::{AuthConfig, AuthManagedEmailConfig};
 
 pub(crate) const USERS_TABLE: &str = "auth.users";
 pub(crate) const IDENTITIES_TABLE: &str = "auth.identities";
@@ -23,9 +29,11 @@ pub(crate) const KEYS_TABLE: &str = "auth.keys";
 pub(crate) const SIGNING_KEYS_TABLE: &str = "auth.signing_keys";
 pub(crate) const GRANTS_TABLE: &str = "auth.grants";
 pub(crate) const PROVIDERS_TABLE: &str = "auth.providers";
+pub(crate) const FLOW_TOKENS_TABLE: &str = "auth.flow_tokens";
+pub(crate) const SETTINGS_TABLE: &str = "auth.settings";
 
 const AUTH_SCHEMA_VERSION_KEY: &[u8] = b"_auth:schema_version";
-const AUTH_SCHEMA_VERSION: &[u8] = b"1";
+const AUTH_SCHEMA_VERSION: &[u8] = b"2";
 const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
 const ACCESS_REVOKED_AFTER_PREFIX: &[u8] = b"_auth:access_revoked_after:";
 
@@ -33,6 +41,83 @@ const ACCESS_REVOKED_AFTER_PREFIX: &[u8] = b"_auth:access_revoked_after:";
 enum ApiKeyKind {
     Publishable,
     Secret,
+}
+
+#[derive(Clone, Debug)]
+struct SigningKey {
+    kid: String,
+    algorithm: String,
+    public_jwk: String,
+    private_key: String,
+}
+
+#[derive(Clone, Debug)]
+struct AuthSettings {
+    email_confirmation_required: bool,
+    flow_token_ttl: Duration,
+    site_url: String,
+    email_provider: String,
+    email_from: Option<String>,
+    email_reply_to: Option<String>,
+    email_postmark_server_token: Option<String>,
+    email_postmark_message_stream: String,
+    email_app_name: String,
+    email_from_name: Option<String>,
+}
+
+struct FlowTokenInsert<'a> {
+    settings: &'a AuthSettings,
+    kind: &'a str,
+    user_id: &'a str,
+    email: &'a str,
+    redirect_to: &'a str,
+    metadata: Value,
+}
+
+#[derive(Clone, Debug)]
+struct EffectiveEmailDelivery {
+    provider: String,
+    from: Option<String>,
+    reply_to: Option<String>,
+    postmark_server_token: Option<String>,
+    postmark_message_stream: String,
+    app_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthEmailMessage {
+    from: String,
+    to: String,
+    reply_to: Option<String>,
+    subject: String,
+    text_body: String,
+    html_body: String,
+    message_stream: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PostmarkEmailPayload {
+    #[serde(rename = "From")]
+    from: String,
+    #[serde(rename = "To")]
+    to: String,
+    #[serde(rename = "Subject")]
+    subject: String,
+    #[serde(rename = "TextBody")]
+    text_body: String,
+    #[serde(rename = "HtmlBody")]
+    html_body: String,
+    #[serde(rename = "MessageStream")]
+    message_stream: String,
+    #[serde(rename = "ReplyTo", skip_serializing_if = "Option::is_none")]
+    reply_to: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PasswordVerification {
+    Invalid,
+    Valid,
+    ValidNeedsRehash,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -304,6 +389,31 @@ pub(crate) fn bootstrap(
         ],
         now,
     )?;
+    create_table_if_missing(
+        store,
+        cache,
+        FLOW_TOKENS_TABLE,
+        &[
+            "id STR PRIMARY KEY,",
+            "type STR,",
+            "token_hash STR UNIQUE,",
+            "user_id UUID,",
+            "email STR,",
+            "redirect_to STR,",
+            "metadata STR,",
+            "expires_at INT,",
+            "consumed_at INT,",
+            "created_at INT",
+        ],
+        now,
+    )?;
+    create_table_if_missing(
+        store,
+        cache,
+        SETTINGS_TABLE,
+        &["key STR PRIMARY KEY,", "value STR,", "updated_at INT"],
+        now,
+    )?;
     store.set(AUTH_SCHEMA_VERSION_KEY, AUTH_SCHEMA_VERSION, None, now);
     Ok(())
 }
@@ -359,6 +469,34 @@ pub(crate) fn bootstrap_runtime(
 ) -> Result<(), String> {
     let now = Instant::now();
     ensure_signing_key(store, cache, now)?;
+    ensure_auth_setting(
+        store,
+        cache,
+        "email_confirmation_required",
+        if config.email_confirmation_required {
+            "true"
+        } else {
+            "false"
+        },
+        now,
+    )?;
+    ensure_auth_setting(
+        store,
+        cache,
+        "flow_token_ttl_seconds",
+        &config.flow_token_ttl.as_secs().to_string(),
+        now,
+    )?;
+    ensure_auth_setting(store, cache, "site_url", &config.site_url, now)?;
+    ensure_auth_setting(store, cache, "email_provider", "console", now)?;
+    ensure_auth_setting(
+        store,
+        cache,
+        "email_postmark_message_stream",
+        "outbound",
+        now,
+    )?;
+    ensure_auth_setting(store, cache, "email_app_name", "Lux", now)?;
     if let Some(key) = config.initial_publishable_key.as_deref() {
         ensure_api_key(
             store,
@@ -397,6 +535,7 @@ pub(crate) fn route_http(
 
     match (method, base) {
         ("GET", ["health"]) => ok(json!({"result":"ok"})),
+        ("GET", [".well-known", "jwks.json"]) => jwks(store, cache),
         ("POST", ["signup"]) => {
             if let Err(response) = require_publishable_or_secret(headers, store, cache) {
                 return response;
@@ -416,7 +555,20 @@ pub(crate) fn route_http(
             let grant_type = get_param(params, "grant_type").unwrap_or("");
             token(body, grant_type, headers, store, cache)
         }
+        ("POST", ["recover"]) => {
+            if let Err(response) = require_publishable_or_secret(headers, store, cache) {
+                return response;
+            }
+            recover(body, store, cache)
+        }
+        ("POST", ["verify"]) => {
+            if let Err(response) = require_publishable_or_secret(headers, store, cache) {
+                return response;
+            }
+            verify_otp(body, headers, store, cache)
+        }
         ("GET", ["user"]) => user_from_bearer(headers, store, cache),
+        ("PUT", ["user"]) | ("PATCH", ["user"]) => update_user(body, headers, store, cache),
         ("POST", ["logout"]) => logout(body, headers, store, cache),
         ("GET", ["admin", "users"]) => {
             if let Err(response) = require_secret(headers, store, cache) {
@@ -424,11 +576,29 @@ pub(crate) fn route_http(
             }
             admin_list_users(store, cache)
         }
+        ("GET", ["admin", "users", user_id]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_get_user(user_id, store, cache)
+        }
         ("POST", ["admin", "users"]) => {
             if let Err(response) = require_secret(headers, store, cache) {
                 return response;
             }
             admin_create_user(body, store, cache)
+        }
+        ("PATCH", ["admin", "users", user_id]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_update_user(user_id, body, store, cache)
+        }
+        ("DELETE", ["admin", "users", user_id]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_delete_user(user_id, store, cache)
         }
         ("GET", ["admin", "keys"]) => {
             if let Err(response) = require_secret(headers, store, cache) {
@@ -453,6 +623,18 @@ pub(crate) fn route_http(
                 return response;
             }
             admin_list_providers(store, cache)
+        }
+        ("GET", ["admin", "settings"]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_get_settings(store, cache)
+        }
+        ("PATCH", ["admin", "settings"]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_update_settings(body, store, cache)
         }
         ("POST", ["admin", "providers", provider]) | ("PUT", ["admin", "providers", provider]) => {
             if let Err(response) = require_secret(headers, store, cache) {
@@ -506,28 +688,35 @@ fn signup(
     };
     let user_meta = parsed
         .get("data")
+        .or_else(|| {
+            parsed
+                .get("options")
+                .and_then(|options| options.get("data"))
+        })
         .or_else(|| parsed.get("user_metadata"))
         .cloned()
         .unwrap_or_else(|| json!({}))
         .to_string();
     let app_meta = json!({"provider":"email","providers":["email"]}).to_string();
+    let settings = match auth_settings(store, cache, now) {
+        Ok(settings) => settings,
+        Err(e) => return error(400, "Bad Request", &e),
+    };
+    let now_sec_str = now_sec.to_string();
+    let mut fields = vec![
+        ("id", user_id.as_str()),
+        ("email", email.as_str()),
+        ("encrypted_password", password_hash.as_str()),
+        ("raw_user_meta_data", user_meta.as_str()),
+        ("raw_app_meta_data", app_meta.as_str()),
+        ("created_at", now_sec_str.as_str()),
+        ("updated_at", now_sec_str.as_str()),
+    ];
+    if !settings.email_confirmation_required {
+        fields.push(("email_confirmed_at", now_sec_str.as_str()));
+    }
 
-    if let Err(e) = durable_table_insert(
-        store,
-        cache,
-        USERS_TABLE,
-        &[
-            ("id", user_id.as_str()),
-            ("email", email.as_str()),
-            ("encrypted_password", password_hash.as_str()),
-            ("email_confirmed_at", &now_sec.to_string()),
-            ("raw_user_meta_data", user_meta.as_str()),
-            ("raw_app_meta_data", app_meta.as_str()),
-            ("created_at", &now_sec.to_string()),
-            ("updated_at", &now_sec.to_string()),
-        ],
-        now,
-    ) {
+    if let Err(e) = durable_table_insert(store, cache, USERS_TABLE, &fields, now) {
         return error(400, "Bad Request", &e);
     }
     if let Err(e) = durable_table_insert(
@@ -540,13 +729,39 @@ fn signup(
             ("provider", "email"),
             ("provider_id", email.as_str()),
             ("identity_data", json!({"email":email}).to_string().as_str()),
-            ("created_at", &now_sec.to_string()),
-            ("updated_at", &now_sec.to_string()),
+            ("created_at", now_sec_str.as_str()),
+            ("updated_at", now_sec_str.as_str()),
         ],
         now,
     ) {
         let _ = durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", &user_id], now);
         return error(400, "Bad Request", &e);
+    }
+
+    if settings.email_confirmation_required {
+        let redirect_to = auth_redirect_to_with_default(&parsed, &settings.site_url);
+        if let Err(response) =
+            create_email_flow_token(store, cache, "signup", &user_id, &email, &redirect_to, now)
+        {
+            let _ = durable_table_delete_where(
+                store,
+                cache,
+                IDENTITIES_TABLE,
+                &["user_id", "=", &user_id],
+                now,
+            );
+            let _ =
+                durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", &user_id], now);
+            return response;
+        }
+        return ok(json!({
+            "access_token": Value::Null,
+            "token_type": "bearer",
+            "expires_in": 0,
+            "refresh_token": Value::Null,
+            "session": Value::Null,
+            "user": user_json(store, cache, &user_id, now).unwrap_or_else(|| json!({"id":user_id,"email":email}))
+        }));
     }
 
     match issue_session_response(store, cache, headers, &user_id, &email, now) {
@@ -630,6 +845,7 @@ fn token(
     match grant_type {
         "password" => password_grant(&parsed, headers, store, cache),
         "refresh_token" => refresh_token_grant(&parsed, headers, store, cache),
+        "authorization_code" | "pkce" => authorization_code_grant(&parsed, headers, store, cache),
         _ => error(400, "Bad Request", "unsupported grant_type"),
     }
 }
@@ -664,9 +880,44 @@ fn password_grant(
     if let Err(response) = validate_user_active(&user, unix_seconds()) {
         return response;
     }
-    match verify_password(password, password_hash) {
-        Ok(true) => {}
-        Ok(false) => return error(400, "Bad Request", "invalid login credentials"),
+    let settings = match auth_settings(store, cache, now) {
+        Ok(settings) => settings,
+        Err(e) => return error(400, "Bad Request", &e),
+    };
+    if settings.email_confirmation_required
+        && user
+            .get("email_confirmed_at")
+            .map(|value| value.trim().is_empty() || value == "0")
+            .unwrap_or(true)
+    {
+        return error(401, "Unauthorized", "email not confirmed");
+    }
+    match verify_password_state(password, password_hash) {
+        Ok(PasswordVerification::Valid) => {}
+        Ok(PasswordVerification::ValidNeedsRehash) => {
+            if let Some(user_id) = user.get("id") {
+                match hash_password(password) {
+                    Ok(hash) => {
+                        let now_sec = unix_seconds().to_string();
+                        let _ = durable_table_update_where(
+                            store,
+                            cache,
+                            USERS_TABLE,
+                            &[
+                                ("encrypted_password", hash.as_str()),
+                                ("updated_at", now_sec.as_str()),
+                            ],
+                            &["id", "=", user_id],
+                            now,
+                        );
+                    }
+                    Err(e) => return error(500, "Internal Server Error", &e),
+                }
+            }
+        }
+        Ok(PasswordVerification::Invalid) => {
+            return error(400, "Bad Request", "invalid login credentials")
+        }
         Err(e) => return error(500, "Internal Server Error", &e),
     }
     let Some(user_id) = user.get("id") else {
@@ -762,6 +1013,138 @@ fn refresh_token_grant(
     )
 }
 
+fn authorization_code_grant(
+    parsed: &Value,
+    headers: &[(String, String)],
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let code = match required_string(parsed, "code") {
+        Ok(code) => code,
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    let token = match consume_flow_token(store, cache, "oauth_code", code, now) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let Some(user_id) = token.get("user_id") else {
+        return error(400, "Bad Request", "authorization code is missing user");
+    };
+    let Some(user) = find_row_by_field(store, cache, USERS_TABLE, "id", user_id, now)
+        .ok()
+        .flatten()
+    else {
+        return error(401, "Unauthorized", "user not found");
+    };
+    if let Err(response) = validate_user_active(&user, unix_seconds()) {
+        return response;
+    }
+    let email = user.get("email").cloned().unwrap_or_default();
+    issue_session_response(store, cache, headers, user_id, &email, now)
+}
+
+fn recover(body: &str, store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
+    if !store.config().auth.email_password_enabled {
+        return error(400, "Bad Request", "email/password auth is disabled");
+    }
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let email = match required_string(&parsed, "email") {
+        Ok(email) => normalize_email(email),
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    let settings = match auth_settings(store, cache, now) {
+        Ok(settings) => settings,
+        Err(e) => return error(400, "Bad Request", &e),
+    };
+    if let Some(user) = find_row_by_field(store, cache, USERS_TABLE, "email", &email, now)
+        .ok()
+        .flatten()
+    {
+        if validate_user_active(&user, unix_seconds()).is_ok() {
+            if let Some(user_id) = user.get("id") {
+                let redirect_to = auth_redirect_to_with_default(&parsed, &settings.site_url);
+                if let Err(response) = create_email_flow_token(
+                    store,
+                    cache,
+                    "recovery",
+                    user_id,
+                    &email,
+                    &redirect_to,
+                    now,
+                ) {
+                    return response;
+                }
+            }
+        }
+    }
+    ok(json!({}))
+}
+
+fn verify_otp(
+    body: &str,
+    headers: &[(String, String)],
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let token = match required_string(&parsed, "token_hash") {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let kind = match required_string(&parsed, "type") {
+        Ok(kind) => kind,
+        Err(response) => return response,
+    };
+    let expected_kind = match kind {
+        "signup" | "email" | "email_change" => "signup",
+        "recovery" => "recovery",
+        _ => return error(400, "Bad Request", "unsupported verification type"),
+    };
+    let now = Instant::now();
+    let flow = match consume_flow_token(store, cache, expected_kind, token, now) {
+        Ok(flow) => flow,
+        Err(response) => return response,
+    };
+    let Some(user_id) = flow.get("user_id") else {
+        return error(400, "Bad Request", "verification token is missing user");
+    };
+    let Some(user) = find_row_by_field(store, cache, USERS_TABLE, "id", user_id, now)
+        .ok()
+        .flatten()
+    else {
+        return error(401, "Unauthorized", "user not found");
+    };
+    if let Err(response) = validate_user_active(&user, unix_seconds()) {
+        return response;
+    }
+    if expected_kind == "signup" {
+        let now_sec = unix_seconds().to_string();
+        if let Err(e) = durable_table_update_where(
+            store,
+            cache,
+            USERS_TABLE,
+            &[
+                ("email_confirmed_at", now_sec.as_str()),
+                ("updated_at", now_sec.as_str()),
+            ],
+            &["id", "=", user_id],
+            now,
+        ) {
+            return error(400, "Bad Request", &e);
+        }
+    }
+    let email = user.get("email").cloned().unwrap_or_default();
+    issue_session_response(store, cache, headers, user_id, &email, now)
+}
+
 fn issue_session_response(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -854,6 +1237,80 @@ fn user_from_bearer(
     }
 }
 
+fn update_user(
+    body: &str,
+    headers: &[(String, String)],
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let claims = match claims_from_bearer(headers, store, cache) {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    let now_sec = unix_seconds().to_string();
+    let mut updates: Vec<(String, String)> = Vec::new();
+
+    if let Some(password) = parsed.get("password").and_then(Value::as_str) {
+        if password.len() < 8 {
+            return error(400, "Bad Request", "password must be at least 8 characters");
+        }
+        match hash_password(password) {
+            Ok(hash) => updates.push(("encrypted_password".to_string(), hash)),
+            Err(e) => return error(500, "Internal Server Error", &e),
+        }
+    }
+    if let Some(email) = parsed.get("email").and_then(Value::as_str) {
+        let email = normalize_email(email);
+        if email.is_empty() {
+            return error(400, "Bad Request", "email cannot be empty");
+        }
+        if let Some(row) = find_row_by_field(store, cache, USERS_TABLE, "email", &email, now)
+            .ok()
+            .flatten()
+        {
+            if row.get("id").map(String::as_str) != Some(claims.sub.as_str()) {
+                return error(409, "Conflict", "email already exists");
+            }
+        }
+        updates.push(("email".to_string(), email));
+    }
+    if let Some(metadata) = parsed
+        .get("data")
+        .or_else(|| parsed.get("user_metadata"))
+        .cloned()
+    {
+        updates.push(("raw_user_meta_data".to_string(), metadata.to_string()));
+    }
+
+    if updates.is_empty() {
+        return error(400, "Bad Request", "no user attributes to update");
+    }
+    updates.push(("updated_at".to_string(), now_sec));
+    let update_refs: Vec<(&str, &str)> = updates
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    if let Err(e) = durable_table_update_where(
+        store,
+        cache,
+        USERS_TABLE,
+        &update_refs,
+        &["id", "=", &claims.sub],
+        now,
+    ) {
+        return error(400, "Bad Request", &e);
+    }
+    match user_json(store, cache, &claims.sub, now) {
+        Some(user) => ok(json!({"user": user})),
+        None => error(404, "Not Found", "user not found"),
+    }
+}
+
 fn logout(
     body: &str,
     headers: &[(String, String)],
@@ -888,6 +1345,42 @@ fn logout(
     error(401, "Unauthorized", "missing bearer token or refresh_token")
 }
 
+fn jwks(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
+    let plan = SelectPlan {
+        table: SIGNING_KEYS_TABLE.to_string(),
+        alias: None,
+        projections: Vec::new(),
+        aggregates: Vec::new(),
+        joins: Vec::new(),
+        conditions: Vec::new(),
+        group_by: Vec::new(),
+        having: Vec::new(),
+        near: None,
+        order_by: None,
+        limit: Some(100),
+        offset: None,
+    };
+    match tables::table_select(store, cache, &plan, Instant::now()) {
+        Ok(SelectResult::Rows(rows)) => {
+            let keys = rows
+                .into_iter()
+                .map(|row| row.into_iter().collect::<HashMap<_, _>>())
+                .filter(|row| {
+                    parse_bool(row.get("active"))
+                        && row.get("algorithm").map(String::as_str) != Some("HS256")
+                })
+                .filter_map(|row| {
+                    row.get("public_jwk")
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                })
+                .collect::<Vec<_>>();
+            ok(json!({"keys": keys}))
+        }
+        Ok(SelectResult::Aggregate(_)) => ok(json!({"keys": []})),
+        Err(e) => error(400, "Bad Request", &e),
+    }
+}
+
 fn admin_list_users(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
     let plan = SelectPlan {
         table: USERS_TABLE.to_string(),
@@ -918,7 +1411,302 @@ fn admin_create_user(
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
-    signup(body, &[], store, cache)
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let email = match required_string(&parsed, "email") {
+        Ok(email) => normalize_email(email),
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    if find_row_by_field(store, cache, USERS_TABLE, "email", &email, now)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return error(409, "Conflict", "user already exists");
+    }
+
+    let user_id = parsed
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(tables::generate_uuid_v7);
+    let password_hash = match admin_password_hash(&parsed) {
+        Ok(hash) => hash,
+        Err(response) => return response,
+    };
+    let now_sec = unix_seconds();
+    let now_sec_str = now_sec.to_string();
+    let email_confirmed_at = admin_confirmed_at(&parsed, "email_confirmed_at", "email_confirmed")
+        .unwrap_or_else(|| now_sec.to_string());
+    let phone = optional_json_string(&parsed, "phone");
+    let phone_confirmed_at =
+        admin_confirmed_at(&parsed, "phone_confirmed_at", "phone_confirmed").unwrap_or_default();
+    let user_meta = parsed
+        .get("user_metadata")
+        .or_else(|| parsed.get("data"))
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+        .to_string();
+    let app_meta = parsed
+        .get("app_metadata")
+        .cloned()
+        .unwrap_or_else(|| json!({"provider":"email","providers":["email"]}))
+        .to_string();
+    let banned_until = optional_json_string(&parsed, "banned_until");
+
+    let mut fields = vec![
+        ("id", user_id.as_str()),
+        ("email", email.as_str()),
+        ("raw_user_meta_data", user_meta.as_str()),
+        ("raw_app_meta_data", app_meta.as_str()),
+        ("created_at", now_sec_str.as_str()),
+        ("updated_at", now_sec_str.as_str()),
+    ];
+    if !email_confirmed_at.is_empty() {
+        fields.push(("email_confirmed_at", email_confirmed_at.as_str()));
+    }
+    if let Some(password_hash) = password_hash.as_deref() {
+        fields.push(("encrypted_password", password_hash));
+    }
+    if let Some(phone) = phone.as_deref() {
+        fields.push(("phone", phone));
+    }
+    if !phone_confirmed_at.is_empty() {
+        fields.push(("phone_confirmed_at", phone_confirmed_at.as_str()));
+    }
+    if let Some(banned_until) = banned_until.as_deref() {
+        fields.push(("banned_until", banned_until));
+    }
+
+    if let Err(e) = durable_table_insert(store, cache, USERS_TABLE, &fields, now) {
+        return error(400, "Bad Request", &e);
+    }
+    if let Err(e) = durable_table_insert(
+        store,
+        cache,
+        IDENTITIES_TABLE,
+        &[
+            ("id", random_id("idn").as_str()),
+            ("user_id", user_id.as_str()),
+            ("provider", "email"),
+            ("provider_id", email.as_str()),
+            ("identity_data", json!({"email":email}).to_string().as_str()),
+            ("created_at", now_sec_str.as_str()),
+            ("updated_at", now_sec_str.as_str()),
+        ],
+        now,
+    ) {
+        let _ = durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", &user_id], now);
+        return error(400, "Bad Request", &e);
+    }
+
+    ok(
+        json!({"user": user_json(store, cache, &user_id, now).unwrap_or_else(|| json!({"id":user_id,"email":email}))}),
+    )
+}
+
+fn admin_get_user(
+    user_id: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    match user_json(store, cache, user_id, Instant::now()) {
+        Some(user) => ok(json!({"user": user})),
+        None => error(404, "Not Found", "user not found"),
+    }
+}
+
+fn admin_update_user(
+    user_id: &str,
+    body: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    let Some(existing) = find_row_by_field(store, cache, USERS_TABLE, "id", user_id, now)
+        .ok()
+        .flatten()
+    else {
+        return error(404, "Not Found", "user not found");
+    };
+
+    let mut updates: Vec<(String, String)> = Vec::new();
+    let mut new_email = None;
+    if let Some(email) = parsed.get("email").and_then(Value::as_str) {
+        let email = normalize_email(email);
+        if email.is_empty() {
+            return error(400, "Bad Request", "email cannot be empty");
+        }
+        if existing.get("email").map(String::as_str) != Some(email.as_str()) {
+            if let Some(row) = find_row_by_field(store, cache, USERS_TABLE, "email", &email, now)
+                .ok()
+                .flatten()
+            {
+                if row.get("id").map(String::as_str) != Some(user_id) {
+                    return error(409, "Conflict", "user already exists");
+                }
+            }
+        }
+        updates.push(("email".to_string(), email.clone()));
+        new_email = Some(email);
+    }
+    if let Some(phone) = optional_json_string(&parsed, "phone") {
+        updates.push(("phone".to_string(), phone));
+    }
+    match admin_password_hash(&parsed) {
+        Ok(Some(hash)) => updates.push(("encrypted_password".to_string(), hash)),
+        Ok(None) => {}
+        Err(response) => return response,
+    }
+    if let Some(value) = parsed.get("user_metadata").or_else(|| parsed.get("data")) {
+        updates.push(("raw_user_meta_data".to_string(), value.clone().to_string()));
+    }
+    if let Some(value) = parsed.get("app_metadata") {
+        updates.push(("raw_app_meta_data".to_string(), value.clone().to_string()));
+    }
+    if let Some(value) = admin_confirmed_at(&parsed, "email_confirmed_at", "email_confirmed") {
+        updates.push(("email_confirmed_at".to_string(), value));
+    }
+    if let Some(value) = admin_confirmed_at(&parsed, "phone_confirmed_at", "phone_confirmed") {
+        updates.push(("phone_confirmed_at".to_string(), value));
+    }
+    if let Some(value) = optional_json_string(&parsed, "banned_until") {
+        updates.push(("banned_until".to_string(), value));
+    }
+    if let Some(value) = optional_json_string(&parsed, "deleted_at") {
+        updates.push(("deleted_at".to_string(), value));
+    }
+    let now_sec = unix_seconds().to_string();
+    updates.push(("updated_at".to_string(), now_sec.clone()));
+
+    let refs: Vec<(&str, &str)> = updates
+        .iter()
+        .map(|(field, value)| (field.as_str(), value.as_str()))
+        .collect();
+    if let Err(e) =
+        durable_table_update_where(store, cache, USERS_TABLE, &refs, &["id", "=", user_id], now)
+    {
+        return error(400, "Bad Request", &e);
+    }
+    if let Some(email) = new_email {
+        let identity_data = json!({"email":email}).to_string();
+        let _ = durable_table_update_where(
+            store,
+            cache,
+            IDENTITIES_TABLE,
+            &[
+                ("provider_id", email.as_str()),
+                ("identity_data", identity_data.as_str()),
+                ("updated_at", now_sec.as_str()),
+            ],
+            &["user_id", "=", user_id],
+            now,
+        );
+    }
+
+    match user_json(store, cache, user_id, now) {
+        Some(user) => ok(json!({"user": user})),
+        None => error(404, "Not Found", "user not found"),
+    }
+}
+
+fn admin_delete_user(
+    user_id: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let now = Instant::now();
+    let Some(user) = user_json(store, cache, user_id, now) else {
+        return error(404, "Not Found", "user not found");
+    };
+    if let Err(e) = durable_table_delete_where(
+        store,
+        cache,
+        IDENTITIES_TABLE,
+        &["user_id", "=", user_id],
+        now,
+    ) {
+        return error(400, "Bad Request", &e);
+    }
+    if let Err(e) = durable_table_delete_where(
+        store,
+        cache,
+        SESSIONS_TABLE,
+        &["user_id", "=", user_id],
+        now,
+    ) {
+        return error(400, "Bad Request", &e);
+    }
+    match durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", user_id], now) {
+        Ok(0) => error(404, "Not Found", "user not found"),
+        Ok(_) => ok(json!({"user": user})),
+        Err(e) => error(400, "Bad Request", &e),
+    }
+}
+
+fn admin_password_hash(parsed: &Value) -> Result<Option<String>, (u16, &'static str, String)> {
+    if let Some(hash) = parsed
+        .get("encrypted_password")
+        .and_then(Value::as_str)
+        .filter(|hash| !hash.is_empty())
+    {
+        return Ok(Some(hash.to_string()));
+    }
+    if let Some(password) = parsed
+        .get("password")
+        .and_then(Value::as_str)
+        .filter(|password| !password.is_empty())
+    {
+        if password.len() < 8 {
+            return Err(error(
+                400,
+                "Bad Request",
+                "password must be at least 8 characters",
+            ));
+        }
+        return hash_password(password)
+            .map(Some)
+            .map_err(|e| error(500, "Internal Server Error", &e));
+    }
+    Ok(None)
+}
+
+fn admin_confirmed_at(parsed: &Value, timestamp_field: &str, bool_field: &str) -> Option<String> {
+    if let Some(value) = parsed.get(timestamp_field) {
+        return json_scalar_to_string(value);
+    }
+    parsed
+        .get(bool_field)
+        .and_then(Value::as_bool)
+        .map(|confirmed| {
+            if confirmed {
+                unix_seconds().to_string()
+            } else {
+                String::new()
+            }
+        })
+}
+
+fn optional_json_string(parsed: &Value, field: &str) -> Option<String> {
+    parsed.get(field).and_then(json_scalar_to_string)
+}
+
+fn json_scalar_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Null => Some(String::new()),
+        _ => None,
+    }
 }
 
 fn admin_list_providers(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
@@ -944,6 +1732,148 @@ fn admin_list_providers(store: &Store, cache: &SharedSchemaCache) -> (u16, &'sta
         Ok(SelectResult::Aggregate(_)) => ok(json!({"providers": []})),
         Err(e) => error(400, "Bad Request", &e),
     }
+}
+
+fn admin_get_settings(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
+    match auth_settings(store, cache, Instant::now()) {
+        Ok(settings) => ok(
+            json!({"settings": auth_settings_json(&settings, store.config().auth.managed_email.as_ref())}),
+        ),
+        Err(e) => error(400, "Bad Request", &e),
+    }
+}
+
+fn admin_update_settings(
+    body: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let Some(object) = parsed.as_object() else {
+        return error(400, "Bad Request", "settings payload must be an object");
+    };
+    let now = Instant::now();
+    let managed_email = store.config().auth.managed_email.as_ref();
+    if managed_email.is_some()
+        && [
+            "email_provider",
+            "email_from",
+            "email_reply_to",
+            "email_postmark_server_token",
+            "email_postmark_message_stream",
+        ]
+        .iter()
+        .any(|field| object.contains_key(*field))
+    {
+        return error(
+            400,
+            "Bad Request",
+            "managed email delivery settings cannot be changed on this project",
+        );
+    }
+
+    if let Some(value) = object.get("email_confirmation_required") {
+        let Some(enabled) = value.as_bool() else {
+            return error(
+                400,
+                "Bad Request",
+                "email_confirmation_required must be a boolean",
+            );
+        };
+        if let Err(e) = set_auth_setting(
+            store,
+            cache,
+            "email_confirmation_required",
+            if enabled { "true" } else { "false" },
+            now,
+        ) {
+            return error(400, "Bad Request", &e);
+        }
+    }
+
+    if let Some(value) = object.get("flow_token_ttl_seconds") {
+        let Some(ttl) = value.as_u64() else {
+            return error(
+                400,
+                "Bad Request",
+                "flow_token_ttl_seconds must be a positive integer",
+            );
+        };
+        if ttl == 0 {
+            return error(
+                400,
+                "Bad Request",
+                "flow_token_ttl_seconds must be greater than zero",
+            );
+        }
+        if let Err(e) = set_auth_setting(
+            store,
+            cache,
+            "flow_token_ttl_seconds",
+            &ttl.to_string(),
+            now,
+        ) {
+            return error(400, "Bad Request", &e);
+        }
+    }
+
+    if let Some(value) = object.get("site_url") {
+        let Some(site_url) = value.as_str().map(str::trim).filter(|url| !url.is_empty()) else {
+            return error(400, "Bad Request", "site_url must be a non-empty string");
+        };
+        if let Err(e) = set_auth_setting(store, cache, "site_url", site_url, now) {
+            return error(400, "Bad Request", &e);
+        }
+    }
+
+    if let Some(value) = object.get("email_provider") {
+        let Some(provider) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) else {
+            return error(
+                400,
+                "Bad Request",
+                "email_provider must be a non-empty string",
+            );
+        };
+        let provider = provider.to_ascii_lowercase();
+        if !matches!(provider.as_str(), "console" | "log" | "postmark") {
+            return error(400, "Bad Request", "unsupported email_provider");
+        }
+        let provider = if provider == "log" {
+            "console".to_string()
+        } else {
+            provider
+        };
+        if let Err(e) = set_auth_setting(store, cache, "email_provider", &provider, now) {
+            return error(400, "Bad Request", &e);
+        }
+    }
+
+    for field in [
+        "email_from",
+        "email_reply_to",
+        "email_postmark_server_token",
+        "email_postmark_message_stream",
+        "email_app_name",
+        "email_from_name",
+    ] {
+        if let Some(value) = object.get(field) {
+            let Some(value) = optional_setting_string(value) else {
+                return error(
+                    400,
+                    "Bad Request",
+                    &format!("{field} must be a string or null"),
+                );
+            };
+            if let Err(e) = set_auth_setting(store, cache, field, &value, now) {
+                return error(400, "Bad Request", &e);
+            }
+        }
+    }
+
+    admin_get_settings(store, cache)
 }
 
 fn admin_upsert_provider(
@@ -1096,6 +2026,7 @@ fn oauth_authorize(
     let payload = json!({
         "provider": provider,
         "redirect_to": redirect_to,
+        "flow": get_param(params, "flow").unwrap_or("code"),
         "created_at": unix_seconds(),
     });
     store.set(
@@ -1188,24 +2119,103 @@ async fn oauth_callback(
         Ok(user) => user,
         Err(e) => return AuthHttpResponse::redirect(oauth_error_url(&redirect_to, &e)),
     };
-    match oauth_sign_in(&oauth_user, headers, store, cache) {
-        (200, _, body) => match serde_json::from_str::<Value>(&body) {
-            Ok(session) => AuthHttpResponse::redirect(oauth_success_url(&redirect_to, &session)),
-            Err(_) => AuthHttpResponse::redirect(oauth_error_url(&redirect_to, "invalid_session")),
-        },
-        (_, _, body) => AuthHttpResponse::redirect(oauth_error_url(
+    let flow = state_value
+        .get("flow")
+        .and_then(Value::as_str)
+        .unwrap_or("code");
+    match oauth_resolve_user(&oauth_user, store, cache) {
+        Ok(subject) if flow == "implicit" => {
+            match issue_session_response(
+                store,
+                cache,
+                headers,
+                &subject.user_id,
+                &subject.email,
+                Instant::now(),
+            ) {
+                (200, _, body) => match serde_json::from_str::<Value>(&body) {
+                    Ok(session) => {
+                        AuthHttpResponse::redirect(oauth_success_url(&redirect_to, &session))
+                    }
+                    Err(_) => {
+                        AuthHttpResponse::redirect(oauth_error_url(&redirect_to, "invalid_session"))
+                    }
+                },
+                (_, _, body) => AuthHttpResponse::redirect(oauth_error_url(
+                    &redirect_to,
+                    &json_error_message(&body)
+                        .unwrap_or_else(|| "oauth_sign_in_failed".to_string()),
+                )),
+            }
+        }
+        Ok(subject) => {
+            let now = Instant::now();
+            let settings = match auth_settings(store, cache, now) {
+                Ok(settings) => settings,
+                Err(_) => {
+                    return AuthHttpResponse::redirect(oauth_error_url(
+                        &redirect_to,
+                        "invalid_session",
+                    ))
+                }
+            };
+            match create_flow_token(
+                store,
+                cache,
+                FlowTokenInsert {
+                    settings: &settings,
+                    kind: "oauth_code",
+                    user_id: &subject.user_id,
+                    email: &subject.email,
+                    redirect_to: &redirect_to,
+                    metadata: json!({}),
+                },
+                now,
+            ) {
+                Ok(code) => AuthHttpResponse::redirect(oauth_code_url(&redirect_to, &code)),
+                Err(_) => {
+                    AuthHttpResponse::redirect(oauth_error_url(&redirect_to, "invalid_session"))
+                }
+            }
+        }
+        Err((_, _, body)) => AuthHttpResponse::redirect(oauth_error_url(
             &redirect_to,
             &json_error_message(&body).unwrap_or_else(|| "oauth_sign_in_failed".to_string()),
         )),
     }
 }
 
+#[derive(Clone, Debug)]
+struct AuthSessionSubject {
+    user_id: String,
+    email: String,
+}
+
+#[cfg(test)]
 fn oauth_sign_in(
     oauth_user: &OAuthUser,
     headers: &[(String, String)],
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
+    match oauth_resolve_user(oauth_user, store, cache) {
+        Ok(subject) => issue_session_response(
+            store,
+            cache,
+            headers,
+            &subject.user_id,
+            &subject.email,
+            Instant::now(),
+        ),
+        Err(response) => response,
+    }
+}
+
+fn oauth_resolve_user(
+    oauth_user: &OAuthUser,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> Result<AuthSessionSubject, (u16, &'static str, String)> {
     let provider = oauth_user.provider.as_str();
     let provider_user_id = oauth_user.provider_id.as_str();
     let email = normalize_email(&oauth_user.email);
@@ -1224,24 +2234,22 @@ fn oauth_sign_in(
         now,
     ) {
         Ok(identity) => identity,
-        Err(e) => return error(400, "Bad Request", &e),
+        Err(e) => return Err(error(400, "Bad Request", &e)),
     } {
         let Some(user_id) = identity.get("user_id") else {
-            return error(
+            return Err(error(
                 500,
                 "Internal Server Error",
                 "identity row is missing user_id",
-            );
+            ));
         };
         let Some(user) = (match find_row_by_field(store, cache, USERS_TABLE, "id", user_id, now) {
             Ok(user) => user,
-            Err(e) => return error(400, "Bad Request", &e),
+            Err(e) => return Err(error(400, "Bad Request", &e)),
         }) else {
-            return error(401, "Unauthorized", "user not found");
+            return Err(error(401, "Unauthorized", "user not found"));
         };
-        if let Err(response) = validate_user_active(&user, unix_seconds()) {
-            return response;
-        }
+        validate_user_active(&user, unix_seconds())?;
         let user_email = user.get("email").cloned().unwrap_or_else(|| email.clone());
         let now_sec = unix_seconds().to_string();
         let merged_app_meta =
@@ -1274,17 +2282,24 @@ fn oauth_sign_in(
             ],
             now,
         );
-        return issue_session_response(store, cache, headers, user_id, &user_email, now);
+        return Ok(AuthSessionSubject {
+            user_id: user_id.to_string(),
+            email: user_email,
+        });
     }
 
     let now_sec = unix_seconds();
     let existing_user = match find_row_by_field(store, cache, USERS_TABLE, "email", &email, now) {
         Ok(user) => user,
-        Err(e) => return error(400, "Bad Request", &e),
+        Err(e) => return Err(error(400, "Bad Request", &e)),
     };
     let (user_id, created_user) = if let Some(user) = existing_user {
         let Some(user_id) = user.get("id").cloned() else {
-            return error(500, "Internal Server Error", "auth user row is missing id");
+            return Err(error(
+                500,
+                "Internal Server Error",
+                "auth user row is missing id",
+            ));
         };
         let merged_app_meta =
             app_metadata_with_provider(user.get("raw_app_meta_data").map(String::as_str), provider);
@@ -1299,34 +2314,27 @@ fn oauth_sign_in(
             &["id", "=", &user_id],
             now,
         ) {
-            return error(400, "Bad Request", &e);
+            return Err(error(400, "Bad Request", &e));
         }
         (user_id, false)
     } else {
         let user_id = tables::generate_uuid_v7();
         let user_meta = user_meta.to_string();
         let app_meta = app_metadata_with_provider(None, provider);
-        let email_confirmed_at = if email_confirmed {
-            now_sec.to_string()
-        } else {
-            String::new()
-        };
-        if let Err(e) = durable_table_insert(
-            store,
-            cache,
-            USERS_TABLE,
-            &[
-                ("id", user_id.as_str()),
-                ("email", email.as_str()),
-                ("email_confirmed_at", email_confirmed_at.as_str()),
-                ("raw_user_meta_data", user_meta.as_str()),
-                ("raw_app_meta_data", app_meta.as_str()),
-                ("created_at", &now_sec.to_string()),
-                ("updated_at", &now_sec.to_string()),
-            ],
-            now,
-        ) {
-            return error(400, "Bad Request", &e);
+        let now_sec_str = now_sec.to_string();
+        let mut fields = vec![
+            ("id", user_id.as_str()),
+            ("email", email.as_str()),
+            ("raw_user_meta_data", user_meta.as_str()),
+            ("raw_app_meta_data", app_meta.as_str()),
+            ("created_at", now_sec_str.as_str()),
+            ("updated_at", now_sec_str.as_str()),
+        ];
+        if email_confirmed {
+            fields.push(("email_confirmed_at", now_sec_str.as_str()));
+        }
+        if let Err(e) = durable_table_insert(store, cache, USERS_TABLE, &fields, now) {
+            return Err(error(400, "Bad Request", &e));
         }
         (user_id, true)
     };
@@ -1351,10 +2359,10 @@ fn oauth_sign_in(
             let _ =
                 durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", &user_id], now);
         }
-        return error(400, "Bad Request", &e);
+        return Err(error(400, "Bad Request", &e));
     }
 
-    issue_session_response(store, cache, headers, &user_id, &email, now)
+    Ok(AuthSessionSubject { user_id, email })
 }
 
 fn admin_list_keys(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
@@ -1525,9 +2533,10 @@ fn ensure_signing_key(
     cache: &SharedSchemaCache,
     now: Instant,
 ) -> Result<(), String> {
-    if active_signing_secret(store, cache, now)?.is_some() {
+    if active_signing_key(store, cache, now)?.is_some() {
         return Ok(());
     }
+    let key = generate_es256_signing_key()?;
     let now_sec = unix_seconds().to_string();
     durable_table_insert(
         store,
@@ -1535,16 +2544,39 @@ fn ensure_signing_key(
         SIGNING_KEYS_TABLE,
         &[
             ("id", random_id("sgn").as_str()),
-            ("kid", random_id("kid").as_str()),
-            ("algorithm", "HS256"),
-            ("public_jwk", ""),
-            ("private_key_encrypted", random_token(48).as_str()),
+            ("kid", key.kid.as_str()),
+            ("algorithm", key.algorithm.as_str()),
+            ("public_jwk", key.public_jwk.as_str()),
+            ("private_key_encrypted", key.private_key.as_str()),
             ("active", "true"),
             ("created_at", now_sec.as_str()),
         ],
         now,
     )?;
     Ok(())
+}
+
+fn generate_es256_signing_key() -> Result<SigningKey, String> {
+    let kid = random_id("kid");
+    let secret = SecretKey::random(&mut OsRng);
+    let private_pem = secret
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|e| e.to_string())?
+        .to_string();
+    let encoding_key =
+        EncodingKey::from_ec_pem(private_pem.as_bytes()).map_err(|e| e.to_string())?;
+    let mut jwk =
+        Jwk::from_encoding_key(&encoding_key, Algorithm::ES256).map_err(|e| e.to_string())?;
+    jwk.common.key_id = Some(kid.clone());
+    jwk.common.public_key_use = Some(PublicKeyUse::Signature);
+    jwk.common.key_algorithm = Some(KeyAlgorithm::ES256);
+    let public_jwk = serde_json::to_string(&jwk).map_err(|e| e.to_string())?;
+    Ok(SigningKey {
+        kid,
+        algorithm: "ES256".to_string(),
+        public_jwk,
+        private_key: private_pem,
+    })
 }
 
 fn ensure_api_key(
@@ -1694,14 +2726,29 @@ fn sign_access_token(
         iat: now as usize,
         exp: exp as usize,
     };
-    let secret = active_signing_secret(store, cache, Instant::now())?
+    let signing_key = active_signing_key(store, cache, Instant::now())?
         .ok_or_else(|| "missing active auth signing key".to_string())?;
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .map_err(|e| e.to_string())
+    match signing_key.algorithm.as_str() {
+        "ES256" => {
+            let mut header = Header::new(Algorithm::ES256);
+            header.kid = Some(signing_key.kid);
+            let key = EncodingKey::from_ec_pem(signing_key.private_key.as_bytes())
+                .map_err(|e| e.to_string())?;
+            encode(&header, &claims, &key).map_err(|e| e.to_string())
+        }
+        _ => {
+            let mut header = Header::new(Algorithm::HS256);
+            if !signing_key.kid.is_empty() {
+                header.kid = Some(signing_key.kid);
+            }
+            encode(
+                &header,
+                &claims,
+                &EncodingKey::from_secret(signing_key.private_key.as_bytes()),
+            )
+            .map_err(|e| e.to_string())
+        }
+    }
 }
 
 fn claims_from_bearer(
@@ -1735,25 +2782,42 @@ fn claims_from_access_token(
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> Result<AccessClaims, (u16, &'static str, String)> {
-    let secret = active_signing_secret(store, cache, Instant::now())
-        .map_err(|e| error(500, "Internal Server Error", &e))?
-        .ok_or_else(|| {
-            error(
-                500,
-                "Internal Server Error",
-                "missing active auth signing key",
-            )
-        })?;
-    let mut validation = Validation::new(Algorithm::HS256);
+    let header =
+        decode_header(token).map_err(|_| error(401, "Unauthorized", "invalid bearer token"))?;
+    let signing_key = match header.alg {
+        Algorithm::ES256 => {
+            let kid = header
+                .kid
+                .as_deref()
+                .ok_or_else(|| error(401, "Unauthorized", "invalid bearer token"))?;
+            signing_key_by_kid(store, cache, kid, Instant::now())
+                .map_err(|e| error(500, "Internal Server Error", &e))?
+        }
+        Algorithm::HS256 => active_signing_key(store, cache, Instant::now())
+            .map_err(|e| error(500, "Internal Server Error", &e))?,
+        _ => None,
+    }
+    .ok_or_else(|| error(401, "Unauthorized", "invalid bearer token"))?;
+
+    let (algorithm, decoding_key) = match signing_key.algorithm.as_str() {
+        "ES256" => {
+            let jwk = serde_json::from_str::<Jwk>(&signing_key.public_jwk)
+                .map_err(|_| error(500, "Internal Server Error", "invalid auth signing key"))?;
+            let key = DecodingKey::from_jwk(&jwk)
+                .map_err(|_| error(500, "Internal Server Error", "invalid auth signing key"))?;
+            (Algorithm::ES256, key)
+        }
+        _ => (
+            Algorithm::HS256,
+            DecodingKey::from_secret(signing_key.private_key.as_bytes()),
+        ),
+    };
+    let mut validation = Validation::new(algorithm);
     validation.set_issuer(&[store.config().auth.issuer.as_str()]);
-    decode::<AccessClaims>(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &validation,
-    )
-    .map(|token| token.claims)
-    .map_err(|_| error(401, "Unauthorized", "invalid bearer token"))
-    .and_then(|claims| validate_access_claims(claims, store, cache))
+    decode::<AccessClaims>(token, &decoding_key, &validation)
+        .map(|token| token.claims)
+        .map_err(|_| error(401, "Unauthorized", "invalid bearer token"))
+        .and_then(|claims| validate_access_claims(claims, store, cache))
 }
 
 fn validate_access_claims(
@@ -1901,13 +2965,39 @@ fn row_field_is_set(row: &HashMap<String, String>, field: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn active_signing_secret(
+fn active_signing_key(
     store: &Store,
     cache: &SharedSchemaCache,
     now: Instant,
-) -> Result<Option<String>, String> {
+) -> Result<Option<SigningKey>, String> {
     let row = find_row_by_field(store, cache, SIGNING_KEYS_TABLE, "active", "true", now)?;
-    Ok(row.and_then(|row| row.get("private_key_encrypted").cloned()))
+    Ok(row.map(signing_key_from_row))
+}
+
+fn signing_key_by_kid(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    kid: &str,
+    now: Instant,
+) -> Result<Option<SigningKey>, String> {
+    let row = find_row_by_field(store, cache, SIGNING_KEYS_TABLE, "kid", kid, now)?;
+    Ok(row.map(signing_key_from_row))
+}
+
+fn signing_key_from_row(row: HashMap<String, String>) -> SigningKey {
+    SigningKey {
+        kid: row.get("kid").cloned().unwrap_or_default(),
+        algorithm: row
+            .get("algorithm")
+            .cloned()
+            .filter(|algorithm| !algorithm.is_empty())
+            .unwrap_or_else(|| "HS256".to_string()),
+        public_jwk: row.get("public_jwk").cloned().unwrap_or_default(),
+        private_key: row
+            .get("private_key_encrypted")
+            .cloned()
+            .unwrap_or_default(),
+    }
 }
 
 fn user_json(
@@ -2275,8 +3365,12 @@ fn oauth_success_url(redirect_to: &str, session: &Value) -> String {
     append_fragment(redirect_to, &fragment.join("&"))
 }
 
+fn oauth_code_url(redirect_to: &str, code: &str) -> String {
+    append_query(redirect_to, &[("code", code)])
+}
+
 fn oauth_error_url(redirect_to: &str, message: &str) -> String {
-    append_fragment(redirect_to, &format!("error={}", url_encode(message)))
+    append_query(redirect_to, &[("error", message)])
 }
 
 fn redirect_oauth_error(params: &[(String, String)], message: &str) -> AuthHttpResponse {
@@ -2290,6 +3384,540 @@ fn redirect_oauth_error(params: &[(String, String)], message: &str) -> AuthHttpR
 fn append_fragment(url: &str, fragment: &str) -> String {
     let separator = if url.contains('#') { "&" } else { "#" };
     format!("{url}{separator}{fragment}")
+}
+
+fn append_query(url: &str, params: &[(&str, &str)]) -> String {
+    let separator = if url.contains('?') { "&" } else { "?" };
+    let query = params
+        .iter()
+        .map(|(key, value)| format!("{}={}", url_encode(key), url_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{url}{separator}{query}")
+}
+
+fn auth_action_link(redirect_to: &str, token: &str, kind: &str) -> String {
+    append_query(redirect_to, &[("token_hash", token), ("type", kind)])
+}
+
+fn auth_redirect_to_with_default(parsed: &Value, default_url: &str) -> String {
+    parsed
+        .get("redirect_to")
+        .or_else(|| parsed.get("email_redirect_to"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            parsed
+                .get("options")
+                .and_then(|options| {
+                    options
+                        .get("emailRedirectTo")
+                        .or_else(|| options.get("redirectTo"))
+                })
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(sanitize_header_value)
+        .unwrap_or_else(|| default_url.to_string())
+}
+
+fn create_email_flow_token(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    kind: &str,
+    user_id: &str,
+    email: &str,
+    redirect_to: &str,
+    now: Instant,
+) -> Result<String, (u16, &'static str, String)> {
+    let settings = auth_settings(store, cache, now).map_err(|e| error(400, "Bad Request", &e))?;
+    let metadata = json!({
+        "action_link": auth_action_link(redirect_to, "", kind),
+    });
+    let token = create_flow_token(
+        store,
+        cache,
+        FlowTokenInsert {
+            settings: &settings,
+            kind,
+            user_id,
+            email,
+            redirect_to,
+            metadata,
+        },
+        now,
+    )?;
+    let action_link = auth_action_link(redirect_to, &token, kind);
+    let metadata = json!({ "action_link": action_link }).to_string();
+    durable_table_update_where(
+        store,
+        cache,
+        FLOW_TOKENS_TABLE,
+        &[("metadata", metadata.as_str())],
+        &["token_hash", "=", &hash_secret(&token)],
+        now,
+    )
+    .map_err(|e| error(400, "Bad Request", &e))?;
+    if let Err(e) = send_auth_email(store, &settings, kind, email, &action_link) {
+        let _ = durable_table_delete_where(
+            store,
+            cache,
+            FLOW_TOKENS_TABLE,
+            &["token_hash", "=", &hash_secret(&token)],
+            now,
+        );
+        return Err(error(502, "Bad Gateway", &e));
+    }
+    Ok(token)
+}
+
+fn send_auth_email(
+    store: &Store,
+    settings: &AuthSettings,
+    kind: &str,
+    email: &str,
+    action_link: &str,
+) -> Result<(), String> {
+    validate_auth_email_settings(settings, store.config().auth.managed_email.as_ref())?;
+    let delivery = effective_email_delivery(settings, store.config().auth.managed_email.as_ref())?;
+    match delivery.provider.as_str() {
+        "console" | "log" => {
+            eprintln!("Lux Auth {kind} link for {email}: {action_link}");
+            Ok(())
+        }
+        "postmark" => {
+            let token = delivery
+                .postmark_server_token
+                .clone()
+                .ok_or_else(|| "postmark email delivery requires a server token".to_string())?;
+            let message = auth_email_message(kind, email, action_link, &delivery)?;
+            run_async_work(send_postmark_email(token, message))
+        }
+        _ => Err("unsupported email_provider".to_string()),
+    }
+}
+
+fn effective_email_delivery(
+    settings: &AuthSettings,
+    managed_email: Option<&AuthManagedEmailConfig>,
+) -> Result<EffectiveEmailDelivery, String> {
+    if let Some(managed) = managed_email {
+        let provider = managed.provider.trim().to_ascii_lowercase();
+        let from = apply_email_from_name(&managed.from, settings.email_from_name.as_deref());
+        return Ok(EffectiveEmailDelivery {
+            provider,
+            from: Some(from),
+            reply_to: managed.reply_to.clone(),
+            postmark_server_token: managed.postmark_server_token.clone(),
+            postmark_message_stream: managed
+                .postmark_message_stream
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "outbound".to_string()),
+            app_name: settings.email_app_name.clone(),
+        });
+    }
+    Ok(EffectiveEmailDelivery {
+        provider: settings.email_provider.clone(),
+        from: settings.email_from.clone(),
+        reply_to: settings.email_reply_to.clone(),
+        postmark_server_token: settings.email_postmark_server_token.clone(),
+        postmark_message_stream: settings.email_postmark_message_stream.clone(),
+        app_name: settings.email_app_name.clone(),
+    })
+}
+
+fn auth_email_message(
+    kind: &str,
+    email: &str,
+    action_link: &str,
+    delivery: &EffectiveEmailDelivery,
+) -> Result<AuthEmailMessage, String> {
+    let from = delivery
+        .from
+        .clone()
+        .ok_or_else(|| "email delivery requires a from address".to_string())?;
+    let app_name = delivery.app_name.trim();
+    let app_name = if app_name.is_empty() { "Lux" } else { app_name };
+    let (subject, text_intro, html_heading) = match kind {
+        "signup" => (
+            format!("Confirm your email for {app_name}"),
+            format!("Confirm your email for {app_name} by opening this link:"),
+            "Confirm your email",
+        ),
+        "recovery" => (
+            format!("Reset your password for {app_name}"),
+            format!("Reset your password for {app_name} by opening this link:"),
+            "Reset your password",
+        ),
+        _ => (
+            format!("Continue signing in to {app_name}"),
+            format!("Continue signing in to {app_name} by opening this link:"),
+            "Continue signing in",
+        ),
+    };
+    let escaped_link = html_escape(action_link);
+    let escaped_heading = html_escape(html_heading);
+    let escaped_app = html_escape(app_name);
+    Ok(AuthEmailMessage {
+        from,
+        to: email.to_string(),
+        reply_to: delivery.reply_to.clone(),
+        subject,
+        text_body: format!("{text_intro}\n\n{action_link}\n\nIf you did not request this, you can ignore this email."),
+        html_body: format!(
+            "<h2>{escaped_heading}</h2><p>Use this link to continue with {escaped_app}:</p><p><a href=\"{escaped_link}\">{escaped_link}</a></p><p>If you did not request this, you can ignore this email.</p>"
+        ),
+        message_stream: delivery.postmark_message_stream.clone(),
+    })
+}
+
+fn postmark_payload(message: &AuthEmailMessage) -> PostmarkEmailPayload {
+    PostmarkEmailPayload {
+        from: message.from.clone(),
+        to: message.to.clone(),
+        subject: message.subject.clone(),
+        text_body: message.text_body.clone(),
+        html_body: message.html_body.clone(),
+        message_stream: message.message_stream.clone(),
+        reply_to: message.reply_to.clone(),
+    }
+}
+
+async fn send_postmark_email(
+    server_token: String,
+    message: AuthEmailMessage,
+) -> Result<(), String> {
+    let response = reqwest::Client::new()
+        .post("https://api.postmarkapp.com/email")
+        .header("Accept", "application/json")
+        .header("X-Postmark-Server-Token", server_token)
+        .json(&postmark_payload(&message))
+        .send()
+        .await
+        .map_err(|_| "postmark email request failed".to_string())?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "postmark email request failed with status {}",
+            response.status().as_u16()
+        ))
+    }
+}
+
+fn apply_email_from_name(from: &str, from_name: Option<&str>) -> String {
+    let Some(name) = from_name.map(str::trim).filter(|value| !value.is_empty()) else {
+        return sanitize_header_value(from);
+    };
+    let safe_name = sanitize_header_value(name)
+        .replace(['<', '>'], "")
+        .trim()
+        .to_string();
+    if safe_name.is_empty() {
+        return sanitize_header_value(from);
+    }
+    let safe_from = sanitize_header_value(from);
+    if let Some((_, rest)) = safe_from.split_once('<') {
+        if let Some((address, _)) = rest.split_once('>') {
+            return format!("{safe_name} <{}>", address.trim());
+        }
+    }
+    format!("{safe_name} <{}>", safe_from.trim())
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn create_flow_token(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    insert: FlowTokenInsert<'_>,
+    now: Instant,
+) -> Result<String, (u16, &'static str, String)> {
+    let token = random_token(32);
+    let token_hash = hash_secret(&token);
+    let now_sec = unix_seconds();
+    let expires_at = now_sec + insert.settings.flow_token_ttl.as_secs();
+    durable_table_insert(
+        store,
+        cache,
+        FLOW_TOKENS_TABLE,
+        &[
+            ("id", random_id("flt").as_str()),
+            ("type", insert.kind),
+            ("token_hash", token_hash.as_str()),
+            ("user_id", insert.user_id),
+            ("email", insert.email),
+            ("redirect_to", insert.redirect_to),
+            ("metadata", insert.metadata.to_string().as_str()),
+            ("expires_at", &expires_at.to_string()),
+            ("created_at", &now_sec.to_string()),
+        ],
+        now,
+    )
+    .map_err(|e| error(400, "Bad Request", &e))?;
+    Ok(token)
+}
+
+fn auth_settings_json(
+    settings: &AuthSettings,
+    managed_email: Option<&AuthManagedEmailConfig>,
+) -> Value {
+    let managed = managed_email.is_some();
+    json!({
+        "email_confirmation_required": settings.email_confirmation_required,
+        "flow_token_ttl_seconds": settings.flow_token_ttl.as_secs(),
+        "site_url": settings.site_url,
+        "email_provider": if managed { "managed" } else { settings.email_provider.as_str() },
+        "email_delivery_managed": managed,
+        "email_delivery_configured": managed || matches!(settings.email_provider.as_str(), "console" | "log") || settings.email_postmark_server_token.is_some(),
+        "email_from": if managed { Value::Null } else { optional_string_json(settings.email_from.as_deref()) },
+        "email_reply_to": if managed { Value::Null } else { optional_string_json(settings.email_reply_to.as_deref()) },
+        "email_postmark_message_stream": if managed {
+            Value::Null
+        } else {
+            Value::String(settings.email_postmark_message_stream.clone())
+        },
+        "has_email_postmark_server_token": !managed && settings.email_postmark_server_token.is_some(),
+        "email_app_name": settings.email_app_name,
+        "email_from_name": optional_string_json(settings.email_from_name.as_deref()),
+    })
+}
+
+fn optional_string_json(value: Option<&str>) -> Value {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| Value::String(value.to_string()))
+        .unwrap_or(Value::Null)
+}
+
+fn ensure_auth_setting(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    key: &str,
+    value: &str,
+    now: Instant,
+) -> Result<(), String> {
+    if find_row_by_field(store, cache, SETTINGS_TABLE, "key", key, now)?.is_some() {
+        return Ok(());
+    }
+    let now_sec = unix_seconds().to_string();
+    durable_table_insert(
+        store,
+        cache,
+        SETTINGS_TABLE,
+        &[
+            ("key", key),
+            ("value", value),
+            ("updated_at", now_sec.as_str()),
+        ],
+        now,
+    )
+    .map(|_| ())
+}
+
+fn set_auth_setting(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    key: &str,
+    value: &str,
+    now: Instant,
+) -> Result<(), String> {
+    if find_row_by_field(store, cache, SETTINGS_TABLE, "key", key, now)?.is_some() {
+        let now_sec = unix_seconds().to_string();
+        durable_table_update_where(
+            store,
+            cache,
+            SETTINGS_TABLE,
+            &[("value", value), ("updated_at", now_sec.as_str())],
+            &["key", "=", key],
+            now,
+        )?;
+    } else {
+        ensure_auth_setting(store, cache, key, value, now)?;
+    }
+    Ok(())
+}
+
+fn auth_settings(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    now: Instant,
+) -> Result<AuthSettings, String> {
+    Ok(AuthSettings {
+        email_confirmation_required: auth_setting_value(
+            store,
+            cache,
+            "email_confirmation_required",
+            now,
+        )?
+        .map(|value| parse_setting_bool(&value))
+        .unwrap_or(store.config().auth.email_confirmation_required),
+        flow_token_ttl: Duration::from_secs(
+            auth_setting_value(store, cache, "flow_token_ttl_seconds", now)?
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_else(|| store.config().auth.flow_token_ttl.as_secs()),
+        ),
+        site_url: auth_setting_value(store, cache, "site_url", now)?
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| store.config().auth.site_url.clone()),
+        email_provider: auth_setting_value(store, cache, "email_provider", now)?
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.to_ascii_lowercase())
+            .map(|value| {
+                if value == "log" {
+                    "console".to_string()
+                } else {
+                    value
+                }
+            })
+            .unwrap_or_else(|| "console".to_string()),
+        email_from: auth_setting_value(store, cache, "email_from", now)?
+            .filter(|value| !value.trim().is_empty()),
+        email_reply_to: auth_setting_value(store, cache, "email_reply_to", now)?
+            .filter(|value| !value.trim().is_empty()),
+        email_postmark_server_token: auth_setting_value(
+            store,
+            cache,
+            "email_postmark_server_token",
+            now,
+        )?
+        .filter(|value| !value.trim().is_empty()),
+        email_postmark_message_stream: auth_setting_value(
+            store,
+            cache,
+            "email_postmark_message_stream",
+            now,
+        )?
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "outbound".to_string()),
+        email_app_name: auth_setting_value(store, cache, "email_app_name", now)?
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "Lux".to_string()),
+        email_from_name: auth_setting_value(store, cache, "email_from_name", now)?
+            .filter(|value| !value.trim().is_empty()),
+    })
+}
+
+fn auth_setting_value(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    key: &str,
+    now: Instant,
+) -> Result<Option<String>, String> {
+    Ok(
+        find_row_by_field(store, cache, SETTINGS_TABLE, "key", key, now)?
+            .and_then(|row| row.get("value").cloned()),
+    )
+}
+
+fn parse_setting_bool(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn optional_setting_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.trim().to_string()),
+        Value::Null => Some(String::new()),
+        _ => None,
+    }
+}
+
+fn validate_auth_email_settings(
+    settings: &AuthSettings,
+    managed_email: Option<&AuthManagedEmailConfig>,
+) -> Result<(), String> {
+    if let Some(managed) = managed_email {
+        if managed.provider.trim().eq_ignore_ascii_case("postmark")
+            && managed
+                .postmark_server_token
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+        {
+            return Err("managed postmark email delivery requires a server token".to_string());
+        }
+        return Ok(());
+    }
+    match settings.email_provider.as_str() {
+        "console" | "log" => Ok(()),
+        "postmark" => {
+            if settings.email_from.as_deref().unwrap_or("").is_empty() {
+                return Err("postmark email delivery requires email_from".to_string());
+            }
+            if settings
+                .email_postmark_server_token
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(
+                    "postmark email delivery requires email_postmark_server_token".to_string(),
+                );
+            }
+            Ok(())
+        }
+        _ => Err("unsupported email_provider".to_string()),
+    }
+}
+
+fn consume_flow_token(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    kind: &str,
+    token: &str,
+    now: Instant,
+) -> Result<HashMap<String, String>, (u16, &'static str, String)> {
+    let token_hash = hash_secret(token);
+    let Some(row) = find_row_by_field(
+        store,
+        cache,
+        FLOW_TOKENS_TABLE,
+        "token_hash",
+        &token_hash,
+        now,
+    )
+    .map_err(|e| error(400, "Bad Request", &e))?
+    else {
+        return Err(error(400, "Bad Request", "invalid or expired token"));
+    };
+    if row.get("type").map(String::as_str) != Some(kind) {
+        return Err(error(400, "Bad Request", "invalid token type"));
+    }
+    if row
+        .get("consumed_at")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false)
+    {
+        return Err(error(400, "Bad Request", "token already consumed"));
+    }
+    let expires_at = row
+        .get("expires_at")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    if expires_at <= unix_seconds() {
+        return Err(error(400, "Bad Request", "invalid or expired token"));
+    }
+    let consumed_at = unix_seconds().to_string();
+    durable_table_update_where(
+        store,
+        cache,
+        FLOW_TOKENS_TABLE,
+        &[("consumed_at", consumed_at.as_str())],
+        &["token_hash", "=", &token_hash],
+        now,
+    )
+    .map_err(|e| error(400, "Bad Request", &e))?;
+    Ok(row)
 }
 
 fn form_body(items: &[(&str, &str)]) -> String {
@@ -2837,15 +4465,40 @@ fn hash_password(password: &str) -> Result<String, String> {
     })
 }
 
+#[cfg(test)]
 fn verify_password(password: &str, hash: &str) -> Result<bool, String> {
+    verify_password_state(password, hash).map(|state| state != PasswordVerification::Invalid)
+}
+
+fn verify_password_state(password: &str, hash: &str) -> Result<PasswordVerification, String> {
     let password = password.to_string();
     let hash = hash.to_string();
     run_password_work(move || {
+        if is_bcrypt_hash(&hash) {
+            return bcrypt::verify(&password, &hash)
+                .map(|valid| {
+                    if valid {
+                        PasswordVerification::ValidNeedsRehash
+                    } else {
+                        PasswordVerification::Invalid
+                    }
+                })
+                .map_err(|e| e.to_string());
+        }
         let parsed = PasswordHash::new(&hash).map_err(|e| e.to_string())?;
-        Ok(Argon2::default()
+        let valid = Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
-            .is_ok())
+            .is_ok();
+        Ok(if valid {
+            PasswordVerification::Valid
+        } else {
+            PasswordVerification::Invalid
+        })
     })
+}
+
+fn is_bcrypt_hash(hash: &str) -> bool {
+    hash.starts_with("$2a$") || hash.starts_with("$2b$") || hash.starts_with("$2y$")
 }
 
 fn run_password_work<T, F>(work: F) -> T
@@ -2856,6 +4509,32 @@ where
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => block_in_place(work),
         _ => work(),
+    }
+}
+
+fn run_async_work<T, F>(future: F) -> T
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            block_in_place(|| handle.block_on(future))
+        }
+        Ok(_) => std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build auth email runtime")
+                .block_on(future)
+        })
+        .join()
+        .expect("auth email runtime thread panicked"),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build auth email runtime")
+            .block_on(future),
     }
 }
 
@@ -3375,12 +5054,20 @@ mod tests {
             enabled: true,
             initial_publishable_key: Some("lux_pub_secret".to_string()),
             initial_secret_key: Some("lux_sec_secret".to_string()),
+            managed_email: Some(crate::AuthManagedEmailConfig {
+                provider: "postmark".to_string(),
+                from: "auth@app.test".to_string(),
+                reply_to: None,
+                postmark_server_token: Some("pm_secret".to_string()),
+                postmark_message_stream: None,
+            }),
             ..AuthConfig::default()
         };
         let debug = format!("{config:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("lux_pub_secret"));
         assert!(!debug.contains("lux_sec_secret"));
+        assert!(!debug.contains("pm_secret"));
     }
 
     #[test]
@@ -3389,6 +5076,19 @@ mod tests {
         assert_ne!(hash, "correct horse battery staple");
         assert!(verify_password("correct horse battery staple", &hash).unwrap());
         assert!(!verify_password("wrong password", &hash).unwrap());
+    }
+
+    #[test]
+    fn bcrypt_password_hashes_verify_and_request_rehash() {
+        let hash = bcrypt::hash("correct horse battery staple", 4).unwrap();
+        assert_eq!(
+            verify_password_state("correct horse battery staple", &hash).unwrap(),
+            PasswordVerification::ValidNeedsRehash
+        );
+        assert_eq!(
+            verify_password_state("wrong password", &hash).unwrap(),
+            PasswordVerification::Invalid
+        );
     }
 
     #[test]
@@ -3404,14 +5104,15 @@ mod tests {
     }
 
     #[test]
-    fn reserved_auth_tables_are_blocked_from_generic_table_reads() {
+    fn reserved_auth_tables_are_readable_through_direct_table_commands() {
         let store = Store::new();
         let cache = Arc::new(RwLock::new(SchemaCache::new()));
         bootstrap(&store, &cache, &AuthConfig::default()).unwrap();
 
         let broker = crate::pubsub::Broker::new();
-        // Both schema introspection and row reads of auth.* via the generic
-        // table commands must be refused; clients use /auth/v1 instead.
+        // Direct operator command surfaces (CLI/cloud command prompt/RESP) can
+        // inspect auth internals. Public REST/table/live paths still carry their
+        // own reserved-table guards, and mutations remain blocked.
         for cmd in [
             &[b"TSCHEMA".as_ref(), b"auth.users".as_ref()][..],
             &[
@@ -3424,8 +5125,10 @@ mod tests {
             let mut out = bytes::BytesMut::new();
             crate::cmd::execute(&store, &cache, &broker, cmd, &mut out, Instant::now());
             let response = std::str::from_utf8(&out).unwrap();
-            assert!(response.starts_with("-ERR"), "{response}");
-            assert!(response.contains("managed by Lux Auth"), "{response}");
+            assert!(
+                !response.starts_with("-ERR"),
+                "direct auth table read should be allowed: {response}"
+            );
         }
     }
 
@@ -3468,6 +5171,525 @@ mod tests {
         let token_json: Value = serde_json::from_str(&token_body).unwrap();
         assert!(token_json.get("access_token").is_some(), "{token_body}");
         assert!(token_json.get("refresh_token").is_some(), "{token_body}");
+    }
+
+    fn flow_token_for_email(
+        store: &Store,
+        cache: &SharedSchemaCache,
+        email: &str,
+        kind: &str,
+    ) -> String {
+        let rows = find_rows_by_field(
+            store,
+            cache,
+            FLOW_TOKENS_TABLE,
+            "email",
+            email,
+            Instant::now(),
+        )
+        .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.get("type").map(String::as_str) == Some(kind))
+            .expect("flow token should exist");
+        let metadata: Value =
+            serde_json::from_str(row.get("metadata").map(String::as_str).unwrap_or("{}")).unwrap();
+        metadata["action_link"]
+            .as_str()
+            .and_then(|link| link.split("token_hash=").nth(1))
+            .map(|rest| rest.split('&').next().unwrap_or(rest).to_string())
+            .expect("action link should carry token_hash")
+    }
+
+    #[test]
+    fn signup_confirmation_flow_confirms_email_and_issues_session() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                email_confirmation_required: true,
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let (status, _, signup_body) = route_http(
+            "POST",
+            "/auth/v1/signup",
+            r#"{"email":"confirm@example.com","password":"password123","email_redirect_to":"http://app.test/confirm"}"#,
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "{signup_body}");
+        let signup_json: Value = serde_json::from_str(&signup_body).unwrap();
+        assert!(signup_json["access_token"].is_null(), "{signup_body}");
+
+        let (status, _, body) = route_http(
+            "POST",
+            "/auth/v1/token",
+            r#"{"grant_type":"password","email":"confirm@example.com","password":"password123"}"#,
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 401, "unconfirmed login should fail: {body}");
+
+        let token = flow_token_for_email(&store, &cache, "confirm@example.com", "signup");
+        let (status, _, verify_body) = route_http(
+            "POST",
+            "/auth/v1/verify",
+            &format!(r#"{{"type":"signup","token_hash":"{token}"}}"#),
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "verify: {verify_body}");
+        let verified: Value = serde_json::from_str(&verify_body).unwrap();
+        assert!(verified["access_token"].is_string(), "{verify_body}");
+
+        let (status, _, body) = route_http(
+            "POST",
+            "/auth/v1/token",
+            r#"{"grant_type":"password","email":"confirm@example.com","password":"password123"}"#,
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "confirmed login should succeed: {body}");
+    }
+
+    #[test]
+    fn admin_settings_update_auth_flows_without_restart() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                initial_secret_key: Some("lux_sec_test".to_string()),
+                email_confirmation_required: false,
+                site_url: "http://initial.test/auth".to_string(),
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let (status, _, body) = route_http(
+            "PATCH",
+            "/auth/v1/admin/settings",
+            r#"{"email_confirmation_required":true,"flow_token_ttl_seconds":120,"site_url":"http://updated.test/auth"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "settings update: {body}");
+        let settings: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(settings["settings"]["email_confirmation_required"], true);
+        assert_eq!(settings["settings"]["flow_token_ttl_seconds"], 120);
+        assert_eq!(settings["settings"]["site_url"], "http://updated.test/auth");
+
+        let (status, _, signup_body) = route_http(
+            "POST",
+            "/auth/v1/signup",
+            r#"{"email":"dynamic@example.com","password":"password123"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "signup: {signup_body}");
+        let signup: Value = serde_json::from_str(&signup_body).unwrap();
+        assert!(signup["session"].is_null(), "{signup_body}");
+
+        let token_row = find_rows_by_field(
+            &store,
+            &cache,
+            FLOW_TOKENS_TABLE,
+            "email",
+            "dynamic@example.com",
+            Instant::now(),
+        )
+        .unwrap()
+        .pop()
+        .expect("signup flow token should exist after dynamic settings update");
+        let metadata: Value =
+            serde_json::from_str(token_row.get("metadata").map(String::as_str).unwrap()).unwrap();
+        assert!(
+            metadata["action_link"]
+                .as_str()
+                .unwrap()
+                .starts_with("http://updated.test/auth?token_hash="),
+            "{metadata}"
+        );
+    }
+
+    #[test]
+    fn postmark_payload_renders_builtin_signup_and_recovery_emails() {
+        let delivery = EffectiveEmailDelivery {
+            provider: "postmark".to_string(),
+            from: Some("Auth <auth@app.test>".to_string()),
+            reply_to: Some("support@app.test".to_string()),
+            postmark_server_token: Some("server-token".to_string()),
+            postmark_message_stream: "outbound".to_string(),
+            app_name: "Pompeii".to_string(),
+        };
+
+        let signup = auth_email_message(
+            "signup",
+            "user@app.test",
+            "http://app.test/confirm",
+            &delivery,
+        )
+        .unwrap();
+        let signup_payload = postmark_payload(&signup);
+        assert_eq!(signup_payload.from, "Auth <auth@app.test>");
+        assert_eq!(signup_payload.to, "user@app.test");
+        assert_eq!(signup_payload.reply_to.as_deref(), Some("support@app.test"));
+        assert_eq!(signup_payload.subject, "Confirm your email for Pompeii");
+        assert!(signup_payload.text_body.contains("http://app.test/confirm"));
+        assert!(signup_payload.html_body.contains("Confirm your email"));
+
+        let recovery = auth_email_message(
+            "recovery",
+            "user@app.test",
+            "http://app.test/reset",
+            &delivery,
+        )
+        .unwrap();
+        let recovery_payload = postmark_payload(&recovery);
+        assert_eq!(recovery_payload.subject, "Reset your password for Pompeii");
+        assert!(recovery_payload.text_body.contains("http://app.test/reset"));
+        assert!(recovery_payload.html_body.contains("Reset your password"));
+    }
+
+    #[test]
+    fn admin_settings_redacts_and_preserves_postmark_token() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                initial_secret_key: Some("lux_sec_test".to_string()),
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let (status, _, body) = route_http(
+            "PATCH",
+            "/auth/v1/admin/settings",
+            r#"{"email_provider":"postmark","email_from":"Auth <auth@app.test>","email_postmark_server_token":"server-token","email_postmark_message_stream":"outbound","email_app_name":"Pompeii"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "settings update: {body}");
+        assert!(!body.contains("server-token"), "{body}");
+        let settings: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(settings["settings"]["email_provider"], "postmark");
+        assert_eq!(
+            settings["settings"]["has_email_postmark_server_token"],
+            true
+        );
+
+        let (status, _, body) = route_http(
+            "PATCH",
+            "/auth/v1/admin/settings",
+            r#"{"email_app_name":"Pompeii AI"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "settings update without token: {body}");
+        let settings: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            settings["settings"]["has_email_postmark_server_token"],
+            true
+        );
+        assert_eq!(settings["settings"]["email_app_name"], "Pompeii AI");
+        assert!(!body.contains("server-token"), "{body}");
+    }
+
+    #[test]
+    fn signup_delivery_failure_invalidates_flow_token() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                initial_secret_key: Some("lux_sec_test".to_string()),
+                email_confirmation_required: true,
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let (status, _, body) = route_http(
+            "PATCH",
+            "/auth/v1/admin/settings",
+            r#"{"email_provider":"postmark","email_from":"Auth <auth@app.test>"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "settings update: {body}");
+
+        let (status, _, body) = route_http(
+            "POST",
+            "/auth/v1/signup",
+            r#"{"email":"sendfail@example.com","password":"password123"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(
+            status, 502,
+            "signup should fail when delivery fails: {body}"
+        );
+        assert!(
+            find_rows_by_field(
+                &store,
+                &cache,
+                FLOW_TOKENS_TABLE,
+                "email",
+                "sendfail@example.com",
+                Instant::now(),
+            )
+            .unwrap()
+            .is_empty(),
+            "unsent flow token should be removed"
+        );
+    }
+
+    #[test]
+    fn managed_email_delivery_overrides_project_provider_settings() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                initial_secret_key: Some("lux_sec_test".to_string()),
+                managed_email: Some(crate::AuthManagedEmailConfig {
+                    provider: "postmark".to_string(),
+                    from: "managed@app.test".to_string(),
+                    reply_to: None,
+                    postmark_server_token: Some("managed-token".to_string()),
+                    postmark_message_stream: Some("broadcast".to_string()),
+                }),
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let (status, _, body) = route_http(
+            "PATCH",
+            "/auth/v1/admin/settings",
+            r#"{"email_provider":"postmark"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 400, "managed provider should be immutable: {body}");
+
+        let (status, _, body) = route_http(
+            "PATCH",
+            "/auth/v1/admin/settings",
+            r#"{"email_from_name":"Pompeii","email_app_name":"Pompeii"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "safe branding update: {body}");
+        let settings_json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(settings_json["settings"]["email_provider"], "managed");
+        assert_eq!(settings_json["settings"]["email_delivery_managed"], true);
+        assert_eq!(
+            settings_json["settings"]["has_email_postmark_server_token"],
+            false
+        );
+        assert!(!body.contains("managed-token"), "{body}");
+
+        let settings = auth_settings(&store, &cache, Instant::now()).unwrap();
+        let delivery =
+            effective_email_delivery(&settings, store.config().auth.managed_email.as_ref())
+                .unwrap();
+        assert_eq!(delivery.provider, "postmark");
+        assert_eq!(delivery.from.as_deref(), Some("Pompeii <managed@app.test>"));
+        assert_eq!(
+            delivery.postmark_server_token.as_deref(),
+            Some("managed-token")
+        );
+        assert_eq!(delivery.postmark_message_stream, "broadcast");
+    }
+
+    #[test]
+    fn recovery_flow_issues_session_and_allows_password_update() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let (status, _, body) = route_http(
+            "POST",
+            "/auth/v1/signup",
+            r#"{"email":"recover@example.com","password":"password123"}"#,
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "signup: {body}");
+
+        let (status, _, body) = route_http(
+            "POST",
+            "/auth/v1/recover",
+            r#"{"email":"recover@example.com","redirect_to":"http://app.test/update-password"}"#,
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "recover: {body}");
+        let token = flow_token_for_email(&store, &cache, "recover@example.com", "recovery");
+
+        let (status, _, verify_body) = route_http(
+            "POST",
+            "/auth/v1/verify",
+            &format!(r#"{{"type":"recovery","token_hash":"{token}"}}"#),
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "verify recovery: {verify_body}");
+        let session: Value = serde_json::from_str(&verify_body).unwrap();
+        let access = session["access_token"].as_str().unwrap();
+
+        let (status, _, update_body) = route_http(
+            "PUT",
+            "/auth/v1/user",
+            r#"{"password":"newpassword123"}"#,
+            &[],
+            &[("authorization".to_string(), format!("Bearer {access}"))],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "update password: {update_body}");
+
+        let (status, _, old_body) = route_http(
+            "POST",
+            "/auth/v1/token",
+            r#"{"grant_type":"password","email":"recover@example.com","password":"password123"}"#,
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 400, "old password should fail: {old_body}");
+
+        let (status, _, new_body) = route_http(
+            "POST",
+            "/auth/v1/token",
+            r#"{"grant_type":"password","email":"recover@example.com","password":"newpassword123"}"#,
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "new password should login: {new_body}");
+    }
+
+    #[test]
+    fn authorization_code_flow_is_one_time_use() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let (_, _, signup_body) = route_http(
+            "POST",
+            "/auth/v1/signup",
+            r#"{"email":"code@example.com","password":"password123"}"#,
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        let signup: Value = serde_json::from_str(&signup_body).unwrap();
+        let user_id = signup["user"]["id"].as_str().unwrap();
+        let settings = auth_settings(&store, &cache, Instant::now()).unwrap();
+        let code = create_flow_token(
+            &store,
+            &cache,
+            FlowTokenInsert {
+                settings: &settings,
+                kind: "oauth_code",
+                user_id,
+                email: "code@example.com",
+                redirect_to: "http://app.test/callback",
+                metadata: json!({}),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+
+        let (status, _, body) = route_http(
+            "POST",
+            "/auth/v1/token",
+            &format!(r#"{{"grant_type":"authorization_code","code":"{code}"}}"#),
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "code exchange: {body}");
+
+        let (status, _, body) = route_http(
+            "POST",
+            "/auth/v1/token",
+            &format!(r#"{{"grant_type":"authorization_code","code":"{code}"}}"#),
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 400, "code should be single-use: {body}");
     }
 
     #[tokio::test]
