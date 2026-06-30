@@ -1958,7 +1958,7 @@ pub(crate) fn project_columns(
         .map(|row| {
             projections
                 .iter()
-                .filter_map(|proj| {
+                .map(|proj| {
                     let target = &proj.expr;
                     let qualified = format!("{}.{}", table_alias, bare_col(target));
                     let val = row
@@ -1982,7 +1982,7 @@ pub(crate) fn project_columns(
                         .clone()
                         .unwrap_or_else(|| bare_col(target).to_string());
 
-                    val.map(|v| (out_name, v))
+                    (out_name, val.unwrap_or_default())
                 })
                 .collect()
         })
