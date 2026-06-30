@@ -5759,6 +5759,79 @@ mod tests {
     }
 
     #[test]
+    fn select_join_projection_keeps_missing_aliased_columns() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let now = now();
+
+        table_create(
+            &store,
+            &cache,
+            "members",
+            &[
+                "id STR PRIMARY KEY,",
+                "role STR,",
+                "team_id STR,",
+                "user_id STR",
+            ],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "members",
+            &[
+                ("id", "m1"),
+                ("role", "owner"),
+                ("team_id", "t1"),
+                ("user_id", "u1"),
+            ],
+            now,
+        )
+        .unwrap();
+
+        table_create(
+            &store,
+            &cache,
+            "profiles",
+            &["id STR PRIMARY KEY,", "username STR,", "full_name STR"],
+            now,
+        )
+        .unwrap();
+        table_insert(&store, &cache, "profiles", &[("id", "u1")], now).unwrap();
+
+        let plan = parse_select(&[
+            "id,role,team_id,user_id,p.id AS profile_id,p.username AS username,p.full_name AS full_name",
+            "FROM",
+            "members",
+            "JOIN",
+            "profiles",
+            "p",
+            "ON",
+            "user_id",
+            "=",
+            "p.id",
+            "WHERE",
+            "team_id",
+            "=",
+            "t1",
+        ])
+        .unwrap();
+        let result = table_select(&store, &cache, &plan, now).unwrap();
+        match result {
+            SelectResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                let row = &rows[0];
+                assert!(row.iter().any(|(k, v)| k == "profile_id" && v == "u1"));
+                assert!(row.iter().any(|(k, v)| k == "username" && v.is_empty()));
+                assert!(row.iter().any(|(k, v)| k == "full_name" && v.is_empty()));
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
     fn select_multi_join_resolves_qualified_duplicate_column_names() {
         let store = Arc::new(Store::new());
         let cache = make_cache();
