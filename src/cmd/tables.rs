@@ -592,7 +592,8 @@ pub fn cmd_tselect(
     match tables::table_select(store, cache, &plan, now) {
         Ok(SelectResult::Rows(rows)) => {
             resp::write_array_header(out, rows.len());
-            for row in rows {
+            for mut row in rows {
+                crate::auth::redact_auth_select_row(&plan, &mut row);
                 resp::write_array_header(out, row.len() * 2);
                 for (k, v) in row {
                     resp::write_bulk(out, &k);

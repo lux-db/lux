@@ -662,14 +662,14 @@ export class LuxProjectSelectBuilder<T extends object, TResult> extends LuxProje
 	single(): LuxProjectSelectBuilder<T, ProjectSelectSingle<TResult>> {
 		this.expectSingle = true;
 		this.allowEmptySingle = false;
-		if (this.limitCount == null) this.limitCount = 1;
+		if (this.limitCount == null) this.limitCount = 2;
 		return this as unknown as LuxProjectSelectBuilder<T, ProjectSelectSingle<TResult>>;
 	}
 
 	maybeSingle(): LuxProjectSelectBuilder<T, ProjectSelectMaybeSingle<TResult>> {
 		this.expectSingle = true;
 		this.allowEmptySingle = true;
-		if (this.limitCount == null) this.limitCount = 1;
+		if (this.limitCount == null) this.limitCount = 2;
 		return this as unknown as LuxProjectSelectBuilder<T, ProjectSelectMaybeSingle<TResult>>;
 	}
 
@@ -690,6 +690,9 @@ export class LuxProjectSelectBuilder<T extends object, TResult> extends LuxProje
 		if (rows.length === 0) {
 			if (this.allowEmptySingle) return ok(null as TResult);
 			return err('NOT_FOUND', `No rows found in table '${this.tableName}'`);
+		}
+		if (rows.length > 1) {
+			return err('MULTIPLE_ROWS', `Multiple rows found in table '${this.tableName}'`);
 		}
 		return ok(rows[0] as unknown as TResult);
 	}
@@ -1114,7 +1117,7 @@ function formatWhereValue(value: QueryValue): string {
 	// tokenizer (whitespace), or that start with a quote (which the tokenizer
 	// would treat as an opening quote). Everything else stays bare, so simple
 	// values keep working against engines that predate quoted-WHERE support.
-	if (!/\s/.test(str) && !str.startsWith("'")) return str;
+	if (!/[\s=<>!()]/.test(str) && !str.startsWith("'")) return str;
 	const escaped = str.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 	return `'${escaped}'`;
 }

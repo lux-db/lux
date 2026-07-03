@@ -165,6 +165,8 @@ describe('Lux project client', () => {
 		await client.table('posts').select().eq('title', 'a OR b').gt('rank', 5); // space -> quoted
 		await client.table('people').select().eq('name', "O'Brien"); // no space -> bare (back-compat)
 		await client.table('users').select().eq('email', 'a@b.com'); // no space -> bare
+		await client.table('filters').select().eq('expr', 'a=b'); // operator char -> quoted
+		await client.table('filters').select().eq('range', 'x<y'); // operator char -> quoted
 		await client.table('nums').select().eq('id', 42); // number -> bare
 
 		expect(seen).toEqual([
@@ -172,6 +174,8 @@ describe('Lux project client', () => {
 			"title = 'a OR b' AND rank > 5",
 			"name = O'Brien",
 			'email = a@b.com',
+			"expr = 'a=b'",
+			"range = 'x<y'",
 			'id = 42',
 		]);
 	});
@@ -212,6 +216,37 @@ describe('Lux project client', () => {
 			data: null,
 			error: null,
 		});
+	});
+
+	test('single and maybeSingle detect multiple rows', async () => {
+		const urls: string[] = [];
+		const fetchImpl = async (input: RequestInfo | URL) => {
+			urls.push(String(input));
+			return new Response(JSON.stringify({ result: [{ id: 1 }, { id: 2 }] }), { status: 200 });
+		};
+
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const single = await client.table<{ id: number }>('messages').select().eq('room', 'general').single();
+		const maybeSingle = await client.table<{ id: number }>('messages').select().eq('room', 'general').maybeSingle();
+
+		expect(single).toEqual({
+			data: null,
+			error: {
+				code: 'MULTIPLE_ROWS',
+				message: "Multiple rows found in table 'messages'",
+				details: undefined,
+			},
+		});
+		expect(maybeSingle.error?.code).toBe('MULTIPLE_ROWS');
+		expect(urls).toEqual([
+			'http://localhost:3957/v1/project/tables/messages?where=room+%3D+general&limit=2',
+			'http://localhost:3957/v1/project/tables/messages?where=room+%3D+general&limit=2',
+		]);
 	});
 
 	test('update and delete require fluent filters', async () => {

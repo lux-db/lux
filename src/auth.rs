@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -35,7 +36,9 @@ pub(crate) const SETTINGS_TABLE: &str = "auth.settings";
 const AUTH_SCHEMA_VERSION_KEY: &[u8] = b"_auth:schema_version";
 const AUTH_SCHEMA_VERSION: &[u8] = b"2";
 const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+const POSTMARK_EMAIL_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCESS_REVOKED_AFTER_PREFIX: &[u8] = b"_auth:access_revoked_after:";
+static FLOW_TOKEN_CONSUME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ApiKeyKind {
@@ -56,6 +59,7 @@ struct AuthSettings {
     email_confirmation_required: bool,
     flow_token_ttl: Duration,
     site_url: String,
+    redirect_allow_list: Vec<String>,
     email_provider: String,
     email_from: Option<String>,
     email_reply_to: Option<String>,
@@ -258,6 +262,57 @@ pub(crate) fn reserved_plan_access_error(plan: &SelectPlan) -> Option<String> {
         }
     }
     None
+}
+
+pub(crate) fn redact_auth_table_row(table: &str, row: &mut [(String, String)]) {
+    if !is_reserved_auth_table(table) {
+        return;
+    }
+    if table == SETTINGS_TABLE {
+        let key = row
+            .iter()
+            .find(|(field, _)| bare_auth_field(field) == "key")
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("");
+        if key == "email_postmark_server_token" {
+            redact_row_field(row, "value");
+        }
+        return;
+    }
+    for field in sensitive_auth_fields(table) {
+        redact_row_field(row, field);
+    }
+}
+
+pub(crate) fn redact_auth_select_row(plan: &SelectPlan, row: &mut [(String, String)]) {
+    redact_auth_table_row(&plan.table, row);
+    for join in &plan.joins {
+        redact_auth_table_row(&join.table, row);
+    }
+}
+
+fn redact_row_field(row: &mut [(String, String)], field: &str) {
+    for (name, value) in row {
+        if bare_auth_field(name) == field && !value.is_empty() {
+            *value = "<redacted>".to_string();
+        }
+    }
+}
+
+fn bare_auth_field(field: &str) -> &str {
+    field.rsplit('.').next().unwrap_or(field)
+}
+
+fn sensitive_auth_fields(table: &str) -> &'static [&'static str] {
+    match table {
+        USERS_TABLE => &["encrypted_password"],
+        SESSIONS_TABLE => &["refresh_token_hash"],
+        KEYS_TABLE => &["key_hash"],
+        SIGNING_KEYS_TABLE => &["private_key_encrypted"],
+        PROVIDERS_TABLE => &["client_secret"],
+        FLOW_TOKENS_TABLE => &["token_hash"],
+        _ => &[],
+    }
 }
 
 fn reserved_table_error(table: &str) -> String {
@@ -488,6 +543,7 @@ pub(crate) fn bootstrap_runtime(
         now,
     )?;
     ensure_auth_setting(store, cache, "site_url", &config.site_url, now)?;
+    ensure_auth_setting(store, cache, "redirect_allow_list", "", now)?;
     ensure_auth_setting(store, cache, "email_provider", "console", now)?;
     ensure_auth_setting(
         store,
@@ -702,6 +758,14 @@ fn signup(
         Ok(settings) => settings,
         Err(e) => return error(400, "Bad Request", &e),
     };
+    let signup_redirect_to = if settings.email_confirmation_required {
+        match auth_redirect_to_with_default(&parsed, &settings) {
+            Ok(redirect_to) => Some(redirect_to),
+            Err(e) => return error(400, "Bad Request", &e),
+        }
+    } else {
+        None
+    };
     let now_sec_str = now_sec.to_string();
     let mut fields = vec![
         ("id", user_id.as_str()),
@@ -739,9 +803,9 @@ fn signup(
     }
 
     if settings.email_confirmation_required {
-        let redirect_to = auth_redirect_to_with_default(&parsed, &settings.site_url);
+        let redirect_to = signup_redirect_to.as_deref().unwrap_or("/");
         if let Err(response) =
-            create_email_flow_token(store, cache, "signup", &user_id, &email, &redirect_to, now)
+            create_email_flow_token(store, cache, "signup", &user_id, &email, redirect_to, now)
         {
             let _ = durable_table_delete_where(
                 store,
@@ -1061,13 +1125,16 @@ fn recover(body: &str, store: &Store, cache: &SharedSchemaCache) -> (u16, &'stat
         Ok(settings) => settings,
         Err(e) => return error(400, "Bad Request", &e),
     };
+    let redirect_to = match auth_redirect_to_with_default(&parsed, &settings) {
+        Ok(redirect_to) => redirect_to,
+        Err(e) => return error(400, "Bad Request", &e),
+    };
     if let Some(user) = find_row_by_field(store, cache, USERS_TABLE, "email", &email, now)
         .ok()
         .flatten()
     {
         if validate_user_active(&user, unix_seconds()).is_ok() {
             if let Some(user_id) = user.get("id") {
-                let redirect_to = auth_redirect_to_with_default(&parsed, &settings.site_url);
                 if let Err(response) = create_email_flow_token(
                     store,
                     cache,
@@ -1829,6 +1896,28 @@ fn admin_update_settings(
         }
     }
 
+    if let Some(value) = object.get("redirect_allow_list") {
+        let allow_list = match optional_string_list_setting(value) {
+            Some(values) => values,
+            None => {
+                return error(
+                    400,
+                    "Bad Request",
+                    "redirect_allow_list must be an array, string, or null",
+                )
+            }
+        };
+        if let Err(e) = set_auth_setting(
+            store,
+            cache,
+            "redirect_allow_list",
+            &allow_list.join("\n"),
+            now,
+        ) {
+            return error(400, "Bad Request", &e);
+        }
+    }
+
     if let Some(value) = object.get("email_provider") {
         let Some(provider) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) else {
             return error(
@@ -2005,7 +2094,20 @@ fn oauth_authorize(
     let redirect_to = get_param(params, "redirect_to")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("/");
-    let redirect_to = sanitize_header_value(redirect_to);
+    let settings = match auth_settings(store, cache, Instant::now()) {
+        Ok(settings) => settings,
+        Err(e) => {
+            let (status, status_text, body) = error(400, "Bad Request", &e);
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+    };
+    let redirect_to = match validate_auth_redirect(redirect_to, &settings) {
+        Ok(redirect_to) => redirect_to,
+        Err(e) => {
+            let (status, status_text, body) = error(400, "Bad Request", &e);
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+    };
     let config = match oauth_provider_config(store, cache, &provider, Instant::now()) {
         Ok(Some(config)) if config.enabled => config,
         Ok(Some(_)) => {
@@ -3400,8 +3502,11 @@ fn auth_action_link(redirect_to: &str, token: &str, kind: &str) -> String {
     append_query(redirect_to, &[("token_hash", token), ("type", kind)])
 }
 
-fn auth_redirect_to_with_default(parsed: &Value, default_url: &str) -> String {
-    parsed
+fn auth_redirect_to_with_default(
+    parsed: &Value,
+    settings: &AuthSettings,
+) -> Result<String, String> {
+    let redirect = parsed
         .get("redirect_to")
         .or_else(|| parsed.get("email_redirect_to"))
         .and_then(Value::as_str)
@@ -3417,7 +3522,87 @@ fn auth_redirect_to_with_default(parsed: &Value, default_url: &str) -> String {
         })
         .filter(|value| !value.trim().is_empty())
         .map(sanitize_header_value)
-        .unwrap_or_else(|| default_url.to_string())
+        .unwrap_or_else(|| settings.site_url.clone());
+    validate_auth_redirect(&redirect, settings)
+}
+
+fn validate_auth_redirect(redirect: &str, settings: &AuthSettings) -> Result<String, String> {
+    let redirect = sanitize_header_value(redirect).trim().to_string();
+    if redirect.is_empty() {
+        return Err("redirect URL cannot be empty".to_string());
+    }
+    if is_relative_redirect(&redirect) {
+        return Ok(redirect);
+    }
+    let Some(target_origin) = url_origin(&redirect) else {
+        return Err("redirect URL must be relative or absolute http(s) URL".to_string());
+    };
+    if url_origin(&settings.site_url).as_deref() == Some(target_origin.as_str()) {
+        return Ok(redirect);
+    }
+    if settings
+        .redirect_allow_list
+        .iter()
+        .any(|allowed| redirect_matches_allowed(&redirect, &target_origin, allowed))
+    {
+        return Ok(redirect);
+    }
+    Err("redirect URL is not allowed".to_string())
+}
+
+fn is_relative_redirect(value: &str) -> bool {
+    value.starts_with('/') && !value.starts_with("//") && !value.contains('\\')
+}
+
+fn redirect_matches_allowed(redirect: &str, target_origin: &str, allowed: &str) -> bool {
+    let allowed = allowed.trim();
+    if allowed.is_empty() {
+        return false;
+    }
+    if let Some(allowed_origin) = url_origin(allowed) {
+        if allowed_origin != target_origin {
+            return false;
+        }
+        if let Some(path_start) = url_path_start(allowed) {
+            let allowed_path = &allowed[path_start..];
+            if allowed_path == "/" {
+                return true;
+            }
+            return redirect
+                .get(path_start..)
+                .is_some_and(|path| path.starts_with(allowed_path));
+        }
+        return true;
+    }
+    redirect == allowed
+}
+
+fn url_origin(value: &str) -> Option<String> {
+    let scheme_end = value.find("://")?;
+    let scheme = &value[..scheme_end].to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let rest = &value[scheme_end + 3..];
+    if rest.is_empty() || rest.starts_with('/') {
+        return None;
+    }
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if host_end == 0 {
+        return None;
+    }
+    Some(format!(
+        "{}://{}",
+        scheme,
+        &rest[..host_end].to_ascii_lowercase()
+    ))
+}
+
+fn url_path_start(value: &str) -> Option<usize> {
+    let scheme_end = value.find("://")?;
+    let rest_start = scheme_end + 3;
+    let rest = &value[rest_start..];
+    rest.find('/').map(|idx| rest_start + idx)
 }
 
 fn create_email_flow_token(
@@ -3587,7 +3772,11 @@ async fn send_postmark_email(
     server_token: String,
     message: AuthEmailMessage,
 ) -> Result<(), String> {
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .timeout(POSTMARK_EMAIL_TIMEOUT)
+        .build()
+        .map_err(|_| "postmark email client setup failed".to_string())?;
+    let response = client
         .post("https://api.postmarkapp.com/email")
         .header("Accept", "application/json")
         .header("X-Postmark-Server-Token", server_token)
@@ -3674,6 +3863,7 @@ fn auth_settings_json(
         "email_confirmation_required": settings.email_confirmation_required,
         "flow_token_ttl_seconds": settings.flow_token_ttl.as_secs(),
         "site_url": settings.site_url,
+        "redirect_allow_list": settings.redirect_allow_list.clone(),
         "email_provider": if managed { "managed" } else { settings.email_provider.as_str() },
         "email_delivery_managed": managed,
         "email_delivery_configured": managed || matches!(settings.email_provider.as_str(), "console" | "log") || settings.email_postmark_server_token.is_some(),
@@ -3767,6 +3957,9 @@ fn auth_settings(
         site_url: auth_setting_value(store, cache, "site_url", now)?
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| store.config().auth.site_url.clone()),
+        redirect_allow_list: auth_setting_value(store, cache, "redirect_allow_list", now)?
+            .map(|value| parse_redirect_allow_list(&value))
+            .unwrap_or_default(),
         email_provider: auth_setting_value(store, cache, "email_provider", now)?
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.to_ascii_lowercase())
@@ -3832,6 +4025,33 @@ fn optional_setting_string(value: &Value) -> Option<String> {
     }
 }
 
+fn optional_string_list_setting(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::Null => Some(Vec::new()),
+        Value::String(value) => Some(parse_redirect_allow_list(value)),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| value.as_str().map(|s| s.trim().to_string()))
+            .collect::<Option<Vec<_>>>()
+            .map(|values| {
+                values
+                    .into_iter()
+                    .filter(|value| !value.is_empty())
+                    .collect()
+            }),
+        _ => None,
+    }
+}
+
+fn parse_redirect_allow_list(value: &str) -> Vec<String> {
+    value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn validate_auth_email_settings(
     settings: &AuthSettings,
     managed_email: Option<&AuthManagedEmailConfig>,
@@ -3877,8 +4097,18 @@ fn consume_flow_token(
     token: &str,
     now: Instant,
 ) -> Result<HashMap<String, String>, (u16, &'static str, String)> {
+    let _guard = FLOW_TOKEN_CONSUME_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| {
+            error(
+                500,
+                "Internal Server Error",
+                "auth flow token lock poisoned",
+            )
+        })?;
     let token_hash = hash_secret(token);
-    let Some(row) = find_row_by_field(
+    let Some(existing) = find_row_by_field(
         store,
         cache,
         FLOW_TOKENS_TABLE,
@@ -3890,34 +4120,61 @@ fn consume_flow_token(
     else {
         return Err(error(400, "Bad Request", "invalid or expired token"));
     };
-    if row.get("type").map(String::as_str) != Some(kind) {
+    if existing.get("type").map(String::as_str) != Some(kind) {
         return Err(error(400, "Bad Request", "invalid token type"));
     }
-    if row
+    if existing
         .get("consumed_at")
         .map(|value| !value.is_empty() && value != "0")
         .unwrap_or(false)
     {
         return Err(error(400, "Bad Request", "token already consumed"));
     }
-    let expires_at = row
+    let expires_at = existing
         .get("expires_at")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
-    if expires_at <= unix_seconds() {
+    let now_sec = unix_seconds();
+    if expires_at <= now_sec {
         return Err(error(400, "Bad Request", "invalid or expired token"));
     }
-    let consumed_at = unix_seconds().to_string();
-    durable_table_update_where(
+    let consumed_at = now_sec.to_string();
+    let expires_at_s = expires_at.to_string();
+    let rows = tables::table_update_where_returning_ttl(
         store,
         cache,
         FLOW_TOKENS_TABLE,
         &[("consumed_at", consumed_at.as_str())],
-        &["token_hash", "=", &token_hash],
+        &[
+            "token_hash",
+            "=",
+            &token_hash,
+            "AND",
+            "type",
+            "=",
+            kind,
+            "AND",
+            "expires_at",
+            "=",
+            &expires_at_s,
+            "AND",
+            "consumed_at",
+            "IS",
+            "NULL",
+        ],
+        None,
         now,
     )
     .map_err(|e| error(400, "Bad Request", &e))?;
-    Ok(row)
+    if rows.len() != 1 {
+        return Err(error(400, "Bad Request", "token already consumed"));
+    }
+    Ok(rows
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .into_iter()
+        .collect())
 }
 
 fn form_body(items: &[(&str, &str)]) -> String {
@@ -5482,6 +5739,162 @@ mod tests {
     }
 
     #[test]
+    fn direct_auth_table_reads_redact_sensitive_values() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+        set_auth_setting(
+            &store,
+            &cache,
+            "email_postmark_server_token",
+            "server-token",
+            Instant::now(),
+        )
+        .unwrap();
+        let (status, _, body) = route_http(
+            "POST",
+            "/auth/v1/signup",
+            r#"{"email":"redact@example.com","password":"password123"}"#,
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "signup: {body}");
+        let signup_json: Value = serde_json::from_str(&body).unwrap();
+        let user_id = signup_json["user"]["id"].as_str().unwrap();
+        tables::table_create(
+            &store,
+            &cache,
+            "redaction_posts",
+            &["id STR PRIMARY KEY,", "user_id UUID"],
+            Instant::now(),
+        )
+        .unwrap();
+        durable_table_insert(
+            &store,
+            &cache,
+            "redaction_posts",
+            &[("id", "post_1"), ("user_id", user_id)],
+            Instant::now(),
+        )
+        .unwrap();
+
+        let broker = crate::pubsub::Broker::new();
+        let mut users = bytes::BytesMut::new();
+        crate::cmd::execute(
+            &store,
+            &cache,
+            &broker,
+            &[
+                b"TSELECT",
+                b"*",
+                b"FROM",
+                b"auth.users",
+                b"WHERE",
+                b"email",
+                b"=",
+                b"redact@example.com",
+            ],
+            &mut users,
+            Instant::now(),
+        );
+        let users = std::str::from_utf8(&users).unwrap();
+        assert!(
+            users.contains("<redacted>"),
+            "password hash should be redacted: {users}"
+        );
+        assert!(!users.contains("$argon2"), "password hash leaked: {users}");
+
+        let mut joined_users = bytes::BytesMut::new();
+        crate::cmd::execute(
+            &store,
+            &cache,
+            &broker,
+            &[
+                b"TSELECT",
+                b"*",
+                b"FROM",
+                b"redaction_posts",
+                b"p",
+                b"JOIN",
+                b"auth.users",
+                b"u",
+                b"ON",
+                b"p.user_id",
+                b"=",
+                b"u.id",
+            ],
+            &mut joined_users,
+            Instant::now(),
+        );
+        let joined_users = std::str::from_utf8(&joined_users).unwrap();
+        assert!(
+            joined_users.contains("<redacted>"),
+            "joined password hash should be redacted: {joined_users}"
+        );
+        assert!(
+            !joined_users.contains("$argon2"),
+            "joined password hash leaked: {joined_users}"
+        );
+
+        let mut signing_keys = bytes::BytesMut::new();
+        crate::cmd::execute(
+            &store,
+            &cache,
+            &broker,
+            &[b"TSELECT", b"*", b"FROM", b"auth.signing_keys"],
+            &mut signing_keys,
+            Instant::now(),
+        );
+        let signing_keys = std::str::from_utf8(&signing_keys).unwrap();
+        assert!(
+            signing_keys.contains("<redacted>"),
+            "private signing key should be redacted: {signing_keys}"
+        );
+        assert!(
+            !signing_keys.contains("BEGIN PRIVATE KEY"),
+            "private signing key leaked: {signing_keys}"
+        );
+
+        let mut settings = bytes::BytesMut::new();
+        crate::cmd::execute(
+            &store,
+            &cache,
+            &broker,
+            &[
+                b"TSELECT",
+                b"*",
+                b"FROM",
+                b"auth.settings",
+                b"WHERE",
+                b"key",
+                b"=",
+                b"email_postmark_server_token",
+            ],
+            &mut settings,
+            Instant::now(),
+        );
+        let settings = std::str::from_utf8(&settings).unwrap();
+        assert!(
+            settings.contains("<redacted>"),
+            "postmark token should be redacted: {settings}"
+        );
+        assert!(
+            !settings.contains("server-token"),
+            "postmark token leaked: {settings}"
+        );
+    }
+
+    #[test]
     fn signup_and_password_grant_issue_tokens() {
         let config = Arc::new(crate::ServerConfig {
             auth: AuthConfig {
@@ -5551,11 +5964,93 @@ mod tests {
     }
 
     #[test]
+    fn signup_rejects_untrusted_redirect_before_creating_user() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                email_confirmation_required: true,
+                site_url: "http://app.test/auth".to_string(),
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let (status, _, body) = route_http(
+            "POST",
+            "/auth/v1/signup",
+            r#"{"email":"evil-redirect@example.com","password":"password123","email_redirect_to":"https://evil.test/steal"}"#,
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("redirect URL is not allowed"), "{body}");
+        assert!(
+            find_row_by_field(
+                &store,
+                &cache,
+                USERS_TABLE,
+                "email",
+                "evil-redirect@example.com",
+                Instant::now(),
+            )
+            .unwrap()
+            .is_none(),
+            "bad redirect signup should not leave a user row"
+        );
+    }
+
+    #[test]
+    fn recover_rejects_untrusted_redirect() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                site_url: "http://app.test/auth".to_string(),
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let (status, _, body) = route_http(
+            "POST",
+            "/auth/v1/signup",
+            r#"{"email":"recover-redirect@example.com","password":"password123"}"#,
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "signup: {body}");
+
+        let (status, _, body) = route_http(
+            "POST",
+            "/auth/v1/recover",
+            r#"{"email":"recover-redirect@example.com","redirect_to":"https://evil.test/update"}"#,
+            &[],
+            &[],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("redirect URL is not allowed"), "{body}");
+    }
+
+    #[test]
     fn signup_confirmation_flow_confirms_email_and_issues_session() {
         let config = Arc::new(crate::ServerConfig {
             auth: AuthConfig {
                 enabled: true,
                 email_confirmation_required: true,
+                site_url: "http://app.test/auth".to_string(),
                 ..AuthConfig::default()
             },
             ..crate::ServerConfig::default()
@@ -5898,6 +6393,7 @@ mod tests {
         let config = Arc::new(crate::ServerConfig {
             auth: AuthConfig {
                 enabled: true,
+                site_url: "http://app.test/auth".to_string(),
                 ..AuthConfig::default()
             },
             ..crate::ServerConfig::default()
@@ -6041,12 +6537,72 @@ mod tests {
         assert_eq!(status, 400, "code should be single-use: {body}");
     }
 
+    #[test]
+    fn flow_token_consume_has_single_winner_under_concurrency() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Arc::new(Store::new_with_config(config));
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let settings = auth_settings(&store, &cache, Instant::now()).unwrap();
+        let user_id = tables::generate_uuid_v7();
+        let token = create_flow_token(
+            &store,
+            &cache,
+            FlowTokenInsert {
+                settings: &settings,
+                kind: "recovery",
+                user_id: &user_id,
+                email: "race@example.com",
+                redirect_to: "/",
+                metadata: json!({}),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+
+        let workers = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(workers));
+        let successes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let store = Arc::clone(&store);
+            let cache = Arc::clone(&cache);
+            let barrier = Arc::clone(&barrier);
+            let successes = Arc::clone(&successes);
+            let token = token.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                if consume_flow_token(&store, &cache, "recovery", &token, Instant::now()).is_ok() {
+                    successes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            successes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only one concurrent consumer may redeem a flow token"
+        );
+    }
+
     #[tokio::test]
     async fn oauth_provider_config_and_authorize_redirect_are_core_owned() {
         let config = Arc::new(crate::ServerConfig {
             auth: AuthConfig {
                 enabled: true,
                 initial_secret_key: Some("lux_sec_test".to_string()),
+                site_url: "http://app.test/auth".to_string(),
                 ..AuthConfig::default()
             },
             ..crate::ServerConfig::default()

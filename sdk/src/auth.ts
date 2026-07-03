@@ -288,6 +288,7 @@ export interface LuxAuthSettings {
 	email_confirmation_required: boolean;
 	flow_token_ttl_seconds: number;
 	site_url: string;
+	redirect_allow_list: string[];
 	email_provider: 'console' | 'postmark' | 'managed' | string;
 	email_delivery_managed: boolean;
 	email_delivery_configured: boolean;
@@ -303,6 +304,7 @@ export interface LuxAuthSettingsUpdate {
 	email_confirmation_required?: boolean;
 	flow_token_ttl_seconds?: number;
 	site_url?: string;
+	redirect_allow_list?: string[] | string | null;
 	email_provider?: 'console' | 'postmark' | string;
 	email_from?: string | null;
 	email_reply_to?: string | null;
