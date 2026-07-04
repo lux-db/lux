@@ -76,6 +76,7 @@ pub struct SetOptions<'a> {
     pub xx: bool,
     pub ifeq: Option<&'a [u8]>,
     pub get: bool,
+    pub encrypted: bool,
 }
 
 #[derive(Clone, Default)]
@@ -305,6 +306,7 @@ impl StoreMetrics {
 
 pub struct Store {
     config: Arc<crate::ServerConfig>,
+    encryption: crate::encryption::EncryptionKeyring,
     shards: Box<[RwLock<Shard>]>,
     metrics: StoreMetrics,
     /// Serializes Lua script execution for this runtime without blocking other
@@ -359,12 +361,29 @@ fn parse_table_vector_key(key: &str) -> Option<(&str, &str, &str)> {
     Some((table, field, pk))
 }
 
+fn parse_table_row_key(key: &str) -> Option<(&str, &str)> {
+    let rest = key.strip_prefix("_t:")?;
+    let (table, pk) = rest.split_once(":row:")?;
+    if table.is_empty() || pk.is_empty() {
+        return None;
+    }
+    Some((table, pk))
+}
+
 fn table_vector_index_name(table: &str, field: &str) -> String {
     format!("{}.{}", table, field)
 }
 
 fn table_vector_key_for_pk(table: &str, field: &str, pk: &str) -> String {
     format!("_t:{}:vec:{}:{}", table, field, pk)
+}
+
+fn encrypted_value_would_be_orphaned(value: &[u8], remaining_key_ids: &HashSet<String>) -> bool {
+    crate::encryption::EncryptionKeyring::is_encrypted_value(value)
+        && !crate::encryption::EncryptionKeyring::envelope_decryptable_by_any(
+            value,
+            remaining_key_ids,
+        )
 }
 
 pub(crate) struct TableVectorCandidateQuery<'a> {
@@ -467,6 +486,9 @@ impl Store {
     }
 
     pub fn new_with_config(config: Arc<crate::ServerConfig>) -> Self {
+        let encryption =
+            crate::encryption::EncryptionKeyring::open(&config.encryption, &config.data_dir)
+                .unwrap_or_else(|e| panic!("invalid encryption config: {e}"));
         let n = config.shards;
         let shards: Vec<RwLock<Shard>> = (0..n)
             .map(|_| {
@@ -506,6 +528,7 @@ impl Store {
 
         Self {
             config,
+            encryption,
             shards: shards.into_boxed_slice(),
             metrics: StoreMetrics::new(),
             script_gate: RwLock::new(()),
@@ -519,6 +542,134 @@ impl Store {
 
     pub fn config(&self) -> &crate::ServerConfig {
         &self.config
+    }
+
+    pub(crate) fn encryption(&self) -> &crate::encryption::EncryptionKeyring {
+        &self.encryption
+    }
+
+    pub(crate) fn enc_rewrap_all(&self) -> Result<usize, String> {
+        let mut count = 0usize;
+        for idx in 0..self.shards.len() {
+            let mut shard = self.shards[idx].write();
+            let mut shard_changed = false;
+            let mut mem_delta: isize = 0;
+            let mut disk_remove = Vec::new();
+            for (key, entry) in shard.data.iter_mut() {
+                if entry.is_expired_at(Instant::now()) {
+                    continue;
+                }
+                match &mut entry.value {
+                    StoreValue::Str(value) => {
+                        if crate::encryption::EncryptionKeyring::is_encrypted_value(value) {
+                            let key_name = key_string(key);
+                            let new_value = self
+                                .encryption()
+                                .reencrypt("__lux_kv", "value", &key_name, value)?;
+                            mem_delta += new_value.len() as isize - value.len() as isize;
+                            *value = Bytes::from(new_value);
+                            count += 1;
+                            shard_changed = true;
+                            disk_remove.push(key.clone());
+                        }
+                    }
+                    StoreValue::StrBuf(value) => {
+                        if crate::encryption::EncryptionKeyring::is_encrypted_value(value) {
+                            let key_name = key_string(key);
+                            let new_value = self
+                                .encryption()
+                                .reencrypt("__lux_kv", "value", &key_name, value)?;
+                            mem_delta += new_value.len() as isize - value.len() as isize;
+                            *value = new_value;
+                            count += 1;
+                            shard_changed = true;
+                            disk_remove.push(key.clone());
+                        }
+                    }
+                    StoreValue::Hash(map) => {
+                        let key_name = key_string(key);
+                        let table_row = parse_table_row_key(&key_name)
+                            .map(|(table, pk)| (table.to_string(), pk.to_string()));
+                        for (field, value) in map.iter_mut() {
+                            if !crate::encryption::EncryptionKeyring::is_encrypted_value(value) {
+                                continue;
+                            }
+                            let new_value = if let Some((table, pk)) = &table_row {
+                                self.encryption().reencrypt(table, field, pk, value)?
+                            } else {
+                                self.encryption().reencrypt(
+                                    "__lux_hash",
+                                    field,
+                                    &key_name,
+                                    value,
+                                )?
+                            };
+                            mem_delta += new_value.len() as isize - value.len() as isize;
+                            *value = Bytes::from(new_value);
+                            count += 1;
+                            shard_changed = true;
+                            disk_remove.push(key.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if shard_changed {
+                shard.version += 1;
+                if mem_delta > 0 {
+                    shard.used_memory += mem_delta as usize;
+                    self.mem_add(mem_delta as usize);
+                } else if mem_delta < 0 {
+                    let freed = (-mem_delta) as usize;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    self.mem_sub(freed);
+                }
+            }
+            drop(shard);
+            for key in disk_remove {
+                self.remove_from_disk(&key);
+            }
+        }
+        Ok(count)
+    }
+
+    pub(crate) fn enc_retire_key(&self, key_id: &str) -> Result<(), String> {
+        let remaining = self.encryption().remaining_key_ids_without(key_id);
+        if remaining.is_empty() {
+            return Err("ERR ENC cannot retire the last key".to_string());
+        }
+        for shard in self.shards.iter() {
+            let shard = shard.read();
+            for entry in shard.data.values() {
+                match &entry.value {
+                    StoreValue::Str(value) => {
+                        if encrypted_value_would_be_orphaned(value, &remaining) {
+                            return Err(
+                                "ERR ENC key is still required by encrypted data".to_string()
+                            );
+                        }
+                    }
+                    StoreValue::StrBuf(value) => {
+                        if encrypted_value_would_be_orphaned(value, &remaining) {
+                            return Err(
+                                "ERR ENC key is still required by encrypted data".to_string()
+                            );
+                        }
+                    }
+                    StoreValue::Hash(map) => {
+                        for value in map.values() {
+                            if encrypted_value_would_be_orphaned(value, &remaining) {
+                                return Err(
+                                    "ERR ENC key is still required by encrypted data".to_string()
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.encryption().retire(key_id)
     }
 
     fn insert_vector_indexes(&self, key: String, dims: u32, data: Vec<f32>) {
@@ -1103,6 +1254,119 @@ impl Store {
     }
 
     #[inline(always)]
+    fn user_kv_key(key: &[u8]) -> String {
+        key_string(key)
+    }
+
+    #[inline(always)]
+    fn user_hash_field(field: &[u8]) -> String {
+        key_string(field)
+    }
+
+    #[inline(always)]
+    fn is_table_storage_key(key: &[u8]) -> bool {
+        key.starts_with(b"_t:")
+    }
+
+    pub(crate) fn decrypt_kv_string_value(
+        &self,
+        key: &[u8],
+        value: Bytes,
+    ) -> Result<Bytes, String> {
+        if !crate::encryption::EncryptionKeyring::is_encrypted_value(&value) {
+            return Ok(value);
+        }
+        let key_name = Self::user_kv_key(key);
+        self.encryption()
+            .decrypt("__lux_kv", "value", &key_name, &value)
+            .map(Bytes::from)
+    }
+
+    fn encrypt_kv_string_value(&self, key: &[u8], value: &[u8]) -> Result<Vec<u8>, String> {
+        let key_name = Self::user_kv_key(key);
+        self.encryption()
+            .encrypt("__lux_kv", "value", &key_name, value)
+    }
+
+    pub(crate) fn decrypt_hash_field_value(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        value: Bytes,
+    ) -> Result<Bytes, String> {
+        if Self::is_table_storage_key(key)
+            || !crate::encryption::EncryptionKeyring::is_encrypted_value(&value)
+        {
+            return Ok(value);
+        }
+        let key_name = Self::user_kv_key(key);
+        let field_name = Self::user_hash_field(field);
+        self.encryption()
+            .decrypt("__lux_hash", &field_name, &key_name, &value)
+            .map(Bytes::from)
+    }
+
+    fn encrypt_hash_field_value(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        value: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let key_name = Self::user_kv_key(key);
+        let field_name = Self::user_hash_field(field);
+        self.encryption()
+            .encrypt("__lux_hash", &field_name, &key_name, value)
+    }
+
+    pub(crate) fn kv_string_is_encrypted(&self, key: &[u8], now: Instant) -> bool {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        Self::get_from_shard(&shard.data, key, now)
+            .as_ref()
+            .is_some_and(|value| crate::encryption::EncryptionKeyring::is_encrypted_value(value))
+    }
+
+    pub(crate) fn hash_fields_need_encryption(
+        &self,
+        key: &[u8],
+        fields: &[&[u8]],
+        now: Instant,
+    ) -> bool {
+        if Self::is_table_storage_key(key) {
+            return false;
+        }
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        let Some(entry) = shard
+            .data
+            .get(key)
+            .filter(|entry| !entry.is_expired_at(now))
+        else {
+            return false;
+        };
+        let StoreValue::Hash(map) = &entry.value else {
+            return false;
+        };
+        fields.iter().any(|field| {
+            map.get(key_str(field)).is_some_and(|value| {
+                crate::encryption::EncryptionKeyring::is_encrypted_value(value)
+            })
+        })
+    }
+
+    pub(crate) fn get_raw_string(&self, key: &[u8], now: Instant) -> Option<Bytes> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        Self::get_from_shard(&shard.data, key, now)
+    }
+
+    pub(crate) fn get_kv_string(&self, key: &[u8], now: Instant) -> Result<Option<Bytes>, String> {
+        self.get_raw_string(key, now)
+            .map(|value| self.decrypt_kv_string_value(key, value))
+            .transpose()
+    }
+
+    #[inline(always)]
     #[allow(dead_code)]
     pub(crate) fn get_and_write(
         data: &ShardData,
@@ -1114,6 +1378,29 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => {
                 if let Some(s) = entry.value.string_bytes() {
                     crate::resp::write_bulk_raw(out, s);
+                } else {
+                    crate::resp::write_null(out);
+                }
+            }
+            _ => crate::resp::write_null(out),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn get_kv_and_write_from_shard(
+        &self,
+        data: &ShardData,
+        key: &[u8],
+        now: Instant,
+        out: &mut bytes::BytesMut,
+    ) {
+        match data.get(key) {
+            Some(entry) if !entry.is_expired_at(now) => {
+                if let Some(s) = entry.value.string_to_bytes() {
+                    match self.decrypt_kv_string_value(key, s) {
+                        Ok(value) => crate::resp::write_bulk_raw(out, &value),
+                        Err(err) => crate::resp::write_error(out, &err),
+                    }
                 } else {
                     crate::resp::write_null(out);
                 }
@@ -1327,6 +1614,7 @@ impl Store {
         let mut exists = false;
         let mut old = None;
         let mut old_expires_at = None;
+        let mut existing_encrypted = false;
         let mut ifeq_matches = options.ifeq.is_none();
         if let Some(entry) = shard
             .data
@@ -1335,19 +1623,23 @@ impl Store {
         {
             exists = true;
             old_expires_at = entry.expires_at;
+            existing_encrypted = entry
+                .value
+                .string_bytes()
+                .is_some_and(crate::encryption::EncryptionKeyring::is_encrypted_value);
             if options.get {
-                old = Some(
-                    entry
-                        .value
-                        .string_to_bytes()
-                        .ok_or_else(|| WRONGTYPE.to_string())?,
-                );
+                let raw = entry
+                    .value
+                    .string_to_bytes()
+                    .ok_or_else(|| WRONGTYPE.to_string())?;
+                old = Some(self.decrypt_kv_string_value(key, raw)?);
             }
             if let Some(expected) = options.ifeq {
-                let current = entry
+                let raw = entry
                     .value
-                    .string_bytes()
+                    .string_to_bytes()
                     .ok_or_else(|| WRONGTYPE.to_string())?;
+                let current = self.decrypt_kv_string_value(key, raw)?;
                 ifeq_matches = current == expected;
             }
         }
@@ -1363,7 +1655,12 @@ impl Store {
             } else {
                 options.ttl.map(|d| now + d)
             };
-            let new_value = StoreValue::Str(Bytes::copy_from_slice(value));
+            let stored_value = if options.encrypted || existing_encrypted {
+                self.encrypt_kv_string_value(key, value)?
+            } else {
+                value.to_vec()
+            };
+            let new_value = StoreValue::Str(Bytes::from(stored_value));
             let mem = estimate_entry_memory(key, &new_value);
             let old_entry = shard.data.insert(
                 key_bytes(key),

@@ -8,6 +8,7 @@ use super::{arg_str, cmd_eq, parse_i64, parse_u64, CmdResult};
 
 const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
 const VALUE_TOO_LARGE_ERR: &str = "ERR string exceeds maximum allowed size";
+const ENCRYPTED_MUTATION_ERR: &str = "ERR encrypted string does not support this mutation command";
 
 fn parse_i64_arg(arg: &[u8], out: &mut BytesMut) -> Option<i64> {
     match parse_i64(arg) {
@@ -46,6 +47,28 @@ fn parse_positive_ttl(arg: &[u8], command: &str, out: &mut BytesMut) -> Option<u
     }
 }
 
+fn reject_encrypted_string_mutation(
+    store: &Store,
+    key: &[u8],
+    now: Instant,
+    out: &mut BytesMut,
+) -> bool {
+    if store.kv_string_is_encrypted(key, now) {
+        resp::write_error(out, ENCRYPTED_MUTATION_ERR);
+        true
+    } else {
+        false
+    }
+}
+
+fn full_string_value(store: &Store, key: &[u8], now: Instant) -> Result<Bytes, String> {
+    if store.kv_string_is_encrypted(key, now) {
+        Ok(store.get_kv_string(key, now)?.unwrap_or_default())
+    } else {
+        store.getrange(key, 0, -1, now)
+    }
+}
+
 pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 3 {
         resp::write_error(out, "ERR wrong number of arguments for 'set' command");
@@ -57,6 +80,7 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
     let mut xx = false;
     let mut get = false;
     let mut ifeq = None;
+    let mut encrypted = false;
     let mut i = 3;
     while i < args.len() {
         if cmd_eq(args[i], b"EX") {
@@ -146,6 +170,9 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
             }
             keep_ttl = true;
             i += 1;
+        } else if cmd_eq(args[i], b"ENCRYPTED") {
+            encrypted = true;
+            i += 1;
         } else {
             resp::write_error(out, "ERR syntax error");
             return CmdResult::Written;
@@ -162,9 +189,30 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
         xx,
         ifeq,
         get,
+        encrypted,
     };
+    let should_self_log = encrypted || store.kv_string_is_encrypted(args[1], now);
     match store.set_conditional(args[1], args[2], options, now) {
         Ok((set, old)) => {
+            if set && should_self_log && store.wal_enabled() {
+                if let Some(raw) = store.get_raw_string(args[1], now) {
+                    let mut owned: Vec<Vec<u8>> = Vec::with_capacity(args.len());
+                    owned.push(b"ENC".to_vec());
+                    owned.push(b"RAWSET".to_vec());
+                    owned.push(args[1].to_vec());
+                    owned.push(raw.to_vec());
+                    for arg in &args[3..] {
+                        if !cmd_eq(arg, b"ENCRYPTED") {
+                            owned.push(arg.to_vec());
+                        }
+                    }
+                    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+                    if let Err(e) = store.wal_log_command(&refs) {
+                        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                        return CmdResult::Written;
+                    }
+                }
+            }
             if get {
                 resp::write_optional_bulk_raw(out, &old);
             } else if set {
@@ -183,6 +231,9 @@ pub fn cmd_setnx(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         resp::write_error(out, "ERR wrong number of arguments for 'setnx' command");
         return CmdResult::Written;
     }
+    if reject_encrypted_string_mutation(store, args[1], now, out) {
+        return CmdResult::Written;
+    }
     resp::write_integer(
         out,
         if store.set_nx(args[1], args[2], now) {
@@ -197,6 +248,9 @@ pub fn cmd_setnx(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
 pub fn cmd_setex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 4 {
         resp::write_error(out, "ERR wrong number of arguments for 'setex' command");
+        return CmdResult::Written;
+    }
+    if reject_encrypted_string_mutation(store, args[1], now, out) {
         return CmdResult::Written;
     }
     match parse_i64(args[2]) {
@@ -222,6 +276,9 @@ pub fn cmd_psetex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'psetex' command");
         return CmdResult::Written;
     }
+    if reject_encrypted_string_mutation(store, args[1], now, out) {
+        return CmdResult::Written;
+    }
     let ms = match parse_positive_ttl(args[2], "psetex", out) {
         Some(ms) => ms,
         None => return CmdResult::Written,
@@ -236,13 +293,19 @@ pub fn cmd_get(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
         resp::write_error(out, "ERR wrong number of arguments for 'get' command");
         return CmdResult::Written;
     }
-    resp::write_optional_bulk_raw(out, &store.get(args[1], now));
+    match store.get_kv_string(args[1], now) {
+        Ok(value) => resp::write_optional_bulk_raw(out, &value),
+        Err(err) => resp::write_error(out, &err),
+    }
     CmdResult::Written
 }
 
 pub fn cmd_getset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 3 {
         resp::write_error(out, "ERR wrong number of arguments for 'getset' command");
+        return CmdResult::Written;
+    }
+    if reject_encrypted_string_mutation(store, args[1], now, out) {
         return CmdResult::Written;
     }
     resp::write_optional_bulk_raw(out, &store.get_set(args[1], args[2], now));
@@ -254,7 +317,14 @@ pub fn cmd_getdel(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'getdel' command");
         return CmdResult::Written;
     }
-    resp::write_optional_bulk_raw(out, &store.getdel(args[1], now));
+    let old = store.getdel(args[1], now);
+    match old
+        .map(|value| store.decrypt_kv_string_value(args[1], value))
+        .transpose()
+    {
+        Ok(value) => resp::write_optional_bulk_raw(out, &value),
+        Err(err) => resp::write_error(out, &err),
+    }
     CmdResult::Written
 }
 
@@ -349,7 +419,14 @@ pub fn cmd_getex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
             return CmdResult::Written;
         }
     }
-    resp::write_optional_bulk_raw(out, &store.getex(args[1], ttl, persist, now));
+    let value = store.getex(args[1], ttl, persist, now);
+    match value
+        .map(|value| store.decrypt_kv_string_value(args[1], value))
+        .transpose()
+    {
+        Ok(value) => resp::write_optional_bulk_raw(out, &value),
+        Err(err) => resp::write_error(out, &err),
+    }
     CmdResult::Written
 }
 
@@ -366,6 +443,36 @@ pub fn cmd_getrange(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
         Some(n) => n,
         None => return CmdResult::Written,
     };
+    if store.kv_string_is_encrypted(args[1], now) {
+        match store.get_kv_string(args[1], now) {
+            Ok(Some(value)) => {
+                if value.is_empty() {
+                    resp::write_bulk_raw(out, b"");
+                    return CmdResult::Written;
+                }
+                let len = value.len() as i64;
+                let s = if start < 0 {
+                    (len + start).max(0)
+                } else {
+                    start
+                } as usize;
+                let e_raw = if end < 0 { len + end } else { end };
+                if e_raw < 0 {
+                    resp::write_bulk_raw(out, b"");
+                    return CmdResult::Written;
+                }
+                let e = e_raw.min(len - 1) as usize;
+                if s > e || s >= value.len() {
+                    resp::write_bulk_raw(out, b"");
+                } else {
+                    resp::write_bulk_raw(out, &value[s..=e]);
+                }
+            }
+            Ok(None) => resp::write_bulk_raw(out, b""),
+            Err(err) => resp::write_error(out, &err),
+        }
+        return CmdResult::Written;
+    }
     match store.getrange(args[1], start, end, now) {
         Ok(val) => resp::write_bulk_raw(out, &val),
         Err(err) => resp::write_error(out, &err),
@@ -382,6 +489,9 @@ pub fn cmd_setrange(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
         Some(n) => n,
         None => return CmdResult::Written,
     };
+    if reject_encrypted_string_mutation(store, args[1], now, out) {
+        return CmdResult::Written;
+    }
     let offset = match usize::try_from(offset_u64) {
         Ok(offset) => offset,
         Err(_) => {
@@ -416,7 +526,10 @@ pub fn cmd_mget(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     }
     resp::write_array_header(out, args.len() - 1);
     for key in &args[1..] {
-        resp::write_optional_bulk_raw(out, &store.get(key, now));
+        match store.get_kv_string(key, now) {
+            Ok(value) => resp::write_optional_bulk_raw(out, &value),
+            Err(_) => resp::write_null(out),
+        }
     }
     CmdResult::Written
 }
@@ -428,6 +541,9 @@ pub fn cmd_mset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     }
     let mut i = 1;
     while i < args.len() {
+        if reject_encrypted_string_mutation(store, args[i], now, out) {
+            return CmdResult::Written;
+        }
         store.set(args[i], args[i + 1], None, now);
         i += 2;
     }
@@ -441,6 +557,13 @@ pub fn cmd_msetnx(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         return CmdResult::Written;
     }
     let pairs: Vec<(&[u8], &[u8])> = args[1..].chunks(2).map(|c| (c[0], c[1])).collect();
+    if pairs
+        .iter()
+        .any(|(key, _)| store.kv_string_is_encrypted(key, now))
+    {
+        resp::write_error(out, ENCRYPTED_MUTATION_ERR);
+        return CmdResult::Written;
+    }
     resp::write_integer(out, if store.msetnx(&pairs, now) { 1 } else { 0 });
     CmdResult::Written
 }
@@ -450,7 +573,15 @@ pub fn cmd_strlen(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'strlen' command");
         return CmdResult::Written;
     }
-    resp::write_integer(out, store.strlen(args[1], now));
+    if store.kv_string_is_encrypted(args[1], now) {
+        match store.get_kv_string(args[1], now) {
+            Ok(Some(value)) => resp::write_integer(out, value.len() as i64),
+            Ok(None) => resp::write_integer(out, 0),
+            Err(err) => resp::write_error(out, &err),
+        }
+    } else {
+        resp::write_integer(out, store.strlen(args[1], now));
+    }
     CmdResult::Written
 }
 
@@ -500,14 +631,14 @@ pub fn cmd_lcs(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
         return CmdResult::Written;
     }
 
-    let left = match store.getrange(args[1], 0, -1, now) {
+    let left = match full_string_value(store, args[1], now) {
         Ok(value) => value,
         Err(err) => {
             resp::write_error(out, &err);
             return CmdResult::Written;
         }
     };
-    let right = match store.getrange(args[2], 0, -1, now) {
+    let right = match full_string_value(store, args[2], now) {
         Ok(value) => value,
         Err(err) => {
             resp::write_error(out, &err);
@@ -614,6 +745,9 @@ pub fn cmd_append(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'append' command");
         return CmdResult::Written;
     }
+    if reject_encrypted_string_mutation(store, args[1], now, out) {
+        return CmdResult::Written;
+    }
     // Cap repeated APPENDs so a value can't be grown without bound past the
     // configured request ceiling (each call is RESP-bounded, the running total is not).
     let projected = (store.strlen(args[1], now) as usize).saturating_add(args[2].len());
@@ -630,6 +764,9 @@ pub fn cmd_incr(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'incr' command");
         return CmdResult::Written;
     }
+    if reject_encrypted_string_mutation(store, args[1], now, out) {
+        return CmdResult::Written;
+    }
     match store.incr(args[1], 1, now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
@@ -642,6 +779,9 @@ pub fn cmd_decr(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'decr' command");
         return CmdResult::Written;
     }
+    if reject_encrypted_string_mutation(store, args[1], now, out) {
+        return CmdResult::Written;
+    }
     match store.incr(args[1], -1, now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
@@ -652,6 +792,9 @@ pub fn cmd_decr(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
 pub fn cmd_incrby(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 3 {
         resp::write_error(out, "ERR wrong number of arguments for 'incrby' command");
+        return CmdResult::Written;
+    }
+    if reject_encrypted_string_mutation(store, args[1], now, out) {
         return CmdResult::Written;
     }
     match parse_i64(args[2]) {
@@ -667,6 +810,9 @@ pub fn cmd_incrby(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
 pub fn cmd_decrby(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 3 {
         resp::write_error(out, "ERR wrong number of arguments for 'decrby' command");
+        return CmdResult::Written;
+    }
+    if reject_encrypted_string_mutation(store, args[1], now, out) {
         return CmdResult::Written;
     }
     match parse_i64(args[2]) {
@@ -690,6 +836,9 @@ pub fn cmd_incrbyfloat(
             out,
             "ERR wrong number of arguments for 'incrbyfloat' command",
         );
+        return CmdResult::Written;
+    }
+    if reject_encrypted_string_mutation(store, args[1], now, out) {
         return CmdResult::Written;
     }
     let delta_str = arg_str(args[2]);

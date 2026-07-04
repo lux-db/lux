@@ -13,11 +13,9 @@ pub(crate) fn get_row(
 ) -> Option<Vec<(String, String)>> {
     // Build a lookup map on the fly - only called from paths that don't have a pre-built map.
     // Hot paths (table_select) use get_row_with_map directly.
-    let type_map: hashbrown::HashMap<&str, &FieldType> = schema
-        .iter()
-        .map(|f| (f.name.as_str(), &f.field_type))
-        .collect();
-    get_row_with_map(store, table, &type_map, pk_str, now)
+    let field_map: hashbrown::HashMap<&str, &FieldDef> =
+        schema.iter().map(|f| (f.name.as_str(), f)).collect();
+    get_row_with_map(store, table, &field_map, pk_str, now)
 }
 
 /// Like `get_row`, but returns the row even when its TTL has expired. The
@@ -30,11 +28,9 @@ pub(crate) fn get_row_including_expired(
     pk_str: &str,
     now: Instant,
 ) -> Option<Vec<(String, String)>> {
-    let type_map: hashbrown::HashMap<&str, &FieldType> = schema
-        .iter()
-        .map(|f| (f.name.as_str(), &f.field_type))
-        .collect();
-    get_row_with_map_impl(store, table, &type_map, pk_str, now, true)
+    let field_map: hashbrown::HashMap<&str, &FieldDef> =
+        schema.iter().map(|f| (f.name.as_str(), f)).collect();
+    get_row_with_map_impl(store, table, &field_map, pk_str, now, true)
 }
 
 /// Hot-path row fetch: takes a pre-built field-type map to avoid O(N) schema scan per field.
@@ -42,18 +38,18 @@ pub(crate) fn get_row_including_expired(
 pub(crate) fn get_row_with_map(
     store: &Store,
     table: &str,
-    type_map: &hashbrown::HashMap<&str, &FieldType>,
+    field_map: &hashbrown::HashMap<&str, &FieldDef>,
     pk_str: &str,
     now: Instant,
 ) -> Option<Vec<(String, String)>> {
-    get_row_with_map_impl(store, table, type_map, pk_str, now, false)
+    get_row_with_map_impl(store, table, field_map, pk_str, now, false)
 }
 
 #[inline]
 fn get_row_with_map_impl(
     store: &Store,
     table: &str,
-    type_map: &hashbrown::HashMap<&str, &FieldType>,
+    field_map: &hashbrown::HashMap<&str, &FieldDef>,
     pk_str: &str,
     now: Instant,
     include_expired: bool,
@@ -82,8 +78,11 @@ fn get_row_with_map_impl(
             }
             continue; // never expose the hidden TTL field
         }
-        let decoded = match type_map.get(k.as_str()) {
-            Some(ft) => ft.decode_value(&v),
+        let decoded = match field_map.get(k.as_str()) {
+            Some(field) => match decode_stored_value(store, table, field, pk_str, &v) {
+                Ok(decoded) => decoded,
+                Err(_) => return None,
+            },
             None => String::from_utf8_lossy(&v).to_string(),
         };
         out.push((k, decoded));
@@ -312,18 +311,26 @@ pub(crate) fn row_passes_conditions(
                 f.name == root && matches!(f.field_type, FieldType::Json | FieldType::Array)
             }) {
                 let raw = store.hget(rk.as_bytes(), root.as_bytes(), now);
-                return eval_json_path_binary(raw.as_deref(), rest, cond);
+                let decoded = raw.and_then(|bytes| {
+                    let field = schema.iter().find(|f| f.name == root)?;
+                    stored_plain_bytes(store, table, field, pk, &bytes).ok()
+                });
+                return eval_json_path_binary(decoded.as_deref(), rest, cond);
             }
         }
         let bare = bare_col(&cond.field);
         if let Some(fd) = schema.iter().find(|f| f.name == bare) {
             if matches!(fd.field_type, FieldType::Json | FieldType::Array) {
                 let raw = store.hget(rk.as_bytes(), bare.as_bytes(), now);
-                return eval_json_whole_binary(raw.as_deref(), cond);
+                let decoded =
+                    raw.and_then(|bytes| stored_plain_bytes(store, table, fd, pk, &bytes).ok());
+                return eval_json_whole_binary(decoded.as_deref(), cond);
             }
             return match store.hget(rk.as_bytes(), bare.as_bytes(), now) {
                 Some(b) => {
-                    let val = fd.field_type.decode_value(&b);
+                    let Ok(val) = decode_stored_value(store, table, fd, pk, &b) else {
+                        return false;
+                    };
                     let row = [(bare.to_string(), val)];
                     matches_condition(
                         &row,
@@ -478,6 +485,24 @@ pub(crate) fn candidates_from_index(
     limit: Option<usize>,
     now: Instant,
 ) -> Option<Vec<String>> {
+    if field_def.encrypted {
+        if !field_def.searchable || cond.op != CmpOp::Eq {
+            return None;
+        }
+        let index_values = searchable_index_values(store, table, field_def, &cond.value).ok()?;
+        let mut members = Vec::new();
+        for index_value in index_values {
+            let skey = idx_str_key(table, &cond.field, &index_value);
+            members.extend(store.smembers(skey.as_bytes(), now).unwrap_or_default());
+        }
+        members.sort();
+        members.dedup();
+        let members = match limit {
+            Some(n) => members.into_iter().take(n).collect(),
+            None => members,
+        };
+        return Some(members);
+    }
     match &field_def.field_type {
         FieldType::Str | FieldType::Uuid => {
             if cond.op == CmpOp::Eq {
@@ -1093,11 +1118,25 @@ pub fn table_select(
 
     // Validate WHERE columns
     for cond in &conditions {
-        let bare = bare_col(&cond.field);
-        if !schema.iter().any(|f| f.name == bare) {
-            // Might be a join column - validate later
+        validate_encrypted_condition(cond, &schema)?;
+    }
+    if let Some((order_col, _)) = &plan.order_by {
+        let order_col = strip_alias(order_col, table_alias);
+        if let Some(root) = encrypted_path_root(&order_col, &schema) {
+            return Err(format!(
+                "ERR encrypted column '{}' does not support ORDER BY",
+                root.name
+            ));
+        }
+        let bare = bare_col(&order_col);
+        if schema.iter().any(|f| f.name == bare && f.encrypted) {
+            return Err(format!(
+                "ERR encrypted column '{}' does not support ORDER BY",
+                bare
+            ));
         }
     }
+    validate_encrypted_joins(store, cache, plan, &schema, table_alias, now)?;
 
     // ---- Fast-path aggregates (no row fetches needed) ----
     // We handle the common aggregate-only queries directly against the indexes,
@@ -1120,11 +1159,9 @@ pub fn table_select(
     }
 
     // ---- Scan primary table ----
-    // Build a field-type lookup map ONCE per query so get_row doesn't O(N) scan per field.
-    let type_map: hashbrown::HashMap<&str, &FieldType> = schema
-        .iter()
-        .map(|f| (f.name.as_str(), &f.field_type))
-        .collect();
+    // Build a field lookup map ONCE per query so get_row doesn't O(N) scan per field.
+    let field_map: hashbrown::HashMap<&str, &FieldDef> =
+        schema.iter().map(|f| (f.name.as_str(), f)).collect();
     let implicit_id_field = if schema.iter().any(|f| f.primary_key) {
         None
     } else {
@@ -1137,6 +1174,8 @@ pub fn table_select(
             default_value: None,
             sequence_partition: None,
             references: None,
+            encrypted: false,
+            searchable: false,
         })
     };
 
@@ -1167,7 +1206,7 @@ pub fn table_select(
     let near_candidate_pks = if plan.near.is_some() && !conditions.is_empty() {
         let mut candidates = HashSet::new();
         for pk_str in &scan.row_ids {
-            let Some(row) = get_row_with_map(store, &plan.table, &type_map, pk_str, now) else {
+            let Some(row) = get_row_with_map(store, &plan.table, &field_map, pk_str, now) else {
                 continue;
             };
             if row_matches_base_conditions(&row, &schema, implicit_id_field.as_ref(), &conditions) {
@@ -1227,7 +1266,7 @@ pub fn table_select(
         ) {
             return None;
         }
-        let mut row = get_row_with_map(store, &plan.table, &type_map, &pk_str, now)?;
+        let mut row = get_row_with_map(store, &plan.table, &field_map, &pk_str, now)?;
         if let Some(similarity) = vector_similarity
             .as_ref()
             .and_then(|scores| scores.get(&pk_str))
@@ -1383,6 +1422,90 @@ pub fn table_select(
     };
 
     Ok(SelectResult::Rows(rows))
+}
+
+fn validate_encrypted_condition(cond: &WhereClause, schema: &[FieldDef]) -> Result<(), String> {
+    if cond.op == CmpOp::Or {
+        for clause in &cond.or_clauses {
+            validate_encrypted_condition(clause, schema)?;
+        }
+        return Ok(());
+    }
+    if let Some(root) = encrypted_path_root(&cond.field, schema) {
+        return Err(format!(
+            "ERR encrypted column '{}' does not support JSON path filters",
+            root.name
+        ));
+    }
+    let bare = bare_col(&cond.field);
+    let Some(field) = schema.iter().find(|f| f.name == bare) else {
+        return Ok(()); // Might be a join column - validate later.
+    };
+    if !field.encrypted {
+        return Ok(());
+    }
+    match cond.op {
+        CmpOp::Eq if field.searchable => Ok(()),
+        CmpOp::IsNull | CmpOp::IsNotNull => Ok(()),
+        CmpOp::Eq => Err(format!(
+            "ERR encrypted column '{}' must be SEARCHABLE for equality filters",
+            field.name
+        )),
+        _ => Err(format!(
+            "ERR encrypted column '{}' only supports equality filters when SEARCHABLE",
+            field.name
+        )),
+    }
+}
+
+fn encrypted_path_root<'a>(field: &str, schema: &'a [FieldDef]) -> Option<&'a FieldDef> {
+    let (root, rest) = field.split_once('.')?;
+    if rest.is_empty() {
+        return None;
+    }
+    schema.iter().find(|f| f.name == root && f.encrypted)
+}
+
+fn validate_encrypted_joins(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    plan: &SelectPlan,
+    left_schema: &[FieldDef],
+    left_alias: &str,
+    now: Instant,
+) -> Result<(), String> {
+    for join in &plan.joins {
+        let right_schema = load_schema(store, cache, &join.table, now)?;
+        for col in [&join.left_col, &join.right_col] {
+            if let Some(field) =
+                join_column_field(col, left_schema, left_alias, &right_schema, &join.alias)
+            {
+                if field.encrypted {
+                    return Err(format!(
+                        "ERR encrypted column '{}' does not support JOIN",
+                        field.name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn join_column_field<'a>(
+    col: &str,
+    left_schema: &'a [FieldDef],
+    left_alias: &str,
+    right_schema: &'a [FieldDef],
+    right_alias: &str,
+) -> Option<&'a FieldDef> {
+    let bare = bare_col(col);
+    match col.split_once('.').map(|(alias, _)| alias) {
+        Some(alias) if alias == right_alias => right_schema.iter().find(|f| f.name == bare),
+        Some(alias) if alias == left_alias => left_schema.iter().find(|f| f.name == bare),
+        Some(_) => None,
+        None => left_schema.iter().find(|f| f.name == bare),
+    }
 }
 
 pub(crate) fn plan_table_scan(
@@ -1719,6 +1842,8 @@ pub(crate) fn build_candidate_set(
                     default_value: None,
                     sequence_partition: None,
                     references: None,
+                    encrypted: false,
+                    searchable: false,
                 };
                 if let Some(pks) =
                     candidates_from_index(store, table, cond, &synthetic, index_limit, now)
@@ -1806,6 +1931,9 @@ pub(crate) fn candidates_from_order_index(
         ids_key(table)
     } else {
         let field = schema.iter().find(|f| f.name == scan.column)?;
+        if field.encrypted {
+            return None;
+        }
         match &field.field_type {
             FieldType::Int
             | FieldType::Float
@@ -2639,6 +2767,7 @@ pub(crate) fn scan_matching_pks(
     // Validate WHERE fields (allow "id" for implicit-PK tables and JSON dot-paths).
     let has_implicit_pk = !schema.iter().any(|f| f.primary_key);
     for cond in conditions {
+        validate_encrypted_condition(cond, &schema)?;
         validate_where_field(cond, &schema, has_implicit_pk)?;
     }
     let implicit_id = implicit_id_field_for(&schema);

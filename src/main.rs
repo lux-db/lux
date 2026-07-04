@@ -70,6 +70,8 @@ async fn async_main() -> std::io::Result<()> {
         .unwrap_or(30 * 24 * 60 * 60);
     let managed_email = managed_auth_email_from_env();
 
+    let encryption = encryption_config_from_env()?;
+
     let config = lux::ServerConfig {
         bind_host: std::env::var("LUX_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
         port: std::env::var("LUX_PORT")
@@ -145,6 +147,7 @@ async fn async_main() -> std::io::Result<()> {
             initial_secret_key: std::env::var("LUX_AUTH_SECRET_KEY").ok(),
             managed_email,
         },
+        encryption,
         // The library is quiet by default; the binary maps severity-specific
         // callbacks back to the previous stdout/stderr behavior.
         on_info: Some(std::sync::Arc::new(print_info_event)),
@@ -159,6 +162,162 @@ async fn async_main() -> std::io::Result<()> {
         println!("lux v{} ready", env!("CARGO_PKG_VERSION"));
     }
     handle.wait().await
+}
+
+fn encryption_config_from_env() -> std::io::Result<lux::EncryptionConfig> {
+    let state_path = std::env::var("LUX_ENC_STATE_PATH").ok();
+    let seal_path = std::env::var("LUX_ENC_SEAL_PATH").ok();
+    let auto_init = std::env::var("LUX_ENC_AUTO_INIT").is_ok_and(|value| {
+        let value = value.to_ascii_lowercase();
+        value == "1" || value == "true"
+    });
+    let seal_secret = parse_seal_env("LUX_ENC_SEAL_KEY")
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let previous_seal_secrets = parse_seal_list_env("LUX_ENC_SEAL_KEY_PREVIOUS")
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+
+    // Warn once at boot when encryption is in use but the seal lives on the data
+    // volume: a stolen disk/snapshot then carries both the sealed keyring and its
+    // key. Env-sourced seals (LUX_ENC_SEAL_KEY) avoid this.
+    let encryption_in_use = auto_init
+        || std::env::var("LUX_ENCRYPTION_KEYS").is_ok()
+        || std::env::var("LUX_ENCRYPTION_KEY").is_ok();
+    if seal_secret.is_none() && encryption_in_use {
+        eprintln!(
+            "lux: warning: encryption seal key is stored on the data volume; \
+             a stolen disk or backup carries the key. Set LUX_ENC_SEAL_KEY \
+             (base64 of 32 bytes) from your secret store."
+        );
+    }
+
+    if let Ok(raw) = std::env::var("LUX_ENCRYPTION_KEYS") {
+        let mut config =
+            parse_encryption_keys_json(&raw, std::env::var("LUX_ENCRYPTION_KEY_ID").ok())
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error));
+        if let Ok(config) = &mut config {
+            config.state_path = state_path;
+            config.seal_path = seal_path;
+            config.auto_init = auto_init;
+            config.seal_secret = seal_secret;
+            config.previous_seal_secrets = previous_seal_secrets;
+        }
+        return config;
+    }
+
+    let Some(secret) = std::env::var("LUX_ENCRYPTION_KEY").ok() else {
+        return Ok(lux::EncryptionConfig {
+            state_path,
+            seal_path,
+            auto_init,
+            seal_secret,
+            previous_seal_secrets,
+            ..Default::default()
+        });
+    };
+    let id = std::env::var("LUX_ENCRYPTION_KEY_ID").unwrap_or_else(|_| "local".to_string());
+    Ok(lux::EncryptionConfig {
+        active_key_id: Some(id.clone()),
+        keys: vec![lux::EncryptionKeyConfig {
+            id,
+            secret: secret.into_bytes(),
+            decrypt_only: false,
+        }],
+        state_path,
+        seal_path,
+        auto_init,
+        seal_secret,
+        previous_seal_secrets,
+    })
+}
+
+/// Decode a single base64 seal env var into 32 bytes. Absent -> None; present but
+/// malformed / wrong length -> hard error (fail closed rather than silently
+/// falling back to a disk seal).
+fn parse_seal_env(name: &str) -> Result<Option<[u8; 32]>, String> {
+    match std::env::var(name) {
+        Ok(raw) if !raw.trim().is_empty() => Ok(Some(decode_seal_value(name, raw.trim())?)),
+        _ => Ok(None),
+    }
+}
+
+/// Decode a comma-separated list of base64 seals (previous/rotated-out keys).
+fn parse_seal_list_env(name: &str) -> Result<Vec<[u8; 32]>, String> {
+    let Ok(raw) = std::env::var(name) else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| decode_seal_value(name, s))
+        .collect()
+}
+
+fn decode_seal_value(name: &str, value: &str) -> Result<[u8; 32], String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| format!("{name} must be base64"))?;
+    bytes
+        .try_into()
+        .map_err(|_| format!("{name} must decode to exactly 32 bytes"))
+}
+
+fn parse_encryption_keys_json(
+    raw: &str,
+    active_key_id: Option<String>,
+) -> Result<lux::EncryptionConfig, String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|error| format!("invalid LUX_ENCRYPTION_KEYS JSON: {error}"))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| "LUX_ENCRYPTION_KEYS must be a JSON array".to_string())?;
+    let mut keys = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("LUX_ENCRYPTION_KEYS[{idx}].id must be a non-empty string"))?;
+        let secret = item
+            .get("secret")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                format!("LUX_ENCRYPTION_KEYS[{idx}].secret must be a non-empty string")
+            })?;
+        keys.push(lux::EncryptionKeyConfig {
+            id: id.to_string(),
+            secret: secret.as_bytes().to_vec(),
+            decrypt_only: item
+                .get("decryptOnly")
+                .or_else(|| item.get("decrypt_only"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        });
+    }
+    let active_key_id = active_key_id.or_else(|| {
+        keys.iter()
+            .rev()
+            .find(|k| !k.decrypt_only)
+            .map(|k| k.id.clone())
+    });
+    if active_key_id.is_none() {
+        return Err("LUX_ENCRYPTION_KEYS must include at least one writable key".to_string());
+    }
+    let config = lux::EncryptionConfig {
+        active_key_id,
+        keys,
+        state_path: std::env::var("LUX_ENC_STATE_PATH").ok(),
+        seal_path: std::env::var("LUX_ENC_SEAL_PATH").ok(),
+        auto_init: std::env::var("LUX_ENC_AUTO_INIT").is_ok_and(|value| {
+            let value = value.to_ascii_lowercase();
+            value == "1" || value == "true"
+        }),
+        // Filled in by the caller from LUX_ENC_SEAL_KEY / _PREVIOUS.
+        seal_secret: None,
+        previous_seal_secrets: Vec::new(),
+    };
+    Ok(config)
 }
 
 fn managed_auth_email_from_env() -> Option<lux::AuthManagedEmailConfig> {
@@ -271,5 +430,58 @@ fn print_error_event(event: lux::ServerErrorEvent) {
         lux::ServerErrorEvent::HttpServerFailed { error } => {
             eprintln!("http server error: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_seal_value, parse_encryption_keys_json};
+
+    #[test]
+    fn decode_seal_value_requires_base64_of_32_bytes() {
+        use base64::Engine as _;
+        let good = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        assert_eq!(decode_seal_value("X", &good).unwrap(), [7u8; 32]);
+
+        // Not base64.
+        assert!(decode_seal_value("X", "not base64!!").is_err());
+        // Base64 but wrong length (16 bytes).
+        let short = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
+        let err = decode_seal_value("X", &short).unwrap_err();
+        assert!(err.contains("32 bytes"), "{err}");
+    }
+
+    #[test]
+    fn encryption_keys_json_parses_rotation_network() {
+        let config = parse_encryption_keys_json(
+            r#"[
+                {"id":"k1","secret":"old","decryptOnly":true},
+                {"id":"k2","secret":"new"}
+            ]"#,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(config.active_key_id.as_deref(), Some("k2"));
+        assert_eq!(config.keys.len(), 2);
+        assert!(config.keys[0].decrypt_only);
+        assert!(!config.keys[1].decrypt_only);
+    }
+
+    #[test]
+    fn encryption_keys_json_fails_closed_on_bad_config() {
+        let err = parse_encryption_keys_json("not-json", None).unwrap_err();
+        assert!(err.contains("invalid LUX_ENCRYPTION_KEYS JSON"), "{err}");
+
+        let err = parse_encryption_keys_json(r#"{"id":"k1"}"#, None).unwrap_err();
+        assert!(err.contains("must be a JSON array"), "{err}");
+
+        let err = parse_encryption_keys_json(r#"[{"id":"k1"}]"#, None).unwrap_err();
+        assert!(err.contains("secret must be a non-empty string"), "{err}");
+
+        let err =
+            parse_encryption_keys_json(r#"[{"id":"k1","secret":"old","decryptOnly":true}]"#, None)
+                .unwrap_err();
+        assert!(err.contains("at least one writable key"), "{err}");
     }
 }

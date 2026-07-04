@@ -264,6 +264,8 @@ pub struct FieldDef {
     pub default_value: Option<String>, // DEFAULT value for the column
     pub sequence_partition: Option<String>, // SEQUENCE PARTITION BY <column>
     pub references: Option<ForeignKey>,
+    pub encrypted: bool,
+    pub searchable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -605,6 +607,292 @@ fn ttl_wal_tokens(ttl: Option<TtlOp>) -> Option<(&'static [u8], Vec<u8>)> {
     }
 }
 
+fn schema_has_encrypted_fields(schema: &[FieldDef]) -> bool {
+    schema.iter().any(|field| field.encrypted)
+}
+
+fn log_raw_row_wal(store: &Store, table: &str, pk: &str, now: Instant) {
+    if !store.wal_enabled() {
+        return;
+    }
+    let rk = row_key_for_pk(table, pk);
+    let Ok(row) = store.hgetall(rk.as_bytes(), now) else {
+        return;
+    };
+    if row.is_empty() {
+        return;
+    }
+    let mut a: Vec<Vec<u8>> = Vec::with_capacity(row.len() * 2 + 3);
+    a.push(b"TROWSET".to_vec());
+    a.push(table.as_bytes().to_vec());
+    a.push(pk.as_bytes().to_vec());
+    for (field, value) in row {
+        a.push(field.into_bytes());
+        a.push(value.to_vec());
+    }
+    let refs: Vec<&[u8]> = a.iter().map(|v| v.as_slice()).collect();
+    let _ = store.wal_log_command(&refs);
+}
+
+pub(crate) fn table_apply_wal_row(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    raw_pairs: &[(&[u8], &[u8])],
+    now: Instant,
+) -> Result<(), String> {
+    let schema = load_schema(store, cache, table, now)?;
+    let rk = row_key_for_pk(table, pk_str);
+
+    if let Some(old_row) = get_row_including_expired(store, table, &schema, pk_str, now) {
+        let old_map: std::collections::HashMap<String, String> = old_row.into_iter().collect();
+        for field in &schema {
+            if let Some(old_val) = old_map.get(&field.name) {
+                remove_from_index(store, table, field, old_val, pk_str, now);
+                if field.unique {
+                    remove_unique_entries(store, table, field, old_val, now);
+                }
+            }
+        }
+    }
+
+    let mut raw_map: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    for (field, value) in raw_pairs {
+        raw_map.insert(String::from_utf8_lossy(field).to_string(), value.to_vec());
+    }
+
+    let ikey = ids_key(table);
+    let score: f64 = store
+        .zscore(ikey.as_bytes(), pk_str.as_bytes(), now)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| {
+            pk_str
+                .parse::<f64>()
+                .unwrap_or_else(|_| next_id(store, &format!("{}__order", table), now) as f64)
+        });
+    let _ = store.zadd(
+        ikey.as_bytes(),
+        &[(pk_str.as_bytes(), score)],
+        false,
+        false,
+        false,
+        false,
+        false,
+        now,
+    );
+
+    if let Some(pk_field) = schema.iter().find(|f| f.primary_key) {
+        if pk_field.field_type == FieldType::Int {
+            if let Ok(id) = pk_str.parse::<i64>() {
+                bump_seq_to_at_least(store, table, id, now);
+            }
+        }
+    } else if let Ok(id) = pk_str.parse::<i64>() {
+        bump_seq_to_at_least(store, table, id, now);
+    }
+
+    for field in &schema {
+        let Some(raw) = raw_map.get(&field.name) else {
+            continue;
+        };
+        let value = decode_stored_value(store, table, field, pk_str, raw)?;
+        add_to_index(store, table, field, &value, pk_str, now);
+        if field.unique {
+            let ukey = uniq_key(table, &field.name);
+            for index_value in searchable_index_values(store, table, field, &value)? {
+                store.hset(
+                    ukey.as_bytes(),
+                    &[(index_value.as_bytes() as &[u8], pk_str.as_bytes() as &[u8])],
+                    now,
+                )?;
+            }
+        }
+    }
+
+    for pi in &load_path_indexes(store, cache, table, now) {
+        if let Some((root, rest)) = pi.path.split_once('.') {
+            if let Some(root_field) = schema.iter().find(|f| f.name == root) {
+                if root_field.encrypted {
+                    continue;
+                }
+                if let Some(raw) = raw_map.get(root) {
+                    if let Ok(bytes) = stored_plain_bytes(store, table, root_field, pk_str, raw) {
+                        if let Some(scalar) =
+                            extract_json_scalar(&root_field.field_type.decode_value(&bytes), rest)
+                        {
+                            add_to_index(
+                                store,
+                                table,
+                                &synthetic_path_fielddef(pi),
+                                &scalar,
+                                pk_str,
+                                now,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(ttl_bytes) = raw_map.get(std::str::from_utf8(HIDDEN_TTL_FIELD).unwrap_or("")) {
+        if let Some(deadline_ms) = std::str::from_utf8(ttl_bytes)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            let member = ttl_member(table, pk_str);
+            let _ = store.zadd(
+                ttl_index_key().as_bytes(),
+                &[(member.as_bytes(), deadline_ms as f64)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                now,
+            );
+        }
+    } else {
+        let member = ttl_member(table, pk_str);
+        let _ = store.zrem(ttl_index_key().as_bytes(), &[member.as_bytes()], now);
+        let _ = store.hdel(rk.as_bytes(), &[HIDDEN_TTL_FIELD], now);
+    }
+
+    let pair_refs: Vec<(&[u8], &[u8])> = raw_pairs.iter().map(|(k, v)| (*k, *v)).collect();
+    store.hset(rk.as_bytes(), &pair_refs, now)?;
+    Ok(())
+}
+
+fn field_supports_encryption(field: &FieldDef) -> Result<(), String> {
+    if field.searchable && !field.encrypted {
+        return Err(format!(
+            "ERR SEARCHABLE column '{}' must also be ENCRYPTED",
+            field.name
+        ));
+    }
+    if !field.encrypted {
+        return Ok(());
+    }
+    if field.primary_key {
+        return Err(format!(
+            "ERR encrypted column '{}' cannot be a PRIMARY KEY",
+            field.name
+        ));
+    }
+    if field.references.is_some() || matches!(field.field_type, FieldType::Ref(_)) {
+        return Err(format!(
+            "ERR encrypted column '{}' cannot be a foreign key",
+            field.name
+        ));
+    }
+    if field.sequence_partition.is_some() {
+        return Err(format!(
+            "ERR encrypted column '{}' cannot be a SEQUENCE column",
+            field.name
+        ));
+    }
+    if matches!(field.field_type, FieldType::Vector(_)) {
+        return Err(format!(
+            "ERR encrypted column '{}' cannot use VECTOR type",
+            field.name
+        ));
+    }
+    if field.default_value.is_some() {
+        return Err(format!(
+            "ERR encrypted column '{}' cannot use DEFAULT",
+            field.name
+        ));
+    }
+    if field.searchable && matches!(field.field_type, FieldType::Json | FieldType::Array) {
+        return Err(format!(
+            "ERR encrypted column '{}' cannot be SEARCHABLE with JSON or ARRAY type",
+            field.name
+        ));
+    }
+    if field.unique && field.encrypted && !field.searchable {
+        return Err(format!(
+            "ERR UNIQUE encrypted column '{}' must be SEARCHABLE",
+            field.name
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_encryption_ready(store: &Store, fields: &[FieldDef]) -> Result<(), String> {
+    if fields.iter().any(|f| f.encrypted) && !store.encryption().has_active_key() {
+        return Err(
+            "ERR encrypted columns require ENC INIT or an active encryption key".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn encode_stored_value(
+    store: &Store,
+    table: &str,
+    field: &FieldDef,
+    pk: &str,
+    value: &str,
+) -> Result<Vec<u8>, String> {
+    let encoded = field.field_type.encode_value(value)?;
+    if field.encrypted {
+        store
+            .encryption()
+            .encrypt(table, &field.name, pk, encoded.as_slice())
+    } else {
+        Ok(encoded)
+    }
+}
+
+pub(crate) fn decode_stored_value(
+    store: &Store,
+    table: &str,
+    field: &FieldDef,
+    pk: &str,
+    raw: &[u8],
+) -> Result<String, String> {
+    let bytes = stored_plain_bytes(store, table, field, pk, raw)?;
+    Ok(field.field_type.decode_value(&bytes))
+}
+
+pub(crate) fn stored_plain_bytes(
+    store: &Store,
+    table: &str,
+    field: &FieldDef,
+    pk: &str,
+    raw: &[u8],
+) -> Result<Vec<u8>, String> {
+    if field.encrypted {
+        store.encryption().decrypt(table, &field.name, pk, raw)
+    } else {
+        Ok(raw.to_vec())
+    }
+}
+
+fn searchable_index_values(
+    store: &Store,
+    table: &str,
+    field: &FieldDef,
+    value: &str,
+) -> Result<Vec<String>, String> {
+    if field.encrypted {
+        if !field.searchable {
+            return Err(format!(
+                "ERR encrypted column '{}' is not SEARCHABLE",
+                field.name
+            ));
+        }
+        let encoded = field.field_type.encode_value(value)?;
+        store
+            .encryption()
+            .blind_indexes(table, &field.name, encoded.as_slice())
+    } else {
+        Ok(vec![value.to_string()])
+    }
+}
+
 /// Read-validate a unique-index hit: does the holder row actually still carry
 /// `value` in `field`? A stale entry (row gone or value changed without the index
 /// being updated) returns false, so the uniqueness check treats it as free.
@@ -618,14 +906,44 @@ fn uniq_holder_holds_value(
 ) -> bool {
     let rk = row_key_for_pk(table, holder_pk);
     match store.hget(rk.as_bytes(), field.name.as_bytes(), now) {
-        // Compare in the stored (encoded) form so the match is exact.
-        Some(raw) => field
-            .field_type
-            .encode_value(value)
-            .map(|enc| enc == raw)
+        Some(raw) => decode_stored_value(store, table, field, holder_pk, &raw)
+            .map(|stored| stored == value)
             .unwrap_or(false),
         None => false,
     }
+}
+
+fn remove_unique_entries(store: &Store, table: &str, field: &FieldDef, value: &str, now: Instant) {
+    let ukey = uniq_key(table, &field.name);
+    match searchable_index_values(store, table, field, value) {
+        Ok(index_values) => {
+            for index_value in index_values {
+                let _ = store.hdel(ukey.as_bytes(), &[index_value.as_bytes()], now);
+            }
+        }
+        Err(_) => {
+            let _ = store.hdel(ukey.as_bytes(), &[value.as_bytes()], now);
+        }
+    }
+}
+
+fn unique_holder_for_value(
+    store: &Store,
+    table: &str,
+    field: &FieldDef,
+    value: &str,
+    now: Instant,
+) -> Result<Option<String>, String> {
+    if !field.unique {
+        return Ok(None);
+    }
+    let ukey = uniq_key(table, &field.name);
+    for index_value in searchable_index_values(store, table, field, value)? {
+        if let Some(holder) = store.hget(ukey.as_bytes(), index_value.as_bytes(), now) {
+            return Ok(Some(String::from_utf8_lossy(&holder).to_string()));
+        }
+    }
+    Ok(None)
 }
 
 /// Register a new row's TTL deadline in the global `_t:_ttl` index and return the
@@ -850,10 +1168,20 @@ fn parse_field_def(spec: &str) -> Result<FieldDef, String> {
     let mut default_value: Option<String> = None;
     let mut sequence_partition: Option<String> = None;
     let mut references: Option<ForeignKey> = None;
+    let mut encrypted = false;
+    let mut searchable = false;
 
     let mut i = 2;
     while i < tokens.len() {
         match tokens[i].to_uppercase().as_str() {
+            "ENCRYPTED" => {
+                encrypted = true;
+                i += 1;
+            }
+            "SEARCHABLE" => {
+                searchable = true;
+                i += 1;
+            }
             "DEFAULT" => {
                 i += 1;
                 if i >= tokens.len() {
@@ -966,7 +1294,7 @@ fn parse_field_def(spec: &str) -> Result<FieldDef, String> {
         }
     }
 
-    Ok(FieldDef {
+    let field = FieldDef {
         name,
         field_type,
         primary_key,
@@ -975,7 +1303,11 @@ fn parse_field_def(spec: &str) -> Result<FieldDef, String> {
         default_value,
         sequence_partition,
         references,
-    })
+        encrypted,
+        searchable,
+    };
+    field_supports_encryption(&field)?;
+    Ok(field)
 }
 
 /// Parse "table(column)" or "table( column )" into (table, column)
@@ -1092,6 +1424,12 @@ fn encode_field_def(def: &FieldDef) -> String {
     if let Some(partition) = &def.sequence_partition {
         parts.push(format!("seqpart:{}", partition));
     }
+    if def.encrypted {
+        parts.push("encrypted".to_string());
+    }
+    if def.searchable {
+        parts.push("searchable".to_string());
+    }
     parts.join("|")
 }
 
@@ -1123,6 +1461,8 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
     let mut default_value: Option<String> = None;
     let mut sequence_partition: Option<String> = None;
     let mut references: Option<ForeignKey> = None;
+    let mut encrypted = false;
+    let mut searchable = false;
 
     for flag in &parts[1..] {
         match *flag {
@@ -1156,6 +1496,8 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
             s if s.starts_with("seqpart:") => {
                 sequence_partition = Some(s[8..].to_string());
             }
+            "encrypted" => encrypted = true,
+            "searchable" => searchable = true,
             _ => {}
         }
     }
@@ -1169,6 +1511,8 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
         default_value,
         sequence_partition,
         references,
+        encrypted,
+        searchable,
     }
 }
 
@@ -1251,6 +1595,8 @@ fn synthetic_path_fielddef(pi: &PathIndex) -> FieldDef {
         default_value: None,
         sequence_partition: None,
         references: None,
+        encrypted: false,
+        searchable: false,
     }
 }
 
@@ -1336,11 +1682,15 @@ pub fn table_create_path_index(
     if rest.is_empty() {
         return Err("ERR index path must address a value inside the JSON column".to_string());
     }
-    if !schema
+    let root_field = schema
         .iter()
-        .any(|f| f.name == root && f.field_type == FieldType::Json)
-    {
-        return Err(format!("ERR '{}' is not a JSON column", root));
+        .find(|f| f.name == root && f.field_type == FieldType::Json)
+        .ok_or_else(|| format!("ERR '{}' is not a JSON column", root))?;
+    if root_field.encrypted {
+        return Err(format!(
+            "ERR cannot create path index on encrypted column '{}'",
+            root
+        ));
     }
     let field_type = parse_index_type(type_token).ok_or_else(|| {
         format!(
@@ -1622,6 +1972,18 @@ fn add_to_index(
     pk_str: &str,
     now: Instant,
 ) {
+    if field.encrypted {
+        if !field.searchable {
+            return;
+        }
+        if let Ok(index_values) = searchable_index_values(store, table, field, value) {
+            for index_value in index_values {
+                let skey = idx_str_key(table, &field.name, &index_value);
+                let _ = store.sadd(skey.as_bytes(), &[pk_str.as_bytes()], now);
+            }
+        }
+        return;
+    }
     match &field.field_type {
         FieldType::Int
         | FieldType::Float
@@ -1672,6 +2034,18 @@ fn remove_from_index(
     pk_str: &str,
     now: Instant,
 ) {
+    if field.encrypted {
+        if !field.searchable {
+            return;
+        }
+        if let Ok(index_values) = searchable_index_values(store, table, field, value) {
+            for index_value in index_values {
+                let skey = idx_str_key(table, &field.name, &index_value);
+                let _ = store.srem(skey.as_bytes(), &[pk_str.as_bytes()], now);
+            }
+        }
+        return;
+    }
     match &field.field_type {
         FieldType::Int
         | FieldType::Float
@@ -1721,6 +2095,7 @@ pub fn table_create(
     // `... WITH TTL <secs>` gives every row in the table a default expiry.
     let (col_args, default_ttl) = split_with_ttl(col_args);
     let fields = parse_column_list(col_args)?;
+    ensure_encryption_ready(store, &fields)?;
 
     // Validate that referenced tables exist
     for field in &fields {
@@ -1972,6 +2347,16 @@ pub fn table_upsert_returning_ttl(
         };
         conflict_values.push((conflict.as_str(), cval));
     }
+    for (conflict, _) in &conflict_values {
+        if let Some(field) = schema.iter().find(|f| f.name == *conflict) {
+            if field.encrypted && !field.searchable {
+                return Err(format!(
+                    "ERR encrypted column '{}' must be SEARCHABLE for upsert conflict matching",
+                    field.name
+                ));
+            }
+        }
+    }
 
     let existing_pk: Option<String> = if conflicts.len() == 1 {
         let conflict = conflicts[0].as_str();
@@ -1988,13 +2373,21 @@ pub fn table_upsert_returning_ttl(
         } else {
             // Match via the unique index when present; otherwise scan rows for
             // compatibility with unconstrained conflict targets.
-            let ukey = uniq_key(table, conflict);
-            match store
-                .hget(ukey.as_bytes(), cval.as_bytes(), now)
-                .map(|b| String::from_utf8_lossy(&b).to_string())
+            let conflict_field = schema.iter().find(|f| f.name == conflict);
+            match conflict_field
+                .filter(|f| f.unique)
+                .map(|field| unique_holder_for_value(store, table, field, cval, now))
+                .transpose()?
+                .flatten()
             {
                 Some(pk) if !purge_if_expired(store, cache, table, &pk, now) => Some(pk),
-                _ => find_row_by_fields(store, table, &schema, &[(conflict, cval)], now),
+                Some(_) => {
+                    if let Some(field) = conflict_field {
+                        remove_unique_entries(store, table, field, cval, now);
+                    }
+                    find_row_by_fields(store, table, &schema, &[(conflict, cval)], now)
+                }
+                None => find_row_by_fields(store, table, &schema, &[(conflict, cval)], now),
             }
         }
     } else {
@@ -2185,18 +2578,22 @@ fn table_insert_pk(
         // and the insert is allowed -- never a false "duplicate".
         if field.unique {
             let ukey = uniq_key(table, &field.name);
-            if let Some(holder) = store.hget(ukey.as_bytes(), value.as_bytes(), now) {
-                let holder_pk = String::from_utf8_lossy(&holder).to_string();
-                let absent = purge_if_expired(store, cache, table, &holder_pk, now);
-                if !absent && uniq_holder_holds_value(store, table, field, &holder_pk, value, now) {
-                    return Err(format!(
-                        "ERR unique constraint violation on column '{}': value '{}' already exists",
-                        field.name, value
-                    ));
+            for index_value in searchable_index_values(store, table, field, value)? {
+                if let Some(holder) = store.hget(ukey.as_bytes(), index_value.as_bytes(), now) {
+                    let holder_pk = String::from_utf8_lossy(&holder).to_string();
+                    let absent = purge_if_expired(store, cache, table, &holder_pk, now);
+                    if !absent
+                        && uniq_holder_holds_value(store, table, field, &holder_pk, value, now)
+                    {
+                        return Err(format!(
+                            "ERR unique constraint violation on column '{}': value '{}' already exists",
+                            field.name, value
+                        ));
+                    }
+                    // Stale entry -> drop it so it doesn't block this (valid) insert,
+                    // which writes the fresh holder below.
+                    let _ = store.hdel(ukey.as_bytes(), &[index_value.as_bytes()], now);
                 }
-                // Stale entry -> drop it so it doesn't block this (valid) insert,
-                // which writes the fresh holder below.
-                let _ = store.hdel(ukey.as_bytes(), &[value.as_bytes()], now);
             }
         }
 
@@ -2291,12 +2688,12 @@ fn table_insert_pk(
 
     for field in &schema {
         if let Some(value) = provided.get(field.name.as_str()) {
-            let encoded = field.field_type.encode_value(value)?;
+            let encoded = encode_stored_value(store, table, field, &pk_str, value)?;
             pairs_owned.push((field.name.clone(), encoded));
         } else if field.primary_key {
             // Explicit PK that was auto-generated (INT auto-increment or UUIDv7).
             // Encode with the PK column's own type, not a hardcoded INT.
-            let encoded = field.field_type.encode_value(&pk_str)?;
+            let encoded = encode_stored_value(store, table, field, &pk_str, &pk_str)?;
             pairs_owned.push((field.name.clone(), encoded));
         }
     }
@@ -2333,11 +2730,13 @@ fn table_insert_pk(
 
             if field.unique {
                 let ukey = uniq_key(table, &field.name);
-                store.hset(
-                    ukey.as_bytes(),
-                    &[(value.as_bytes() as &[u8], pk_str.as_bytes() as &[u8])],
-                    now,
-                )?;
+                for index_value in searchable_index_values(store, table, field, value)? {
+                    store.hset(
+                        ukey.as_bytes(),
+                        &[(index_value.as_bytes() as &[u8], pk_str.as_bytes() as &[u8])],
+                        now,
+                    )?;
+                }
             }
         }
     }
@@ -2345,6 +2744,9 @@ fn table_insert_pk(
     // Declared JSON path indexes (cached empty for un-indexed tables => cheap).
     for pi in &load_path_indexes(store, cache, table, now) {
         if let Some((root, rest)) = pi.path.split_once('.') {
+            if schema.iter().any(|f| f.name == root && f.encrypted) {
+                continue;
+            }
             if let Some(raw) = provided.get(root).copied() {
                 if let Some(scalar) = extract_json_scalar(raw, rest) {
                     add_to_index(
@@ -2378,7 +2780,9 @@ fn table_insert_pk(
 
     // WAL: log the RESOLVED insert (explicit PK + the resolved column values that
     // were actually stored) so crash replay reproduces this exact row.
-    if store.wal_enabled() {
+    if store.wal_enabled() && schema_has_encrypted_fields(&schema) {
+        log_raw_row_wal(store, table, &pk_str, now);
+    } else if store.wal_enabled() {
         let mut a: Vec<Vec<u8>> = Vec::with_capacity(provided.len() * 2 + 6);
         a.push(b"TINSERT".to_vec());
         a.push(table.as_bytes().to_vec());
@@ -2481,14 +2885,18 @@ fn table_update_by_pk_str(
         }
 
         if field.unique {
-            let ukey = uniq_key(table, &field.name);
-            if let Some(existing_pk_bytes) = store.hget(ukey.as_bytes(), fval.as_bytes(), now) {
-                let existing_pk = String::from_utf8_lossy(&existing_pk_bytes).to_string();
+            if let Some(existing_pk) = unique_holder_for_value(store, table, field, fval, now)? {
                 if existing_pk != pk_str {
-                    return Err(format!(
-                        "ERR unique constraint violation on field '{}'",
-                        field.name
-                    ));
+                    let absent = purge_if_expired(store, cache, table, &existing_pk, now);
+                    if !absent
+                        && uniq_holder_holds_value(store, table, field, &existing_pk, fval, now)
+                    {
+                        return Err(format!(
+                            "ERR unique constraint violation on field '{}'",
+                            field.name
+                        ));
+                    }
+                    remove_unique_entries(store, table, field, fval, now);
                 }
             }
         }
@@ -2500,19 +2908,20 @@ fn table_update_by_pk_str(
         if let Some(old_val) = old_map.get(*fname) {
             remove_from_index(store, table, field, old_val, pk_str, now);
             if field.unique {
-                let ukey = uniq_key(table, &field.name);
-                let _ = store.hdel(ukey.as_bytes(), &[old_val.as_bytes()], now);
+                remove_unique_entries(store, table, field, old_val, now);
             }
         }
 
         add_to_index(store, table, field, fval, pk_str, now);
         if field.unique {
             let ukey = uniq_key(table, &field.name);
-            let _ = store.hset(
-                ukey.as_bytes(),
-                &[(fval.as_bytes() as &[u8], pk_str.as_bytes() as &[u8])],
-                now,
-            );
+            for index_value in searchable_index_values(store, table, field, fval)? {
+                let _ = store.hset(
+                    ukey.as_bytes(),
+                    &[(index_value.as_bytes() as &[u8], pk_str.as_bytes() as &[u8])],
+                    now,
+                );
+            }
         }
     }
 
@@ -2521,6 +2930,9 @@ fn table_update_by_pk_str(
         let Some((root, rest)) = pi.path.split_once('.') else {
             continue;
         };
+        if schema.iter().any(|f| f.name == root && f.encrypted) {
+            continue;
+        }
         let Some(new_raw) = field_values
             .iter()
             .find(|(k, _)| *k == root)
@@ -2542,7 +2954,7 @@ fn table_update_by_pk_str(
     let mut pairs_owned: Vec<(String, Vec<u8>)> = Vec::new();
     for (fname, fval) in field_values {
         let field = schema.iter().find(|f| f.name == *fname).unwrap();
-        let encoded = field.field_type.encode_value(fval)?;
+        let encoded = encode_stored_value(store, table, field, pk_str, fval)?;
         pairs_owned.push((fname.to_string(), encoded));
     }
     let pair_refs: Vec<(&[u8], &[u8])> = pairs_owned
@@ -2560,7 +2972,9 @@ fn table_update_by_pk_str(
     // a different row on replay. (A WHERE-update logs one such command per matched
     // row.) The TTL op is logged as a trailing `TTL <secs>` clause so replay
     // preserves the row's deadline instead of resetting it.
-    if store.wal_enabled() {
+    if store.wal_enabled() && schema_has_encrypted_fields(&schema) {
+        log_raw_row_wal(store, table, pk_str, now);
+    } else if store.wal_enabled() {
         let pkcol = pk_column_name(&schema);
         let mut a: Vec<Vec<u8>> = Vec::with_capacity(field_values.len() * 2 + 9);
         a.push(b"TUPDATE".to_vec());
@@ -2760,8 +3174,7 @@ fn table_delete_inner(
         if let Some(val) = row_map.get(&field.name) {
             remove_from_index(store, table, field, val, pk_str, now);
             if field.unique {
-                let ukey = uniq_key(table, &field.name);
-                let _ = store.hdel(ukey.as_bytes(), &[val.as_bytes()], now);
+                remove_unique_entries(store, table, field, val, now);
             }
         }
         // A VECTOR column stores its embedding in a side key with its own ANN
@@ -2776,6 +3189,9 @@ fn table_delete_inner(
     // Remove declared JSON path index entries for this row.
     for pi in &load_path_indexes(store, cache, table, now) {
         if let Some((root, rest)) = pi.path.split_once('.') {
+            if schema.iter().any(|f| f.name == root && f.encrypted) {
+                continue;
+            }
             if let Some(raw) = row_map.get(root) {
                 if let Some(scalar) = extract_json_scalar(raw, rest) {
                     remove_from_index(
@@ -2974,6 +3390,8 @@ fn implicit_id_field_for(schema: &[FieldDef]) -> Option<FieldDef> {
             default_value: None,
             sequence_partition: None,
             references: None,
+            encrypted: false,
+            searchable: false,
         })
     }
 }
@@ -3330,6 +3748,12 @@ pub fn table_schema(
         if !field.nullable {
             parts.push("NOT NULL".to_string());
         }
+        if field.encrypted {
+            parts.push("ENCRYPTED".to_string());
+        }
+        if field.searchable {
+            parts.push("SEARCHABLE".to_string());
+        }
         if let Some(fk) = &field.references {
             let on_delete = match fk.on_delete {
                 OnDelete::Restrict => "ON DELETE RESTRICT",
@@ -3355,6 +3779,7 @@ pub fn table_add_column(
 ) -> Result<(), String> {
     let schema = load_schema(store, cache, table, now)?;
     let new_field = parse_field_def(field_spec)?;
+    ensure_encryption_ready(store, std::slice::from_ref(&new_field))?;
 
     if schema.iter().any(|f| f.name == new_field.name) {
         return Err(format!("ERR field '{}' already exists", new_field.name));
@@ -3395,12 +3820,10 @@ pub fn table_add_column(
 
         for pk_str in row_ids {
             let rk = row_key_for_pk(table, &pk_str);
-            let encoded = if backfill_value == "NULL" {
-                // Store empty/NULL value
-                vec![]
-            } else {
-                new_field.field_type.encode_value(&backfill_value)?
-            };
+            if backfill_value == "NULL" {
+                continue;
+            }
+            let encoded = encode_stored_value(store, table, &new_field, &pk_str, &backfill_value)?;
             store.hset(
                 rk.as_bytes(),
                 &[(new_field.name.as_bytes() as &[u8], encoded.as_slice())],
@@ -3408,16 +3831,15 @@ pub fn table_add_column(
             )?;
 
             // Add to indexes if needed
-            if backfill_value != "NULL" {
-                add_to_index(store, table, &new_field, &backfill_value, &pk_str, now);
-                if new_field.unique {
-                    let ukey = uniq_key(table, &new_field.name);
+            add_to_index(store, table, &new_field, &backfill_value, &pk_str, now);
+            if new_field.unique {
+                let ukey = uniq_key(table, &new_field.name);
+                for index_value in
+                    searchable_index_values(store, table, &new_field, &backfill_value)?
+                {
                     store.hset(
                         ukey.as_bytes(),
-                        &[(
-                            backfill_value.as_bytes() as &[u8],
-                            pk_str.as_bytes() as &[u8],
-                        )],
+                        &[(index_value.as_bytes() as &[u8], pk_str.as_bytes() as &[u8])],
                         now,
                     )?;
                 }
@@ -3504,6 +3926,7 @@ fn get_all_row_ids(store: &Store, table: &str, now: Instant) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::store::Store;
+    use crate::{EncryptionConfig, EncryptionKeyConfig, StorageConfig, StorageMode};
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -3513,6 +3936,40 @@ mod tests {
 
     fn now() -> Instant {
         Instant::now()
+    }
+
+    fn encrypted_store() -> Arc<Store> {
+        Arc::new(Store::new_with_config(Arc::new(crate::ServerConfig {
+            encryption: EncryptionConfig {
+                active_key_id: Some("k2".to_string()),
+                keys: vec![
+                    EncryptionKeyConfig {
+                        id: "k1".to_string(),
+                        secret: b"old-key-secret".to_vec(),
+                        decrypt_only: true,
+                    },
+                    EncryptionKeyConfig {
+                        id: "k2".to_string(),
+                        secret: b"new-key-secret".to_vec(),
+                        decrypt_only: false,
+                    },
+                ],
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        })))
+    }
+
+    fn select_err(
+        store: &Store,
+        cache: &SharedSchemaCache,
+        plan: &SelectPlan,
+        now: Instant,
+    ) -> String {
+        match table_select(store, cache, plan, now) {
+            Ok(_) => panic!("expected table_select to fail"),
+            Err(err) => err,
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -3544,6 +4001,1327 @@ mod tests {
 
         let f = parse_field_def("embedding VECTOR(3)").unwrap();
         assert_eq!(f.field_type, FieldType::Vector(3));
+    }
+
+    #[test]
+    fn encrypted_field_schema_roundtrips() {
+        let field = parse_field_def("token STR ENCRYPTED SEARCHABLE UNIQUE").unwrap();
+        assert!(field.encrypted);
+        assert!(field.searchable);
+        assert!(field.unique);
+
+        let encoded = encode_field_def(&field);
+        let decoded = decode_field_def("token", &encoded);
+        assert!(decoded.encrypted);
+        assert!(decoded.searchable);
+        assert!(decoded.unique);
+    }
+
+    #[test]
+    fn encrypted_field_rejects_invalid_combinations() {
+        assert!(parse_field_def("id UUID PRIMARY KEY ENCRYPTED").is_err());
+        assert!(parse_field_def("owner UUID REFERENCES users(id) ENCRYPTED").is_err());
+        assert!(parse_field_def("embedding VECTOR(3) ENCRYPTED").is_err());
+        assert!(parse_field_def("token STR SEARCHABLE").is_err());
+        assert!(parse_field_def("token STR ENCRYPTED UNIQUE").is_err());
+        assert!(parse_field_def("token STR ENCRYPTED DEFAULT seeded").is_err());
+    }
+
+    #[test]
+    fn encrypted_field_stores_ciphertext_and_returns_plaintext() {
+        let store = encrypted_store();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "secrets",
+            &["id UUID PRIMARY KEY, token STR ENCRYPTED, email STR ENCRYPTED SEARCHABLE"],
+            now,
+        )
+        .unwrap();
+        let id = "018f9d72-7c8d-7000-8000-000000000001";
+        table_insert(
+            &store,
+            &cache,
+            "secrets",
+            &[
+                ("id", id),
+                ("token", "topsecret"),
+                ("email", "a@example.com"),
+            ],
+            now,
+        )
+        .unwrap();
+
+        let raw = store
+            .hget(row_key_for_pk("secrets", id).as_bytes(), b"token", now)
+            .unwrap();
+        assert!(!raw.windows(b"topsecret".len()).any(|w| w == b"topsecret"));
+
+        let row = get_row(
+            &store,
+            "secrets",
+            &load_schema(&store, &cache, "secrets", now).unwrap(),
+            id,
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            row.iter().find(|(k, _)| k == "token").unwrap().1,
+            "topsecret"
+        );
+
+        let plan = parse_select(&[
+            "*",
+            "FROM",
+            "secrets",
+            "WHERE",
+            "email",
+            "=",
+            "a@example.com",
+        ])
+        .unwrap();
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cell(&rows[0], "token"), "topsecret");
+    }
+
+    #[test]
+    fn encrypted_value_can_be_decrypted_by_non_writer_network_key() {
+        let store = encrypted_store();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "secrets",
+            &["id UUID PRIMARY KEY, token STR ENCRYPTED"],
+            now,
+        )
+        .unwrap();
+        let id = "018f9d72-7c8d-7000-8000-000000000001";
+        table_insert(
+            &store,
+            &cache,
+            "secrets",
+            &[("id", id), ("token", "network-secret")],
+            now,
+        )
+        .unwrap();
+        let raw = store
+            .hget(row_key_for_pk("secrets", id).as_bytes(), b"token", now)
+            .unwrap();
+        let field = load_schema(&store, &cache, "secrets", now)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.name == "token")
+            .unwrap();
+
+        let old_key_store = Store::new_with_config(Arc::new(crate::ServerConfig {
+            encryption: EncryptionConfig {
+                active_key_id: Some("k1".to_string()),
+                keys: vec![EncryptionKeyConfig {
+                    id: "k1".to_string(),
+                    secret: b"old-key-secret".to_vec(),
+                    decrypt_only: false,
+                }],
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        }));
+        let plaintext = decode_stored_value(&old_key_store, "secrets", &field, id, &raw).unwrap();
+        assert_eq!(plaintext, "network-secret");
+    }
+
+    #[test]
+    fn encrypted_key_rotation_survives_wal_replay_update_and_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_only = Arc::new(crate::ServerConfig {
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            encryption: EncryptionConfig {
+                active_key_id: Some("k1".to_string()),
+                keys: vec![EncryptionKeyConfig {
+                    id: "k1".to_string(),
+                    secret: b"old-key-secret".to_vec(),
+                    decrypt_only: false,
+                }],
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let rotated = Arc::new(crate::ServerConfig {
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            encryption: EncryptionConfig {
+                active_key_id: Some("k2".to_string()),
+                keys: vec![
+                    EncryptionKeyConfig {
+                        id: "k1".to_string(),
+                        secret: b"old-key-secret".to_vec(),
+                        decrypt_only: true,
+                    },
+                    EncryptionKeyConfig {
+                        id: "k2".to_string(),
+                        secret: b"new-key-secret".to_vec(),
+                        decrypt_only: false,
+                    },
+                ],
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+
+        let store = Arc::new(Store::new_with_config(old_only.clone()));
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "accounts",
+            &[
+                "id UUID PRIMARY KEY,",
+                "email STR ENCRYPTED SEARCHABLE UNIQUE,",
+                "token STR ENCRYPTED",
+            ],
+            now,
+        )
+        .unwrap();
+        let first = "018f9d72-7c8d-7000-8000-000000000001";
+        table_insert(
+            &store,
+            &cache,
+            "accounts",
+            &[
+                ("id", first),
+                ("email", "old@example.com"),
+                ("token", "old-token"),
+            ],
+            now,
+        )
+        .unwrap();
+        store.fsync_wal();
+
+        let rotated_store = Arc::new(Store::new_with_config(rotated.clone()));
+        rotated_store.replay_wal(&crate::pubsub::Broker::new());
+        let rotated_cache = make_cache();
+        let old_query = parse_select(&[
+            "*",
+            "FROM",
+            "accounts",
+            "WHERE",
+            "email",
+            "=",
+            "old@example.com",
+        ])
+        .unwrap();
+        let rows = rows_of(table_select(&rotated_store, &rotated_cache, &old_query, now).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cell(&rows[0], "token"), "old-token");
+
+        table_update_by_pk_str(
+            &rotated_store,
+            &rotated_cache,
+            "accounts",
+            first,
+            &[("email", "rotated@example.com"), ("token", "new-token")],
+            None,
+            now,
+        )
+        .unwrap();
+        let second = "018f9d72-7c8d-7000-8000-000000000002";
+        table_insert(
+            &rotated_store,
+            &rotated_cache,
+            "accounts",
+            &[
+                ("id", second),
+                ("email", "fresh@example.com"),
+                ("token", "fresh-token"),
+            ],
+            now,
+        )
+        .unwrap();
+        rotated_store.fsync_wal();
+
+        let mut wal_bytes = Vec::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path().join("wal.lux");
+            if path.exists() {
+                wal_bytes.extend(std::fs::read(path).unwrap());
+            }
+        }
+        for plaintext in [
+            b"old@example.com".as_slice(),
+            b"rotated@example.com".as_slice(),
+            b"fresh@example.com".as_slice(),
+            b"old-token".as_slice(),
+            b"new-token".as_slice(),
+            b"fresh-token".as_slice(),
+        ] {
+            assert!(
+                !wal_bytes.windows(plaintext.len()).any(|w| w == plaintext),
+                "plaintext leaked into encrypted WAL"
+            );
+        }
+
+        let restored = Arc::new(Store::new_with_config(rotated));
+        restored.replay_wal(&crate::pubsub::Broker::new());
+        let restored_cache = make_cache();
+        let old_rows = rows_of(table_select(&restored, &restored_cache, &old_query, now).unwrap());
+        assert_eq!(old_rows.len(), 0);
+
+        let rotated_query = parse_select(&[
+            "*",
+            "FROM",
+            "accounts",
+            "WHERE",
+            "email",
+            "=",
+            "rotated@example.com",
+        ])
+        .unwrap();
+        let rows = rows_of(table_select(&restored, &restored_cache, &rotated_query, now).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cell(&rows[0], "id"), first);
+        assert_eq!(cell(&rows[0], "token"), "new-token");
+
+        let fresh_query = parse_select(&[
+            "*",
+            "FROM",
+            "accounts",
+            "WHERE",
+            "email",
+            "=",
+            "fresh@example.com",
+        ])
+        .unwrap();
+        let rows = rows_of(table_select(&restored, &restored_cache, &fresh_query, now).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cell(&rows[0], "id"), second);
+        assert_eq!(cell(&rows[0], "token"), "fresh-token");
+
+        table_insert(
+            &restored,
+            &restored_cache,
+            "accounts",
+            &[
+                ("id", "018f9d72-7c8d-7000-8000-000000000003"),
+                ("email", "old@example.com"),
+                ("token", "reused-old-email"),
+            ],
+            now,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn encrypted_searchable_unique_uses_plaintext_semantics() {
+        let store = encrypted_store();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "accounts",
+            &["id UUID PRIMARY KEY, email STR ENCRYPTED SEARCHABLE UNIQUE"],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "accounts",
+            &[
+                ("id", "018f9d72-7c8d-7000-8000-000000000001"),
+                ("email", "a@example.com"),
+            ],
+            now,
+        )
+        .unwrap();
+        let err = table_insert(
+            &store,
+            &cache,
+            "accounts",
+            &[
+                ("id", "018f9d72-7c8d-7000-8000-000000000002"),
+                ("email", "a@example.com"),
+            ],
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("unique constraint"));
+    }
+
+    #[test]
+    fn encrypted_query_guards_reject_unsupported_filters_and_ordering() {
+        let store = encrypted_store();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "secrets",
+            &[
+                "id UUID PRIMARY KEY,",
+                "token STR ENCRYPTED,",
+                "email STR ENCRYPTED SEARCHABLE,",
+                "profile JSON ENCRYPTED",
+            ],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "secrets",
+            &[
+                ("id", "018f9d72-7c8d-7000-8000-000000000001"),
+                ("token", "topsecret"),
+                ("email", "a@example.com"),
+                ("profile", r#"{"ssn":"1234"}"#),
+            ],
+            now,
+        )
+        .unwrap();
+
+        let non_searchable =
+            parse_select(&["*", "FROM", "secrets", "WHERE", "token", "=", "topsecret"]).unwrap();
+        let err = select_err(&store, &cache, &non_searchable, now);
+        assert!(err.contains("must be SEARCHABLE"), "{err}");
+
+        let range = parse_select(&["*", "FROM", "secrets", "WHERE", "email", ">", "a"]).unwrap();
+        let err = select_err(&store, &cache, &range, now);
+        assert!(err.contains("only supports equality filters"), "{err}");
+
+        let order = parse_select(&["*", "FROM", "secrets", "ORDER", "BY", "email"]).unwrap();
+        let err = select_err(&store, &cache, &order, now);
+        assert!(err.contains("does not support ORDER BY"), "{err}");
+
+        let json_path =
+            parse_select(&["*", "FROM", "secrets", "WHERE", "profile.ssn", "=", "1234"]).unwrap();
+        let err = select_err(&store, &cache, &json_path, now);
+        assert!(err.contains("does not support JSON path filters"), "{err}");
+
+        let json_order =
+            parse_select(&["*", "FROM", "secrets", "ORDER", "BY", "profile.ssn"]).unwrap();
+        let err = select_err(&store, &cache, &json_order, now);
+        assert!(err.contains("does not support ORDER BY"), "{err}");
+    }
+
+    #[test]
+    fn encrypted_mutation_guards_reject_unsupported_predicates_and_conflicts() {
+        let store = encrypted_store();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "secrets",
+            &[
+                "id UUID PRIMARY KEY,",
+                "token STR ENCRYPTED,",
+                "email STR ENCRYPTED SEARCHABLE,",
+                "note STR",
+            ],
+            now,
+        )
+        .unwrap();
+        let id = "018f9d72-7c8d-7000-8000-000000000001";
+        table_insert(
+            &store,
+            &cache,
+            "secrets",
+            &[
+                ("id", id),
+                ("token", "topsecret"),
+                ("email", "a@example.com"),
+                ("note", "before"),
+            ],
+            now,
+        )
+        .unwrap();
+
+        let err = table_update_where(
+            &store,
+            &cache,
+            "secrets",
+            &[("note", "leaked")],
+            &["token", "=", "topsecret"],
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("must be SEARCHABLE"), "{err}");
+
+        let err = table_delete_where(
+            &store,
+            &cache,
+            "secrets",
+            &["email", ">", "a@example.com"],
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("only supports equality filters"), "{err}");
+
+        let err = table_upsert_returning(
+            &store,
+            &cache,
+            "secrets",
+            &[("token", "topsecret"), ("note", "upserted")],
+            Some("token"),
+            now,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("must be SEARCHABLE for upsert conflict"),
+            "{err}"
+        );
+
+        let updated = table_update_where(
+            &store,
+            &cache,
+            "secrets",
+            &[("note", "matched")],
+            &["email", "=", "a@example.com"],
+            now,
+        )
+        .unwrap();
+        assert_eq!(updated, 1);
+        let row = get_row(
+            &store,
+            "secrets",
+            &load_schema(&store, &cache, "secrets", now).unwrap(),
+            id,
+            now,
+        )
+        .unwrap();
+        assert_eq!(cell(&row, "note"), "matched");
+
+        let deleted = table_delete_where(
+            &store,
+            &cache,
+            "secrets",
+            &["email", "=", "a@example.com"],
+            now,
+        )
+        .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(get_row(
+            &store,
+            "secrets",
+            &load_schema(&store, &cache, "secrets", now).unwrap(),
+            id,
+            now,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn encrypted_json_and_array_cannot_be_searchable_and_paths_reject() {
+        assert!(parse_field_def("meta JSON ENCRYPTED SEARCHABLE").is_err());
+        assert!(parse_field_def("tags ARRAY ENCRYPTED SEARCHABLE").is_err());
+
+        let store = encrypted_store();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "events",
+            &["id UUID PRIMARY KEY, meta JSON ENCRYPTED"],
+            now,
+        )
+        .unwrap();
+        let id = "018f9d72-7c8d-7000-8000-000000000001";
+        let meta = r#"{"kind":"login","count":1}"#;
+        table_insert(&store, &cache, "events", &[("id", id), ("meta", meta)], now).unwrap();
+
+        let raw = store
+            .hget(row_key_for_pk("events", id).as_bytes(), b"meta", now)
+            .unwrap();
+        assert!(!raw.windows(b"login".len()).any(|window| window == b"login"));
+
+        let whole = parse_select(&["*", "FROM", "events", "WHERE", "meta", "=", meta]).unwrap();
+        let err = select_err(&store, &cache, &whole, now);
+        assert!(err.contains("must be SEARCHABLE"), "{err}");
+
+        let path =
+            parse_select(&["*", "FROM", "events", "WHERE", "meta.kind", "=", "login"]).unwrap();
+        let err = select_err(&store, &cache, &path, now);
+        assert!(err.contains("does not support JSON path filters"), "{err}");
+    }
+
+    #[test]
+    fn encrypted_join_keys_are_rejected() {
+        let store = encrypted_store();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "users",
+            &["id UUID PRIMARY KEY, email STR ENCRYPTED SEARCHABLE, org_id STR"],
+            now,
+        )
+        .unwrap();
+        table_create(
+            &store,
+            &cache,
+            "profiles",
+            &["id UUID PRIMARY KEY, email STR, org_secret STR ENCRYPTED SEARCHABLE"],
+            now,
+        )
+        .unwrap();
+
+        let left_encrypted = parse_select(&[
+            "*", "FROM", "users", "u", "JOIN", "profiles", "p", "ON", "u.email", "=", "p.email",
+        ])
+        .unwrap();
+        let err = select_err(&store, &cache, &left_encrypted, now);
+        assert!(err.contains("does not support JOIN"), "{err}");
+
+        let right_encrypted = parse_select(&[
+            "*",
+            "FROM",
+            "users",
+            "u",
+            "JOIN",
+            "profiles",
+            "p",
+            "ON",
+            "u.org_id",
+            "=",
+            "p.org_secret",
+        ])
+        .unwrap();
+        let err = select_err(&store, &cache, &right_encrypted, now);
+        assert!(err.contains("does not support JOIN"), "{err}");
+    }
+
+    #[test]
+    fn encrypted_searchable_unique_rekeys_on_update() {
+        let store = encrypted_store();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "accounts",
+            &["id UUID PRIMARY KEY, email STR ENCRYPTED SEARCHABLE UNIQUE"],
+            now,
+        )
+        .unwrap();
+        let first = "018f9d72-7c8d-7000-8000-000000000001";
+        let second = "018f9d72-7c8d-7000-8000-000000000002";
+        table_insert(
+            &store,
+            &cache,
+            "accounts",
+            &[("id", first), ("email", "old@example.com")],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "accounts",
+            &[("id", second), ("email", "other@example.com")],
+            now,
+        )
+        .unwrap();
+
+        table_update_by_pk_str(
+            &store,
+            &cache,
+            "accounts",
+            first,
+            &[("email", "new@example.com")],
+            None,
+            now,
+        )
+        .unwrap();
+
+        table_insert(
+            &store,
+            &cache,
+            "accounts",
+            &[
+                ("id", "018f9d72-7c8d-7000-8000-000000000003"),
+                ("email", "old@example.com"),
+            ],
+            now,
+        )
+        .unwrap();
+        let err = table_insert(
+            &store,
+            &cache,
+            "accounts",
+            &[
+                ("id", "018f9d72-7c8d-7000-8000-000000000004"),
+                ("email", "new@example.com"),
+            ],
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("unique constraint"), "{err}");
+    }
+
+    #[test]
+    fn encrypted_searchable_unique_delete_cleans_blind_indexes_and_allows_reuse() {
+        let store = encrypted_store();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "accounts",
+            &["id UUID PRIMARY KEY, email STR ENCRYPTED SEARCHABLE UNIQUE"],
+            now,
+        )
+        .unwrap();
+        let first = "018f9d72-7c8d-7000-8000-000000000001";
+        let second = "018f9d72-7c8d-7000-8000-000000000002";
+        table_insert(
+            &store,
+            &cache,
+            "accounts",
+            &[("id", first), ("email", "deleted@example.com")],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "accounts",
+            &[("id", second), ("email", "other@example.com")],
+            now,
+        )
+        .unwrap();
+
+        let deleted = table_delete_where(
+            &store,
+            &cache,
+            "accounts",
+            &["email", "=", "deleted@example.com"],
+            now,
+        )
+        .unwrap();
+        assert_eq!(deleted, 1);
+
+        let email_field = load_schema(&store, &cache, "accounts", now)
+            .unwrap()
+            .into_iter()
+            .find(|field| field.name == "email")
+            .unwrap();
+        let ukey = uniq_key("accounts", "email");
+        for index_value in
+            searchable_index_values(&store, "accounts", &email_field, "deleted@example.com")
+                .unwrap()
+        {
+            assert!(
+                store
+                    .hget(ukey.as_bytes(), index_value.as_bytes(), now)
+                    .is_none(),
+                "deleted encrypted unique value left a stale holder"
+            );
+            let skey = idx_str_key("accounts", "email", &index_value);
+            let members = store.smembers(skey.as_bytes(), now).unwrap_or_default();
+            assert!(
+                !members.iter().any(|member| member == first),
+                "deleted encrypted searchable value left a stale index member"
+            );
+        }
+
+        table_update_by_pk_str(
+            &store,
+            &cache,
+            "accounts",
+            second,
+            &[("email", "deleted@example.com")],
+            None,
+            now,
+        )
+        .unwrap();
+        let plan = parse_select(&[
+            "*",
+            "FROM",
+            "accounts",
+            "WHERE",
+            "email",
+            "=",
+            "deleted@example.com",
+        ])
+        .unwrap();
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cell(&rows[0], "id"), second);
+    }
+
+    #[test]
+    fn encrypted_add_column_rejects_default_and_keeps_existing_rows_readable() {
+        let store = encrypted_store();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "profiles",
+            &["id UUID PRIMARY KEY, name STR"],
+            now,
+        )
+        .unwrap();
+        let id = "018f9d72-7c8d-7000-8000-000000000001";
+        table_insert(
+            &store,
+            &cache,
+            "profiles",
+            &[("id", id), ("name", "Ada")],
+            now,
+        )
+        .unwrap();
+
+        let err = table_add_column(
+            &store,
+            &cache,
+            "profiles",
+            "email STR ENCRYPTED SEARCHABLE UNIQUE DEFAULT seeded@example.com",
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot use DEFAULT"), "{err}");
+
+        table_add_column(
+            &store,
+            &cache,
+            "profiles",
+            "email STR ENCRYPTED SEARCHABLE UNIQUE",
+            now,
+        )
+        .unwrap();
+
+        let row = get_row(
+            &store,
+            "profiles",
+            &load_schema(&store, &cache, "profiles", now).unwrap(),
+            id,
+            now,
+        )
+        .unwrap();
+        assert_eq!(cell(&row, "name"), "Ada");
+        assert!(row.iter().all(|(field, _)| field != "email"));
+
+        let second = "018f9d72-7c8d-7000-8000-000000000002";
+        table_insert(
+            &store,
+            &cache,
+            "profiles",
+            &[
+                ("id", second),
+                ("name", "Grace"),
+                ("email", "grace@example.com"),
+            ],
+            now,
+        )
+        .unwrap();
+        let raw = store
+            .hget(row_key_for_pk("profiles", second).as_bytes(), b"email", now)
+            .unwrap();
+        assert!(!raw
+            .windows(b"grace@example.com".len())
+            .any(|window| window == b"grace@example.com"));
+
+        let plan = parse_select(&[
+            "*",
+            "FROM",
+            "profiles",
+            "WHERE",
+            "email",
+            "=",
+            "grace@example.com",
+        ])
+        .unwrap();
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cell(&rows[0], "id"), second);
+    }
+
+    #[test]
+    fn encrypted_returning_paths_emit_plaintext_and_store_ciphertext() {
+        let store = encrypted_store();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "secrets",
+            &[
+                "id",
+                "STR",
+                "PRIMARY",
+                "KEY,",
+                "email",
+                "STR",
+                "ENCRYPTED",
+                "SEARCHABLE",
+                "UNIQUE,",
+                "token",
+                "STR",
+                "ENCRYPTED",
+            ],
+            now,
+        )
+        .unwrap();
+
+        let inserted = table_insert_returning(
+            &store,
+            &cache,
+            "secrets",
+            &[
+                ("id", "s1"),
+                ("email", "person@example.com"),
+                ("token", "first-secret"),
+            ],
+            now,
+        )
+        .unwrap();
+        assert!(inserted
+            .iter()
+            .any(|(k, v)| k == "token" && v == "first-secret"));
+        let raw = store
+            .hget(row_key_for_pk("secrets", "s1").as_bytes(), b"token", now)
+            .unwrap();
+        assert!(!raw
+            .windows(b"first-secret".len())
+            .any(|w| w == b"first-secret"));
+
+        let updated = table_update_where_returning(
+            &store,
+            &cache,
+            "secrets",
+            &[("token", "second-secret")],
+            &["email", "=", "person@example.com"],
+            now,
+        )
+        .unwrap();
+        assert_eq!(updated.len(), 1);
+        assert!(updated[0]
+            .iter()
+            .any(|(k, v)| k == "token" && v == "second-secret"));
+        let raw = store
+            .hget(row_key_for_pk("secrets", "s1").as_bytes(), b"token", now)
+            .unwrap();
+        assert!(!raw
+            .windows(b"second-secret".len())
+            .any(|w| w == b"second-secret"));
+
+        let deleted = table_delete_where_returning(
+            &store,
+            &cache,
+            "secrets",
+            &["email", "=", "person@example.com"],
+            now,
+        )
+        .unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert!(deleted[0]
+            .iter()
+            .any(|(k, v)| k == "token" && v == "second-secret"));
+        assert!(get_row(
+            &store,
+            "secrets",
+            &load_schema(&store, &cache, "secrets", now).unwrap(),
+            "s1",
+            now,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn encrypted_upsert_on_searchable_unique_replays_with_ttl_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            encryption: EncryptionConfig {
+                active_key_id: Some("k2".to_string()),
+                keys: vec![EncryptionKeyConfig {
+                    id: "k2".to_string(),
+                    secret: b"new-key-secret".to_vec(),
+                    decrypt_only: false,
+                }],
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Arc::new(Store::new_with_config(config.clone()));
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "accounts",
+            &[
+                "id UUID PRIMARY KEY,",
+                "email STR ENCRYPTED SEARCHABLE UNIQUE,",
+                "name STR ENCRYPTED",
+            ],
+            now,
+        )
+        .unwrap();
+        let id = "018f9d72-7c8d-7000-8000-000000000001";
+        table_insert_ttl(
+            &store,
+            &cache,
+            "accounts",
+            &[("id", id), ("email", "a@example.com"), ("name", "old")],
+            Some(TtlOp::Set(3600)),
+            now,
+        )
+        .unwrap();
+        let row = table_upsert_returning_ttl(
+            &store,
+            &cache,
+            "accounts",
+            &[("email", "a@example.com"), ("name", "updated")],
+            Some("email"),
+            Some(TtlOp::Clear),
+            now,
+        )
+        .unwrap();
+        assert_eq!(cell(&row, "id"), id);
+        assert_eq!(cell(&row, "name"), "updated");
+        store.fsync_wal();
+
+        let restored = Arc::new(Store::new_with_config(config));
+        restored.replay_wal(&crate::pubsub::Broker::new());
+        let restored_cache = make_cache();
+        let plan = parse_select(&[
+            "*",
+            "FROM",
+            "accounts",
+            "WHERE",
+            "email",
+            "=",
+            "a@example.com",
+        ])
+        .unwrap();
+        let rows = rows_of(table_select(&restored, &restored_cache, &plan, now).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cell(&rows[0], "id"), id);
+        assert_eq!(cell(&rows[0], "name"), "updated");
+        let rk = row_key_for_pk("accounts", id);
+        assert!(restored
+            .hget(rk.as_bytes(), HIDDEN_TTL_FIELD, now)
+            .is_none());
+    }
+
+    #[test]
+    fn encrypted_snapshot_does_not_store_plaintext_and_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            encryption: EncryptionConfig {
+                active_key_id: Some("k2".to_string()),
+                keys: vec![
+                    EncryptionKeyConfig {
+                        id: "k1".to_string(),
+                        secret: b"old-key-secret".to_vec(),
+                        decrypt_only: true,
+                    },
+                    EncryptionKeyConfig {
+                        id: "k2".to_string(),
+                        secret: b"new-key-secret".to_vec(),
+                        decrypt_only: false,
+                    },
+                ],
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Arc::new(Store::new_with_config(config.clone()));
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "secrets",
+            &["id UUID PRIMARY KEY, token STR ENCRYPTED"],
+            now,
+        )
+        .unwrap();
+        let id = "018f9d72-7c8d-7000-8000-000000000001";
+        table_insert(
+            &store,
+            &cache,
+            "secrets",
+            &[("id", id), ("token", "snapshot-topsecret")],
+            now,
+        )
+        .unwrap();
+
+        let snapshot_path = crate::snapshot::snapshot_for_backup(&store).unwrap();
+        let snapshot = std::fs::read(snapshot_path).unwrap();
+        assert!(!snapshot
+            .windows(b"snapshot-topsecret".len())
+            .any(|w| w == b"snapshot-topsecret"));
+
+        let restored = Arc::new(Store::new_with_config(config));
+        crate::snapshot::load(&restored).unwrap();
+        let restored_cache = make_cache();
+        let row = get_row(
+            &restored,
+            "secrets",
+            &load_schema(&restored, &restored_cache, "secrets", now).unwrap(),
+            id,
+            now,
+        )
+        .unwrap();
+        assert_eq!(cell(&row, "token"), "snapshot-topsecret");
+    }
+
+    #[test]
+    fn encrypted_wal_does_not_store_plaintext_and_replays_latest_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            encryption: EncryptionConfig {
+                active_key_id: Some("k2".to_string()),
+                keys: vec![
+                    EncryptionKeyConfig {
+                        id: "k1".to_string(),
+                        secret: b"old-key-secret".to_vec(),
+                        decrypt_only: true,
+                    },
+                    EncryptionKeyConfig {
+                        id: "k2".to_string(),
+                        secret: b"new-key-secret".to_vec(),
+                        decrypt_only: false,
+                    },
+                ],
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Arc::new(Store::new_with_config(config.clone()));
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "secrets",
+            &["id UUID PRIMARY KEY, token STR ENCRYPTED"],
+            now,
+        )
+        .unwrap();
+        let id = "018f9d72-7c8d-7000-8000-000000000001";
+        table_insert(
+            &store,
+            &cache,
+            "secrets",
+            &[("id", id), ("token", "wal-topsecret")],
+            now,
+        )
+        .unwrap();
+        table_update_by_pk_str(
+            &store,
+            &cache,
+            "secrets",
+            id,
+            &[("token", "wal-newsecret")],
+            None,
+            now,
+        )
+        .unwrap();
+        store.fsync_wal();
+
+        let mut wal_bytes = Vec::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path().join("wal.lux");
+            if path.exists() {
+                wal_bytes.extend(std::fs::read(path).unwrap());
+            }
+        }
+        assert!(!wal_bytes
+            .windows(b"wal-topsecret".len())
+            .any(|w| w == b"wal-topsecret"));
+        assert!(!wal_bytes
+            .windows(b"wal-newsecret".len())
+            .any(|w| w == b"wal-newsecret"));
+        assert!(wal_bytes.windows(b"TROWSET".len()).any(|w| w == b"TROWSET"));
+
+        let restored = Arc::new(Store::new_with_config(config));
+        restored.replay_wal(&crate::pubsub::Broker::new());
+        let restored_cache = make_cache();
+        let row = get_row(
+            &restored,
+            "secrets",
+            &load_schema(&restored, &restored_cache, "secrets", now).unwrap(),
+            id,
+            now,
+        )
+        .unwrap();
+        assert_eq!(cell(&row, "token"), "wal-newsecret");
+    }
+
+    #[test]
+    fn encrypted_wal_replay_preserves_uuid_row_order_after_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            encryption: EncryptionConfig {
+                active_key_id: Some("k2".to_string()),
+                keys: vec![EncryptionKeyConfig {
+                    id: "k2".to_string(),
+                    secret: b"new-key-secret".to_vec(),
+                    decrypt_only: false,
+                }],
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Arc::new(Store::new_with_config(config.clone()));
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "secrets",
+            &["id UUID PRIMARY KEY, token STR ENCRYPTED"],
+            now,
+        )
+        .unwrap();
+        let first = "018f9d72-7c8d-7000-8000-000000000001";
+        let second = "018f9d72-7c8d-7000-8000-000000000002";
+        table_insert(
+            &store,
+            &cache,
+            "secrets",
+            &[("id", first), ("token", "first")],
+            now,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "secrets",
+            &[("id", second), ("token", "second")],
+            now,
+        )
+        .unwrap();
+        table_update_by_pk_str(
+            &store,
+            &cache,
+            "secrets",
+            first,
+            &[("token", "first-updated")],
+            None,
+            now,
+        )
+        .unwrap();
+        store.fsync_wal();
+
+        let restored = Arc::new(Store::new_with_config(config));
+        restored.replay_wal(&crate::pubsub::Broker::new());
+        let restored_cache = make_cache();
+        let plan = parse_select(&["*", "FROM", "secrets", "LIMIT", "2"]).unwrap();
+        let rows = rows_of(table_select(&restored, &restored_cache, &plan, now).unwrap());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(cell(&rows[0], "id"), first);
+        assert_eq!(cell(&rows[0], "token"), "first-updated");
+        assert_eq!(cell(&rows[1], "id"), second);
+    }
+
+    #[test]
+    fn encrypted_wal_replay_clears_hidden_ttl_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            encryption: EncryptionConfig {
+                active_key_id: Some("k2".to_string()),
+                keys: vec![EncryptionKeyConfig {
+                    id: "k2".to_string(),
+                    secret: b"new-key-secret".to_vec(),
+                    decrypt_only: false,
+                }],
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Arc::new(Store::new_with_config(config.clone()));
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "secrets",
+            &["id UUID PRIMARY KEY, token STR ENCRYPTED"],
+            now,
+        )
+        .unwrap();
+        let id = "018f9d72-7c8d-7000-8000-000000000001";
+        table_insert_ttl(
+            &store,
+            &cache,
+            "secrets",
+            &[("id", id), ("token", "ttl-secret")],
+            Some(TtlOp::Set(3600)),
+            now,
+        )
+        .unwrap();
+        table_update_by_pk_str(
+            &store,
+            &cache,
+            "secrets",
+            id,
+            &[("token", "ttl-cleared")],
+            Some(TtlOp::Clear),
+            now,
+        )
+        .unwrap();
+        store.fsync_wal();
+
+        let restored = Arc::new(Store::new_with_config(config));
+        restored.replay_wal(&crate::pubsub::Broker::new());
+        let rk = row_key_for_pk("secrets", id);
+        assert!(restored
+            .hget(rk.as_bytes(), HIDDEN_TTL_FIELD, now)
+            .is_none());
+        assert_eq!(
+            restored
+                .zscore(
+                    ttl_index_key().as_bytes(),
+                    ttl_member("secrets", id).as_bytes(),
+                    now
+                )
+                .unwrap(),
+            None
+        );
+        let restored_cache = make_cache();
+        let row = get_row(
+            &restored,
+            "secrets",
+            &load_schema(&restored, &restored_cache, "secrets", now).unwrap(),
+            id,
+            now,
+        )
+        .unwrap();
+        assert_eq!(cell(&row, "token"), "ttl-cleared");
     }
 
     #[test]
@@ -5748,6 +7526,25 @@ mod tests {
         let err =
             table_create_path_index(&store, &cache, "events", "kind.x", "STR", now).unwrap_err();
         assert!(err.contains("not a JSON column"), "{err}");
+    }
+
+    #[test]
+    fn tindex_rejects_encrypted_json_column() {
+        let store = encrypted_store();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "events",
+            &["id INT PRIMARY KEY, meta JSON ENCRYPTED"],
+            now,
+        )
+        .unwrap();
+        let err =
+            table_create_path_index(&store, &cache, "events", "meta.ssn", "STR", now).unwrap_err();
+        assert!(err.contains("encrypted column"), "{err}");
+        assert!(load_path_indexes(&store, &cache, "events", now).is_empty());
     }
 
     // -------------------------------------------------------------------------

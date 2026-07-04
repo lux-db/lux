@@ -405,6 +405,92 @@ async fn live_websocket_table_subscription_receives_http_insert() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_encrypted_table_streams_plaintext_rows_without_key_event_value_leak() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux_with_env(resp_port, http_port, None, &[("LUX_ENC_AUTO_INIT", "1")]);
+
+    let (status, created) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"encrypted_messages","columns":[{"name":"id","type":"STR","primaryKey":true},{"name":"email","type":"STR","encrypted":true,"searchable":true},{"name":"token","type":"STR","encrypted":true}]}"#,
+        None,
+    );
+    assert_eq!(status, 200, "create encrypted table: {created}");
+
+    let mut table_ws = connect_live(http_port, None).await;
+    send_json(
+        &mut table_ws,
+        json!({
+            "type":"live.subscribe",
+            "id":"messages",
+            "spec":{
+                "kind":"table",
+                "table":"encrypted_messages",
+                "where":{"email":"a@example.com"}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(recv_json(&mut table_ws).await["type"], "live.subscribed");
+    let snapshot = recv_live_event(&mut table_ws, "messages").await;
+    assert_eq!(snapshot["kind"], "snapshot");
+    assert_eq!(snapshot["rows"].as_array().unwrap().len(), 0);
+
+    let mut key_ws = connect_live(http_port, None).await;
+    send_json(
+        &mut key_ws,
+        json!({"type":"live.subscribe","id":"keys","spec":{"kind":"key","pattern":"encrypted_messages"}}),
+    )
+    .await;
+    assert_eq!(recv_json(&mut key_ws).await["type"], "live.subscribed");
+
+    let (status, inserted) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/encrypted_messages",
+        r#"{"id":"msg-1","email":"a@example.com","token":"live-secret"}"#,
+        None,
+    );
+    assert_eq!(status, 200, "insert encrypted row: {inserted}");
+    assert_eq!(inserted["result"]["token"], "live-secret");
+
+    let key_event = recv_live_event(&mut key_ws, "keys").await;
+    assert_eq!(key_event["kind"], "key.update");
+    assert_eq!(key_event["key"], "encrypted_messages");
+    let key_json = key_event.to_string();
+    assert!(
+        !key_json.contains("live-secret") && !key_json.contains("a@example.com"),
+        "key event leaked encrypted table values: {key_json}"
+    );
+
+    let insert = recv_live_event(&mut table_ws, "messages").await;
+    assert_eq!(insert["kind"], "insert");
+    assert_eq!(insert["pk"], "msg-1");
+    assert_eq!(insert["row"]["email"], "a@example.com");
+    assert_eq!(insert["row"]["token"], "live-secret");
+    let insert_json = insert.to_string();
+    assert!(
+        !insert_json.contains("LUXENC2"),
+        "table live event exposed encrypted envelope bytes: {insert_json}"
+    );
+
+    let (status, updated) = http_json_request(
+        http_port,
+        "PATCH",
+        "/v1/tables/encrypted_messages?where=email=a@example.com",
+        r#"{"token":"rotated-secret"}"#,
+        None,
+    );
+    assert_eq!(status, 200, "update encrypted row: {updated}");
+    let update = recv_live_event(&mut table_ws, "messages").await;
+    assert_eq!(update["kind"], "update");
+    assert_eq!(update["row"]["token"], "rotated-secret");
+    assert_eq!(update["previous"]["token"], "live-secret");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_websocket_join_reacts_to_joined_table_insert() {
     let resp_port = free_port();
     let http_port = free_port();

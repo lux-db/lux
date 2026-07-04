@@ -2821,7 +2821,7 @@ fn route_table_create(
     // Accepts two formats per element:
     //   - plain string: "id UUID PRIMARY KEY" (passed through as-is)
     //   - object: {"name":"email","type":"STR","primaryKey":true,"unique":true,"notNull":true,
-    //              "references":"users(id)","onDelete":"CASCADE"}
+    //              "encrypted":true,"searchable":true,"references":"users(id)","onDelete":"CASCADE"}
     let mut col_specs: Vec<String> = Vec::new();
     for col in columns {
         if let Some(s) = col.as_str() {
@@ -2845,6 +2845,20 @@ fn route_table_create(
                 .unwrap_or(false)
             {
                 spec.push_str(" NOT NULL");
+            }
+            if obj
+                .get("encrypted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                spec.push_str(" ENCRYPTED");
+            }
+            if obj
+                .get("searchable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                spec.push_str(" SEARCHABLE");
             }
             if let Some(refs) = obj.get("references").and_then(|v| v.as_str()) {
                 spec.push_str(&format!(" REFERENCES {}", refs));
@@ -3992,6 +4006,101 @@ mod tests {
             out.contains(r#""embedding":[0.1,0.2,0.3]"#),
             "returning: {out}"
         );
+    }
+
+    fn encrypted_http_fixture() -> (
+        Arc<Store>,
+        Broker,
+        SharedSchemaCache,
+        Arc<lua::ScriptEngine>,
+    ) {
+        let config = Arc::new(crate::ServerConfig {
+            encryption: crate::EncryptionConfig {
+                active_key_id: Some("k1".to_string()),
+                keys: vec![crate::EncryptionKeyConfig {
+                    id: "k1".to_string(),
+                    secret: b"http-encryption-secret".to_vec(),
+                    decrypt_only: false,
+                }],
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Arc::new(Store::new_with_config(config));
+        let cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let broker = Broker::new();
+        let script_engine = Arc::new(lua::ScriptEngine::new());
+        (store, broker, cache, script_engine)
+    }
+
+    #[test]
+    fn http_table_routes_round_trip_encrypted_columns_without_raw_plaintext() {
+        let (store, broker, cache, se) = encrypted_http_fixture();
+        let body = r#"{
+            "name":"secrets",
+            "columns":[
+                {"name":"id","type":"STR","primaryKey":true},
+                {"name":"email","type":"STR","encrypted":true,"searchable":true,"unique":true},
+                {"name":"token","type":"STR","encrypted":true}
+            ]
+        }"#;
+        let (status, _, out) = route_table_create(body, &store, &broker, &cache, &se);
+        assert_eq!(status, 200, "{out}");
+        assert!(!out.contains("error"), "{out}");
+
+        let (status, _, inserted) = route_table_insert(
+            "secrets",
+            &[],
+            r#"{"id":"s1","email":"person@example.com","token":"plain-secret"}"#,
+            &store,
+            &broker,
+            &cache,
+            &HttpAuthContext::Operator,
+        );
+        assert_eq!(status, 200, "{inserted}");
+        assert!(
+            inserted.contains(r#""email":"person@example.com""#),
+            "{inserted}"
+        );
+        assert!(inserted.contains(r#""token":"plain-secret""#), "{inserted}");
+
+        let raw_email = store
+            .hget(b"_t:secrets:row:s1", b"email", Instant::now())
+            .unwrap();
+        let raw_token = store
+            .hget(b"_t:secrets:row:s1", b"token", Instant::now())
+            .unwrap();
+        assert!(!raw_email
+            .windows(b"person@example.com".len())
+            .any(|w| w == b"person@example.com"));
+        assert!(!raw_token
+            .windows(b"plain-secret".len())
+            .any(|w| w == b"plain-secret"));
+
+        let params = vec![(
+            "where".to_string(),
+            "email = person@example.com".to_string(),
+        )];
+        let (status, _, queried) = route_table_query("secrets", &params, &store, &broker, &cache);
+        assert_eq!(status, 200, "{queried}");
+        assert!(
+            queried.contains(r#""email":"person@example.com""#),
+            "{queried}"
+        );
+        assert!(queried.contains(r#""token":"plain-secret""#), "{queried}");
+    }
+
+    #[test]
+    fn http_table_create_rejects_encrypted_default() {
+        let (store, broker, cache, se) = encrypted_http_fixture();
+        let body = r#"{
+            "name":"secrets",
+            "columns":["id STR PRIMARY KEY","token STR ENCRYPTED DEFAULT leaked"]
+        }"#;
+        let (status, _, out) = route_table_create(body, &store, &broker, &cache, &se);
+        assert_eq!(status, 200, "{out}");
+        assert!(out.contains("cannot use DEFAULT"), "{out}");
     }
 
     #[test]

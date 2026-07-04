@@ -1,4 +1,5 @@
 mod bitops;
+mod encryption;
 mod geo;
 mod hashes;
 mod hll;
@@ -848,6 +849,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 3,
     },
     CommandSpec {
+        name: b"ENC",
+        min_arity: 2,
+    },
+    CommandSpec {
         name: b"SCRIPT",
         min_arity: 2,
     },
@@ -1613,6 +1618,9 @@ pub fn execute(
             if cmd_eq(cmd, b"EVALSHA") {
                 return scripting::cmd_evalsha(args, store, out, now);
             }
+            if cmd_eq(cmd, b"ENC") {
+                return encryption::cmd_enc(args, store, out, now);
+            }
             if cmd_eq(cmd, b"EXEC") {
                 resp::write_error(out, &format!("ERR unknown command '{}'", arg_str(cmd)));
                 return CmdResult::Written;
@@ -2028,6 +2036,9 @@ pub fn execute(
             if cmd_eq(cmd, b"TINSERT") {
                 return tables::cmd_tinsert(args, store, cache, out, now);
             }
+            if cmd_eq(cmd, b"TROWSET") {
+                return tables::cmd_trowset(args, store, cache, out, now);
+            }
             if cmd_eq(cmd, b"TUPSERT") {
                 return tables::cmd_tupsert(args, store, cache, out, now);
             }
@@ -2246,7 +2257,7 @@ pub fn execute_with_wal(
         // layer (for crash determinism + so HTTP table writes, which never reach
         // this function, are durable). Raw-logging them here too would apply the
         // row twice on replay, so skip them.
-        if !command_self_logs_wal(args[0]) {
+        if !command_self_logs_wal_args(args, store, now) {
             if let Err(e) = store.wal_log_command(args) {
                 resp::write_error(out, &format!("ERR WAL append failed: {e}"));
                 return CmdResult::Written;
@@ -2269,8 +2280,42 @@ fn command_self_logs_wal(cmd: &[u8]) -> bool {
     let c = &up[..cmd.len()];
     matches!(
         c,
-        b"TINSERT" | b"TUPSERT" | b"TUPDATE" | b"TDELETE" | b"TCREATE" | b"TDROP" | b"XADD"
+        b"TINSERT"
+            | b"TROWSET"
+            | b"TUPSERT"
+            | b"TUPDATE"
+            | b"TDELETE"
+            | b"TCREATE"
+            | b"TDROP"
+            | b"XADD"
     )
+}
+
+fn command_self_logs_wal_args(args: &[&[u8]], store: &Store, now: Instant) -> bool {
+    if args.is_empty() {
+        return false;
+    }
+    let cmd = args[0];
+    if command_self_logs_wal(cmd) {
+        return true;
+    }
+    if cmd_eq(cmd, b"SET") && args.len() >= 3 {
+        return args[3..].iter().any(|arg| cmd_eq(arg, b"ENCRYPTED"))
+            || store.kv_string_is_encrypted(args[1], now);
+    }
+    if (cmd_eq(cmd, b"HSET") || cmd_eq(cmd, b"HMSET")) && args.len() >= 4 {
+        let encrypted = args.last().is_some_and(|arg| cmd_eq(arg, b"ENCRYPTED"));
+        let end = if encrypted {
+            args.len() - 1
+        } else {
+            args.len()
+        };
+        if end > 2 && (end - 2).is_multiple_of(2) {
+            let fields: Vec<&[u8]> = args[2..end].chunks(2).map(|chunk| chunk[0]).collect();
+            return encrypted || store.hash_fields_need_encryption(args[1], &fields, now);
+        }
+    }
+    false
 }
 
 #[allow(dead_code)]
@@ -3566,6 +3611,8 @@ mod tests {
     use super::*;
     use crate::pubsub::Broker;
     use crate::store::Store;
+    use crate::{ServerConfig, StorageConfig, StorageMode};
+    use std::sync::Arc;
     use std::time::Instant;
 
     fn exec(store: &Store, args: &[&[u8]]) -> BytesMut {
@@ -3580,6 +3627,177 @@ mod tests {
 
     fn exec_str(store: &Store, args: &[&[u8]]) -> String {
         String::from_utf8_lossy(&exec(store, args)).to_string()
+    }
+
+    fn exec_wal(store: &Store, args: &[&[u8]]) -> BytesMut {
+        let broker = Broker::new();
+        let cache =
+            std::sync::Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let mut out = BytesMut::new();
+        execute_with_wal(store, &cache, &broker, args, &mut out, Instant::now());
+        out
+    }
+
+    fn read_wal_bytes(dir: &std::path::Path) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path().join("wal.lux");
+            if path.exists() {
+                bytes.extend(std::fs::read(path).unwrap());
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn enc_init_persists_sealed_state_and_rotate_lists_statuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+
+        let status = exec_str(&store, &[b"ENC", b"STATUS"]);
+        assert!(status.contains("initialized"), "{status}");
+        let out = exec_str(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        assert!(out.contains("k1"), "{out}");
+        assert!(dir.path().join("lux.enc").exists());
+        assert!(dir.path().join("lux.enc.seal").exists());
+        let sealed = std::fs::read(dir.path().join("lux.enc")).unwrap();
+        assert!(!sealed.windows(b"secret".len()).any(|w| w == b"secret"));
+
+        let restored = Store::new_with_config(config);
+        let list = exec_str(&restored, &[b"ENC", b"LIST"]);
+        assert!(list.contains("k1"), "{list}");
+        assert!(list.contains("active"), "{list}");
+        let out = exec_str(&restored, &[b"ENC", b"ROTATE", b"KEYID", b"k2"]);
+        assert!(out.contains("k2"), "{out}");
+        let list = exec_str(&restored, &[b"ENC", b"LIST"]);
+        assert!(list.contains("k1"), "{list}");
+        assert!(list.contains("decrypt-only"), "{list}");
+        assert!(list.contains("k2"), "{list}");
+        assert!(list.contains("active"), "{list}");
+    }
+
+    #[test]
+    fn encrypted_set_self_logs_ciphertext_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        let out = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[b"SET", b"api-token", b"wal-secret-value", b"ENCRYPTED"],
+        ))
+        .to_string();
+        assert!(out.contains("OK"), "{out}");
+        store.fsync_wal();
+        let wal = read_wal_bytes(dir.path());
+        assert!(!wal
+            .windows(b"wal-secret-value".len())
+            .any(|w| w == b"wal-secret-value"));
+        assert!(wal.windows(b"RAWSET".len()).any(|w| w == b"RAWSET"));
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"GET", b"api-token"]);
+        assert!(got.contains("wal-secret-value"), "{got}");
+    }
+
+    #[test]
+    fn encrypted_hset_self_logs_ciphertext_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        let out = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[
+                b"HSET",
+                b"profile:1",
+                b"token",
+                b"hash-secret-value",
+                b"ENCRYPTED",
+            ],
+        ))
+        .to_string();
+        assert!(out.contains(":1"), "{out}");
+        store.fsync_wal();
+        let wal = read_wal_bytes(dir.path());
+        assert!(!wal
+            .windows(b"hash-secret-value".len())
+            .any(|w| w == b"hash-secret-value"));
+        assert!(wal.windows(b"RAWHSET".len()).any(|w| w == b"RAWHSET"));
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"HGET", b"profile:1", b"token"]);
+        assert!(got.contains("hash-secret-value"), "{got}");
+        let scan = exec_str(&restored, &[b"HSCAN", b"profile:1", b"0"]);
+        assert!(scan.contains("hash-secret-value"), "{scan}");
+    }
+
+    #[test]
+    fn enc_rotate_rewrap_then_retire_preserves_existing_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(&store, &[b"SET", b"token", b"rotate-secret", b"ENCRYPTED"]);
+
+        let out = exec_str(&store, &[b"ENC", b"ROTATE", b"KEYID", b"k2"]);
+        assert!(out.contains("k2"), "{out}");
+        let got = exec_str(&store, &[b"GET", b"token"]);
+        assert!(got.contains("rotate-secret"), "{got}");
+        let retire = exec_str(&store, &[b"ENC", b"RETIRE", b"k1"]);
+        assert!(retire.contains("still required"), "{retire}");
+
+        let rewrap = exec_str(&store, &[b"ENC", b"REWRAP"]);
+        assert!(rewrap.contains(":1"), "{rewrap}");
+        let retire = exec_str(&store, &[b"ENC", b"RETIRE", b"k1"]);
+        assert!(retire.contains("OK"), "{retire}");
+        let got = exec_str(&store, &[b"GET", b"token"]);
+        assert!(got.contains("rotate-secret"), "{got}");
+    }
+
+    #[test]
+    fn encrypted_string_side_commands_use_plaintext_or_reject_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(&store, &[b"SET", b"secret", b"abcdef", b"ENCRYPTED"]);
+
+        let get = exec(&store, &[b"GET", b"secret"]);
+        assert_eq!(&get[..], b"$6\r\nabcdef\r\n");
+        let strlen = exec_str(&store, &[b"STRLEN", b"secret"]);
+        assert!(strlen.contains(":6"), "{strlen}");
+        let range = exec_str(&store, &[b"GETRANGE", b"secret", b"1", b"3"]);
+        assert!(range.contains("bcd"), "{range}");
+        let append = exec_str(&store, &[b"APPEND", b"secret", b"x"]);
+        assert!(append.contains("encrypted string"), "{append}");
+        let incr = exec_str(&store, &[b"INCR", b"secret"]);
+        assert!(incr.contains("encrypted string"), "{incr}");
     }
 
     #[test]

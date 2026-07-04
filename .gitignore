@@ -18,3 +18,8 @@ harness-rules.toml
 .env.*
 **/.env
 **/.env.*
+
+# Encryption keyring runtime artifacts (never commit)
+lux.enc
+*.enc.seal
+*.enc.tmp

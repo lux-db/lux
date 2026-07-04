@@ -4336,6 +4336,7 @@ pub(crate) fn put_grant(
             }
             None => grant.predicate.clone(),
         };
+        validate_grant_predicate_for_schema(store, cache, &grant.table, &predicate, now)?;
         let predicate = crate::grants::predicate_to_string(&predicate);
         let _ =
             tables::table_delete_where(store, cache, GRANTS_TABLE, &["id", "=", id.as_str()], now);
@@ -4354,6 +4355,109 @@ pub(crate) fn put_grant(
         )?;
     }
     Ok(())
+}
+
+fn validate_grant_predicate_for_schema(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    predicate: &crate::grants::Predicate,
+    now: Instant,
+) -> Result<(), String> {
+    let Ok(schema) = tables::load_schema(store, cache, table, now) else {
+        return Ok(());
+    };
+    validate_grant_predicate_columns(store, cache, table, &schema, predicate, now)
+}
+
+fn validate_grant_predicate_columns(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    schema: &[tables::FieldDef],
+    predicate: &crate::grants::Predicate,
+    now: Instant,
+) -> Result<(), String> {
+    for clause in predicate.clauses() {
+        for condition in clause {
+            validate_grant_condition_columns(store, cache, table, schema, condition, now)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_grant_condition_columns(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    schema: &[tables::FieldDef],
+    condition: &crate::grants::Condition,
+    now: Instant,
+) -> Result<(), String> {
+    match condition {
+        crate::grants::Condition::Cmp { column, op, .. } => {
+            validate_grant_column_filter(table, schema, column, op)
+        }
+        crate::grants::Condition::InSubquery {
+            column,
+            negated,
+            subquery,
+        } => {
+            validate_grant_column_filter(
+                table,
+                schema,
+                column,
+                if *negated { "NOT IN" } else { "IN" },
+            )?;
+            if let Ok(inner_schema) = tables::load_schema(store, cache, &subquery.table, now) {
+                validate_grant_predicate_columns(
+                    store,
+                    cache,
+                    &subquery.table,
+                    &inner_schema,
+                    &subquery.inner,
+                    now,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_grant_column_filter(
+    table: &str,
+    schema: &[tables::FieldDef],
+    column: &str,
+    op: &str,
+) -> Result<(), String> {
+    if let Some((root, rest)) = column.split_once('.') {
+        if !rest.is_empty() && schema.iter().any(|f| f.name == root && f.encrypted) {
+            return Err(format!(
+                "ERR encrypted column '{}' in grant on '{}' does not support JSON path filters",
+                root, table
+            ));
+        }
+    }
+    let bare = column.split('.').next().unwrap_or(column);
+    let Some(field) = schema.iter().find(|f| f.name == bare) else {
+        return Ok(());
+    };
+    if !field.encrypted {
+        return Ok(());
+    }
+    if op == "=" && field.searchable {
+        return Ok(());
+    }
+    if op == "=" {
+        return Err(format!(
+            "ERR encrypted column '{}' in grant on '{}' must be SEARCHABLE for equality filters",
+            field.name, table
+        ));
+    }
+    Err(format!(
+        "ERR encrypted column '{}' in grant on '{}' only supports equality filters when SEARCHABLE",
+        field.name, table
+    ))
 }
 
 /// Remove a grant for (table, scope). Returns true if one existed.
@@ -5586,6 +5690,141 @@ mod tests {
         let p = principal("u1");
         let filter = read_filter(&store, &cache, &p, "audit", now).unwrap();
         assert_eq!(filter, "owner = u@x.dev");
+    }
+
+    fn encrypted_test_store() -> Store {
+        Store::new_with_config(Arc::new(crate::ServerConfig {
+            encryption: crate::EncryptionConfig {
+                active_key_id: Some("k1".to_string()),
+                keys: vec![crate::EncryptionKeyConfig {
+                    id: "k1".to_string(),
+                    secret: b"grant-encryption-secret".to_vec(),
+                    decrypt_only: false,
+                }],
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        }))
+    }
+
+    fn selected_rows(result: crate::tables::SelectResult) -> Vec<Vec<(String, String)>> {
+        match result {
+            crate::tables::SelectResult::Rows(rows) => rows,
+            crate::tables::SelectResult::Aggregate(_) => panic!("expected row result"),
+        }
+    }
+
+    #[test]
+    fn read_grant_on_encrypted_searchable_column_filters_through_blind_index() {
+        let store = encrypted_test_store();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "messages",
+            &[
+                "id",
+                "STR",
+                "PRIMARY",
+                "KEY,",
+                "owner_email",
+                "STR",
+                "ENCRYPTED",
+                "SEARCHABLE,",
+                "body",
+                "STR",
+            ],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "messages",
+            &[
+                ("id", "m1"),
+                ("owner_email", "u@x.dev"),
+                ("body", "allowed"),
+            ],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "messages",
+            &[
+                ("id", "m2"),
+                ("owner_email", "other@x.dev"),
+                ("body", "blocked"),
+            ],
+            now,
+        )
+        .unwrap();
+        grant(
+            &store,
+            &cache,
+            &[
+                "read",
+                "ON",
+                "messages",
+                "WHERE",
+                "owner_email",
+                "=",
+                "auth.email",
+            ],
+            now,
+        );
+
+        let p = principal("u1");
+        let filter = read_filter(&store, &cache, &p, "messages", now).unwrap();
+        assert_eq!(filter, "owner_email = u@x.dev");
+        let mut tokens = vec!["*", "FROM", "messages", "WHERE"];
+        tokens.extend(filter.split_whitespace());
+        let plan = crate::tables::parse_select(&tokens).unwrap();
+        let rows = selected_rows(crate::tables::table_select(&store, &cache, &plan, now).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].iter().any(|(k, v)| k == "body" && v == "allowed"));
+        assert!(rows[0]
+            .iter()
+            .any(|(k, v)| k == "owner_email" && v == "u@x.dev"));
+    }
+
+    #[test]
+    fn grant_on_encrypted_non_searchable_column_is_rejected() {
+        let store = encrypted_test_store();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "messages",
+            &[
+                "id",
+                "UUID",
+                "PRIMARY",
+                "KEY,",
+                "secret",
+                "STR",
+                "ENCRYPTED",
+            ],
+            now,
+        )
+        .unwrap();
+        let grant = crate::grants::parse_grant(&[
+            "read",
+            "ON",
+            "messages",
+            "WHERE",
+            "secret",
+            "=",
+            "auth.email",
+        ])
+        .unwrap();
+
+        let err = put_grant(&store, &cache, &grant, now).unwrap_err();
+        assert!(err.contains("must be SEARCHABLE"), "{err}");
     }
 
     #[test]

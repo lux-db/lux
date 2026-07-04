@@ -20,7 +20,13 @@ fn parse_usize_arg(arg: &[u8], out: &mut BytesMut) -> Option<usize> {
 
 pub fn cmd_hset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     let is_hmset = cmd_eq(args[0], b"HMSET");
-    if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
+    let encrypted = args.last().is_some_and(|arg| cmd_eq(arg, b"ENCRYPTED"));
+    let end = if encrypted {
+        args.len() - 1
+    } else {
+        args.len()
+    };
+    if end < 4 || !(end - 2).is_multiple_of(2) {
         let cmd_name = if is_hmset { "hmset" } else { "hset" };
         resp::write_error(
             out,
@@ -28,15 +34,35 @@ pub fn cmd_hset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         );
         return CmdResult::Written;
     }
-    let result = if args.len() == 4 {
-        let pair = [(args[2], args[3])];
-        store.hset(args[1], &pair, now)
+    let pairs: Vec<(&[u8], &[u8])> = args[2..end].chunks(2).map(|c| (c[0], c[1])).collect();
+    let fields: Vec<&[u8]> = pairs.iter().map(|(field, _)| *field).collect();
+    let should_self_log = encrypted || store.hash_fields_need_encryption(args[1], &fields, now);
+    let result = if should_self_log {
+        store
+            .hset_kv(args[1], &pairs, encrypted, now)
+            .map(|(added, stored_pairs)| (added, Some(stored_pairs)))
     } else {
-        let pairs: Vec<(&[u8], &[u8])> = args[2..].chunks(2).map(|c| (c[0], c[1])).collect();
-        store.hset(args[1], &pairs, now)
+        store.hset(args[1], &pairs, now).map(|added| (added, None))
     };
     match result {
-        Ok(n) => {
+        Ok((n, stored_pairs)) => {
+            if should_self_log && store.wal_enabled() {
+                if let Some(stored_pairs) = stored_pairs {
+                    let mut owned: Vec<Vec<u8>> = Vec::with_capacity(3 + stored_pairs.len() * 2);
+                    owned.push(b"ENC".to_vec());
+                    owned.push(b"RAWHSET".to_vec());
+                    owned.push(args[1].to_vec());
+                    for (field, value) in stored_pairs {
+                        owned.push(field);
+                        owned.push(value);
+                    }
+                    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+                    if let Err(e) = store.wal_log_command(&refs) {
+                        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                        return CmdResult::Written;
+                    }
+                }
+            }
             if is_hmset {
                 resp::write_ok(out);
             } else {
@@ -382,7 +408,13 @@ pub fn cmd_hscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
                         resp::write_array_header(out, filtered.len() * 2);
                         for (k, v) in &filtered {
                             resp::write_bulk(out, k);
-                            resp::write_bulk_raw(out, v);
+                            match store.decrypt_hash_field_value(ks, k.as_bytes(), (*v).clone()) {
+                                Ok(value) => resp::write_bulk_raw(out, &value),
+                                Err(err) => {
+                                    resp::write_error(out, &err);
+                                    return CmdResult::Written;
+                                }
+                            }
                         }
                     }
                 } else {

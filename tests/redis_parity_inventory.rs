@@ -265,6 +265,7 @@ const INVENTORY: &[CommandInventory] = &[
     missing("ZUNION", "compatibility gap"),
     supported("ZUNIONSTORE"),
     lux_native("DELIFEQ"),
+    lux_native("ENC"),
     lux_native("GRANT"),
     lux_native("KSUB"),
     lux_native("KUNSUB"),

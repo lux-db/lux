@@ -163,6 +163,39 @@ pub fn cmd_tinsert(
     CmdResult::Written
 }
 
+pub fn cmd_trowset(
+    args: &[&[u8]],
+    store: &Store,
+    cache: &SharedSchemaCache,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    if !store
+        .wal_suppress
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        resp::write_error(out, "ERR TROWSET is internal to WAL replay");
+        return CmdResult::Written;
+    }
+    if args.len() < 3 || !(args.len() - 3).is_multiple_of(2) {
+        resp::write_error(out, "ERR usage: TROWSET <table> <pk> <field> <raw> ...");
+        return CmdResult::Written;
+    }
+    let table = arg_str(args[1]);
+    let pk = arg_str(args[2]);
+    let mut raw_pairs = Vec::new();
+    let mut i = 3;
+    while i + 1 < args.len() {
+        raw_pairs.push((args[i], args[i + 1]));
+        i += 2;
+    }
+    match tables::table_apply_wal_row(store, cache, table, pk, &raw_pairs, now) {
+        Ok(()) => resp::write_ok(out),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
 pub fn cmd_tupsert(
     args: &[&[u8]],
     store: &Store,

@@ -10,6 +10,7 @@ mod cmd;
 mod command;
 mod disk;
 mod embedded;
+mod encryption;
 mod eviction;
 #[cfg(feature = "fuzzing")]
 pub mod fuzz_api;
@@ -48,6 +49,7 @@ pub use embedded::{
     EmbeddedPipeline, GeoMember, GeoPosition, GeoUnit, PreparedPipeline, RedisKeyType,
     ScoredMember, SetOptions,
 };
+pub use encryption::{EncryptionConfig, EncryptionKeyConfig};
 pub use eviction::{parse_eviction_policy, parse_memory_size, EvictionConfig, EvictionPolicy};
 
 const SUB_MODE_BATCH_MAX: usize = 64;
@@ -231,6 +233,8 @@ pub struct ServerConfig {
     pub eviction: EvictionConfig,
     /// Per-project application auth configuration.
     pub auth: AuthConfig,
+    /// Table column encryption key configuration.
+    pub encryption: EncryptionConfig,
     /// Enables the RESP listener. Use this instead of overloading `port = 0`.
     pub enable_resp: bool,
     /// Optional informational event sink. Library mode is silent when unset.
@@ -260,6 +264,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("storage", &self.storage)
             .field("eviction", &self.eviction)
             .field("auth", &self.auth)
+            .field("encryption", &self.encryption)
             .field("enable_resp", &self.enable_resp)
             .field("on_info", &self.on_info.as_ref().map(|_| "<callback>"))
             .field("on_warn", &self.on_warn.as_ref().map(|_| "<callback>"))
@@ -287,6 +292,7 @@ impl Default for ServerConfig {
             storage: StorageConfig::default(),
             eviction: EvictionConfig::default(),
             auth: AuthConfig::default(),
+            encryption: EncryptionConfig::default(),
             enable_resp: true,
             on_info: None,
             on_warn: None,
@@ -465,6 +471,21 @@ fn validate_shard_count(config: &ServerConfig) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_encryption_config(config: &ServerConfig) -> std::io::Result<()> {
+    // Fail fast on a bad encryption config: unresolvable key material, a
+    // decrypt-only active key, or persisted state that no configured seal can
+    // unseal. Validate against the real data dir (not the process cwd, which
+    // would strand seal/state files there) with auto-init off, since creating a
+    // brand-new keyring is the store's job, not validation's.
+    let validation = EncryptionConfig {
+        auto_init: false,
+        ..config.encryption.clone()
+    };
+    crate::encryption::EncryptionKeyring::open(&validation, &config.data_dir)
+        .map(|_| ())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
 pub struct ServerHandle {
@@ -2866,6 +2887,7 @@ pub async fn run_with_config(config: ServerConfig) -> std::io::Result<ServerHand
     validate_listener_security(&config)?;
     validate_auth_config(&config)?;
     validate_shard_count(&config)?;
+    validate_encryption_config(&config)?;
     let listener = if config.enable_resp {
         let addr = config.listen_addr();
         Some(TcpListener::bind(&addr).await?)

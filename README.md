@@ -77,7 +77,7 @@ Lux Cloud is the fastest path when you want to build an app backend around Lux w
 ## Features
 
 - **200+ commands** -- strings, lists, hashes, sets, sorted sets, streams, vectors, geo, time series, tables, HyperLogLog, bitops, pub/sub, transactions
-- **Relational tables** -- TCREATE, TINSERT, TSELECT, TUPDATE (WHERE), TDELETE (WHERE), TALTER with typed fields (str, int, float, bool, timestamp, uuid, vector, json, array), unique constraints, foreign keys, joins, GROUP BY/HAVING, WHERE/ORDER BY/LIMIT, `IN`/`NOT IN`, JSON dot-path queries with `IS VALID`, array `CONTAINS`, declared JSON-path indexes, and vector-aware NEAR queries. Structured data without standing up a separate primary database
+- **Relational tables** -- TCREATE, TINSERT, TSELECT, TUPDATE (WHERE), TDELETE (WHERE), TALTER with typed fields (str, int, float, bool, timestamp, uuid, vector, json, array), unique constraints, foreign keys, encrypted columns, joins, GROUP BY/HAVING, WHERE/ORDER BY/LIMIT, `IN`/`NOT IN`, JSON dot-path queries with `IS VALID`, array `CONTAINS`, declared JSON-path indexes, and vector-aware NEAR queries. Structured data without standing up a separate primary database
 - **Realtime key subscriptions** -- KSUB/KUNSUB: subscribe to key patterns, receive events when matching keys are mutated. Zero overhead when unused. No global config flags, no separate services. Unlike Redis keyspace notifications which tax every write globally, KSUB is surgical and async
 - **Native time series** -- TSADD, TSGET, TSRANGE, TSMRANGE with aggregation (avg, sum, min, max, count, std), retention policies, and label-based filtering. No modules, no sidecars. TSGET 4x faster than Redis GET
 - **Native vector search** -- VSET, VGET, VSEARCH with cosine similarity and metadata filtering, plus `VECTOR(n)` table columns that compose with table filters and live queries. No extensions, no sidecars
@@ -295,6 +295,12 @@ redis-cli TSELECT '*' FROM events WHERE metadata.count IS VALID       # existenc
 redis-cli TSELECT '*' FROM events WHERE tags CONTAINS a               # array membership; tags.0 indexes an element
 redis-cli TINDEX events metadata.plan.tier STR                        # declare a JSON-path index
 
+# Encrypted columns keep values encrypted in WAL/snapshots/tiered storage.
+# Add SEARCHABLE when you need exact equality filters or UNIQUE. ENCRYPTED
+# columns do not support DEFAULT because defaults are stored in schema metadata.
+redis-cli TCREATE secrets id UUID PRIMARY KEY, token STR ENCRYPTED, email STR UNIQUE ENCRYPTED SEARCHABLE
+redis-cli TSELECT '*' FROM secrets WHERE email = alice@example.com
+
 # Alter tables
 redis-cli TALTER users ADD role STR
 redis-cli TALTER users DROP role
@@ -302,7 +308,7 @@ redis-cli TALTER users DROP role
 
 Field types: `STR`, `INT`, `FLOAT`, `BOOL`, `TIMESTAMP`, `UUID`, `VECTOR(n)`, `JSON`, `ARRAY`.
 WHERE operators: `= != < > <= >=`, `IN`/`NOT IN`, JSON `IS VALID`/`IS NOT VALID`, and `CONTAINS`.
-Use SQL-style constraints like `UNIQUE`, `PRIMARY KEY`, and `REFERENCES table(field)`.
+Use SQL-style constraints like `UNIQUE`, `PRIMARY KEY`, and `REFERENCES table(field)`. Self-hosted encrypted columns use native `ENC` state (`ENC INIT`, `ENC ROTATE`, `ENC LIST`); Lux Cloud auto-initializes hosted projects.
 
 ### CLI
 
