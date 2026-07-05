@@ -40,8 +40,12 @@ pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     let mut i = 3 + dims;
     let mut metadata = None;
     let mut ttl = None;
+    let mut encrypted = false;
     while i < args.len() {
-        if cmd_eq(args[i], b"META") {
+        if cmd_eq(args[i], b"ENCRYPTED") {
+            encrypted = true;
+            i += 1;
+        } else if cmd_eq(args[i], b"META") {
             if i + 1 >= args.len() {
                 resp::write_error(out, "ERR syntax error");
                 return CmdResult::Written;
@@ -79,7 +83,39 @@ pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
             return CmdResult::Written;
         }
     }
-    store.vset(key, data, metadata, ttl, now);
+    // Encrypted vectors keep plaintext in RAM but self-log the sealed payload as
+    // ENC RAWVSET so the WAL carries no plaintext f32 (mirrors SET ... ENCRYPTED).
+    let sealed = if encrypted {
+        match store.encrypt_vector(key, &data) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                resp::write_error(out, &e);
+                return CmdResult::Written;
+            }
+        }
+    } else {
+        None
+    };
+    store.vset(key, data, metadata.clone(), ttl, encrypted, now);
+    if let Some(ct) = sealed {
+        if store.wal_enabled() {
+            let mut owned: Vec<Vec<u8>> =
+                vec![b"ENC".to_vec(), b"RAWVSET".to_vec(), key.to_vec(), ct];
+            if let Some(m) = &metadata {
+                owned.push(b"META".to_vec());
+                owned.push(m.as_bytes().to_vec());
+            }
+            if let Some(d) = ttl {
+                owned.push(b"EX".to_vec());
+                owned.push(d.as_secs().to_string().into_bytes());
+            }
+            let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+            if let Err(e) = store.wal_log_command(&refs) {
+                resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                return CmdResult::Written;
+            }
+        }
+    }
     resp::write_ok(out);
     CmdResult::Written
 }
