@@ -465,6 +465,92 @@ fn http_auth_anonymous_signin_issues_session() {
 }
 
 #[test]
+fn http_encrypted_columns_hidden_from_anonymous_users() {
+    // Grant-gated decryption end to end: an ENCRYPTED column decrypts for the
+    // operator and real authenticated users, but is omitted for anonymous
+    // (signInAnonymously) callers — even though both carry role "authenticated".
+    let server = LuxServer::builder()
+        .http()
+        .password("rootsecret")
+        .env("LUX_AUTH_ENABLED", "true")
+        .env("LUX_ENC_AUTO_INIT", "1")
+        .start();
+    let http = server.http_port();
+
+    // Operator (RESP): encrypted column + a plaintext column, one row, and an
+    // unconditional read grant so authenticated users can read the table.
+    let mut op = server.conn();
+    let mut run = |args: &[&str]| {
+        op.write_all(&resp_cmd(args)).unwrap();
+        read_all(&mut op)
+    };
+    assert!(run(&["AUTH", "rootsecret"]).contains("+OK"));
+    let created = run(&[
+        "TCREATE",
+        "secrets",
+        "id",
+        "UUID",
+        "PRIMARY",
+        "KEY",
+        ",",
+        "ssn",
+        "STR",
+        "ENCRYPTED",
+        ",",
+        "name",
+        "STR",
+    ]);
+    assert!(created.contains("+OK"), "TCREATE: {created}");
+    run(&["TINSERT", "secrets", "ssn", "123-45-6789", "name", "Alice"]);
+    let granted = run(&["GRANT", "read", "ON", "secrets"]);
+    assert!(!granted.contains("-ERR"), "GRANT: {granted}");
+
+    // Anonymous + real-user tokens.
+    let (s, b) = http_request(http, "POST", "/auth/v1/signin/anonymous", Some("{}"), None);
+    assert_eq!(s, 200, "anon signin: {b}");
+    let anon_tok = serde_json::from_str::<serde_json::Value>(&b).unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (s, b) = http_request(
+        http,
+        "POST",
+        "/auth/v1/signup",
+        Some(r#"{"email":"real@example.com","password":"password123"}"#),
+        None,
+    );
+    assert_eq!(s, 200, "signup: {b}");
+    let real_tok = serde_json::from_str::<serde_json::Value>(&b).unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Operator and real user both see the decrypted ssn.
+    let (_, op_body) = http_request(http, "GET", "/v1/tables/secrets", None, Some("rootsecret"));
+    assert!(
+        op_body.contains("123-45-6789"),
+        "operator must see ssn: {op_body}"
+    );
+    let (_, real_body) = http_request(http, "GET", "/v1/tables/secrets", None, Some(&real_tok));
+    assert!(
+        real_body.contains("123-45-6789"),
+        "real user must see ssn: {real_body}"
+    );
+
+    // Anonymous user: the row is visible (plaintext name) but the encrypted ssn
+    // is withheld.
+    let (_, anon_body) = http_request(http, "GET", "/v1/tables/secrets", None, Some(&anon_tok));
+    assert!(
+        anon_body.contains("Alice"),
+        "anon should see the row: {anon_body}"
+    );
+    assert!(
+        !anon_body.contains("123-45-6789"),
+        "anon must NOT see encrypted ssn: {anon_body}"
+    );
+}
+
+#[test]
 fn http_auth_anonymous_signin_can_be_disabled() {
     let server = LuxServer::builder()
         .http()
