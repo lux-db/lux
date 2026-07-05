@@ -947,6 +947,8 @@ export class LuxProjectInsertBuilder<TResult> extends LuxProjectThenable<TResult
 }
 
 export class LuxProjectMutationBuilder<TResult> extends LuxProjectFilterBuilder<TResult, LuxProjectMutationBuilder<TResult>> {
+	private expectSingle = false;
+
 	constructor(
 		client: LuxProjectClient<any>,
 		tableName: string,
@@ -954,6 +956,11 @@ export class LuxProjectMutationBuilder<TResult> extends LuxProjectFilterBuilder<
 		private body?: Record<string, QueryValue>,
 	) {
 		super(client, tableName);
+	}
+
+	single(): LuxProjectMutationBuilder<ProjectSelectSingle<TResult>> {
+		this.expectSingle = true;
+		return this as unknown as LuxProjectMutationBuilder<ProjectSelectSingle<TResult>>;
 	}
 
 	async execute(): Promise<LuxResult<TResult>> {
@@ -973,7 +980,14 @@ export class LuxProjectMutationBuilder<TResult> extends LuxProjectFilterBuilder<
 			this.body,
 		);
 		if (res.error) return res as LuxResult<TResult>;
-		return ok(unwrapResult<TResult>(res.data) as TResult);
+		const data = unwrapResult<unknown>(res.data);
+		if (!this.expectSingle) return ok(data as TResult);
+
+		const rows = Array.isArray(data) ? data : [];
+		if (rows.length === 0) {
+			return err('NOT_FOUND', `No rows affected in table '${this.tableName}'`);
+		}
+		return ok(rows[0] as TResult);
 	}
 }
 

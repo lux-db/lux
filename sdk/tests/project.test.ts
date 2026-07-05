@@ -323,6 +323,69 @@ describe('Lux project client', () => {
 		expect(updated).toEqual({ data: [{ id: '019ed-uuid', body: 'edited' }], error: null });
 	});
 
+	test('mutation single returns one affected row', async () => {
+		const calls: Array<{ method?: string; url: string }> = [];
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({ method: init?.method, url: String(input) });
+			return new Response(JSON.stringify({ result: [{ id: '019ed-uuid', body: 'edited' }] }), {
+				status: 200,
+			});
+		};
+
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const updated = await client
+			.table<{ id: string; body: string }>('messages')
+			.update({ body: 'edited' })
+			.eq('id', '019ed-uuid')
+			.single();
+		const deleted = await client
+			.table<{ id: string; body: string }>('messages')
+			.delete()
+			.eq('id', '019ed-uuid')
+			.single();
+
+		expect(updated).toEqual({ data: { id: '019ed-uuid', body: 'edited' }, error: null });
+		expect(deleted).toEqual({ data: { id: '019ed-uuid', body: 'edited' }, error: null });
+		expect(calls).toEqual([
+			{
+				method: 'PATCH',
+				url: 'http://localhost:3957/v1/project/tables/messages?where=id+%3D+019ed-uuid',
+			},
+			{
+				method: 'DELETE',
+				url: 'http://localhost:3957/v1/project/tables/messages?where=id+%3D+019ed-uuid',
+			},
+		]);
+	});
+
+	test('mutation single errors when no rows are affected', async () => {
+		const fetchImpl = async () => {
+			return new Response(JSON.stringify({ result: [] }), { status: 200 });
+		};
+
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const updated = await client.table('messages').update({ body: 'edited' }).eq('id', 'missing').single();
+
+		expect(updated).toEqual({
+			data: null,
+			error: {
+				code: 'NOT_FOUND',
+				message: "No rows affected in table 'messages'",
+				details: undefined,
+			},
+		});
+	});
+
 	test('multi-row insert sends one request with an array body', async () => {
 		const calls: Array<{ method?: string; body?: unknown }> = [];
 		const fetchImpl = async (_input: RequestInfo | URL, init?: RequestInit) => {
