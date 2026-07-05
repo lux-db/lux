@@ -152,6 +152,11 @@ enum Commands {
         #[command(subcommand)]
         action: SeedAction,
     },
+    /// Manage the local engine's encryption keyring (ENC status/list/rotate/...).
+    Enc {
+        #[command(subcommand)]
+        action: EncAction,
+    },
     /// Generate TypeScript types from your project schema.
     Types {
         #[arg(help = "Project name or ID (omit for the local engine)")]
@@ -263,6 +268,87 @@ enum SeedAction {
         #[arg(short = 'a', long, help = "Password for direct connection")]
         password: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum EncAction {
+    /// Show encryption status (initialized, active key, key count).
+    Status,
+    /// List encryption keys and their state.
+    List,
+    /// Initialize the keyring (no-op if `lux start` already auto-initialized it).
+    Init {
+        #[arg(long, help = "Explicit key id (default: generated)")]
+        key_id: Option<String>,
+    },
+    /// Add a new active key; existing keys become decrypt-only.
+    Rotate {
+        #[arg(long, help = "Explicit key id (default: generated)")]
+        key_id: Option<String>,
+    },
+    /// Re-encrypt all values under the current keyring.
+    Rewrap,
+    /// Remove a retired (decrypt-only) key once no data needs it.
+    Retire {
+        #[arg(help = "Key id to retire")]
+        key_id: String,
+    },
+}
+
+/// Map an `EncAction` to the engine command argv it proxies.
+fn enc_command_args(action: &EncAction) -> Vec<String> {
+    let mut args = vec!["ENC".to_string()];
+    match action {
+        EncAction::Status => args.push("STATUS".into()),
+        EncAction::List => args.push("LIST".into()),
+        EncAction::Init { key_id } => {
+            args.push("INIT".into());
+            if let Some(id) = key_id {
+                args.push("KEYID".into());
+                args.push(id.clone());
+            }
+        }
+        EncAction::Rotate { key_id } => {
+            args.push("ROTATE".into());
+            if let Some(id) = key_id {
+                args.push("KEYID".into());
+                args.push(id.clone());
+            }
+        }
+        EncAction::Rewrap => args.push("REWRAP".into()),
+        EncAction::Retire { key_id } => {
+            args.push("RETIRE".into());
+            args.push(key_id.clone());
+        }
+    }
+    args
+}
+
+/// `KEY=VALUE` engine env for the local `lux start` container: auth keys, ports,
+/// tiered storage, and `LUX_ENC_AUTO_INIT=1` so encrypted columns work without a
+/// manual `ENC INIT`.
+fn local_engine_env(state: &LocalState) -> Vec<String> {
+    vec![
+        "LUX_AUTH_ENABLED=1".to_string(),
+        format!("LUX_PASSWORD={}", state.password),
+        format!("LUX_AUTH_PUBLISHABLE_KEY={}", state.publishable_key),
+        format!("LUX_AUTH_SECRET_KEY={}", state.secret_key),
+        "LUX_PORT=6379".to_string(),
+        "LUX_HTTP_PORT=8080".to_string(),
+        "LUX_BIND_HOST=0.0.0.0".to_string(),
+        "LUX_DATA_DIR=/data".to_string(),
+        // Tiered (WAL) storage so local-dev data survives a crash/restart;
+        // memory mode only persists on periodic snapshots.
+        "LUX_STORAGE_MODE=tiered".to_string(),
+        "LUX_STORAGE_DIR=/data/storage".to_string(),
+        format!(
+            "LUX_AUTH_ISSUER=http://localhost:{}/auth/v1",
+            state.http_port
+        ),
+        // Engine self-mints its keyring + seal into /data on first boot; the CLI
+        // never handles encryption key material (unlike the auth keys above).
+        "LUX_ENC_AUTO_INIT=1".to_string(),
+    ]
 }
 
 #[derive(Serialize, Deserialize)]
@@ -604,6 +690,7 @@ fn print_connection_block(state: &LocalState) {
     );
     println!("  {}  {}", "LUX_SECRET_KEY   ".dimmed(), state.secret_key);
     println!("  {}  {}", "Data volume      ".dimmed(), state.volume);
+    println!("  {}  {}", "Encryption       ".dimmed(), "enabled".green());
     println!();
     println!(
         "  Written to {}. Point the SDK at {}.",
@@ -1230,15 +1317,9 @@ pub async fn run() {
             let resp_map = format!("{}:6379", state.resp_port);
             let http_map = format!("{}:8080", state.http_port);
             let vol_map = format!("{}:/data", state.volume);
-            let issuer = format!(
-                "LUX_AUTH_ISSUER=http://localhost:{}/auth/v1",
-                state.http_port
-            );
-            let e_pass = format!("LUX_PASSWORD={}", state.password);
-            let e_pub = format!("LUX_AUTH_PUBLISHABLE_KEY={}", state.publishable_key);
-            let e_sec = format!("LUX_AUTH_SECRET_KEY={}", state.secret_key);
+            let engine_env = local_engine_env(&state);
 
-            let run_args: Vec<&str> = vec![
+            let mut run_args: Vec<&str> = vec![
                 "run",
                 "-d",
                 "--name",
@@ -1249,34 +1330,17 @@ pub async fn run() {
                 &http_map,
                 "-v",
                 &vol_map,
-                "-e",
-                "LUX_AUTH_ENABLED=1",
-                "-e",
-                &e_pass,
-                "-e",
-                &e_pub,
-                "-e",
-                &e_sec,
-                "-e",
-                "LUX_PORT=6379",
-                "-e",
-                "LUX_HTTP_PORT=8080",
-                "-e",
-                "LUX_BIND_HOST=0.0.0.0",
-                "-e",
-                "LUX_DATA_DIR=/data",
-                // Tiered (WAL) storage so local-dev data survives a crash/restart;
-                // memory mode only persists on periodic snapshots.
-                "-e",
-                "LUX_STORAGE_MODE=tiered",
-                "-e",
-                "LUX_STORAGE_DIR=/data/storage",
-                "-e",
-                &issuer,
-                "--restart",
-                "unless-stopped",
-                &state.image,
             ];
+            // Engine env: auth keys, ports, tiered (WAL) storage so local data
+            // survives a restart, and LUX_ENC_AUTO_INIT=1 so encrypted columns
+            // work out of the box. See local_engine_env.
+            for entry in &engine_env {
+                run_args.push("-e");
+                run_args.push(entry);
+            }
+            run_args.push("--restart");
+            run_args.push("unless-stopped");
+            run_args.push(&state.image);
             if let Err(e) = docker_output(&run_args) {
                 eprintln!("{} Failed to start container: {e}", "Error:".red());
                 std::process::exit(1);
@@ -1519,6 +1583,7 @@ pub async fn run() {
                 println!("{} {}", "LUX_URL:".bold(), state.lux_url());
                 println!("{} {}", "Direct:".bold(), state.direct_url());
                 println!("{} {}", "Data volume:".bold(), state.volume);
+                println!("{} {}", "Encryption:".bold(), "enabled".green());
                 if !running {
                     println!("\nRun {} to boot it.", "lux start".cyan());
                 }
@@ -1593,6 +1658,33 @@ pub async fn run() {
                 password.as_deref(),
                 &api_url_override,
                 &cmd,
+            )
+            .await
+            {
+                Ok(output) => println!("{output}"),
+                Err(error) => {
+                    eprintln!("{} {error}", "Error:".red());
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::Enc { action } => {
+            // Proxies the engine's ENC subcommands against the local `lux start`
+            // engine. (Remote/cloud targeting can be added later via a connection
+            // arg, like `lux exec`.)
+            let Some(state) = load_local_state() else {
+                eprintln!("{}", "No local engine found. Run `lux start` first.".red());
+                std::process::exit(1);
+            };
+            let command = enc_command_args(&action);
+            match exec_cli_command_args(
+                "",
+                Some("127.0.0.1"),
+                Some(state.resp_port),
+                Some(&state.password),
+                &api_url_override,
+                &command,
             )
             .await
             {
@@ -4112,6 +4204,43 @@ mod tests {
         );
         assert_eq!(env[2], "LUX_PUBLISHABLE_KEY=lux_pub_local_cafef00d");
         assert_eq!(env[3], "LUX_SECRET_KEY=lux_sec_local_deadbeef");
+    }
+
+    #[test]
+    fn local_engine_env_enables_encryption_auto_init() {
+        let env = local_engine_env(&sample_state());
+        assert!(
+            env.iter().any(|e| e == "LUX_ENC_AUTO_INIT=1"),
+            "engine env must enable encryption auto-init: {env:?}"
+        );
+        // Auth keys still flow through as before.
+        assert!(env
+            .iter()
+            .any(|e| e == "LUX_PASSWORD=lux_sec_local_deadbeef"));
+        assert!(env.iter().any(|e| e == "LUX_STORAGE_MODE=tiered"));
+    }
+
+    #[test]
+    fn enc_command_args_maps_subcommands() {
+        assert_eq!(enc_command_args(&EncAction::Status), vec!["ENC", "STATUS"]);
+        assert_eq!(enc_command_args(&EncAction::List), vec!["ENC", "LIST"]);
+        assert_eq!(enc_command_args(&EncAction::Rewrap), vec!["ENC", "REWRAP"]);
+        assert_eq!(
+            enc_command_args(&EncAction::Init { key_id: None }),
+            vec!["ENC", "INIT"]
+        );
+        assert_eq!(
+            enc_command_args(&EncAction::Rotate {
+                key_id: Some("k2".to_string())
+            }),
+            vec!["ENC", "ROTATE", "KEYID", "k2"]
+        );
+        assert_eq!(
+            enc_command_args(&EncAction::Retire {
+                key_id: "k1".to_string()
+            }),
+            vec!["ENC", "RETIRE", "k1"]
+        );
     }
 
     #[test]
