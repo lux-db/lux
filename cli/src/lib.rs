@@ -152,8 +152,13 @@ enum Commands {
         #[command(subcommand)]
         action: SeedAction,
     },
-    /// Manage the local engine's encryption keyring (ENC status/list/rotate/...).
+    /// Manage the encryption keyring (ENC status/list/rotate/...).
     Enc {
+        #[arg(
+            long,
+            help = "Project name, ID, or connection URL (omit for the local engine)"
+        )]
+        project: Option<String>,
         #[command(subcommand)]
         action: EncAction,
     },
@@ -1669,25 +1674,32 @@ pub async fn run() {
             }
         }
 
-        Commands::Enc { action } => {
-            // Proxies the engine's ENC subcommands against the local `lux start`
-            // engine. (Remote/cloud targeting can be added later via a connection
-            // arg, like `lux exec`.)
-            let Some(state) = load_local_state() else {
-                eprintln!("{}", "No local engine found. Run `lux start` first.".red());
-                std::process::exit(1);
-            };
+        Commands::Enc { project, action } => {
+            // Proxies the engine's ENC subcommands. With --project (name/ID/URL)
+            // it targets that instance via the CLI's cloud auth (or a direct URL);
+            // otherwise it uses the local `lux start` engine's stored credentials.
             let command = enc_command_args(&action);
-            match exec_cli_command_args(
-                "",
-                Some("127.0.0.1"),
-                Some(state.resp_port),
-                Some(&state.password),
-                &api_url_override,
-                &command,
-            )
-            .await
-            {
+            let result = if let Some(project) = project {
+                exec_cli_command_args(&project, None, None, None, &api_url_override, &command).await
+            } else {
+                let Some(state) = load_local_state() else {
+                    eprintln!(
+                        "{}",
+                        "No local engine found. Run `lux start` first, or pass --project.".red()
+                    );
+                    std::process::exit(1);
+                };
+                exec_cli_command_args(
+                    "",
+                    Some("127.0.0.1"),
+                    Some(state.resp_port),
+                    Some(&state.password),
+                    &api_url_override,
+                    &command,
+                )
+                .await
+            };
+            match result {
                 Ok(output) => println!("{output}"),
                 Err(error) => {
                     eprintln!("{} {error}", "Error:".red());
