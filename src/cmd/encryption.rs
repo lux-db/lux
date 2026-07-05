@@ -88,6 +88,12 @@ pub fn cmd_enc(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
     if cmd_eq(args[1], b"RAWHSET") {
         return cmd_rawhset(args, store, out, now);
     }
+    if cmd_eq(args[1], b"RAWLPUSH") {
+        return cmd_rawlpush(args, store, out, now, true);
+    }
+    if cmd_eq(args[1], b"RAWRPUSH") {
+        return cmd_rawlpush(args, store, out, now, false);
+    }
     resp::write_error(out, "ERR unknown ENC subcommand");
     CmdResult::Written
 }
@@ -153,6 +159,31 @@ fn cmd_rawhset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
     }
     let pairs: Vec<(&[u8], &[u8])> = args[3..].chunks(2).map(|c| (c[0], c[1])).collect();
     match store.hset(args[2], &pairs, now) {
+        Ok(_) => resp::write_ok(out),
+        Err(err) => resp::write_error(out, &err),
+    }
+    CmdResult::Written
+}
+
+/// Replay form of an encrypted LPUSH/RPUSH: stores the already-sealed envelope
+/// elements verbatim (no re-encryption). `front` selects LPUSH vs RPUSH.
+fn cmd_rawlpush(
+    args: &[&[u8]],
+    store: &Store,
+    out: &mut BytesMut,
+    now: Instant,
+    front: bool,
+) -> CmdResult {
+    if args.len() < 4 {
+        resp::write_error(out, "ERR usage: ENC RAWLPUSH|RAWRPUSH <key> <element> ...");
+        return CmdResult::Written;
+    }
+    let res = if front {
+        store.lpush(args[2], &args[3..], now)
+    } else {
+        store.rpush(args[2], &args[3..], now)
+    };
+    match res {
         Ok(_) => resp::write_ok(out),
         Err(err) => resp::write_error(out, &err),
     }
