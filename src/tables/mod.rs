@@ -427,6 +427,12 @@ pub struct SelectPlan {
     // LIMIT / OFFSET
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+
+    // Whether the caller may see decrypted values of ENCRYPTED columns. True for
+    // the operator/secret key and real authenticated users; false for anonymous
+    // (signInAnonymously) principals, who get NULL for encrypted columns. Set by
+    // the HTTP auth boundary; defaults true for internal/RESP/operator queries.
+    pub decrypt_authorized: bool,
 }
 
 fn schema_key(table: &str) -> String {
@@ -1711,7 +1717,7 @@ pub fn table_create_path_index(
     };
     let synthetic = synthetic_path_fielddef(&pi);
     for pk_str in get_all_row_ids(store, table, now) {
-        let Some(row) = get_row(store, table, &schema, &pk_str, now) else {
+        let Some(row) = get_row(store, table, &schema, &pk_str, now, true) else {
             continue;
         };
         if let Some(raw) = row.iter().find(|(k, _)| k == root).map(|(_, v)| v.as_str()) {
@@ -1739,7 +1745,7 @@ pub fn table_drop_path_index(
     let (root, rest) = path.split_once('.').unwrap_or((path, ""));
     let synthetic = synthetic_path_fielddef(pi);
     for pk_str in get_all_row_ids(store, table, now) {
-        let Some(row) = get_row(store, table, &schema, &pk_str, now) else {
+        let Some(row) = get_row(store, table, &schema, &pk_str, now, true) else {
             continue;
         };
         if let Some(raw) = row.iter().find(|(k, _)| k == root).map(|(_, v)| v.as_str()) {
@@ -1948,7 +1954,7 @@ fn find_row_by_fields(
     now: Instant,
 ) -> Option<String> {
     for pk_str in get_all_row_ids(store, table, now) {
-        let Some(row) = get_row(store, table, schema, &pk_str, now) else {
+        let Some(row) = get_row(store, table, schema, &pk_str, now, true) else {
             continue;
         };
         if fields
@@ -2254,7 +2260,7 @@ pub fn table_insert_returning_ttl(
 ) -> Result<Vec<(String, String)>, String> {
     let schema = load_schema(store, cache, table, now)?;
     let pk_str = table_insert_pk(store, cache, table, field_values, ttl, now)?;
-    let mut row = get_row(store, table, &schema, &pk_str, now)
+    let mut row = get_row(store, table, &schema, &pk_str, now, true)
         .ok_or_else(|| format!("ERR inserted row not found in table '{}'", table))?;
     row.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(row)
@@ -2415,7 +2421,7 @@ pub fn table_upsert_returning_ttl(
             if !updates.is_empty() {
                 table_update_by_pk_str(store, cache, table, &pk, &updates, ttl, now)?;
             }
-            let mut row = get_row(store, table, &schema, &pk, now)
+            let mut row = get_row(store, table, &schema, &pk, now, true)
                 .ok_or_else(|| format!("ERR upserted row not found in table '{}'", table))?;
             row.sort_by(|a, b| a.0.cmp(&b.0));
             Ok(row)
@@ -2819,7 +2825,9 @@ pub fn table_get(
 ) -> Result<Vec<(String, String)>, String> {
     let schema = load_schema(store, cache, table, now)?;
     let pk_str = id.to_string();
-    let row = get_row(store, table, &schema, &pk_str, now)
+    // Direct by-id fetch is the operator/full-access path; gated by-id reads go
+    // through table_get_filtered -> table_select with the plan's decrypt flag.
+    let row = get_row(store, table, &schema, &pk_str, now, true)
         .ok_or_else(|| format!("ERR row {} not found in table '{}'", id, table))?;
     let mut result = row;
     result.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2860,7 +2868,7 @@ fn table_update_by_pk_str(
     let schema = load_schema(store, cache, table, now)?;
     let rk = row_key_for_pk(table, pk_str);
 
-    let old_row = get_row(store, table, &schema, pk_str, now)
+    let old_row = get_row(store, table, &schema, pk_str, now, true)
         .ok_or_else(|| format!("ERR row '{}' not found in table '{}'", pk_str, table))?;
 
     let old_map: std::collections::HashMap<String, String> = old_row.into_iter().collect();
@@ -3464,7 +3472,7 @@ pub fn table_update_where_returning_ttl(
 ) -> Result<Vec<Vec<(String, String)>>, String> {
     let (schema, pks) =
         table_update_where_pks(store, cache, table, field_values, where_args, ttl, now)?;
-    Ok(rows_for_pks(store, table, &schema, &pks, now))
+    Ok(rows_for_pks(store, table, &schema, &pks, now, true))
 }
 
 /// Apply an UPDATE, returning (schema, primary keys of the updated rows).
@@ -3523,7 +3531,7 @@ pub fn table_delete_where_returning(
 ) -> Result<Vec<Vec<(String, String)>>, String> {
     let conditions = parse_where_conditions(where_args)?;
     let (schema, matched) = scan_matching_pks(store, cache, table, &conditions, now)?;
-    let rows = rows_for_pks(store, table, &schema, &matched, now);
+    let rows = rows_for_pks(store, table, &schema, &matched, now, true);
     for pk_str in &matched {
         table_delete_inner(store, cache, table, pk_str, now, 0)?;
     }
@@ -3565,7 +3573,7 @@ pub fn table_drop(
             .iter()
             .any(|field| matches!(field.field_type, FieldType::Vector(_)))
         {
-            if let Some(row) = get_row(store, table, &schema, pk_str, now) {
+            if let Some(row) = get_row(store, table, &schema, pk_str, now, true) {
                 for field in &schema {
                     if let Some((_, value)) = row.iter().find(|(k, _)| k == &field.name) {
                         remove_from_index(store, table, field, value, pk_str, now);
@@ -3682,9 +3690,12 @@ pub fn table_get_filtered(
     id: i64,
     filter: &str,
     now: Instant,
+    decrypt_authorized: bool,
 ) -> Result<Option<Vec<(String, String)>>, String> {
-    // No filter (operator / unconditional grant): direct PK fetch, no plan.
-    if filter.trim().is_empty() {
+    // Full-access with no row filter: direct PK fetch, no plan. When the caller
+    // isn't decrypt-authorized we fall through to the plan path so encrypted
+    // columns get gated even on an unconditional grant.
+    if filter.trim().is_empty() && decrypt_authorized {
         return match table_get(store, cache, table, id, now) {
             Ok(row) => Ok(Some(row)),
             Err(e) if e.contains("not found") => Ok(None),
@@ -3711,7 +3722,8 @@ pub fn table_get_filtered(
         toks.extend(filter.split_whitespace().map(ToString::to_string));
     }
     let refs: Vec<&str> = toks.iter().map(|s| s.as_str()).collect();
-    let plan = parse_select(&refs)?;
+    let mut plan = parse_select(&refs)?;
+    plan.decrypt_authorized = decrypt_authorized;
     match table_select(store, cache, &plan, now)? {
         SelectResult::Rows(mut rows) => Ok(rows.drain(..).next()),
         SelectResult::Aggregate(_) => Ok(None),
@@ -4065,6 +4077,7 @@ mod tests {
             &load_schema(&store, &cache, "secrets", now).unwrap(),
             id,
             now,
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -4085,6 +4098,74 @@ mod tests {
         let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
         assert_eq!(rows.len(), 1);
         assert_eq!(cell(&rows[0], "token"), "topsecret");
+    }
+
+    #[test]
+    fn unauthorized_reads_omit_encrypted_columns() {
+        let store = encrypted_store();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "secrets",
+            &["id UUID PRIMARY KEY, token STR ENCRYPTED, email STR UNIQUE ENCRYPTED SEARCHABLE, plan STR"],
+            now,
+        )
+        .unwrap();
+        let id = "018f9d72-7c8d-7000-8000-000000000001";
+        table_insert(
+            &store,
+            &cache,
+            "secrets",
+            &[
+                ("id", id),
+                ("token", "topsecret"),
+                ("email", "a@example.com"),
+                ("plan", "pro"),
+            ],
+            now,
+        )
+        .unwrap();
+
+        let has = |rows: &[Vec<(String, String)>], col: &str| rows[0].iter().any(|(k, _)| k == col);
+
+        // Authorized: encrypted columns decrypt and come back.
+        let mut plan = parse_select(&["*", "FROM", "secrets"]).unwrap();
+        plan.decrypt_authorized = true;
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cell(&rows[0], "token"), "topsecret");
+        assert_eq!(cell(&rows[0], "email"), "a@example.com");
+
+        // Unauthorized (anonymous): encrypted columns are omitted, plaintext ones stay.
+        plan.decrypt_authorized = false;
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert!(!has(&rows, "token"), "encrypted token must be omitted");
+        assert!(!has(&rows, "email"), "encrypted email must be omitted");
+        assert!(has(&rows, "id"), "primary key stays");
+        assert_eq!(cell(&rows[0], "plan"), "pro"); // non-encrypted column stays
+
+        // Searchable equality on the encrypted column still matches (blind index),
+        // but the value is still withheld from an unauthorized caller.
+        let mut plan = parse_select(&[
+            "*",
+            "FROM",
+            "secrets",
+            "WHERE",
+            "email",
+            "=",
+            "a@example.com",
+        ])
+        .unwrap();
+        plan.decrypt_authorized = false;
+        let rows = rows_of(table_select(&store, &cache, &plan, now).unwrap());
+        assert_eq!(rows.len(), 1, "blind-index filter still matches");
+        assert!(
+            !has(&rows, "email"),
+            "matched row still withholds the encrypted value"
+        );
     }
 
     #[test]
@@ -4498,6 +4579,7 @@ mod tests {
             &load_schema(&store, &cache, "secrets", now).unwrap(),
             id,
             now,
+            true,
         )
         .unwrap();
         assert_eq!(cell(&row, "note"), "matched");
@@ -4517,6 +4599,7 @@ mod tests {
             &load_schema(&store, &cache, "secrets", now).unwrap(),
             id,
             now,
+            true,
         )
         .is_none());
     }
@@ -4810,6 +4893,7 @@ mod tests {
             &load_schema(&store, &cache, "profiles", now).unwrap(),
             id,
             now,
+            true,
         )
         .unwrap();
         assert_eq!(cell(&row, "name"), "Ada");
@@ -4937,6 +5021,7 @@ mod tests {
             &load_schema(&store, &cache, "secrets", now).unwrap(),
             "s1",
             now,
+            true,
         )
         .is_none());
     }
@@ -5081,6 +5166,7 @@ mod tests {
             &load_schema(&restored, &restored_cache, "secrets", now).unwrap(),
             id,
             now,
+            true,
         )
         .unwrap();
         assert_eq!(cell(&row, "token"), "snapshot-topsecret");
@@ -5168,6 +5254,7 @@ mod tests {
             &load_schema(&restored, &restored_cache, "secrets", now).unwrap(),
             id,
             now,
+            true,
         )
         .unwrap();
         assert_eq!(cell(&row, "token"), "wal-newsecret");
@@ -5319,6 +5406,7 @@ mod tests {
             &load_schema(&restored, &restored_cache, "secrets", now).unwrap(),
             id,
             now,
+            true,
         )
         .unwrap();
         assert_eq!(cell(&row, "token"), "ttl-cleared");

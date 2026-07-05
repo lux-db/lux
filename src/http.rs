@@ -26,6 +26,17 @@ enum HttpAuthContext {
     User(crate::auth::AuthPrincipal),
 }
 
+/// Whether this caller may see decrypted values of ENCRYPTED columns. The
+/// operator and real authenticated users can; anonymous (signInAnonymously)
+/// principals cannot (encrypted columns are omitted from their reads).
+fn decrypt_authorized(ctx: &HttpAuthContext) -> bool {
+    match ctx {
+        HttpAuthContext::Operator => true,
+        HttpAuthContext::User(p) => !p.is_anonymous,
+        HttpAuthContext::Anonymous => false,
+    }
+}
+
 /// Constant-time byte comparison to prevent timing attacks on auth tokens.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -335,8 +346,11 @@ async fn handle_request(
                 let where_clause = get_param(&params, "where").unwrap_or("");
                 let combined = combine_where(where_clause, filter.as_deref().unwrap_or(""));
                 let scoped = params_with_where(&params, &combined);
-                return stream_table_query(socket, table, &scoped, prefer, store, cache, max_rows)
-                    .await;
+                let da = decrypt_authorized(&auth_context);
+                return stream_table_query(
+                    socket, table, &scoped, prefer, store, cache, max_rows, da,
+                )
+                .await;
             }
             ["v1", "tables", table, "count"] => {
                 let filter = match enforce_table_read(store, cache, &auth_context, table) {
@@ -399,7 +413,13 @@ async fn handle_request(
                 let body = match id.parse::<i64>() {
                     Ok(id_i64) => {
                         match crate::tables::table_get_filtered(
-                            store, cache, table, id_i64, scope, now,
+                            store,
+                            cache,
+                            table,
+                            id_i64,
+                            scope,
+                            now,
+                            decrypt_authorized(&auth_context),
                         ) {
                             // A row that exists but is out of grant scope reads as
                             // not-found, so we don't leak that it exists.
@@ -487,6 +507,7 @@ async fn stream_snapshot(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_table_query(
     socket: &mut tokio::net::TcpStream,
     table: &str,
@@ -495,18 +516,20 @@ async fn stream_table_query(
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
     max_rows: Option<usize>,
+    decrypt_authorized: bool,
 ) -> std::io::Result<bool> {
     use tokio::io::AsyncWriteExt;
 
     let now = std::time::Instant::now();
 
-    let (parsed, plan) = match parse_http_table_query(params, table, max_rows) {
+    let (parsed, mut plan) = match parse_http_table_query(params, table, max_rows) {
         Ok(v) => v,
         Err(e) => {
             let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
             return send_json(socket, 400, "Bad Request", &body).await;
         }
     };
+    plan.decrypt_authorized = decrypt_authorized;
     let has_where = parsed.has_where;
     let offset = parsed.offset;
     let count_exact = prefer.contains("count=exact");
@@ -1788,7 +1811,11 @@ fn fetch_live_table_rows(
         tokens.push(offset.to_string());
     }
     let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-    let plan = crate::tables::parse_select(&refs).map_err(|e| live_error("TSELECT_ERROR", &e))?;
+    let mut plan =
+        crate::tables::parse_select(&refs).map_err(|e| live_error("TSELECT_ERROR", &e))?;
+    // Anonymous subscribers get encrypted columns omitted; operator (no principal)
+    // and real users see plaintext. Covers both the initial fetch and change refetch.
+    plan.decrypt_authorized = spec.principal.as_ref().is_none_or(|p| !p.is_anonymous);
     if let Some(err) = crate::auth::reserved_plan_access_error(&plan) {
         return Err(live_error("FORBIDDEN", &err));
     }
@@ -2537,7 +2564,14 @@ fn route_request_with_auth(
             let where_clause = get_param(params, "where").unwrap_or("");
             let combined = combine_where(where_clause, filter.as_deref().unwrap_or(""));
             let scoped = params_with_where(params, &combined);
-            route_table_query(table, &scoped, store, broker, cache)
+            route_table_query(
+                table,
+                &scoped,
+                store,
+                broker,
+                cache,
+                decrypt_authorized(auth),
+            )
         }
         ("GET", ["tables", table, "schema"]) => {
             if let Err(resp) = enforce_table_read(store, cache, auth, table) {
@@ -2885,6 +2919,7 @@ fn route_table_query(
     store: &Arc<Store>,
     _broker: &Broker,
     cache: &SharedSchemaCache,
+    decrypt_authorized: bool,
 ) -> (u16, &'static str, String) {
     if let Some(err) = crate::auth::reserved_table_access_error(table) {
         return (
@@ -2898,14 +2933,17 @@ fn route_table_query(
 
     let cols = render_columns(store, cache, table, now);
     match parse_http_table_query(params, table, None) {
-        Ok((_, plan)) => match crate::tables::table_select(store, cache, &plan, now) {
-            Ok(result) => ok(select_result_to_json(result, &cols)),
-            Err(e) => (
-                400,
-                "Bad Request",
-                format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
-            ),
-        },
+        Ok((_, mut plan)) => {
+            plan.decrypt_authorized = decrypt_authorized;
+            match crate::tables::table_select(store, cache, &plan, now) {
+                Ok(result) => ok(select_result_to_json(result, &cols)),
+                Err(e) => (
+                    400,
+                    "Bad Request",
+                    format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                ),
+            }
+        }
         Err(e) => (
             400,
             "Bad Request",
@@ -4082,7 +4120,8 @@ mod tests {
             "where".to_string(),
             "email = person@example.com".to_string(),
         )];
-        let (status, _, queried) = route_table_query("secrets", &params, &store, &broker, &cache);
+        let (status, _, queried) =
+            route_table_query("secrets", &params, &store, &broker, &cache, true);
         assert_eq!(status, 200, "{queried}");
         assert!(
             queried.contains(r#""email":"person@example.com""#),
@@ -4392,11 +4431,16 @@ mod tests {
     }
 
     fn user_ctx(uid: &str) -> HttpAuthContext {
+        user_ctx_kind(uid, false)
+    }
+
+    fn user_ctx_kind(uid: &str, is_anonymous: bool) -> HttpAuthContext {
         HttpAuthContext::User(crate::auth::AuthPrincipal {
             user_id: uid.to_string(),
             email: format!("{uid}@x.dev"),
             session_id: "sess".to_string(),
             role: "authenticated".to_string(),
+            is_anonymous,
         })
     }
 
@@ -4426,7 +4470,8 @@ mod tests {
         let filter = enforce_table_read(&store, &cache, &alice, "messages").unwrap();
         let combined = combine_where("", filter.as_deref().unwrap_or(""));
         let scoped = params_with_where(&[], &combined);
-        let (status, _, body) = route_table_query("messages", &scoped, &store, &broker, &cache);
+        let (status, _, body) =
+            route_table_query("messages", &scoped, &store, &broker, &cache, true);
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("\"a1\"") && body.contains("\"a2\""), "{body}");
         assert!(!body.contains("\"b1\""), "bob's row leaked: {body}");
@@ -4442,7 +4487,8 @@ mod tests {
         let filter = enforce_table_read(&store, &cache, &alice, "messages").unwrap();
         let combined = combine_where("body = a1", filter.as_deref().unwrap_or(""));
         let scoped = params_with_where(&[], &combined);
-        let (status, _, body) = route_table_query("messages", &scoped, &store, &broker, &cache);
+        let (status, _, body) =
+            route_table_query("messages", &scoped, &store, &broker, &cache, true);
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("\"a1\""), "{body}");
         assert!(
@@ -4462,7 +4508,7 @@ mod tests {
         let filter =
             enforce_table_read(&store, &cache, &HttpAuthContext::Operator, "messages").unwrap();
         assert!(filter.is_none());
-        let (status, _, body) = route_table_query("messages", &[], &store, &broker, &cache);
+        let (status, _, body) = route_table_query("messages", &[], &store, &broker, &cache, true);
         assert_eq!(status, 200, "{body}");
         assert!(
             body.contains("\"b1\""),
@@ -4586,7 +4632,7 @@ mod tests {
         let filter = enforce_table_read(store, cache, ctx, "messages").unwrap();
         let combined = combine_where("", filter.as_deref().unwrap_or(""));
         let scoped = params_with_where(&[], &combined);
-        let (status, _, body) = route_table_query("messages", &scoped, store, broker, cache);
+        let (status, _, body) = route_table_query("messages", &scoped, store, broker, cache, true);
         (status, body)
     }
 
@@ -4964,12 +5010,12 @@ mod tests {
 
         // id=1 is alice's -> visible; id=3 is bob's -> reads as not-found.
         assert!(
-            crate::tables::table_get_filtered(&store, &cache, "messages", 1, scope, now)
+            crate::tables::table_get_filtered(&store, &cache, "messages", 1, scope, now, true)
                 .unwrap()
                 .is_some()
         );
         assert!(
-            crate::tables::table_get_filtered(&store, &cache, "messages", 3, scope, now)
+            crate::tables::table_get_filtered(&store, &cache, "messages", 3, scope, now, true)
                 .unwrap()
                 .is_none()
         );

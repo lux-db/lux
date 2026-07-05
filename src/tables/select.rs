@@ -10,12 +10,13 @@ pub(crate) fn get_row(
     schema: &[FieldDef],
     pk_str: &str,
     now: Instant,
+    decrypt_authorized: bool,
 ) -> Option<Vec<(String, String)>> {
     // Build a lookup map on the fly - only called from paths that don't have a pre-built map.
     // Hot paths (table_select) use get_row_with_map directly.
     let field_map: hashbrown::HashMap<&str, &FieldDef> =
         schema.iter().map(|f| (f.name.as_str(), f)).collect();
-    get_row_with_map(store, table, &field_map, pk_str, now)
+    get_row_with_map(store, table, &field_map, pk_str, now, decrypt_authorized)
 }
 
 /// Like `get_row`, but returns the row even when its TTL has expired. The
@@ -30,10 +31,13 @@ pub(crate) fn get_row_including_expired(
 ) -> Option<Vec<(String, String)>> {
     let field_map: hashbrown::HashMap<&str, &FieldDef> =
         schema.iter().map(|f| (f.name.as_str(), f)).collect();
-    get_row_with_map_impl(store, table, &field_map, pk_str, now, true)
+    // Expired-row reads are for internal index cleanup on the delete path, which
+    // always needs plaintext.
+    get_row_with_map_impl(store, table, &field_map, pk_str, now, true, true)
 }
 
 /// Hot-path row fetch: takes a pre-built field-type map to avoid O(N) schema scan per field.
+/// `decrypt_authorized` false omits ENCRYPTED columns from the result (anonymous principals).
 #[inline]
 pub(crate) fn get_row_with_map(
     store: &Store,
@@ -41,8 +45,17 @@ pub(crate) fn get_row_with_map(
     field_map: &hashbrown::HashMap<&str, &FieldDef>,
     pk_str: &str,
     now: Instant,
+    decrypt_authorized: bool,
 ) -> Option<Vec<(String, String)>> {
-    get_row_with_map_impl(store, table, field_map, pk_str, now, false)
+    get_row_with_map_impl(
+        store,
+        table,
+        field_map,
+        pk_str,
+        now,
+        false,
+        decrypt_authorized,
+    )
 }
 
 #[inline]
@@ -53,6 +66,7 @@ fn get_row_with_map_impl(
     pk_str: &str,
     now: Instant,
     include_expired: bool,
+    decrypt_authorized: bool,
 ) -> Option<Vec<(String, String)>> {
     let rk = row_key_for_pk(table, pk_str);
     let pairs = store.hgetall(rk.as_bytes(), now).unwrap_or_default();
@@ -79,6 +93,9 @@ fn get_row_with_map_impl(
             continue; // never expose the hidden TTL field
         }
         let decoded = match field_map.get(k.as_str()) {
+            // Grant-gated decryption: an unauthorized (anonymous) principal never
+            // sees an encrypted column's value — omit it from the row entirely.
+            Some(field) if field.encrypted && !decrypt_authorized => continue,
             Some(field) => match decode_stored_value(store, table, field, pk_str, &v) {
                 Ok(decoded) => decoded,
                 Err(_) => return None,
@@ -905,6 +922,9 @@ pub fn parse_select(args: &[&str]) -> Result<SelectPlan, String> {
         order_by,
         limit,
         offset,
+        // Default: full decryption. The HTTP auth boundary lowers this to false
+        // for anonymous principals after parsing; RESP/internal callers stay true.
+        decrypt_authorized: true,
     })
 }
 
@@ -1206,7 +1226,10 @@ pub fn table_select(
     let near_candidate_pks = if plan.near.is_some() && !conditions.is_empty() {
         let mut candidates = HashSet::new();
         for pk_str in &scan.row_ids {
-            let Some(row) = get_row_with_map(store, &plan.table, &field_map, pk_str, now) else {
+            // Candidate pre-filter for NEAR: decode fully so WHERE evaluation is
+            // correct; the gated projection happens at the row-emit site below.
+            let Some(row) = get_row_with_map(store, &plan.table, &field_map, pk_str, now, true)
+            else {
                 continue;
             };
             if row_matches_base_conditions(&row, &schema, implicit_id_field.as_ref(), &conditions) {
@@ -1266,7 +1289,14 @@ pub fn table_select(
         ) {
             return None;
         }
-        let mut row = get_row_with_map(store, &plan.table, &field_map, &pk_str, now)?;
+        let mut row = get_row_with_map(
+            store,
+            &plan.table,
+            &field_map,
+            &pk_str,
+            now,
+            plan.decrypt_authorized,
+        )?;
         if let Some(similarity) = vector_similarity
             .as_ref()
             .and_then(|scores| scores.get(&pk_str))
@@ -1327,7 +1357,16 @@ pub fn table_select(
     // ---- Hash Joins ----
     for join in &plan.joins {
         // Pass the limit so the join can stop early once satisfied
-        rows = hash_join(store, cache, rows, join, plan.limit, plan.offset, now)?;
+        rows = hash_join(
+            store,
+            cache,
+            rows,
+            join,
+            plan.limit,
+            plan.offset,
+            now,
+            plan.decrypt_authorized,
+        )?;
     }
 
     // ---- Post-join WHERE filter (for conditions referencing join columns) ----
@@ -1969,6 +2008,7 @@ pub(crate) fn candidates_from_order_index(
 ///
 /// Builds an in-memory HashMap of the right table keyed on the join column,
 /// then iterates the left rows performing O(1) lookups.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn hash_join(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -1977,6 +2017,7 @@ pub(crate) fn hash_join(
     limit: Option<usize>,
     offset: Option<usize>,
     now: Instant,
+    decrypt_authorized: bool,
 ) -> Result<Vec<Vec<(String, String)>>, String> {
     let right_schema = load_schema(store, cache, &join.table, now)?;
     let right_alias = &join.alias;
@@ -1990,7 +2031,14 @@ pub(crate) fn hash_join(
         hashbrown::HashMap::with_capacity(right_ids.len());
 
     for pk_str in right_ids {
-        if let Some(row) = get_row(store, &join.table, &right_schema, &pk_str, now) {
+        if let Some(row) = get_row(
+            store,
+            &join.table,
+            &right_schema,
+            &pk_str,
+            now,
+            decrypt_authorized,
+        ) {
             let key_val = row
                 .iter()
                 .find(|(k, _)| k == &right_key)
@@ -2790,7 +2838,8 @@ pub(crate) fn scan_matching_pks(
 
     let mut matched = Vec::new();
     for pk_str in row_ids {
-        let Some(row) = get_row(store, table, &schema, &pk_str, now) else {
+        // Internal WHERE re-check: needs plaintext regardless of caller.
+        let Some(row) = get_row(store, table, &schema, &pk_str, now, true) else {
             continue;
         };
         if row_matches_base_conditions(&row, &schema, implicit_id.as_ref(), conditions) {
@@ -2828,10 +2877,11 @@ pub(crate) fn rows_for_pks(
     schema: &[FieldDef],
     pks: &[String],
     now: Instant,
+    decrypt_authorized: bool,
 ) -> Vec<Vec<(String, String)>> {
     pks.iter()
         .filter_map(|pk| {
-            get_row(store, table, schema, pk, now).map(|mut r| {
+            get_row(store, table, schema, pk, now, decrypt_authorized).map(|mut r| {
                 r.sort_by(|a, b| a.0.cmp(&b.0));
                 r
             })
@@ -2880,7 +2930,8 @@ pub(crate) fn scan_projected_column(
             // The pk *is* the projected value (it may not be a stored field).
             Some(pk.clone())
         } else {
-            get_row(store, table, &schema, pk, now).and_then(|row| {
+            // Internal grant-subquery membership resolution: needs plaintext.
+            get_row(store, table, &schema, pk, now, true).and_then(|row| {
                 row.into_iter()
                     .find(|(k, _)| k == projected)
                     .map(|(_, v)| v)

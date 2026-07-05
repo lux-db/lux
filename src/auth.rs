@@ -133,6 +133,11 @@ struct AccessClaims {
     role: String,
     iat: usize,
     exp: usize,
+    // Anonymous (signInAnonymously) sessions. Gates decryption of ENCRYPTED
+    // columns: anonymous callers get NULL, real users get plaintext. Defaulted
+    // so tokens minted before this field decode (missing -> not anonymous).
+    #[serde(default)]
+    is_anonymous: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -172,6 +177,9 @@ pub(crate) struct AuthPrincipal {
     pub email: String,
     pub session_id: String,
     pub role: String,
+    /// Anonymous (signInAnonymously) session. Encrypted columns are NULLed for
+    /// these principals; real users and the operator get plaintext.
+    pub is_anonymous: bool,
 }
 
 pub(crate) fn is_reserved_auth_table(table: &str) -> bool {
@@ -1426,6 +1434,7 @@ fn jwks(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String)
         order_by: None,
         limit: Some(100),
         offset: None,
+        decrypt_authorized: true,
     };
     match tables::table_select(store, cache, &plan, Instant::now()) {
         Ok(SelectResult::Rows(rows)) => {
@@ -1462,6 +1471,7 @@ fn admin_list_users(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static 
         order_by: None,
         limit: Some(1000),
         offset: None,
+        decrypt_authorized: true,
     };
     match tables::table_select(store, cache, &plan, Instant::now()) {
         Ok(SelectResult::Rows(rows)) => {
@@ -1790,6 +1800,7 @@ fn admin_list_providers(store: &Store, cache: &SharedSchemaCache) -> (u16, &'sta
         order_by: None,
         limit: Some(100),
         offset: None,
+        decrypt_authorized: true,
     };
     match tables::table_select(store, cache, &plan, Instant::now()) {
         Ok(SelectResult::Rows(rows)) => {
@@ -2481,6 +2492,7 @@ fn admin_list_keys(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static s
         order_by: None,
         limit: Some(1000),
         offset: None,
+        decrypt_authorized: true,
     };
     match tables::table_select(store, cache, &plan, Instant::now()) {
         Ok(SelectResult::Rows(rows)) => {
@@ -2819,6 +2831,14 @@ fn sign_access_token(
 ) -> Result<String, String> {
     let now = unix_seconds();
     let exp = now + store.config().auth.access_token_ttl.as_secs();
+    // Derive is_anonymous from the user's stored app metadata so every mint path
+    // (signin, anonymous, refresh) stamps it consistently without threading a flag.
+    let is_anonymous = find_row_by_field(store, cache, USERS_TABLE, "id", user_id, Instant::now())
+        .ok()
+        .flatten()
+        .as_ref()
+        .map(row_is_anonymous)
+        .unwrap_or(false);
     let claims = AccessClaims {
         iss: store.config().auth.issuer.clone(),
         sub: user_id.to_string(),
@@ -2827,6 +2847,7 @@ fn sign_access_token(
         role: "authenticated".to_string(),
         iat: now as usize,
         exp: exp as usize,
+        is_anonymous,
     };
     let signing_key = active_signing_key(store, cache, Instant::now())?
         .ok_or_else(|| "missing active auth signing key".to_string())?;
@@ -2876,6 +2897,7 @@ pub(crate) fn authenticate_access_token(
         email: claims.email,
         session_id: claims.session_id,
         role: claims.role,
+        is_anonymous: claims.is_anonymous,
     })
 }
 
@@ -4189,9 +4211,18 @@ fn sanitize_header_value(value: &str) -> String {
     value.replace(['\r', '\n'], "")
 }
 
+/// A user is anonymous when their app metadata records the anonymous provider
+/// (set by `signin_anonymous`). Single source of truth for the flag.
+fn row_is_anonymous(row: &HashMap<String, String>) -> bool {
+    parse_json_string(row.get("raw_app_meta_data"))
+        .get("provider")
+        .and_then(Value::as_str)
+        == Some("anonymous")
+}
+
 fn user_map_json(row: &HashMap<String, String>) -> Value {
     let app_metadata = parse_json_string(row.get("raw_app_meta_data"));
-    let is_anonymous = app_metadata.get("provider").and_then(Value::as_str) == Some("anonymous");
+    let is_anonymous = row_is_anonymous(row);
     json!({
         "id": row.get("id").cloned().unwrap_or_default(),
         "email": row.get("email").cloned().unwrap_or_default(),
@@ -4284,6 +4315,7 @@ fn find_row_by_field(
         order_by: None,
         limit: Some(1),
         offset: None,
+        decrypt_authorized: true,
     };
     match tables::table_select(store, cache, &plan, now)? {
         SelectResult::Rows(rows) => Ok(rows
@@ -4957,6 +4989,7 @@ fn find_rows_by_field(
         order_by: None,
         limit: Some(1000),
         offset: None,
+        decrypt_authorized: true,
     };
     match tables::table_select(store, cache, &plan, now)? {
         SelectResult::Rows(rows) => Ok(rows
@@ -5199,7 +5232,23 @@ mod tests {
             email: "u@x.dev".into(),
             session_id: "sess".into(),
             role: "authenticated".into(),
+            is_anonymous: false,
         }
+    }
+
+    #[test]
+    fn row_is_anonymous_detects_provider() {
+        let anon = HashMap::from([(
+            "raw_app_meta_data".to_string(),
+            r#"{"provider":"anonymous"}"#.to_string(),
+        )]);
+        assert!(row_is_anonymous(&anon));
+        let real = HashMap::from([(
+            "raw_app_meta_data".to_string(),
+            r#"{"provider":"email","providers":["email"]}"#.to_string(),
+        )]);
+        assert!(!row_is_anonymous(&real));
+        assert!(!row_is_anonymous(&HashMap::new())); // missing metadata -> not anonymous
     }
 
     fn cond(c: &str, o: &str, v: &str) -> crate::grants::ResolvedCond {
