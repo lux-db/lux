@@ -4120,6 +4120,43 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_load_fails_loudly_when_encrypted_vector_cant_decrypt() {
+        // Store A: encrypt a vector and snapshot it.
+        let dir_a = tempfile::tempdir().unwrap();
+        let store_a = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir_a.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        exec(&store_a, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(
+            &store_a,
+            &[b"VSET", b"v", b"2", b"1.0", b"2.0", b"ENCRYPTED"],
+        );
+        crate::snapshot::save_and_truncate_wal_consistent(&store_a).unwrap();
+        let dat = std::fs::read(dir_a.path().join("lux.dat")).unwrap();
+
+        // Store B has its own (different) keyring. Drop A's snapshot in and load.
+        let dir_b = tempfile::tempdir().unwrap();
+        let store_b = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir_b.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        exec(&store_b, &[b"ENC", b"INIT", b"KEYID", b"other"]);
+        std::fs::write(dir_b.path().join("lux.dat"), &dat).unwrap();
+        // Must fail loudly (startup then refuses), not silently drop the vector
+        // and cascade — and the on-disk snapshot is left intact for recovery.
+        assert!(
+            crate::snapshot::load(&store_b).is_err(),
+            "load must error on an undecryptable encrypted vector"
+        );
+        assert_eq!(
+            std::fs::read(dir_b.path().join("lux.dat")).unwrap(),
+            dat,
+            "load must not modify the on-disk snapshot"
+        );
+    }
+
+    #[test]
     fn enc_rotate_rewrap_then_retire_preserves_existing_data() {
         let dir = tempfile::tempdir().unwrap();
         let config = Arc::new(ServerConfig {

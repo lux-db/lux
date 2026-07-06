@@ -3044,12 +3044,29 @@ impl Runtime {
         match snapshot::load(&runtime.store) {
             Ok(0) => emit_info(&runtime.config, ServerInfoEvent::NoSnapshotFound),
             Ok(n) => emit_info(&runtime.config, ServerInfoEvent::SnapshotLoaded { keys: n }),
-            Err(e) => emit_error(
-                &runtime.config,
-                ServerErrorEvent::SnapshotLoadFailed {
-                    error: e.to_string(),
-                },
-            ),
+            Err(e) => {
+                // Refuse to start on a load failure (e.g. an encrypted value the
+                // current keyring can't decrypt) rather than coming up with a
+                // truncated dataset that the background save would then overwrite.
+                // The on-disk snapshot is left intact and recoverable; supply the
+                // correct keyring/seal and restart.
+                runtime
+                    .store
+                    .wal_suppress
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                emit_error(
+                    &runtime.config,
+                    ServerErrorEvent::SnapshotLoadFailed {
+                        error: e.to_string(),
+                    },
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "refusing to start: snapshot load failed, on-disk data preserved (not overwritten): {e}"
+                    ),
+                ));
+            }
         }
         runtime
             .store
