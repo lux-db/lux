@@ -1,12 +1,14 @@
 use super::*;
 
 impl Store {
+    #[allow(clippy::too_many_arguments)]
     pub fn vset(
         &self,
         key: &[u8],
         data: Vec<f32>,
         metadata: Option<String>,
         ttl: Option<Duration>,
+        encrypted: bool,
         now: Instant,
     ) {
         let idx = self.shard_index(key);
@@ -21,6 +23,7 @@ impl Store {
             dims,
             data,
             metadata,
+            encrypted,
         });
         let new_mem = estimate_entry_memory(&ks, &new_value);
         let expires_at = ttl.map(|d| now + d);
