@@ -1746,9 +1746,12 @@ impl EmbeddedClient {
         }
         let key_s = std::str::from_utf8(key).unwrap_or("");
         if self.runtime.broker.has_list_waiters(key_s) {
-            self.runtime
-                .broker
-                .drain_list_waiters(key_s, &mut shard.data, now);
+            self.runtime.broker.drain_list_waiters(
+                key_s,
+                &mut shard.data,
+                &self.runtime.store,
+                now,
+            );
         }
     }
 
@@ -3643,7 +3646,10 @@ impl CommandExecutor {
 
         if !cmd::is_pipeline_special_command(args[0]) {
             let access = cmd::pipeline_access_for_args(args);
-            if access == cmd::PipelineAccess::Read {
+            // The shard-local read fast-path reads stored bytes directly and has
+            // no keyring, so it cannot decrypt. When encryption is active, fall
+            // through to the slow path (cmd::execute) which decrypts on read.
+            if access == cmd::PipelineAccess::Read && !self.store.encryption().has_active_key() {
                 let command = [ShardPipelineCommand { args, access }];
                 let shard_idx = self.store.shard_for_key(args[1]);
                 if let Err(err) = self
@@ -3766,7 +3772,10 @@ impl CommandExecutor {
             }
         }
 
-        if has_special || !all_single_key_rw {
+        // When encryption is active, the shard-local fast batch path can neither
+        // encrypt writes nor decrypt reads (no keyring there), so force every
+        // command onto the slow path (cmd::execute) which handles both.
+        if has_special || !all_single_key_rw || self.store.encryption().has_active_key() {
             for command in commands {
                 let args = command.argv();
                 if !session.authenticated && !is_public_without_auth_cmd(args[0]) {

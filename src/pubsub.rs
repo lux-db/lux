@@ -155,6 +155,7 @@ impl Broker {
         &self,
         key: &str,
         shard_data: &mut crate::store::ShardData,
+        store: &crate::store::Store,
         now: std::time::Instant,
     ) {
         let mut waiters = self.list_waiters.lock();
@@ -181,6 +182,9 @@ impl Broker {
                 list.pop_back()
             };
             if let Some(v) = val {
+                // Decrypt encrypted list elements before handing them to the
+                // blocked waiter (deferred BLPOP/BRPOP resolution).
+                let v = store.decrypt_list_element(v.clone()).unwrap_or(v);
                 let _ = req.tx.try_send((key.to_string(), v));
             }
         }

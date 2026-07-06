@@ -72,6 +72,41 @@ fn log_resolved_xadd(store: &Store, args: &[&[u8]], id: StreamId, out: &mut Byte
     }
 }
 
+/// Self-log an encrypted XADD as a normal XADD carrying the resolved id and the
+/// sealed ciphertext values (the ENCRYPTED flag is dropped). On replay the
+/// envelope bytes are stored verbatim (no ENCRYPTED flag => no re-encryption),
+/// and reads decrypt them via the envelope magic prefix.
+fn log_encrypted_xadd(
+    store: &Store,
+    args: &[&[u8]],
+    id: StreamId,
+    fields: &[(String, Bytes)],
+    out: &mut BytesMut,
+) -> bool {
+    if !store.wal_enabled() {
+        return true;
+    }
+    let Some(id_idx) = xadd_id_arg_index(args) else {
+        return true;
+    };
+    let mut owned: Vec<Vec<u8>> = vec![b"XADD".to_vec(), args[1].to_vec()];
+    // Preserve trimming options (MAXLEN/MINID/NOMKSTREAM) that sit before the id.
+    owned.extend(args[2..id_idx].iter().map(|a| a.to_vec()));
+    owned.push(id.to_string().into_bytes());
+    for (name, val) in fields {
+        owned.push(name.as_bytes().to_vec());
+        owned.push(val.to_vec());
+    }
+    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+    match store.wal_log_command(&refs) {
+        Ok(()) => true,
+        Err(e) => {
+            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+            false
+        }
+    }
+}
+
 pub fn cmd_xadd(
     args: &[&[u8]],
     store: &Store,
@@ -83,6 +118,9 @@ pub fn cmd_xadd(
         resp::write_error(out, "ERR wrong number of arguments for 'xadd' command");
         return CmdResult::Written;
     }
+    // Trailing ENCRYPTED flag (mirrors SET/HSET): seal each field value.
+    let encrypted = args.last().is_some_and(|a| cmd_eq(a, b"ENCRYPTED"));
+    let arg_end = args.len() - encrypted as usize;
     let mut i = 2;
     let mut maxlen: Option<usize> = None;
     while i < args.len() {
@@ -101,27 +139,40 @@ pub fn cmd_xadd(
             break;
         }
     }
-    if i >= args.len() {
+    if i >= arg_end {
         resp::write_error(out, "ERR wrong number of arguments for 'xadd' command");
         return CmdResult::Written;
     }
     let id_input = arg_str(args[i]);
     i += 1;
-    if (args.len() - i) < 2 || !(args.len() - i).is_multiple_of(2) {
+    if (arg_end - i) < 2 || !(arg_end - i).is_multiple_of(2) {
         resp::write_error(out, "ERR wrong number of arguments for 'xadd' command");
         return CmdResult::Written;
     }
     let mut fields = Vec::new();
-    while i + 1 < args.len() {
-        fields.push((
-            arg_str(args[i]).to_string(),
-            Bytes::copy_from_slice(args[i + 1]),
-        ));
+    while i + 1 < arg_end {
+        let value = if encrypted {
+            match store.encrypt_stream_value(args[1], args[i], args[i + 1]) {
+                Ok(ct) => Bytes::from(ct),
+                Err(e) => {
+                    resp::write_error(out, &e);
+                    return CmdResult::Written;
+                }
+            }
+        } else {
+            Bytes::copy_from_slice(args[i + 1])
+        };
+        fields.push((arg_str(args[i]).to_string(), value));
         i += 2;
     }
-    match store.xadd(args[1], id_input, fields, maxlen, now) {
+    match store.xadd(args[1], id_input, fields.clone(), maxlen, now) {
         Ok(id) => {
-            if !log_resolved_xadd(store, args, id, out) {
+            let logged = if encrypted {
+                log_encrypted_xadd(store, args, id, &fields, out)
+            } else {
+                log_resolved_xadd(store, args, id, out)
+            };
+            if !logged {
                 return CmdResult::Written;
             }
             resp::write_bulk(out, &id.to_string());

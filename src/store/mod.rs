@@ -611,6 +611,43 @@ impl Store {
                             disk_remove.push(key.clone());
                         }
                     }
+                    StoreValue::List(list) => {
+                        for elem in list.iter_mut() {
+                            if !crate::encryption::EncryptionKeyring::is_encrypted_value(elem) {
+                                continue;
+                            }
+                            let new_value =
+                                self.encryption()
+                                    .reencrypt("__lux_list", "element", "", elem)?;
+                            mem_delta += new_value.len() as isize - elem.len() as isize;
+                            *elem = Bytes::from(new_value);
+                            count += 1;
+                            shard_changed = true;
+                            disk_remove.push(key.clone());
+                        }
+                    }
+                    StoreValue::Stream(stream) => {
+                        let key_name = key_string(key);
+                        for fields in stream.entries.values_mut() {
+                            for (field, value) in fields.iter_mut() {
+                                if !crate::encryption::EncryptionKeyring::is_encrypted_value(value)
+                                {
+                                    continue;
+                                }
+                                let new_value = self.encryption().reencrypt(
+                                    "__lux_stream",
+                                    field,
+                                    &key_name,
+                                    value,
+                                )?;
+                                mem_delta += new_value.len() as isize - value.len() as isize;
+                                *value = Bytes::from(new_value);
+                                count += 1;
+                                shard_changed = true;
+                                disk_remove.push(key.clone());
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -630,6 +667,11 @@ impl Store {
                 self.remove_from_disk(&key);
             }
         }
+        // Make the rewrap durable: persist the re-wrapped in-memory values and
+        // truncate the WAL so a restart cannot replay the pre-rewrap (old-key)
+        // ciphertext.
+        crate::snapshot::save_and_truncate_wal_consistent(self)
+            .map_err(|e| format!("ERR rewrap persist failed: {e}"))?;
         Ok(count)
     }
 
@@ -665,10 +707,33 @@ impl Store {
                             }
                         }
                     }
+                    StoreValue::List(list) => {
+                        for elem in list.iter() {
+                            if encrypted_value_would_be_orphaned(elem, &remaining) {
+                                return Err(
+                                    "ERR ENC key is still required by encrypted data".to_string()
+                                );
+                            }
+                        }
+                    }
+                    StoreValue::Stream(stream) => {
+                        for fields in stream.entries.values() {
+                            for (_field, value) in fields {
+                                if encrypted_value_would_be_orphaned(value, &remaining) {
+                                    return Err("ERR ENC key is still required by encrypted data"
+                                        .to_string());
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
         }
+        // Persist the re-wrapped values and truncate the WAL before removing the
+        // key, so no stored value or WAL entry still references it.
+        crate::snapshot::save_and_truncate_wal_consistent(self)
+            .map_err(|e| format!("ERR retire persist failed: {e}"))?;
         self.encryption().retire(key_id)
     }
 
@@ -1286,6 +1351,73 @@ impl Store {
         let key_name = Self::user_kv_key(key);
         self.encryption()
             .encrypt("__lux_kv", "value", &key_name, value)
+    }
+
+    /// Encrypt a list element. AAD is intentionally key-independent so an
+    /// envelope stays decryptable after LMOVE/RPOPLPUSH move it to another list
+    /// (no re-keying). Per-value random DEK + nonce still protects each element.
+    pub(crate) fn encrypt_list_element(&self, value: &[u8]) -> Result<Vec<u8>, String> {
+        self.encryption()
+            .encrypt("__lux_list", "element", "", value)
+    }
+
+    /// Decrypt a list element if it is an encryption envelope; pass plaintext
+    /// through untouched so encrypted and plaintext elements can coexist.
+    pub(crate) fn decrypt_list_element(&self, value: Bytes) -> Result<Bytes, String> {
+        if !crate::encryption::EncryptionKeyring::is_encrypted_value(&value) {
+            return Ok(value);
+        }
+        self.encryption()
+            .decrypt("__lux_list", "element", "", &value)
+            .map(Bytes::from)
+    }
+
+    /// Encrypt a stream entry field value. AAD binds the stream key + field.
+    pub(crate) fn encrypt_stream_value(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        value: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let key_name = Self::user_kv_key(key);
+        let field_name = Self::user_hash_field(field);
+        self.encryption()
+            .encrypt("__lux_stream", &field_name, &key_name, value)
+    }
+
+    /// Decrypt a stream entry field value if it is an envelope.
+    pub(crate) fn decrypt_stream_value(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        value: Bytes,
+    ) -> Result<Bytes, String> {
+        if !crate::encryption::EncryptionKeyring::is_encrypted_value(&value) {
+            return Ok(value);
+        }
+        let key_name = Self::user_kv_key(key);
+        let field_name = Self::user_hash_field(field);
+        self.encryption()
+            .decrypt("__lux_stream", &field_name, &key_name, &value)
+            .map(Bytes::from)
+    }
+
+    /// Decrypt all field values of one stream entry for output. Plaintext (and,
+    /// defensively, undecryptable) values pass through unchanged.
+    pub(crate) fn decrypt_stream_fields(
+        &self,
+        key: &[u8],
+        fields: &[(String, Bytes)],
+    ) -> Vec<(String, Bytes)> {
+        fields
+            .iter()
+            .map(|(f, v)| {
+                let dv = self
+                    .decrypt_stream_value(key, f.as_bytes(), v.clone())
+                    .unwrap_or_else(|_| v.clone());
+                (f.clone(), dv)
+            })
+            .collect()
     }
 
     pub(crate) fn decrypt_hash_field_value(

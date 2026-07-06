@@ -157,7 +157,7 @@ impl Store {
                 StoreValue::Stream(s) => {
                     let mut result = Vec::new();
                     for (id, fields) in s.entries.range(start..=end) {
-                        result.push((*id, fields.clone()));
+                        result.push((*id, self.decrypt_stream_fields(key, fields)));
                         if let Some(c) = count {
                             if result.len() >= c {
                                 break;
@@ -188,7 +188,7 @@ impl Store {
                 StoreValue::Stream(s) => {
                     let mut result = Vec::new();
                     for (id, fields) in s.entries.range(start..=end).rev() {
-                        result.push((*id, fields.clone()));
+                        result.push((*id, self.decrypt_stream_fields(key, fields)));
                         if let Some(c) = count {
                             if result.len() >= c {
                                 break;
@@ -225,7 +225,7 @@ impl Store {
                         };
                         let mut entries = Vec::new();
                         for (id, fields) in s.entries.range(start..) {
-                            entries.push((*id, fields.clone()));
+                            entries.push((*id, self.decrypt_stream_fields(key.as_bytes(), fields)));
                             if let Some(c) = count {
                                 if entries.len() >= c {
                                     break;
@@ -387,7 +387,10 @@ impl Store {
                             };
                             let mut entries = Vec::new();
                             for (id, fields) in s.entries.range(start..) {
-                                entries.push((*id, fields.clone()));
+                                entries.push((
+                                    *id,
+                                    self.decrypt_stream_fields(key.as_bytes(), fields),
+                                ));
                                 if !noack {
                                     cg.pel.insert(
                                         *id,
@@ -432,7 +435,10 @@ impl Store {
                             sorted.sort();
                             for id in sorted {
                                 if let Some(fields) = s.entries.get(&id) {
-                                    entries.push((id, fields.clone()));
+                                    entries.push((
+                                        id,
+                                        self.decrypt_stream_fields(key.as_bytes(), fields),
+                                    ));
                                     if let Some(cnt) = count {
                                         if entries.len() >= cnt {
                                             break;
@@ -627,7 +633,7 @@ impl Store {
                                 c.pel.insert(*id);
                                 c.seen_time = inst_now;
                                 if let Some(fields) = s.entries.get(id) {
-                                    result.push((*id, fields.clone()));
+                                    result.push((*id, self.decrypt_stream_fields(key, fields)));
                                 }
                             }
                         }
@@ -706,7 +712,7 @@ impl Store {
                                 c.pel.insert(id);
                                 c.seen_time = inst_now;
                                 if let Some(fields) = s.entries.get(&id) {
-                                    claimed.push((id, fields.clone()));
+                                    claimed.push((id, self.decrypt_stream_fields(key, fields)));
                                 } else {
                                     deleted_ids.push(id);
                                 }

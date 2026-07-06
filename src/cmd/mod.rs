@@ -2303,6 +2303,11 @@ fn command_self_logs_wal_args(args: &[&[u8]], store: &Store, now: Instant) -> bo
         return args[3..].iter().any(|arg| cmd_eq(arg, b"ENCRYPTED"))
             || store.kv_string_is_encrypted(args[1], now);
     }
+    if (cmd_eq(cmd, b"LPUSH") || cmd_eq(cmd, b"RPUSH")) && args.len() >= 4 {
+        // Encrypted pushes self-log ENC RAWLPUSH/RAWRPUSH with the resolved
+        // ciphertext; plaintext pushes take the normal WAL path.
+        return args.last().is_some_and(|arg| cmd_eq(arg, b"ENCRYPTED"));
+    }
     if (cmd_eq(cmd, b"HSET") || cmd_eq(cmd, b"HMSET")) && args.len() >= 4 {
         let encrypted = args.last().is_some_and(|arg| cmd_eq(arg, b"ENCRYPTED"));
         let end = if encrypted {
@@ -3750,6 +3755,153 @@ mod tests {
         assert!(got.contains("hash-secret-value"), "{got}");
         let scan = exec_str(&restored, &[b"HSCAN", b"profile:1", b"0"]);
         assert!(scan.contains("hash-secret-value"), "{scan}");
+    }
+
+    #[test]
+    fn encrypted_lpush_self_logs_ciphertext_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        let out = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[
+                b"RPUSH",
+                b"events",
+                b"list-secret-one",
+                b"list-secret-two",
+                b"ENCRYPTED",
+            ],
+        ))
+        .to_string();
+        assert!(out.contains(":2"), "{out}");
+        store.fsync_wal();
+        let wal = read_wal_bytes(dir.path());
+        assert!(!wal
+            .windows(b"list-secret-one".len())
+            .any(|w| w == b"list-secret-one"));
+        assert!(wal.windows(b"RAWRPUSH".len()).any(|w| w == b"RAWRPUSH"));
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"LRANGE", b"events", b"0", b"-1"]);
+        assert!(got.contains("list-secret-one"), "{got}");
+        assert!(got.contains("list-secret-two"), "{got}");
+    }
+
+    #[test]
+    fn encrypted_list_element_survives_lmove_across_keys() {
+        // List AAD is key-independent, so an encrypted element stays decryptable
+        // after LMOVE relocates it to a different list.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(&store, &[b"RPUSH", b"src", b"move-me-secret", b"ENCRYPTED"]);
+        exec(&store, &[b"LMOVE", b"src", b"dst", b"LEFT", b"RIGHT"]);
+        let got = exec_str(&store, &[b"LRANGE", b"dst", b"0", b"-1"]);
+        assert!(got.contains("move-me-secret"), "{got}");
+    }
+
+    #[test]
+    fn encrypted_xadd_self_logs_ciphertext_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        let out = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[
+                b"XADD",
+                b"stream:1",
+                b"*",
+                b"payload",
+                b"stream-secret-value",
+                b"ENCRYPTED",
+            ],
+        ))
+        .to_string();
+        assert!(out.contains('-'), "{out}"); // resolved stream id like <ms>-<seq>
+        store.fsync_wal();
+        let wal = read_wal_bytes(dir.path());
+        assert!(!wal
+            .windows(b"stream-secret-value".len())
+            .any(|w| w == b"stream-secret-value"));
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"XRANGE", b"stream:1", b"-", b"+"]);
+        assert!(got.contains("stream-secret-value"), "{got}");
+        assert!(got.contains("payload"), "{got}");
+    }
+
+    #[test]
+    fn rotate_rewrap_retire_preserves_list_and_stream_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(
+            &store,
+            &[b"RPUSH", b"l", b"list-rotate-secret", b"ENCRYPTED"],
+        );
+        exec(
+            &store,
+            &[
+                b"XADD",
+                b"s",
+                b"*",
+                b"f",
+                b"stream-rotate-secret",
+                b"ENCRYPTED",
+            ],
+        );
+        exec(&store, &[b"ENC", b"ROTATE", b"KEYID", b"k2"]);
+        let rewrap = exec_str(&store, &[b"ENC", b"REWRAP"]);
+        assert!(!rewrap.contains("ERR"), "rewrap: {rewrap}");
+        assert!(
+            exec_str(&store, &[b"ENC", b"RETIRE", b"k1"]).contains("OK"),
+            "retire k1 should succeed once list/stream are rewrapped"
+        );
+
+        // Restart from disk (snapshot re-sealed under k2, WAL truncated): the old
+        // key is gone, so this fails if REWRAP didn't cover list/stream + persist.
+        let restored = Store::new_with_config(config);
+        let _ = crate::snapshot::load(&restored);
+        restored.replay_wal(&Broker::new());
+        let l = exec_str(&restored, &[b"LRANGE", b"l", b"0", b"-1"]);
+        assert!(
+            l.contains("list-rotate-secret"),
+            "list after rotate/retire/restart: {l}"
+        );
+        let s = exec_str(&restored, &[b"XRANGE", b"s", b"-", b"+"]);
+        assert!(
+            s.contains("stream-rotate-secret"),
+            "stream after rotate/retire/restart: {s}"
+        );
     }
 
     #[test]
