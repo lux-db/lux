@@ -17,11 +17,22 @@ fn resp_encrypted_values_roundtrip_over_tcp() {
         "encrypted GET must decrypt over TCP"
     );
 
+    // STRLEN must report the plaintext length, not the ciphertext envelope size.
+    assert!(
+        send_and_read(&mut c, &["STRLEN", "tok"]).contains("13"),
+        "encrypted STRLEN must report plaintext length over TCP"
+    );
+
     // Hash field.
     send_and_read(&mut c, &["HSET", "h", "f", "hash-secret", "ENCRYPTED"]);
     assert!(
         send_and_read(&mut c, &["HGET", "h", "f"]).contains("hash-secret"),
         "encrypted HGET must decrypt over TCP"
+    );
+    let hgetall = send_and_read(&mut c, &["HGETALL", "h"]);
+    assert!(
+        hgetall.contains("hash-secret"),
+        "encrypted HGETALL must decrypt over TCP: {hgetall}"
     );
 
     // List elements: LRANGE/LINDEX go through the read fast-path.
