@@ -4017,6 +4017,76 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_string_rejects_bit_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(&store, &[b"SET", b"bk", b"topsecret", b"ENCRYPTED"]);
+        // SETBIT must be rejected and must NOT corrupt the envelope.
+        assert!(exec_str(&store, &[b"SETBIT", b"bk", b"0", b"1"]).contains("ERR"));
+        assert!(
+            exec_str(&store, &[b"GET", b"bk"]).contains("topsecret"),
+            "value must survive a rejected SETBIT"
+        );
+        // BITOP with an encrypted operand is rejected and leaves it intact.
+        exec(&store, &[b"SET", b"plain", b"AAAA"]);
+        assert!(exec_str(&store, &[b"BITOP", b"AND", b"bk", b"bk", b"plain"]).contains("ERR"));
+        assert!(
+            exec_str(&store, &[b"GET", b"bk"]).contains("topsecret"),
+            "value must survive a rejected BITOP"
+        );
+        // Reads over the envelope are refused rather than returning ciphertext-based answers.
+        assert!(exec_str(&store, &[b"GETBIT", b"bk", b"0"]).contains("ERR"));
+        assert!(exec_str(&store, &[b"BITCOUNT", b"bk"]).contains("ERR"));
+    }
+
+    #[test]
+    fn encrypted_key_relocation_is_rejected_but_data_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(&store, &[b"SET", b"a", b"rename-secret", b"ENCRYPTED"]);
+        // RENAME / COPY of an encrypted key must be refused, leaving the source intact.
+        assert!(exec_str(&store, &[b"RENAME", b"a", b"b"]).contains("ERR"));
+        assert!(
+            exec_str(&store, &[b"GET", b"a"]).contains("rename-secret"),
+            "source must survive a rejected RENAME"
+        );
+        assert!(exec_str(&store, &[b"COPY", b"a", b"c"]).contains("ERR"));
+        assert!(exec_str(&store, &[b"GET", b"a"]).contains("rename-secret"));
+        // Non-encrypted keys still rename normally (the guard must not over-block).
+        exec(&store, &[b"SET", b"plain", b"hello"]);
+        assert!(exec_str(&store, &[b"RENAME", b"plain", b"plain2"]).contains("OK"));
+        assert!(exec_str(&store, &[b"GET", b"plain2"]).contains("hello"));
+    }
+
+    #[test]
+    fn vset_encryption_is_sticky() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(&store, &[b"VSET", b"v", b"2", b"1.0", b"2.0", b"ENCRYPTED"]);
+        // Re-set WITHOUT the flag, using a distinctive value, must stay encrypted.
+        exec(&store, &[b"VSET", b"v", b"2", b"111222.5", b"0.0"]);
+        crate::snapshot::save_and_truncate_wal_consistent(&store).unwrap();
+        let dat = std::fs::read(dir.path().join("lux.dat")).unwrap();
+        let needle = 111222.5f32.to_le_bytes();
+        assert!(
+            !dat.windows(4).any(|w| w == needle),
+            "re-set vector silently downgraded to plaintext-at-rest"
+        );
+    }
+
+    #[test]
     fn enc_rotate_rewrap_then_retire_preserves_existing_data() {
         let dir = tempfile::tempdir().unwrap();
         let config = Arc::new(ServerConfig {

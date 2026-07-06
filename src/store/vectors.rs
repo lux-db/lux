@@ -19,6 +19,13 @@ impl Store {
         let dims = data.len() as u32;
         let index_data = data.clone();
         let mut old_vector_dims = None;
+        // Sticky encryption: overwriting an encrypted vector without the flag
+        // must not silently downgrade it to plaintext-at-rest (mirrors SET).
+        let encrypted = encrypted
+            || matches!(
+                shard.data.get(&ks).map(|e| &e.value),
+                Some(StoreValue::Vector(v)) if v.encrypted
+            );
         let new_value = StoreValue::Vector(VectorData {
             dims,
             data,

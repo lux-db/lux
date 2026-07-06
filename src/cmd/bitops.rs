@@ -7,6 +7,20 @@ use crate::store::Store;
 use super::{arg_str, cmd_eq, parse_i64, CmdResult};
 
 const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
+const ENCRYPTED_BITOP_ERR: &str =
+    "ERR bit operations are not supported on encrypted values (they would operate on ciphertext)";
+
+/// Reject a bit operation touching an encrypted string. Bit ops read/write the
+/// raw stored bytes, which for an encrypted value are the ciphertext envelope:
+/// a write corrupts it irrecoverably and a read returns meaningless answers.
+fn reject_encrypted_bitop(store: &Store, key: &[u8], now: Instant, out: &mut BytesMut) -> bool {
+    if store.kv_string_is_encrypted(key, now) {
+        resp::write_error(out, ENCRYPTED_BITOP_ERR);
+        true
+    } else {
+        false
+    }
+}
 
 fn parse_i64_arg(arg: &[u8], out: &mut BytesMut) -> Option<i64> {
     match parse_i64(arg) {
@@ -21,6 +35,9 @@ fn parse_i64_arg(arg: &[u8], out: &mut BytesMut) -> Option<i64> {
 pub fn cmd_setbit(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() != 4 {
         resp::write_error(out, "ERR wrong number of arguments for 'setbit' command");
+        return CmdResult::Written;
+    }
+    if reject_encrypted_bitop(store, args[1], now, out) {
         return CmdResult::Written;
     }
     let offset = match parse_i64(args[2]) {
@@ -56,6 +73,9 @@ pub fn cmd_getbit(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'getbit' command");
         return CmdResult::Written;
     }
+    if reject_encrypted_bitop(store, args[1], now, out) {
+        return CmdResult::Written;
+    }
     let offset = match parse_i64(args[2]) {
         Ok(o) if o >= 0 => o as u64,
         _ => {
@@ -71,6 +91,9 @@ pub fn cmd_getbit(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
 }
 
 pub fn cmd_bitcount(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() >= 2 && reject_encrypted_bitop(store, args[1], now, out) {
+        return CmdResult::Written;
+    }
     if args.len() < 2 {
         resp::write_error(out, "ERR wrong number of arguments for 'bitcount' command");
         return CmdResult::Written;
@@ -119,6 +142,9 @@ pub fn cmd_bitcount(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
 pub fn cmd_bitpos(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 3 {
         resp::write_error(out, "ERR wrong number of arguments for 'bitpos' command");
+        return CmdResult::Written;
+    }
+    if reject_encrypted_bitop(store, args[1], now, out) {
         return CmdResult::Written;
     }
     let bit = match args[2] {
@@ -180,6 +206,17 @@ pub fn cmd_bitop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
     }
     let dest = args[2];
     let src_keys: Vec<&[u8]> = args[3..].to_vec();
+    // Refuse if the destination or any source is encrypted: BITOP would either
+    // overwrite an encrypted key with a plaintext result or compute over an
+    // envelope. Guard before any mutation.
+    if reject_encrypted_bitop(store, dest, now, out) {
+        return CmdResult::Written;
+    }
+    for key in &src_keys {
+        if reject_encrypted_bitop(store, key, now, out) {
+            return CmdResult::Written;
+        }
+    }
     for key in &src_keys {
         store.try_promote(key, now);
     }

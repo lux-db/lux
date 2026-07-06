@@ -111,6 +111,8 @@ impl Hasher for FxHasher {
 #[allow(dead_code)]
 pub const MAX_SHARDS: usize = 1024;
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+const RENAME_ENCRYPTED_ERR: &str =
+    "ERR cannot relocate an encrypted key: its ciphertext is bound to the key name and would be unrecoverable at the destination; decrypt and re-set under the new key instead";
 
 pub struct VectorData {
     #[allow(dead_code)]
@@ -1425,6 +1427,24 @@ impl Store {
             .collect()
     }
 
+    /// True if relocating this value to a different key would orphan encrypted
+    /// data, because its AEAD AAD is bound to the key name. Lists use a
+    /// key-independent AAD and vectors stay plaintext in RAM (re-sealed on the
+    /// next write), so both self-heal on a move and are not blocked.
+    pub(crate) fn value_has_key_bound_encryption(value: &StoreValue) -> bool {
+        use crate::encryption::EncryptionKeyring as E;
+        match value {
+            StoreValue::Str(v) => E::is_encrypted_value(v),
+            StoreValue::StrBuf(v) => E::is_encrypted_value(v),
+            StoreValue::Hash(map) => map.values().any(|v| E::is_encrypted_value(v)),
+            StoreValue::Stream(s) => s
+                .entries
+                .values()
+                .any(|fields| fields.iter().any(|(_, v)| E::is_encrypted_value(v))),
+            _ => false,
+        }
+    }
+
     /// Seal a vector (as little-endian f32 bytes) for at-rest storage. AAD binds
     /// the vector's storage key so envelopes can't be swapped between slots.
     pub(crate) fn encrypt_vector(&self, key: &[u8], data: &[f32]) -> Result<Vec<u8>, String> {
@@ -2457,6 +2477,16 @@ impl Store {
 
     pub fn rename(&self, key: &[u8], new_key: &[u8], now: Instant) -> Result<(), String> {
         let old_idx = self.shard_index(key);
+        {
+            // A value whose AEAD AAD is bound to the key name can't be decrypted
+            // at a new key; moving it would orphan it. Refuse rather than lose it.
+            let shard = self.shards[old_idx].read();
+            if let Some(e) = shard.data.get(key) {
+                if !e.is_expired_at(now) && Self::value_has_key_bound_encryption(&e.value) {
+                    return Err(RENAME_ENCRYPTED_ERR.to_string());
+                }
+            }
+        }
         let entry = {
             let mut shard = self.shards[old_idx].write();
             shard.version += 1;
@@ -2499,6 +2529,9 @@ impl Store {
             let ks = src;
             match shard.data.get(ks) {
                 Some(entry) if !entry.is_expired_at(now) => {
+                    if Self::value_has_key_bound_encryption(&entry.value) {
+                        return Err(RENAME_ENCRYPTED_ERR.to_string());
+                    }
                     let ttl = entry.expires_at.map(|exp| exp.duration_since(now));
                     let dv = store_value_to_dump_value(&entry.value);
                     (dv, ttl)
