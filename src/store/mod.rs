@@ -611,6 +611,43 @@ impl Store {
                             disk_remove.push(key.clone());
                         }
                     }
+                    StoreValue::List(list) => {
+                        for elem in list.iter_mut() {
+                            if !crate::encryption::EncryptionKeyring::is_encrypted_value(elem) {
+                                continue;
+                            }
+                            let new_value =
+                                self.encryption()
+                                    .reencrypt("__lux_list", "element", "", elem)?;
+                            mem_delta += new_value.len() as isize - elem.len() as isize;
+                            *elem = Bytes::from(new_value);
+                            count += 1;
+                            shard_changed = true;
+                            disk_remove.push(key.clone());
+                        }
+                    }
+                    StoreValue::Stream(stream) => {
+                        let key_name = key_string(key);
+                        for fields in stream.entries.values_mut() {
+                            for (field, value) in fields.iter_mut() {
+                                if !crate::encryption::EncryptionKeyring::is_encrypted_value(value)
+                                {
+                                    continue;
+                                }
+                                let new_value = self.encryption().reencrypt(
+                                    "__lux_stream",
+                                    field,
+                                    &key_name,
+                                    value,
+                                )?;
+                                mem_delta += new_value.len() as isize - value.len() as isize;
+                                *value = Bytes::from(new_value);
+                                count += 1;
+                                shard_changed = true;
+                                disk_remove.push(key.clone());
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -630,6 +667,11 @@ impl Store {
                 self.remove_from_disk(&key);
             }
         }
+        // Make the rewrap durable: persist the re-wrapped in-memory values and
+        // truncate the WAL so a restart cannot replay the pre-rewrap (old-key)
+        // ciphertext.
+        crate::snapshot::save_and_truncate_wal_consistent(self)
+            .map_err(|e| format!("ERR rewrap persist failed: {e}"))?;
         Ok(count)
     }
 
@@ -665,10 +707,33 @@ impl Store {
                             }
                         }
                     }
+                    StoreValue::List(list) => {
+                        for elem in list.iter() {
+                            if encrypted_value_would_be_orphaned(elem, &remaining) {
+                                return Err(
+                                    "ERR ENC key is still required by encrypted data".to_string()
+                                );
+                            }
+                        }
+                    }
+                    StoreValue::Stream(stream) => {
+                        for fields in stream.entries.values() {
+                            for (_field, value) in fields {
+                                if encrypted_value_would_be_orphaned(value, &remaining) {
+                                    return Err("ERR ENC key is still required by encrypted data"
+                                        .to_string());
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
         }
+        // Persist the re-wrapped values and truncate the WAL before removing the
+        // key, so no stored value or WAL entry still references it.
+        crate::snapshot::save_and_truncate_wal_consistent(self)
+            .map_err(|e| format!("ERR retire persist failed: {e}"))?;
         self.encryption().retire(key_id)
     }
 

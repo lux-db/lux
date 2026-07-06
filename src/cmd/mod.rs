@@ -3852,6 +3852,59 @@ mod tests {
     }
 
     #[test]
+    fn rotate_rewrap_retire_preserves_list_and_stream_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(
+            &store,
+            &[b"RPUSH", b"l", b"list-rotate-secret", b"ENCRYPTED"],
+        );
+        exec(
+            &store,
+            &[
+                b"XADD",
+                b"s",
+                b"*",
+                b"f",
+                b"stream-rotate-secret",
+                b"ENCRYPTED",
+            ],
+        );
+        exec(&store, &[b"ENC", b"ROTATE", b"KEYID", b"k2"]);
+        let rewrap = exec_str(&store, &[b"ENC", b"REWRAP"]);
+        assert!(!rewrap.contains("ERR"), "rewrap: {rewrap}");
+        assert!(
+            exec_str(&store, &[b"ENC", b"RETIRE", b"k1"]).contains("OK"),
+            "retire k1 should succeed once list/stream are rewrapped"
+        );
+
+        // Restart from disk (snapshot re-sealed under k2, WAL truncated): the old
+        // key is gone, so this fails if REWRAP didn't cover list/stream + persist.
+        let restored = Store::new_with_config(config);
+        let _ = crate::snapshot::load(&restored);
+        restored.replay_wal(&Broker::new());
+        let l = exec_str(&restored, &[b"LRANGE", b"l", b"0", b"-1"]);
+        assert!(
+            l.contains("list-rotate-secret"),
+            "list after rotate/retire/restart: {l}"
+        );
+        let s = exec_str(&restored, &[b"XRANGE", b"s", b"-", b"+"]);
+        assert!(
+            s.contains("stream-rotate-secret"),
+            "stream after rotate/retire/restart: {s}"
+        );
+    }
+
+    #[test]
     fn enc_rotate_rewrap_then_retire_preserves_existing_data() {
         let dir = tempfile::tempdir().unwrap();
         let config = Arc::new(ServerConfig {
