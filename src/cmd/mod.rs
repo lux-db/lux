@@ -4157,6 +4157,37 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_overwrite_to_expiry_does_not_resurrect_after_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec_wal(&store, &[b"SET", b"ek", b"orig-secret", b"ENCRYPTED"]);
+        // Overwrite with an already-past absolute expiry: live, the key is gone.
+        exec_wal(
+            &store,
+            &[b"SET", b"ek", b"new-secret", b"EXAT", b"1", b"ENCRYPTED"],
+        );
+        store.fsync_wal();
+
+        // Replay from WAL: the prior encrypted value must NOT come back.
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"GET", b"ek"]);
+        assert!(
+            !got.contains("orig-secret"),
+            "stale encrypted value resurrected after replay: {got}"
+        );
+    }
+
+    #[test]
     fn enc_rotate_rewrap_then_retire_preserves_existing_data() {
         let dir = tempfile::tempdir().unwrap();
         let config = Arc::new(ServerConfig {

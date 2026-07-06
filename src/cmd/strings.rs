@@ -196,6 +196,9 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
         Ok((set, old)) => {
             if set && should_self_log && store.wal_enabled() {
                 if let Some(raw) = store.get_raw_string(args[1], now) {
+                    // Self-log the resolved ciphertext plus the original SET
+                    // options (minus ENCRYPTED), incl. EX/PX/EXAT/PXAT, which
+                    // ENC RAWSET replays faithfully so expiry survives a restart.
                     let mut owned: Vec<Vec<u8>> = Vec::with_capacity(args.len());
                     owned.push(b"ENC".to_vec());
                     owned.push(b"RAWSET".to_vec());

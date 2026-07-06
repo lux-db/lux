@@ -137,6 +137,30 @@ fn cmd_rawset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -
             };
             ttl = Some(Duration::from_millis(ms));
             i += 2;
+        } else if cmd_eq(args[i], b"EXAT") && i + 1 < args.len() {
+            // Absolute epoch-seconds deadline -> remaining duration (0 if past,
+            // so the value replays as already-expired, matching SET ... EXAT).
+            let Ok(secs) = parse_u64(args[i + 1]) else {
+                resp::write_error(out, "ERR value is not an integer or out of range");
+                return CmdResult::Written;
+            };
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            ttl = Some(Duration::from_secs(secs.saturating_sub(now_secs)));
+            i += 2;
+        } else if cmd_eq(args[i], b"PXAT") && i + 1 < args.len() {
+            let Ok(ms) = parse_u64(args[i + 1]) else {
+                resp::write_error(out, "ERR value is not an integer or out of range");
+                return CmdResult::Written;
+            };
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            ttl = Some(Duration::from_millis(ms.saturating_sub(now_ms)));
+            i += 2;
         } else if cmd_eq(args[i], b"NX")
             || cmd_eq(args[i], b"XX")
             || cmd_eq(args[i], b"KEEPTTL")
