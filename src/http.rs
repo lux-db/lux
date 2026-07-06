@@ -634,16 +634,9 @@ async fn stream_table_query(
                     buf.push(',');
                 }
                 first_row = false;
-                buf.push('{');
-                let mut first_col = true;
-                for (k, v) in row {
-                    if !first_col {
-                        buf.push(',');
-                    }
-                    first_col = false;
-                    push_field_value(&mut buf, k, v, &cols);
-                }
-                buf.push('}');
+                let materialize_missing =
+                    plan.projections.is_empty() && plan.alias.is_none() && plan.joins.is_empty();
+                push_row_object(&mut buf, row, &cols, materialize_missing);
 
                 if buf.len() >= CHUNK_SIZE {
                     write_chunk(socket, buf.as_bytes()).await?;
@@ -2936,7 +2929,12 @@ fn route_table_query(
         Ok((_, mut plan)) => {
             plan.decrypt_authorized = decrypt_authorized;
             match crate::tables::table_select(store, cache, &plan, now) {
-                Ok(result) => ok(select_result_to_json(result, &cols)),
+                Ok(result) => {
+                    let materialize_missing = plan.projections.is_empty()
+                        && plan.alias.is_none()
+                        && plan.joins.is_empty();
+                    ok(select_result_to_json(result, &cols, materialize_missing))
+                }
                 Err(e) => (
                     400,
                     "Bad Request",
@@ -3537,6 +3535,7 @@ fn reserved_auth_table_exec_read_error(command: &[String]) -> Option<String> {
 /// (`[1,2,3]`) to match the `number[]` type the SDK generates.
 #[derive(Default)]
 struct RenderCols {
+    fields: Vec<String>,
     json: std::collections::HashSet<String>,
     number: std::collections::HashSet<String>,
     bool_: std::collections::HashSet<String>,
@@ -3552,6 +3551,7 @@ fn render_columns(
     let mut cols = RenderCols::default();
     if let Ok(fields) = crate::tables::load_schema(store, cache, table, now) {
         for f in fields {
+            cols.fields.push(f.name.clone());
             match f.field_type {
                 crate::tables::FieldType::Json | crate::tables::FieldType::Array => {
                     cols.json.insert(f.name);
@@ -3609,7 +3609,17 @@ fn push_field_value(out: &mut String, key: &str, v: &str, cols: &RenderCols) {
     }
 }
 
-fn select_result_to_json(result: crate::tables::SelectResult, cols: &RenderCols) -> String {
+fn push_null_field(out: &mut String, key: &str) {
+    out.push('"');
+    push_escaped(out, key);
+    out.push_str("\":null");
+}
+
+fn select_result_to_json(
+    result: crate::tables::SelectResult,
+    cols: &RenderCols,
+    materialize_missing: bool,
+) -> String {
     match result {
         crate::tables::SelectResult::Rows(rows) => {
             // Estimate ~80 bytes per field, 4 fields avg per row - better than 64 flat
@@ -3622,16 +3632,7 @@ fn select_result_to_json(result: crate::tables::SelectResult, cols: &RenderCols)
                     out.push(',');
                 }
                 first_row = false;
-                out.push('{');
-                let mut first_col = true;
-                for (k, v) in &row {
-                    if !first_col {
-                        out.push(',');
-                    }
-                    first_col = false;
-                    push_field_value(&mut out, k, v, cols);
-                }
-                out.push('}');
+                push_row_object(&mut out, &row, cols, materialize_missing);
             }
             out.push_str("]}");
             out
@@ -3664,7 +3665,12 @@ fn select_result_to_json(result: crate::tables::SelectResult, cols: &RenderCols)
 
 /// Serialize a single row (from table_get) as a JSON object.
 /// Append a single row as a bare JSON object `{...}` (no `result` wrapper).
-fn push_row_object(out: &mut String, row: &[(String, String)], cols: &RenderCols) {
+fn push_row_object(
+    out: &mut String,
+    row: &[(String, String)],
+    cols: &RenderCols,
+    materialize_missing: bool,
+) {
     out.push('{');
     let mut first = true;
     for (k, v) in row {
@@ -3674,13 +3680,25 @@ fn push_row_object(out: &mut String, row: &[(String, String)], cols: &RenderCols
         first = false;
         push_field_value(out, k, v, cols);
     }
+    if materialize_missing {
+        for field in &cols.fields {
+            if row.iter().any(|(k, _)| k == field) {
+                continue;
+            }
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            push_null_field(out, field);
+        }
+    }
     out.push('}');
 }
 
 fn row_to_json_object(row: &[(String, String)], cols: &RenderCols) -> String {
     let mut out = String::with_capacity(row.len() * 32 + 12);
     out.push_str(r#"{"result":"#);
-    push_row_object(&mut out, row, cols);
+    push_row_object(&mut out, row, cols, true);
     out.push('}');
     out
 }
@@ -3693,7 +3711,7 @@ fn rows_to_json_array(rows: &[Vec<(String, String)>], cols: &RenderCols) -> Stri
         if i > 0 {
             out.push(',');
         }
-        push_row_object(&mut out, row, cols);
+        push_row_object(&mut out, row, cols, true);
     }
     out.push_str("]}");
     out
@@ -3956,7 +3974,7 @@ mod tests {
         let mut cols = RenderCols::default();
         cols.json.insert("payload".to_string());
         cols.json.insert("tags".to_string());
-        let out = select_result_to_json(crate::tables::SelectResult::Rows(rows), &cols);
+        let out = select_result_to_json(crate::tables::SelectResult::Rows(rows), &cols, true);
         assert!(out.contains(r#""payload":{"a":1}"#), "json raw: {out}");
         assert!(out.contains(r#""tags":[1,2]"#), "array raw: {out}");
         assert!(
@@ -4028,7 +4046,8 @@ mod tests {
             ("empty_vec".to_string(), String::new()),
         ]];
         cols.vector.insert("empty_vec".to_string());
-        let out = select_result_to_json(crate::tables::SelectResult::Rows(rows.clone()), &cols);
+        let out =
+            select_result_to_json(crate::tables::SelectResult::Rows(rows.clone()), &cols, true);
         assert!(
             out.contains(r#""embedding":[0.1,0.2,0.3]"#),
             "select: {out}"
@@ -4044,6 +4063,77 @@ mod tests {
             out.contains(r#""embedding":[0.1,0.2,0.3]"#),
             "returning: {out}"
         );
+    }
+
+    #[test]
+    fn missing_schema_columns_render_as_null_for_full_rows() {
+        let rows = vec![vec![
+            ("id".to_string(), "1".to_string()),
+            ("body".to_string(), "edited".to_string()),
+        ]];
+        let mut cols = RenderCols::default();
+        cols.fields.push("id".to_string());
+        cols.fields.push("body".to_string());
+        cols.fields.push("created_at".to_string());
+        cols.number.insert("id".to_string());
+        cols.number.insert("created_at".to_string());
+
+        let out = rows_to_json_array(&rows, &cols);
+        assert!(out.contains(r#""id":1"#), "id typed: {out}");
+        assert!(out.contains(r#""body":"edited""#), "body present: {out}");
+        assert!(
+            out.contains(r#""created_at":null"#),
+            "absent nullable column materialized as null: {out}"
+        );
+    }
+
+    #[test]
+    fn explicit_select_does_not_materialize_missing_schema_columns() {
+        let rows = vec![vec![("body".to_string(), "edited".to_string())]];
+        let mut cols = RenderCols::default();
+        cols.fields.push("id".to_string());
+        cols.fields.push("body".to_string());
+        cols.fields.push("created_at".to_string());
+
+        let out = select_result_to_json(crate::tables::SelectResult::Rows(rows), &cols, false);
+        assert_eq!(out, r#"{"result":[{"body":"edited"}]}"#);
+    }
+
+    #[test]
+    fn update_returning_materializes_absent_nullable_columns_as_null() {
+        let store = Arc::new(Store::new());
+        let cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let broker = Broker::new();
+        let script_engine = Arc::new(lua::ScriptEngine::new());
+        let now = Instant::now();
+
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "messages",
+            &["id INT PRIMARY KEY,", "body STR,", "created_at TIMESTAMP"],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_insert(&store, &cache, "messages", &[("body", "hi")], now).unwrap();
+
+        let params = vec![("where".to_string(), "id = 1".to_string())];
+        let (status, _, body) = route_table_update(
+            "messages",
+            &params,
+            r#"{"body":"edited"}"#,
+            &store,
+            &broker,
+            &cache,
+            &script_engine,
+            &HttpAuthContext::Operator,
+        );
+
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""id":1"#), "{body}");
+        assert!(body.contains(r#""body":"edited""#), "{body}");
+        assert!(body.contains(r#""created_at":null"#), "{body}");
     }
 
     fn encrypted_http_fixture() -> (
