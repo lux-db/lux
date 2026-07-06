@@ -554,6 +554,72 @@ impl Store {
         &self.encryption
     }
 
+    /// Rewrap any encrypted values inside a cold-tier `DumpValue` under the
+    /// current keyset. Returns true if anything was re-encrypted. Mirrors the
+    /// in-memory rewrap AAD slots. Vectors never cold-tier (pinned hot).
+    fn reencrypt_cold_dump_value(&self, key: &str, value: &mut DumpValue) -> Result<bool, String> {
+        use crate::encryption::EncryptionKeyring as E;
+        let mut changed = false;
+        match value {
+            DumpValue::Str(v) => {
+                if E::is_encrypted_value(v) {
+                    *v = self.encryption().reencrypt("__lux_kv", "value", key, v)?;
+                    changed = true;
+                }
+            }
+            DumpValue::Hash(pairs) => {
+                for (field, v) in pairs.iter_mut() {
+                    if E::is_encrypted_value(v) {
+                        *v = self.encryption().reencrypt("__lux_hash", field, key, v)?;
+                        changed = true;
+                    }
+                }
+            }
+            DumpValue::List(items) => {
+                for v in items.iter_mut() {
+                    if E::is_encrypted_value(v) {
+                        *v = self
+                            .encryption()
+                            .reencrypt("__lux_list", "element", "", v)?;
+                        changed = true;
+                    }
+                }
+            }
+            DumpValue::Stream(entries, _, _) => {
+                for (_id, fields) in entries.iter_mut() {
+                    for (field, v) in fields.iter_mut() {
+                        if E::is_encrypted_value(v) {
+                            *v = self.encryption().reencrypt("__lux_stream", field, key, v)?;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(changed)
+    }
+
+    /// True if any encrypted value in a cold-tier `DumpValue` would become
+    /// undecryptable without the retiring key.
+    fn dump_value_would_orphan(value: &DumpValue, remaining: &HashSet<String>) -> bool {
+        match value {
+            DumpValue::Str(v) => encrypted_value_would_be_orphaned(v, remaining),
+            DumpValue::Hash(pairs) => pairs
+                .iter()
+                .any(|(_, v)| encrypted_value_would_be_orphaned(v, remaining)),
+            DumpValue::List(items) => items
+                .iter()
+                .any(|v| encrypted_value_would_be_orphaned(v, remaining)),
+            DumpValue::Stream(entries, _, _) => entries.iter().any(|(_, fields)| {
+                fields
+                    .iter()
+                    .any(|(_, v)| encrypted_value_would_be_orphaned(v, remaining))
+            }),
+            _ => false,
+        }
+    }
+
     pub(crate) fn enc_rewrap_all(&self) -> Result<usize, String> {
         let mut count = 0usize;
         for idx in 0..self.shards.len() {
@@ -673,6 +739,23 @@ impl Store {
                 self.remove_from_disk(&key);
             }
         }
+        // Cold-tiered encrypted values live on disk, invisible to the in-RAM
+        // pass above; rewrap them in place too so a later RETIRE can't orphan them.
+        if let Some(disk_shards) = &self.disk_shards {
+            for ds in disk_shards.iter() {
+                let mut disk = ds.lock();
+                let entries = disk
+                    .dump_all(Instant::now())
+                    .map_err(|e| format!("ERR rewrap cold read failed: {e}"))?;
+                for mut entry in entries {
+                    if self.reencrypt_cold_dump_value(&entry.key, &mut entry.value)? {
+                        disk.put(&entry.key, &entry)
+                            .map_err(|e| format!("ERR rewrap cold write failed: {e}"))?;
+                        count += 1;
+                    }
+                }
+            }
+        }
         // Make the rewrap durable: persist re-wrapped in-memory values, re-seal
         // encrypted vectors (plaintext in RAM) under the current keyset, and
         // truncate the WAL so a restart can't replay pre-rewrap (old-key) bytes.
@@ -733,6 +816,21 @@ impl Store {
                         }
                     }
                     _ => {}
+                }
+            }
+        }
+        // Cold-tiered encrypted values are invisible to the in-RAM scan above;
+        // scan the disk tier too so we never retire a key they still need.
+        if let Some(disk_shards) = &self.disk_shards {
+            for ds in disk_shards.iter() {
+                let mut disk = ds.lock();
+                let entries = disk
+                    .dump_all(Instant::now())
+                    .map_err(|e| format!("ERR retire cold scan failed: {e}"))?;
+                for entry in &entries {
+                    if Self::dump_value_would_orphan(&entry.value, &remaining) {
+                        return Err("ERR ENC key is still required by encrypted data".to_string());
+                    }
                 }
             }
         }

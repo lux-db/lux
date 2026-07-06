@@ -4087,6 +4087,39 @@ mod tests {
     }
 
     #[test]
+    fn cold_tiered_encrypted_value_survives_rotate_rewrap_retire() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(&store, &[b"SET", b"cold", b"cold-secret", b"ENCRYPTED"]);
+        // Force it onto the cold tier (where the rewrap/retire guard was blind).
+        let idx = store.shard_for_key(b"cold");
+        assert!(
+            store.evict_key(idx, b"cold"),
+            "value should evict to cold tier"
+        );
+        exec(&store, &[b"ENC", b"ROTATE", b"KEYID", b"k2"]);
+        assert!(!exec_str(&store, &[b"ENC", b"REWRAP"]).contains("ERR"));
+        // Retire must succeed (cold value rewrapped) and the value must survive.
+        assert!(
+            exec_str(&store, &[b"ENC", b"RETIRE", b"k1"]).contains("OK"),
+            "retire should succeed once the cold value is rewrapped"
+        );
+        assert!(
+            exec_str(&store, &[b"GET", b"cold"]).contains("cold-secret"),
+            "cold-tiered encrypted value must survive rotate+rewrap+retire"
+        );
+    }
+
+    #[test]
     fn enc_rotate_rewrap_then_retire_preserves_existing_data() {
         let dir = tempfile::tempdir().unwrap();
         let config = Arc::new(ServerConfig {
