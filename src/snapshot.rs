@@ -133,7 +133,7 @@ fn save_entries(store: &Store, entries: &[crate::store::DumpEntry]) -> io::Resul
     let tmp = format!("{path}.{}.tmp", std::process::id());
     let file = fs::File::create(&tmp)?;
     let mut w = BufWriter::new(file);
-    save_binary(&mut w, entries)?;
+    save_binary(&mut w, entries, store)?;
     w.into_inner().map_err(io::Error::other)?.sync_all()?;
     fs::rename(&tmp, &path)?;
     Ok(entries.len())
@@ -221,7 +221,11 @@ fn purge_lux_storage_shards(storage_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn save_binary(w: &mut impl Write, entries: &[crate::store::DumpEntry]) -> io::Result<()> {
+fn save_binary(
+    w: &mut impl Write,
+    entries: &[crate::store::DumpEntry],
+    store: &Store,
+) -> io::Result<()> {
     w.write_all(HEADER)?;
     for entry in entries {
         let type_byte: u8 = match &entry.value {
@@ -231,7 +235,8 @@ fn save_binary(w: &mut impl Write, entries: &[crate::store::DumpEntry]) -> io::R
             DumpValue::Set(_) => b'T',
             DumpValue::SortedSet(_) => b'Z',
             DumpValue::Stream(..) => b'X',
-            DumpValue::Vector(..) => b'V',
+            DumpValue::Vector(_, _, true) => b'W',
+            DumpValue::Vector(_, _, false) => b'V',
             DumpValue::HyperLogLog(..) => b'P',
             DumpValue::TimeSeries(..) => b'I',
         };
@@ -308,10 +313,18 @@ fn save_binary(w: &mut impl Write, entries: &[crate::store::DumpEntry]) -> io::R
                     }
                 }
             }
-            DumpValue::Vector(data, metadata) => {
-                write_u32(w, data.len() as u32)?;
-                for f in data {
-                    w.write_all(&f.to_le_bytes())?;
+            DumpValue::Vector(data, metadata, encrypted) => {
+                if *encrypted {
+                    // Seal the f32 payload; the 'W' type byte marks it encrypted.
+                    let sealed = store
+                        .encrypt_vector(entry.key.as_bytes(), data)
+                        .map_err(io::Error::other)?;
+                    write_bytes(w, &sealed)?;
+                } else {
+                    write_u32(w, data.len() as u32)?;
+                    for f in data {
+                        w.write_all(&f.to_le_bytes())?;
+                    }
                 }
                 match metadata {
                     Some(m) => {
@@ -507,7 +520,22 @@ pub(crate) fn load_binary(
                 } else {
                     None
                 };
-                DumpValue::Vector(data, metadata)
+                DumpValue::Vector(data, metadata, false)
+            }
+            b'W' => {
+                // Encrypted vector: sealed f32 payload, decrypted with the key.
+                let sealed = read_bytes(r)?;
+                let mut flag = [0u8; 1];
+                r.read_exact(&mut flag)?;
+                let metadata = if flag[0] == 1 {
+                    Some(read_string(r)?)
+                } else {
+                    None
+                };
+                let data = store
+                    .decrypt_vector(key.as_bytes(), &sealed)
+                    .map_err(io::Error::other)?;
+                DumpValue::Vector(data, metadata, true)
             }
             b'P' => {
                 let len = read_sized_count(r, "hyperloglog register", 1)?;
@@ -731,7 +759,7 @@ fn save_to_path(store: &Store, path: &str) -> io::Result<usize> {
     let tmp = format!("{path}.tmp");
     let file = fs::File::create(&tmp)?;
     let mut w = BufWriter::new(file);
-    save_binary(&mut w, &entries)?;
+    save_binary(&mut w, &entries, store)?;
     w.into_inner().map_err(io::Error::other)?.sync_all()?;
     fs::rename(&tmp, path)?;
     Ok(entries.len())

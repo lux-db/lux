@@ -2320,6 +2320,10 @@ fn command_self_logs_wal_args(args: &[&[u8]], store: &Store, now: Instant) -> bo
             return encrypted || store.hash_fields_need_encryption(args[1], &fields, now);
         }
     }
+    if cmd_eq(cmd, b"VSET") {
+        // Encrypted VSET self-logs ENC RAWVSET with the sealed payload.
+        return args.iter().any(|arg| cmd_eq(arg, b"ENCRYPTED"));
+    }
     false
 }
 
@@ -3837,7 +3841,7 @@ mod tests {
             ],
         ))
         .to_string();
-        assert!(out.contains('-'), "{out}"); // resolved stream id like <ms>-<seq>
+        assert!(out.contains('-'), "{out}");
         store.fsync_wal();
         let wal = read_wal_bytes(dir.path());
         assert!(!wal
@@ -3849,6 +3853,77 @@ mod tests {
         let got = exec_str(&restored, &[b"XRANGE", b"stream:1", b"-", b"+"]);
         assert!(got.contains("stream-secret-value"), "{got}");
         assert!(got.contains("payload"), "{got}");
+    }
+
+    #[test]
+    fn encrypted_vset_self_logs_ciphertext_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        let out = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[
+                b"VSET",
+                b"emb:1",
+                b"3",
+                b"1.5",
+                b"2.5",
+                b"3.5",
+                b"ENCRYPTED",
+            ],
+        ))
+        .to_string();
+        assert!(out.contains("OK"), "{out}");
+        store.fsync_wal();
+        let wal = read_wal_bytes(dir.path());
+        assert!(
+            wal.windows(b"RAWVSET".len()).any(|w| w == b"RAWVSET"),
+            "encrypted VSET must self-log ENC RAWVSET"
+        );
+        assert!(
+            !wal.windows(b"2.5".len()).any(|w| w == b"2.5"),
+            "WAL must not contain the plaintext vector components"
+        );
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"VGET", b"emb:1"]);
+        assert!(
+            got.contains("1.5") && got.contains("2.5") && got.contains("3.5"),
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn encrypt_vector_roundtrips_and_hides_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        }));
+        store.encryption().init(Some("k1")).unwrap();
+        let v = vec![1.5f32, -2.25, 3.0, 0.125];
+        let sealed = store.encrypt_vector(b"emb:1", &v).unwrap();
+
+        let mut plain = Vec::new();
+        for f in &v {
+            plain.extend_from_slice(&f.to_le_bytes());
+        }
+        assert!(
+            !sealed.windows(plain.len()).any(|w| w == plain.as_slice()),
+            "plaintext vector bytes leaked into the envelope"
+        );
+
+        assert_eq!(store.decrypt_vector(b"emb:1", &sealed).unwrap(), v);
+        assert!(store.decrypt_vector(b"other:key", &sealed).is_err());
     }
 
     #[test]
@@ -3887,8 +3962,6 @@ mod tests {
             "retire k1 should succeed once list/stream are rewrapped"
         );
 
-        // Restart from disk (snapshot re-sealed under k2, WAL truncated): the old
-        // key is gone, so this fails if REWRAP didn't cover list/stream + persist.
         let restored = Store::new_with_config(config);
         let _ = crate::snapshot::load(&restored);
         restored.replay_wal(&Broker::new());
@@ -3901,6 +3974,45 @@ mod tests {
         assert!(
             s.contains("stream-rotate-secret"),
             "stream after rotate/retire/restart: {s}"
+        );
+    }
+
+    #[test]
+    fn rotate_rewrap_retire_preserves_vector_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(
+            &store,
+            &[
+                b"VSET",
+                b"emb:1",
+                b"3",
+                b"1.5",
+                b"2.5",
+                b"3.5",
+                b"ENCRYPTED",
+            ],
+        );
+        exec(&store, &[b"ENC", b"ROTATE", b"KEYID", b"k2"]);
+        assert!(!exec_str(&store, &[b"ENC", b"REWRAP"]).contains("ERR"));
+        assert!(exec_str(&store, &[b"ENC", b"RETIRE", b"k1"]).contains("OK"));
+
+        let restored = Store::new_with_config(config);
+        let _ = crate::snapshot::load(&restored);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"VGET", b"emb:1"]);
+        assert!(
+            got.contains("1.5") && got.contains("2.5") && got.contains("3.5"),
+            "vector after rotate/retire/restart: {got}"
         );
     }
 

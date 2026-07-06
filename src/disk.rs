@@ -951,7 +951,10 @@ pub fn write_single_entry(w: &mut impl Write, entry: &DumpEntry) -> io::Result<(
             }
             write_stream_groups(w, groups)?;
         }
-        DumpValue::Vector(data, metadata) => {
+        // Vectors are pinned to the hot tier (eviction skips them), so an
+        // encrypted vector never reaches cold-tier disk; the flag is not
+        // persisted here and reads back as plaintext.
+        DumpValue::Vector(data, metadata, _) => {
             write_u32(w, data.len() as u32)?;
             for f in data {
                 w.write_all(&f.to_le_bytes())?;
@@ -1063,7 +1066,7 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
             } else {
                 None
             };
-            DumpValue::Vector(data, metadata)
+            DumpValue::Vector(data, metadata, false)
         }
         b'P' => {
             let len = read_u32(r)? as usize;
@@ -1449,7 +1452,7 @@ mod tests {
                 prop::collection::vec(-1e6f32..1e6f32, 0..64),
                 prop::option::of(arb_string())
             )
-                .prop_map(|(data, meta)| DumpValue::Vector(data, meta)),
+                .prop_map(|(data, meta)| DumpValue::Vector(data, meta, false)),
             prop::collection::vec(any::<u8>(), 0..256).prop_map(|regs| {
                 let cached = crate::hll::hll_count(&regs);
                 DumpValue::HyperLogLog(regs, cached)
@@ -1497,7 +1500,9 @@ mod tests {
             (DumpValue::Stream(ae, al, ag), DumpValue::Stream(be, bl, bg)) => {
                 ae == be && al == bl && ag == bg
             }
-            (DumpValue::Vector(ad, am), DumpValue::Vector(bd, bm)) => ad == bd && am == bm,
+            (DumpValue::Vector(ad, am, ae), DumpValue::Vector(bd, bm, be)) => {
+                ad == bd && am == bm && ae == be
+            }
             (DumpValue::HyperLogLog(ar, _), DumpValue::HyperLogLog(br, _)) => ar == br,
             (DumpValue::TimeSeries(as_, ar, al), DumpValue::TimeSeries(bs, br, bl)) => {
                 as_ == bs && ar == br && al == bl

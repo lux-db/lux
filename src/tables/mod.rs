@@ -799,9 +799,9 @@ fn field_supports_encryption(field: &FieldDef) -> Result<(), String> {
             field.name
         ));
     }
-    if matches!(field.field_type, FieldType::Vector(_)) {
+    if field.searchable && matches!(field.field_type, FieldType::Vector(_)) {
         return Err(format!(
-            "ERR encrypted column '{}' cannot use VECTOR type",
+            "ERR encrypted VECTOR column '{}' cannot be SEARCHABLE (similarity search uses the in-memory index, not a blind index)",
             field.name
         ));
     }
@@ -2024,7 +2024,14 @@ fn add_to_index(
                 })
                 .to_string();
                 let vkey = table_vector_key(table, &field.name, pk_str);
-                store.vset(vkey.as_bytes(), vector, Some(metadata), None, now);
+                store.vset(
+                    vkey.as_bytes(),
+                    vector,
+                    Some(metadata),
+                    None,
+                    field.encrypted,
+                    now,
+                );
             }
         }
         // JSON/ARRAY columns are not auto-indexed; only declared path indexes apply.
@@ -4033,7 +4040,10 @@ mod tests {
     fn encrypted_field_rejects_invalid_combinations() {
         assert!(parse_field_def("id UUID PRIMARY KEY ENCRYPTED").is_err());
         assert!(parse_field_def("owner UUID REFERENCES users(id) ENCRYPTED").is_err());
-        assert!(parse_field_def("embedding VECTOR(3) ENCRYPTED").is_err());
+        // Encrypted VECTOR columns are allowed (at-rest); only SEARCHABLE on an
+        // encrypted vector is rejected (no blind index for similarity search).
+        assert!(parse_field_def("embedding VECTOR(3) ENCRYPTED").is_ok());
+        assert!(parse_field_def("embedding VECTOR(3) ENCRYPTED SEARCHABLE").is_err());
         assert!(parse_field_def("token STR SEARCHABLE").is_err());
         assert!(parse_field_def("token STR ENCRYPTED UNIQUE").is_err());
         assert!(parse_field_def("token STR ENCRYPTED DEFAULT seeded").is_err());

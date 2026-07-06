@@ -117,6 +117,10 @@ pub struct VectorData {
     pub dims: u32,
     pub data: Vec<f32>,
     pub metadata: Option<String>,
+    /// When true this vector is encrypted at rest: the in-memory `data` stays
+    /// plaintext (HNSW/search need it), but it is sealed when written to the
+    /// snapshot and self-logged as ciphertext in the WAL.
+    pub encrypted: bool,
 }
 
 pub struct TimeSeriesData {
@@ -667,9 +671,9 @@ impl Store {
                 self.remove_from_disk(&key);
             }
         }
-        // Make the rewrap durable: persist the re-wrapped in-memory values and
-        // truncate the WAL so a restart cannot replay the pre-rewrap (old-key)
-        // ciphertext.
+        // Make the rewrap durable: persist re-wrapped in-memory values, re-seal
+        // encrypted vectors (plaintext in RAM) under the current keyset, and
+        // truncate the WAL so a restart can't replay pre-rewrap (old-key) bytes.
         crate::snapshot::save_and_truncate_wal_consistent(self)
             .map_err(|e| format!("ERR rewrap persist failed: {e}"))?;
         Ok(count)
@@ -730,8 +734,9 @@ impl Store {
                 }
             }
         }
-        // Persist the re-wrapped values and truncate the WAL before removing the
-        // key, so no stored value or WAL entry still references it.
+        // Re-seal all at-rest data (in-memory values + plaintext-in-RAM vectors)
+        // under the current keyset and truncate the WAL before removing the key,
+        // so nothing persisted still references it.
         crate::snapshot::save_and_truncate_wal_consistent(self)
             .map_err(|e| format!("ERR retire persist failed: {e}"))?;
         self.encryption().retire(key_id)
@@ -1418,6 +1423,33 @@ impl Store {
                 (f.clone(), dv)
             })
             .collect()
+    }
+
+    /// Seal a vector (as little-endian f32 bytes) for at-rest storage. AAD binds
+    /// the vector's storage key so envelopes can't be swapped between slots.
+    pub(crate) fn encrypt_vector(&self, key: &[u8], data: &[f32]) -> Result<Vec<u8>, String> {
+        let key_name = Self::user_kv_key(key);
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for f in data {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        self.encryption()
+            .encrypt("__lux_vec", "data", &key_name, &bytes)
+    }
+
+    /// Decrypt a sealed vector back into f32 values.
+    pub(crate) fn decrypt_vector(&self, key: &[u8], envelope: &[u8]) -> Result<Vec<f32>, String> {
+        let key_name = Self::user_kv_key(key);
+        let bytes = self
+            .encryption()
+            .decrypt("__lux_vec", "data", &key_name, envelope)?;
+        if !bytes.len().is_multiple_of(4) {
+            return Err("ERR corrupt encrypted vector payload".to_string());
+        }
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     }
 
     pub(crate) fn decrypt_hash_field_value(
@@ -3342,7 +3374,7 @@ impl Store {
                     groups,
                 })
             }
-            DumpValue::Vector(data, metadata) => {
+            DumpValue::Vector(data, metadata, encrypted) => {
                 let dims = data.len() as u32;
                 let index_data = data.clone();
                 let key_clone = key.clone();
@@ -3350,6 +3382,7 @@ impl Store {
                     dims,
                     data,
                     metadata,
+                    encrypted,
                 });
                 let expires_at = ttl.map(|d| Instant::now() + d);
                 let mem = estimate_entry_memory(&key, &sv);
@@ -4848,7 +4881,7 @@ fn store_value_to_dump_value(value: &StoreValue) -> DumpValue {
                 .collect();
             DumpValue::Stream(entries, s.last_id.to_string(), groups)
         }
-        StoreValue::Vector(v) => DumpValue::Vector(v.data.clone(), v.metadata.clone()),
+        StoreValue::Vector(v) => DumpValue::Vector(v.data.clone(), v.metadata.clone(), v.encrypted),
         StoreValue::HyperLogLog(regs, cached) => DumpValue::HyperLogLog(regs.clone(), *cached),
         StoreValue::TimeSeries(ts) => {
             DumpValue::TimeSeries(ts.samples.clone(), ts.retention, ts.labels.clone())
@@ -4874,7 +4907,9 @@ pub enum DumpValue {
     Set(Vec<String>),
     SortedSet(Vec<(String, f64)>),
     Stream(Vec<StreamDumpEntry>, String, Vec<StreamGroupDump>),
-    Vector(Vec<f32>, Option<String>),
+    /// f32 data, metadata, and whether it is encrypted-at-rest (sealed in the
+    /// snapshot; the in-memory copy is plaintext).
+    Vector(Vec<f32>, Option<String>, bool),
     HyperLogLog(Vec<u8>, u64),
     TimeSeries(Vec<(i64, f64)>, u64, Vec<(String, String)>),
 }
@@ -6097,8 +6132,8 @@ mod tests {
     fn vector_search_indexes_are_dimension_scoped() {
         let store = Store::new();
         let n = now();
-        store.vset(b"two_dim", vec![1.0, 0.0], None, None, n);
-        store.vset(b"three_dim", vec![0.0, 1.0, 0.0], None, None, n);
+        store.vset(b"two_dim", vec![1.0, 0.0], None, None, false, n);
+        store.vset(b"three_dim", vec![0.0, 1.0, 0.0], None, None, false, n);
 
         let two_dim = store.vsearch(&[1.0, 0.0], 1, None, None, n);
         assert_eq!(

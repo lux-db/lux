@@ -94,6 +94,9 @@ pub fn cmd_enc(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
     if cmd_eq(args[1], b"RAWRPUSH") {
         return cmd_rawlpush(args, store, out, now, false);
     }
+    if cmd_eq(args[1], b"RAWVSET") {
+        return cmd_rawvset(args, store, out, now);
+    }
     resp::write_error(out, "ERR unknown ENC subcommand");
     CmdResult::Written
 }
@@ -187,5 +190,44 @@ fn cmd_rawlpush(
         Ok(_) => resp::write_ok(out),
         Err(err) => resp::write_error(out, &err),
     }
+    CmdResult::Written
+}
+
+/// Replay form of an encrypted VSET: decrypts the sealed payload back to f32 and
+/// re-inserts (rebuilding the in-memory index), preserving the encrypted flag.
+fn cmd_rawvset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 4 {
+        resp::write_error(
+            out,
+            "ERR usage: ENC RAWVSET <key> <ciphertext> [META <m>] [EX <s>]",
+        );
+        return CmdResult::Written;
+    }
+    let key = args[2];
+    let data = match store.decrypt_vector(key, args[3]) {
+        Ok(d) => d,
+        Err(err) => {
+            resp::write_error(out, &err);
+            return CmdResult::Written;
+        }
+    };
+    let mut metadata = None;
+    let mut ttl = None;
+    let mut i = 4;
+    while i < args.len() {
+        if cmd_eq(args[i], b"META") && i + 1 < args.len() {
+            metadata = Some(String::from_utf8_lossy(args[i + 1]).to_string());
+            i += 2;
+        } else if cmd_eq(args[i], b"EX") && i + 1 < args.len() {
+            if let Ok(s) = parse_u64(args[i + 1]) {
+                ttl = Some(Duration::from_secs(s));
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    store.vset(key, data, metadata, ttl, true, now);
+    resp::write_ok(out);
     CmdResult::Written
 }
