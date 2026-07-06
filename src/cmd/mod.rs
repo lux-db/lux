@@ -3831,6 +3831,47 @@ mod tests {
     }
 
     #[test]
+    fn rotate_rewrap_retire_preserves_vector_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(
+            &store,
+            &[
+                b"VSET",
+                b"emb:1",
+                b"3",
+                b"1.5",
+                b"2.5",
+                b"3.5",
+                b"ENCRYPTED",
+            ],
+        );
+        exec(&store, &[b"ENC", b"ROTATE", b"KEYID", b"k2"]);
+        assert!(!exec_str(&store, &[b"ENC", b"REWRAP"]).contains("ERR"));
+        assert!(exec_str(&store, &[b"ENC", b"RETIRE", b"k1"]).contains("OK"));
+
+        // Restart from disk: the vector's snapshot envelope must have been
+        // re-sealed under k2 (old key retired), else decrypt-on-load fails.
+        let restored = Store::new_with_config(config);
+        let _ = crate::snapshot::load(&restored);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"VGET", b"emb:1"]);
+        assert!(
+            got.contains("1.5") && got.contains("2.5") && got.contains("3.5"),
+            "vector after rotate/retire/restart: {got}"
+        );
+    }
+
+    #[test]
     fn enc_rotate_rewrap_then_retire_preserves_existing_data() {
         let dir = tempfile::tempdir().unwrap();
         let config = Arc::new(ServerConfig {

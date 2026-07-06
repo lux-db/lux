@@ -634,6 +634,11 @@ impl Store {
                 self.remove_from_disk(&key);
             }
         }
+        // Encrypted vectors keep plaintext in RAM (nothing to rewrap in place),
+        // but their at-rest envelope must be re-sealed under the current keyset;
+        // a consistent save rewrites it and truncates the WAL.
+        crate::snapshot::save_and_truncate_wal_consistent(self)
+            .map_err(|e| format!("ERR rewrap persist failed: {e}"))?;
         Ok(count)
     }
 
@@ -673,6 +678,11 @@ impl Store {
                 }
             }
         }
+        // Re-seal at-rest data (including plaintext-in-RAM vectors, whose disk
+        // envelope is rewritten under the current keyset) and truncate the WAL
+        // before removing the key, so nothing persisted still references it.
+        crate::snapshot::save_and_truncate_wal_consistent(self)
+            .map_err(|e| format!("ERR retire persist failed: {e}"))?;
         self.encryption().retire(key_id)
     }
 
