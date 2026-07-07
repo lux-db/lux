@@ -115,6 +115,29 @@ const { data: deleted } = await lux
   .eq("id", inserted?.id);
 ```
 
+### Point access by primary key
+
+When you already know a row's primary key, skip the query builder entirely and
+address the row directly with `.row(pk)`. It works for any PK type (int, UUID,
+string).
+
+```ts
+// read the whole row, or a single column
+const { data: user } = await lux.table<User>("users").row(123).get();
+const { data: age }  = await lux.table<User>("users").row(123).get("age");
+
+// point-update one cell, or several at once
+await lux.table("users").row(123).set("age", 30);
+await lux.table("users").row(123).set({ age: 30, name: "Ada" });
+```
+
+`.set()` updates an existing row (it is not an upsert) and resolves to the
+updated row. On the wire this is a direct cell write, not a `WHERE` query, so it
+skips the query planner — but it still runs the full table write path: column
+types, unique constraints, secondary/JSON indexes, encryption, TTL, and `.live()`
+change events are all enforced, and reads and writes are grant-checked exactly
+like the query builder. It is a typed fast path, not raw key/value access.
+
 ### Filters and JSON
 
 Beyond `.eq/.neq/.gt/.gte/.lt/.lte`, the query builder supports `IN` lists, JSON

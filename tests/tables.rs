@@ -2167,3 +2167,28 @@ fn tset_rejects_reserved_auth_table() {
     child.kill().ok();
     child.wait().ok();
 }
+
+#[test]
+fn tset_tget_work_with_uuid_pk() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Point access is keyed by the raw pk string, so a UUID pk works the same
+    // as an int pk end to end.
+    send(
+        &mut s,
+        &["TCREATE", "docs", "id UUID PRIMARY KEY,", "name STR"],
+    );
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    send(&mut s, &["TINSERT", "docs", "id", uuid, "name", "alice"]);
+
+    assert_eq!(send(&mut s, &["TGET", "docs", uuid, "name"]), "$alice");
+    assert_eq!(send(&mut s, &["TSET", "docs", uuid, "name", "bob"]), ":1");
+    assert_eq!(send(&mut s, &["TGET", "docs", uuid, "name"]), "$bob");
+    let row = send(&mut s, &["TGET", "docs", uuid]);
+    assert!(row.contains("bob") && row.contains(uuid), "{row}");
+
+    child.kill().ok();
+    child.wait().ok();
+}
