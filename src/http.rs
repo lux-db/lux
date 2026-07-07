@@ -410,28 +410,24 @@ async fn handle_request(
                 }
                 let now = std::time::Instant::now();
                 let scope = filter.as_deref().unwrap_or("");
-                let body = match id.parse::<i64>() {
-                    Ok(id_i64) => {
-                        match crate::tables::table_get_filtered(
-                            store,
-                            cache,
-                            table,
-                            id_i64,
-                            scope,
-                            now,
-                            decrypt_authorized(&auth_context),
-                        ) {
-                            // A row that exists but is out of grant scope reads as
-                            // not-found, so we don't leak that it exists.
-                            Ok(Some(row)) => row_to_json_object(
-                                &row,
-                                &render_columns(store, cache, table, Instant::now()),
-                            ),
-                            Ok(None) => r#"{"error":"row not found"}"#.to_string(),
-                            Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
-                        }
-                    }
-                    Err(_) => r#"{"error":"invalid row id"}"#.to_string(),
+                // Keyed by the raw PK string, so int, UUID, and string PKs all work.
+                let body = match crate::tables::table_get_filtered_pk(
+                    store,
+                    cache,
+                    table,
+                    id,
+                    scope,
+                    now,
+                    decrypt_authorized(&auth_context),
+                ) {
+                    // A row that exists but is out of grant scope reads as
+                    // not-found, so we don't leak that it exists.
+                    Ok(Some(row)) => row_to_json_object(
+                        &row,
+                        &render_columns(store, cache, table, Instant::now()),
+                    ),
+                    Ok(None) => r#"{"error":"row not found"}"#.to_string(),
+                    Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
                 };
                 return send_json(socket, 200, "OK", &body).await;
             }
@@ -2616,6 +2612,32 @@ fn route_request_with_auth(
             script_engine,
             auth,
         ),
+        // Point update by primary key: PATCH /tables/<t>/<id> with a {field: value}
+        // body. Synthesizes `where <pk> = <id>` and routes through the same
+        // grant-enforced update path (RLS USING + WITH CHECK + .live() event), so
+        // it is a convenience over the bulk path, not a new authorization surface.
+        // Works for any PK type (the id path segment is used verbatim).
+        ("PATCH", ["tables", table, id]) => {
+            // Implicit-id tables don't flag the column primary_key; fall back to
+            // "id" exactly like the engine's pk_column_name does.
+            let pk = live_table_pk_field(store, cache, table).unwrap_or_else(|| "id".to_string());
+            let mut point_params: Vec<(String, String)> = params
+                .iter()
+                .filter(|(k, _)| k != "where")
+                .cloned()
+                .collect();
+            point_params.push(("where".to_string(), format!("{pk} = {id}")));
+            route_table_update(
+                table,
+                &point_params,
+                body,
+                store,
+                broker,
+                cache,
+                script_engine,
+                auth,
+            )
+        }
         // Bulk delete via DELETE with where parameter (TDROP is separate)
         ("DELETE", ["tables", table]) => {
             route_table_delete(table, params, store, broker, cache, script_engine, auth)

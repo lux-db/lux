@@ -2823,6 +2823,9 @@ fn table_insert_pk(
     Ok(pk_str)
 }
 
+/// Test convenience: fetch a row by integer id, full-access. Production reads go
+/// through `table_get_by_pk_str` / `table_get_filtered_pk`.
+#[cfg(test)]
 pub fn table_get(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -3730,6 +3733,8 @@ pub fn table_count_filtered(
 /// Fetch a row by primary key, but only when it also satisfies `filter` (a
 /// resolved row-scoped read grant). `Ok(None)` means the row is absent or out of
 /// scope, so the caller can 404 without leaking that it exists.
+/// Test convenience: integer-id form of `table_get_filtered_pk`.
+#[cfg(test)]
 pub fn table_get_filtered(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -3739,15 +3744,34 @@ pub fn table_get_filtered(
     now: Instant,
     decrypt_authorized: bool,
 ) -> Result<Option<Vec<(String, String)>>, String> {
+    table_get_filtered_pk(
+        store,
+        cache,
+        table,
+        &id.to_string(),
+        filter,
+        now,
+        decrypt_authorized,
+    )
+}
+
+/// Like `table_get_filtered` but keyed by a raw PK string, so it works for any
+/// PK type (INT, UUID, STR). The RLS `filter` is ANDed onto the PK match so a
+/// row outside the caller's grant reads as not-found.
+pub fn table_get_filtered_pk(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    filter: &str,
+    now: Instant,
+    decrypt_authorized: bool,
+) -> Result<Option<Vec<(String, String)>>, String> {
     // Full-access with no row filter: direct PK fetch, no plan. When the caller
     // isn't decrypt-authorized we fall through to the plan path so encrypted
     // columns get gated even on an unconditional grant.
     if filter.trim().is_empty() && decrypt_authorized {
-        return match table_get(store, cache, table, id, now) {
-            Ok(row) => Ok(Some(row)),
-            Err(e) if e.contains("not found") => Ok(None),
-            Err(e) => Err(e),
-        };
+        return table_get_by_pk_str(store, cache, table, pk_str, None, true, now);
     }
     let schema = load_schema(store, cache, table, now)?;
     let pk = schema
@@ -3762,7 +3786,7 @@ pub fn table_get_filtered(
         "WHERE".to_string(),
         pk,
         "=".to_string(),
-        id.to_string(),
+        pk_str.to_string(),
     ];
     if !filter.trim().is_empty() {
         toks.push("AND".to_string());

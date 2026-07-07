@@ -1556,3 +1556,94 @@ fn http_auth_tables_blocked_from_table_api() {
         "exec TSELECT auth.signing_keys body: {body}"
     );
 }
+
+#[test]
+fn http_point_patch_updates_and_reads_by_id() {
+    // PATCH /v1/tables/<t>/<id> point-updates one row; GET /v1/tables/<t>/<id>
+    // reads it back. Operator path.
+    let server = LuxServer::builder().http().password("rootsecret").start();
+    let http = server.http_port();
+    let mut op = server.conn();
+    let mut run = |args: &[&str]| {
+        op.write_all(&resp_cmd(args)).unwrap();
+        read_all(&mut op)
+    };
+    assert!(run(&["AUTH", "rootsecret"]).contains("+OK"));
+    assert!(run(&["TCREATE", "users", "name", "STR", ",", "age", "INT"]).contains("+OK"));
+    run(&["TINSERT", "users", "name", "alice", "age", "30"]); // id 1
+
+    let (s, b) = http_request(
+        http,
+        "PATCH",
+        "/v1/tables/users/1",
+        Some(r#"{"age":31}"#),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "patch: {b}");
+
+    let (s, b) = http_request(http, "GET", "/v1/tables/users/1", None, Some("rootsecret"));
+    assert_eq!(s, 200, "get: {b}");
+    assert!(
+        b.contains("\"age\"") && b.contains("31") && b.contains("alice"),
+        "row not updated: {b}"
+    );
+}
+
+#[test]
+fn http_point_patch_respects_write_grant() {
+    // The point PATCH routes through the same grant enforcement as the bulk path:
+    // a user with no write grant is denied, the operator is not.
+    let server = LuxServer::builder()
+        .http()
+        .password("rootsecret")
+        .env("LUX_AUTH_ENABLED", "true")
+        .start();
+    let http = server.http_port();
+    let mut op = server.conn();
+    let mut run = |args: &[&str]| {
+        op.write_all(&resp_cmd(args)).unwrap();
+        read_all(&mut op)
+    };
+    assert!(run(&["AUTH", "rootsecret"]).contains("+OK"));
+    assert!(run(&["TCREATE", "notes", "body", "STR"]).contains("+OK"));
+    run(&["TINSERT", "notes", "body", "hello"]); // id 1
+
+    let (s, b) = http_request(
+        http,
+        "POST",
+        "/auth/v1/signup",
+        Some(r#"{"email":"u@x.dev","password":"password123"}"#),
+        None,
+    );
+    assert_eq!(s, 200, "signup: {b}");
+    let tok = serde_json::from_str::<serde_json::Value>(&b).unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // No write grant -> the user's point update is refused.
+    let (s, b) = http_request(
+        http,
+        "PATCH",
+        "/v1/tables/notes/1",
+        Some(r#"{"body":"hacked"}"#),
+        Some(&tok),
+    );
+    assert_ne!(s, 200, "user without a write grant must be denied: {b}");
+
+    // Operator update lands.
+    let (s, b) = http_request(
+        http,
+        "PATCH",
+        "/v1/tables/notes/1",
+        Some(r#"{"body":"edited"}"#),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "operator patch: {b}");
+
+    let (_, b) = http_request(http, "GET", "/v1/tables/notes/1", None, Some("rootsecret"));
+    assert!(
+        b.contains("edited") && !b.contains("hacked"),
+        "user write must not have landed: {b}"
+    );
+}
