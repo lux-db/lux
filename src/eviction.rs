@@ -293,6 +293,7 @@ pub fn is_write_command(cmd: &[u8]) -> bool {
         || eq(cmd, b"TDELETE")
         || eq(cmd, b"TDROP")
         || eq(cmd, b"TALTER")
+        || eq(cmd, b"TSET")
         || eq(cmd, b"EVAL")
         || eq(cmd, b"EVALSHA")
         || eq(cmd, b"RPOPLPUSH")

@@ -1008,6 +1008,14 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         name: b"TSELECT",
         min_arity: 4,
     },
+    CommandSpec {
+        name: b"TSET",
+        min_arity: 5,
+    },
+    CommandSpec {
+        name: b"TGET",
+        min_arity: 3,
+    },
 ];
 
 fn command_spec(cmd: &[u8]) -> Option<&'static CommandSpec> {
@@ -2072,6 +2080,12 @@ pub fn execute(
             if cmd_eq(cmd, b"TSELECT") {
                 return tables::cmd_tselect(args, store, cache, out, now);
             }
+            if cmd_eq(cmd, b"TSET") {
+                return tables::cmd_tset(args, store, cache, out, now);
+            }
+            if cmd_eq(cmd, b"TGET") {
+                return tables::cmd_tget(args, store, cache, out, now);
+            }
         }
         b'U' => {
             if cmd_eq(cmd, b"UNLINK") {
@@ -2287,6 +2301,7 @@ fn command_self_logs_wal(cmd: &[u8]) -> bool {
             | b"TDELETE"
             | b"TCREATE"
             | b"TDROP"
+            | b"TSET"
             | b"XADD"
     )
 }
@@ -3759,6 +3774,100 @@ mod tests {
         assert!(got.contains("hash-secret-value"), "{got}");
         let scan = exec_str(&restored, &[b"HSCAN", b"profile:1", b"0"]);
         assert!(scan.contains("hash-secret-value"), "{scan}");
+    }
+
+    #[test]
+    fn tset_point_update_replays_from_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec_wal(&store, &[b"TCREATE", b"users", b"name STR,", b"age INT"]);
+        exec_wal(
+            &store,
+            &[b"TINSERT", b"users", b"name", b"alice", b"age", b"30"],
+        );
+        assert!(String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[b"TSET", b"users", b"1", b"age", b"31"]
+        ))
+        .contains(":1"));
+        store.fsync_wal();
+        // The point-write self-logs a resolved, replayable TUPDATE (no double log).
+        let wal = read_wal_bytes(dir.path());
+        assert!(wal.windows(b"TUPDATE".len()).any(|w| w == b"TUPDATE"));
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"TGET", b"users", b"1", b"age"]);
+        assert!(got.contains("31"), "{got}");
+    }
+
+    #[test]
+    fn tset_encrypted_column_roundtrips_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        exec(
+            &store,
+            &[b"TCREATE", b"vault", b"name STR,", b"secret STR ENCRYPTED"],
+        );
+        exec(
+            &store,
+            &[
+                b"TINSERT",
+                b"vault",
+                b"name",
+                b"alice",
+                b"secret",
+                b"old-secret",
+            ],
+        );
+        // Point-update the encrypted cell; it must go through encode+encrypt.
+        assert!(String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[b"TSET", b"vault", b"1", b"secret", b"new-secret-value"],
+        ))
+        .contains(":1"));
+        store.fsync_wal();
+        let wal = read_wal_bytes(dir.path());
+        assert!(
+            !wal.windows(b"new-secret-value".len())
+                .any(|w| w == b"new-secret-value"),
+            "plaintext leaked into the WAL"
+        );
+
+        // Operator TGET decrypts; a successful decode proves TSET stored ciphertext
+        // keyed correctly (decode of a plaintext value in an encrypted column errors).
+        let live = exec_str(&store, &[b"TGET", b"vault", b"1", b"secret"]);
+        assert!(live.contains("new-secret-value"), "{live}");
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        let replayed = exec_str(&restored, &[b"TGET", b"vault", b"1", b"secret"]);
+        assert!(replayed.contains("new-secret-value"), "{replayed}");
+    }
+
+    #[test]
+    fn tset_is_a_write_command() {
+        // Gates the reserved-table guard, the WAL self-log suppression, and the
+        // central .live() key-event fire -- all keyed off is_write_command.
+        assert!(crate::eviction::is_write_command(b"TSET"));
+        assert!(!crate::eviction::is_write_command(b"TGET"));
     }
 
     #[test]

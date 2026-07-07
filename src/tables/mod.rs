@@ -2841,6 +2841,46 @@ pub fn table_get(
     Ok(result)
 }
 
+/// Point-update: set one or more fields on the row identified by its raw PK
+/// string, with no WHERE query. Routes through the same invariant-preserving
+/// leaf as every table update (type validation, FK/unique checks, secondary +
+/// unique + blind + JSON-path index maintenance, per-cell encryption, TTL, and
+/// WAL self-logging). Errors if the row does not exist (this is an update, not
+/// an upsert).
+pub fn table_set_fields(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    field_values: &[(&str, &str)],
+    now: Instant,
+) -> Result<(), String> {
+    table_update_by_pk_str(store, cache, table, pk_str, field_values, None, now)
+}
+
+/// Point-read: fetch a row by its raw PK string, optionally projecting a subset
+/// of fields. Returns `None` if the row does not exist. `decrypt_authorized`
+/// false omits ENCRYPTED columns (anonymous principals), matching the query path.
+pub fn table_get_by_pk_str(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    fields: Option<&[&str]>,
+    decrypt_authorized: bool,
+    now: Instant,
+) -> Result<Option<Vec<(String, String)>>, String> {
+    let schema = load_schema(store, cache, table, now)?;
+    let Some(mut row) = get_row(store, table, &schema, pk_str, now, decrypt_authorized) else {
+        return Ok(None);
+    };
+    if let Some(fields) = fields {
+        row.retain(|(name, _)| fields.contains(&name.as_str()));
+    }
+    row.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(Some(row))
+}
+
 /// Convenience wrapper used by tests: update by integer id, no TTL change.
 #[cfg(test)]
 pub fn table_update(

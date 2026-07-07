@@ -94,6 +94,94 @@ fn write_rows(out: &mut BytesMut, rows: &[Vec<(String, String)>], projection: &[
     }
 }
 
+pub fn cmd_tset(
+    args: &[&[u8]],
+    store: &Store,
+    cache: &SharedSchemaCache,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    // TSET <table> <pk> <field> <value> [<field> <value> ...]
+    // Point-update one or more cells on a row by primary key, no WHERE query.
+    // Routes through the same invariant-preserving leaf as TUPDATE.
+    if args.len() < 5 || args.len().is_multiple_of(2) {
+        resp::write_error(
+            out,
+            "ERR usage: TSET <table> <pk> <field> <value> [<field> <value> ...]",
+        );
+        return CmdResult::Written;
+    }
+    if let Some(err) = crate::auth::reserved_table_mutation_error(args, store) {
+        resp::write_error(out, &err);
+        return CmdResult::Written;
+    }
+    let table = arg_str(args[1]);
+    let pk = arg_str(args[2]);
+    let mut field_values: Vec<(&str, &str)> = Vec::new();
+    let mut i = 3;
+    while i + 1 < args.len() {
+        field_values.push((arg_str(args[i]), arg_str(args[i + 1])));
+        i += 2;
+    }
+    match tables::table_set_fields(store, cache, table, pk, &field_values, now) {
+        Ok(()) => resp::write_integer(out, field_values.len() as i64),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_tget(
+    args: &[&[u8]],
+    store: &Store,
+    cache: &SharedSchemaCache,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    // TGET <table> <pk> [<field> ...]
+    // Point-read a row by primary key. With one field, replies the bare value
+    // (nil if absent); with several, or none, replies field/value pairs.
+    if args.len() < 3 {
+        resp::write_error(out, "ERR usage: TGET <table> <pk> [<field> ...]");
+        return CmdResult::Written;
+    }
+    let table = arg_str(args[1]);
+    let pk = arg_str(args[2]);
+    let fields: Vec<&str> = args[3..].iter().map(|a| arg_str(a)).collect();
+    let projection = if fields.is_empty() {
+        None
+    } else {
+        Some(fields.as_slice())
+    };
+    // RESP is the operator/full-access path (decrypt_authorized = true), matching
+    // TSELECT; sensitive auth columns are redacted, not decrypted-and-exposed.
+    match tables::table_get_by_pk_str(store, cache, table, pk, projection, true, now) {
+        Ok(None) => {
+            if fields.len() == 1 {
+                resp::write_null(out);
+            } else {
+                resp::write_null_array(out);
+            }
+        }
+        Ok(Some(mut row)) => {
+            crate::auth::redact_auth_table_row(table, &mut row);
+            if fields.len() == 1 {
+                match row.iter().find(|(k, _)| k == fields[0]) {
+                    Some((_, v)) => resp::write_bulk(out, v),
+                    None => resp::write_null(out),
+                }
+            } else {
+                resp::write_array_header(out, row.len() * 2);
+                for (k, v) in &row {
+                    resp::write_bulk(out, k);
+                    resp::write_bulk(out, v);
+                }
+            }
+        }
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
 pub fn cmd_tcreate(
     args: &[&[u8]],
     store: &Store,

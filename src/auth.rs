@@ -200,7 +200,7 @@ pub(crate) fn reserved_table_mutation_error(args: &[&[u8]], store: &Store) -> Op
         .unwrap_or("")
         .to_ascii_uppercase();
     let table = match cmd.as_str() {
-        "TCREATE" | "TINSERT" | "TUPDATE" | "TDROP" | "TALTER" => args.get(1),
+        "TCREATE" | "TINSERT" | "TUPDATE" | "TDROP" | "TALTER" | "TSET" => args.get(1),
         "TDELETE" => args.get(2),
         _ => None,
     }
@@ -243,7 +243,7 @@ pub(crate) fn reserved_key_mutation_error(args: &[&[u8]], store: &Store) -> Opti
     // `T*` table commands are handled by `reserved_table_mutation_error`.
     if matches!(
         cmd.as_str(),
-        "TINSERT" | "TUPSERT" | "TUPDATE" | "TDELETE" | "TCREATE" | "TDROP" | "TALTER"
+        "TINSERT" | "TUPSERT" | "TUPDATE" | "TDELETE" | "TCREATE" | "TDROP" | "TALTER" | "TSET"
     ) {
         return None;
     }
