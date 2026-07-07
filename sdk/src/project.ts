@@ -448,6 +448,58 @@ export class LuxProjectTable<T extends object> {
 		if (result.error) return result as LuxResult<number>;
 		return ok(unwrapResult<number>(result.data) ?? 0);
 	}
+
+	/**
+	 * Point access to a single row by primary key, without a query. Reads and
+	 * writes address the row directly (GET/PATCH `/tables/<t>/<pk>`); writes are
+	 * still grant-enforced server-side.
+	 */
+	row(pk: string | number): LuxProjectRow<T> {
+		return new LuxProjectRow<T>(this.client, this.name, pk);
+	}
+}
+
+export class LuxProjectRow<T extends object> {
+	constructor(
+		private client: LuxProjectClient<any>,
+		private name: string,
+		private pk: string | number,
+	) {}
+
+	private path(): string {
+		return `/tables/${encodeURIComponent(this.name)}/${encodeURIComponent(String(this.pk))}`;
+	}
+
+	/** Read the whole row, or a single column's value. */
+	get(): Promise<LuxResult<T>>;
+	get<K extends keyof T>(field: K): Promise<LuxResult<T[K]>>;
+	async get(field?: string): Promise<LuxResult<unknown>> {
+		const res = await this.client.request('GET', this.path());
+		if (res.error) return res;
+		const payload = res.data as { result?: Record<string, unknown> };
+		// A missing row comes back as {"error":"row not found"} with a 200.
+		if (!payload || typeof payload !== 'object' || !('result' in payload)) {
+			return err('NOT_FOUND', `Row '${this.pk}' not found in '${this.name}'`);
+		}
+		const row = payload.result ?? {};
+		return ok(field === undefined ? row : row[field]);
+	}
+
+	/** Point-update one cell, or several via a patch object. */
+	set<K extends keyof T>(field: K, value: T[K]): Promise<LuxResult<T>>;
+	set(patch: Partial<T>): Promise<LuxResult<T>>;
+	async set(fieldOrPatch: string | Partial<T>, value?: unknown): Promise<LuxResult<T>> {
+		const patch =
+			typeof fieldOrPatch === 'string' ? { [fieldOrPatch]: value } : fieldOrPatch;
+		const res = await this.client.request('PATCH', this.path(), patch);
+		if (res.error) return res as LuxResult<T>;
+		const data = unwrapResult<unknown>(res.data);
+		const rows = Array.isArray(data) ? data : [];
+		if (rows.length === 0) {
+			return err('NOT_FOUND', `Row '${this.pk}' not found or not permitted in '${this.name}'`);
+		}
+		return ok(rows[0] as T);
+	}
 }
 
 abstract class LuxProjectThenable<TResult> implements PromiseLike<LuxResult<TResult>> {

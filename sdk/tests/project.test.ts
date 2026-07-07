@@ -106,6 +106,47 @@ describe('Lux project client', () => {
 		expect(seen?.headers.Authorization).toBe('Bearer existing-user-jwt');
 	});
 
+	test('row(pk) point access issues GET/PATCH by id', async () => {
+		const seen: Array<{ url: string; method: string; body?: string }> = [];
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const method = init?.method ?? 'GET';
+			seen.push({ url: String(input), method, body: init?.body as string | undefined });
+			const payload =
+				method === 'PATCH'
+					? { result: [{ id: 1, body: 'hi', age: 31 }] }
+					: { result: { id: 1, body: 'hi', age: 30 } };
+			return new Response(JSON.stringify(payload), { status: 200 });
+		};
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		// Whole row by pk.
+		const whole = await client.table('messages').row(1).get();
+		expect(whole.error).toBeNull();
+		expect(whole.data).toEqual({ id: 1, body: 'hi', age: 30 });
+		expect(seen.at(-1)?.method).toBe('GET');
+		expect(seen.at(-1)?.url).toBe('http://localhost:3957/v1/project/tables/messages/1');
+
+		// Single cell.
+		const cell = await client.table('messages').row(1).get('body');
+		expect(cell.data).toBe('hi');
+
+		// Point-set one cell -> PATCH by id with just that field.
+		const set1 = await client.table('messages').row(1).set('age', 31);
+		expect(set1.error).toBeNull();
+		expect(set1.data).toEqual({ id: 1, body: 'hi', age: 31 });
+		expect(seen.at(-1)?.method).toBe('PATCH');
+		expect(seen.at(-1)?.url).toBe('http://localhost:3957/v1/project/tables/messages/1');
+		expect(JSON.parse(seen.at(-1)?.body ?? '{}')).toEqual({ age: 31 });
+
+		// Point-set several cells via a patch object.
+		await client.table('messages').row(1).set({ body: 'x', age: 5 });
+		expect(JSON.parse(seen.at(-1)?.body ?? '{}')).toEqual({ body: 'x', age: 5 });
+	});
+
 	test('table filters use supabase-style fluent query builders', async () => {
 		const seen: string[] = [];
 		const fetchImpl = async (input: RequestInfo | URL) => {
