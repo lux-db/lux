@@ -4707,25 +4707,88 @@ fn render_enforced_clause(conds: &[crate::grants::EnforcedCondition]) -> String 
     parts.join(" AND ")
 }
 
-fn collapse_or_clauses(
+fn render_enforced_or_clauses(
     clauses: &[Vec<crate::grants::EnforcedCondition>],
-) -> Result<Option<crate::grants::EnforcedCondition>, String> {
+) -> Result<String, String> {
     use crate::grants::EnforcedCondition;
-    let mut column: Option<String> = None;
-    let mut values: Vec<String> = Vec::new();
+    if let Some(cond) = collapse_same_column_or_clauses(clauses) {
+        return Ok(render_enforced_clause(&[cond]));
+    }
+    let mut branches = Vec::new();
     for clause in clauses {
         if clause.is_empty() {
-            return Ok(None);
+            return Ok(String::new());
         }
-        if clause.len() != 1 {
+        let mut parts = Vec::new();
+        let mut branch_is_false = false;
+        for condition in clause {
+            match condition {
+                EnforcedCondition::Cmp(rc) => {
+                    parts.push(format!("{} {} {}", rc.column, rc.op, rc.value));
+                }
+                EnforcedCondition::InSet {
+                    column,
+                    negated,
+                    values,
+                } => {
+                    if values.is_empty() {
+                        if *negated {
+                            continue;
+                        }
+                        branch_is_false = true;
+                        break;
+                    }
+                    let kw = if *negated { "NOT IN" } else { "IN" };
+                    parts.push(format!("{column} {kw} ( {} )", values.join(" ")));
+                }
+            }
+        }
+        if branch_is_false {
+            continue;
+        }
+        if parts.is_empty() {
+            return Ok(String::new());
+        }
+        if parts.len() != 1 {
             return Err(
                 "OR grants with multi-condition branches are not supported yet".to_string(),
             );
         }
+        branches.push(parts.remove(0));
+    }
+    if branches.is_empty() {
+        let Some(first_column) = clauses
+            .iter()
+            .flat_map(|clause| clause.iter())
+            .map(|condition| match condition {
+                EnforcedCondition::Cmp(rc) => rc.column.as_str(),
+                EnforcedCondition::InSet { column, .. } => column.as_str(),
+            })
+            .next()
+        else {
+            return Ok(String::new());
+        };
+        return Ok(format!(
+            "{first_column} IS NULL AND {first_column} IS NOT NULL"
+        ));
+    }
+    Ok(branches.join(" OR "))
+}
+
+fn collapse_same_column_or_clauses(
+    clauses: &[Vec<crate::grants::EnforcedCondition>],
+) -> Option<crate::grants::EnforcedCondition> {
+    use crate::grants::EnforcedCondition;
+    let mut column: Option<String> = None;
+    let mut values: Vec<String> = Vec::new();
+    for clause in clauses {
+        if clause.len() != 1 {
+            return None;
+        }
         match &clause[0] {
             EnforcedCondition::Cmp(rc) if rc.op == "=" => {
                 if column.as_deref().is_some_and(|c| c != rc.column) {
-                    return Err("OR grants must target the same column".to_string());
+                    return None;
                 }
                 column.get_or_insert_with(|| rc.column.clone());
                 if !values.iter().any(|value| value == &rc.value) {
@@ -4738,7 +4801,7 @@ fn collapse_or_clauses(
                 values: set,
             } => {
                 if column.as_deref().is_some_and(|column| column != c) {
-                    return Err("OR grants must target the same column".to_string());
+                    return None;
                 }
                 column.get_or_insert_with(|| c.clone());
                 for value in set {
@@ -4747,22 +4810,14 @@ fn collapse_or_clauses(
                     }
                 }
             }
-            _ => {
-                return Err(
-                    "OR grants only support '=' and positive IN branches on the same column"
-                        .to_string(),
-                );
-            }
+            _ => return None,
         }
     }
-    let Some(column) = column else {
-        return Ok(None);
-    };
-    Ok(Some(EnforcedCondition::InSet {
-        column,
+    Some(EnforcedCondition::InSet {
+        column: column?,
         negated: false,
         values,
-    }))
+    })
 }
 
 fn render_enforced_clauses(
@@ -4771,10 +4826,7 @@ fn render_enforced_clauses(
     if clauses.len() == 1 {
         return Ok(render_enforced_clause(&clauses[0]));
     }
-    match collapse_or_clauses(clauses)? {
-        Some(cond) => Ok(render_enforced_clause(&[cond])),
-        None => Ok(String::new()),
-    }
+    render_enforced_or_clauses(clauses)
 }
 
 /// Resolve + execute the grant for `(table, scope)` into enforced conditions.
@@ -4824,6 +4876,7 @@ pub(crate) fn read_filter(
 /// (column, op, value) instead of a rendered string. Used by the `.live()` path,
 /// which merges them into the subscription's own `where_conditions` so both the
 /// initial snapshot and streamed events are scoped to the grant.
+#[cfg(test)]
 pub(crate) fn read_filter_conds(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -4842,13 +4895,12 @@ pub(crate) fn read_filter_conds(
     else {
         return Err(format!("no read access to '{table}'"));
     };
-    if conds.len() == 1 {
-        return Ok(conds.into_iter().next().unwrap_or_default());
+    if conds.len() != 1 {
+        return Err(
+            "read grant has OR alternatives; use read_filter for expression rendering".to_string(),
+        );
     }
-    match collapse_or_clauses(&conds)? {
-        Some(cond) => Ok(vec![cond]),
-        None => Ok(Vec::new()),
-    }
+    Ok(conds.into_iter().next().unwrap_or_default())
 }
 
 /// Return tables consulted by READ-grant membership subqueries. Live queries
@@ -5642,6 +5694,74 @@ mod tests {
         );
         assert!(teamed_filter.contains("alice"), "got: {teamed_filter}");
         assert!(teamed_filter.contains("bob"), "got: {teamed_filter}");
+    }
+
+    #[test]
+    fn repeated_read_grants_on_different_columns_render_or_alternatives() {
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "invites",
+            &[
+                "id", "STR", "PRIMARY", "KEY,", "team_id", "STR,", "email", "STR",
+            ],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "members",
+            &[
+                "id", "STR", "PRIMARY", "KEY,", "user_id", "STR,", "team_id", "STR",
+            ],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "members",
+            &[("id", "1"), ("user_id", "alice"), ("team_id", "team-a")],
+            now,
+        )
+        .unwrap();
+
+        grant(
+            &store,
+            &cache,
+            &[
+                "read",
+                "ON",
+                "invites",
+                "WHERE",
+                "team_id",
+                "IN",
+                "(",
+                "SELECT",
+                "team_id",
+                "FROM",
+                "members",
+                "WHERE",
+                "user_id",
+                "=",
+                "auth.uid()",
+                ")",
+            ],
+            now,
+        );
+        grant(
+            &store,
+            &cache,
+            &["read", "ON", "invites", "WHERE", "email", "=", "auth.email"],
+            now,
+        );
+
+        let filter = read_filter(&store, &cache, &principal("alice"), "invites", now).unwrap();
+        assert_eq!(filter, "team_id IN ( team-a ) OR email = u@x.dev");
     }
 
     // ── RLS auto-filter (USING) coverage ──

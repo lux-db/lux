@@ -1340,7 +1340,7 @@ async fn build_live_subscription(
                 // Validate access at subscribe time, but do not freeze the
                 // resolved conditions here: membership subqueries can change
                 // while the socket remains open.
-                crate::auth::read_filter_conds(store, cache, p, &table_spec.table, Instant::now())
+                crate::auth::read_filter(store, cache, p, &table_spec.table, Instant::now())
                     .map_err(|e| live_error("FORBIDDEN", &e))?;
                 table_spec.auth_dependencies = crate::auth::read_filter_dependencies(
                     store,
@@ -1714,7 +1714,7 @@ fn fetch_live_table_rows(
     if spec.deny_all {
         return Ok(Vec::new());
     }
-    let Some(where_conditions) = live_table_where_conditions(store, cache, spec)? else {
+    let Some(where_tokens) = live_table_where_tokens(store, cache, spec)? else {
         return Ok(Vec::new());
     };
     let mut tokens = vec![spec.select.clone(), "FROM".to_string(), spec.table.clone()];
@@ -1736,40 +1736,9 @@ fn fetch_live_table_rows(
             },
         ]);
     }
-    if !where_conditions.is_empty() {
+    if !where_tokens.is_empty() {
         tokens.push("WHERE".to_string());
-        for (index, (field, op, value)) in where_conditions.iter().enumerate() {
-            if index > 0 {
-                tokens.push("AND".to_string());
-            }
-            tokens.push(field.clone());
-            let op_upper = op.to_ascii_uppercase();
-            if op_upper == "IN" || op_upper == "NOT IN" {
-                if op_upper == "NOT IN" {
-                    tokens.push("NOT".to_string());
-                }
-                tokens.push("IN".to_string());
-                tokens.push("(".to_string());
-                match value.as_array() {
-                    Some(arr) => {
-                        for v in arr {
-                            tokens.push(live_value_to_token(v));
-                        }
-                    }
-                    None => tokens.push(live_value_to_token(value)),
-                }
-                tokens.push(")".to_string());
-            } else if op_upper == "IS VALID" || op_upper == "IS NOT VALID" {
-                tokens.push("IS".to_string());
-                if op_upper == "IS NOT VALID" {
-                    tokens.push("NOT".to_string());
-                }
-                tokens.push("VALID".to_string());
-            } else {
-                tokens.push(op.clone());
-                tokens.push(live_value_to_token(value));
-            }
-        }
+        tokens.extend(where_tokens);
     }
     if let Some(near) = &spec.near {
         tokens.push("NEAR".to_string());
@@ -1822,43 +1791,60 @@ fn fetch_live_table_rows(
     }
 }
 
-fn live_table_where_conditions(
+fn live_table_where_tokens(
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
     spec: &LiveTableSpec,
-) -> Result<Option<LiveTableWhereConditions>, Value> {
-    let mut conditions = spec.where_conditions.clone();
-    let Some(principal) = &spec.principal else {
-        return Ok(Some(conditions));
-    };
-    let grant_conds =
-        crate::auth::read_filter_conds(store, cache, principal, &spec.table, Instant::now())
+) -> Result<Option<Vec<String>>, Value> {
+    let mut tokens = live_where_conditions_to_tokens(&spec.where_conditions);
+    if let Some(principal) = &spec.principal {
+        let grant = crate::auth::read_filter(store, cache, principal, &spec.table, Instant::now())
             .map_err(|e| live_error("FORBIDDEN", &e))?;
-    for condition in grant_conds {
-        match condition {
-            crate::grants::EnforcedCondition::Cmp(rc) => {
-                conditions.push((rc.column, rc.op, Value::String(rc.value)));
+        if !grant.trim().is_empty() {
+            if !tokens.is_empty() {
+                tokens.push("AND".to_string());
             }
-            crate::grants::EnforcedCondition::InSet {
-                column,
-                negated,
-                values,
-            } => {
-                if values.is_empty() {
-                    if !negated {
-                        return Ok(None);
-                    }
-                } else {
-                    conditions.push((
-                        column,
-                        if negated { "NOT IN" } else { "IN" }.to_string(),
-                        Value::Array(values.into_iter().map(Value::String).collect()),
-                    ));
-                }
-            }
+            tokens.extend(tokenize_where(&grant).map_err(|e| live_error("FORBIDDEN", &e))?);
         }
     }
-    Ok(Some(conditions))
+    Ok(Some(tokens))
+}
+
+fn live_where_conditions_to_tokens(conditions: &LiveTableWhereConditions) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for (index, (field, op, value)) in conditions.iter().enumerate() {
+        if index > 0 {
+            tokens.push("AND".to_string());
+        }
+        tokens.push(field.clone());
+        let op_upper = op.to_ascii_uppercase();
+        if op_upper == "IN" || op_upper == "NOT IN" {
+            if op_upper == "NOT IN" {
+                tokens.push("NOT".to_string());
+            }
+            tokens.push("IN".to_string());
+            tokens.push("(".to_string());
+            match value.as_array() {
+                Some(arr) => {
+                    for v in arr {
+                        tokens.push(live_value_to_token(v));
+                    }
+                }
+                None => tokens.push(live_value_to_token(value)),
+            }
+            tokens.push(")".to_string());
+        } else if op_upper == "IS VALID" || op_upper == "IS NOT VALID" {
+            tokens.push("IS".to_string());
+            if op_upper == "IS NOT VALID" {
+                tokens.push("NOT".to_string());
+            }
+            tokens.push("VALID".to_string());
+        } else {
+            tokens.push(op.clone());
+            tokens.push(live_value_to_token(value));
+        }
+    }
+    tokens
 }
 
 fn live_table_dependencies(spec: &LiveTableSpec) -> Vec<String> {
@@ -4880,6 +4866,129 @@ mod tests {
             Some("members"),
             "grant dependency changes must wake the live query"
         );
+    }
+
+    #[test]
+    fn live_table_allows_or_read_grants_on_different_columns() {
+        let config = std::sync::Arc::new(crate::ServerConfig {
+            auth: crate::AuthConfig {
+                enabled: true,
+                ..crate::AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Arc::new(Store::new_with_config(config));
+        let cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let now = Instant::now();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "invites",
+            &[
+                "id", "STR", "PRIMARY", "KEY,", "team_id", "STR,", "email", "STR",
+            ],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "members",
+            &[
+                "id", "STR", "PRIMARY", "KEY,", "user_id", "STR,", "team_id", "STR",
+            ],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "members",
+            &[("id", "m1"), ("user_id", "alice"), ("team_id", "team-a")],
+            now,
+        )
+        .unwrap();
+        for (id, team_id, email) in [
+            ("team", "team-a", "other@x.dev"),
+            ("email", "team-b", "alice@x.dev"),
+            ("hidden", "team-b", "other@x.dev"),
+        ] {
+            crate::tables::table_insert(
+                &store,
+                &cache,
+                "invites",
+                &[("id", id), ("team_id", team_id), ("email", email)],
+                now,
+            )
+            .unwrap();
+        }
+        for grant in [
+            crate::grants::parse_grant(&[
+                "read",
+                "ON",
+                "invites",
+                "WHERE",
+                "team_id",
+                "IN",
+                "(",
+                "SELECT",
+                "team_id",
+                "FROM",
+                "members",
+                "WHERE",
+                "user_id",
+                "=",
+                "auth.uid()",
+                ")",
+            ])
+            .unwrap(),
+            crate::grants::parse_grant(&[
+                "read",
+                "ON",
+                "invites",
+                "WHERE",
+                "email",
+                "=",
+                "auth.email",
+            ])
+            .unwrap(),
+        ] {
+            crate::auth::put_grant(&store, &cache, &grant, now).unwrap();
+        }
+        let principal = match user_ctx("alice") {
+            HttpAuthContext::User(principal) => principal,
+            _ => unreachable!(),
+        };
+        let spec = LiveTableSpec {
+            table: "invites".to_string(),
+            select: "*".to_string(),
+            where_conditions: vec![],
+            joins: vec![],
+            principal: Some(principal),
+            auth_dependencies: vec!["members".to_string()],
+            near: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            deny_all: false,
+        };
+
+        crate::auth::read_filter(
+            &store,
+            &cache,
+            spec.principal.as_ref().unwrap(),
+            "invites",
+            now,
+        )
+        .unwrap();
+        let body =
+            serde_json::to_string(&fetch_live_table_rows(&store, &cache, &spec).unwrap()).unwrap();
+        assert!(
+            body.contains("\"team\"") && body.contains("\"email\""),
+            "{body}"
+        );
+        assert!(!body.contains("\"hidden\""), "{body}");
     }
 
     #[test]
