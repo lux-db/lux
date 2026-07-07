@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use base64::Engine;
-use jsonwebtoken::jwk::{Jwk, KeyAlgorithm, PublicKeyUse};
+use jsonwebtoken::jwk::{Jwk, JwkSet, KeyAlgorithm, PublicKeyUse};
 use jsonwebtoken::{
     decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
 };
@@ -317,7 +317,7 @@ fn sensitive_auth_fields(table: &str) -> &'static [&'static str] {
         SESSIONS_TABLE => &["refresh_token_hash"],
         KEYS_TABLE => &["key_hash"],
         SIGNING_KEYS_TABLE => &["private_key_encrypted"],
-        PROVIDERS_TABLE => &["client_secret"],
+        PROVIDERS_TABLE => &["client_secret", "apple_private_key"],
         FLOW_TOKENS_TABLE => &["token_hash"],
         _ => &[],
     }
@@ -448,10 +448,18 @@ pub(crate) fn bootstrap(
             "redirect_uri STR,",
             "scopes STR,",
             "created_at INT,",
-            "updated_at INT",
+            "updated_at INT,",
+            // Apple Sign In key material. `apple_private_key` holds the .p8, sealed
+            // with the encryption keyring when one is active (see seal_apple_private_key).
+            "apple_team_id STR,",
+            "apple_key_id STR,",
+            "apple_services_id STR,",
+            "apple_bundle_ids STR,",
+            "apple_private_key STR",
         ],
         now,
     )?;
+    migrate_provider_apple_columns(store, cache, now)?;
     create_table_if_missing(
         store,
         cache,
@@ -510,6 +518,14 @@ pub(crate) async fn route_http_response(
         ("GET", ["callback", provider]) => {
             oauth_callback(provider, params, headers, store, cache).await
         }
+        // Apple uses response_mode=form_post, so its callback arrives as a POST
+        // with form-encoded code/state in the body rather than the query string.
+        ("POST", ["callback", provider]) => {
+            let mut form = parse_form_urlencoded(body);
+            form.extend_from_slice(params);
+            oauth_callback(provider, &form, headers, store, cache).await
+        }
+        ("POST", ["signin", "apple"]) => signin_apple(body, headers, store, cache).await,
         _ => {
             let (status, status_text, body) = route_http(
                 method,
@@ -1990,6 +2006,9 @@ fn admin_upsert_provider(
         Ok(parsed) => parsed,
         Err(response) => return response,
     };
+    if provider == "apple" {
+        return admin_upsert_apple_provider(&parsed, store, cache);
+    }
     let client_id = match required_string(&parsed, "client_id") {
         Ok(client_id) => client_id.trim(),
         Err(response) => return response,
@@ -2080,6 +2099,126 @@ fn admin_upsert_provider(
                 Err(e) => error(400, "Bad Request", &e),
             }
         }
+        Err(e) => error(400, "Bad Request", &e),
+    }
+}
+
+fn admin_upsert_apple_provider(
+    parsed: &Value,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let opt = |key: &str| {
+        parsed
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+    };
+    let enabled = parsed
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+        .to_string();
+    let services_id = opt("apple_services_id");
+    let team_id = opt("apple_team_id");
+    let key_id = opt("apple_key_id");
+    let bundle_ids = opt("apple_bundle_ids");
+    let redirect_uri = opt("redirect_uri");
+    let scopes_raw = opt("scopes");
+    let scopes = if scopes_raw.is_empty() {
+        default_oauth_scopes("apple").to_string()
+    } else {
+        scopes_raw.to_string()
+    };
+    // Raw .p8 PEM from the client, or blank to keep the existing key on update.
+    let private_key_input = opt("apple_private_key");
+
+    let now = Instant::now();
+    let now_sec = unix_seconds().to_string();
+
+    let existing = match find_row_by_field(store, cache, PROVIDERS_TABLE, "provider", "apple", now)
+    {
+        Ok(existing) => existing,
+        Err(e) => return error(400, "Bad Request", &e),
+    };
+    let sealed_key = if private_key_input.is_empty() {
+        existing
+            .as_ref()
+            .and_then(|row| row.get("apple_private_key"))
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        match seal_apple_private_key(store, private_key_input) {
+            Ok(sealed) => sealed,
+            Err(e) => return error(400, "Bad Request", &e),
+        }
+    };
+
+    // Require at least one usable flow: native (bundle IDs to check `aud`) or web
+    // (services ID + team/key IDs + the .p8 to mint the client secret).
+    let native_ok = !bundle_ids.is_empty();
+    let web_ok = !services_id.is_empty()
+        && !team_id.is_empty()
+        && !key_id.is_empty()
+        && !sealed_key.is_empty();
+    if !native_ok && !web_ok {
+        return error(
+            400,
+            "Bad Request",
+            "apple provider requires apple_bundle_ids (native) or apple_services_id + apple_team_id + apple_key_id + apple_private_key (web)",
+        );
+    }
+
+    let result = if existing.is_some() {
+        durable_table_update_where(
+            store,
+            cache,
+            PROVIDERS_TABLE,
+            &[
+                ("enabled", enabled.as_str()),
+                ("redirect_uri", redirect_uri),
+                ("scopes", scopes.as_str()),
+                ("apple_team_id", team_id),
+                ("apple_key_id", key_id),
+                ("apple_services_id", services_id),
+                ("apple_bundle_ids", bundle_ids),
+                ("apple_private_key", sealed_key.as_str()),
+                ("updated_at", now_sec.as_str()),
+            ],
+            &["provider", "=", "apple"],
+            now,
+        )
+        .map(|_| ())
+    } else {
+        durable_table_insert(
+            store,
+            cache,
+            PROVIDERS_TABLE,
+            &[
+                ("provider", "apple"),
+                ("enabled", enabled.as_str()),
+                ("redirect_uri", redirect_uri),
+                ("scopes", scopes.as_str()),
+                ("apple_team_id", team_id),
+                ("apple_key_id", key_id),
+                ("apple_services_id", services_id),
+                ("apple_bundle_ids", bundle_ids),
+                ("apple_private_key", sealed_key.as_str()),
+                ("created_at", now_sec.as_str()),
+                ("updated_at", now_sec.as_str()),
+            ],
+            now,
+        )
+        .map(|_| ())
+    };
+
+    match result {
+        Ok(()) => match oauth_provider_config(store, cache, "apple", now) {
+            Ok(Some(config)) => ok(json!({"provider": provider_config_json(&config)})),
+            Ok(None) => error(404, "Not Found", "provider not found"),
+            Err(e) => error(400, "Bad Request", &e),
+        },
         Err(e) => error(400, "Bad Request", &e),
     }
 }
@@ -2572,6 +2711,33 @@ fn create_table_if_missing(
         Ok(_) => Ok(()),
         Err(_) => tables::table_create(store, cache, table, columns, now),
     }
+}
+
+// Apple Sign In columns added to auth.providers after the original two-provider
+// (google/github) schema shipped. Adds them to instances whose auth.providers
+// predates Apple support; idempotent, so it also no-ops on fresh instances that
+// already have them from the bootstrap CREATE above.
+const APPLE_PROVIDER_COLUMNS: &[&str] = &[
+    "apple_team_id STR",
+    "apple_key_id STR",
+    "apple_services_id STR",
+    "apple_bundle_ids STR",
+    "apple_private_key STR",
+];
+
+fn migrate_provider_apple_columns(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    now: Instant,
+) -> Result<(), String> {
+    for spec in APPLE_PROVIDER_COLUMNS {
+        match tables::table_add_column(store, cache, PROVIDERS_TABLE, spec, now) {
+            Ok(()) => {}
+            Err(e) if e.contains("already exists") => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 fn durable_table_insert(
@@ -3182,6 +3348,14 @@ struct OAuthProviderConfig {
     client_secret: String,
     redirect_uri: String,
     scopes: String,
+    // Apple Sign In: services_id is the web OAuth client_id (aud), bundle_ids is a
+    // comma-separated list of native audiences, apple_private_key is the unsealed
+    // .p8 PEM (empty unless configured). team_id/key_id identify the .p8 to Apple.
+    apple_team_id: String,
+    apple_key_id: String,
+    apple_services_id: String,
+    apple_bundle_ids: String,
+    apple_private_key: String,
     created_at: Value,
     updated_at: Value,
 }
@@ -3204,6 +3378,11 @@ fn provider_map_json(row: &HashMap<String, String>) -> Value {
         "redirect_uri": row.get("redirect_uri").cloned().unwrap_or_default(),
         "scopes": row.get("scopes").cloned().unwrap_or_default(),
         "has_client_secret": row.get("client_secret").map(|s| !s.is_empty()).unwrap_or(false),
+        "apple_team_id": row.get("apple_team_id").cloned().unwrap_or_default(),
+        "apple_key_id": row.get("apple_key_id").cloned().unwrap_or_default(),
+        "apple_services_id": row.get("apple_services_id").cloned().unwrap_or_default(),
+        "apple_bundle_ids": row.get("apple_bundle_ids").cloned().unwrap_or_default(),
+        "has_apple_private_key": row.get("apple_private_key").map(|s| !s.is_empty()).unwrap_or(false),
         "created_at": parse_optional_int(row.get("created_at")),
         "updated_at": parse_optional_int(row.get("updated_at")),
     })
@@ -3217,9 +3396,55 @@ fn provider_config_json(config: &OAuthProviderConfig) -> Value {
         "redirect_uri": config.redirect_uri,
         "scopes": config.scopes,
         "has_client_secret": !config.client_secret.is_empty(),
+        "apple_team_id": config.apple_team_id,
+        "apple_key_id": config.apple_key_id,
+        "apple_services_id": config.apple_services_id,
+        "apple_bundle_ids": config.apple_bundle_ids,
+        "has_apple_private_key": !config.apple_private_key.is_empty(),
         "created_at": config.created_at,
         "updated_at": config.updated_at,
     })
+}
+
+// Apple's .p8 is stored in the plain `apple_private_key` STR column, sealed with
+// the encryption keyring when one is active (prod instances) and stored as-is
+// otherwise (dev / non-encryption instances). A sealed value carries this prefix
+// so reads can tell the two apart without relying on the ENCRYPTED column flag
+// (which would hard-fail auth bootstrap on non-encryption instances).
+const APPLE_KEY_SEAL_PREFIX: &str = "luxsealed:";
+const APPLE_KEY_AAD_PK: &str = "apple";
+
+fn seal_apple_private_key(store: &Store, p8: &str) -> Result<String, String> {
+    if p8.is_empty() {
+        return Ok(String::new());
+    }
+    if !store.encryption().has_active_key() {
+        return Ok(p8.to_string());
+    }
+    let envelope = store.encryption().encrypt(
+        PROVIDERS_TABLE,
+        "apple_private_key",
+        APPLE_KEY_AAD_PK,
+        p8.as_bytes(),
+    )?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(envelope);
+    Ok(format!("{APPLE_KEY_SEAL_PREFIX}{encoded}"))
+}
+
+fn unseal_apple_private_key(store: &Store, stored: &str) -> Result<String, String> {
+    let Some(encoded) = stored.strip_prefix(APPLE_KEY_SEAL_PREFIX) else {
+        return Ok(stored.to_string());
+    };
+    let envelope = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("ERR apple private key decode failed: {e}"))?;
+    let plain = store.encryption().decrypt(
+        PROVIDERS_TABLE,
+        "apple_private_key",
+        APPLE_KEY_AAD_PK,
+        &envelope,
+    )?;
+    String::from_utf8(plain).map_err(|e| format!("ERR apple private key not utf-8: {e}"))
 }
 
 fn oauth_provider_config(
@@ -3232,6 +3457,10 @@ fn oauth_provider_config(
     else {
         return Ok(None);
     };
+    let apple_private_key = match row.get("apple_private_key") {
+        Some(stored) if !stored.is_empty() => unseal_apple_private_key(store, stored)?,
+        _ => String::new(),
+    };
     Ok(Some(OAuthProviderConfig {
         provider: row.get("provider").cloned().unwrap_or_default(),
         enabled: parse_bool(row.get("enabled")),
@@ -3242,6 +3471,11 @@ fn oauth_provider_config(
             .get("scopes")
             .cloned()
             .unwrap_or_else(|| default_oauth_scopes(provider).to_string()),
+        apple_team_id: row.get("apple_team_id").cloned().unwrap_or_default(),
+        apple_key_id: row.get("apple_key_id").cloned().unwrap_or_default(),
+        apple_services_id: row.get("apple_services_id").cloned().unwrap_or_default(),
+        apple_bundle_ids: row.get("apple_bundle_ids").cloned().unwrap_or_default(),
+        apple_private_key,
         created_at: parse_optional_int(row.get("created_at")),
         updated_at: parse_optional_int(row.get("updated_at")),
     }))
@@ -3250,7 +3484,7 @@ fn oauth_provider_config(
 fn normalize_oauth_provider(provider: &str) -> Result<String, (u16, &'static str, String)> {
     let provider = provider.trim().to_ascii_lowercase();
     match provider.as_str() {
-        "google" | "github" => Ok(provider),
+        "google" | "github" | "apple" => Ok(provider),
         _ => Err(error(400, "Bad Request", "unsupported provider")),
     }
 }
@@ -3259,6 +3493,7 @@ fn default_oauth_scopes(provider: &str) -> &'static str {
     match provider {
         "google" => "openid email profile",
         "github" => "read:user user:email",
+        "apple" => "name email",
         _ => "",
     }
 }
@@ -3292,8 +3527,238 @@ fn oauth_authorization_url(
             url_encode(&config.scopes),
             url_encode(state),
         ),
+        // Apple uses the Services ID as client_id and requires form_post response
+        // mode when name/email scopes are requested (Apple then POSTs the callback).
+        "apple" => format!(
+            "https://appleid.apple.com/auth/authorize?client_id={}&redirect_uri={}&response_type=code&response_mode=form_post&scope={}&state={}",
+            url_encode(&config.apple_services_id),
+            url_encode(redirect_uri),
+            url_encode(&config.scopes),
+            url_encode(state),
+        ),
         _ => String::new(),
     }
+}
+
+// ---- Sign in with Apple ----------------------------------------------------
+
+const APPLE_ISSUER: &str = "https://appleid.apple.com";
+const APPLE_JWKS_URL: &str = "https://appleid.apple.com/auth/keys";
+const APPLE_JWKS_TTL: Duration = Duration::from_secs(6 * 3600);
+
+static APPLE_JWKS_CACHE: OnceLock<Mutex<Option<(Instant, JwkSet)>>> = OnceLock::new();
+
+#[derive(Debug, Deserialize)]
+struct AppleIdTokenClaims {
+    sub: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    nonce: Option<String>,
+}
+
+fn apple_jwks_cache() -> &'static Mutex<Option<(Instant, JwkSet)>> {
+    APPLE_JWKS_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Seed the Apple JWKS cache so verification runs without a network fetch.
+#[cfg(test)]
+fn seed_apple_jwks_for_test(set: JwkSet) {
+    *apple_jwks_cache().lock().unwrap() = Some((Instant::now(), set));
+}
+
+/// Apple's public signing keys, cached with a TTL. In tests the cache is seeded
+/// directly (see test_support) so no network call is made.
+async fn apple_jwks(force_refresh: bool) -> Result<JwkSet, String> {
+    if !force_refresh {
+        if let Some((fetched, set)) = apple_jwks_cache().lock().unwrap().as_ref() {
+            if fetched.elapsed() < APPLE_JWKS_TTL {
+                return Ok(set.clone());
+            }
+        }
+    }
+    let set: JwkSet = reqwest::Client::new()
+        .get(APPLE_JWKS_URL)
+        .send()
+        .await
+        .map_err(|_| "apple_jwks_fetch_failed".to_string())?
+        .json()
+        .await
+        .map_err(|_| "apple_jwks_parse_failed".to_string())?;
+    *apple_jwks_cache().lock().unwrap() = Some((Instant::now(), set.clone()));
+    Ok(set)
+}
+
+fn sha256_hex(input: &str) -> String {
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Verify an Apple identity token against Apple's JWKS. Checks RS256 signature,
+/// issuer, that `aud` is one of `allowed_auds`, expiry, and (when provided) that
+/// the token's `nonce` equals sha256hex of `expected_nonce_raw` (the native SDK
+/// sends the raw nonce; Apple echoes its SHA-256 in the token).
+fn verify_apple_id_token(
+    jwks: &JwkSet,
+    id_token: &str,
+    allowed_auds: &[String],
+    expected_nonce_raw: Option<&str>,
+) -> Result<AppleIdTokenClaims, String> {
+    let header = decode_header(id_token).map_err(|_| "apple_id_token_invalid".to_string())?;
+    let kid = header
+        .kid
+        .ok_or_else(|| "apple_id_token_missing_kid".to_string())?;
+    let jwk = jwks
+        .find(&kid)
+        .ok_or_else(|| "apple_signing_key_not_found".to_string())?;
+    let decoding_key = DecodingKey::from_jwk(jwk).map_err(|_| "apple_jwk_invalid".to_string())?;
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&[APPLE_ISSUER]);
+    validation.set_audience(allowed_auds);
+    let claims = decode::<AppleIdTokenClaims>(id_token, &decoding_key, &validation)
+        .map_err(|_| "apple_id_token_verification_failed".to_string())?
+        .claims;
+    if let Some(raw) = expected_nonce_raw {
+        let expected = sha256_hex(raw);
+        match claims.nonce.as_deref() {
+            Some(nonce) if nonce == expected => {}
+            _ => return Err("apple_id_token_nonce_mismatch".to_string()),
+        }
+    }
+    Ok(claims)
+}
+
+fn oauth_user_from_apple(claims: AppleIdTokenClaims, name: Option<String>) -> OAuthUser {
+    let email = claims.email.clone().unwrap_or_default();
+    let mut user_metadata = json!({});
+    if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
+        user_metadata["name"] = json!(name);
+    }
+    OAuthUser {
+        provider: "apple".to_string(),
+        provider_id: claims.sub.clone(),
+        email,
+        // Apple only issues emails it controls (including private-relay), so they
+        // are always verified.
+        email_verified: true,
+        user_metadata,
+        identity_data: json!({ "sub": claims.sub }),
+    }
+}
+
+async fn signin_apple(
+    body: &str,
+    headers: &[(String, String)],
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> AuthHttpResponse {
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err((status, status_text, body)) => {
+            return AuthHttpResponse::json(status, status_text, body)
+        }
+    };
+    let id_token = match required_string(&parsed, "id_token") {
+        Ok(id_token) => id_token.trim().to_string(),
+        Err((status, status_text, body)) => {
+            return AuthHttpResponse::json(status, status_text, body)
+        }
+    };
+    let nonce = parsed
+        .get("nonce")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let name = parsed
+        .get("user")
+        .and_then(|user| user.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let now = Instant::now();
+    let config = match oauth_provider_config(store, cache, "apple", now) {
+        Ok(Some(config)) if config.enabled => config,
+        Ok(Some(_)) => {
+            let (s, st, b) = error(400, "Bad Request", "apple provider is disabled");
+            return AuthHttpResponse::json(s, st, b);
+        }
+        Ok(None) => {
+            let (s, st, b) = error(400, "Bad Request", "apple provider is not configured");
+            return AuthHttpResponse::json(s, st, b);
+        }
+        Err(e) => {
+            let (s, st, b) = error(400, "Bad Request", &e);
+            return AuthHttpResponse::json(s, st, b);
+        }
+    };
+
+    // Native tokens carry the app's bundle ID as `aud`; also accept the web
+    // services ID so a single provider config serves both surfaces.
+    let mut allowed_auds: Vec<String> = config
+        .apple_bundle_ids
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !config.apple_services_id.is_empty() {
+        allowed_auds.push(config.apple_services_id.clone());
+    }
+    if allowed_auds.is_empty() {
+        let (s, st, b) = error(
+            400,
+            "Bad Request",
+            "apple provider has no configured audiences",
+        );
+        return AuthHttpResponse::json(s, st, b);
+    }
+
+    let jwks = match apple_jwks(false).await {
+        Ok(jwks) => jwks,
+        Err(e) => {
+            let (s, st, b) = error(502, "Bad Gateway", &e);
+            return AuthHttpResponse::json(s, st, b);
+        }
+    };
+    // A rotated Apple key can miss the cache; refetch once before failing.
+    let claims = match verify_apple_id_token(&jwks, &id_token, &allowed_auds, nonce.as_deref()) {
+        Ok(claims) => claims,
+        Err(first) if first == "apple_signing_key_not_found" => match apple_jwks(true).await {
+            Ok(fresh) => {
+                match verify_apple_id_token(&fresh, &id_token, &allowed_auds, nonce.as_deref()) {
+                    Ok(claims) => claims,
+                    Err(e) => {
+                        let (s, st, b) = error(401, "Unauthorized", &e);
+                        return AuthHttpResponse::json(s, st, b);
+                    }
+                }
+            }
+            Err(e) => {
+                let (s, st, b) = error(502, "Bad Gateway", &e);
+                return AuthHttpResponse::json(s, st, b);
+            }
+        },
+        Err(e) => {
+            let (s, st, b) = error(401, "Unauthorized", &e);
+            return AuthHttpResponse::json(s, st, b);
+        }
+    };
+
+    let oauth_user = oauth_user_from_apple(claims, name);
+    let subject = match oauth_resolve_user(&oauth_user, store, cache) {
+        Ok(subject) => subject,
+        Err((status, status_text, body)) => {
+            return AuthHttpResponse::json(status, status_text, body)
+        }
+    };
+    let (status, status_text, body) =
+        issue_session_response(store, cache, headers, &subject.user_id, &subject.email, now);
+    AuthHttpResponse::json(status, status_text, body)
 }
 
 async fn exchange_oauth_code(
@@ -3304,8 +3769,78 @@ async fn exchange_oauth_code(
     match config.provider.as_str() {
         "google" => exchange_google_code(config, code, redirect_uri).await,
         "github" => exchange_github_code(config, code, redirect_uri).await,
+        "apple" => exchange_apple_code(config, code, redirect_uri).await,
         _ => Err("unsupported_provider".to_string()),
     }
+}
+
+/// Mint Apple's OAuth "client secret" on demand: an ES256 JWT signed with the
+/// stored .p8. Minted per exchange with a short expiry, so unlike a manually
+/// pasted secret it never goes stale and never needs rotation.
+fn mint_apple_client_secret(config: &OAuthProviderConfig) -> Result<String, String> {
+    if config.apple_team_id.is_empty()
+        || config.apple_key_id.is_empty()
+        || config.apple_services_id.is_empty()
+        || config.apple_private_key.is_empty()
+    {
+        return Err("apple_web_not_configured".to_string());
+    }
+    let now = unix_seconds() as i64;
+    let claims = json!({
+        "iss": config.apple_team_id,
+        "iat": now,
+        "exp": now + 300,
+        "aud": APPLE_ISSUER,
+        "sub": config.apple_services_id,
+    });
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some(config.apple_key_id.clone());
+    let key = EncodingKey::from_ec_pem(config.apple_private_key.as_bytes())
+        .map_err(|_| "apple_private_key_invalid".to_string())?;
+    encode(&header, &claims, &key).map_err(|_| "apple_client_secret_mint_failed".to_string())
+}
+
+async fn exchange_apple_code(
+    config: &OAuthProviderConfig,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<OAuthUser, String> {
+    let client_secret = mint_apple_client_secret(config)?;
+    let body = form_body(&[
+        ("client_id", config.apple_services_id.as_str()),
+        ("client_secret", client_secret.as_str()),
+        ("code", code),
+        ("grant_type", "authorization_code"),
+        ("redirect_uri", redirect_uri),
+    ]);
+    let token: Value = reqwest::Client::new()
+        .post("https://appleid.apple.com/auth/token")
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| "token_exchange_failed".to_string())?
+        .json()
+        .await
+        .map_err(|_| "token_response_invalid".to_string())?;
+    let id_token = token
+        .get("id_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "token_exchange_failed".to_string())?;
+    let allowed = [config.apple_services_id.clone()];
+    let jwks = apple_jwks(false).await?;
+    let claims = match verify_apple_id_token(&jwks, id_token, &allowed, None) {
+        Ok(claims) => claims,
+        Err(e) if e == "apple_signing_key_not_found" => {
+            let fresh = apple_jwks(true).await?;
+            verify_apple_id_token(&fresh, id_token, &allowed, None)?
+        }
+        Err(e) => return Err(e),
+    };
+    // Apple returns the user's name only in the first form_post callback body,
+    // never in the id_token, so the web flow does not capture it here.
+    Ok(oauth_user_from_apple(claims, None))
 }
 
 async fn exchange_google_code(
@@ -4205,6 +4740,47 @@ fn form_body(items: &[(&str, &str)]) -> String {
         .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+fn parse_form_urlencoded(body: &str) -> Vec<(String, String)> {
+    body.split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next()?;
+            let value = parts.next().unwrap_or("");
+            Some((url_decode(key), url_decode(value)))
+        })
+        .collect()
+}
+
+fn url_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn sanitize_header_value(value: &str) -> String {
@@ -7248,5 +7824,332 @@ mod tests {
             user.get("email").map(String::as_str),
             Some("wal@example.com")
         );
+    }
+
+    // ---- Sign in with Apple ------------------------------------------------
+
+    // Throwaway RSA keypair (never used outside tests) that stands in for Apple's
+    // signing key. The matching public modulus is published via apple_test_jwks().
+    const APPLE_TEST_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDWrRYTz3nd0N+2\nzH7DdCUaxV9uG4JQWK2/DIB1ijP1onsSANqSOI8M7Yc0gHW7QBGzxB9juB8UECDh\n9JG6cYcjCD/7C4AFoTxSQghN/mHXuWLR4nIUOC5R8fGWO8tM4T7sU3J0YN+8B7bS\nT2thaZUfYdzIzDxbE6l9nnArDAJvMm5K8CdNdtmOgFFpXBLFP9EsAI2/2/cRYIhz\nqsfgpNcrogW9lerKHvsODc8mErVmPMYS29q6iiy0QnG29Yapaga96ZlWnvsaQ4fB\nfQEypbLC7Mrn1YsGsnk5vQ/FnCNgHTKxn3QwRKu+ah40kKfVvXGuhIHicGoRG2ZY\nXaNLLaXHAgMBAAECggEAaZIjCkj80FWYvsegCzSBzsGDZZ2Hn0WM5CgcwDDfzotB\n5J+g3UmNJ7ljxTDrNNOUIQhwu1RfjDlGQnhIdhzAbTzwYd/M7HfXN0ib1ucjbLgR\nXc/zc/gQ52GJAe2T09HtZMDAx3SgclKE2LYPw47ts8onjmPJxqxLrKgO10yHofCO\nlJ5OQhsRkY1bXldo26epF//LNWObaH8pPs62LUXcjjPpvEJN3+qB254X7n6iXJZK\ngo3Ytn1/LDyHArzpOmCMdTIK01nejqeQYqyZN9mcC3j6Uc+4FiCeTXC10R60fCf6\nHZqwfuNh0DucgqQDuhsrTqLGNSQQXP/4ht9PTBSy4QKBgQD/uqs8iopnMlx/bu2J\nNK2m9jOoAzZd3Ss6Slr3/+bAmLckgLsXkOND845gIzOgwVIOeDr8ite+oghY5rdU\nsylJtpkqde9nDpXhnHYNcAJMsumf492rbonJDhjW/qBEuWnxeSfKkxDz/6KYBiHt\nitXQ1KXYL6feDZYYaeZIZkcuVwKBgQDW50mSnOm7lTxloMd1nGsD2vili/sJYmKd\neVr01mh+fFrvN1+qVqC67FUhyH4eootsIR58oDPDW+bwJHLwIHLedJWP7xjfnt86\n2LmumH5F8JTEiuHpUWldqhiwtFRFsue5oFNkr8xEuTMuBrZrcqc2x5mRDSqZ5+RK\n3d/QbQm+EQKBgQDuO3scaj/nRU5QVQmqgU2otcGHqn5yUQDdS7mVQWs5TsuGkPo6\nSPq/Kd0gCIsnHhGQc0cYT0wPRqmaEE0H9ePnzNjBap69FiRgyj5b5FXwF9h24HN4\nKgDoMV7IouqxOz3L+78rA3iOpj5Ve5kNzwHDiuZ5EGRFA8kpMzaZidaT/wKBgBo9\nT0xpgFh5FlDKWtBPcvmbiPSdrN8udiAIK0Tt0QBwqqG+vx2LSkDIjnR7iHqxGhjv\nykspPGjEFeSIbshHDf9/eKuEZCMZwOPshm99Cx37DA8bbg4Q9K6NEEqzGf8Qox6V\nJtmKZYSWoFskUq236BbWNDfzxZnZKJTDlopaZfAhAoGASo3rF6mA03tlu0m5bqai\nchXO2C15Mme+QRVgH9eoDbJy6YZtSx443RCrwZI+hDjXWXQeeML12IvFX5yl0BnZ\nqnIpvsWHn9vcD/NxTuKLOw55MMNXEBtvNh+dpE49oaLpve847/0x/HjAMcMYZbMA\nOtciBxUogvL+pAyZKs12XcM=\n-----END PRIVATE KEY-----\n";
+    const APPLE_TEST_MODULUS_N: &str = "1q0WE8953dDftsx-w3QlGsVfbhuCUFitvwyAdYoz9aJ7EgDakjiPDO2HNIB1u0ARs8QfY7gfFBAg4fSRunGHIwg_-wuABaE8UkIITf5h17li0eJyFDguUfHxljvLTOE-7FNydGDfvAe20k9rYWmVH2HcyMw8WxOpfZ5wKwwCbzJuSvAnTXbZjoBRaVwSxT_RLACNv9v3EWCIc6rH4KTXK6IFvZXqyh77Dg3PJhK1ZjzGEtvauoostEJxtvWGqWoGvemZVp77GkOHwX0BMqWywuzK59WLBrJ5Ob0PxZwjYB0ysZ90MESrvmoeNJCn1b1xroSB4nBqERtmWF2jSy2lxw";
+    const APPLE_TEST_KID: &str = "apple-test-kid";
+
+    fn apple_test_jwks() -> JwkSet {
+        serde_json::from_value(json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": APPLE_TEST_KID,
+                "use": "sig",
+                "alg": "RS256",
+                "n": APPLE_TEST_MODULUS_N,
+                "e": "AQAB",
+            }],
+        }))
+        .unwrap()
+    }
+
+    fn mint_apple_id_token(
+        aud: &str,
+        sub: &str,
+        email: Option<&str>,
+        nonce_claim: Option<&str>,
+        exp_offset_secs: i64,
+    ) -> String {
+        let now = unix_seconds() as i64;
+        let mut claims = json!({
+            "iss": APPLE_ISSUER,
+            "aud": aud,
+            "sub": sub,
+            "iat": now,
+            "exp": now + exp_offset_secs,
+        });
+        if let Some(email) = email {
+            claims["email"] = json!(email);
+        }
+        if let Some(nonce) = nonce_claim {
+            claims["nonce"] = json!(nonce);
+        }
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(APPLE_TEST_KID.to_string());
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(APPLE_TEST_PRIVATE_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn verify_apple_id_token_accepts_valid_token() {
+        let jwks = apple_test_jwks();
+        let nonce_claim = sha256_hex("raw-nonce-123");
+        let token = mint_apple_id_token(
+            "com.pompeii.app",
+            "apple-sub-001",
+            Some("user@privaterelay.appleid.com"),
+            Some(&nonce_claim),
+            3600,
+        );
+        let claims = verify_apple_id_token(
+            &jwks,
+            &token,
+            &["com.pompeii.app".to_string()],
+            Some("raw-nonce-123"),
+        )
+        .expect("valid token should verify");
+        assert_eq!(claims.sub, "apple-sub-001");
+        assert_eq!(
+            claims.email.as_deref(),
+            Some("user@privaterelay.appleid.com")
+        );
+    }
+
+    #[test]
+    fn verify_apple_id_token_rejects_wrong_audience() {
+        let jwks = apple_test_jwks();
+        let token = mint_apple_id_token("com.pompeii.app", "s", None, None, 3600);
+        assert!(
+            verify_apple_id_token(&jwks, &token, &["com.someone.else".to_string()], None).is_err()
+        );
+    }
+
+    #[test]
+    fn verify_apple_id_token_rejects_expired() {
+        let jwks = apple_test_jwks();
+        let token = mint_apple_id_token("com.pompeii.app", "s", None, None, -3600);
+        assert!(
+            verify_apple_id_token(&jwks, &token, &["com.pompeii.app".to_string()], None).is_err()
+        );
+    }
+
+    #[test]
+    fn verify_apple_id_token_rejects_nonce_mismatch() {
+        let jwks = apple_test_jwks();
+        let token = mint_apple_id_token(
+            "com.pompeii.app",
+            "s",
+            None,
+            Some(&sha256_hex("expected")),
+            3600,
+        );
+        assert!(verify_apple_id_token(
+            &jwks,
+            &token,
+            &["com.pompeii.app".to_string()],
+            Some("attacker-supplied")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn apple_private_key_seals_and_unseals_with_active_key() {
+        let store = Store::new();
+        store.encryption().init(Some("k1")).unwrap();
+        let p8 = "-----BEGIN PRIVATE KEY-----\nMOCKAPPLEP8\n-----END PRIVATE KEY-----\n";
+        let sealed = seal_apple_private_key(&store, p8).unwrap();
+        assert!(sealed.starts_with(APPLE_KEY_SEAL_PREFIX), "{sealed}");
+        assert!(
+            !sealed.contains("MOCKAPPLEP8"),
+            "sealed key leaked plaintext"
+        );
+        assert_eq!(unseal_apple_private_key(&store, &sealed).unwrap(), p8);
+    }
+
+    #[test]
+    fn apple_private_key_falls_back_to_plaintext_without_key() {
+        let store = Store::new();
+        let p8 = "-----BEGIN PRIVATE KEY-----\nNOKEY\n-----END PRIVATE KEY-----\n";
+        let stored = seal_apple_private_key(&store, p8).unwrap();
+        // On an instance with no active keyring the .p8 is stored verbatim; if a
+        // key is active (ambient in a parallel test run) it is sealed instead.
+        // Either way the value must round-trip back to the original PEM.
+        if store.encryption().has_active_key() {
+            assert!(stored.starts_with(APPLE_KEY_SEAL_PREFIX), "{stored}");
+        } else {
+            assert_eq!(stored, p8, "no active key -> stored as-is");
+        }
+        assert_eq!(unseal_apple_private_key(&store, &stored).unwrap(), p8);
+    }
+
+    #[tokio::test]
+    async fn signin_apple_native_creates_and_relinks_user() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                initial_secret_key: Some("lux_sec_test".to_string()),
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        let (status, _, body) = route_http(
+            "PUT",
+            "/auth/v1/admin/providers/apple",
+            r#"{"enabled":true,"apple_bundle_ids":"com.pompeii.app"}"#,
+            &[],
+            &[("apikey".to_string(), "lux_sec_test".to_string())],
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "provider upsert: {body}");
+
+        seed_apple_jwks_for_test(apple_test_jwks());
+        let token = mint_apple_id_token(
+            "com.pompeii.app",
+            "apple-sub-777",
+            Some("ada@privaterelay.appleid.com"),
+            None,
+            3600,
+        );
+        let signin_body = json!({"id_token": token, "user": {"name": "Ada Lovelace"}}).to_string();
+        let response = route_http_response(
+            "POST",
+            "/auth/v1/signin/apple",
+            &signin_body,
+            &[],
+            &[("host".to_string(), "localhost".to_string())],
+            &store,
+            &cache,
+        )
+        .await;
+        assert_eq!(response.status, 200, "signin: {}", response.body);
+        let session: Value = serde_json::from_str(&response.body).unwrap();
+        assert!(
+            session
+                .get("access_token")
+                .and_then(Value::as_str)
+                .is_some(),
+            "expected a session: {}",
+            response.body
+        );
+        let first_user_id = session["user"]["id"].as_str().unwrap().to_string();
+
+        // The captured first-login name is persisted on the user.
+        let user = find_row_by_field(
+            &store,
+            &cache,
+            USERS_TABLE,
+            "id",
+            &first_user_id,
+            Instant::now(),
+        )
+        .unwrap()
+        .expect("user row exists");
+        assert!(
+            user.get("raw_user_meta_data")
+                .map(|m| m.contains("Ada Lovelace"))
+                .unwrap_or(false),
+            "name not stored: {user:?}"
+        );
+
+        // A second sign-in for the same Apple sub reuses the same user (relink),
+        // not a duplicate.
+        let token2 = mint_apple_id_token("com.pompeii.app", "apple-sub-777", None, None, 3600);
+        let signin_body2 = json!({"id_token": token2}).to_string();
+        let response2 = route_http_response(
+            "POST",
+            "/auth/v1/signin/apple",
+            &signin_body2,
+            &[],
+            &[("host".to_string(), "localhost".to_string())],
+            &store,
+            &cache,
+        )
+        .await;
+        assert_eq!(response2.status, 200, "second signin: {}", response2.body);
+        let session2: Value = serde_json::from_str(&response2.body).unwrap();
+        assert_eq!(session2["user"]["id"].as_str().unwrap(), first_user_id);
+    }
+
+    const APPLE_TEST_EC_P8: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg1iQsEnphFL7abUF9\nS1iI4ajeI9EjWBBA+zh9clX4HOOhRANCAAR4dUPeEUs6DKhz17e6lA+CkszoLk7c\nD9rbk21+TPrIDWi8fX12WR9JKtcscBtNo/FiwRuGQROsuw2xpArVKgs5\n-----END PRIVATE KEY-----\n";
+    const APPLE_TEST_EC_PUB: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEeHVD3hFLOgyoc9e3upQPgpLM6C5O\n3A/a25Ntfkz6yA1ovH19dlkfSSrXLHAbTaPxYsEbhkETrLsNsaQK1SoLOQ==\n-----END PUBLIC KEY-----\n";
+
+    fn apple_web_config() -> OAuthProviderConfig {
+        OAuthProviderConfig {
+            provider: "apple".to_string(),
+            enabled: true,
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_uri: "https://app.test/auth/callback/apple".to_string(),
+            scopes: "name email".to_string(),
+            apple_team_id: "TEAM123456".to_string(),
+            apple_key_id: "KEY7890AB".to_string(),
+            apple_services_id: "com.pompeii.web".to_string(),
+            apple_bundle_ids: "com.pompeii.app".to_string(),
+            apple_private_key: APPLE_TEST_EC_P8.to_string(),
+            created_at: Value::Null,
+            updated_at: Value::Null,
+        }
+    }
+
+    #[test]
+    fn mint_apple_client_secret_produces_verifiable_es256() {
+        let secret = mint_apple_client_secret(&apple_web_config()).expect("mint");
+        let header = decode_header(&secret).unwrap();
+        assert_eq!(header.alg, Algorithm::ES256);
+        assert_eq!(header.kid.as_deref(), Some("KEY7890AB"));
+
+        let mut validation = Validation::new(Algorithm::ES256);
+        validation.validate_aud = false;
+        let claims = decode::<Value>(
+            &secret,
+            &DecodingKey::from_ec_pem(APPLE_TEST_EC_PUB.as_bytes()).unwrap(),
+            &validation,
+        )
+        .expect("client secret verifies against the .p8 public key")
+        .claims;
+        assert_eq!(claims["iss"], "TEAM123456");
+        assert_eq!(claims["sub"], "com.pompeii.web");
+        assert_eq!(claims["aud"], APPLE_ISSUER);
+    }
+
+    #[test]
+    fn mint_apple_client_secret_requires_web_config() {
+        let mut config = apple_web_config();
+        config.apple_private_key = String::new();
+        assert!(mint_apple_client_secret(&config).is_err());
+    }
+
+    #[test]
+    fn parse_form_urlencoded_decodes_apple_callback() {
+        let parsed =
+            parse_form_urlencoded("code=abc123&state=xyz&user=%7B%22name%22%3A%22Ada%22%7D");
+        assert_eq!(get_param(&parsed, "code"), Some("abc123"));
+        assert_eq!(get_param(&parsed, "state"), Some("xyz"));
+        assert_eq!(get_param(&parsed, "user"), Some(r#"{"name":"Ada"}"#));
+    }
+
+    #[tokio::test]
+    async fn signin_apple_rejects_unconfigured_provider() {
+        let config = Arc::new(crate::ServerConfig {
+            auth: AuthConfig {
+                enabled: true,
+                ..AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        seed_apple_jwks_for_test(apple_test_jwks());
+        let token = mint_apple_id_token("com.pompeii.app", "s", None, None, 3600);
+        let signin_body = json!({"id_token": token}).to_string();
+        let response = route_http_response(
+            "POST",
+            "/auth/v1/signin/apple",
+            &signin_body,
+            &[],
+            &[("host".to_string(), "localhost".to_string())],
+            &store,
+            &cache,
+        )
+        .await;
+        assert_eq!(response.status, 400, "{}", response.body);
     }
 }
