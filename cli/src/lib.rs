@@ -53,7 +53,12 @@ enum Commands {
         #[arg(long, help = "Don't open a browser window")]
         no_open: bool,
     },
-    Login,
+    /// Log in to Lux Cloud with an access token. Pass the token (or set
+    /// LUX_TOKEN) for non-interactive use in CI; omit to paste it interactively.
+    Login {
+        #[arg(help = "Access token; omit to paste interactively. Also reads LUX_TOKEN.")]
+        token: Option<String>,
+    },
     Logout,
     Link {
         #[arg(help = "Project name or ID")]
@@ -1446,18 +1451,31 @@ pub async fn run() {
             }
         }
 
-        Commands::Login => {
-            println!("{}", "Paste your Lux Cloud access token.".bold());
-            println!(
-                "Get one from: {}",
-                "https://luxdb.dev/dashboard/settings".cyan()
-            );
-            print!("\n{} ", "Token:".bold());
-            std::io::stdout().flush().ok();
+        Commands::Login { token } => {
+            // Non-interactive (CI): token as an argument or LUX_TOKEN env var.
+            // Interactive: prompt for a paste. Env is preferred in CI so the
+            // secret stays out of shell history and the process list.
+            let provided = token
+                .or_else(|| std::env::var("LUX_TOKEN").ok())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty());
 
-            let mut token = String::new();
-            std::io::stdin().read_line(&mut token).ok();
-            let token = token.trim().to_string();
+            let token = match provided {
+                Some(token) => token,
+                None => {
+                    println!("{}", "Paste your Lux Cloud access token.".bold());
+                    println!(
+                        "Get one from: {}",
+                        "https://luxdb.dev/dashboard/settings".cyan()
+                    );
+                    print!("\n{} ", "Token:".bold());
+                    std::io::stdout().flush().ok();
+
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).ok();
+                    input.trim().to_string()
+                }
+            };
 
             if token.is_empty() {
                 eprintln!("{}", "No token provided.".red());
