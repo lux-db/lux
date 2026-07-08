@@ -256,6 +256,60 @@ export class TableSubscription<T extends object> {
 	}
 }
 
+/**
+ * Point access to a single row by primary key over RESP (TGET/TSET). `.set`
+ * updates one or more cells directly; `.get(field)` reads one cell; `.get()`
+ * reads the whole row as raw string cells (use the query builder's `.single()`
+ * for schema-decoded rows).
+ */
+export class LuxTableRow {
+	constructor(
+		private readonly client: TableClient,
+		private readonly name: string,
+		private readonly key: string,
+	) {}
+
+	async set(
+		fieldOrPatch: string | Record<string, unknown>,
+		value?: unknown,
+	): Promise<LuxResult<number>> {
+		const pairs: Array<string | number> = [];
+		if (typeof fieldOrPatch === 'string') {
+			pairs.push(fieldOrPatch, serializeFieldValue(value));
+		} else {
+			for (const [k, v] of Object.entries(fieldOrPatch)) {
+				pairs.push(k, serializeFieldValue(v));
+			}
+		}
+		try {
+			const result = (await this.client.call('TSET', this.name, this.key, ...pairs)) as
+				| string
+				| number;
+			return ok(Number(result) || 0);
+		} catch (error) {
+			return err('LUX_TSET_ERROR', error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	async get(field?: string): Promise<LuxResult<unknown>> {
+		try {
+			if (field !== undefined) {
+				const v = await this.client.call('TGET', this.name, this.key, field);
+				return ok(v ?? null);
+			}
+			const arr = (await this.client.call('TGET', this.name, this.key)) as unknown[] | null;
+			if (!Array.isArray(arr)) return ok(null);
+			const row: Record<string, unknown> = {};
+			for (let i = 0; i + 1 < arr.length; i += 2) {
+				row[String(arr[i])] = arr[i + 1];
+			}
+			return ok(row);
+		} catch (error) {
+			return err('LUX_TGET_ERROR', error instanceof Error ? error.message : String(error));
+		}
+	}
+}
+
 export class TableQueryBuilder<T extends object = TableRow> {
 	private client: TableClient;
 	private name: string;
@@ -280,53 +334,10 @@ export class TableQueryBuilder<T extends object = TableRow> {
 	}
 
 	/**
-	 * Point access to a row by primary key over RESP (TGET/TSET). `.set` updates
-	 * one or more cells directly; `.get(field)` reads one cell; `.get()` reads the
-	 * whole row as raw string cells (use the query builder's `.single()` for
-	 * schema-decoded rows).
+	 * Point access to a row by primary key over RESP (TGET/TSET). See `LuxTableRow`.
 	 */
-	row(pk: string | number) {
-		const client = this.client;
-		const name = this.name;
-		const key = String(pk);
-		return {
-			async set(
-				fieldOrPatch: string | Record<string, unknown>,
-				value?: unknown,
-			): Promise<LuxResult<number>> {
-				const pairs: Array<string | number> = [];
-				if (typeof fieldOrPatch === 'string') {
-					pairs.push(fieldOrPatch, serializeFieldValue(value));
-				} else {
-					for (const [k, v] of Object.entries(fieldOrPatch)) {
-						pairs.push(k, serializeFieldValue(v));
-					}
-				}
-				try {
-					const result = (await client.call('TSET', name, key, ...pairs)) as string | number;
-					return ok(Number(result) || 0);
-				} catch (error) {
-					return err('LUX_TSET_ERROR', error instanceof Error ? error.message : String(error));
-				}
-			},
-			async get(field?: string): Promise<LuxResult<unknown>> {
-				try {
-					if (field !== undefined) {
-						const v = await client.call('TGET', name, key, field);
-						return ok(v ?? null);
-					}
-					const arr = (await client.call('TGET', name, key)) as unknown[] | null;
-					if (!Array.isArray(arr)) return ok(null);
-					const row: Record<string, unknown> = {};
-					for (let i = 0; i + 1 < arr.length; i += 2) {
-						row[String(arr[i])] = arr[i + 1];
-					}
-					return ok(row);
-				} catch (error) {
-					return err('LUX_TGET_ERROR', error instanceof Error ? error.message : String(error));
-				}
-			},
-		};
+	row(pk: string | number): LuxTableRow {
+		return new LuxTableRow(this.client, this.name, String(pk));
 	}
 
 	private validateRow(row: TableRow): T {
