@@ -2160,6 +2160,16 @@ fn admin_upsert_apple_provider(
             .cloned()
             .unwrap_or_default()
     } else {
+        // Fail fast on a bad or wrong-file .p8 with a clear message, instead of a
+        // cryptic mint failure at first web sign-in. Same parse the client-secret
+        // minter (mint_apple_client_secret) does per exchange.
+        if EncodingKey::from_ec_pem(private_key_input.as_bytes()).is_err() {
+            return error(
+                400,
+                "Bad Request",
+                "invalid Apple .p8 auth key: expected a PKCS#8 EC private key (the AuthKey_*.p8 Apple issued, starting with -----BEGIN PRIVATE KEY-----)",
+            );
+        }
         match seal_apple_private_key(store, private_key_input) {
             Ok(sealed) => sealed,
             Err(e) => return error(400, "Bad Request", &e),
@@ -8500,6 +8510,38 @@ mod tests {
         )
         .await;
         assert_eq!(response.status, 400, "{}", response.body);
+    }
+
+    #[test]
+    fn admin_upsert_apple_provider_rejects_invalid_p8() {
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+        // A web config with a bad .p8 is rejected up front with a clear message.
+        let bad = json!({
+            "apple_services_id": "com.pompeii.web",
+            "apple_team_id": "TEAM123456",
+            "apple_key_id": "KEY7890AB",
+            "apple_private_key": "-----BEGIN PRIVATE KEY-----\nNOTAKEY\n-----END PRIVATE KEY-----\n",
+        });
+        let (status, _, body) = admin_upsert_apple_provider(&bad, &store, &cache);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("invalid Apple .p8"), "{body}");
+
+        // The same config with a real EC .p8 passes the key check.
+        let good = json!({
+            "apple_services_id": "com.pompeii.web",
+            "apple_team_id": "TEAM123456",
+            "apple_key_id": "KEY7890AB",
+            "apple_private_key": APPLE_TEST_EC_P8,
+        });
+        let (_, _, body) = admin_upsert_apple_provider(&good, &store, &cache);
+        assert!(
+            !body.contains("invalid Apple .p8"),
+            "valid key wrongly rejected: {body}"
+        );
     }
 }
 
