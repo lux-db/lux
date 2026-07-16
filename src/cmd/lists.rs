@@ -691,3 +691,177 @@ pub fn cmd_blmove(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         timeout,
     }
 }
+
+/// Parse the shared tail of LMPOP/BLMPOP starting at the numkeys argument index
+/// `base`: `numkeys key [key ...] <LEFT|RIGHT> [COUNT count]`.
+fn parse_lmpop_args<'a>(
+    args: &'a [&'a [u8]],
+    base: usize,
+    out: &mut BytesMut,
+) -> Option<(Vec<&'a [u8]>, bool, usize)> {
+    let numkeys = match parse_u64(args[base]) {
+        Ok(n) if n >= 1 => n as usize,
+        _ => {
+            resp::write_error(out, "ERR numkeys should be greater than 0");
+            return None;
+        }
+    };
+    let dir_idx = base + 1 + numkeys;
+    if dir_idx >= args.len() {
+        resp::write_error(out, "ERR syntax error");
+        return None;
+    }
+    let keys: Vec<&[u8]> = args[base + 1..base + 1 + numkeys].to_vec();
+    let pop_left = if cmd_eq(args[dir_idx], b"LEFT") {
+        true
+    } else if cmd_eq(args[dir_idx], b"RIGHT") {
+        false
+    } else {
+        resp::write_error(out, "ERR syntax error");
+        return None;
+    };
+    let mut count = 1usize;
+    let rest = &args[dir_idx + 1..];
+    if !rest.is_empty() {
+        if rest.len() == 2 && cmd_eq(rest[0], b"COUNT") {
+            match parse_u64(rest[1]) {
+                Ok(n) if n >= 1 => count = n as usize,
+                _ => {
+                    resp::write_error(out, "ERR count should be greater than 0");
+                    return None;
+                }
+            }
+        } else {
+            resp::write_error(out, "ERR syntax error");
+            return None;
+        }
+    }
+    Some((keys, pop_left, count))
+}
+
+/// Write the LMPOP/BLMPOP success reply: `[key, [elements...]]`.
+fn write_lmpop_reply(store: &Store, out: &mut BytesMut, key: &[u8], items: &[Bytes]) {
+    resp::write_array_header(out, 2);
+    resp::write_bulk_raw(out, key);
+    resp::write_array_header(out, items.len());
+    for item in items {
+        resp::write_bulk_raw(out, &decrypt_out(store, item.clone()));
+    }
+}
+
+/// Self-log an LMPOP/BLMPOP pop as a keyed `LPOP|RPOP key n` so a sharded WAL
+/// replays it in the popped key's shard (the raw command shards on numkeys).
+pub(crate) fn wal_log_lmpop(
+    store: &Store,
+    key: &[u8],
+    pop_left: bool,
+    n: usize,
+    out: &mut BytesMut,
+) -> bool {
+    if !store.wal_enabled() {
+        return true;
+    }
+    let cmd: &[u8] = if pop_left { b"LPOP" } else { b"RPOP" };
+    let n_str = n.to_string();
+    if let Err(e) = store.wal_log_command(&[cmd, key, n_str.as_bytes()]) {
+        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+        return false;
+    }
+    true
+}
+
+pub fn cmd_lmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    // LMPOP numkeys key [key ...] <LEFT|RIGHT> [COUNT count]
+    if args.len() < 4 {
+        resp::write_error(out, "ERR wrong number of arguments for 'lmpop' command");
+        return CmdResult::Written;
+    }
+    let Some((keys, pop_left, count)) = parse_lmpop_args(args, 1, out) else {
+        return CmdResult::Written;
+    };
+    match store.lmpop(&keys, pop_left, count, now) {
+        Ok(Some((key, items))) => {
+            if !wal_log_lmpop(store, &key, pop_left, items.len(), out) {
+                return CmdResult::Written;
+            }
+            write_lmpop_reply(store, out, &key, &items);
+        }
+        Ok(None) => resp::write_null_array(out),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_blmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    // BLMPOP timeout numkeys key [key ...] <LEFT|RIGHT> [COUNT count]
+    if args.len() < 5 {
+        resp::write_error(out, "ERR wrong number of arguments for 'blmpop' command");
+        return CmdResult::Written;
+    }
+    let timeout = match parse_block_timeout(args[1], out) {
+        Some(t) => t,
+        None => return CmdResult::Written,
+    };
+    let Some((keys, pop_left, count)) = parse_lmpop_args(args, 2, out) else {
+        return CmdResult::Written;
+    };
+    // Immediately satisfiable -> behave like LMPOP and self-log the effect.
+    match store.lmpop(&keys, pop_left, count, now) {
+        Ok(Some((key, items))) => {
+            if !wal_log_lmpop(store, &key, pop_left, items.len(), out) {
+                return CmdResult::Written;
+            }
+            write_lmpop_reply(store, out, &key, &items);
+            return CmdResult::Written;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
+    }
+    let owned_keys: Vec<String> = keys.iter().map(|k| arg_str(k).to_string()).collect();
+    CmdResult::BlockListMPop {
+        keys: owned_keys,
+        pop_left,
+        count,
+        timeout,
+    }
+}
+
+pub fn cmd_brpoplpush(
+    args: &[&[u8]],
+    store: &Store,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    // BRPOPLPUSH src dst timeout == BLMOVE src dst RIGHT LEFT timeout.
+    if args.len() != 4 {
+        resp::write_error(
+            out,
+            "ERR wrong number of arguments for 'brpoplpush' command",
+        );
+        return CmdResult::Written;
+    }
+    let src = arg_str(args[1]).to_string();
+    let dst = arg_str(args[2]).to_string();
+    let timeout = match parse_block_timeout(args[3], out) {
+        Some(t) => t,
+        None => return CmdResult::Written,
+    };
+    let (src_left, dst_left) = (false, true);
+    if let Some(v) = store.lmove(args[1], args[2], src_left, dst_left, now) {
+        if !wal_log_list_move(store, args[1], args[2], v.as_ref(), src_left, dst_left, out) {
+            return CmdResult::Written;
+        }
+        resp::write_bulk_raw(out, &decrypt_out(store, v));
+        return CmdResult::Written;
+    }
+    CmdResult::BlockMove {
+        src,
+        dst,
+        src_left,
+        dst_left,
+        timeout,
+    }
+}

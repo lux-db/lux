@@ -2979,6 +2979,56 @@ impl Store {
         }
     }
 
+    /// LMPOP/BLMPOP core: pop up to `count` elements from the `pop_left` side of
+    /// the first non-empty list among `keys`. Returns the popped key and the
+    /// elements (raw, caller decrypts), or None if every key is missing/empty.
+    /// Errors WRONGTYPE if a scanned key holds a non-list value (Redis matches
+    /// on the first such key). Empty lists are left in place, mirroring LPOP.
+    #[allow(clippy::type_complexity)]
+    pub fn lmpop(
+        &self,
+        keys: &[&[u8]],
+        pop_left: bool,
+        count: usize,
+        now: Instant,
+    ) -> Result<Option<(Vec<u8>, Vec<Bytes>)>, String> {
+        for key in keys {
+            self.try_promote(key, now);
+            let idx = self.shard_index(key);
+            let mut shard = self.shards[idx].write();
+            match shard.data.get(*key) {
+                Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                    StoreValue::List(list) => {
+                        if list.is_empty() {
+                            continue;
+                        }
+                    }
+                    _ => return Err(WRONGTYPE.to_string()),
+                },
+                _ => continue,
+            }
+            let mut items = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                let popped = if pop_left {
+                    self.lpop_on_shard(&mut shard, key, now)
+                } else {
+                    self.rpop_on_shard(&mut shard, key, now)
+                };
+                match popped {
+                    Some(v) => items.push(v),
+                    None => break,
+                }
+            }
+            if !items.is_empty() {
+                shard.version += 1;
+                drop(shard);
+                self.remove_from_disk(key);
+                return Ok(Some((key.to_vec(), items)));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn llen(&self, key: &[u8], now: Instant) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();

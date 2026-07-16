@@ -48,6 +48,12 @@ pub enum CmdResult {
         timeout: std::time::Duration,
         pop_min: bool,
     },
+    BlockListMPop {
+        keys: Vec<String>,
+        pop_left: bool,
+        count: usize,
+        timeout: std::time::Duration,
+    },
     BlockMove {
         src: String,
         dst: String,
@@ -514,6 +520,18 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: b"RPOPLPUSH",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"LMPOP",
+        min_arity: 3,
+    },
+    CommandSpec {
+        name: b"BLMPOP",
+        min_arity: 4,
+    },
+    CommandSpec {
+        name: b"BRPOPLPUSH",
         min_arity: 3,
     },
     CommandSpec {
@@ -1072,6 +1090,8 @@ pub(crate) fn is_blocking_command(cmd: &[u8]) -> bool {
     cmd_eq(cmd, b"BLPOP")
         || cmd_eq(cmd, b"BRPOP")
         || cmd_eq(cmd, b"BLMOVE")
+        || cmd_eq(cmd, b"BRPOPLPUSH")
+        || cmd_eq(cmd, b"BLMPOP")
         || cmd_eq(cmd, b"BZPOPMIN")
         || cmd_eq(cmd, b"BZPOPMAX")
 }
@@ -1579,6 +1599,12 @@ pub fn execute(
             if cmd_eq(cmd, b"BLMOVE") {
                 return lists::cmd_blmove(args, store, out, now);
             }
+            if cmd_eq(cmd, b"BLMPOP") {
+                return lists::cmd_blmpop(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"BRPOPLPUSH") {
+                return lists::cmd_brpoplpush(args, store, out, now);
+            }
             if cmd_eq(cmd, b"BGSAVE") {
                 return server::cmd_bgsave(args, store, out, now);
             }
@@ -1841,6 +1867,9 @@ pub fn execute(
             }
             if cmd_eq(cmd, b"LMOVE") {
                 return lists::cmd_lmove(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"LMPOP") {
+                return lists::cmd_lmpop(args, store, out, now);
             }
             if cmd_eq(cmd, b"LXRESTORE") {
                 // Internal, replay-only: COPY's self-logged effect. Reject if a
@@ -2371,6 +2400,7 @@ fn command_self_logs_wal(cmd: &[u8]) -> bool {
             | b"TSADD"
             | b"TSMADD"
             | b"ZMPOP"
+            | b"LMPOP"
     )
 }
 

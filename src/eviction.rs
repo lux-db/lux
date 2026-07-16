@@ -236,6 +236,7 @@ pub fn is_write_command(cmd: &[u8]) -> bool {
         || eq(cmd, b"LSET")
         || eq(cmd, b"LREM")
         || eq(cmd, b"LMOVE")
+        || eq(cmd, b"LMPOP")
         || eq(cmd, b"SADD")
         || eq(cmd, b"SREM")
         || eq(cmd, b"SPOP")

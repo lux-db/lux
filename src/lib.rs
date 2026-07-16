@@ -1786,6 +1786,7 @@ impl EmbeddedClient {
                 CmdResult::BlockMove { .. } => "BLMOVE",
                 CmdResult::BlockStreamRead { .. } => "XREAD/XREADGROUP",
                 CmdResult::BlockZPop { .. } => "BZPOP*",
+                CmdResult::BlockListMPop { .. } => "BLMPOP",
                 _ => "unsupported",
             };
             return Err(LuxError::Unsupported(format!(
@@ -2019,6 +2020,7 @@ impl EmbeddedClient {
                 CmdResult::BlockMove { .. } => "BLMOVE",
                 CmdResult::BlockStreamRead { .. } => "XREAD/XREADGROUP",
                 CmdResult::BlockZPop { .. } => "BZPOP*",
+                CmdResult::BlockListMPop { .. } => "BLMPOP",
                 _ => "unsupported",
             };
             return Err(LuxError::Unsupported(format!(
@@ -3358,6 +3360,7 @@ fn handle_tx_cmd(
                         CmdResult::BlockPop { .. }
                         | CmdResult::BlockMove { .. }
                         | CmdResult::BlockStreamRead { .. }
+                        | CmdResult::BlockListMPop { .. }
                         | CmdResult::BlockZPop { .. } => {
                             resp::write_error(
                                 write_buf,
@@ -3961,6 +3964,7 @@ impl CommandExecutor {
             CmdResult::BlockPop { .. }
             | CmdResult::BlockMove { .. }
             | CmdResult::BlockStreamRead { .. }
+            | CmdResult::BlockListMPop { .. }
             | CmdResult::BlockZPop { .. } => Some(cmd_result),
             CmdResult::Eval { script, keys, argv } => {
                 handle_eval(
@@ -4344,6 +4348,15 @@ async fn handle_connection(
                     } => {
                         handle_block_zpop(&mut socket, &store, &keys, timeout, pop_min).await?;
                     }
+                    CmdResult::BlockListMPop {
+                        keys,
+                        pop_left,
+                        count,
+                        timeout,
+                    } => {
+                        handle_block_lmpop(&mut socket, &store, &keys, pop_left, count, timeout)
+                            .await?;
+                    }
                     _ => {}
                 }
             }
@@ -4600,6 +4613,57 @@ fn handle_eval(
         Err(e) => {
             resp::write_error(out, &e);
         }
+    }
+}
+
+async fn handle_block_lmpop(
+    socket: &mut tokio::net::TcpStream,
+    store: &Arc<Store>,
+    keys: &[String],
+    pop_left: bool,
+    count: usize,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
+    let mut write_buf = BytesMut::new();
+
+    loop {
+        let now = Instant::now();
+        match store.lmpop(&key_refs, pop_left, count, now) {
+            Ok(Some((key, items))) => {
+                // Popped straight from the store outside the WAL; log the
+                // compensating LPOP/RPOP keyed on the popped key so replay stays
+                // correct (ENG-1316/1317). No shard locks held here.
+                if store.wal_enabled() {
+                    let pop: &[u8] = if pop_left { b"LPOP" } else { b"RPOP" };
+                    let n = items.len().to_string();
+                    let _ = store.wal_log_command(&[pop, &key, n.as_bytes()]);
+                }
+                resp::write_array_header(&mut write_buf, 2);
+                resp::write_bulk_raw(&mut write_buf, &key);
+                resp::write_array_header(&mut write_buf, items.len());
+                for item in &items {
+                    let decrypted = store
+                        .decrypt_list_element(item.clone())
+                        .unwrap_or_else(|_| item.clone());
+                    resp::write_bulk_raw(&mut write_buf, &decrypted);
+                }
+                return socket.write_all(&write_buf).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                resp::write_error(&mut write_buf, &e);
+                return socket.write_all(&write_buf).await;
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            resp::write_null_array(&mut write_buf);
+            return socket.write_all(&write_buf).await;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 
