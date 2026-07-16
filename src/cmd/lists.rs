@@ -671,7 +671,14 @@ pub fn cmd_blmove(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         None => return CmdResult::Written,
     };
 
+    // Immediately-satisfiable BLMOVE moves like LMOVE, so it must be logged the
+    // same way (it isn't classified as a write command, so execute_with_wal never
+    // logs it). Self-log the resolved pop+push keyed per-key. The blocked path
+    // (CmdResult::BlockMove) is logged when the waiter is later satisfied.
     if let Some(v) = store.lmove(args[1], args[2], src_left, dst_left, now) {
+        if !wal_log_list_move(store, args[1], args[2], v.as_ref(), src_left, dst_left, out) {
+            return CmdResult::Written;
+        }
         resp::write_bulk_raw(out, &decrypt_out(store, v));
         return CmdResult::Written;
     }

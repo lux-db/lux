@@ -299,6 +299,82 @@ fn rpoplpush_cross_shard_order_survives_wal_replay() {
     }
 }
 
+// PROBE (ENG-1316): an immediately-satisfiable BLMOVE moves like LMOVE and must
+// be logged the same way. BLMOVE isn't classified as a write command, so
+// execute_with_wal never logs it; the immediate path self-logs pop+push.
+#[test]
+fn blmove_immediate_cross_shard_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let n = 24usize;
+    for i in 0..n {
+        let a = format!("a{i}");
+        let b = format!("b{i}");
+        send(&mut c, &["RPUSH", &a, "M"]);
+        send(&mut c, &["RPUSH", &b, "P"]); // b{i} = [P]
+        send(&mut c, &["BLMOVE", &a, &b, "LEFT", "RIGHT", "0"]); // src non-empty => immediate
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let a = format!("a{i}");
+        let b = format!("b{i}");
+        let range = send(&mut c, &["LRANGE", &b, "0", "-1"]);
+        let p = range.find("\r\nP\r\n");
+        let m = range.find("\r\nM\r\n");
+        assert!(
+            p.is_some() && m.is_some() && p < m,
+            "b{i} must be [P, M] after replay; got {range:?}"
+        );
+        assert!(
+            send(&mut c, &["LLEN", &a]).contains(":0"),
+            "a{i} must be empty after replay"
+        );
+    }
+}
+
+// QUARANTINED repro: a BLOCKED BLMOVE later satisfied by a push does not log the
+// move, so WAL replay leaves the element in src and never in dst. This is the
+// broader blocked-consumer durability gap (BLPOP/BRPOP have the same shape: the
+// push is logged but the waiter's consuming pop is not). Tracked separately from
+// the sharded-replay fix; un-ignore when fixing. Run with:
+//   cargo test --release --test crash_recovery -- --ignored blmove_blocked
+#[test]
+#[ignore]
+fn blmove_blocked_completion_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut blocker = srv.conn();
+    let h = thread::spawn(move || {
+        // Blocks on empty bsrc until the push below wakes it.
+        send(
+            &mut blocker,
+            &["BLMOVE", "bsrc", "bdst", "LEFT", "RIGHT", "5"],
+        );
+    });
+    thread::sleep(Duration::from_millis(300)); // let the BLMOVE register as a waiter
+    let mut c = srv.conn();
+    send(&mut c, &["RPUSH", "bsrc", "V"]); // wakes the blocked BLMOVE: V moves to bdst
+    h.join().unwrap();
+    assert!(
+        send(&mut c, &["LRANGE", "bdst", "0", "-1"]).contains("V"),
+        "runtime move must have happened"
+    );
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    assert!(
+        send(&mut c, &["LRANGE", "bdst", "0", "-1"]).contains("V"),
+        "bdst must retain the moved element after replay"
+    );
+    assert!(
+        send(&mut c, &["LLEN", "bsrc"]).contains(":0"),
+        "bsrc must be empty after replay (element was moved, not left behind)"
+    );
+}
+
 // PROBE (ENG-1316): COPY writes only dst but the raw command shards on src and
 // re-reads src at replay, when a per-shard replay may not have rebuilt src yet
 // (and dst's own writes replay in a separate shard). COPY self-logs the resolved
