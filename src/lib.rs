@@ -1990,7 +1990,14 @@ impl EmbeddedClient {
             ));
         };
 
-        wait_for_blocking_pop(&self.runtime.broker, &owned_keys, timeout, pop_left).await
+        wait_for_blocking_pop(
+            &self.runtime.store,
+            &self.runtime.broker,
+            &owned_keys,
+            timeout,
+            pop_left,
+        )
+        .await
     }
 
     async fn execute_owned(&self, argv: Vec<Vec<u8>>) -> Result<bytes::Bytes, LuxError> {
@@ -2694,6 +2701,7 @@ fn parse_blocking_pop_value(buf: &[u8]) -> Result<Option<(String, bytes::Bytes)>
 }
 
 async fn wait_for_blocking_pop(
+    store: &Store,
     broker: &Broker,
     keys: &[String],
     timeout: Duration,
@@ -2718,6 +2726,10 @@ async fn wait_for_blocking_pop(
         val = rx.recv() => val,
         _ = tokio::time::sleep(timeout) => None,
     };
+
+    if let Some((key, _)) = &result {
+        wal_log_blocked_pop(store, key.as_bytes(), pop_left);
+    }
 
     broker.remove_list_waiters_by_id(keys, waiter_id);
     Ok(result)
@@ -4339,9 +4351,23 @@ async fn handle_connection(
     }
 }
 
+/// Log the pop that satisfied a blocked BLPOP/BRPOP/BLMOVE. The element was
+/// already removed from `key` in memory by the pushing side's drain, and the
+/// push that satisfied us was WAL-logged before we woke, so appending the
+/// matching pop here keeps WAL replay from resurrecting the element (ENG-1317).
+/// Runs in the woken task with no shard locks held, so there is no
+/// memory->WAL lock nesting.
+fn wal_log_blocked_pop(store: &Store, key: &[u8], pop_left: bool) {
+    if !store.wal_enabled() {
+        return;
+    }
+    let pop: &[u8] = if pop_left { b"LPOP" } else { b"RPOP" };
+    let _ = store.wal_log_command(&[pop, key]);
+}
+
 async fn handle_block_pop(
     socket: &mut tokio::net::TcpStream,
-    _store: &Arc<Store>,
+    store: &Arc<Store>,
     broker: &Broker,
     keys: &[String],
     timeout: std::time::Duration,
@@ -4370,6 +4396,7 @@ async fn handle_block_pop(
 
     match result {
         Some((key, val)) => {
+            wal_log_blocked_pop(store, key.as_bytes(), pop_left);
             resp::write_array_header(&mut write_buf, 2);
             resp::write_bulk(&mut write_buf, &key);
             resp::write_bulk_raw(&mut write_buf, &val);
@@ -4422,6 +4449,20 @@ async fn handle_block_move(
                 let _ = store.lpush(dst.as_bytes(), vals, now);
             } else {
                 let _ = store.rpush(dst.as_bytes(), vals, now);
+            }
+            // Log both effects of the completed move: the src pop (done in the
+            // pushing side's drain) and the dst push (done just above). Neither
+            // went through the WAL yet; the satisfying push to src was logged
+            // before we woke, so replay order is push(src), pop(src), push(dst)
+            // -> element ends up only in dst (ENG-1317). Batched so a same-shard
+            // move is one atomic frame; a cross-shard move splits per shard.
+            if store.wal_enabled() {
+                let pop: &[u8] = if src_left { b"LPOP" } else { b"RPOP" };
+                let push: &[u8] = if dst_left { b"LPUSH" } else { b"RPUSH" };
+                let pop_cmd: [&[u8]; 2] = [pop, src.as_bytes()];
+                let push_cmd: [&[u8]; 3] = [push, dst.as_bytes(), val.as_ref()];
+                let batch: [&[&[u8]]; 2] = [&pop_cmd, &push_cmd];
+                let _ = store.wal_log_command_batch(&batch);
             }
             resp::write_bulk_raw(&mut write_buf, &val);
         }

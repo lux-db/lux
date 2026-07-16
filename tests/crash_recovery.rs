@@ -335,44 +335,105 @@ fn blmove_immediate_cross_shard_survives_wal_replay() {
     }
 }
 
-// QUARANTINED repro: a BLOCKED BLMOVE later satisfied by a push does not log the
-// move, so WAL replay leaves the element in src and never in dst. This is the
-// broader blocked-consumer durability gap (BLPOP/BRPOP have the same shape: the
-// push is logged but the waiter's consuming pop is not). Tracked separately from
-// the sharded-replay fix; un-ignore when fixing. Run with:
-//   cargo test --release --test crash_recovery -- --ignored blmove_blocked
+// PROBE (ENG-1317): a BLOCKED BLMOVE later satisfied by a push. The satisfying
+// push is logged, but the consuming pop (src) and the deferred dst push happen
+// outside the WAL. The woken handler now logs both, keyed so each lands on its
+// own shard, so replay leaves the element only in dst. Cross-shard fan-out so
+// each bsrc{i}/bdst{i} pair spans different disk-WAL shards.
 #[test]
-#[ignore]
 fn blmove_blocked_completion_survives_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
-    let mut blocker = srv.conn();
-    let h = thread::spawn(move || {
-        // Blocks on empty bsrc until the push below wakes it.
-        send(
-            &mut blocker,
-            &["BLMOVE", "bsrc", "bdst", "LEFT", "RIGHT", "5"],
-        );
-    });
-    thread::sleep(Duration::from_millis(300)); // let the BLMOVE register as a waiter
+    let n = 16usize;
+    let port = srv.port();
+    let mut blockers = Vec::new();
+    for i in 0..n {
+        let h = thread::spawn(move || {
+            let mut b = common::connect(port);
+            let src = format!("bsrc{i}");
+            let dst = format!("bdst{i}");
+            // Blocks on empty src until the push below wakes it.
+            send(&mut b, &["BLMOVE", &src, &dst, "LEFT", "RIGHT", "5"]);
+        });
+        blockers.push(h);
+    }
+    thread::sleep(Duration::from_millis(400)); // let every BLMOVE register as a waiter
     let mut c = srv.conn();
-    send(&mut c, &["RPUSH", "bsrc", "V"]); // wakes the blocked BLMOVE: V moves to bdst
-    h.join().unwrap();
-    assert!(
-        send(&mut c, &["LRANGE", "bdst", "0", "-1"]).contains("V"),
-        "runtime move must have happened"
-    );
+    for i in 0..n {
+        let src = format!("bsrc{i}");
+        send(&mut c, &["RPUSH", &src, "V"]); // wakes the blocked BLMOVE: V moves to dst
+    }
+    for h in blockers {
+        h.join().unwrap();
+    }
+    for i in 0..n {
+        let dst = format!("bdst{i}");
+        assert!(
+            send(&mut c, &["LRANGE", &dst, "0", "-1"]).contains("V"),
+            "runtime move to bdst{i} must have happened"
+        );
+    }
     drop(c);
     srv.kill();
     srv.restart(); // WAL replay only
     let mut c = srv.conn();
-    assert!(
-        send(&mut c, &["LRANGE", "bdst", "0", "-1"]).contains("V"),
-        "bdst must retain the moved element after replay"
-    );
-    assert!(
-        send(&mut c, &["LLEN", "bsrc"]).contains(":0"),
-        "bsrc must be empty after replay (element was moved, not left behind)"
-    );
+    for i in 0..n {
+        let src = format!("bsrc{i}");
+        let dst = format!("bdst{i}");
+        assert!(
+            send(&mut c, &["LRANGE", &dst, "0", "-1"]).contains("V"),
+            "bdst{i} must retain the moved element after replay"
+        );
+        assert!(
+            send(&mut c, &["LLEN", &src]).contains(":0"),
+            "bsrc{i} must be empty after replay (element moved, not left behind)"
+        );
+    }
+}
+
+// PROBE (ENG-1317): a BLOCKED BLPOP satisfied by a later push. The push is
+// logged; the waiter's consuming pop is now logged too (keyed on the popped
+// key), so replay does not resurrect the element into the source list.
+#[test]
+fn blpop_blocked_completion_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let n = 16usize;
+    let port = srv.port();
+    let mut blockers = Vec::new();
+    for i in 0..n {
+        let h = thread::spawn(move || {
+            let mut b = common::connect(port);
+            let q = format!("q{i}");
+            send(&mut b, &["BLPOP", &q, "5"]);
+        });
+        blockers.push(h);
+    }
+    thread::sleep(Duration::from_millis(400)); // let every BLPOP register as a waiter
+    let mut c = srv.conn();
+    for i in 0..n {
+        let q = format!("q{i}");
+        send(&mut c, &["RPUSH", &q, "V"]); // wakes the blocked BLPOP: V is consumed
+    }
+    for h in blockers {
+        h.join().unwrap();
+    }
+    for i in 0..n {
+        let q = format!("q{i}");
+        assert!(
+            send(&mut c, &["LLEN", &q]).contains(":0"),
+            "q{i} must be empty at runtime (consumed by the blocked BLPOP)"
+        );
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let q = format!("q{i}");
+        assert!(
+            send(&mut c, &["LLEN", &q]).contains(":0"),
+            "q{i} must stay empty after replay (pop was logged, not resurrected)"
+        );
+    }
 }
 
 // PROBE (ENG-1316): COPY writes only dst but the raw command shards on src and
