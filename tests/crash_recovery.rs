@@ -337,6 +337,39 @@ fn copy_cross_shard_survives_wal_replay() {
     );
 }
 
+// PROBE (ENG-1316): MSET writes many keys but the raw command shards on the
+// first key only, so a later independent write to a non-first key can replay
+// before the MSET's value for that key, losing the newer write. Self-logging a
+// keyed SET per pair puts each in its own shard in append order.
+#[test]
+fn mset_cross_shard_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let n = 24usize;
+    for i in 0..n {
+        let a = format!("first{i}");
+        let b = format!("second{i}");
+        send(&mut c, &["MSET", &a, "F", &b, "S"]);
+        send(&mut c, &["SET", &b, "OVERWRITE"]); // later write to the non-first key
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let a = format!("first{i}");
+        let b = format!("second{i}");
+        assert!(
+            send(&mut c, &["GET", &a]).contains("F\r"),
+            "first{i} must survive MSET replay"
+        );
+        assert!(
+            send(&mut c, &["GET", &b]).contains("OVERWRITE"),
+            "second{i} must reflect the later SET, not the replayed MSET value"
+        );
+    }
+}
+
 // ZMPOP mutates the sorted set, so the pop must survive a WAL-only restart
 // (regression guard that ZMPOP is classified as a write and WAL-logged).
 #[test]

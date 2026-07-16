@@ -2402,6 +2402,11 @@ fn command_self_logs_wal_args(args: &[&[u8]], store: &Store, now: Instant) -> bo
     if cmd_eq(cmd, b"COPY") {
         return true;
     }
+    // MSET/MSETNX write many keys; the raw command shards on the first key only.
+    // They self-log a keyed SET per pair so each lands in its own WAL shard.
+    if cmd_eq(cmd, b"MSET") || cmd_eq(cmd, b"MSETNX") {
+        return true;
+    }
     if cmd_eq(cmd, b"SET") && args.len() >= 3 {
         return args[3..].iter().any(|arg| cmd_eq(arg, b"ENCRYPTED"))
             || store.kv_string_is_encrypted(args[1], now);

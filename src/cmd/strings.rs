@@ -550,6 +550,21 @@ pub fn cmd_mset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         store.set(args[i], args[i + 1], None, now);
         i += 2;
     }
+    // Self-log each pair as a keyed SET so every key lands in its own WAL shard.
+    // The raw MSET would shard on the first key only, replaying the rest out of
+    // order vs their own shards' writes. Batched: atomic when all keys share a
+    // shard, correctly split when they don't.
+    if store.wal_enabled() {
+        let sets: Vec<[&[u8]; 3]> = args[1..]
+            .chunks(2)
+            .map(|c| [b"SET".as_slice(), c[0], c[1]])
+            .collect();
+        let refs: Vec<&[&[u8]]> = sets.iter().map(|s| s.as_slice()).collect();
+        if let Err(e) = store.wal_log_command_batch(&refs) {
+            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+            return CmdResult::Written;
+        }
+    }
     resp::write_ok(out);
     CmdResult::Written
 }
@@ -567,7 +582,21 @@ pub fn cmd_msetnx(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, ENCRYPTED_MUTATION_ERR);
         return CmdResult::Written;
     }
-    resp::write_integer(out, if store.msetnx(&pairs, now) { 1 } else { 0 });
+    let set = store.msetnx(&pairs, now);
+    // Self-log each applied pair as a keyed SET (same cross-shard reasoning as
+    // MSET). The NX check already passed at runtime; replay just sets the values.
+    if set && store.wal_enabled() {
+        let sets: Vec<[&[u8]; 3]> = pairs
+            .iter()
+            .map(|(k, v)| [b"SET".as_slice(), *k, *v])
+            .collect();
+        let refs: Vec<&[&[u8]]> = sets.iter().map(|s| s.as_slice()).collect();
+        if let Err(e) = store.wal_log_command_batch(&refs) {
+            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+            return CmdResult::Written;
+        }
+    }
+    resp::write_integer(out, if set { 1 } else { 0 });
     CmdResult::Written
 }
 
