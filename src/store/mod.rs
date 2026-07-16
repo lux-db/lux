@@ -2687,6 +2687,87 @@ impl Store {
         Ok(true)
     }
 
+    /// DUMP: serialize the value at `key` into Lux's snapshot value format.
+    /// Returns None when the key is missing/expired. The blob is Lux-internal
+    /// (not RDB-compatible) and round-trips within Lux via RESTORE. Refuses
+    /// key-bound-encrypted values, same as COPY.
+    pub fn dump_key(&self, key: &[u8], now: Instant) -> Result<Option<Vec<u8>>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key) {
+            Some(entry) if !entry.is_expired_at(now) => {
+                if Self::value_has_key_bound_encryption(&entry.value) {
+                    return Err(RENAME_ENCRYPTED_ERR.to_string());
+                }
+                let ttl_ms = entry
+                    .expires_at
+                    .map(|exp| exp.duration_since(now).as_millis() as i64)
+                    .unwrap_or(-1);
+                let value = store_value_to_dump_value(&entry.value);
+                let dentry = DumpEntry {
+                    key: key_string(key),
+                    value,
+                    ttl_ms,
+                };
+                let blob = crate::snapshot::encode_dump_blob(self, &dentry)
+                    .map_err(|e| format!("ERR DUMP failed: {e}"))?;
+                Ok(Some(blob))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// RESTORE: recreate `key` from a DUMP blob. `ttl_ms` is the new TTL in ms
+    /// (0 = persist); `absttl` reads it as an absolute unix-ms deadline. Returns
+    /// BUSYKEY if the key exists and `replace` is false.
+    pub fn restore_key(
+        &self,
+        key: &[u8],
+        ttl_ms: i64,
+        blob: &[u8],
+        replace: bool,
+        absttl: bool,
+        now: Instant,
+    ) -> Result<(), String> {
+        if ttl_ms < 0 {
+            return Err("ERR Invalid TTL value, must be >= 0".to_string());
+        }
+        {
+            let idx = self.shard_index(key);
+            let shard = self.shards[idx].read();
+            if let Some(entry) = shard.data.get(key) {
+                if !entry.is_expired_at(now) && !replace {
+                    return Err("BUSYKEY Target key name already exists.".to_string());
+                }
+            }
+        }
+        let (value, _embedded_ttl) = crate::snapshot::decode_dump_blob_value(self, blob)
+            .map_err(|_| "ERR Bad data format".to_string())?;
+        let ttl = if ttl_ms == 0 {
+            None
+        } else if absttl {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let remaining = ttl_ms.saturating_sub(now_ms);
+            if remaining <= 0 {
+                // Past absolute deadline: the key would expire immediately. Drop
+                // any existing key (REPLACE) and do not create a new one.
+                self.del(&[key]);
+                return Ok(());
+            }
+            Some(Duration::from_millis(remaining as u64))
+        } else {
+            Some(Duration::from_millis(ttl_ms as u64))
+        };
+        // Clear any existing value first so memory/key accounting stays exact on
+        // REPLACE (load_entry only adds).
+        self.del(&[key]);
+        self.load_entry(key_string(key), value, ttl);
+        Ok(())
+    }
+
     pub fn dbsize(&self, now: Instant) -> i64 {
         // Redis contract: DBSIZE reports the exact number of non-expired keys
         // in the current DB at call time.

@@ -418,161 +418,7 @@ pub(crate) fn load_binary(
             (Some(Duration::from_millis(ttl_ms as u64)), false)
         };
 
-        let value = match type_buf[0] {
-            b'S' => DumpValue::Str(read_bytes(r)?),
-            b'L' => {
-                let len = read_count(r, "list item")?;
-                let mut items = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..len {
-                    items.push(read_bytes(r)?);
-                }
-                DumpValue::List(items)
-            }
-            b'H' => {
-                let len = read_count(r, "hash field")?;
-                let mut pairs = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..len {
-                    let k = read_string(r)?;
-                    let v = read_bytes(r)?;
-                    pairs.push((k, v));
-                }
-                DumpValue::Hash(pairs)
-            }
-            b'T' => {
-                let len = read_count(r, "set member")?;
-                let mut members = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..len {
-                    members.push(read_string(r)?);
-                }
-                DumpValue::Set(members)
-            }
-            b'Z' => {
-                let len = read_count(r, "sorted set member")?;
-                let mut members = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..len {
-                    let m = read_string(r)?;
-                    let s = read_f64(r)?;
-                    members.push((m, s));
-                }
-                DumpValue::SortedSet(members)
-            }
-            b'X' => {
-                let last_id = read_string(r)?;
-                let entry_count = read_count(r, "stream entry")?;
-                let mut entries = Vec::with_capacity(entry_count.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..entry_count {
-                    let id = read_string(r)?;
-                    let field_count = read_count(r, "stream field")?;
-                    let mut fields = Vec::with_capacity(field_count.min(SNAPSHOT_PREALLOC_CAP));
-                    for _ in 0..field_count {
-                        let k = read_string(r)?;
-                        let v = read_bytes(r)?;
-                        fields.push((k, v));
-                    }
-                    entries.push((id, fields));
-                }
-                let mut groups = Vec::new();
-                if stream_groups {
-                    let group_count = read_count(r, "stream group")?;
-                    groups.reserve(group_count.min(SNAPSHOT_PREALLOC_CAP));
-                    for _ in 0..group_count {
-                        let name = read_string(r)?;
-                        let last_delivered_id = read_string(r)?;
-                        let consumer_count = read_count(r, "stream consumer")?;
-                        let mut consumers =
-                            Vec::with_capacity(consumer_count.min(SNAPSHOT_PREALLOC_CAP));
-                        for _ in 0..consumer_count {
-                            let consumer = read_string(r)?;
-                            let pending_count = read_count(r, "stream consumer pending")?;
-                            let mut pending_ids =
-                                Vec::with_capacity(pending_count.min(SNAPSHOT_PREALLOC_CAP));
-                            for _ in 0..pending_count {
-                                pending_ids.push(read_string(r)?);
-                            }
-                            consumers.push((consumer, pending_ids));
-                        }
-                        let pending_count = read_count(r, "stream group pending")?;
-                        let mut pending =
-                            Vec::with_capacity(pending_count.min(SNAPSHOT_PREALLOC_CAP));
-                        for _ in 0..pending_count {
-                            let id = read_string(r)?;
-                            let consumer = read_string(r)?;
-                            let delivery_count = read_u32(r)? as u64;
-                            pending.push((id, consumer, delivery_count));
-                        }
-                        groups.push((name, last_delivered_id, consumers, pending));
-                    }
-                }
-                DumpValue::Stream(entries, last_id, groups)
-            }
-            b'V' => {
-                let dims = read_sized_count(r, "vector dimension", std::mem::size_of::<f32>())?;
-                let mut data = Vec::with_capacity(dims.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..dims {
-                    let mut buf = [0u8; 4];
-                    r.read_exact(&mut buf)?;
-                    data.push(f32::from_le_bytes(buf));
-                }
-                let mut flag = [0u8; 1];
-                r.read_exact(&mut flag)?;
-                let metadata = if flag[0] == 1 {
-                    Some(read_string(r)?)
-                } else {
-                    None
-                };
-                DumpValue::Vector(data, metadata, false)
-            }
-            b'W' => {
-                // Encrypted vector: sealed f32 payload, decrypted with the key.
-                let sealed = read_bytes(r)?;
-                let mut flag = [0u8; 1];
-                r.read_exact(&mut flag)?;
-                let metadata = if flag[0] == 1 {
-                    Some(read_string(r)?)
-                } else {
-                    None
-                };
-                let data = store
-                    .decrypt_vector(key.as_bytes(), &sealed)
-                    .map_err(io::Error::other)?;
-                DumpValue::Vector(data, metadata, true)
-            }
-            b'P' => {
-                let len = read_sized_count(r, "hyperloglog register", 1)?;
-                let mut regs = vec![0u8; len];
-                r.read_exact(&mut regs)?;
-                let cached = crate::hll::hll_count(&regs);
-                DumpValue::HyperLogLog(regs, cached)
-            }
-            b'I' => {
-                let sample_count = read_sized_count(
-                    r,
-                    "timeseries sample",
-                    std::mem::size_of::<i64>() + std::mem::size_of::<f64>(),
-                )?;
-                let mut samples = Vec::with_capacity(sample_count.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..sample_count {
-                    let ts = read_i64(r)?;
-                    let val = read_f64(r)?;
-                    samples.push((ts, val));
-                }
-                let retention = read_i64(r)? as u64;
-                let label_count = read_count(r, "timeseries label")?;
-                let mut labels = Vec::with_capacity(label_count.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..label_count {
-                    let k = read_string(r)?;
-                    let v = read_string(r)?;
-                    labels.push((k, v));
-                }
-                DumpValue::TimeSeries(samples, retention, labels)
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unknown type byte: {}", type_buf[0]),
-                ))
-            }
-        };
+        let value = read_dump_value(store, r, type_buf[0], &key, stream_groups)?;
 
         // The value bytes were read above to advance the stream; only store the
         // entry if its absolute deadline hasn't already passed during downtime.
@@ -582,6 +428,194 @@ pub(crate) fn load_binary(
         }
     }
     Ok(count)
+}
+
+fn read_dump_value(
+    store: &Store,
+    r: &mut impl Read,
+    type_byte: u8,
+    key: &str,
+    stream_groups: bool,
+) -> io::Result<DumpValue> {
+    Ok(match type_byte {
+        b'S' => DumpValue::Str(read_bytes(r)?),
+        b'L' => {
+            let len = read_count(r, "list item")?;
+            let mut items = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..len {
+                items.push(read_bytes(r)?);
+            }
+            DumpValue::List(items)
+        }
+        b'H' => {
+            let len = read_count(r, "hash field")?;
+            let mut pairs = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..len {
+                let k = read_string(r)?;
+                let v = read_bytes(r)?;
+                pairs.push((k, v));
+            }
+            DumpValue::Hash(pairs)
+        }
+        b'T' => {
+            let len = read_count(r, "set member")?;
+            let mut members = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..len {
+                members.push(read_string(r)?);
+            }
+            DumpValue::Set(members)
+        }
+        b'Z' => {
+            let len = read_count(r, "sorted set member")?;
+            let mut members = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..len {
+                let m = read_string(r)?;
+                let s = read_f64(r)?;
+                members.push((m, s));
+            }
+            DumpValue::SortedSet(members)
+        }
+        b'X' => {
+            let last_id = read_string(r)?;
+            let entry_count = read_count(r, "stream entry")?;
+            let mut entries = Vec::with_capacity(entry_count.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..entry_count {
+                let id = read_string(r)?;
+                let field_count = read_count(r, "stream field")?;
+                let mut fields = Vec::with_capacity(field_count.min(SNAPSHOT_PREALLOC_CAP));
+                for _ in 0..field_count {
+                    let k = read_string(r)?;
+                    let v = read_bytes(r)?;
+                    fields.push((k, v));
+                }
+                entries.push((id, fields));
+            }
+            let mut groups = Vec::new();
+            if stream_groups {
+                let group_count = read_count(r, "stream group")?;
+                groups.reserve(group_count.min(SNAPSHOT_PREALLOC_CAP));
+                for _ in 0..group_count {
+                    let name = read_string(r)?;
+                    let last_delivered_id = read_string(r)?;
+                    let consumer_count = read_count(r, "stream consumer")?;
+                    let mut consumers =
+                        Vec::with_capacity(consumer_count.min(SNAPSHOT_PREALLOC_CAP));
+                    for _ in 0..consumer_count {
+                        let consumer = read_string(r)?;
+                        let pending_count = read_count(r, "stream consumer pending")?;
+                        let mut pending_ids =
+                            Vec::with_capacity(pending_count.min(SNAPSHOT_PREALLOC_CAP));
+                        for _ in 0..pending_count {
+                            pending_ids.push(read_string(r)?);
+                        }
+                        consumers.push((consumer, pending_ids));
+                    }
+                    let pending_count = read_count(r, "stream group pending")?;
+                    let mut pending = Vec::with_capacity(pending_count.min(SNAPSHOT_PREALLOC_CAP));
+                    for _ in 0..pending_count {
+                        let id = read_string(r)?;
+                        let consumer = read_string(r)?;
+                        let delivery_count = read_u32(r)? as u64;
+                        pending.push((id, consumer, delivery_count));
+                    }
+                    groups.push((name, last_delivered_id, consumers, pending));
+                }
+            }
+            DumpValue::Stream(entries, last_id, groups)
+        }
+        b'V' => {
+            let dims = read_sized_count(r, "vector dimension", std::mem::size_of::<f32>())?;
+            let mut data = Vec::with_capacity(dims.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..dims {
+                let mut buf = [0u8; 4];
+                r.read_exact(&mut buf)?;
+                data.push(f32::from_le_bytes(buf));
+            }
+            let mut flag = [0u8; 1];
+            r.read_exact(&mut flag)?;
+            let metadata = if flag[0] == 1 {
+                Some(read_string(r)?)
+            } else {
+                None
+            };
+            DumpValue::Vector(data, metadata, false)
+        }
+        b'W' => {
+            // Encrypted vector: sealed f32 payload, decrypted with the key.
+            let sealed = read_bytes(r)?;
+            let mut flag = [0u8; 1];
+            r.read_exact(&mut flag)?;
+            let metadata = if flag[0] == 1 {
+                Some(read_string(r)?)
+            } else {
+                None
+            };
+            let data = store
+                .decrypt_vector(key.as_bytes(), &sealed)
+                .map_err(io::Error::other)?;
+            DumpValue::Vector(data, metadata, true)
+        }
+        b'P' => {
+            let len = read_sized_count(r, "hyperloglog register", 1)?;
+            let mut regs = vec![0u8; len];
+            r.read_exact(&mut regs)?;
+            let cached = crate::hll::hll_count(&regs);
+            DumpValue::HyperLogLog(regs, cached)
+        }
+        b'I' => {
+            let sample_count = read_sized_count(
+                r,
+                "timeseries sample",
+                std::mem::size_of::<i64>() + std::mem::size_of::<f64>(),
+            )?;
+            let mut samples = Vec::with_capacity(sample_count.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..sample_count {
+                let ts = read_i64(r)?;
+                let val = read_f64(r)?;
+                samples.push((ts, val));
+            }
+            let retention = read_i64(r)? as u64;
+            let label_count = read_count(r, "timeseries label")?;
+            let mut labels = Vec::with_capacity(label_count.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..label_count {
+                let k = read_string(r)?;
+                let v = read_string(r)?;
+                labels.push((k, v));
+            }
+            DumpValue::TimeSeries(samples, retention, labels)
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown type byte: {type_byte}"),
+            ))
+        }
+    })
+}
+
+/// Decode a blob produced by `encode_dump_blob` and return its value plus the
+/// embedded TTL (ms) WITHOUT loading it, so RESTORE can apply the value under a
+/// caller-chosen key and TTL.
+pub(crate) fn decode_dump_blob_value(store: &Store, blob: &[u8]) -> io::Result<(DumpValue, i64)> {
+    let mut cursor = io::Cursor::new(blob);
+    let mut header = [0u8; 4];
+    cursor.read_exact(&mut header)?;
+    let stream_groups = if &header == HEADER || &header == HEADER_V2 {
+        true
+    } else if &header == HEADER_V1 {
+        false
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RESTORE payload is not a lux dump",
+        ));
+    };
+    let mut type_buf = [0u8; 1];
+    cursor.read_exact(&mut type_buf)?;
+    let key = read_string(&mut cursor)?;
+    let ttl_ms = read_i64(&mut cursor)?;
+    let value = read_dump_value(store, &mut cursor, type_buf[0], &key, stream_groups)?;
+    Ok((value, ttl_ms))
 }
 
 /// Encode a single key/value into the on-disk snapshot format (header + one

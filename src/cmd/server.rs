@@ -314,8 +314,64 @@ pub fn cmd_function(
 
 /// DUMP has no serialization format in Lux; a fake +OK would hand clients a
 /// bogus payload, so return a clear unsupported error.
-pub fn cmd_dump(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
-    resp::write_error(out, "ERR DUMP is not supported");
+pub fn cmd_dump(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() != 2 {
+        resp::write_error(out, "ERR wrong number of arguments for 'dump' command");
+        return CmdResult::Written;
+    }
+    match store.dump_key(args[1], now) {
+        Ok(Some(blob)) => resp::write_bulk_raw(out, &blob),
+        Ok(None) => resp::write_null(out),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+/// RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME n] [FREQ n].
+/// The serialized value must come from Lux DUMP (not RDB-compatible).
+pub fn cmd_restore(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 4 {
+        resp::write_error(out, "ERR wrong number of arguments for 'restore' command");
+        return CmdResult::Written;
+    }
+    let Ok(ttl_ms) = arg_str(args[2]).parse::<i64>() else {
+        resp::write_error(out, "ERR value is not an integer or out of range");
+        return CmdResult::Written;
+    };
+    let mut replace = false;
+    let mut absttl = false;
+    let mut i = 4;
+    while i < args.len() {
+        if cmd_eq(args[i], b"REPLACE") {
+            replace = true;
+            i += 1;
+        } else if cmd_eq(args[i], b"ABSTTL") {
+            absttl = true;
+            i += 1;
+        } else if (cmd_eq(args[i], b"IDLETIME") || cmd_eq(args[i], b"FREQ")) && i + 1 < args.len() {
+            // Accepted for compatibility; Lux does not use LRU/LFU restore hints.
+            i += 2;
+        } else {
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
+        }
+    }
+    match store.restore_key(args[1], ttl_ms, args[3], replace, absttl, now) {
+        Ok(()) => resp::write_ok(out),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+/// TOUCH key [key ...]: returns the number of keys that exist (Lux does not
+/// track access recency for eviction the way Redis LRU/LFU does).
+pub fn cmd_touch(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 2 {
+        resp::write_error(out, "ERR wrong number of arguments for 'touch' command");
+        return CmdResult::Written;
+    }
+    let keys: Vec<&[u8]> = args[1..].to_vec();
+    resp::write_integer(out, store.exists(&keys, now));
     CmdResult::Written
 }
 

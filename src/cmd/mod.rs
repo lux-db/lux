@@ -621,6 +621,22 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 1,
     },
     CommandSpec {
+        name: b"WAITAOF",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"RESTORE",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"TOUCH",
+        min_arity: 1,
+    },
+    CommandSpec {
+        name: b"MIGRATE",
+        min_arity: 1,
+    },
+    CommandSpec {
         name: b"RESET",
         min_arity: 1,
     },
@@ -1877,6 +1893,13 @@ pub fn execute(
             if cmd_eq(cmd, b"MEMORY") {
                 return keys::cmd_memory(args, store, out, now);
             }
+            if cmd_eq(cmd, b"MIGRATE") {
+                resp::write_error(
+                    out,
+                    "ERR MIGRATE is not supported: Lux has no Redis-style inter-node key migration. Use DUMP/RESTORE to move a key between Lux instances.",
+                );
+                return CmdResult::Written;
+            }
             if cmd_eq(cmd, b"MULTI") {
                 resp::write_error(out, &format!("ERR unknown command '{}'", arg_str(cmd)));
                 return CmdResult::Written;
@@ -1951,6 +1974,9 @@ pub fn execute(
             }
             if cmd_eq(cmd, b"RENAMENX") {
                 return keys::cmd_renamenx(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"RESTORE") {
+                return server::cmd_restore(args, store, out, now);
             }
             if cmd_eq(cmd, b"RANDOMKEY") {
                 return keys::cmd_randomkey(args, store, out, now);
@@ -2067,6 +2093,9 @@ pub fn execute(
             if cmd_eq(cmd, b"TIME") {
                 return server::cmd_time(args, store, out, now);
             }
+            if cmd_eq(cmd, b"TOUCH") {
+                return server::cmd_touch(args, store, out, now);
+            }
             if cmd_eq(cmd, b"TSADD") {
                 return timeseries::cmd_tsadd(args, store, out, now);
             }
@@ -2163,6 +2192,13 @@ pub fn execute(
         b'W' => {
             if cmd_eq(cmd, b"WAIT") {
                 return server::cmd_wait(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"WAITAOF") {
+                resp::write_error(
+                    out,
+                    "ERR WAITAOF is not supported: Lux uses a write-ahead log, not Redis AOF. See DURABILITY.md.",
+                );
+                return CmdResult::Written;
             }
             if cmd_eq(cmd, b"WATCH") {
                 resp::write_error(out, &format!("ERR unknown command '{}'", arg_str(cmd)));

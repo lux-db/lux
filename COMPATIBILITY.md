@@ -102,8 +102,11 @@ Current partial/stub surfaces:
 - `COMMAND` -- metadata parity incomplete.
 - `CONFIG`, `INFO`, `LATENCY`, `MEMORY`, `OBJECT` -- server/admin metadata
   needs audit.
-- `DEBUG`, `DUMP`, `RESET`, `WAIT` -- compatibility behavior needs explicit
-  implementation or rejection.
+- `DEBUG`, `RESET` -- compatibility behavior needs explicit implementation or
+  rejection.
+- `DUMP`/`RESTORE` -- implemented with a Lux-internal value format (not RDB;
+  round-trips within Lux). `TOUCH` returns the key count without an
+  access-recency effect.
 - `FUNCTION` -- Redis Functions decision pending.
 - `SWAPDB`/multi-DB behavior -- product decision pending.
 
@@ -121,8 +124,7 @@ Current missing Redis OSS/core command groups:
 - Pub/Sub introspection/sharded Pub/Sub: `PUBSUB`, `SPUBLISH`, `SSUBSCRIBE`,
   `SUNSUBSCRIBE`.
 - Admin/diagnostics and key migration: `ACL`, `BGREWRITEAOF`, `LOLWUT`,
-  `MIGRATE`, `MONITOR`, `MOVE`, `RESTORE`, `ROLE`, `SLOWLOG`, `TOUCH`,
-  `WAITAOF`.
+  `MONITOR`, `MOVE`, `ROLE`, `SLOWLOG`.
 
 Explicitly excluded from this parity project:
 
@@ -138,6 +140,11 @@ Known 1.0 differences:
 
 - **Persistence**: Lux uses snapshots plus WAL instead of Redis AOF/RDB
   semantics. See `DURABILITY.md`.
+- **Serialization / migration**: `DUMP`/`RESTORE` use a Lux-internal value
+  format that round-trips within Lux; the payload is not Redis RDB-compatible.
+  `MIGRATE` (inter-node key movement) and `WAITAOF` (AOF fsync wait) return
+  explicit unsupported errors; use `DUMP`/`RESTORE` to move a key between Lux
+  instances.
 - **RESP version**: RESP2 only.
 - **Cluster**: no Redis Cluster mode.
 - **Transactions**: `MULTI`/`EXEC` is supported with WATCH-based optimistic

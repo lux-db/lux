@@ -267,6 +267,7 @@ pub fn is_write_command(cmd: &[u8]) -> bool {
         || eq(cmd, b"XGROUP")
         || eq(cmd, b"XACK")
         || eq(cmd, b"RENAME")
+        || eq(cmd, b"RESTORE")
         || eq(cmd, b"DEL")
         || eq(cmd, b"UNLINK")
         || eq(cmd, b"EXPIRE")
