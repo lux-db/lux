@@ -114,9 +114,10 @@ Current missing Redis OSS/core command groups:
 - Hash field TTL/value helpers: `HEXPIRE`, `HPEXPIRE`, `HEXPIREAT`,
   `HPEXPIREAT`, `HTTL`, `HPTTL`, `HEXPIRETIME`, `HPEXPIRETIME`, `HPERSIST`,
   `HGETEX`, `HGETDEL`.
-- Sorted sets: `ZRANDMEMBER`, `ZMPOP`, `BZMPOP`, `ZRANGESTORE`, `ZUNION`,
-  `ZINTER`, `ZDIFF`, `ZINTERCARD`.
-- Streams: `XSETID` and option-level stream parity audits.
+- Sorted sets: `BZMPOP`, `ZRANGESTORE`.
+- Streams: `XSETID` (top-level command). Consumer-group lifecycle
+  (`XGROUP CREATE`/`SETID`/`DESTROY`/`CREATECONSUMER`/`DELCONSUMER`/`HELP`)
+  and `XINFO STREAM`/`GROUPS`/`CONSUMERS` are implemented.
 - Scripting/functions: `EVAL_RO`, `EVALSHA_RO`, `FCALL`, `FCALL_RO`.
 - Pub/Sub introspection/sharded Pub/Sub: `PUBSUB`, `SPUBLISH`, `SSUBSCRIBE`,
   `SUNSUBSCRIBE`.

@@ -236,3 +236,120 @@ fn xtrim_limits_length() {
     let resp = send_and_read(&mut conn, &["XLEN", "s"]);
     assert!(resp.contains(":5"), "len is 5: {resp}");
 }
+
+#[test]
+fn xgroup_create_duplicate_returns_busygroup() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    send_and_read(&mut conn, &["XADD", "s", "*", "f", "v"]);
+    let ok = send_and_read(&mut conn, &["XGROUP", "CREATE", "s", "g", "0"]);
+    assert!(ok.contains("OK"), "first create ok: {ok}");
+    let dup = send_and_read(&mut conn, &["XGROUP", "CREATE", "s", "g", "0"]);
+    assert!(
+        dup.contains("BUSYGROUP"),
+        "duplicate group must return BUSYGROUP: {dup}"
+    );
+}
+
+#[test]
+fn xgroup_create_mkstream_makes_empty_stream() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    // key does not exist yet; MKSTREAM creates it
+    let resp = send_and_read(&mut conn, &["XGROUP", "CREATE", "ns", "g", "$", "MKSTREAM"]);
+    assert!(resp.contains("OK"), "mkstream create ok: {resp}");
+    let len = send_and_read(&mut conn, &["XLEN", "ns"]);
+    assert!(len.contains(":0"), "mkstream stream is empty: {len}");
+    // without MKSTREAM on a missing key -> error
+    let err = send_and_read(&mut conn, &["XGROUP", "CREATE", "missing", "g", "$"]);
+    assert!(
+        err.contains("requires the key to exist") || err.contains("MKSTREAM"),
+        "missing key without MKSTREAM errors: {err}"
+    );
+}
+
+#[test]
+fn xgroup_createconsumer_accounting() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    send_and_read(&mut conn, &["XADD", "s", "*", "f", "v"]);
+    send_and_read(&mut conn, &["XGROUP", "CREATE", "s", "g", "0"]);
+    let first = send_and_read(&mut conn, &["XGROUP", "CREATECONSUMER", "s", "g", "c1"]);
+    assert!(first.contains(":1"), "new consumer returns 1: {first}");
+    let again = send_and_read(&mut conn, &["XGROUP", "CREATECONSUMER", "s", "g", "c1"]);
+    assert!(again.contains(":0"), "existing consumer returns 0: {again}");
+    // consumer shows up in XINFO CONSUMERS with 0 pending
+    let info = send_and_read(&mut conn, &["XINFO", "CONSUMERS", "s", "g"]);
+    assert!(info.contains("c1"), "consumer listed: {info}");
+    assert!(info.contains("pending"), "has pending field: {info}");
+}
+
+#[test]
+fn xgroup_delconsumer_returns_pending_and_removes() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    send_and_read(&mut conn, &["XADD", "s", "*", "f", "v1"]);
+    send_and_read(&mut conn, &["XADD", "s", "*", "f", "v2"]);
+    send_and_read(&mut conn, &["XGROUP", "CREATE", "s", "g", "0"]);
+    // c1 reads both -> 2 pending
+    send_and_read(
+        &mut conn,
+        &["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"],
+    );
+    let before = send_and_read(&mut conn, &["XINFO", "GROUPS", "s"]);
+    assert!(before.contains("pending"), "groups info shape: {before}");
+    // delconsumer returns the 2 pending it owned
+    let del = send_and_read(&mut conn, &["XGROUP", "DELCONSUMER", "s", "g", "c1"]);
+    assert!(
+        del.contains(":2"),
+        "delconsumer returns owned pending count: {del}"
+    );
+    // consumer is gone
+    let info = send_and_read(&mut conn, &["XINFO", "CONSUMERS", "s", "g"]);
+    assert!(info.contains("*0"), "no consumers left: {info}");
+    // group PEL drained
+    let summary = send_and_read(&mut conn, &["XPENDING", "s", "g"]);
+    assert!(summary.contains(":0"), "group pending drained: {summary}");
+}
+
+#[test]
+fn xgroup_consumer_ops_missing_group_return_nogroup() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    send_and_read(&mut conn, &["XADD", "s", "*", "f", "v"]);
+    // no group created
+    let cc = send_and_read(&mut conn, &["XGROUP", "CREATECONSUMER", "s", "nope", "c1"]);
+    assert!(cc.contains("NOGROUP"), "createconsumer missing group: {cc}");
+    let dc = send_and_read(&mut conn, &["XGROUP", "DELCONSUMER", "s", "nope", "c1"]);
+    assert!(dc.contains("NOGROUP"), "delconsumer missing group: {dc}");
+    let xi = send_and_read(&mut conn, &["XINFO", "CONSUMERS", "s", "nope"]);
+    assert!(
+        xi.contains("NOGROUP"),
+        "xinfo consumers missing group: {xi}"
+    );
+}
+
+#[test]
+fn xinfo_consumers_empty_group_is_empty_array() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    send_and_read(&mut conn, &["XADD", "s", "*", "f", "v"]);
+    send_and_read(&mut conn, &["XGROUP", "CREATE", "s", "g", "0"]);
+    let info = send_and_read(&mut conn, &["XINFO", "CONSUMERS", "s", "g"]);
+    assert!(
+        info.contains("*0"),
+        "empty group -> empty consumers array: {info}"
+    );
+}
+
+#[test]
+fn xgroup_help_returns_array() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    let help = send_and_read(&mut conn, &["XGROUP", "HELP"]);
+    assert!(help.contains("CREATE"), "help mentions CREATE: {help}");
+    assert!(
+        help.contains("DELCONSUMER"),
+        "help mentions DELCONSUMER: {help}"
+    );
+}

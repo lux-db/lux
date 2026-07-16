@@ -382,9 +382,48 @@ pub fn cmd_xgroup(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
             Err(e) => resp::write_error(out, &e),
         }
     } else if cmd_eq(args[1], b"CREATECONSUMER") {
-        resp::write_integer(out, 1);
+        if args.len() < 5 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'xgroup|createconsumer' command",
+            );
+            return CmdResult::Written;
+        }
+        match store.xgroup_createconsumer(args[2], arg_str(args[3]), arg_str(args[4]), now) {
+            Ok(created) => resp::write_integer(out, if created { 1 } else { 0 }),
+            Err(e) => resp::write_error(out, &e),
+        }
     } else if cmd_eq(args[1], b"DELCONSUMER") {
-        resp::write_integer(out, 0);
+        if args.len() < 5 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'xgroup|delconsumer' command",
+            );
+            return CmdResult::Written;
+        }
+        match store.xgroup_delconsumer(args[2], arg_str(args[3]), arg_str(args[4]), now) {
+            Ok(pending) => resp::write_integer(out, pending),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(args[1], b"HELP") {
+        let help = [
+            "XGROUP CREATE <key> <groupname> <id|$> [MKSTREAM]",
+            "    Create a new consumer group.",
+            "XGROUP SETID <key> <groupname> <id|$>",
+            "    Set the current group ID.",
+            "XGROUP DESTROY <key> <groupname>",
+            "    Remove the specified group.",
+            "XGROUP CREATECONSUMER <key> <groupname> <consumer>",
+            "    Create a new consumer in the specified group.",
+            "XGROUP DELCONSUMER <key> <groupname> <consumer>",
+            "    Remove the specified consumer from the group.",
+            "XGROUP HELP",
+            "    Print this help.",
+        ];
+        resp::write_array_header(out, help.len());
+        for line in help {
+            resp::write_bulk(out, line);
+        }
     } else {
         resp::write_error(
             out,
@@ -737,6 +776,31 @@ pub fn cmd_xinfo(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
                         resp::write_bulk(out, k);
                         resp::write_bulk(out, v);
                     }
+                }
+            }
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(args[1], b"CONSUMERS") {
+        if args.len() < 4 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'xinfo|consumers' command",
+            );
+            return CmdResult::Written;
+        }
+        match store.xinfo_consumers(args[2], arg_str(args[3]), now) {
+            Ok(consumers) => {
+                resp::write_array_header(out, consumers.len());
+                for (name, pending, idle, inactive) in &consumers {
+                    resp::write_array_header(out, 8);
+                    resp::write_bulk(out, "name");
+                    resp::write_bulk(out, name);
+                    resp::write_bulk(out, "pending");
+                    resp::write_integer(out, *pending);
+                    resp::write_bulk(out, "idle");
+                    resp::write_integer(out, *idle);
+                    resp::write_bulk(out, "inactive");
+                    resp::write_integer(out, *inactive);
                 }
             }
             Err(e) => resp::write_error(out, &e),
