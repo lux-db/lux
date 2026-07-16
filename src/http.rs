@@ -1070,6 +1070,11 @@ enum LiveSubscription {
         spec: Box<LiveTableSpec>,
         state: LiveQueryState,
         receivers: Vec<broadcast::Receiver<crate::pubsub::Message>>,
+        /// When set, this query is maintained incrementally from typed row
+        /// deltas (single-table, no joins/near/limit/aggregate). `pk_col` is the
+        /// primary-key column used to re-evaluate a single changed row.
+        delta_rx: Option<broadcast::Receiver<crate::pubsub::RowDelta>>,
+        pk_col: String,
     },
     VectorNear {
         spec: LiveVectorNearSpec,
@@ -1182,8 +1187,16 @@ where
             }
             _ = tick.tick() => {
                 drain_live_subscription_events(&mut ws, &mut subscriptions, &store, &cache).await?;
+                drain_live_row_deltas(&mut ws, &mut subscriptions, &store, &cache).await?;
             }
         }
+    }
+
+    // Tear down every subscription on disconnect so broker bookkeeping (row-delta
+    // subscriber count, per-table channels) doesn't leak past the socket.
+    let ids: Vec<String> = subscriptions.keys().cloned().collect();
+    for id in ids {
+        stop_live_subscription(&broker, &mut subscriptions, &id);
     }
 
     Ok(())
@@ -1349,7 +1362,21 @@ async fn build_live_subscription(
                 table_spec.principal = Some(p.clone());
             }
         }
-        let receivers = live_table_dependencies(&table_spec)
+        let pk_field = live_table_pk_field(store, cache, &table_spec.table);
+        let pk_col = pk_field.clone().unwrap_or_else(|| "id".to_string());
+        // A single-table query (no joins/near/limit/offset/aggregate) whose
+        // projection includes the pk is maintained incrementally from typed row
+        // deltas; anything else keeps the re-query-and-diff path. The pk must be
+        // projected so `state.rows` keys line up with the delta's pk. IVM subs
+        // still watch auth-dependency tables via key-events so a grant-membership
+        // change triggers a full resync.
+        let ivm = ivm_eligible(&table_spec) && select_projects_pk(&table_spec.select, &pk_col);
+        let key_tables: Vec<String> = if ivm {
+            table_spec.auth_dependencies.clone()
+        } else {
+            live_table_dependencies(&table_spec)
+        };
+        let receivers = key_tables
             .into_iter()
             .flat_map(|table| {
                 [
@@ -1358,8 +1385,8 @@ async fn build_live_subscription(
                 ]
             })
             .collect();
+        let delta_rx = ivm.then(|| broker.subscribe_row_deltas(&table_spec.table));
         let rows = fetch_live_table_rows(store, cache, &table_spec)?;
-        let pk_field = live_table_pk_field(store, cache, &table_spec.table);
         let query = json!({"type":"table","table":table_spec.table});
         let state = LiveQueryState {
             query: query.clone(),
@@ -1371,6 +1398,8 @@ async fn build_live_subscription(
                 spec: Box::new(table_spec),
                 state,
                 receivers,
+                delta_rx,
+                pk_col,
             },
             vec![json!({"kind":"snapshot","scope":"query","query":query,"rows":rows})],
         ));
@@ -1542,10 +1571,24 @@ fn stop_live_subscription(
         LiveSubscription::Key { pattern, .. } => broker.kunsub(&pattern),
         LiveSubscription::Channel { channel, .. } => broker.unsubscribe_channel(&channel),
         LiveSubscription::PubSubPattern { pattern, .. } => broker.punsubscribe_pattern(&pattern),
-        LiveSubscription::Table { spec, .. } => {
-            for table in live_table_dependencies(&spec) {
+        LiveSubscription::Table { spec, delta_rx, .. } => {
+            // Drop this receiver first so the row-delta channel's receiver_count
+            // reflects reality when unsubscribe decides whether to reclaim it.
+            let was_ivm = delta_rx.is_some();
+            drop(delta_rx);
+            // Mirror the subscribe set: IVM subs watch only auth-dependency tables
+            // via key-events (plus their own row-delta channel); others watch all.
+            let key_tables = if was_ivm {
+                spec.auth_dependencies.clone()
+            } else {
+                live_table_dependencies(&spec)
+            };
+            for table in key_tables {
                 broker.kunsub(&table);
                 broker.kunsub(&format!("_t:{table}:row:*"));
+            }
+            if was_ivm {
+                broker.unsubscribe_row_deltas(&spec.table);
             }
         }
         LiveSubscription::VectorNear { .. } => broker.kunsub("*"),
@@ -1587,6 +1630,162 @@ fn diff_live_query(
 
     state.rows = next;
     events
+}
+
+/// A single-table query with no joins/near/limit/offset/aggregate can be
+/// maintained incrementally from typed row deltas. Everything else keeps the
+/// re-query-and-diff path.
+fn ivm_eligible(spec: &LiveTableSpec) -> bool {
+    spec.joins.is_empty()
+        && spec.near.is_none()
+        && spec.limit.is_none()
+        && spec.offset.is_none()
+        && !select_has_aggregate(&spec.select)
+}
+
+fn select_has_aggregate(select: &str) -> bool {
+    let s = select.to_ascii_lowercase();
+    s.contains("count(")
+        || s.contains("sum(")
+        || s.contains("avg(")
+        || s.contains("min(")
+        || s.contains("max(")
+        || s.contains("group by")
+}
+
+/// True if the projection surfaces `pk_col`, so incrementally-maintained rows
+/// key on the same value the snapshot indexed on. `*` projects everything;
+/// otherwise the column must appear as a selected term (bare or aliased).
+fn select_projects_pk(select: &str, pk_col: &str) -> bool {
+    let s = select.trim();
+    if s == "*" {
+        return true;
+    }
+    let pk = pk_col.to_ascii_lowercase();
+    s.split(',').any(|term| {
+        // Drop any `AS alias`, then take the column past a `table.` qualifier.
+        let base = term.split_whitespace().next().unwrap_or("");
+        let col = base.rsplit('.').next().unwrap_or(base).trim();
+        col == "*" || col.eq_ignore_ascii_case(&pk)
+    })
+}
+
+/// Re-evaluate one row (by pk) against the live query + RLS, reusing the normal
+/// fetch so projection/typing/grants match the snapshot exactly. Returns the
+/// projected JSON row if that pk currently belongs in the result, else None.
+fn fetch_live_table_row_for_pk(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    spec: &LiveTableSpec,
+    pk_col: &str,
+    pk: &str,
+) -> Option<Value> {
+    let mut s = spec.clone();
+    s.where_conditions.push((
+        pk_col.to_string(),
+        "=".to_string(),
+        Value::String(pk.to_string()),
+    ));
+    s.order_by = None;
+    s.offset = None;
+    s.limit = Some(1);
+    fetch_live_table_rows(store, cache, &s)
+        .ok()?
+        .into_iter()
+        .next()
+}
+
+/// Incremental view maintenance: drain typed row deltas for IVM table
+/// subscriptions and emit per-row insert/update/delete by re-evaluating only the
+/// changed pk, instead of re-running the whole query.
+async fn drain_live_row_deltas<S>(
+    ws: &mut WebSocketStream<S>,
+    subscriptions: &mut HashMap<String, LiveSubscription>,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut outgoing: Vec<(String, Value)> = Vec::new();
+    for (id, subscription) in subscriptions.iter_mut() {
+        let LiveSubscription::Table {
+            spec,
+            state,
+            delta_rx: Some(rx),
+            pk_col,
+            ..
+        } = subscription
+        else {
+            continue;
+        };
+        // Distinct changed pks since the last tick (one re-eval each).
+        let mut changed: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut lagged = false;
+        loop {
+            match rx.try_recv() {
+                Ok(delta) => {
+                    if seen.insert(delta.pk.clone()) {
+                        changed.push(delta.pk);
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    lagged = true;
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+        if lagged {
+            // Fell behind the delta stream: resync from a fresh query (safe truth).
+            let rows = fetch_live_table_rows(store, cache, spec).unwrap_or_default();
+            outgoing.extend(diff_live_query(
+                id,
+                state,
+                rows,
+                Some(json!({"kind":"resync","scope":"query"})),
+            ));
+            continue;
+        }
+        for pk in changed {
+            let now_row = fetch_live_table_row_for_pk(store, cache, spec, pk_col, &pk);
+            let prev = state.rows.get(&pk).cloned();
+            // The cause reflects the row's transition in this query's result set
+            // (which is what the client observes); table names the source table.
+            let table = spec.table.as_str();
+            match (prev, now_row) {
+                (None, Some(row)) => {
+                    state.rows.insert(pk.clone(), row.clone());
+                    outgoing.push((
+                        id.clone(),
+                        json!({"kind":"insert","scope":"query","query":state.query,"pk":pk,"row":row,"previous":null,"cause":{"kind":"table.insert","table":table,"operation":"tinsert"}}),
+                    ));
+                }
+                (Some(before), None) => {
+                    state.rows.remove(&pk);
+                    outgoing.push((
+                        id.clone(),
+                        json!({"kind":"delete","scope":"query","query":state.query,"pk":pk,"row":null,"previous":before,"cause":{"kind":"table.delete","table":table,"operation":"tdelete"}}),
+                    ));
+                }
+                (Some(before), Some(row)) => {
+                    if row_fingerprint(&before) != row_fingerprint(&row) {
+                        state.rows.insert(pk.clone(), row.clone());
+                        outgoing.push((
+                            id.clone(),
+                            json!({"kind":"update","scope":"query","query":state.query,"pk":pk,"row":row,"previous":before,"changed":changed_json_fields(&before,&row),"cause":{"kind":"table.update","table":table,"operation":"tupdate"}}),
+                        ));
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+    }
+    for (id, event) in outgoing {
+        send_live_json(ws, json!({"type":"live.event","id":id,"event":event})).await?;
+    }
+    Ok(())
 }
 
 fn parse_live_table_spec(spec: &Value) -> Result<LiveTableSpec, Value> {

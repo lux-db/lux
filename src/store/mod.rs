@@ -542,6 +542,10 @@ pub struct Store {
     disk_shards: Option<Box<[parking_lot::Mutex<crate::disk::DiskShard>]>>,
     wal_shards: Option<Box<[parking_lot::Mutex<crate::disk::Wal>]>>,
     pub(crate) wal_suppress: std::sync::atomic::AtomicBool,
+    /// Set once at runtime startup; sink for typed row deltas feeding reactive
+    /// live queries. Absent for embedded/replay-only stores, so emission is a
+    /// cheap no-op there.
+    row_delta_broker: std::sync::OnceLock<crate::pubsub::Broker>,
 }
 
 #[inline(always)]
@@ -761,6 +765,7 @@ impl Store {
             disk_shards,
             wal_shards,
             wal_suppress: std::sync::atomic::AtomicBool::new(false),
+            row_delta_broker: std::sync::OnceLock::new(),
         }
     }
 
@@ -1260,6 +1265,41 @@ impl Store {
     /// replay-only commands (e.g. `LXRESTORE`) so clients can't invoke them.
     pub(crate) fn wal_replaying(&self) -> bool {
         self.wal_suppress.load(Ordering::Relaxed)
+    }
+
+    /// Wire the row-delta sink (reactive live queries) at runtime startup.
+    pub fn set_row_delta_broker(&self, broker: crate::pubsub::Broker) {
+        let _ = self.row_delta_broker.set(broker);
+    }
+
+    /// Cheap gate for table mutation sites: is anyone watching row deltas right
+    /// now? Lets callers skip building old/new row snapshots when idle.
+    pub(crate) fn wants_row_deltas(&self) -> bool {
+        !self.wal_suppress.load(Ordering::Relaxed)
+            && self
+                .row_delta_broker
+                .get()
+                .is_some_and(|b| b.has_any_row_delta_subs())
+    }
+
+    /// Emit a typed row delta for a table row change. Cheap no-op unless a
+    /// broker is wired AND some live query is watching AND we aren't replaying
+    /// the WAL. The delta carries only the changed pk; the live-query engine
+    /// re-evaluates that pk against each subscription.
+    pub(crate) fn emit_row_delta(&self, table: &str, pk: &str) {
+        if self.wal_suppress.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(broker) = self.row_delta_broker.get() else {
+            return;
+        };
+        if !broker.has_any_row_delta_subs() {
+            return;
+        }
+        broker.publish_row_delta(crate::pubsub::RowDelta {
+            table: table.to_string(),
+            pk: pk.to_string(),
+        });
     }
 
     /// Decode and apply an `LXRESTORE` blob (COPY's self-logged effect). Only

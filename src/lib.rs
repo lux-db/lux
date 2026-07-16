@@ -3014,6 +3014,8 @@ impl Runtime {
         let schema_cache: SharedSchemaCache =
             std::sync::Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
         let broker = Broker::new();
+        // Wire the row-delta sink so table writes feed reactive live queries.
+        store.set_row_delta_broker(broker.clone());
         let shard_executor = ShardExecutor::new(store.clone(), broker.clone());
         let script_engine = Arc::new(lua::ScriptEngine::new());
 

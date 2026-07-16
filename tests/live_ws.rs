@@ -843,3 +843,291 @@ async fn live_anonymous_session_subscribes_granted_table() {
     assert_eq!(insert["pk"], "n1");
     assert_eq!(insert["row"]["body"], "hello");
 }
+
+// Incremental view maintenance: an UPDATE that moves a row across the WHERE
+// predicate must emit exactly one insert (move-in) or delete (move-out), and an
+// in-place change to a matching row must emit an update. This is the case the
+// coarse re-query path handled but the delta path must reproduce precisely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_table_where_predicate_transitions_emit_incremental_deltas() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, None);
+
+    let (status, created) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"tasks","columns":[{"name":"id","type":"STR","primaryKey":true},{"name":"status","type":"STR","notNull":true},{"name":"title","type":"STR"}]}"#,
+        None,
+    );
+    assert_eq!(status, 200, "create table: {created}");
+
+    let mut ws = connect_live(http_port, None).await;
+    send_json(
+        &mut ws,
+        json!({
+            "type":"live.subscribe",
+            "id":"open",
+            "spec":{"kind":"table","table":"tasks","where":{"status":"open"}}
+        }),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws).await["type"], "live.subscribed");
+    assert_eq!(recv_live_event(&mut ws, "open").await["kind"], "snapshot");
+
+    // Insert a matching row -> insert.
+    let (status, _) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/tasks",
+        r#"{"id":"t1","status":"open","title":"first"}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+    let e = recv_live_event(&mut ws, "open").await;
+    assert_eq!(e["kind"], "insert");
+    assert_eq!(e["pk"], "t1");
+    assert_eq!(e["cause"]["kind"], "table.insert");
+
+    // Insert a non-matching row -> no event.
+    let (status, _) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/tasks",
+        r#"{"id":"t2","status":"closed","title":"second"}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+    let none = tokio::time::timeout(Duration::from_millis(250), ws.next()).await;
+    assert!(none.is_err(), "non-matching insert should not emit");
+
+    // Move t2 into the predicate via UPDATE -> insert (not update).
+    let (status, _) = http_json_request(
+        http_port,
+        "PATCH",
+        "/v1/tables/tasks/t2",
+        r#"{"status":"open"}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+    let e = recv_live_event(&mut ws, "open").await;
+    assert_eq!(e["kind"], "insert", "move-in should read as insert: {e}");
+    assert_eq!(e["pk"], "t2");
+
+    // In-place change to a matching row -> update.
+    let (status, _) = http_json_request(
+        http_port,
+        "PATCH",
+        "/v1/tables/tasks/t1",
+        r#"{"title":"renamed"}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+    let e = recv_live_event(&mut ws, "open").await;
+    assert_eq!(e["kind"], "update", "in-place change should be update: {e}");
+    assert_eq!(e["pk"], "t1");
+    assert_eq!(e["row"]["title"], "renamed");
+    assert_eq!(e["cause"]["kind"], "table.update");
+
+    // Move t1 out of the predicate via UPDATE -> delete (not update).
+    let (status, _) = http_json_request(
+        http_port,
+        "PATCH",
+        "/v1/tables/tasks/t1",
+        r#"{"status":"done"}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+    let e = recv_live_event(&mut ws, "open").await;
+    assert_eq!(e["kind"], "delete", "move-out should read as delete: {e}");
+    assert_eq!(e["pk"], "t1");
+    assert_eq!(e["cause"]["kind"], "table.delete");
+
+    // An UPDATE to a row that is out of the set on both sides -> no event.
+    let (status, _) = http_json_request(
+        http_port,
+        "PATCH",
+        "/v1/tables/tasks/t1",
+        r#"{"title":"still done"}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+    let none = tokio::time::timeout(Duration::from_millis(250), ws.next()).await;
+    assert!(none.is_err(), "out-of-set update should not emit");
+
+    // Delete the remaining matching row -> delete.
+    let reply = resp_command(
+        resp_port,
+        &["TDELETE", "FROM", "tasks", "WHERE", "id", "=", "t2"],
+    );
+    assert!(!reply.contains("ERR"), "tdelete: {reply}");
+    let e = recv_live_event(&mut ws, "open").await;
+    assert_eq!(e["kind"], "delete");
+    assert_eq!(e["pk"], "t2");
+}
+
+// Parity: the incrementally-maintained result set must equal a fresh TSELECT of
+// the same query after an arbitrary write sequence (IVM == ground truth).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_table_ivm_result_matches_fresh_select() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, None);
+
+    let (status, created) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"items","columns":[{"name":"id","type":"STR","primaryKey":true},{"name":"bucket","type":"STR","notNull":true},{"name":"v","type":"INT"}]}"#,
+        None,
+    );
+    assert_eq!(status, 200, "create: {created}");
+
+    let mut ws = connect_live(http_port, None).await;
+    send_json(
+        &mut ws,
+        json!({
+            "type":"live.subscribe",
+            "id":"a",
+            "spec":{"kind":"table","table":"items","where":{"bucket":"a"}}
+        }),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws).await["type"], "live.subscribed");
+    assert_eq!(recv_live_event(&mut ws, "a").await["kind"], "snapshot");
+
+    // A mixed write sequence: inserts, in/out moves, in-place updates, deletes.
+    let writes: &[(&str, &str, &str)] = &[
+        (
+            "POST",
+            "/v1/tables/items",
+            r#"{"id":"i1","bucket":"a","v":1}"#,
+        ),
+        (
+            "POST",
+            "/v1/tables/items",
+            r#"{"id":"i2","bucket":"b","v":2}"#,
+        ),
+        (
+            "POST",
+            "/v1/tables/items",
+            r#"{"id":"i3","bucket":"a","v":3}"#,
+        ),
+        ("PATCH", "/v1/tables/items/i2", r#"{"bucket":"a"}"#), // move in
+        ("PATCH", "/v1/tables/items/i1", r#"{"v":10}"#),       // in-place
+        ("PATCH", "/v1/tables/items/i3", r#"{"bucket":"c"}"#), // move out
+        (
+            "POST",
+            "/v1/tables/items",
+            r#"{"id":"i4","bucket":"a","v":4}"#,
+        ),
+    ];
+    for (method, path, body) in writes {
+        let (status, resp) = http_json_request(http_port, method, path, body, None);
+        assert_eq!(status, 200, "{method} {path}: {resp}");
+    }
+    // Delete i2 (RESP, since HTTP delete-by-id is a where-filtered bulk route).
+    let reply = resp_command(
+        resp_port,
+        &["TDELETE", "FROM", "items", "WHERE", "id", "=", "i2"],
+    );
+    assert!(!reply.contains("ERR"), "tdelete: {reply}");
+
+    // Reconstruct the client's maintained result set purely from the delta
+    // stream, applying each event the way a real client would.
+    let mut client: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    while let Ok(event) =
+        tokio::time::timeout(Duration::from_millis(300), recv_live_event(&mut ws, "a")).await
+    {
+        let pk = event["pk"].as_str().unwrap().to_string();
+        match event["kind"].as_str().unwrap() {
+            "insert" | "update" => {
+                client.insert(pk, event["row"].clone());
+            }
+            "delete" => {
+                client.remove(&pk);
+            }
+            other => panic!("unexpected event kind {other}: {event}"),
+        }
+    }
+
+    // Ground truth after the sequence, restricted to bucket == "a":
+    //   i1: inserted (a,1) then v->10           => present, v=10
+    //   i2: (b,2) -> moved to a -> deleted        => absent
+    //   i3: (a,3) -> moved to c                    => absent
+    //   i4: inserted (a,4)                         => present, v=4
+    let mut client_ids: Vec<&String> = client.keys().collect();
+    client_ids.sort();
+    assert_eq!(
+        client_ids,
+        vec![&"i1".to_string(), &"i4".to_string()],
+        "IVM-maintained set must converge to ground truth: {client:?}"
+    );
+    assert_eq!(
+        client["i1"]["v"],
+        json!(10),
+        "i1 reflects the in-place update"
+    );
+    assert_eq!(client["i4"]["v"], json!(4));
+}
+
+// After a live socket disconnects, its row-delta subscription must be torn down
+// so the broker's per-table channel and subscriber gate are reclaimed. A fresh
+// connection re-subscribing to the same table must still receive deltas, proving
+// the teardown left the broker in a clean, reusable state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_table_ivm_survives_reconnect_after_disconnect() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, None);
+
+    let (status, _) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"beats","columns":[{"name":"id","type":"STR","primaryKey":true},{"name":"room","type":"STR"}]}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+
+    // First subscriber connects, gets its snapshot, then drops the socket.
+    {
+        let mut ws = connect_live(http_port, None).await;
+        send_json(
+            &mut ws,
+            json!({"type":"live.subscribe","id":"b","spec":{"kind":"table","table":"beats"}}),
+        )
+        .await;
+        assert_eq!(recv_json(&mut ws).await["type"], "live.subscribed");
+        assert_eq!(recv_live_event(&mut ws, "b").await["kind"], "snapshot");
+        // ws dropped here -> server-side teardown should reclaim the channel.
+    }
+
+    // Give the server a moment to observe the close and run teardown.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A brand-new connection re-subscribes to the same table and must still get
+    // incremental deltas (the reclaimed channel is transparently recreated).
+    let mut ws2 = connect_live(http_port, None).await;
+    send_json(
+        &mut ws2,
+        json!({"type":"live.subscribe","id":"b2","spec":{"kind":"table","table":"beats"}}),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws2).await["type"], "live.subscribed");
+    assert_eq!(recv_live_event(&mut ws2, "b2").await["kind"], "snapshot");
+
+    let (status, _) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/beats",
+        r#"{"id":"k1","room":"main"}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+
+    let e = recv_live_event(&mut ws2, "b2").await;
+    assert_eq!(e["kind"], "insert");
+    assert_eq!(e["pk"], "k1");
+}

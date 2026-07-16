@@ -79,6 +79,9 @@ pub struct Broker {
     stream_waiters: Arc<parking_lot::Mutex<HashMap<String, Vec<StreamWaiter>>>>,
     stream_waiter_count: Arc<AtomicU64>,
     waiter_counter: Arc<AtomicU64>,
+    /// Per-table broadcast of typed row deltas for reactive live queries.
+    row_delta_subs: Arc<parking_lot::RwLock<HashMap<String, broadcast::Sender<RowDelta>>>>,
+    row_delta_sub_count: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -94,6 +97,18 @@ pub struct Message {
     pub pattern: Option<String>,
     pub kind: MessageKind,
 }
+
+/// A typed hint, emitted at the table mutation site, that row `pk` in `table`
+/// changed. The live-query engine re-evaluates just that pk against each
+/// affected subscription, so the delta only carries the identity of what moved,
+/// not the row image.
+#[derive(Clone, Debug)]
+pub struct RowDelta {
+    pub table: String,
+    pub pk: String,
+}
+
+const ROW_DELTA_CAPACITY: usize = 4096;
 
 impl Broker {
     pub fn new() -> Self {
@@ -126,6 +141,46 @@ impl Broker {
             stream_waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             stream_waiter_count: Arc::new(AtomicU64::new(0)),
             waiter_counter: Arc::new(AtomicU64::new(0)),
+            row_delta_subs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            row_delta_sub_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Cheap global gate: are there any reactive live-query subscribers at all?
+    /// Checked on the table write hot path before doing any delta work.
+    pub fn has_any_row_delta_subs(&self) -> bool {
+        self.row_delta_sub_count.load(Ordering::Relaxed) > 0
+    }
+
+    /// Subscribe to typed row deltas for `table`. The receiver is per live query.
+    pub fn subscribe_row_deltas(&self, table: &str) -> broadcast::Receiver<RowDelta> {
+        let mut subs = self.row_delta_subs.write();
+        let tx = subs
+            .entry(table.to_string())
+            .or_insert_with(|| broadcast::channel(ROW_DELTA_CAPACITY).0);
+        let rx = tx.subscribe();
+        self.row_delta_sub_count.fetch_add(1, Ordering::Relaxed);
+        rx
+    }
+
+    /// Drop one live-query subscription to `table`'s row deltas.
+    pub fn unsubscribe_row_deltas(&self, table: &str) {
+        self.row_delta_sub_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            })
+            .ok();
+        let mut subs = self.row_delta_subs.write();
+        if subs.get(table).is_some_and(|tx| tx.receiver_count() == 0) {
+            subs.remove(table);
+        }
+    }
+
+    /// Publish a typed row delta to any live queries watching its table.
+    pub fn publish_row_delta(&self, delta: RowDelta) {
+        let subs = self.row_delta_subs.read();
+        if let Some(tx) = subs.get(&delta.table) {
+            let _ = tx.send(delta);
         }
     }
 
@@ -727,5 +782,46 @@ mod tests {
             rx2.try_recv().err(),
             Some(broadcast::error::TryRecvError::Empty)
         );
+    }
+
+    #[test]
+    fn row_delta_subscriber_count_gates_and_reclaims() {
+        let broker = Broker::new();
+        assert!(!broker.has_any_row_delta_subs());
+
+        let rx1 = broker.subscribe_row_deltas("tasks");
+        let mut rx2 = broker.subscribe_row_deltas("tasks");
+        assert!(broker.has_any_row_delta_subs());
+
+        // A published delta reaches every live receiver on the table.
+        broker.publish_row_delta(RowDelta {
+            table: "tasks".to_string(),
+            pk: "t1".to_string(),
+        });
+        assert_eq!(rx2.try_recv().unwrap().pk, "t1");
+
+        // Dropping one receiver then unsubscribing keeps the channel (rx2 lives).
+        drop(rx1);
+        broker.unsubscribe_row_deltas("tasks");
+        assert!(broker.has_any_row_delta_subs());
+        assert!(broker.row_delta_subs.read().contains_key("tasks"));
+
+        // Dropping the last receiver before unsubscribe reclaims the channel and
+        // flips the global gate back off.
+        drop(rx2);
+        broker.unsubscribe_row_deltas("tasks");
+        assert!(!broker.has_any_row_delta_subs());
+        assert!(!broker.row_delta_subs.read().contains_key("tasks"));
+    }
+
+    #[test]
+    fn publish_row_delta_to_idle_table_is_noop() {
+        let broker = Broker::new();
+        // No panic, no subscribers, nothing to receive.
+        broker.publish_row_delta(RowDelta {
+            table: "ghost".to_string(),
+            pk: "x".to_string(),
+        });
+        assert!(!broker.has_any_row_delta_subs());
     }
 }

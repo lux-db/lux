@@ -2820,6 +2820,12 @@ fn table_insert_pk(
         let _ = store.wal_log_command(&refs);
     }
 
+    // Reactive live queries: hint that this pk changed so watching queries
+    // re-evaluate it (gated, so idle writes pay nothing).
+    if store.wants_row_deltas() {
+        store.emit_row_delta(table, &pk_str);
+    }
+
     Ok(pk_str)
 }
 
@@ -3052,6 +3058,11 @@ fn table_update_by_pk_str(
         }
         let refs: Vec<&[u8]> = a.iter().map(|v| v.as_slice()).collect();
         let _ = store.wal_log_command(&refs);
+    }
+
+    // Reactive live queries: hint that this pk changed.
+    if store.wants_row_deltas() {
+        store.emit_row_delta(table, pk_str);
     }
 
     Ok(())
@@ -3290,6 +3301,12 @@ fn table_delete_inner(
             pk_str.as_bytes(),
         ];
         let _ = store.wal_log_command(&a);
+    }
+
+    // Reactive live queries: hint that this pk changed. Cascaded child deletes
+    // emit too (every real row removal is a live-query change).
+    if store.wants_row_deltas() {
+        store.emit_row_delta(table, pk_str);
     }
 
     Ok(())
