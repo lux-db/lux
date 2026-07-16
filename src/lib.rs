@@ -4624,6 +4624,14 @@ async fn handle_block_zpop(
             if let Ok(items) = result {
                 if !items.is_empty() {
                     let (member, score) = &items[0];
+                    // BZPOPMIN/BZPOPMAX pop straight from the store here, outside
+                    // the WAL; log the removal of the exact member so replay
+                    // doesn't resurrect it (ENG-1317). Keyed on `key` -> correct
+                    // shard; no shard locks held at this point.
+                    if store.wal_enabled() {
+                        let _ =
+                            store.wal_log_command(&[b"ZREM", key.as_bytes(), member.as_bytes()]);
+                    }
                     resp::write_array_header(&mut write_buf, 3);
                     resp::write_bulk(&mut write_buf, key);
                     resp::write_bulk(&mut write_buf, member);

@@ -436,6 +436,52 @@ fn blpop_blocked_completion_survives_wal_replay() {
     }
 }
 
+// PROBE (ENG-1317): a BLOCKED BZPOPMIN satisfied by a later ZADD. handle_block_zpop
+// pops straight from the store outside the WAL; the removal is now logged as a
+// keyed ZREM so replay doesn't resurrect the popped member into the zset.
+#[test]
+fn bzpopmin_blocked_completion_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let n = 16usize;
+    let port = srv.port();
+    let mut blockers = Vec::new();
+    for i in 0..n {
+        let h = thread::spawn(move || {
+            let mut b = common::connect(port);
+            let z = format!("z{i}");
+            send(&mut b, &["BZPOPMIN", &z, "5"]);
+        });
+        blockers.push(h);
+    }
+    thread::sleep(Duration::from_millis(400)); // let every BZPOPMIN register/poll
+    let mut c = srv.conn();
+    for i in 0..n {
+        let z = format!("z{i}");
+        send(&mut c, &["ZADD", &z, "1", "m"]); // wakes the blocked BZPOPMIN: m consumed
+    }
+    for h in blockers {
+        h.join().unwrap();
+    }
+    for i in 0..n {
+        let z = format!("z{i}");
+        assert!(
+            send(&mut c, &["ZCARD", &z]).contains(":0"),
+            "z{i} must be empty at runtime (consumed by the blocked BZPOPMIN)"
+        );
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let z = format!("z{i}");
+        assert!(
+            send(&mut c, &["ZCARD", &z]).contains(":0"),
+            "z{i} must stay empty after replay (ZREM was logged, member not resurrected)"
+        );
+    }
+}
+
 // PROBE (ENG-1316): COPY writes only dst but the raw command shards on src and
 // re-reads src at replay, when a per-shard replay may not have rebuilt src yet
 // (and dst's own writes replay in a separate shard). COPY self-logs the resolved
