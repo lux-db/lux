@@ -535,6 +535,38 @@ pub fn cmd_lpos(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     CmdResult::Written
 }
 
+/// Self-log a resolved list move as its two keyed single-key effects: a POP on
+/// `src` (keyed on src) and a PUSH of the moved element on `dst` (keyed on dst).
+/// The raw LMOVE/RPOPLPUSH is skipped in execute_with_wal (it would shard on src
+/// and replay dst's push out of order vs dst's own writes). Batched so it stays
+/// one atomic append when src and dst share a WAL shard and splits into
+/// correctly-sharded frames when they don't. A plain PUSH stores the moved bytes
+/// verbatim (no re-encryption), so this is correct for encrypted lists too.
+/// Returns false and writes an error to `out` if the WAL append fails.
+fn wal_log_list_move(
+    store: &Store,
+    src: &[u8],
+    dst: &[u8],
+    moved: &[u8],
+    src_left: bool,
+    dst_left: bool,
+    out: &mut BytesMut,
+) -> bool {
+    if !store.wal_enabled() {
+        return true;
+    }
+    let pop: &[u8] = if src_left { b"LPOP" } else { b"RPOP" };
+    let push: &[u8] = if dst_left { b"LPUSH" } else { b"RPUSH" };
+    let pop_cmd: [&[u8]; 2] = [pop, src];
+    let push_cmd: [&[u8]; 3] = [push, dst, moved];
+    let batch: [&[&[u8]]; 2] = [&pop_cmd, &push_cmd];
+    if let Err(e) = store.wal_log_command_batch(&batch) {
+        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+        return false;
+    }
+    true
+}
+
 pub fn cmd_lmove(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 5 {
         resp::write_error(out, "ERR wrong number of arguments for 'lmove' command");
@@ -548,12 +580,15 @@ pub fn cmd_lmove(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         Some(side) => side,
         None => return CmdResult::Written,
     };
-    resp::write_optional_bulk_raw(
-        out,
-        &store
-            .lmove(args[1], args[2], src_left, dst_left, now)
-            .map(|b| decrypt_out(store, b)),
-    );
+    match store.lmove(args[1], args[2], src_left, dst_left, now) {
+        Some(v) => {
+            if !wal_log_list_move(store, args[1], args[2], v.as_ref(), src_left, dst_left, out) {
+                return CmdResult::Written;
+            }
+            resp::write_bulk_raw(out, &decrypt_out(store, v));
+        }
+        None => resp::write_null(out),
+    }
     CmdResult::Written
 }
 
@@ -562,12 +597,15 @@ pub fn cmd_rpoplpush(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Ins
         resp::write_error(out, "ERR wrong number of arguments for 'rpoplpush' command");
         return CmdResult::Written;
     }
-    resp::write_optional_bulk_raw(
-        out,
-        &store
-            .lmove(args[1], args[2], false, true, now)
-            .map(|b| decrypt_out(store, b)),
-    );
+    match store.lmove(args[1], args[2], false, true, now) {
+        Some(v) => {
+            if !wal_log_list_move(store, args[1], args[2], v.as_ref(), false, true, out) {
+                return CmdResult::Written;
+            }
+            resp::write_bulk_raw(out, &decrypt_out(store, v));
+        }
+        None => resp::write_null(out),
+    }
     CmdResult::Written
 }
 

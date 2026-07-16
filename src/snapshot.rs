@@ -584,6 +584,39 @@ pub(crate) fn load_binary(
     Ok(count)
 }
 
+/// Encode a single key/value into the on-disk snapshot format (header + one
+/// entry). Used to self-log COPY to the WAL as a keyed `LXRESTORE dst <blob>`
+/// so replay reconstructs the destination from its own WAL shard, rather than
+/// re-reading a source key whose shard may not have replayed yet.
+pub(crate) fn encode_dump_blob(
+    store: &Store,
+    entry: &crate::store::DumpEntry,
+) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    save_binary(&mut buf, std::slice::from_ref(entry), store)?;
+    Ok(buf)
+}
+
+/// Decode a blob produced by `encode_dump_blob` and load its entry into the
+/// store, overwriting any existing key. Replay path for `LXRESTORE`.
+pub(crate) fn decode_dump_blob(store: &Store, blob: &[u8]) -> io::Result<usize> {
+    let mut cursor = io::Cursor::new(blob);
+    let mut header = [0u8; 4];
+    cursor.read_exact(&mut header)?;
+    if &header == HEADER {
+        load_binary(store, &mut cursor, true, true)
+    } else if &header == HEADER_V2 {
+        load_binary(store, &mut cursor, true, false)
+    } else if &header == HEADER_V1 {
+        load_binary(store, &mut cursor, false, false)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "LXRESTORE payload is not a lux snapshot",
+        ))
+    }
+}
+
 fn load_legacy(store: &Store, file: fs::File) -> io::Result<usize> {
     let reader = io::BufReader::new(file);
     let mut count = 0;

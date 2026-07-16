@@ -1038,6 +1038,20 @@ impl Store {
         self.wal_shards.is_some() && !self.wal_suppress.load(Ordering::Relaxed)
     }
 
+    /// True while `replay_wal` is re-applying logged commands. Gates internal
+    /// replay-only commands (e.g. `LXRESTORE`) so clients can't invoke them.
+    pub(crate) fn wal_replaying(&self) -> bool {
+        self.wal_suppress.load(Ordering::Relaxed)
+    }
+
+    /// Decode and apply an `LXRESTORE` blob (COPY's self-logged effect). Only
+    /// honored during WAL replay.
+    pub(crate) fn apply_lxrestore(&self, blob: &[u8]) -> Result<(), String> {
+        crate::snapshot::decode_dump_blob(self, blob)
+            .map(|_| ())
+            .map_err(|e| format!("ERR LXRESTORE decode failed: {e}"))
+    }
+
     pub(crate) fn lock_read_shard(&self, idx: usize) -> parking_lot::RwLockReadGuard<'_, Shard> {
         self.shards[idx].read()
     }
@@ -2648,7 +2662,28 @@ impl Store {
             }
         }
 
-        self.load_entry(key_string(dst), dump_val, ttl);
+        // Self-log the resolved destination value as `LXRESTORE dst <blob>` keyed
+        // on dst. The raw COPY is skipped in execute_with_wal: it shards on src
+        // (args[1]) and, worse, re-reads src at replay time, but a per-shard WAL
+        // replay can hit COPY before src's own shard has replayed its post-snapshot
+        // writes, copying a stale source. The self-logged blob captures dst's exact
+        // value and replays in dst's shard order. Log before mutating memory so a
+        // WAL failure leaves dst untouched.
+        if self.wal_enabled() {
+            let ttl_ms = ttl.map(|d| d.as_millis() as i64).unwrap_or(-1);
+            let entry = DumpEntry {
+                key: key_string(dst),
+                value: dump_val,
+                ttl_ms,
+            };
+            let blob = crate::snapshot::encode_dump_blob(self, &entry)
+                .map_err(|e| format!("ERR COPY encode failed: {e}"))?;
+            self.wal_log_command(&[b"LXRESTORE", dst, &blob])
+                .map_err(|e| format!("ERR WAL append failed: {e}"))?;
+            self.load_entry(entry.key, entry.value, ttl);
+        } else {
+            self.load_entry(key_string(dst), dump_val, ttl);
+        }
         Ok(true)
     }
 
@@ -4699,35 +4734,51 @@ impl Store {
         }
     }
 
+    /// Replace `dst` with `members` (as a set) and self-log the resolved effect
+    /// (DEL + SADD) keyed on dst, so replay rebuilds dst from its own WAL shard,
+    /// independent of the source keys' shard order. (The raw *STORE command is
+    /// skipped in execute_with_wal via command_self_logs_wal.)
+    fn write_computed_set(
+        &self,
+        dst: &[u8],
+        members: &[&[u8]],
+        now: Instant,
+    ) -> Result<i64, String> {
+        self.del(&[dst]);
+        if !members.is_empty() {
+            self.sadd(dst, members, now)?;
+        }
+        if self.wal_enabled() {
+            self.wal_log_command(&[b"DEL", dst])
+                .map_err(|e| format!("ERR WAL append failed: {e}"))?;
+            if !members.is_empty() {
+                let mut sadd: Vec<&[u8]> = Vec::with_capacity(members.len() + 2);
+                sadd.push(b"SADD");
+                sadd.push(dst);
+                sadd.extend_from_slice(members);
+                self.wal_log_command(&sadd)
+                    .map_err(|e| format!("ERR WAL append failed: {e}"))?;
+            }
+        }
+        Ok(members.len() as i64)
+    }
+
     pub fn sdiffstore(&self, dst: &[u8], keys: &[&[u8]], now: Instant) -> Result<i64, String> {
         let result = self.sdiff(keys, now)?;
         let members: Vec<&[u8]> = result.iter().map(|s| s.as_bytes()).collect();
-        self.del(&[dst]);
-        if !members.is_empty() {
-            let member_refs: Vec<&[u8]> = members;
-            self.sadd(dst, &member_refs, now)?;
-        }
-        Ok(result.len() as i64)
+        self.write_computed_set(dst, &members, now)
     }
 
     pub fn sinterstore(&self, dst: &[u8], keys: &[&[u8]], now: Instant) -> Result<i64, String> {
         let result = self.sinter(keys, now)?;
         let members: Vec<&[u8]> = result.iter().map(|s| s.as_bytes()).collect();
-        self.del(&[dst]);
-        if !members.is_empty() {
-            self.sadd(dst, &members, now)?;
-        }
-        Ok(result.len() as i64)
+        self.write_computed_set(dst, &members, now)
     }
 
     pub fn sunionstore(&self, dst: &[u8], keys: &[&[u8]], now: Instant) -> Result<i64, String> {
         let result = self.sunion(keys, now)?;
         let members: Vec<&[u8]> = result.iter().map(|s| s.as_bytes()).collect();
-        self.del(&[dst]);
-        if !members.is_empty() {
-            self.sadd(dst, &members, now)?;
-        }
-        Ok(result.len() as i64)
+        self.write_computed_set(dst, &members, now)
     }
 
     pub fn expire_sweep(&self, now: Instant) {

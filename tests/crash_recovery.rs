@@ -168,6 +168,175 @@ fn tsadd_star_timestamp_stable_after_wal_replay() {
     );
 }
 
+// PROBE (ENG-1316): ZUNIONSTORE reads source keys that may live on other WAL
+// shards. Per-shard replay applies each shard fully in order, so a dst whose
+// shard replays before a source's shard computes the union from empty sources.
+// With many sources spread across shards, most dsts are affected.
+#[test]
+fn zunionstore_cross_shard_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let n = 24usize;
+    let srcs: Vec<String> = (0..n).map(|i| format!("src{i}")).collect();
+    for (i, k) in srcs.iter().enumerate() {
+        send(&mut c, &["ZADD", k, "1", &format!("m{i}")]);
+    }
+    let numkeys = n.to_string();
+    for d in 0..10 {
+        let dst = format!("dst{d}");
+        let mut args: Vec<&str> = vec!["ZUNIONSTORE", &dst, &numkeys];
+        args.extend(srcs.iter().map(String::as_str));
+        send(&mut c, &args);
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for d in 0..10 {
+        let dst = format!("dst{d}");
+        let card = send(&mut c, &["ZCARD", &dst]);
+        assert!(
+            card.contains(&format!(":{n}\r\n")),
+            "dst{d} must hold all {n} union members after replay; got {card:?}"
+        );
+    }
+}
+
+// PROBE (ENG-1316): SMOVE adds the member to dst, which may live on a different
+// WAL shard than src. A conflicting SREM on dst must stay ordered after the move.
+// Under raw logging the whole move lands in src's shard and can replay after
+// dst's SREM, resurrecting the member. Self-logging `SREM src` + `SADD dst` keys
+// each effect to its own shard so append order is preserved on replay.
+#[test]
+fn smove_cross_shard_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let n = 24usize;
+    for i in 0..n {
+        let a = format!("a{i}");
+        let b = format!("b{i}");
+        send(&mut c, &["SADD", &a, "m"]);
+        send(&mut c, &["SMOVE", &a, &b, "m"]); // b{i} = {m}
+        send(&mut c, &["SREM", &b, "m"]); // b{i} = {}
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let a = format!("a{i}");
+        let b = format!("b{i}");
+        assert!(
+            send(&mut c, &["SCARD", &b]).contains(":0"),
+            "b{i} must be empty (SADD-then-SREM order preserved) after replay"
+        );
+        assert!(
+            send(&mut c, &["SISMEMBER", &a, "m"]).contains(":0"),
+            "a{i} must not resurrect the moved member after replay"
+        );
+    }
+}
+
+// PROBE (ENG-1316): LMOVE pushes the moved element onto dst, whose shard may
+// differ from src's. List order is significant, so a pre-existing element on dst
+// must stay ordered before the moved one. Raw logging puts the whole move in
+// src's shard and can replay it before dst's own push, inverting the order.
+#[test]
+fn lmove_cross_shard_order_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let n = 24usize;
+    for i in 0..n {
+        let a = format!("a{i}");
+        let b = format!("b{i}");
+        send(&mut c, &["RPUSH", &a, "M"]);
+        send(&mut c, &["RPUSH", &b, "P"]); // b{i} = [P]
+        send(&mut c, &["LMOVE", &a, &b, "LEFT", "RIGHT"]); // b{i} = [P, M]
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let b = format!("b{i}");
+        let range = send(&mut c, &["LRANGE", &b, "0", "-1"]);
+        let p = range.find("\r\nP\r\n");
+        let m = range.find("\r\nM\r\n");
+        assert!(
+            p.is_some() && m.is_some() && p < m,
+            "b{i} must be [P, M] after replay; got {range:?}"
+        );
+    }
+}
+
+// PROBE (ENG-1316): RPOPLPUSH is LMOVE src dst RIGHT LEFT; same cross-shard
+// ordering hazard on the destination push.
+#[test]
+fn rpoplpush_cross_shard_order_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let n = 24usize;
+    for i in 0..n {
+        let a = format!("a{i}");
+        let b = format!("b{i}");
+        send(&mut c, &["RPUSH", &a, "M"]);
+        send(&mut c, &["RPUSH", &b, "P"]); // b{i} = [P]
+        send(&mut c, &["RPOPLPUSH", &a, &b]); // pop tail M of a, push head of b => [M, P]
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let b = format!("b{i}");
+        let range = send(&mut c, &["LRANGE", &b, "0", "-1"]);
+        let m = range.find("\r\nM\r\n");
+        let p = range.find("\r\nP\r\n");
+        assert!(
+            m.is_some() && p.is_some() && m < p,
+            "b{i} must be [M, P] after replay; got {range:?}"
+        );
+    }
+}
+
+// PROBE (ENG-1316): COPY writes only dst but the raw command shards on src and
+// re-reads src at replay, when a per-shard replay may not have rebuilt src yet
+// (and dst's own writes replay in a separate shard). COPY self-logs the resolved
+// dst value as a keyed `LXRESTORE dst <blob>`.
+#[test]
+fn copy_cross_shard_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let n = 24usize;
+    for i in 0..n {
+        let s = format!("s{i}");
+        let d = format!("d{i}");
+        send(&mut c, &["SET", &s, &format!("v{i}")]);
+        send(&mut c, &["SET", &d, "OLD"]); // independent write to dst's shard
+        send(&mut c, &["COPY", &s, &d, "REPLACE"]); // d{i} = v{i}
+    }
+    // Cover a non-string type through the dump blob.
+    send(&mut c, &["RPUSH", "lsrc", "l0", "l1", "l2"]);
+    send(&mut c, &["COPY", "lsrc", "ldst"]);
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let d = format!("d{i}");
+        let got = send(&mut c, &["GET", &d]);
+        assert!(
+            got.contains(&format!("v{i}\r")),
+            "d{i} must hold the copied value (not OLD) after replay; got {got:?}"
+        );
+    }
+    let l = send(&mut c, &["LRANGE", "ldst", "0", "-1"]);
+    assert!(
+        l.contains("l0") && l.contains("l1") && l.contains("l2"),
+        "list COPY must survive replay through the dump blob; got {l:?}"
+    );
+}
+
 // ZMPOP mutates the sorted set, so the pop must survive a WAL-only restart
 // (regression guard that ZMPOP is classified as a write and WAL-logged).
 #[test]

@@ -1842,6 +1842,21 @@ pub fn execute(
             if cmd_eq(cmd, b"LMOVE") {
                 return lists::cmd_lmove(args, store, out, now);
             }
+            if cmd_eq(cmd, b"LXRESTORE") {
+                // Internal, replay-only: COPY's self-logged effect. Reject if a
+                // client sends it during normal operation.
+                if !store.wal_replaying() {
+                    resp::write_error(out, &format!("ERR unknown command '{}'", arg_str(cmd)));
+                    return CmdResult::Written;
+                }
+                if args.len() != 3 {
+                    return CmdResult::Written;
+                }
+                if let Err(e) = store.apply_lxrestore(args[2]) {
+                    resp::write_error(out, &e);
+                }
+                return CmdResult::Written;
+            }
             if cmd_eq(cmd, b"LASTSAVE") {
                 return server::cmd_lastsave(args, store, out, now);
             }
@@ -2365,6 +2380,26 @@ fn command_self_logs_wal_args(args: &[&[u8]], store: &Store, now: Instant) -> bo
     }
     let cmd = args[0];
     if command_self_logs_wal(cmd) {
+        return true;
+    }
+    // Commands whose key isn't at args[1] and/or that read/write across WAL
+    // shards self-log their resolved single-key effects to the correct shard(s),
+    // so they must not be raw-logged here (which would replay out of order).
+    if cmd_eq(cmd, b"ZUNIONSTORE") || cmd_eq(cmd, b"ZINTERSTORE") || cmd_eq(cmd, b"ZDIFFSTORE") {
+        return true;
+    }
+    if cmd_eq(cmd, b"SUNIONSTORE") || cmd_eq(cmd, b"SINTERSTORE") || cmd_eq(cmd, b"SDIFFSTORE") {
+        return true;
+    }
+    // Movers write two keys on different WAL shards. They self-log the resolved
+    // per-key effects (pop on src, push on dst) so each replays in its own
+    // shard's order instead of the raw command landing wholesale in src's shard.
+    if cmd_eq(cmd, b"LMOVE") || cmd_eq(cmd, b"RPOPLPUSH") || cmd_eq(cmd, b"SMOVE") {
+        return true;
+    }
+    // COPY writes only dst but shards on src and re-reads src at replay; it
+    // self-logs the resolved dst value as a keyed LXRESTORE instead.
+    if cmd_eq(cmd, b"COPY") {
         return true;
     }
     if cmd_eq(cmd, b"SET") && args.len() >= 3 {

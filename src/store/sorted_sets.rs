@@ -732,36 +732,80 @@ impl Store {
     }
 
     /// Delete `dst` and store `result` as a sorted set; returns the member count.
-    fn write_computed_zset(&self, dst: &[u8], result: HashMap<String, f64>) -> i64 {
+    fn write_computed_zset(&self, dst: &[u8], result: HashMap<String, f64>) -> Result<i64, String> {
         let count = result.len() as i64;
         self.del(&[dst]);
-        if !result.is_empty() {
-            let idx = self.shard_index(dst);
-            let mut shard = self.shards[idx].write();
-            shard.version += 1;
-            let mut tree = BTreeMap::new();
-            let mut scores = HashMap::new();
-            let mut mem = key_str(dst).len() + 64;
-            for (member, score) in result {
-                mem += member.len() + 48;
-                tree.insert((OrderedFloat(score), member.clone()), ());
-                scores.insert(member, score);
+        let wal = self.wal_enabled();
+
+        if result.is_empty() {
+            // Self-log the clear so replay drops any prior dst on dst's own shard.
+            if wal {
+                self.wal_log_command(&[b"DEL", dst])
+                    .map_err(|e| format!("ERR WAL append failed: {e}"))?;
             }
-            let old = shard.data.insert(
-                key_bytes(dst),
-                Entry {
-                    value: StoreValue::SortedSet(tree, scores),
-                    expires_at: None,
-                    lru_clock: self.lru_clock(),
-                },
-            );
-            if old.is_none() {
-                self.key_added();
-            }
-            shard.used_memory += mem;
-            self.mem_add(mem);
+            return Ok(count);
         }
-        count
+
+        let idx = self.shard_index(dst);
+        let mut shard = self.shards[idx].write();
+        shard.version += 1;
+        let mut tree = BTreeMap::new();
+        let mut scores = HashMap::new();
+        let mut mem = key_str(dst).len() + 64;
+        // Captured for the self-logged ZADD below (only when WAL is on).
+        let mut members: Vec<String> = if wal {
+            Vec::with_capacity(result.len())
+        } else {
+            Vec::new()
+        };
+        let mut score_strs: Vec<String> = if wal {
+            Vec::with_capacity(result.len())
+        } else {
+            Vec::new()
+        };
+        for (member, score) in result {
+            mem += member.len() + 48;
+            tree.insert((OrderedFloat(score), member.clone()), ());
+            if wal {
+                score_strs.push(score.to_string());
+                members.push(member.clone());
+            }
+            scores.insert(member, score);
+        }
+        let old = shard.data.insert(
+            key_bytes(dst),
+            Entry {
+                value: StoreValue::SortedSet(tree, scores),
+                expires_at: None,
+                lru_clock: self.lru_clock(),
+            },
+        );
+        if old.is_none() {
+            self.key_added();
+        }
+        shard.used_memory += mem;
+        self.mem_add(mem);
+        drop(shard);
+
+        // Self-log the resolved effect keyed on dst (DEL + ZADD). The raw *STORE
+        // command reads source keys that may live on other WAL shards, so per-
+        // shard replay could apply it before the sources are restored. Logging
+        // DEL+ZADD to dst's own shard makes replay independent of source order.
+        // (The raw command is skipped in execute_with_wal via command_self_logs_wal.)
+        if wal {
+            self.wal_log_command(&[b"DEL", dst])
+                .map_err(|e| format!("ERR WAL append failed: {e}"))?;
+            let mut zadd: Vec<&[u8]> = Vec::with_capacity(members.len() * 2 + 2);
+            zadd.push(b"ZADD");
+            zadd.push(dst);
+            for (s, m) in score_strs.iter().zip(members.iter()) {
+                zadd.push(s.as_bytes());
+                zadd.push(m.as_bytes());
+            }
+            self.wal_log_command(&zadd)
+                .map_err(|e| format!("ERR WAL append failed: {e}"))?;
+        }
+        Ok(count)
     }
 
     /// Sort a member->score map into Redis order: by score ascending, ties by
@@ -785,7 +829,7 @@ impl Store {
         now: Instant,
     ) -> Result<i64, String> {
         let result = self.zunion_compute(keys, weights, aggregate, now)?;
-        Ok(self.write_computed_zset(dst, result))
+        self.write_computed_zset(dst, result)
     }
 
     pub fn zinterstore(
@@ -797,12 +841,12 @@ impl Store {
         now: Instant,
     ) -> Result<i64, String> {
         let result = self.zinter_compute(keys, weights, aggregate, now)?;
-        Ok(self.write_computed_zset(dst, result))
+        self.write_computed_zset(dst, result)
     }
 
     pub fn zdiffstore(&self, dst: &[u8], keys: &[&[u8]], now: Instant) -> Result<i64, String> {
         let result = self.zdiff_compute(keys, now)?;
-        Ok(self.write_computed_zset(dst, result))
+        self.write_computed_zset(dst, result)
     }
 
     /// Direct-return union (sorted). WITHSCORES is applied at the command layer.
