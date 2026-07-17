@@ -2634,6 +2634,8 @@ fn route_request_with_auth(
         ("DELETE", ["push", "devices", id]) => push_delete_device(id, store, cache, auth),
         ("POST", ["push", "send"]) => push_send(body, store, cache),
         ("POST", ["push", "credentials"]) => push_set_credentials(body, store, cache),
+        ("GET", ["push", "admin", "devices"]) => push_admin_devices(store, cache),
+        ("GET", ["push", "admin", "outbox"]) => push_admin_outbox(store, cache),
 
         // ── KV routes ──
         ("GET", ["kv", key]) => ok(exec_json(
@@ -3011,6 +3013,8 @@ fn route_requires_operator(method: &str, base: &[&str]) -> bool {
             | ("DELETE", ["vectors", _])
             | ("POST", ["push", "send"])
             | ("POST", ["push", "credentials"])
+            | ("GET", ["push", "admin", "devices"])
+            | ("GET", ["push", "admin", "outbox"])
     )
 }
 
@@ -3121,6 +3125,25 @@ fn push_send(
         .unwrap_or_else(|| json!({}));
     match crate::push::enqueue_send(store, cache, user_id, &notification, Instant::now()) {
         Ok(n) => ok(json!({ "enqueued": n }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `GET /v1/push/admin/devices` (operator) — every device in the project.
+fn push_admin_devices(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    match crate::push::list_all_devices(store, cache, Instant::now()) {
+        Ok(devices) => ok(json!({ "devices": devices }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `GET /v1/push/admin/outbox` (operator) — dead-lettered deliveries.
+fn push_admin_outbox(store: &Arc<Store>, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
+    match crate::push::list_dead_letters(store, cache, Instant::now()) {
+        Ok(dead) => ok(json!({ "dead_letters": dead }).to_string()),
         Err(e) => push_json_error(400, "Bad Request", &e),
     }
 }

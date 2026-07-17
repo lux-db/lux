@@ -168,6 +168,69 @@ pub(crate) fn delete_device(
 }
 
 // ---------------------------------------------------------------------------
+// Admin reads (operator) — for the cloud dashboard
+// ---------------------------------------------------------------------------
+
+/// List every device across all users (operator view). Tokens are omitted.
+pub(crate) fn list_all_devices(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    now: Instant,
+) -> Result<Vec<Value>, String> {
+    let rows = select_rows(store, cache, DEVICES_TABLE, Vec::new(), None, now)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let m: std::collections::HashMap<String, String> = row.into_iter().collect();
+            json!({
+                "id": m.get("id").cloned().unwrap_or_default(),
+                "user_id": m.get("user_id").cloned().unwrap_or_default(),
+                "platform": m.get("platform").cloned().unwrap_or_default(),
+                "app_id": m.get("app_id").cloned().unwrap_or_default(),
+                "created_at": m.get("created_at").cloned().unwrap_or_default(),
+                "last_seen_at": m.get("last_seen_at").cloned().unwrap_or_default(),
+                "disabled_at": m.get("disabled_at").cloned().unwrap_or_default(),
+            })
+        })
+        .collect())
+}
+
+/// List dead-lettered deliveries (operator view). Target tokens are omitted.
+pub(crate) fn list_dead_letters(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    now: Instant,
+) -> Result<Vec<Value>, String> {
+    let rows = select_rows(
+        store,
+        cache,
+        PUSH_OUTBOX_TABLE,
+        vec![WhereClause::single(
+            "state".into(),
+            CmpOp::Eq,
+            "dead".into(),
+        )],
+        Some(200),
+        now,
+    )?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let m: std::collections::HashMap<String, String> = row.into_iter().collect();
+            json!({
+                "id": m.get("id").cloned().unwrap_or_default(),
+                "user_id": m.get("user_id").cloned().unwrap_or_default(),
+                "app_id": m.get("app_id").cloned().unwrap_or_default(),
+                "platform": m.get("platform").cloned().unwrap_or_default(),
+                "attempts": m.get("attempts").cloned().unwrap_or_default(),
+                "last_error": m.get("last_error").cloned().unwrap_or_default(),
+                "created_at": m.get("created_at").cloned().unwrap_or_default(),
+            })
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // Credentials
 // ---------------------------------------------------------------------------
 
