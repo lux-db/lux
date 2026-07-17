@@ -117,7 +117,11 @@ pub fn cmd_info(
     } else {
         "all".to_string()
     };
-    let info = build_info(store, broker, &section, now);
+    let mut info = build_info(store, broker, &section, now);
+    if section == "all" || section == "push" {
+        info.push_str("\r\n");
+        crate::push::append_info(&mut info);
+    }
     resp::write_bulk(out, &info);
     CmdResult::Written
 }

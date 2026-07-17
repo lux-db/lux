@@ -32,6 +32,9 @@ pub(crate) const GRANTS_TABLE: &str = "auth.grants";
 pub(crate) const PROVIDERS_TABLE: &str = "auth.providers";
 pub(crate) const FLOW_TOKENS_TABLE: &str = "auth.flow_tokens";
 pub(crate) const SETTINGS_TABLE: &str = "auth.settings";
+pub(crate) const DEVICES_TABLE: &str = "auth.devices";
+pub(crate) const PUSH_CREDENTIALS_TABLE: &str = "auth.push_credentials";
+pub(crate) const PUSH_OUTBOX_TABLE: &str = "auth.push_outbox";
 
 const AUTH_SCHEMA_VERSION_KEY: &[u8] = b"_auth:schema_version";
 const AUTH_SCHEMA_VERSION: &[u8] = b"2";
@@ -319,6 +322,9 @@ fn sensitive_auth_fields(table: &str) -> &'static [&'static str] {
         SIGNING_KEYS_TABLE => &["private_key_encrypted"],
         PROVIDERS_TABLE => &["client_secret"],
         FLOW_TOKENS_TABLE => &["token_hash"],
+        DEVICES_TABLE => &["token"],
+        PUSH_CREDENTIALS_TABLE => &["apns_p8_pem"],
+        PUSH_OUTBOX_TABLE => &["target_token"],
         _ => &[],
     }
 }
@@ -475,6 +481,60 @@ pub(crate) fn bootstrap(
         cache,
         SETTINGS_TABLE,
         &["key STR PRIMARY KEY,", "value STR,", "updated_at INT"],
+        now,
+    )?;
+    // lux push: per-user device registry, per-app push credentials, and the
+    // durable delivery outbox. All under `auth.*` so the reserved-table guards
+    // (mutation/read/redaction) cover them for free.
+    create_table_if_missing(
+        store,
+        cache,
+        DEVICES_TABLE,
+        &[
+            "id STR PRIMARY KEY,",
+            "user_id UUID,",
+            "token STR,",
+            "platform STR,",
+            "app_id STR,",
+            "created_at INT,",
+            "last_seen_at INT,",
+            "disabled_at INT",
+        ],
+        now,
+    )?;
+    create_table_if_missing(
+        store,
+        cache,
+        PUSH_CREDENTIALS_TABLE,
+        &[
+            "app_id STR PRIMARY KEY,",
+            "platform STR,",
+            "apns_team_id STR,",
+            "apns_key_id STR,",
+            "apns_p8_pem STR,",
+            "apns_topic STR,",
+            "environment STR,",
+            "created_at INT",
+        ],
+        now,
+    )?;
+    create_table_if_missing(
+        store,
+        cache,
+        PUSH_OUTBOX_TABLE,
+        &[
+            "id STR PRIMARY KEY,",
+            "user_id UUID,",
+            "app_id STR,",
+            "target_token STR,",
+            "platform STR,",
+            "payload STR,",
+            "attempts INT,",
+            "next_attempt_at INT,",
+            "state STR,",
+            "last_error STR,",
+            "created_at INT",
+        ],
         now,
     )?;
     store.set(AUTH_SCHEMA_VERSION_KEY, AUTH_SCHEMA_VERSION, None, now);
@@ -2574,7 +2634,7 @@ fn create_table_if_missing(
     }
 }
 
-fn durable_table_insert(
+pub(crate) fn durable_table_insert(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -2590,7 +2650,7 @@ fn durable_table_insert(
     tables::table_insert(store, cache, table, field_values, now)
 }
 
-fn durable_table_update_where(
+pub(crate) fn durable_table_update_where(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -2615,7 +2675,7 @@ fn durable_table_update_where(
     tables::table_update_where(store, cache, table, field_values, where_args, now)
 }
 
-fn durable_table_delete_where(
+pub(crate) fn durable_table_delete_where(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -4290,7 +4350,7 @@ fn app_metadata_with_provider(existing: Option<&str>, provider: &str) -> String 
     value.to_string()
 }
 
-fn find_row_by_field(
+pub(crate) fn find_row_by_field(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -5152,7 +5212,7 @@ fn random_token(bytes: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
 }
 
-fn random_id(prefix: &str) -> String {
+pub(crate) fn random_id(prefix: &str) -> String {
     format!("{prefix}_{}", random_token(18))
 }
 
@@ -5160,7 +5220,7 @@ fn key_prefix(key: &str) -> String {
     key.chars().take(12).collect()
 }
 
-fn unix_seconds() -> u64 {
+pub(crate) fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

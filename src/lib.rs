@@ -22,6 +22,7 @@ mod http;
 mod jsonb;
 mod lua;
 mod pubsub;
+mod push;
 mod resp;
 mod shard_exec;
 mod snapshot;
@@ -3155,6 +3156,15 @@ impl Runtime {
                     }
                 }
             });
+        }
+
+        // lux push delivery worker: drains the durable outbox and delivers to
+        // APNs/etc. Only runs when auth is enabled (the push registry lives under
+        // the `auth.*` reserved tables, bootstrapped above).
+        if runtime.config.auth.enabled {
+            let store = runtime.store.clone();
+            let cache = runtime.schema_cache.clone();
+            background_tasks.spawn(push::worker::run_delivery_worker(store, cache));
         }
 
         if runtime.config.storage.mode == StorageMode::Tiered {

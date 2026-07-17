@@ -1,0 +1,518 @@
+//! Integration tests for lux push (engine PR1): device registry, reserved-table
+//! guards, durable outbox delivery through a mock APNs server, dead-token
+//! pruning, and WAL-replay durability.
+
+mod common;
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::process::Child;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+// ── engine harness ─────────────────────────────────────────────────────────
+
+struct PushServer {
+    child: Child,
+    dir: std::path::PathBuf,
+    keep_dir: bool,
+}
+
+impl Drop for PushServer {
+    fn drop(&mut self) {
+        common::terminate_child(&mut self.child);
+        if !self.keep_dir {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn start(dir: &std::path::Path, resp_port: u16, http_port: u16, keep_dir: bool) -> PushServer {
+    let bin = common::find_lux_binary();
+    std::fs::create_dir_all(dir).unwrap();
+    let mut cmd = common::lux_command(&bin);
+    cmd.env("LUX_PORT", resp_port.to_string())
+        .env("LUX_HTTP_PORT", http_port.to_string())
+        .env("LUX_SHARDS", "4")
+        .env("LUX_SAVE_INTERVAL", "0")
+        .env("LUX_DATA_DIR", dir.to_str().unwrap())
+        // Tiered storage enables the WAL, so the registry survives restart.
+        .env("LUX_STORAGE_MODE", "tiered")
+        .env("LUX_STORAGE_DIR", dir.join("storage").to_str().unwrap())
+        .env("LUX_PASSWORD", "rootsecret")
+        .env("LUX_AUTH_ENABLED", "true")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let child = cmd.spawn().expect("spawn lux");
+    let server = PushServer {
+        child,
+        dir: dir.to_path_buf(),
+        keep_dir,
+    };
+    for _ in 0..80 {
+        if TcpStream::connect(("127.0.0.1", http_port)).is_ok()
+            && TcpStream::connect(("127.0.0.1", resp_port)).is_ok()
+        {
+            std::thread::sleep(Duration::from_millis(150));
+            return server;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("lux did not start");
+}
+
+fn http(port: u16, method: &str, path: &str, body: &str, auth: Option<&str>) -> (u16, Value) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let auth_header = auth
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{auth_header}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                resp.extend_from_slice(&buf[..n]);
+                if let Some(he) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&resp[..he]);
+                    if let Some(len) = headers
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                        .and_then(|l| l.split(':').nth(1))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                    {
+                        if resp.len() >= he + 4 + len {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&resp);
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(0);
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+    (
+        status,
+        serde_json::from_str(body).unwrap_or_else(|_| json!({})),
+    )
+}
+
+fn resp_cmd(port: u16, args: &[&str]) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    // The push-test engine sets a password; authenticate on the same connection
+    // (pipelined) before the command.
+    let mut req = String::from("*2\r\n$4\r\nAUTH\r\n$10\r\nrootsecret\r\n");
+    req.push_str(&format!("*{}\r\n", args.len()));
+    for a in args {
+        req.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+    }
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                resp.extend_from_slice(&buf[..n]);
+                if n < buf.len() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&resp).to_string()
+}
+
+fn exec(port: u16, command: Value) -> (u16, Value) {
+    http(
+        port,
+        "POST",
+        "/v1/exec",
+        &json!({ "command": command }).to_string(),
+        Some("rootsecret"),
+    )
+}
+
+// ── mock APNs server (HTTP/1.1; reqwest talks cleartext h1 to localhost) ─────
+
+#[derive(Clone, Default)]
+struct Captured {
+    path: String,
+    authorization: String,
+    apns_topic: String,
+    body: String,
+}
+
+struct MockApns {
+    port: u16,
+    requests: Arc<Mutex<Vec<Captured>>>,
+}
+
+impl MockApns {
+    fn start(status: u16) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let reqs = requests.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut stream) = conn else { continue };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                // Read headers.
+                let header_end = loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break None,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break Some(p);
+                            }
+                        }
+                        Err(_) => break None,
+                    }
+                };
+                let Some(he) = header_end else { continue };
+                let head = String::from_utf8_lossy(&buf[..he]).to_string();
+                let mut cap = Captured::default();
+                for (i, line) in head.lines().enumerate() {
+                    if i == 0 {
+                        cap.path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                    } else if let Some((k, v)) = line.split_once(':') {
+                        match k.trim().to_ascii_lowercase().as_str() {
+                            "authorization" => cap.authorization = v.trim().to_string(),
+                            "apns-topic" => cap.apns_topic = v.trim().to_string(),
+                            _ => {}
+                        }
+                    }
+                }
+                let content_len = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = buf[he + 4..].to_vec();
+                while body.len() < content_len {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => body.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                }
+                cap.body = String::from_utf8_lossy(&body).to_string();
+                reqs.lock().unwrap().push(cap);
+                let reason = if status == 200 {
+                    "{}"
+                } else {
+                    "{\"reason\":\"Unregistered\"}"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reason}",
+                    reason.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        MockApns { port, requests }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    fn wait_for_request(&self, timeout: Duration) -> Option<Captured> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(c) = self.requests.lock().unwrap().first().cloned() {
+                return Some(c);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+}
+
+fn test_p8() -> String {
+    use p256::pkcs8::{EncodePrivateKey, LineEnding};
+    use p256::SecretKey;
+    SecretKey::random(&mut rand_core::OsRng)
+        .to_pkcs8_pem(LineEnding::LF)
+        .unwrap()
+        .to_string()
+}
+
+fn set_creds(http_port: u16, environment: &str) {
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/credentials",
+        &json!({
+            "app_id": "default",
+            "team_id": "TEAM123456",
+            "key_id": "KEY7890AB",
+            "p8_pem": test_p8(),
+            "topic": "com.example.app",
+            "environment": environment,
+        })
+        .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "set creds: {b}");
+}
+
+fn anon_login(http_port: u16) -> (String, String) {
+    let (s, sess) = http(http_port, "POST", "/auth/v1/signin/anonymous", "{}", None);
+    assert_eq!(s, 200, "anon signin: {sess}");
+    (
+        sess["access_token"].as_str().unwrap().to_string(),
+        sess["user"]["id"].as_str().unwrap().to_string(),
+    )
+}
+
+fn info_field(port: u16, field: &str) -> i64 {
+    let info = resp_cmd(port, &["INFO", "push"]);
+    for line in info.lines() {
+        if let Some(rest) = line.trim().strip_prefix(&format!("{field}:")) {
+            return rest.trim().parse().unwrap_or(-1);
+        }
+    }
+    -1
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn push_end_to_end_delivers_to_apns_mock() {
+    let mock = MockApns::start(200);
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let server = start(dir.path(), resp_port, http_port, false);
+
+    set_creds(http_port, &mock.url());
+    let (token, uid) = anon_login(http_port);
+
+    // Register a device as the current user (user_id derived from the JWT).
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"token":"devtoken-abc","platform":"ios","app_id":"default"}).to_string(),
+        Some(&token),
+    );
+    assert_eq!(s, 200, "register: {b}");
+
+    // Operator send fans out to the user's devices.
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({"user_id": uid, "notification": {"title":"Hi","body":"There"}}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "send: {b}");
+    assert_eq!(b["enqueued"], 1);
+
+    let got = mock
+        .wait_for_request(Duration::from_secs(5))
+        .expect("APNs mock should receive a delivery");
+    assert_eq!(got.path, "/3/device/devtoken-abc");
+    assert!(
+        got.authorization.starts_with("bearer "),
+        "auth header: {}",
+        got.authorization
+    );
+    assert_eq!(got.apns_topic, "com.example.app");
+    let body: Value = serde_json::from_str(&got.body).unwrap();
+    assert_eq!(body["aps"]["alert"]["title"], "Hi");
+    assert_eq!(body["aps"]["alert"]["body"], "There");
+
+    // Delivered: the outbox drains and the counter increments.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while info_field(resp_port, "push_delivered_total") < 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(info_field(resp_port, "push_delivered_total") >= 1);
+    drop(server);
+}
+
+#[test]
+fn push_unregistered_token_disables_device() {
+    let mock = MockApns::start(410);
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let server = start(dir.path(), resp_port, http_port, false);
+
+    set_creds(http_port, &mock.url());
+    let (token, uid) = anon_login(http_port);
+    let (s, _) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"token":"dead-token","platform":"ios","app_id":"default"}).to_string(),
+        Some(&token),
+    );
+    assert_eq!(s, 200);
+
+    let (s, _) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({"user_id": uid, "notification": {"title":"x","body":"y"}}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200);
+
+    assert!(
+        mock.wait_for_request(Duration::from_secs(5)).is_some(),
+        "mock should receive the attempt"
+    );
+
+    // 410 Unregistered prunes the token: the device disappears from the list.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let (_, list) = http(http_port, "GET", "/v1/push/devices", "", Some(&token));
+        let n = list["devices"].as_array().map(|a| a.len()).unwrap_or(0);
+        if n == 0 || Instant::now() >= deadline {
+            assert_eq!(n, 0, "unregistered device should be disabled: {list}");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(server);
+}
+
+#[test]
+fn push_devices_scoped_and_reserved_guarded() {
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let server = start(dir.path(), resp_port, http_port, false);
+
+    let (token_a, _uid_a) = anon_login(http_port);
+    let (token_b, _uid_b) = anon_login(http_port);
+
+    // User A registers a device; user B cannot see it.
+    let (s, _) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"token":"a-token","platform":"ios","app_id":"default"}).to_string(),
+        Some(&token_a),
+    );
+    assert_eq!(s, 200);
+    let (_, list_a) = http(http_port, "GET", "/v1/push/devices", "", Some(&token_a));
+    assert_eq!(list_a["devices"].as_array().unwrap().len(), 1);
+    let (_, list_b) = http(http_port, "GET", "/v1/push/devices", "", Some(&token_b));
+    assert_eq!(list_b["devices"].as_array().unwrap().len(), 0);
+
+    // Anonymous (no JWT) registration is rejected.
+    let (s, _) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"token":"x"}).to_string(),
+        None,
+    );
+    assert_eq!(s, 401);
+
+    // Reserved-table guard: clients cannot touch auth.devices directly.
+    let (_, ins) = exec(
+        http_port,
+        json!([
+            "TINSERT",
+            "auth.devices",
+            "id",
+            "hax",
+            "user_id",
+            "evil",
+            "token",
+            "t"
+        ]),
+    );
+    assert!(
+        ins["error"].as_str().unwrap_or("").contains("Lux Auth"),
+        "direct insert should be blocked: {ins}"
+    );
+    let (_, sel) = exec(http_port, json!(["TSELECT", "*", "FROM", "auth.devices"]));
+    assert!(
+        sel["error"].as_str().unwrap_or("").contains("Lux Auth"),
+        "direct select should be blocked: {sel}"
+    );
+    drop(server);
+}
+
+#[test]
+fn push_registry_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+
+    // Register via the RESP operator form, then hard-restart on the same dir.
+    {
+        let server = start(dir.path(), resp_port, http_port, true);
+        let reply = resp_cmd(
+            resp_port,
+            &[
+                "LUX",
+                "PUSH",
+                "REGISTER",
+                "11111111-1111-1111-1111-111111111111",
+                "persist-token",
+                "ios",
+                "default",
+            ],
+        );
+        assert!(reply.contains("dev_"), "register reply: {reply}");
+        drop(server);
+    }
+
+    let resp_port2 = free_port();
+    let http_port2 = free_port();
+    let server = start(dir.path(), resp_port2, http_port2, false);
+    let reply = resp_cmd(
+        resp_port2,
+        &[
+            "LUX",
+            "PUSH",
+            "DEVICES",
+            "11111111-1111-1111-1111-111111111111",
+        ],
+    );
+    assert!(
+        reply.contains("persist-token") || reply.contains("dev_"),
+        "device should survive restart: {reply}"
+    );
+    drop(server);
+}

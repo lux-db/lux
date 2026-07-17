@@ -2628,6 +2628,13 @@ fn route_request_with_auth(
         // ── exec (escape hatch) ──
         ("POST", ["exec"]) => ok(handle_exec(body, store, broker, cache, script_engine)),
 
+        // ── push routes (lux push) ──
+        ("POST", ["push", "devices"]) => push_register(body, store, cache, auth),
+        ("GET", ["push", "devices"]) => push_list_devices(store, cache, auth),
+        ("DELETE", ["push", "devices", id]) => push_delete_device(id, store, cache, auth),
+        ("POST", ["push", "send"]) => push_send(body, store, cache),
+        ("POST", ["push", "credentials"]) => push_set_credentials(body, store, cache),
+
         // ── KV routes ──
         ("GET", ["kv", key]) => ok(exec_json(
             store,
@@ -3002,11 +3009,159 @@ fn route_requires_operator(method: &str, base: &[&str]) -> bool {
             | ("GET", ["vectors", ..])
             | ("POST", ["vectors", ..])
             | ("DELETE", ["vectors", _])
+            | ("POST", ["push", "send"])
+            | ("POST", ["push", "credentials"])
     )
 }
 
 fn ok(result: String) -> (u16, &'static str, String) {
     (200, "OK", result)
+}
+
+// ── Push handlers (lux push) ──
+
+fn push_json_error(
+    status: u16,
+    status_text: &'static str,
+    msg: &str,
+) -> (u16, &'static str, String) {
+    (
+        status,
+        status_text,
+        format!(
+            r#"{{"error":{}}}"#,
+            serde_json::Value::String(msg.to_string())
+        ),
+    )
+}
+
+/// `POST /v1/push/devices` — the current user registers a device token. The
+/// user id is taken from the JWT (`auth.uid()`), never asserted by the client.
+fn push_register(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+) -> (u16, &'static str, String) {
+    let Some(principal) = live_auth_principal(auth) else {
+        return push_json_error(401, "Unauthorized", "user authentication required");
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let token = parsed["token"].as_str().unwrap_or("");
+    if token.is_empty() {
+        return push_json_error(400, "Bad Request", "token is required");
+    }
+    let platform = parsed["platform"].as_str().unwrap_or("ios");
+    let app_id = parsed["app_id"].as_str().unwrap_or("default");
+    match crate::push::register_device(
+        store,
+        cache,
+        &principal.user_id,
+        token,
+        platform,
+        app_id,
+        Instant::now(),
+    ) {
+        Ok(id) => ok(format!(r#"{{"id":{}}}"#, serde_json::Value::String(id))),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `GET /v1/push/devices` — list the current user's active devices.
+fn push_list_devices(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+) -> (u16, &'static str, String) {
+    let Some(principal) = live_auth_principal(auth) else {
+        return push_json_error(401, "Unauthorized", "user authentication required");
+    };
+    match crate::push::list_devices(store, cache, &principal.user_id, Instant::now()) {
+        Ok(devices) => ok(json!({ "devices": devices }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `DELETE /v1/push/devices/:id` — remove one of the current user's devices.
+fn push_delete_device(
+    id: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+) -> (u16, &'static str, String) {
+    let Some(principal) = live_auth_principal(auth) else {
+        return push_json_error(401, "Unauthorized", "user authentication required");
+    };
+    match crate::push::delete_device(store, cache, &principal.user_id, id, Instant::now()) {
+        Ok(deleted) => ok(json!({ "deleted": deleted }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `POST /v1/push/send` (operator) — fan a notification out to a user's devices.
+fn push_send(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let user_id = parsed["user_id"].as_str().unwrap_or("");
+    if user_id.is_empty() {
+        return push_json_error(400, "Bad Request", "user_id is required");
+    }
+    let notification = parsed
+        .get("notification")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    match crate::push::enqueue_send(store, cache, user_id, &notification, Instant::now()) {
+        Ok(n) => ok(json!({ "enqueued": n }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `POST /v1/push/credentials` (operator) — set an app's APNs credentials.
+fn push_set_credentials(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let app_id = parsed["app_id"].as_str().unwrap_or("default");
+    let team_id = parsed["team_id"].as_str().unwrap_or("");
+    let key_id = parsed["key_id"].as_str().unwrap_or("");
+    let p8_pem = parsed["p8_pem"].as_str().unwrap_or("");
+    let topic = parsed["topic"].as_str().unwrap_or("");
+    let environment = parsed["environment"].as_str().unwrap_or("sandbox");
+    if team_id.is_empty() || key_id.is_empty() || p8_pem.is_empty() || topic.is_empty() {
+        return push_json_error(
+            400,
+            "Bad Request",
+            "team_id, key_id, p8_pem, and topic are required",
+        );
+    }
+    match crate::push::set_apns_credentials(
+        store,
+        cache,
+        app_id,
+        team_id,
+        key_id,
+        p8_pem,
+        topic,
+        environment,
+        Instant::now(),
+    ) {
+        Ok(()) => ok(json!({ "ok": true }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
 }
 
 // ── Table handlers ──

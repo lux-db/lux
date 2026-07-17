@@ -369,6 +369,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 1,
     },
     CommandSpec {
+        name: b"LUX",
+        min_arity: 3,
+    },
+    CommandSpec {
         name: b"CONFIG",
         min_arity: 1,
     },
@@ -1970,6 +1974,10 @@ pub fn execute(
             }
         }
         b'L' => {
+            if cmd_eq(cmd, b"LUX") {
+                crate::push::cmd_push(args, store, cache, out, now);
+                return CmdResult::Written;
+            }
             if cmd_eq(cmd, b"LCS") {
                 return strings::cmd_lcs(args, store, out, now);
             }
@@ -2582,6 +2590,7 @@ fn command_self_logs_wal(cmd: &[u8]) -> bool {
             | b"HPEXPIRE"
             | b"HEXPIREAT"
             | b"HPEXPIREAT"
+            | b"LUX"
     )
 }
 
