@@ -1,4 +1,5 @@
 import { LuxAuthClient, type LuxAuthOptions } from './auth';
+import { LuxPushNamespace } from './push';
 import { LuxStorageNamespace } from './storage';
 import type { LuxError, LuxResult, LuxSchema, LuxTypedRow } from './types';
 import { err, ok, toLuxError } from './utils';
@@ -120,6 +121,7 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 	readonly key: string;
 	readonly auth: LuxAuthClient;
 	readonly storage: LuxStorageNamespace;
+	readonly push: LuxPushNamespace;
 	private fetchImpl: typeof fetch;
 	private WebSocketImpl?: typeof WebSocket;
 	private liveSocket: WebSocket | null = null;
@@ -143,6 +145,7 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 			else this.restartLiveSocket();
 		});
 		this.storage = new LuxStorageNamespace(this);
+		this.push = new LuxPushNamespace(this);
 	}
 
 	/**

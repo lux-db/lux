@@ -2630,7 +2630,7 @@ fn route_request_with_auth(
 
         // ── push routes (lux push) ──
         ("POST", ["push", "devices"]) => push_register(body, store, cache, auth),
-        ("GET", ["push", "devices"]) => push_list_devices(store, cache, auth),
+        ("GET", ["push", "devices"]) => push_list_devices(params, store, cache, auth),
         ("DELETE", ["push", "devices", id]) => push_delete_device(id, store, cache, auth),
         ("POST", ["push", "send"]) => push_send(body, store, cache),
         ("POST", ["push", "credentials"]) => push_set_credentials(body, store, cache),
@@ -3039,17 +3039,16 @@ fn push_json_error(
     )
 }
 
-/// `POST /v1/push/devices` — the current user registers a device token. The
-/// user id is taken from the JWT (`auth.uid()`), never asserted by the client.
+/// `POST /v1/push/devices` — register a device token under a subject id.
+/// A **secret key / operator** caller supplies `subject_id` explicitly (this is
+/// the Supabase-auth-style path: your server registers on the user's behalf).
+/// A **user JWT** caller omits it; the subject is taken from `auth.uid()`.
 fn push_register(
     body: &str,
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
     auth: &HttpAuthContext,
 ) -> (u16, &'static str, String) {
-    let Some(principal) = live_auth_principal(auth) else {
-        return push_json_error(401, "Unauthorized", "user authentication required");
-    };
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
@@ -3058,12 +3057,29 @@ fn push_register(
     if token.is_empty() {
         return push_json_error(400, "Bad Request", "token is required");
     }
+    let subject_id = match auth {
+        HttpAuthContext::User(principal) => principal.user_id.clone(),
+        HttpAuthContext::Operator => {
+            let s = parsed["subject_id"].as_str().unwrap_or("");
+            if s.is_empty() {
+                return push_json_error(
+                    400,
+                    "Bad Request",
+                    "subject_id is required for secret-key registration",
+                );
+            }
+            s.to_string()
+        }
+        HttpAuthContext::Anonymous => {
+            return push_json_error(401, "Unauthorized", "authentication required")
+        }
+    };
     let platform = parsed["platform"].as_str().unwrap_or("ios");
     let app_id = parsed["app_id"].as_str().unwrap_or("default");
     match crate::push::register_device(
         store,
         cache,
-        &principal.user_id,
+        &subject_id,
         token,
         platform,
         app_id,
@@ -3074,38 +3090,60 @@ fn push_register(
     }
 }
 
-/// `GET /v1/push/devices` — list the current user's active devices.
+/// `GET /v1/push/devices` — list devices. A user JWT lists its own; an operator
+/// lists a given `?subject_id=`.
 fn push_list_devices(
+    params: &[(String, String)],
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
     auth: &HttpAuthContext,
 ) -> (u16, &'static str, String) {
-    let Some(principal) = live_auth_principal(auth) else {
-        return push_json_error(401, "Unauthorized", "user authentication required");
+    let subject_id = match auth {
+        HttpAuthContext::User(principal) => principal.user_id.clone(),
+        HttpAuthContext::Operator => {
+            let s = get_param(params, "subject_id").unwrap_or("");
+            if s.is_empty() {
+                return push_json_error(400, "Bad Request", "subject_id query param is required");
+            }
+            s.to_string()
+        }
+        HttpAuthContext::Anonymous => {
+            return push_json_error(401, "Unauthorized", "authentication required")
+        }
     };
-    match crate::push::list_devices(store, cache, &principal.user_id, Instant::now()) {
+    match crate::push::list_devices(store, cache, &subject_id, Instant::now()) {
         Ok(devices) => ok(json!({ "devices": devices }).to_string()),
         Err(e) => push_json_error(400, "Bad Request", &e),
     }
 }
 
-/// `DELETE /v1/push/devices/:id` — remove one of the current user's devices.
+/// `DELETE /v1/push/devices/:id` — remove a device. A user JWT removes its own;
+/// an operator removes by id regardless of subject.
 fn push_delete_device(
     id: &str,
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
     auth: &HttpAuthContext,
 ) -> (u16, &'static str, String) {
-    let Some(principal) = live_auth_principal(auth) else {
-        return push_json_error(401, "Unauthorized", "user authentication required");
+    let result = match auth {
+        HttpAuthContext::User(principal) => {
+            crate::push::delete_device(store, cache, &principal.user_id, id, Instant::now())
+        }
+        HttpAuthContext::Operator => {
+            crate::push::delete_device_by_id(store, cache, id, Instant::now())
+        }
+        HttpAuthContext::Anonymous => {
+            return push_json_error(401, "Unauthorized", "authentication required")
+        }
     };
-    match crate::push::delete_device(store, cache, &principal.user_id, id, Instant::now()) {
+    match result {
         Ok(deleted) => ok(json!({ "deleted": deleted }).to_string()),
         Err(e) => push_json_error(400, "Bad Request", &e),
     }
 }
 
-/// `POST /v1/push/send` (operator) — fan a notification out to a user's devices.
+/// `POST /v1/push/send` (operator) — fan a notification out to a subject's
+/// devices, or to many subjects at once via `subject_ids`.
 fn push_send(
     body: &str,
     store: &Arc<Store>,
@@ -3115,15 +3153,20 @@ fn push_send(
         Ok(v) => v,
         Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
     };
-    let user_id = parsed["user_id"].as_str().unwrap_or("");
-    if user_id.is_empty() {
-        return push_json_error(400, "Bad Request", "user_id is required");
-    }
     let notification = parsed
         .get("notification")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    match crate::push::enqueue_send(store, cache, user_id, &notification, Instant::now()) {
+    let now = Instant::now();
+    let result = if let Some(arr) = parsed.get("subject_ids").and_then(|v| v.as_array()) {
+        let ids: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        crate::push::enqueue_send_many(store, cache, &ids, &notification, now)
+    } else if let Some(subject_id) = parsed["subject_id"].as_str().filter(|s| !s.is_empty()) {
+        crate::push::enqueue_send(store, cache, subject_id, &notification, now)
+    } else {
+        return push_json_error(400, "Bad Request", "subject_id or subject_ids is required");
+    };
+    match result {
         Ok(n) => ok(json!({ "enqueued": n }).to_string()),
         Err(e) => push_json_error(400, "Bad Request", &e),
     }

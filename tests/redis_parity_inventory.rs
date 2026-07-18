@@ -290,6 +290,7 @@ const INVENTORY: &[CommandInventory] = &[
     lux_native("GRANT"),
     lux_native("KSUB"),
     lux_native("KUNSUB"),
+    lux_native("LUX"),
     lux_native("PFDEBUG"),
     lux_native("TALTER"),
     lux_native("TCOUNT"),

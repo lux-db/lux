@@ -32,9 +32,6 @@ pub(crate) const GRANTS_TABLE: &str = "auth.grants";
 pub(crate) const PROVIDERS_TABLE: &str = "auth.providers";
 pub(crate) const FLOW_TOKENS_TABLE: &str = "auth.flow_tokens";
 pub(crate) const SETTINGS_TABLE: &str = "auth.settings";
-pub(crate) const DEVICES_TABLE: &str = "auth.devices";
-pub(crate) const PUSH_CREDENTIALS_TABLE: &str = "auth.push_credentials";
-pub(crate) const PUSH_OUTBOX_TABLE: &str = "auth.push_outbox";
 
 const AUTH_SCHEMA_VERSION_KEY: &[u8] = b"_auth:schema_version";
 const AUTH_SCHEMA_VERSION: &[u8] = b"2";
@@ -189,6 +186,12 @@ pub(crate) fn is_reserved_auth_table(table: &str) -> bool {
     table.starts_with("auth.")
 }
 
+/// Reserved system scopes managed by the engine (auth + push). Client `T*`/raw-KV
+/// access is blocked and sensitive columns are redacted on operator reads.
+pub(crate) fn is_reserved_system_table(table: &str) -> bool {
+    table.starts_with("auth.") || table.starts_with("push.")
+}
+
 pub(crate) fn reserved_table_mutation_error(args: &[&[u8]], store: &Store) -> Option<String> {
     if store
         .wal_suppress
@@ -209,7 +212,7 @@ pub(crate) fn reserved_table_mutation_error(args: &[&[u8]], store: &Store) -> Op
     }
     .and_then(|raw| std::str::from_utf8(raw).ok())?;
 
-    if is_reserved_auth_table(table) {
+    if is_reserved_system_table(table) {
         Some(reserved_table_error(table))
     } else {
         None
@@ -217,7 +220,7 @@ pub(crate) fn reserved_table_mutation_error(args: &[&[u8]], store: &Store) -> Op
 }
 
 pub(crate) fn reserved_table_access_error(table: &str) -> Option<String> {
-    if is_reserved_auth_table(table) {
+    if is_reserved_system_table(table) {
         Some(reserved_table_error(table))
     } else {
         None
@@ -252,8 +255,8 @@ pub(crate) fn reserved_key_mutation_error(args: &[&[u8]], store: &Store) -> Opti
     }
     for raw in &args[1..] {
         if let Ok(k) = std::str::from_utf8(raw) {
-            if k.starts_with("_t:auth.") {
-                return Some("ERR access to Lux Auth internal keys is not permitted".to_string());
+            if k.starts_with("_t:auth.") || k.starts_with("_t:push.") {
+                return Some("ERR access to Lux internal keys is not permitted".to_string());
             }
         }
     }
@@ -276,7 +279,7 @@ pub(crate) fn reserved_plan_access_error(plan: &SelectPlan) -> Option<String> {
 }
 
 pub(crate) fn redact_auth_table_row(table: &str, row: &mut [(String, String)]) {
-    if !is_reserved_auth_table(table) {
+    if !is_reserved_system_table(table) {
         return;
     }
     if table == SETTINGS_TABLE {
@@ -322,18 +325,20 @@ fn sensitive_auth_fields(table: &str) -> &'static [&'static str] {
         SIGNING_KEYS_TABLE => &["private_key_encrypted"],
         PROVIDERS_TABLE => &["client_secret"],
         FLOW_TOKENS_TABLE => &["token_hash"],
-        DEVICES_TABLE => &["token"],
-        PUSH_CREDENTIALS_TABLE => &["apns_p8_pem"],
-        PUSH_OUTBOX_TABLE => &["target_token"],
+        "push.devices" => &["token"],
+        "push.credentials" => &["apns_p8_pem", "vapid_private"],
+        "push.outbox" => &["target_token"],
         _ => &[],
     }
 }
 
 fn reserved_table_error(table: &str) -> String {
-    format!(
-        "ERR table '{}' is managed by Lux Auth; use /auth/v1 APIs",
-        table
-    )
+    let scope = if table.starts_with("push.") {
+        "Lux Push"
+    } else {
+        "Lux Auth"
+    };
+    format!("ERR table '{table}' is managed by {scope}; use its API")
 }
 
 pub(crate) fn bootstrap(
@@ -481,60 +486,6 @@ pub(crate) fn bootstrap(
         cache,
         SETTINGS_TABLE,
         &["key STR PRIMARY KEY,", "value STR,", "updated_at INT"],
-        now,
-    )?;
-    // lux push: per-user device registry, per-app push credentials, and the
-    // durable delivery outbox. All under `auth.*` so the reserved-table guards
-    // (mutation/read/redaction) cover them for free.
-    create_table_if_missing(
-        store,
-        cache,
-        DEVICES_TABLE,
-        &[
-            "id STR PRIMARY KEY,",
-            "user_id UUID,",
-            "token STR,",
-            "platform STR,",
-            "app_id STR,",
-            "created_at INT,",
-            "last_seen_at INT,",
-            "disabled_at INT",
-        ],
-        now,
-    )?;
-    create_table_if_missing(
-        store,
-        cache,
-        PUSH_CREDENTIALS_TABLE,
-        &[
-            "app_id STR PRIMARY KEY,",
-            "platform STR,",
-            "apns_team_id STR,",
-            "apns_key_id STR,",
-            "apns_p8_pem STR,",
-            "apns_topic STR,",
-            "environment STR,",
-            "created_at INT",
-        ],
-        now,
-    )?;
-    create_table_if_missing(
-        store,
-        cache,
-        PUSH_OUTBOX_TABLE,
-        &[
-            "id STR PRIMARY KEY,",
-            "user_id UUID,",
-            "app_id STR,",
-            "target_token STR,",
-            "platform STR,",
-            "payload STR,",
-            "attempts INT,",
-            "next_attempt_at INT,",
-            "state STR,",
-            "last_error STR,",
-            "created_at INT",
-        ],
         now,
     )?;
     store.set(AUTH_SCHEMA_VERSION_KEY, AUTH_SCHEMA_VERSION, None, now);
@@ -2621,7 +2572,7 @@ fn admin_revoke_key(
     }
 }
 
-fn create_table_if_missing(
+pub(crate) fn create_table_if_missing(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,

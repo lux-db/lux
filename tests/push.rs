@@ -337,7 +337,7 @@ fn push_end_to_end_delivers_to_apns_mock() {
         http_port,
         "POST",
         "/v1/push/send",
-        &json!({"user_id": uid, "notification": {"title":"Hi","body":"There"}}).to_string(),
+        &json!({"subject_id": uid, "notification": {"title":"Hi","body":"There"}}).to_string(),
         Some("rootsecret"),
     );
     assert_eq!(s, 200, "send: {b}");
@@ -389,7 +389,7 @@ fn push_unregistered_token_disables_device() {
         http_port,
         "POST",
         "/v1/push/send",
-        &json!({"user_id": uid, "notification": {"title":"x","body":"y"}}).to_string(),
+        &json!({"subject_id": uid, "notification": {"title":"x","body":"y"}}).to_string(),
         Some("rootsecret"),
     );
     assert_eq!(s, 200);
@@ -447,27 +447,27 @@ fn push_devices_scoped_and_reserved_guarded() {
     );
     assert_eq!(s, 401);
 
-    // Reserved-table guard: clients cannot touch auth.devices directly.
+    // Reserved-table guard: clients cannot touch push.devices directly.
     let (_, ins) = exec(
         http_port,
         json!([
             "TINSERT",
-            "auth.devices",
+            "push.devices",
             "id",
             "hax",
-            "user_id",
+            "subject_id",
             "evil",
             "token",
             "t"
         ]),
     );
     assert!(
-        ins["error"].as_str().unwrap_or("").contains("Lux Auth"),
+        ins["error"].as_str().unwrap_or("").contains("Lux Push"),
         "direct insert should be blocked: {ins}"
     );
-    let (_, sel) = exec(http_port, json!(["TSELECT", "*", "FROM", "auth.devices"]));
+    let (_, sel) = exec(http_port, json!(["TSELECT", "*", "FROM", "push.devices"]));
     assert!(
-        sel["error"].as_str().unwrap_or("").contains("Lux Auth"),
+        sel["error"].as_str().unwrap_or("").contains("Lux Push"),
         "direct select should be blocked: {sel}"
     );
     drop(server);
@@ -513,6 +513,135 @@ fn push_registry_survives_restart() {
     assert!(
         reply.contains("persist-token") || reply.contains("dev_"),
         "device should survive restart: {reply}"
+    );
+    drop(server);
+}
+
+/// Same as `start` but WITHOUT Lux auth — push is a standalone scope and must
+/// work with `LUX_AUTH_ENABLED` unset.
+fn start_no_auth(dir: &std::path::Path, resp_port: u16, http_port: u16) -> PushServer {
+    let bin = common::find_lux_binary();
+    std::fs::create_dir_all(dir).unwrap();
+    let mut cmd = common::lux_command(&bin);
+    cmd.env("LUX_PORT", resp_port.to_string())
+        .env("LUX_HTTP_PORT", http_port.to_string())
+        .env("LUX_SHARDS", "4")
+        .env("LUX_SAVE_INTERVAL", "0")
+        .env("LUX_DATA_DIR", dir.to_str().unwrap())
+        .env("LUX_STORAGE_MODE", "tiered")
+        .env("LUX_STORAGE_DIR", dir.join("storage").to_str().unwrap())
+        .env("LUX_PASSWORD", "rootsecret")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let child = cmd.spawn().expect("spawn lux");
+    let server = PushServer {
+        child,
+        dir: dir.to_path_buf(),
+        keep_dir: false,
+    };
+    for _ in 0..80 {
+        if TcpStream::connect(("127.0.0.1", http_port)).is_ok()
+            && TcpStream::connect(("127.0.0.1", resp_port)).is_ok()
+        {
+            std::thread::sleep(Duration::from_millis(150));
+            return server;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("lux did not start");
+}
+
+/// The Pompeii case: Lux auth OFF, a trusted secret-key caller registers a token
+/// under an arbitrary external subject id and sends by it. No Lux users exist.
+#[test]
+fn push_works_with_auth_disabled_via_secret_key() {
+    let mock = MockApns::start(200);
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let server = start_no_auth(dir.path(), resp_port, http_port);
+
+    set_creds(http_port, &mock.url());
+
+    // Operator (secret key) registers a device under an opaque external subject.
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"subject_id":"ext-user-123","token":"tok-ext","platform":"ios","app_id":"default"})
+            .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "secret-key register: {b}");
+
+    // A user JWT is NOT available (auth off); anonymous register is rejected.
+    let (s, _) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"token":"x"}).to_string(),
+        None,
+    );
+    assert_eq!(s, 401);
+
+    // Send by the external subject id.
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({"subject_id":"ext-user-123","notification":{"title":"Hi","body":"no lux auth"}})
+            .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "send: {b}");
+    assert_eq!(b["enqueued"], 1);
+
+    let got = mock
+        .wait_for_request(Duration::from_secs(5))
+        .expect("APNs mock should receive a delivery");
+    assert_eq!(got.path, "/3/device/tok-ext");
+    drop(server);
+}
+
+/// Batch: one send to many subjects enqueues + delivers to each.
+#[test]
+fn push_batch_send_to_many_subjects() {
+    let mock = MockApns::start(200);
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let server = start_no_auth(dir.path(), resp_port, http_port);
+    set_creds(http_port, &mock.url());
+
+    for (subj, tok) in [("s1", "tok1"), ("s2", "tok2")] {
+        let (s, _) = http(
+            http_port,
+            "POST",
+            "/v1/push/devices",
+            &json!({"subject_id":subj,"token":tok,"platform":"ios"}).to_string(),
+            Some("rootsecret"),
+        );
+        assert_eq!(s, 200);
+    }
+
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({"subject_ids":["s1","s2"],"notification":{"title":"batch","body":"x"}}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "batch send: {b}");
+    assert_eq!(b["enqueued"], 2);
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while mock.requests.lock().unwrap().len() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        mock.requests.lock().unwrap().len(),
+        2,
+        "both subjects should deliver"
     );
     drop(server);
 }

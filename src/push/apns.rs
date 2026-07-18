@@ -171,19 +171,94 @@ impl ApnsSink {
 /// is `{title, body, data?}` JSON; we wrap it into the APNs `aps` envelope.
 pub(crate) fn apns_body_from_payload(payload: &[u8]) -> Vec<u8> {
     let parsed: serde_json::Value = serde_json::from_slice(payload).unwrap_or(json!({}));
-    let title = parsed.get("title").and_then(|v| v.as_str()).unwrap_or("");
-    let body = parsed.get("body").and_then(|v| v.as_str()).unwrap_or("");
-    let mut envelope = json!({
-        "aps": { "alert": { "title": title, "body": body } }
-    });
+    let s = |k: &str| {
+        parsed
+            .get(k)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+    };
+
+    // aps.alert (title / body / subtitle)
+    let mut alert = serde_json::Map::new();
+    if let Some(v) = s("title") {
+        alert.insert("title".into(), json!(v));
+    }
+    if let Some(v) = s("body") {
+        alert.insert("body".into(), json!(v));
+    }
+    if let Some(v) = s("subtitle") {
+        alert.insert("subtitle".into(), json!(v));
+    }
+
+    let mut aps = serde_json::Map::new();
+    if !alert.is_empty() {
+        aps.insert("alert".into(), serde_json::Value::Object(alert));
+    }
+    if let Some(v) = s("thread_id") {
+        aps.insert("thread-id".into(), json!(v));
+    }
+    if let Some(v) = s("category") {
+        aps.insert("category".into(), json!(v));
+    }
+    if let Some(v) = s("sound") {
+        aps.insert("sound".into(), json!(v));
+    }
+    if let Some(v) = parsed.get("badge").and_then(|v| v.as_i64()) {
+        aps.insert("badge".into(), json!(v));
+    }
+    let has_image = s("image").is_some();
+    let mutable = parsed
+        .get("mutable_content")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // Flip mutable-content when an image is attached so the iOS NSE runs and
+    // downloads the thumbnail (mirrors FCM `fcmOptions.imageUrl`).
+    if mutable || has_image {
+        aps.insert("mutable-content".into(), json!(1));
+    }
+    if parsed
+        .get("content_available")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        aps.insert("content-available".into(), json!(1));
+    }
+
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("aps".into(), serde_json::Value::Object(aps));
+    if let Some(v) = s("image") {
+        envelope.insert("image_url".into(), json!(v));
+    }
+    // Arbitrary custom data merged at top level (arrives in the client userInfo).
     if let Some(data) = parsed.get("data").and_then(|v| v.as_object()) {
-        if let Some(obj) = envelope.as_object_mut() {
-            for (k, v) in data {
-                obj.insert(k.clone(), v.clone());
-            }
+        for (k, v) in data {
+            envelope.insert(k.clone(), v.clone());
         }
     }
-    serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec())
+    serde_json::to_vec(&serde_json::Value::Object(envelope)).unwrap_or_else(|_| b"{}".to_vec())
+}
+
+/// `(apns-push-type, apns-priority)` for a payload. A `content_available` push
+/// with no visible alert is a background push (type `background`, priority 5);
+/// everything else is a normal alert (type `alert`, priority 10).
+pub(crate) fn apns_delivery_headers(payload: &[u8]) -> (&'static str, &'static str) {
+    let parsed: serde_json::Value = serde_json::from_slice(payload).unwrap_or(json!({}));
+    let s = |k: &str| {
+        parsed
+            .get(k)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+    };
+    let has_alert = s("title").is_some() || s("body").is_some();
+    let content_available = parsed
+        .get("content_available")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if content_available && !has_alert {
+        ("background", "5")
+    } else {
+        ("alert", "10")
+    }
 }
 
 impl Sink for ApnsSink {
@@ -192,13 +267,14 @@ impl Sink for ApnsSink {
         let jwt = self.provider_token(now_secs)?;
         let url = format!("{}/3/device/{}", self.base_url, target.token);
         let body = apns_body_from_payload(payload);
+        let (push_type, priority) = apns_delivery_headers(payload);
         let resp = self
             .client
             .post(&url)
             .header("authorization", format!("bearer {jwt}"))
             .header("apns-topic", &target.topic)
-            .header("apns-push-type", "alert")
-            .header("apns-priority", "10")
+            .header("apns-push-type", push_type)
+            .header("apns-priority", priority)
             .header("content-type", "application/json")
             .body(body)
             .send()
@@ -304,5 +380,37 @@ mod tests {
         assert_eq!(v["aps"]["alert"]["title"], "Hi");
         assert_eq!(v["aps"]["alert"]["body"], "There");
         assert_eq!(v["k"], "v");
+    }
+
+    #[test]
+    fn body_maps_rich_fields() {
+        let payload = br#"{
+            "title":"T","body":"B","subtitle":"S","thread_id":"th1",
+            "category":"MSG","sound":"ping.caf","badge":3,"image":"https://x/i.png",
+            "data":{"route":"/w/1"}
+        }"#;
+        let v: serde_json::Value =
+            serde_json::from_slice(&apns_body_from_payload(payload)).unwrap();
+        assert_eq!(v["aps"]["alert"]["subtitle"], "S");
+        assert_eq!(v["aps"]["thread-id"], "th1");
+        assert_eq!(v["aps"]["category"], "MSG");
+        assert_eq!(v["aps"]["sound"], "ping.caf");
+        assert_eq!(v["aps"]["badge"], 3);
+        assert_eq!(v["aps"]["mutable-content"], 1); // image → NSE
+        assert_eq!(v["image_url"], "https://x/i.png");
+        assert_eq!(v["route"], "/w/1");
+    }
+
+    #[test]
+    fn content_available_is_a_background_push() {
+        assert_eq!(
+            apns_delivery_headers(br#"{"content_available":true}"#),
+            ("background", "5")
+        );
+        assert_eq!(
+            apns_delivery_headers(br#"{"title":"hi","content_available":true}"#),
+            ("alert", "10")
+        );
+        assert_eq!(apns_delivery_headers(br#"{"title":"hi"}"#), ("alert", "10"));
     }
 }

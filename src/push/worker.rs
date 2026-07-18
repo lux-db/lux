@@ -1,4 +1,4 @@
-//! Delivery worker: drains the durable `auth.push_outbox` and delivers each
+//! Delivery worker: drains the durable `push.outbox` and delivers each
 //! pending row through the platform sink, applying at-least-once retry/backoff,
 //! dead-lettering, and dead-token pruning. All state transitions go through the
 //! durable table helpers so they are WAL-logged and survive restart.
@@ -9,12 +9,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::auth::{durable_table_delete_where, durable_table_update_where, unix_seconds};
-use crate::auth::{DEVICES_TABLE, PUSH_OUTBOX_TABLE};
 use crate::store::Store;
 use crate::tables::{CmpOp, SharedSchemaCache, WhereClause};
 
 use super::apns::{ApnsSink, DeliveryError, DeliveryTarget, Sink};
-use super::{get_apns_credentials, metrics, select_rows};
+use super::{get_apns_credentials, metrics, select_rows, DEVICES_TABLE, OUTBOX_TABLE};
 
 const TICK: Duration = Duration::from_millis(500);
 const BATCH: usize = 100;
@@ -102,7 +101,7 @@ async fn process_pending(
     let rows = select_rows(
         store,
         cache,
-        PUSH_OUTBOX_TABLE,
+        OUTBOX_TABLE,
         vec![
             WhereClause::single("state".into(), CmpOp::Eq, "pending".into()),
             WhereClause::single("next_attempt_at".into(), CmpOp::Le, now_secs.to_string()),
@@ -198,7 +197,7 @@ fn apply(
 ) -> Result<(), String> {
     match action {
         Action::Delivered => {
-            durable_table_delete_where(store, cache, PUSH_OUTBOX_TABLE, &["id", "=", id], now)?;
+            durable_table_delete_where(store, cache, OUTBOX_TABLE, &["id", "=", id], now)?;
             metrics().delivered.fetch_add(1, Ordering::Relaxed);
         }
         Action::Retry {
@@ -211,7 +210,7 @@ fn apply(
             durable_table_update_where(
                 store,
                 cache,
-                PUSH_OUTBOX_TABLE,
+                OUTBOX_TABLE,
                 &[
                     ("attempts", attempts_s.as_str()),
                     ("next_attempt_at", next_s.as_str()),
@@ -226,7 +225,7 @@ fn apply(
             durable_table_update_where(
                 store,
                 cache,
-                PUSH_OUTBOX_TABLE,
+                OUTBOX_TABLE,
                 &[
                     ("state", "dead"),
                     ("attempts", attempts_s.as_str()),
@@ -250,7 +249,7 @@ fn apply(
             durable_table_update_where(
                 store,
                 cache,
-                PUSH_OUTBOX_TABLE,
+                OUTBOX_TABLE,
                 &[("state", "dead"), ("last_error", error.as_str())],
                 &["id", "=", id],
                 now,

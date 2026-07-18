@@ -47,6 +47,7 @@ export {
 };
 export { LuxProjectLiveSubscription } from './project';
 export { createBrowserClient } from './browser';
+export { LuxPushNamespace } from './push';
 export { LuxStorageBucketClient, LuxStorageNamespace } from './storage';
 export type { LuxBrowserClientOptions } from './browser';
 export { createServerClient } from './ssr';
@@ -66,6 +67,11 @@ export type {
 	LuxTableColumn,
 	LuxVectorSearchOptions,
 } from './project';
+export type {
+	LuxPushDevice,
+	LuxPushNotification,
+	LuxPushRegisterOptions,
+} from './push';
 export type {
 	LuxStorageListOptions,
 	LuxStorageObject,

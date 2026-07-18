@@ -1,9 +1,11 @@
 //! lux push: native push notifications. This module owns the engine-side
-//! delivery pipeline: a per-user device registry (`auth.devices`), per-app push
-//! credentials (`auth.push_credentials`), a durable at-least-once delivery
-//! outbox (`auth.push_outbox`), and the background worker that drains it through
-//! platform `Sink`s. PR1 ships the APNs sink; WebPush/FCM/HTTP plug into the
-//! same `Sink` seam later.
+//! delivery pipeline as its own standalone, auth-independent scope: a device
+//! registry (`push.devices`) keyed by an opaque `subject_id`, per-app push
+//! credentials (`push.credentials`), a durable at-least-once delivery outbox
+//! (`push.outbox`), and the background worker that drains it through platform
+//! `Sink`s. A `subject_id` MAY be a Lux `auth.users.id` but doesn't have to be —
+//! push works with Lux auth entirely off, managed by the secret key. PR1 ships
+//! the APNs sink; WebPush/FCM/HTTP plug into the same `Sink` seam later.
 
 pub(crate) mod apns;
 pub(crate) mod worker;
@@ -14,14 +16,88 @@ use bytes::BytesMut;
 use serde_json::{json, Value};
 
 use crate::auth::{
-    durable_table_delete_where, durable_table_insert, durable_table_update_where,
-    find_row_by_field, random_id, unix_seconds, DEVICES_TABLE, PUSH_CREDENTIALS_TABLE,
-    PUSH_OUTBOX_TABLE,
+    create_table_if_missing, durable_table_delete_where, durable_table_insert,
+    durable_table_update_where, find_row_by_field, random_id, unix_seconds,
 };
 use crate::resp;
 use crate::store::Store;
 use crate::tables::{self, CmpOp, SelectPlan, SelectResult, SharedSchemaCache, WhereClause};
 use std::time::Instant;
+
+/// Reserved `push.*` scope tables (protected + redacted by the shared reserved
+/// machinery in `auth.rs`, but bootstrapped and owned here).
+pub(crate) const DEVICES_TABLE: &str = "push.devices";
+pub(crate) const CREDENTIALS_TABLE: &str = "push.credentials";
+pub(crate) const OUTBOX_TABLE: &str = "push.outbox";
+
+/// Create the `push.*` tables if they don't exist. Called lazily on the first
+/// write (register / set-credentials / send) so a project that never uses push
+/// carries no `push.*` tables and no overhead. Idempotent + cheap thereafter
+/// (a schema-cache hit). Push does not depend on Lux auth being enabled.
+pub(crate) fn ensure_tables(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    now: Instant,
+) -> Result<(), String> {
+    create_table_if_missing(
+        store,
+        cache,
+        DEVICES_TABLE,
+        &[
+            "id STR PRIMARY KEY,",
+            // Opaque owner id. MAY be a Lux auth.users id; no FK, no existence
+            // check. Set from auth.uid() on JWT self-register, or supplied
+            // explicitly by a trusted secret-key caller.
+            "subject_id STR,",
+            "token STR,",
+            "platform STR,",
+            "app_id STR,",
+            "created_at INT,",
+            "last_seen_at INT,",
+            "disabled_at INT",
+        ],
+        now,
+    )?;
+    create_table_if_missing(
+        store,
+        cache,
+        CREDENTIALS_TABLE,
+        &[
+            "app_id STR PRIMARY KEY,",
+            "platform STR,",
+            "apns_team_id STR,",
+            "apns_key_id STR,",
+            "apns_p8_pem STR,",
+            "apns_topic STR,",
+            "environment STR,",
+            "vapid_public STR,",
+            "vapid_private STR,",
+            "vapid_subject STR,",
+            "created_at INT",
+        ],
+        now,
+    )?;
+    create_table_if_missing(
+        store,
+        cache,
+        OUTBOX_TABLE,
+        &[
+            "id STR PRIMARY KEY,",
+            "subject_id STR,",
+            "app_id STR,",
+            "target_token STR,",
+            "platform STR,",
+            "payload STR,",
+            "attempts INT,",
+            "next_attempt_at INT,",
+            "state STR,",
+            "last_error STR,",
+            "created_at INT",
+        ],
+        now,
+    )?;
+    Ok(())
+}
 
 /// Cumulative + gauge counters surfaced through `INFO` so the cloud monitor can
 /// scrape push activity like ops. `devices` is a live gauge; the rest are
@@ -61,18 +137,20 @@ pub(crate) struct ResolvedApnsCreds {
 // Device registry
 // ---------------------------------------------------------------------------
 
-/// Register (or refresh) a device token for `user_id`. A token is unique across
-/// the registry: re-registering an existing token re-points it at the current
-/// user and re-activates it rather than duplicating. Returns the device id.
+/// Register (or refresh) a device token for `subject_id`. A token is unique
+/// across the registry: re-registering an existing token re-points it at the
+/// current subject and re-activates it rather than duplicating. Returns the
+/// device id.
 pub(crate) fn register_device(
     store: &Store,
     cache: &SharedSchemaCache,
-    user_id: &str,
+    subject_id: &str,
     token: &str,
     platform: &str,
     app_id: &str,
     now: Instant,
 ) -> Result<String, String> {
+    ensure_tables(store, cache, now)?;
     let now_s = unix_seconds().to_string();
     if let Some(existing) = find_row_by_field(store, cache, DEVICES_TABLE, "token", token, now)? {
         let id = existing.get("id").cloned().unwrap_or_default();
@@ -81,7 +159,7 @@ pub(crate) fn register_device(
             cache,
             DEVICES_TABLE,
             &[
-                ("user_id", user_id),
+                ("subject_id", subject_id),
                 ("platform", platform),
                 ("app_id", app_id),
                 ("last_seen_at", now_s.as_str()),
@@ -99,7 +177,7 @@ pub(crate) fn register_device(
         DEVICES_TABLE,
         &[
             ("id", id.as_str()),
-            ("user_id", user_id),
+            ("subject_id", subject_id),
             ("token", token),
             ("platform", platform),
             ("app_id", app_id),
@@ -113,11 +191,11 @@ pub(crate) fn register_device(
     Ok(id)
 }
 
-/// List a user's active devices as JSON, omitting the raw token.
+/// List a subject's active devices as JSON, omitting the raw token.
 pub(crate) fn list_devices(
     store: &Store,
     cache: &SharedSchemaCache,
-    user_id: &str,
+    subject_id: &str,
     now: Instant,
 ) -> Result<Vec<Value>, String> {
     let rows = select_rows(
@@ -125,7 +203,7 @@ pub(crate) fn list_devices(
         cache,
         DEVICES_TABLE,
         vec![
-            WhereClause::single("user_id".into(), CmpOp::Eq, user_id.into()),
+            WhereClause::single("subject_id".into(), CmpOp::Eq, subject_id.into()),
             WhereClause::single("disabled_at".into(), CmpOp::Eq, "0".into()),
         ],
         None,
@@ -146,11 +224,11 @@ pub(crate) fn list_devices(
         .collect())
 }
 
-/// Delete a user's own device by id. Returns whether a row was removed.
+/// Delete a subject's own device by id. Returns whether a row was removed.
 pub(crate) fn delete_device(
     store: &Store,
     cache: &SharedSchemaCache,
-    user_id: &str,
+    subject_id: &str,
     id: &str,
     now: Instant,
 ) -> Result<bool, String> {
@@ -158,9 +236,24 @@ pub(crate) fn delete_device(
         store,
         cache,
         DEVICES_TABLE,
-        &["id", "=", id, "AND", "user_id", "=", user_id],
+        &["id", "=", id, "AND", "subject_id", "=", subject_id],
         now,
     )?;
+    if removed > 0 {
+        metrics().devices.fetch_sub(1, Ordering::Relaxed);
+    }
+    Ok(removed > 0)
+}
+
+/// Delete any device by id (operator), regardless of subject. Returns whether a
+/// row was removed.
+pub(crate) fn delete_device_by_id(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    id: &str,
+    now: Instant,
+) -> Result<bool, String> {
+    let removed = durable_table_delete_where(store, cache, DEVICES_TABLE, &["id", "=", id], now)?;
     if removed > 0 {
         metrics().devices.fetch_sub(1, Ordering::Relaxed);
     }
@@ -184,7 +277,7 @@ pub(crate) fn list_all_devices(
             let m: std::collections::HashMap<String, String> = row.into_iter().collect();
             json!({
                 "id": m.get("id").cloned().unwrap_or_default(),
-                "user_id": m.get("user_id").cloned().unwrap_or_default(),
+                "subject_id": m.get("subject_id").cloned().unwrap_or_default(),
                 "platform": m.get("platform").cloned().unwrap_or_default(),
                 "app_id": m.get("app_id").cloned().unwrap_or_default(),
                 "created_at": m.get("created_at").cloned().unwrap_or_default(),
@@ -204,7 +297,7 @@ pub(crate) fn list_dead_letters(
     let rows = select_rows(
         store,
         cache,
-        PUSH_OUTBOX_TABLE,
+        OUTBOX_TABLE,
         vec![WhereClause::single(
             "state".into(),
             CmpOp::Eq,
@@ -219,7 +312,7 @@ pub(crate) fn list_dead_letters(
             let m: std::collections::HashMap<String, String> = row.into_iter().collect();
             json!({
                 "id": m.get("id").cloned().unwrap_or_default(),
-                "user_id": m.get("user_id").cloned().unwrap_or_default(),
+                "subject_id": m.get("subject_id").cloned().unwrap_or_default(),
                 "app_id": m.get("app_id").cloned().unwrap_or_default(),
                 "platform": m.get("platform").cloned().unwrap_or_default(),
                 "attempts": m.get("attempts").cloned().unwrap_or_default(),
@@ -247,10 +340,11 @@ pub(crate) fn set_apns_credentials(
     environment: &str,
     now: Instant,
 ) -> Result<(), String> {
+    ensure_tables(store, cache, now)?;
     durable_table_delete_where(
         store,
         cache,
-        PUSH_CREDENTIALS_TABLE,
+        CREDENTIALS_TABLE,
         &["app_id", "=", app_id],
         now,
     )?;
@@ -258,7 +352,7 @@ pub(crate) fn set_apns_credentials(
     durable_table_insert(
         store,
         cache,
-        PUSH_CREDENTIALS_TABLE,
+        CREDENTIALS_TABLE,
         &[
             ("app_id", app_id),
             ("platform", "ios"),
@@ -280,7 +374,7 @@ pub(crate) fn get_apns_credentials(
     app_id: &str,
     now: Instant,
 ) -> Result<Option<ResolvedApnsCreds>, String> {
-    let Some(row) = find_row_by_field(store, cache, PUSH_CREDENTIALS_TABLE, "app_id", app_id, now)?
+    let Some(row) = find_row_by_field(store, cache, CREDENTIALS_TABLE, "app_id", app_id, now)?
     else {
         return Ok(None);
     };
@@ -300,28 +394,58 @@ pub(crate) fn get_apns_credentials(
 // Send / enqueue
 // ---------------------------------------------------------------------------
 
-/// Fan a notification out to all of `user_id`'s active devices by inserting one
-/// pending outbox row each. Returns the number enqueued. The worker delivers
+/// Fan a notification out to all of `subject_id`'s active devices by inserting
+/// one pending outbox row each. Returns the number enqueued. The worker delivers
 /// asynchronously.
 pub(crate) fn enqueue_send(
     store: &Store,
     cache: &SharedSchemaCache,
-    user_id: &str,
+    subject_id: &str,
     notification: &Value,
     now: Instant,
 ) -> Result<usize, String> {
+    let payload = serde_json::to_string(notification).unwrap_or_else(|_| "{}".to_string());
+    enqueue_to_subject(store, cache, subject_id, &payload, now)
+}
+
+/// Fan a notification out to many subjects in one call. Returns the total number
+/// of device rows enqueued across all subjects.
+pub(crate) fn enqueue_send_many(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    subject_ids: &[&str],
+    notification: &Value,
+    now: Instant,
+) -> Result<usize, String> {
+    let payload = serde_json::to_string(notification).unwrap_or_else(|_| "{}".to_string());
+    let mut total = 0usize;
+    for subject_id in subject_ids {
+        total += enqueue_to_subject(store, cache, subject_id, &payload, now)?;
+    }
+    Ok(total)
+}
+
+/// Insert one pending outbox row per active device of `subject_id`. `payload` is
+/// the already-serialized notification JSON.
+fn enqueue_to_subject(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    subject_id: &str,
+    payload: &str,
+    now: Instant,
+) -> Result<usize, String> {
+    ensure_tables(store, cache, now)?;
     let rows = select_rows(
         store,
         cache,
         DEVICES_TABLE,
         vec![
-            WhereClause::single("user_id".into(), CmpOp::Eq, user_id.into()),
+            WhereClause::single("subject_id".into(), CmpOp::Eq, subject_id.into()),
             WhereClause::single("disabled_at".into(), CmpOp::Eq, "0".into()),
         ],
         None,
         now,
     )?;
-    let payload = serde_json::to_string(notification).unwrap_or_else(|_| "{}".to_string());
     let now_s = unix_seconds().to_string();
     let mut count = 0usize;
     for row in rows {
@@ -334,17 +458,17 @@ pub(crate) fn enqueue_send(
         durable_table_insert(
             store,
             cache,
-            PUSH_OUTBOX_TABLE,
+            OUTBOX_TABLE,
             &[
                 ("id", id.as_str()),
-                ("user_id", user_id),
+                ("subject_id", subject_id),
                 ("app_id", m.get("app_id").map(String::as_str).unwrap_or("")),
                 ("target_token", token.as_str()),
                 (
                     "platform",
                     m.get("platform").map(String::as_str).unwrap_or(""),
                 ),
-                ("payload", payload.as_str()),
+                ("payload", payload),
                 ("attempts", "0"),
                 ("next_attempt_at", now_s.as_str()),
                 ("state", "pending"),
@@ -371,6 +495,12 @@ pub(crate) fn select_rows(
     limit: Option<usize>,
     now: Instant,
 ) -> Result<Vec<Vec<(String, String)>>, String> {
+    // Push tables are created lazily on first write, so a project that has never
+    // used push has no `push.*` tables. Treat a missing table as no rows — this
+    // keeps reads (and the worker's outbox scan) quiet until push is configured.
+    if tables::table_schema(store, cache, table, now).is_err() {
+        return Ok(Vec::new());
+    }
     let plan = SelectPlan {
         table: table.to_string(),
         alias: None,
@@ -422,15 +552,14 @@ pub(crate) fn append_info(out: &mut String) {
 // RESP command: LUX PUSH ...
 // ---------------------------------------------------------------------------
 
-/// `LUX PUSH REGISTER <user_id> <token> <platform> <app_id>`
-/// `LUX PUSH SEND <user_id> <json>`
+/// `LUX PUSH REGISTER <subject_id> <token> <platform> <app_id>`
+/// `LUX PUSH SEND <subject_id> <json>`
 /// `LUX PUSH CRED <app_id> <team_id> <key_id> <topic> <environment> <p8_pem>`
-/// `LUX PUSH DEVICES <user_id>`
+/// `LUX PUSH DEVICES <subject_id>`
 /// `LUX PUSH STATS`
 ///
-/// Operator-level RESP parity for the HTTP surface (device registration also
-/// available over HTTP with a user JWT). Self-logs resolved `TINSERT auth.*`
-/// writes via the durable helpers.
+/// Operator-level RESP parity for the HTTP surface. Self-logs resolved
+/// `TINSERT push.*` writes via the durable helpers.
 pub(crate) fn cmd_push(
     args: &[&[u8]],
     store: &Store,
