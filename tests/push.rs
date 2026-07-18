@@ -169,6 +169,7 @@ struct Captured {
     path: String,
     authorization: String,
     apns_topic: String,
+    content_encoding: String,
     body: String,
 }
 
@@ -211,6 +212,7 @@ impl MockApns {
                         match k.trim().to_ascii_lowercase().as_str() {
                             "authorization" => cap.authorization = v.trim().to_string(),
                             "apns-topic" => cap.apns_topic = v.trim().to_string(),
+                            "content-encoding" => cap.content_encoding = v.trim().to_string(),
                             _ => {}
                         }
                     }
@@ -643,5 +645,86 @@ fn push_batch_send_to_many_subjects() {
         2,
         "both subjects should deliver"
     );
+    drop(server);
+}
+
+/// Web Push: register a browser subscription (platform=web), configure VAPID,
+/// send, and assert the mock push service got an aes128gcm + VAPID-authenticated
+/// encrypted POST.
+#[test]
+fn push_web_push_delivers_encrypted() {
+    let mock = MockApns::start(201);
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let server = start_no_auth(dir.path(), resp_port, http_port);
+
+    // Configure VAPID. The private key is any valid P-256 PKCS8 PEM (used to
+    // sign the JWT); the public key is passed through as the `k=` param.
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/credentials",
+        &json!({
+            "app_id":"default",
+            "vapid_public":"BExamplePublicKeyForTestingOnly_notvalidated_1234567890abcdefgh",
+            "vapid_private": test_p8(),
+            "vapid_subject":"mailto:test@luxdb.dev"
+        })
+        .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "set vapid: {b}");
+
+    // Public VAPID key endpoint is readable.
+    let (s, vk) = http(http_port, "GET", "/v1/push/vapid", "", Some("rootsecret"));
+    assert_eq!(s, 200, "get vapid: {vk}");
+    assert!(vk["public_key"]
+        .as_str()
+        .unwrap_or("")
+        .starts_with("BExample"));
+
+    // Register a browser subscription as the device token (P-256 keys from the
+    // RFC 8291 vector — any valid point works, the mock doesn't decrypt).
+    let subscription = json!({
+        "endpoint": format!("{}/wp/device-1", mock.url()),
+        "keys": {
+            "p256dh":"BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
+            "auth":"BTBZMqHH6r4Tts7J_aSIgg"
+        }
+    })
+    .to_string();
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"subject_id":"web-user","token":subscription,"platform":"web","app_id":"default"})
+            .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "register web device: {b}");
+
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({"subject_id":"web-user","notification":{"title":"web","body":"hello browser"}})
+            .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "send: {b}");
+
+    let got = mock
+        .wait_for_request(Duration::from_secs(5))
+        .expect("push service should receive a delivery");
+    assert_eq!(got.path, "/wp/device-1");
+    assert_eq!(got.content_encoding, "aes128gcm");
+    assert!(
+        got.authorization.starts_with("vapid t="),
+        "VAPID auth header: {}",
+        got.authorization
+    );
+    assert!(got.authorization.contains("k="), "VAPID k= param missing");
+    assert!(!got.body.is_empty(), "encrypted body should be non-empty");
     drop(server);
 }

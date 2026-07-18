@@ -13,7 +13,10 @@ use crate::store::Store;
 use crate::tables::{CmpOp, SharedSchemaCache, WhereClause};
 
 use super::apns::{ApnsSink, DeliveryError, DeliveryTarget, Sink};
-use super::{get_apns_credentials, metrics, select_rows, DEVICES_TABLE, OUTBOX_TABLE};
+use super::webpush::WebPushSink;
+use super::{
+    get_apns_credentials, get_vapid_credentials, metrics, select_rows, DEVICES_TABLE, OUTBOX_TABLE,
+};
 
 const TICK: Duration = Duration::from_millis(500);
 const BATCH: usize = 100;
@@ -73,9 +76,11 @@ pub(crate) fn decide(attempts: i64, result: Result<(), DeliveryError>, now_secs:
     }
 }
 
-struct AppSink {
-    sink: ApnsSink,
-    topic: String,
+/// A per-(app, platform) delivery sink. The trait uses RPITIT so it isn't
+/// object-safe; an enum lets the worker hold either concrete sink.
+enum AppSink {
+    Apns { sink: ApnsSink, topic: String },
+    Web(WebPushSink),
 }
 
 /// Spawned once in `Runtime::start`. Loops forever, delivering pending rows.
@@ -115,13 +120,17 @@ async fn process_pending(
         let id = m.get("id").cloned().unwrap_or_default();
         let token = m.get("target_token").cloned().unwrap_or_default();
         let app_id = m.get("app_id").cloned().unwrap_or_default();
+        let platform = m
+            .get("platform")
+            .cloned()
+            .unwrap_or_else(|| "ios".to_string());
         let payload = m.get("payload").cloned().unwrap_or_default();
         let attempts: i64 = m.get("attempts").and_then(|a| a.parse().ok()).unwrap_or(0);
         if id.is_empty() {
             continue;
         }
 
-        let app_sink = match resolve_sink(store, cache, sinks, &app_id, now) {
+        let app_sink = match resolve_sink(store, cache, sinks, &app_id, &platform, now) {
             Ok(Some(s)) => s,
             Ok(None) => {
                 apply(
@@ -150,11 +159,23 @@ async fn process_pending(
             }
         };
 
-        let target = DeliveryTarget {
-            token: token.clone(),
-            topic: app_sink.topic.clone(),
+        let result = match &*app_sink {
+            AppSink::Apns { sink, topic } => {
+                let target = DeliveryTarget {
+                    token: token.clone(),
+                    topic: topic.clone(),
+                };
+                sink.deliver(&target, payload.as_bytes()).await
+            }
+            AppSink::Web(sink) => {
+                // The web token is the subscription JSON; topic is unused.
+                let target = DeliveryTarget {
+                    token: token.clone(),
+                    topic: String::new(),
+                };
+                sink.deliver(&target, payload.as_bytes()).await
+            }
         };
-        let result = app_sink.sink.deliver(&target, payload.as_bytes()).await;
         let action = decide(attempts, result, unix_seconds());
         apply(store, cache, &action, &id, &token, now)?;
     }
@@ -169,21 +190,33 @@ fn resolve_sink(
     cache: &SharedSchemaCache,
     sinks: &mut HashMap<String, Arc<AppSink>>,
     app_id: &str,
+    platform: &str,
     now: Instant,
 ) -> Result<Option<Arc<AppSink>>, String> {
-    if let Some(existing) = sinks.get(app_id) {
+    let cache_key = format!("{app_id}:{platform}");
+    if let Some(existing) = sinks.get(&cache_key) {
         return Ok(Some(existing.clone()));
     }
-    let Some(resolved) = get_apns_credentials(store, cache, app_id, now)? else {
-        return Ok(None);
+    let app_sink = match platform {
+        "web" | "desktop" => {
+            let Some(vapid) = get_vapid_credentials(store, cache, app_id, now)? else {
+                return Ok(None);
+            };
+            AppSink::Web(WebPushSink::new(vapid)?)
+        }
+        _ => {
+            let Some(resolved) = get_apns_credentials(store, cache, app_id, now)? else {
+                return Ok(None);
+            };
+            let base_url = ApnsSink::resolve_base_url(&resolved.environment);
+            AppSink::Apns {
+                sink: ApnsSink::new(base_url, resolved.creds)?,
+                topic: resolved.topic,
+            }
+        }
     };
-    let base_url = ApnsSink::resolve_base_url(&resolved.environment);
-    let sink = ApnsSink::new(base_url, resolved.creds)?;
-    let app_sink = Arc::new(AppSink {
-        sink,
-        topic: resolved.topic,
-    });
-    sinks.insert(app_id.to_string(), app_sink.clone());
+    let app_sink = Arc::new(app_sink);
+    sinks.insert(cache_key, app_sink.clone());
     Ok(Some(app_sink))
 }
 

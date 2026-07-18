@@ -1,5 +1,6 @@
 import type { LuxProjectClient } from './project';
 import type { LuxResult } from './types';
+import { err, toLuxError } from './utils';
 
 export interface LuxPushDevice {
 	id: string;
@@ -99,4 +100,53 @@ export class LuxPushNamespace {
 			: { subject_id: subjects, notification };
 		return this.client.request('POST', '/push/send', body);
 	}
+
+	// ── Web Push (VAPID) ──
+
+	/** The project's VAPID public key (the browser `applicationServerKey`). */
+	async getVapidPublicKey(): Promise<LuxResult<string>> {
+		const res = await this.client.request<{ public_key: string }>('GET', '/push/vapid');
+		if (res.error) return { data: null, error: res.error };
+		return { data: res.data?.public_key ?? '', error: null };
+	}
+
+	/**
+	 * Browser helper: prompt for notification permission, subscribe via the
+	 * service worker's PushManager using the project VAPID key, and register the
+	 * subscription. Requires an active service worker. Pass `vapidPublicKey` to
+	 * skip the network fetch, or `serviceWorker` to use a specific registration.
+	 */
+	async subscribeWebPush(
+		options: { vapidPublicKey?: string; serviceWorker?: ServiceWorkerRegistration } = {},
+	): Promise<LuxResult<{ id: string }>> {
+		try {
+			const key = options.vapidPublicKey ?? (await this.getVapidPublicKey()).data ?? '';
+			if (!key) return err('LUX_PUSH_NO_VAPID', 'No VAPID public key is configured');
+			if (typeof Notification === 'undefined' || !navigator?.serviceWorker) {
+				return err('LUX_PUSH_UNSUPPORTED', 'Web Push is not available in this environment');
+			}
+			const permission = await Notification.requestPermission();
+			if (permission !== 'granted') {
+				return err('LUX_PUSH_PERMISSION_DENIED', 'Notification permission was not granted');
+			}
+			const registration = options.serviceWorker ?? (await navigator.serviceWorker.ready);
+			const subscription = await registration.pushManager.subscribe({
+				userVisibleOnly: true,
+				applicationServerKey: urlBase64ToUint8Array(key),
+			});
+			return this.register({ token: JSON.stringify(subscription), platform: 'web' });
+		} catch (e) {
+			return err('LUX_PUSH_SUBSCRIBE_ERROR', 'Web push subscribe failed', toLuxError(e));
+		}
+	}
+}
+
+/** Decode a base64url VAPID key into the byte array PushManager expects. */
+function urlBase64ToUint8Array(base64: string): Uint8Array<ArrayBuffer> {
+	const padding = '='.repeat((4 - (base64.length % 4)) % 4);
+	const normalized = (base64 + padding).replace(/-/g, '+').replace(/_/g, '/');
+	const raw = atob(normalized);
+	const out = new Uint8Array(new ArrayBuffer(raw.length));
+	for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+	return out;
 }

@@ -8,6 +8,7 @@
 //! the APNs sink; WebPush/FCM/HTTP plug into the same `Sink` seam later.
 
 pub(crate) mod apns;
+pub(crate) mod webpush;
 pub(crate) mod worker;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -195,6 +196,16 @@ pub(crate) struct ResolvedApnsCreds {
     pub creds: apns::ApnsCredentials,
     pub topic: String,
     pub environment: String,
+}
+
+/// Resolved VAPID credentials for one app, ready to build a `WebPushSink`.
+pub(crate) struct ResolvedVapidCreds {
+    /// base64url(uncompressed P-256 public key) — the browser `applicationServerKey`.
+    pub public_key: String,
+    /// PKCS8 PEM private key for signing the VAPID JWT.
+    pub private_pem: String,
+    /// `mailto:` or URL contact, per RFC 8292.
+    pub subject: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -391,7 +402,37 @@ pub(crate) fn list_dead_letters(
 // Credentials
 // ---------------------------------------------------------------------------
 
-/// Upsert an app's APNs credentials (operator only). Replaces any existing row.
+/// Upsert a subset of fields on the per-app credential row, preserving the rest.
+/// APNs and Web Push (VAPID) credentials share one row per `app_id`, so setting
+/// one must not clobber the other.
+fn upsert_credential_fields(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    app_id: &str,
+    fields: &[(&str, &str)],
+    now: Instant,
+) -> Result<(), String> {
+    ensure_tables(store, cache, now)?;
+    if find_row_by_field(store, cache, CREDENTIALS_TABLE, "app_id", app_id, now)?.is_some() {
+        durable_table_update_where(
+            store,
+            cache,
+            CREDENTIALS_TABLE,
+            fields,
+            &["app_id", "=", app_id],
+            now,
+        )?;
+    } else {
+        let now_s = unix_seconds().to_string();
+        let mut insert: Vec<(&str, &str)> =
+            vec![("app_id", app_id), ("created_at", now_s.as_str())];
+        insert.extend_from_slice(fields);
+        durable_table_insert(store, cache, CREDENTIALS_TABLE, &insert, now)?;
+    }
+    Ok(())
+}
+
+/// Upsert an app's APNs credentials (operator only). Preserves any VAPID creds.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn set_apns_credentials(
     store: &Store,
@@ -404,32 +445,75 @@ pub(crate) fn set_apns_credentials(
     environment: &str,
     now: Instant,
 ) -> Result<(), String> {
-    ensure_tables(store, cache, now)?;
-    durable_table_delete_where(
+    upsert_credential_fields(
         store,
         cache,
-        CREDENTIALS_TABLE,
-        &["app_id", "=", app_id],
-        now,
-    )?;
-    let now_s = unix_seconds().to_string();
-    durable_table_insert(
-        store,
-        cache,
-        CREDENTIALS_TABLE,
+        app_id,
         &[
-            ("app_id", app_id),
-            ("platform", "ios"),
             ("apns_team_id", team_id),
             ("apns_key_id", key_id),
             ("apns_p8_pem", p8_pem),
             ("apns_topic", topic),
             ("environment", environment),
-            ("created_at", now_s.as_str()),
         ],
         now,
-    )?;
-    Ok(())
+    )
+}
+
+/// Upsert an app's Web Push (VAPID) credentials (operator only). Preserves APNs.
+pub(crate) fn set_vapid_credentials(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    app_id: &str,
+    public_key: &str,
+    private_pem: &str,
+    subject: &str,
+    now: Instant,
+) -> Result<(), String> {
+    upsert_credential_fields(
+        store,
+        cache,
+        app_id,
+        &[
+            ("vapid_public", public_key),
+            ("vapid_private", private_pem),
+            ("vapid_subject", subject),
+        ],
+        now,
+    )
+}
+
+pub(crate) fn get_vapid_credentials(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    app_id: &str,
+    now: Instant,
+) -> Result<Option<ResolvedVapidCreds>, String> {
+    let Some(row) = find_row_by_field(store, cache, CREDENTIALS_TABLE, "app_id", app_id, now)?
+    else {
+        return Ok(None);
+    };
+    let get = |k: &str| row.get(k).cloned().unwrap_or_default();
+    let public_key = get("vapid_public");
+    let private_pem = get("vapid_private");
+    if public_key.is_empty() || private_pem.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ResolvedVapidCreds {
+        public_key,
+        private_pem,
+        subject: get("vapid_subject"),
+    }))
+}
+
+/// The public VAPID key for an app, if configured (safe to expose to browsers).
+pub(crate) fn vapid_public_key(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    app_id: &str,
+    now: Instant,
+) -> Result<Option<String>, String> {
+    Ok(get_vapid_credentials(store, cache, app_id, now)?.map(|c| c.public_key))
 }
 
 pub(crate) fn get_apns_credentials(

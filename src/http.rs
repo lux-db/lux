@@ -2636,6 +2636,7 @@ fn route_request_with_auth(
         ("POST", ["push", "credentials"]) => push_set_credentials(body, store, cache),
         ("GET", ["push", "admin", "devices"]) => push_admin_devices(store, cache),
         ("GET", ["push", "admin", "outbox"]) => push_admin_outbox(store, cache),
+        ("GET", ["push", "vapid"]) => push_vapid_public(params, store, cache),
 
         // ── KV routes ──
         ("GET", ["kv", key]) => ok(exec_json(
@@ -3202,6 +3203,30 @@ fn push_set_credentials(
         Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
     };
     let app_id = parsed["app_id"].as_str().unwrap_or("default");
+    let now = Instant::now();
+
+    // VAPID (Web Push) credentials, distinguished by the presence of the key.
+    if let Some(vapid_private) = parsed["vapid_private"].as_str().filter(|s| !s.is_empty()) {
+        let vapid_public = parsed["vapid_public"].as_str().unwrap_or("");
+        let subject = parsed["vapid_subject"].as_str().unwrap_or("");
+        if vapid_public.is_empty() {
+            return push_json_error(400, "Bad Request", "vapid_public is required");
+        }
+        return match crate::push::set_vapid_credentials(
+            store,
+            cache,
+            app_id,
+            vapid_public,
+            vapid_private,
+            subject,
+            now,
+        ) {
+            Ok(()) => ok(json!({ "ok": true }).to_string()),
+            Err(e) => push_json_error(400, "Bad Request", &e),
+        };
+    }
+
+    // APNs credentials.
     let team_id = parsed["team_id"].as_str().unwrap_or("");
     let key_id = parsed["key_id"].as_str().unwrap_or("");
     let p8_pem = parsed["p8_pem"].as_str().unwrap_or("");
@@ -3223,9 +3248,24 @@ fn push_set_credentials(
         p8_pem,
         topic,
         environment,
-        Instant::now(),
+        now,
     ) {
         Ok(()) => ok(json!({ "ok": true }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `GET /v1/push/vapid` (public) — the VAPID public key a browser needs to
+/// subscribe. Safe to expose; it's a public key.
+fn push_vapid_public(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let app_id = get_param(params, "app_id").unwrap_or("default");
+    match crate::push::vapid_public_key(store, cache, app_id, Instant::now()) {
+        Ok(Some(key)) => ok(json!({ "public_key": key }).to_string()),
+        Ok(None) => push_json_error(404, "Not Found", "web push is not configured"),
         Err(e) => push_json_error(400, "Bad Request", &e),
     }
 }
