@@ -99,6 +99,70 @@ pub(crate) fn ensure_tables(
     Ok(())
 }
 
+/// One-time migration from the pre-`push.*` layout, where push data lived under
+/// `auth.devices` / `auth.push_credentials` keyed by `user_id`. Copies any such
+/// rows into the `push.*` scope (`user_id` -> `subject_id`). Idempotent (skips
+/// rows already present) and a fast no-op when no legacy tables exist. All data
+/// stays inside the engine — plaintext never leaves the store layer.
+pub(crate) fn migrate_from_auth_scope(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    now: Instant,
+) -> Result<(), String> {
+    let legacy_creds = "auth.push_credentials";
+    let legacy_devices = "auth.devices";
+    let has_legacy = tables::table_schema(store, cache, legacy_creds, now).is_ok()
+        || tables::table_schema(store, cache, legacy_devices, now).is_ok();
+    if !has_legacy {
+        return Ok(());
+    }
+    ensure_tables(store, cache, now)?;
+
+    // Credentials: one row per app_id.
+    for row in select_rows(store, cache, legacy_creds, Vec::new(), None, now)? {
+        let m: std::collections::HashMap<String, String> = row.into_iter().collect();
+        let app_id = m.get("app_id").cloned().unwrap_or_default();
+        if app_id.is_empty()
+            || find_row_by_field(store, cache, CREDENTIALS_TABLE, "app_id", &app_id, now)?.is_some()
+        {
+            continue;
+        }
+        let g = |k: &str| m.get(k).cloned().unwrap_or_default();
+        set_apns_credentials(
+            store,
+            cache,
+            &app_id,
+            &g("apns_team_id"),
+            &g("apns_key_id"),
+            &g("apns_p8_pem"),
+            &g("apns_topic"),
+            &g("environment"),
+            now,
+        )?;
+    }
+
+    // Devices: user_id -> subject_id, re-keyed by token.
+    for row in select_rows(store, cache, legacy_devices, Vec::new(), None, now)? {
+        let m: std::collections::HashMap<String, String> = row.into_iter().collect();
+        let token = m.get("token").cloned().unwrap_or_default();
+        if token.is_empty()
+            || find_row_by_field(store, cache, DEVICES_TABLE, "token", &token, now)?.is_some()
+        {
+            continue;
+        }
+        register_device(
+            store,
+            cache,
+            &m.get("user_id").cloned().unwrap_or_default(),
+            &token,
+            &m.get("platform").cloned().unwrap_or_else(|| "ios".into()),
+            &m.get("app_id").cloned().unwrap_or_else(|| "default".into()),
+            now,
+        )?;
+    }
+    Ok(())
+}
+
 /// Cumulative + gauge counters surfaced through `INFO` so the cloud monitor can
 /// scrape push activity like ops. `devices` is a live gauge; the rest are
 /// monotonic counters.

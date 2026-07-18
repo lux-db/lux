@@ -3127,6 +3127,15 @@ impl Runtime {
             }
         }
 
+        // One-time migration of any pre-`push.*` data (PR1 stored it under
+        // `auth.*`). Runs post-replay with WAL logging on; a no-op when there is
+        // no legacy data. Best-effort: a failure here must not block startup.
+        if let Err(e) =
+            push::migrate_from_auth_scope(&runtime.store, &runtime.schema_cache, Instant::now())
+        {
+            eprintln!("push scope migration skipped: {e}");
+        }
+
         background_tasks.spawn(snapshot::background_save_loop(runtime.store.clone()));
 
         {
