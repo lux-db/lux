@@ -375,6 +375,62 @@ fn credential_change_rebuilds_cached_sink() {
     );
 }
 
+#[test]
+fn unregister_by_token_and_admin_stats() {
+    let mock = MockApns::start(200);
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start(dir.path(), resp_port, http_port, false);
+
+    set_creds(http_port, &mock.url());
+    let (token, uid) = anon_login(http_port);
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"token":"tok-xyz","platform":"ios","app_id":"default"}).to_string(),
+        Some(&token),
+    );
+    assert_eq!(s, 200, "register: {b}");
+
+    // Admin stats endpoint (operator) reports the live device count.
+    let (s, stats) = http(
+        http_port,
+        "GET",
+        "/v1/push/admin/stats",
+        "",
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "stats: {stats}");
+    assert!(
+        stats["devices"].as_i64().unwrap_or(0) >= 1,
+        "stats: {stats}"
+    );
+
+    // Unregister by token (operator) removes the device.
+    let (s, b) = http(
+        http_port,
+        "DELETE",
+        "/v1/push/devices",
+        &json!({"token":"tok-xyz"}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "delete: {b}");
+    assert_eq!(b["deleted"], true);
+
+    // The subject now has no devices, so a send enqueues to zero.
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({"subject_id": uid, "notification": {"title":"x","body":"y"}}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "send: {b}");
+    assert_eq!(b["enqueued"], 0);
+}
+
 fn anon_login(http_port: u16) -> (String, String) {
     let (s, sess) = http(http_port, "POST", "/auth/v1/signin/anonymous", "{}", None);
     assert_eq!(s, 200, "anon signin: {sess}");

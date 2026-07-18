@@ -335,6 +335,22 @@ pub(crate) fn delete_device_by_id(
     Ok(removed > 0)
 }
 
+/// Delete any device by its token (operator). Used for logout-time unregister,
+/// where the caller has the token but not the internal device id.
+pub(crate) fn delete_device_by_token(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    token: &str,
+    now: Instant,
+) -> Result<bool, String> {
+    let removed =
+        durable_table_delete_where(store, cache, DEVICES_TABLE, &["token", "=", token], now)?;
+    if removed > 0 {
+        metrics().devices.fetch_sub(1, Ordering::Relaxed);
+    }
+    Ok(removed > 0)
+}
+
 // ---------------------------------------------------------------------------
 // Admin reads (operator) — for the cloud dashboard
 // ---------------------------------------------------------------------------

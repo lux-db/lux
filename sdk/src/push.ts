@@ -79,6 +79,12 @@ export class LuxPushNamespace {
 		return this.client.request('DELETE', `/push/devices/${encodeURIComponent(id)}`);
 	}
 
+	/** Remove a device by its push token (secret key). Use at logout, where the
+	 *  client has the token but not the internal device id. */
+	async unregisterByToken(token: string): Promise<LuxResult<{ deleted: boolean }>> {
+		return this.client.request('DELETE', '/push/devices', { token });
+	}
+
 	/** List a subject's active devices. With a user session, omit `subjectId` to
 	 *  list your own; with a secret key, pass the subject. */
 	async devices(subjectId?: string): Promise<LuxResult<LuxPushDevice[]>> {

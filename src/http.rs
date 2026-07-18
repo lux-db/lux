@@ -2632,10 +2632,12 @@ fn route_request_with_auth(
         ("POST", ["push", "devices"]) => push_register(body, store, cache, auth),
         ("GET", ["push", "devices"]) => push_list_devices(params, store, cache, auth),
         ("DELETE", ["push", "devices", id]) => push_delete_device(id, store, cache, auth),
+        ("DELETE", ["push", "devices"]) => push_delete_device_by_token(body, store, cache),
         ("POST", ["push", "send"]) => push_send(body, store, cache),
         ("POST", ["push", "credentials"]) => push_set_credentials(body, store, cache),
         ("GET", ["push", "admin", "devices"]) => push_admin_devices(store, cache),
         ("GET", ["push", "admin", "outbox"]) => push_admin_outbox(store, cache),
+        ("GET", ["push", "admin", "stats"]) => push_admin_stats(),
         ("GET", ["push", "vapid"]) => push_vapid_public(params, store, cache),
 
         // ── KV routes ──
@@ -3014,8 +3016,10 @@ fn route_requires_operator(method: &str, base: &[&str]) -> bool {
             | ("DELETE", ["vectors", _])
             | ("POST", ["push", "send"])
             | ("POST", ["push", "credentials"])
+            | ("DELETE", ["push", "devices"])
             | ("GET", ["push", "admin", "devices"])
             | ("GET", ["push", "admin", "outbox"])
+            | ("GET", ["push", "admin", "stats"])
     )
 }
 
@@ -3190,6 +3194,40 @@ fn push_admin_outbox(store: &Arc<Store>, cache: &SharedSchemaCache) -> (u16, &'s
         Ok(dead) => ok(json!({ "dead_letters": dead }).to_string()),
         Err(e) => push_json_error(400, "Bad Request", &e),
     }
+}
+
+/// `DELETE /v1/push/devices` (operator) — remove a device by its token. For
+/// logout-time unregister, where the client has the token but not the id.
+fn push_delete_device_by_token(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let Some(token) = parsed["token"].as_str().filter(|s| !s.is_empty()) else {
+        return push_json_error(400, "Bad Request", "token is required");
+    };
+    match crate::push::delete_device_by_token(store, cache, token, Instant::now()) {
+        Ok(deleted) => ok(json!({ "deleted": deleted }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `GET /v1/push/admin/stats` (operator) — process-level delivery counters
+/// (reset on engine restart): sends, delivered, failed, and live device count.
+fn push_admin_stats() -> (u16, &'static str, String) {
+    use std::sync::atomic::Ordering;
+    let m = crate::push::metrics();
+    ok(json!({
+        "sends": m.sends.load(Ordering::Relaxed),
+        "delivered": m.delivered.load(Ordering::Relaxed),
+        "failed": m.failed.load(Ordering::Relaxed),
+        "devices": m.devices.load(Ordering::Relaxed),
+    })
+    .to_string())
 }
 
 /// `POST /v1/push/credentials` (operator) — set an app's APNs credentials.
