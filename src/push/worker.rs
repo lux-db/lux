@@ -85,7 +85,10 @@ enum AppSink {
 
 /// Spawned once in `Runtime::start`. Loops forever, delivering pending rows.
 pub(crate) async fn run_delivery_worker(store: Arc<Store>, cache: SharedSchemaCache) {
-    let mut sinks: HashMap<String, Arc<AppSink>> = HashMap::new();
+    // Keyed by `{app_id}:{platform}` -> (credentials fingerprint, sink). The
+    // fingerprint invalidates the cached sink when credentials change so an
+    // updated topic/environment/key takes effect without an engine restart.
+    let mut sinks: HashMap<String, (String, Arc<AppSink>)> = HashMap::new();
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -99,7 +102,7 @@ pub(crate) async fn run_delivery_worker(store: Arc<Store>, cache: SharedSchemaCa
 async fn process_pending(
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
-    sinks: &mut HashMap<String, Arc<AppSink>>,
+    sinks: &mut HashMap<String, (String, Arc<AppSink>)>,
 ) -> Result<(), String> {
     let now = Instant::now();
     let now_secs = unix_seconds();
@@ -188,35 +191,59 @@ async fn process_pending(
 fn resolve_sink(
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
-    sinks: &mut HashMap<String, Arc<AppSink>>,
+    sinks: &mut HashMap<String, (String, Arc<AppSink>)>,
     app_id: &str,
     platform: &str,
     now: Instant,
 ) -> Result<Option<Arc<AppSink>>, String> {
     let cache_key = format!("{app_id}:{platform}");
-    if let Some(existing) = sinks.get(&cache_key) {
-        return Ok(Some(existing.clone()));
-    }
-    let app_sink = match platform {
+
+    // Read the current credentials and derive a fingerprint. A cache hit skips
+    // only the sink build (which holds the APNs provider-token cache); reading
+    // the creds row is cheap. A changed fingerprint rebuilds the sink so a
+    // dashboard edit (topic, environment, key, VAPID keypair) takes effect
+    // immediately instead of after an engine restart.
+    let (fingerprint, app_sink): (String, AppSink) = match platform {
         "web" | "desktop" => {
             let Some(vapid) = get_vapid_credentials(store, cache, app_id, now)? else {
+                sinks.remove(&cache_key);
                 return Ok(None);
             };
-            AppSink::Web(WebPushSink::new(vapid)?)
+            // The private PEM changes iff the public key does (they're a pair).
+            let fp = format!("web|{}|{}", vapid.public_key, vapid.subject);
+            if let Some((cached_fp, sink)) = sinks.get(&cache_key) {
+                if *cached_fp == fp {
+                    return Ok(Some(sink.clone()));
+                }
+            }
+            (fp, AppSink::Web(WebPushSink::new(vapid)?))
         }
         _ => {
             let Some(resolved) = get_apns_credentials(store, cache, app_id, now)? else {
+                sinks.remove(&cache_key);
                 return Ok(None);
             };
-            let base_url = ApnsSink::resolve_base_url(&resolved.environment);
-            AppSink::Apns {
-                sink: ApnsSink::new(base_url, resolved.creds)?,
-                topic: resolved.topic,
+            let fp = format!(
+                "apns|{}|{}|{}|{}",
+                resolved.environment, resolved.topic, resolved.creds.team_id, resolved.creds.key_id
+            );
+            if let Some((cached_fp, sink)) = sinks.get(&cache_key) {
+                if *cached_fp == fp {
+                    return Ok(Some(sink.clone()));
+                }
             }
+            let base_url = ApnsSink::resolve_base_url(&resolved.environment);
+            (
+                fp,
+                AppSink::Apns {
+                    sink: ApnsSink::new(base_url, resolved.creds)?,
+                    topic: resolved.topic,
+                },
+            )
         }
     };
     let app_sink = Arc::new(app_sink);
-    sinks.insert(cache_key, app_sink.clone());
+    sinks.insert(cache_key, (fingerprint, app_sink.clone()));
     Ok(Some(app_sink))
 }
 

@@ -292,6 +292,89 @@ fn set_creds(http_port: u16, environment: &str) {
     assert_eq!(s, 200, "set creds: {b}");
 }
 
+fn set_creds_topic(http_port: u16, environment: &str, topic: &str) {
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/credentials",
+        &json!({
+            "app_id": "default",
+            "team_id": "TEAM123456",
+            "key_id": "KEY7890AB",
+            "p8_pem": test_p8(),
+            "topic": topic,
+            "environment": environment,
+        })
+        .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "set creds: {b}");
+}
+
+// A credentials edit (here the APNs topic) must invalidate the worker's cached
+// sink so the next delivery uses the new value. Previously the sink was cached
+// for the worker's lifetime, so changes only took effect after an engine restart.
+#[test]
+fn credential_change_rebuilds_cached_sink() {
+    let mock = MockApns::start(200);
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start(dir.path(), resp_port, http_port, false);
+
+    set_creds_topic(http_port, &mock.url(), "com.example.first");
+    let (token, uid) = anon_login(http_port);
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"token":"devtoken-abc","platform":"ios","app_id":"default"}).to_string(),
+        Some(&token),
+    );
+    assert_eq!(s, 200, "register: {b}");
+
+    let (s, _) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({"subject_id": uid, "notification": {"title":"Hi","body":"1"}}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200);
+    let first = mock
+        .wait_for_request(Duration::from_secs(5))
+        .expect("first delivery");
+    assert_eq!(first.apns_topic, "com.example.first");
+
+    // Change the topic, then send again.
+    set_creds_topic(http_port, &mock.url(), "com.example.second");
+    let (s, _) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({"subject_id": uid, "notification": {"title":"Hi","body":"2"}}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200);
+
+    // The second delivery must carry the NEW topic, not the cached one.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let second_topic = loop {
+        {
+            let reqs = mock.requests.lock().unwrap();
+            if reqs.len() >= 2 {
+                break reqs[1].apns_topic.clone();
+            }
+        }
+        assert!(Instant::now() < deadline, "second delivery not received");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        second_topic, "com.example.second",
+        "a credential change must invalidate the cached sink"
+    );
+}
+
 fn anon_login(http_port: u16) -> (String, String) {
     let (s, sess) = http(http_port, "POST", "/auth/v1/signin/anonymous", "{}", None);
     assert_eq!(s, 200, "anon signin: {sess}");
