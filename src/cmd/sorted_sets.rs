@@ -115,7 +115,7 @@ fn parse_zstore_options(
     while i < args.len() {
         if cmd_eq(args[i], b"WEIGHTS") {
             i += 1;
-            if i + numkeys > args.len() {
+            if numkeys > args.len().saturating_sub(i) {
                 resp::write_error(out, "ERR syntax error");
                 return None;
             }
@@ -865,7 +865,7 @@ pub fn cmd_zunionstore(
         Some(numkeys) => numkeys,
         None => return CmdResult::Written,
     };
-    if 3 + numkeys > args.len() {
+    if numkeys > args.len().saturating_sub(3) {
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
@@ -901,7 +901,7 @@ pub fn cmd_zinterstore(
         Some(numkeys) => numkeys,
         None => return CmdResult::Written,
     };
-    if 3 + numkeys > args.len() {
+    if numkeys > args.len().saturating_sub(3) {
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
@@ -937,11 +937,11 @@ pub fn cmd_zdiffstore(
         Some(numkeys) => numkeys,
         None => return CmdResult::Written,
     };
-    if 3 + numkeys > args.len() {
+    if numkeys > args.len().saturating_sub(3) {
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
-    if 3 + numkeys != args.len() {
+    if numkeys != args.len().saturating_sub(3) {
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
@@ -972,7 +972,7 @@ fn parse_zset_setop<'a>(
     allow_options: bool,
 ) -> Option<ZSetSetOp<'a>> {
     let numkeys = parse_zstore_numkeys(args[1], out)?;
-    if 2 + numkeys > args.len() {
+    if numkeys > args.len().saturating_sub(2) {
         resp::write_error(out, "ERR syntax error");
         return None;
     }
@@ -1086,7 +1086,7 @@ pub fn cmd_zintercard(
         Some(n) => n,
         None => return CmdResult::Written,
     };
-    if 2 + numkeys > args.len() {
+    if numkeys > args.len().saturating_sub(2) {
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
@@ -1180,7 +1180,7 @@ pub fn cmd_zmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         None => return CmdResult::Written,
     };
     // Need at least the MIN|MAX token after the keys.
-    if 2 + numkeys >= args.len() {
+    if numkeys >= args.len().saturating_sub(2) {
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }
@@ -1535,7 +1535,7 @@ pub fn cmd_bzmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         Some(n) => n,
         None => return CmdResult::Written,
     };
-    if 3 + numkeys >= args.len() {
+    if numkeys >= args.len().saturating_sub(3) {
         resp::write_error(out, "ERR syntax error");
         return CmdResult::Written;
     }

@@ -3981,6 +3981,34 @@ mod tests {
         String::from_utf8_lossy(&exec(store, args)).to_string()
     }
 
+    // Regression: the zset set-ops built their length guards as `const + numkeys`,
+    // which overflows usize and panics when numkeys is huge (the `command` fuzz
+    // target found this nightly, e.g. sorted_sets.rs:975). They must reject it
+    // with an error, not crash.
+    #[test]
+    fn zset_setops_reject_overflowing_numkeys() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let n = b"18446744073709551615"; // u64::MAX
+
+        for reply in [
+            exec_str(&store, &[b"ZUNION", n, b"k"]),
+            exec_str(&store, &[b"ZINTER", n, b"k"]),
+            exec_str(&store, &[b"ZDIFF", n, b"k"]),
+            exec_str(&store, &[b"ZUNIONSTORE", b"d", n, b"k"]),
+            exec_str(&store, &[b"ZINTERSTORE", b"d", n, b"k"]),
+            exec_str(&store, &[b"ZDIFFSTORE", b"d", n, b"k"]),
+            exec_str(&store, &[b"ZMPOP", n, b"k", b"MIN"]),
+            exec_str(&store, &[b"BZMPOP", b"0", n, b"k", b"MIN"]),
+        ] {
+            assert!(reply.contains("ERR"), "expected error, got: {reply}");
+        }
+    }
+
     fn exec_wal(store: &Store, args: &[&[u8]]) -> BytesMut {
         let broker = Broker::new();
         let cache =
