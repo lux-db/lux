@@ -932,6 +932,11 @@ struct Instance {
 }
 
 #[derive(Deserialize)]
+struct Workspace {
+    id: String,
+}
+
+#[derive(Deserialize)]
 struct Credentials {
     resp: String,
 }
@@ -1154,14 +1159,47 @@ fn get_client(api_url_override: &Option<String>) -> (reqwest::Client, String, St
     (client, api_url, config.token)
 }
 
+/// A `lux_` token is scoped to one workspace. Resolve it so workspace-scoped
+/// endpoints (project list/create) can name it. Exits on failure.
+async fn resolve_workspace_id(client: &reqwest::Client, api_url: &str, token: &str) -> String {
+    let res = client
+        .get(format!("{api_url}/workspaces"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("{} {e}", "Failed to connect:".red());
+            std::process::exit(1);
+        });
+
+    let body: ApiResponse<Vec<Workspace>> = res.json().await.unwrap_or_else(|e| {
+        eprintln!("{} {e}", "Failed to parse response:".red());
+        std::process::exit(1);
+    });
+
+    if let Some(error) = body.error {
+        eprintln!("{} {error}", "API error:".red());
+        std::process::exit(1);
+    }
+
+    body.data
+        .and_then(|workspaces| workspaces.into_iter().next())
+        .unwrap_or_else(|| {
+            eprintln!("{} No workspace found for this token.", "Error:".red());
+            std::process::exit(1);
+        })
+        .id
+}
+
 async fn find_project(
     client: &reqwest::Client,
     api_url: &str,
     token: &str,
     name_or_id: &str,
 ) -> Instance {
+    let workspace_id = resolve_workspace_id(client, api_url, token).await;
     let res = client
-        .get(format!("{api_url}/instances"))
+        .get(format!("{api_url}/projects?workspace_id={workspace_id}"))
         .header("Authorization", format!("Bearer {token}"))
         .send()
         .await
@@ -1483,8 +1521,8 @@ pub async fn run() {
                 None => {
                     println!("{}", "Paste your Lux Cloud access token.".bold());
                     println!(
-                        "Get one from: {}",
-                        "https://luxdb.dev/dashboard/settings".cyan()
+                        "Get one from your workspace's tokens page: {}",
+                        "https://luxdb.dev/dashboard".cyan()
                     );
                     print!("\n{} ", "Token:".bold());
                     std::io::stdout().flush().ok();
@@ -1506,7 +1544,7 @@ pub async fn run() {
 
             let client = reqwest::Client::new();
             let res = client
-                .get(format!("{api_url}/instances"))
+                .get(format!("{api_url}/workspaces"))
                 .header("Authorization", format!("Bearer {token}"))
                 .send()
                 .await;
@@ -1549,9 +1587,10 @@ pub async fn run() {
 
         Commands::Projects => {
             let (client, api_url, token) = get_client(&api_url_override);
+            let workspace_id = resolve_workspace_id(&client, &api_url, &token).await;
 
             let res = client
-                .get(format!("{api_url}/instances"))
+                .get(format!("{api_url}/projects?workspace_id={workspace_id}"))
                 .header("Authorization", format!("Bearer {token}"))
                 .send()
                 .await
@@ -1829,12 +1868,14 @@ pub async fn run() {
 
             println!("{} Creating project '{}'...", "...".dimmed(), name);
 
+            let workspace_id = resolve_workspace_id(&client, &api_url, &token).await;
             let res = client
-                .post(format!("{api_url}/instances"))
+                .post(format!("{api_url}/projects"))
                 .header("Authorization", format!("Bearer {token}"))
                 .json(&serde_json::json!({
                     "name": name,
                     "price_id": price_id,
+                    "workspace_id": workspace_id,
                 }))
                 .send()
                 .await
@@ -1874,7 +1915,7 @@ pub async fn run() {
             println!("{} Restarting '{}'...", "...".dimmed(), inst.name);
 
             let res = client
-                .post(format!("{api_url}/instances/{}/restart", inst.id))
+                .post(format!("{api_url}/projects/{}/restart", inst.id))
                 .header("Authorization", format!("Bearer {token}"))
                 .send()
                 .await
@@ -2041,7 +2082,7 @@ pub async fn run() {
             println!("{} Destroying '{}'...", "...".dimmed(), inst.name);
 
             let res = client
-                .delete(format!("{api_url}/instances/{}", inst.id))
+                .delete(format!("{api_url}/projects/{}", inst.id))
                 .header("Authorization", format!("Bearer {token}"))
                 .send()
                 .await
@@ -2901,7 +2942,7 @@ async fn get_instance_credentials(
     instance_id: &str,
 ) -> Credentials {
     let res = client
-        .get(format!("{api_url}/instances/{instance_id}/credentials"))
+        .get(format!("{api_url}/projects/{instance_id}/credentials"))
         .header("Authorization", format!("Bearer {token}"))
         .send()
         .await
@@ -2923,9 +2964,7 @@ async fn get_auth_credentials(
     instance_id: &str,
 ) -> AuthCredentials {
     let res = client
-        .get(format!(
-            "{api_url}/instances/{instance_id}/auth/credentials"
-        ))
+        .get(format!("{api_url}/projects/{instance_id}/auth/credentials"))
         .header("Authorization", format!("Bearer {token}"))
         .send()
         .await
@@ -2947,7 +2986,7 @@ async fn list_project_keys(
     instance_id: &str,
 ) -> Vec<ProjectKey> {
     let res = client
-        .get(format!("{api_url}/instances/{instance_id}/auth/keys"))
+        .get(format!("{api_url}/projects/{instance_id}/auth/keys"))
         .header("Authorization", format!("Bearer {token}"))
         .send()
         .await
@@ -2971,7 +3010,7 @@ async fn create_project_key(
     name: Option<String>,
 ) -> CreatedKey {
     let res = client
-        .post(format!("{api_url}/instances/{instance_id}/auth/keys"))
+        .post(format!("{api_url}/projects/{instance_id}/auth/keys"))
         .header("Authorization", format!("Bearer {token}"))
         .json(&serde_json::json!({ "kind": kind, "name": name }))
         .send()
@@ -2996,7 +3035,7 @@ async fn revoke_project_key(
 ) {
     let res = client
         .delete(format!(
-            "{api_url}/instances/{instance_id}/auth/keys/{key_id}"
+            "{api_url}/projects/{instance_id}/auth/keys/{key_id}"
         ))
         .header("Authorization", format!("Bearer {token}"))
         .send()
