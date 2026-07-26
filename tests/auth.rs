@@ -366,3 +366,105 @@ fn revoking_a_key_takes_effect_immediately() {
         "revoked key must not authenticate RESP: {resp}"
     );
 }
+
+// The browser shape, and the reason publishable is not capped at read: a live
+// cursors app signs in anonymously (or as a user) and writes its own row
+// directly from the browser. `apikey: lux_pub_*` + `Authorization: Bearer <jwt>`
+// must read AND write exactly what the grant allows, and nothing else.
+#[test]
+fn publishable_with_end_user_token_reads_and_writes_per_grants() {
+    let server = keyed_server();
+    let port = server.http_port();
+
+    let exec = |cmd: &str| {
+        common::http_request(
+            port,
+            "POST",
+            "/v1/exec",
+            Some(&format!(r#"{{"command":{cmd}}}"#)),
+            Some(SECRET),
+        )
+    };
+    let (status, out) =
+        exec(r#"["TCREATE","cursors","id STR PRIMARY KEY,","owner_id STR,","x STR"]"#);
+    assert!(status < 400, "create table: {status} {out}");
+    let (status, out) =
+        exec(r#"["GRANT","read","write","ON","cursors","WHERE","owner_id","=","auth.uid()"]"#);
+    assert!(
+        status < 400 && !out.contains("error"),
+        "grant: {status} {out}"
+    );
+
+    let (status, signup) = common::http_request_with_headers(
+        port,
+        "POST",
+        "/auth/v1/signup",
+        Some(r#"{"email":"cursor@example.com","password":"hunter2hunter2"}"#),
+        None,
+        &[&format!("apikey: {PUBLISHABLE}")],
+    );
+    assert!(status < 400, "signup: {status} {signup}");
+    let field = |body: &str, key: &str| -> String {
+        body.split(&format!("\"{key}\":\""))
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let jwt = field(&signup, "access_token");
+    let uid = field(&signup, "id");
+    assert!(
+        !jwt.is_empty() && !uid.is_empty(),
+        "signup payload: {signup}"
+    );
+
+    let browser = [
+        format!("apikey: {PUBLISHABLE}"),
+        format!("Authorization: Bearer {jwt}"),
+    ];
+    let browser: Vec<&str> = browser.iter().map(String::as_str).collect();
+
+    // Writes its own row.
+    let (status, body) = common::http_request_with_headers(
+        port,
+        "POST",
+        "/v1/tables/cursors",
+        Some(&format!(r#"{{"id":"c1","owner_id":"{uid}","x":"10"}}"#)),
+        None,
+        &browser,
+    );
+    assert!(
+        status < 400,
+        "publishable+jwt must write its own row: {status} {body}"
+    );
+
+    // Reads it back.
+    let (status, body) =
+        common::http_request_with_headers(port, "GET", "/v1/tables/cursors", None, None, &browser);
+    assert!(
+        status < 400 && body.contains("c1"),
+        "publishable+jwt must read its own row: {status} {body}"
+    );
+
+    // The grant predicate still binds: someone else's row is refused.
+    let (status, body) = common::http_request_with_headers(
+        port,
+        "POST",
+        "/v1/tables/cursors",
+        Some(r#"{"id":"c2","owner_id":"someone-else","x":"99"}"#),
+        None,
+        &browser,
+    );
+    assert!(
+        status >= 400,
+        "grant predicate must block another user's row: {status} {body}"
+    );
+
+    // And a principal never reaches the secret-key routes.
+    let (status, body) =
+        common::http_request_with_headers(port, "GET", "/v1/dbsize", None, None, &browser);
+    assert!(
+        status >= 400,
+        "end-user principal must not reach secret-key routes: {status} {body}"
+    );
+}
