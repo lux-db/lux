@@ -221,8 +221,15 @@ async fn handle_request(
         .map(|(_, v)| v.as_str())
         .and_then(|auth| auth.strip_prefix("Bearer "))
         .unwrap_or("");
+    // Browsers cannot set headers on a WebSocket handshake, so `/live` also takes
+    // the key as a query param. `apikey` is the name the SDK sends (and the
+    // Supabase-compatible one); `token` is accepted as the original alias. Only
+    // reading `token` here meant every keyed SDK client 401'd on the handshake
+    // unless it also had an end-user access token.
     let query_token = if path == "/live" {
-        get_param(&params, "token").unwrap_or("")
+        get_param(&params, "apikey")
+            .or_else(|| get_param(&params, "token"))
+            .unwrap_or("")
     } else {
         ""
     };

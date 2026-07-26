@@ -278,6 +278,9 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 		const url = new URL(`${this.url}/live`);
 		url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
 		url.searchParams.set('apikey', this.key);
+		// Engines before the `apikey` alias only read `token` on /live. Send both so
+		// a current SDK keeps working against an already-deployed engine.
+		url.searchParams.set('token', this.key);
 		if (accessToken) url.searchParams.set('access_token', accessToken);
 
 		const socket = new WebSocketImpl(url.toString());

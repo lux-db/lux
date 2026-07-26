@@ -1131,3 +1131,71 @@ async fn live_table_ivm_survives_reconnect_after_disconnect() {
     assert_eq!(e["kind"], "insert");
     assert_eq!(e["pk"], "k1");
 }
+
+// --- Query-param handshake auth ----------------------------------------------
+//
+// A browser cannot set headers on a WebSocket handshake, so the SDK passes the
+// key in the query string. Every other test here authenticates via the
+// `Authorization` header, which is why a mismatch between the name the SDK sends
+// (`apikey`) and the name the engine read (`token`) shipped unnoticed: keyed
+// clients 401'd on the handshake unless they also had an end-user access token.
+
+async fn connect_live_query(http_port: u16, query: &str) -> Result<TestWs, String> {
+    match connect_async(format!("ws://127.0.0.1:{http_port}/live?{query}")).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Subscribe over an already-open socket to prove the connection is usable, not
+/// merely upgraded.
+async fn assert_live_subscribes(ws: &mut TestWs) {
+    send_json(
+        ws,
+        json!({"type":"live.subscribe","id":"q","spec":{"kind":"key","pattern":"probe:*"}}),
+    )
+    .await;
+    let subscribed = recv_json(ws).await;
+    assert_eq!(subscribed["type"], "live.subscribed");
+    assert_eq!(subscribed["id"], "q");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_accepts_apikey_query_param() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, Some("secret"));
+
+    let mut ws = connect_live_query(http_port, "apikey=secret")
+        .await
+        .expect("apikey query param should authenticate the handshake");
+    assert_live_subscribes(&mut ws).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_accepts_token_query_param() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, Some("secret"));
+
+    // `token` predates the `apikey` alias; keep it working so an older SDK does
+    // not break against a current engine.
+    let mut ws = connect_live_query(http_port, "token=secret")
+        .await
+        .expect("token query param should still authenticate the handshake");
+    assert_live_subscribes(&mut ws).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_rejects_wrong_query_param_key() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, Some("secret"));
+
+    for query in ["apikey=wrong", "token=wrong", "apikey=", "other=secret"] {
+        let err = connect_live_query(http_port, query)
+            .await
+            .expect_err("bad query credential must not upgrade");
+        assert!(err.contains("401"), "{query}: unexpected error: {err}");
+    }
+}

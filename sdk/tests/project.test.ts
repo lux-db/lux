@@ -669,7 +669,7 @@ describe('Lux project client', () => {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(sockets).toHaveLength(1);
 		expect(sockets[0].url).toBe(
-			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&access_token=user-jwt',
+			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&token=lux_pub_test&access_token=user-jwt',
 		);
 
 		sockets[0].open();
@@ -785,7 +785,9 @@ describe('Lux project client', () => {
 		const livePromise = client.table('messages').live();
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(sockets).toHaveLength(1);
-		expect(sockets[0].url).toBe('ws://localhost:3957/v1/project/live?apikey=lux_pub_test');
+		expect(sockets[0].url).toBe(
+			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&token=lux_pub_test',
+		);
 
 		sockets[0].open();
 		const firstSubscribe = JSON.parse(sockets[0].sent[0]);
@@ -809,7 +811,7 @@ describe('Lux project client', () => {
 
 		expect(sockets).toHaveLength(2);
 		expect(sockets[1].url).toBe(
-			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&access_token=user-jwt',
+			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&token=lux_pub_test&access_token=user-jwt',
 		);
 		sockets[1].open();
 		expect(JSON.parse(sockets[1].sent[0])).toEqual(firstSubscribe);
@@ -871,7 +873,7 @@ describe('Lux project client', () => {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(sockets).toHaveLength(1);
 		expect(sockets[0].url).toBe(
-			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&access_token=user-jwt',
+			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&token=lux_pub_test&access_token=user-jwt',
 		);
 
 		sockets[0].open();
