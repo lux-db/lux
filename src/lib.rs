@@ -4039,7 +4039,14 @@ async fn handle_connection(
     let mut write_buf = BytesMut::with_capacity(65536);
     let mut pending = BytesMut::new();
     let max_resp_request = runtime.config.max_resp_request;
-    let mut session = CommandSession::new(runtime.config.require_auth);
+    // An engine is credential-gated by a password *or* by project keys. Checked
+    // per connection rather than per command: `require_auth` is fixed at startup,
+    // so without this a key-only engine (no LUX_PASSWORD) would leave RESP wide
+    // open, and keys minted at runtime would never start gating it.
+    let mut session = CommandSession::new(
+        runtime.config.require_auth
+            || crate::auth::project_keys_configured(&runtime.store, &runtime.schema_cache),
+    );
     let executor = CommandExecutor::new(
         runtime.store.clone(),
         runtime.broker.clone(),

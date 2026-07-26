@@ -2567,7 +2567,11 @@ fn admin_revoke_key(
         now,
     ) {
         Ok(0) => error(404, "Not Found", "key not found"),
-        Ok(_) => ok(json!({"result":"OK"})),
+        Ok(_) => {
+            // Revocation must take effect now, not when the cache entry ages out.
+            invalidate_api_key_cache();
+            ok(json!({"result":"OK"}))
+        }
         Err(e) => error(400, "Bad Request", &e),
     }
 }
@@ -2749,6 +2753,9 @@ fn insert_api_key(
         ],
         now,
     )?;
+    // A negative result for this key may already be cached (something tried it
+    // before it existed); drop it so the new key works immediately.
+    invalidate_api_key_cache();
     Ok(json!({
         "id": key_id,
         "name": name,
@@ -2761,15 +2768,134 @@ fn insert_api_key(
     }))
 }
 
+/// Which surface a credential is being presented to. The resolver enforces the
+/// surface rule itself so no call site has to remember it: a publishable key is
+/// browser-embedded and must never reach the raw command protocol, where lua,
+/// FLUSHALL and raw KV live and no grant can contain the blast radius.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Surface {
+    /// RESP command protocol. Secret keys and the operator password only.
+    Resp,
+    /// HTTP data routes and the `/live` websocket handshake.
+    Http,
+    /// `/auth/v1/*`, which publishable keys legitimately reach.
+    AuthApi,
+}
+
+/// What a presented credential turned out to be.
+///
+/// This is the *identity* of the caller, not their permissions: `Publishable`
+/// and `User` still answer to grants for every row they touch. Only `Secret` and
+/// `Operator` carry blanket project access.
+#[derive(Clone, Debug)]
+pub(crate) enum Credential {
+    /// No credential presented.
+    Anonymous,
+    /// Browser-safe project key. Reaches auth; reaches data only when an
+    /// end-user token rides along and supplies a principal.
+    Publishable,
+    /// Server-side project key: full project access.
+    Secret,
+    /// End-user access token: subject to grants.
+    User(AuthPrincipal),
+    /// `LUX_PASSWORD`. Break-glass and control-plane operations.
+    Operator,
+}
+
+/// Turn a presented credential into an identity, for any surface.
+///
+/// Every entry point (RESP `AUTH`, HTTP, `/live`, `/auth/v1/*`) funnels through
+/// here. The `_t:` namespace bug was two dispatch paths that had to agree and
+/// silently didn't; one resolver is what keeps that from recurring for auth.
+///
+/// `presented` is the api key or bearer token. `user_token` is a separate
+/// end-user access token when one accompanies a project key (the browser case:
+/// `apikey=lux_pub_...` plus `Authorization: Bearer <jwt>`).
+pub(crate) fn resolve_credential(
+    presented: &str,
+    user_token: &str,
+    surface: Surface,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> Result<Credential, String> {
+    let password = &store.config().password;
+
+    // Operator first: the password is the break-glass path and must keep working
+    // even if auth.keys is unreadable.
+    if !password.is_empty()
+        && !presented.is_empty()
+        && constant_time_eq(presented.as_bytes(), password.as_bytes())
+    {
+        return Ok(Credential::Operator);
+    }
+
+    if !presented.is_empty() {
+        if let Some(kind) = lookup_api_key(presented, store, cache)? {
+            return match (kind, surface) {
+                (ApiKeyKind::Publishable, Surface::Resp) => Err(
+                    "publishable keys cannot use the RESP protocol; use a secret key".to_string(),
+                ),
+                (ApiKeyKind::Publishable, _) => {
+                    // A publishable key alone is an identity of the project, not
+                    // of a person. Data access needs a principal on top.
+                    match resolve_user(user_token, store, cache)? {
+                        Some(principal) => Ok(Credential::User(principal)),
+                        None => Ok(Credential::Publishable),
+                    }
+                }
+                (ApiKeyKind::Secret, _) => Ok(Credential::Secret),
+            };
+        }
+    }
+
+    // No project key matched. An end-user token can still stand on its own.
+    if let Some(principal) = resolve_user(user_token, store, cache)? {
+        return Ok(Credential::User(principal));
+    }
+    if let Some(principal) = resolve_user(presented, store, cache)? {
+        return Ok(Credential::User(principal));
+    }
+
+    Ok(Credential::Anonymous)
+}
+
+/// Validate an end-user access token, if one was supplied and auth is on.
+fn resolve_user(
+    token: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> Result<Option<AuthPrincipal>, String> {
+    if token.is_empty() || !store.config().auth.enabled {
+        return Ok(None);
+    }
+    // A project key in this slot is not a user token; don't report it as a bad
+    // JWT.
+    if token.starts_with("lux_pub_") || token.starts_with("lux_sec_") {
+        return Ok(None);
+    }
+    match authenticate_access_token(token, store, cache) {
+        Ok(principal) => Ok(Some(principal)),
+        Err(e) => Err(e),
+    }
+}
+
+/// The project credential presented on an `/auth/v1/*` request.
+fn presented_key(headers: &[(String, String)]) -> &str {
+    header_value(headers, "apikey")
+        .or_else(|| bearer_token(headers))
+        .unwrap_or("")
+}
+
 fn require_publishable_or_secret(
     headers: &[(String, String)],
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> Result<(), (u16, &'static str, String)> {
-    match api_key_kind(headers, store, cache) {
-        Ok(Some(ApiKeyKind::Publishable | ApiKeyKind::Secret)) => Ok(()),
-        Ok(None) if no_project_keys_configured(store, cache) => Ok(()),
-        Ok(None) => Err(error(
+    match resolve_credential(presented_key(headers), "", Surface::AuthApi, store, cache) {
+        Ok(Credential::Publishable | Credential::Secret | Credential::Operator) => Ok(()),
+        // An engine with no keys configured yet is still open, as before.
+        Ok(_) if no_project_keys_configured(store, cache) => Ok(()),
+        Ok(_) => Err(error(
             401,
             "Unauthorized",
             "missing or invalid auth api key",
@@ -2783,45 +2909,98 @@ fn require_secret(
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> Result<(), (u16, &'static str, String)> {
-    if let Some(password) = bearer_token(headers) {
-        if !store.config().password.is_empty()
-            && constant_time_eq(password.as_bytes(), store.config().password.as_bytes())
-        {
-            return Ok(());
-        }
-    }
-    match api_key_kind(headers, store, cache) {
-        Ok(Some(ApiKeyKind::Secret)) => Ok(()),
+    match resolve_credential(presented_key(headers), "", Surface::AuthApi, store, cache) {
+        Ok(Credential::Secret | Credential::Operator) => Ok(()),
         _ => Err(error(401, "Unauthorized", "secret key required")),
     }
 }
 
-fn api_key_kind(
-    headers: &[(String, String)],
+/// Resolve a raw key string to its kind, or `None` if unknown or revoked. The
+/// single place `auth.keys` is consulted, shared by [`resolve_credential`] and
+/// the `/auth/v1/*` guards.
+fn lookup_api_key(
+    key: &str,
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> Result<Option<ApiKeyKind>, String> {
-    let Some(key) = header_value(headers, "apikey").or_else(|| bearer_token(headers)) else {
-        return Ok(None);
-    };
-
-    let hash = hash_secret(key);
-    let Some(row) = find_row_by_field(store, cache, KEYS_TABLE, "key_hash", &hash, Instant::now())?
-    else {
-        return Ok(None);
-    };
-    if row
-        .get("revoked_at")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-    {
+    if key.is_empty() {
         return Ok(None);
     }
-    Ok(match row.get("kind").map(String::as_str) {
-        Some("publishable") => Some(ApiKeyKind::Publishable),
-        Some("secret") => Some(ApiKeyKind::Secret),
-        _ => None,
-    })
+    let hash = hash_secret(key);
+
+    // HTTP authenticates per request, so an uncached lookup puts a hash plus a
+    // table read on the hot path (measured at roughly +5us/req against the
+    // password memcmp). Cache the resolution briefly. Misses are cached too, so
+    // a client looping with a bad key cannot turn into a read storm.
+    if let Some(kind) = cached_api_key(&hash) {
+        return Ok(kind);
+    }
+
+    let resolved =
+        match find_row_by_field(store, cache, KEYS_TABLE, "key_hash", &hash, Instant::now())? {
+            Some(row)
+                if row
+                    .get("revoked_at")
+                    .map(|v| !v.is_empty() && v != "0")
+                    .unwrap_or(false) =>
+            {
+                None
+            }
+            Some(row) => match row.get("kind").map(String::as_str) {
+                Some("publishable") => Some(ApiKeyKind::Publishable),
+                Some("secret") => Some(ApiKeyKind::Secret),
+                _ => None,
+            },
+            None => None,
+        };
+    store_cached_api_key(hash, resolved);
+    Ok(resolved)
+}
+
+/// How long a resolved key stays cached. The ceiling on revocation latency for
+/// anything that does not go through [`invalidate_api_key_cache`], not the
+/// normal path: minting and revoking both clear the cache outright.
+const API_KEY_CACHE_TTL: Duration = Duration::from_secs(5);
+
+type ApiKeyCache = parking_lot::RwLock<HashMap<String, (Option<ApiKeyKind>, Instant)>>;
+
+fn api_key_cache() -> &'static ApiKeyCache {
+    static CACHE: OnceLock<ApiKeyCache> = OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
+}
+
+/// `Some(kind)` on a live cache hit, `None` when the caller must do the lookup.
+fn cached_api_key(hash: &str) -> Option<Option<ApiKeyKind>> {
+    let cache = api_key_cache().read();
+    let (kind, stored_at) = cache.get(hash)?;
+    if stored_at.elapsed() >= API_KEY_CACHE_TTL {
+        return None;
+    }
+    Some(*kind)
+}
+
+fn store_cached_api_key(hash: String, kind: Option<ApiKeyKind>) {
+    let mut cache = api_key_cache().write();
+    // Bounded so an attacker spraying distinct keys cannot grow it without
+    // limit; the working set is a handful of real keys.
+    if cache.len() > 1024 {
+        cache.retain(|_, (_, stored_at)| stored_at.elapsed() < API_KEY_CACHE_TTL);
+        if cache.len() > 1024 {
+            cache.clear();
+        }
+    }
+    cache.insert(hash, (kind, Instant::now()));
+}
+
+/// Drop every cached resolution. Called whenever a key is minted or revoked so
+/// the TTL is a backstop rather than the mechanism.
+pub(crate) fn invalidate_api_key_cache() {
+    api_key_cache().write().clear();
+}
+
+/// Whether this engine has project keys, i.e. whether key-based auth is in play.
+pub(crate) fn project_keys_configured(store: &Store, cache: &SharedSchemaCache) -> bool {
+    !no_project_keys_configured(store, cache)
 }
 
 fn no_project_keys_configured(store: &Store, cache: &SharedSchemaCache) -> bool {

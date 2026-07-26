@@ -22,6 +22,12 @@ const WEBSOCKET_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 enum HttpAuthContext {
     Anonymous,
+    /// Browser-safe project key with no end-user token behind it. Reaches
+    /// `/auth/v1/*` only; it identifies the project, not a person.
+    Publishable,
+    /// Server-side project key: full project access, same reach as the operator
+    /// password for data.
+    Secret,
     Operator,
     User(crate::auth::AuthPrincipal),
 }
@@ -31,26 +37,12 @@ enum HttpAuthContext {
 /// principals cannot (encrypted columns are omitted from their reads).
 fn decrypt_authorized(ctx: &HttpAuthContext) -> bool {
     match ctx {
-        HttpAuthContext::Operator => true,
+        // A secret key is a server-side credential with full project access, so
+        // it sees plaintext exactly as the operator does.
+        HttpAuthContext::Operator | HttpAuthContext::Secret => true,
         HttpAuthContext::User(p) => !p.is_anonymous,
-        HttpAuthContext::Anonymous => false,
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => false,
     }
-}
-
-/// Constant-time byte comparison to prevent timing attacks on auth tokens.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        let mut _acc = 0u8;
-        for &byte in a {
-            _acc |= byte;
-        }
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Runtime options for the HTTP API listener.
@@ -240,38 +232,70 @@ async fn handle_request(
     } else {
         ""
     };
-    let password_ok = !password.is_empty()
-        && (constant_time_eq(bearer.as_bytes(), password.as_bytes())
-            || constant_time_eq(query_token.as_bytes(), password.as_bytes()));
-    let user_token = if !bearer.is_empty() {
+    // The project credential: `apikey` header, then the /live query param, then
+    // the bearer. The bearer is overloaded -- it can be the operator password, a
+    // project key, or an end-user JWT -- so the resolver sorts it out.
+    let apikey_header = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("apikey"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let presented = if !apikey_header.is_empty() {
+        apikey_header
+    } else if !query_token.is_empty() {
+        query_token
+    } else {
+        bearer
+    };
+    // An end-user token rides *alongside* a project key (the browser case:
+    // `apikey=lux_pub_...` + `Authorization: Bearer <jwt>`). When the bearer is
+    // itself the presented credential, the resolver falls back to trying it as a
+    // user token on its own.
+    let user_token = if !query_access_token.is_empty() {
+        query_access_token
+    } else if presented != bearer {
         bearer
     } else {
-        query_access_token
+        ""
     };
-    let auth_context = if password_ok {
-        HttpAuthContext::Operator
-    } else if store.config().auth.enabled && !user_token.is_empty() {
-        match crate::auth::authenticate_access_token(user_token, store, cache) {
-            Ok(principal) => HttpAuthContext::User(principal),
-            Err(e) => {
-                let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
-                return send_json(socket, 401, "Unauthorized", &body).await;
-            }
+
+    let auth_context = match crate::auth::resolve_credential(
+        presented,
+        user_token,
+        crate::auth::Surface::Http,
+        store,
+        cache,
+    ) {
+        Ok(crate::auth::Credential::Operator) => HttpAuthContext::Operator,
+        Ok(crate::auth::Credential::Secret) => HttpAuthContext::Secret,
+        Ok(crate::auth::Credential::Publishable) => HttpAuthContext::Publishable,
+        Ok(crate::auth::Credential::User(principal)) => HttpAuthContext::User(principal),
+        Ok(crate::auth::Credential::Anonymous) => HttpAuthContext::Anonymous,
+        Err(e) => {
+            let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
+            return send_json(socket, 401, "Unauthorized", &body).await;
         }
-    } else {
-        HttpAuthContext::Anonymous
     };
-    if !password.is_empty() {
-        if !password_ok && !matches!(auth_context, HttpAuthContext::User(_)) {
-            let body = r#"{"error":"unauthorized"}"#;
+
+    // An engine is credential-gated once it has either a password or project
+    // keys. Before that (a bare local engine) it stays open, as it always has.
+    if !password.is_empty() || crate::auth::project_keys_configured(store, cache) {
+        let permitted = match &auth_context {
+            HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::User(_) => true,
+            // A publishable key identifies the project, not a person. It reaches
+            // auth (that is how a person is obtained) and nothing else until an
+            // end-user token makes it a User.
+            HttpAuthContext::Publishable => path.starts_with("/auth/v1"),
+            HttpAuthContext::Anonymous => false,
+        };
+        if !permitted {
+            let body = if matches!(auth_context, HttpAuthContext::Publishable) {
+                r#"{"error":"publishable key cannot access this route without an end-user token"}"#
+            } else {
+                r#"{"error":"unauthorized"}"#
+            };
             return send_json(socket, 401, "Unauthorized", body).await;
         }
-    } else if path == "/live"
-        && store.config().auth.enabled
-        && !matches!(auth_context, HttpAuthContext::User(_))
-    {
-        let body = r#"{"error":"unauthorized"}"#;
-        return send_json(socket, 401, "Unauthorized", body).await;
     }
 
     if method == "GET" && path == "/live" {
@@ -786,7 +810,12 @@ fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
 fn live_auth_principal(auth: &HttpAuthContext) -> Option<crate::auth::AuthPrincipal> {
     match auth {
         HttpAuthContext::User(principal) => Some(principal.clone()),
-        HttpAuthContext::Anonymous | HttpAuthContext::Operator => None,
+        // No principal: Operator/Secret are unfiltered, and Publishable never
+        // reaches /live without an end-user token (rejected at the gate).
+        HttpAuthContext::Anonymous
+        | HttpAuthContext::Operator
+        | HttpAuthContext::Secret
+        | HttpAuthContext::Publishable => None,
     }
 }
 
@@ -805,8 +834,11 @@ fn enforce_table_read(
         return Ok(None);
     }
     match auth {
-        HttpAuthContext::Operator => Ok(None),
-        HttpAuthContext::Anonymous => Err((
+        // Full project access: no row filter.
+        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(None),
+        // Publishable is refused at the gate; deny here too rather than trust
+        // that an upstream caller got it right.
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
             401,
             "Unauthorized",
             r#"{"error":"unauthorized"}"#.to_string(),
@@ -839,8 +871,11 @@ fn enforce_table_insert(
         return Ok(());
     }
     match auth {
-        HttpAuthContext::Operator => Ok(()),
-        HttpAuthContext::Anonymous => Err((
+        // Full project access: no row filter.
+        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(()),
+        // Publishable is refused at the gate; deny here too rather than trust
+        // that an upstream caller got it right.
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
             401,
             "Unauthorized",
             r#"{"error":"unauthorized"}"#.to_string(),
@@ -879,8 +914,11 @@ fn enforce_table_write_where(
         return Ok(None);
     }
     match auth {
-        HttpAuthContext::Operator => Ok(None),
-        HttpAuthContext::Anonymous => Err((
+        // Full project access: no row filter.
+        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(None),
+        // Publishable is refused at the gate; deny here too rather than trust
+        // that an upstream caller got it right.
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
             401,
             "Unauthorized",
             r#"{"error":"unauthorized"}"#.to_string(),
@@ -913,8 +951,11 @@ fn enforce_table_update_check(
         return Ok(());
     }
     match auth {
-        HttpAuthContext::Operator => Ok(()),
-        HttpAuthContext::Anonymous => Err((
+        // Full project access: no row filter.
+        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(()),
+        // Publishable is refused at the gate; deny here too rather than trust
+        // that an upstream caller got it right.
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
             401,
             "Unauthorized",
             r#"{"error":"unauthorized"}"#.to_string(),
@@ -965,7 +1006,7 @@ fn params_with_where(params: &[(String, String)], where_value: &str) -> Vec<(Str
 /// Gate an operator-only route. Under the grant model, token principals have no
 /// access to privileged routes (raw KV, exec, catalog, etc.); only an operator
 /// credential passes. Auth-disabled instances are open.
-fn require_operator(
+fn require_project_access(
     store: &Arc<Store>,
     auth: &HttpAuthContext,
 ) -> Result<(), (u16, &'static str, String)> {
@@ -973,8 +1014,11 @@ fn require_operator(
         return Ok(());
     }
     match auth {
-        HttpAuthContext::Operator => Ok(()),
-        HttpAuthContext::Anonymous => Err((
+        // A secret key is the project's server-side credential; these routes
+        // (exec, raw kv, tables, ts, vectors) are exactly what it exists to
+        // reach. The operator password remains valid as break-glass.
+        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(()),
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
             401,
             "Unauthorized",
             r#"{"error":"unauthorized"}"#.to_string(),
@@ -982,7 +1026,7 @@ fn require_operator(
         HttpAuthContext::User(_) => Err((
             403,
             "Forbidden",
-            r#"{"error":"operator credentials required"}"#.to_string(),
+            r#"{"error":"a secret key is required for this route"}"#.to_string(),
         )),
     }
 }
@@ -2625,8 +2669,8 @@ fn route_request_with_auth(
         &segments[..]
     };
 
-    if route_requires_operator(method, base) {
-        if let Err(response) = require_operator(store, auth) {
+    if route_requires_project_access(method, base) {
+        if let Err(response) = require_project_access(store, auth) {
             return response;
         }
     }
@@ -2997,7 +3041,7 @@ fn route_request_with_auth(
 /// exec, time-series, vectors, table catalog) is off-limits to them. Per-table
 /// data routes (`/tables/{table}` GET/POST/PATCH/DELETE) deliberately return
 /// `false` here so the generic gate defers to the inline grant check.
-fn route_requires_operator(method: &str, base: &[&str]) -> bool {
+fn route_requires_project_access(method: &str, base: &[&str]) -> bool {
     matches!(
         (method, base),
         ("POST", ["exec"])
@@ -3071,7 +3115,7 @@ fn push_register(
     }
     let subject_id = match auth {
         HttpAuthContext::User(principal) => principal.user_id.clone(),
-        HttpAuthContext::Operator => {
+        HttpAuthContext::Operator | HttpAuthContext::Secret => {
             let s = parsed["subject_id"].as_str().unwrap_or("");
             if s.is_empty() {
                 return push_json_error(
@@ -3082,7 +3126,7 @@ fn push_register(
             }
             s.to_string()
         }
-        HttpAuthContext::Anonymous => {
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
             return push_json_error(401, "Unauthorized", "authentication required")
         }
     };
@@ -3112,14 +3156,14 @@ fn push_list_devices(
 ) -> (u16, &'static str, String) {
     let subject_id = match auth {
         HttpAuthContext::User(principal) => principal.user_id.clone(),
-        HttpAuthContext::Operator => {
+        HttpAuthContext::Operator | HttpAuthContext::Secret => {
             let s = get_param(params, "subject_id").unwrap_or("");
             if s.is_empty() {
                 return push_json_error(400, "Bad Request", "subject_id query param is required");
             }
             s.to_string()
         }
-        HttpAuthContext::Anonymous => {
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
             return push_json_error(401, "Unauthorized", "authentication required")
         }
     };
@@ -3141,10 +3185,10 @@ fn push_delete_device(
         HttpAuthContext::User(principal) => {
             crate::push::delete_device(store, cache, &principal.user_id, id, Instant::now())
         }
-        HttpAuthContext::Operator => {
+        HttpAuthContext::Operator | HttpAuthContext::Secret => {
             crate::push::delete_device_by_id(store, cache, id, Instant::now())
         }
-        HttpAuthContext::Anonymous => {
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
             return push_json_error(401, "Unauthorized", "authentication required")
         }
     };
@@ -3733,7 +3777,7 @@ fn route_table_delete(
     // is a schema operation, not row access: operator-only.
     if let Some(val) = get_param(params, "drop") {
         if val == "true" {
-            if let Err((status, status_text, body)) = require_operator(store, auth) {
+            if let Err((status, status_text, body)) = require_project_access(store, auth) {
                 return (status, status_text, body);
             }
             return ok(exec_json(
@@ -4759,7 +4803,7 @@ mod tests {
             ("DELETE", vec!["tables", "messages"]),
         ] {
             assert!(
-                !route_requires_operator(m, &base),
+                !route_requires_project_access(m, &base),
                 "{m} /{} should be grant-gated, not operator-only",
                 base.join("/")
             );
@@ -4786,7 +4830,7 @@ mod tests {
             ("DELETE", vec!["vectors", "idx"]),
         ] {
             assert!(
-                route_requires_operator(m, &base),
+                route_requires_project_access(m, &base),
                 "{m} /{} must be operator-only",
                 base.join("/")
             );
