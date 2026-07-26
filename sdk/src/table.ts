@@ -1,5 +1,4 @@
 import type {
-	KSubEvent,
 	LuxError,
 	LuxResult,
 	TableChangeEvent,
@@ -91,169 +90,10 @@ interface TableHavingCondition {
 interface TableClient {
 	call(command: string, ...args: Array<string | number>): Promise<unknown>;
 	_tselect(args: string[]): Promise<TableRow[]>;
-	_subscribePattern(pattern: string, handler: (event: KSubEvent) => void): Promise<() => void>;
 }
 
 export interface TableQueryBuilderOptions<T extends object> {
 	schema?: TableSchema<T>;
-}
-
-export class TableSubscription<T extends object> {
-	private client: TableClient;
-	private table: string;
-	private selectArgsBuilder: (extra?: TableWhereCondition[]) => string[];
-	private handlers: {
-		change: Array<(event: TableChangeEvent<T>) => void>;
-		insert: Array<(event: TableChangeEvent<T>) => void>;
-		update: Array<(event: TableChangeEvent<T>) => void>;
-		delete: Array<(event: TableChangeEvent<T>) => void>;
-		error: Array<(event: TableErrorEvent) => void>;
-	} = {
-		change: [],
-		insert: [],
-		update: [],
-		delete: [],
-		error: [],
-	};
-	private knownRows = new Map<string, T>();
-	private unsubscribeFn: (() => void) | null = null;
-	private initError: LuxError | null;
-
-	constructor(
-		client: TableClient,
-		table: string,
-		selectArgsBuilder: (extra?: TableWhereCondition[]) => string[],
-		initError: LuxError | null = null,
-	) {
-		this.client = client;
-		this.table = table;
-		this.selectArgsBuilder = selectArgsBuilder;
-		this.initError = initError;
-		void this.start();
-	}
-
-	on(event: 'insert' | 'update' | 'delete' | 'change', handler: (event: TableChangeEvent<T>) => void): this;
-	on(event: 'error', handler: (event: TableErrorEvent) => void): this;
-	on(
-		event: TableChangeType,
-		handler: ((event: TableChangeEvent<T>) => void) | ((event: TableErrorEvent) => void),
-	): this {
-		(this.handlers[event] as Array<typeof handler>).push(handler);
-		return this;
-	}
-
-	async unsubscribe(): Promise<void> {
-		if (this.unsubscribeFn) {
-			this.unsubscribeFn();
-			this.unsubscribeFn = null;
-		}
-	}
-
-	private emitError(error: LuxError): void {
-		for (const handler of this.handlers.error) {
-			handler({ type: 'error', table: this.table, error });
-		}
-	}
-
-	private emitChange(event: TableChangeEvent<T>): void {
-		for (const handler of this.handlers.change) handler(event);
-		for (const handler of this.handlers[event.type]) handler(event);
-	}
-
-	private extractPkFromKey(key: string): string | null {
-		const prefix = `_t:${this.table}:row:`;
-		if (!key.startsWith(prefix)) return null;
-		return key.slice(prefix.length);
-	}
-
-	private async fetchMatches(extra?: TableWhereCondition[]): Promise<T[]> {
-		const args = this.selectArgsBuilder(extra);
-		const rows = await this.client._tselect(args);
-		return rows as T[];
-	}
-
-	private async start(): Promise<void> {
-		if (this.initError) {
-			this.emitError(this.initError);
-			return;
-		}
-
-		try {
-			const initial = await this.fetchMatches();
-			for (const row of initial) {
-				const id = (row as { id?: number | string }).id;
-				if (id == null) continue;
-				this.knownRows.set(String(id), row);
-			}
-
-			const pattern = `_t:${this.table}:row:*`;
-			this.unsubscribeFn = await this.client._subscribePattern(pattern, (raw) => {
-				void this.handleRawChange(raw);
-			});
-		} catch (error) {
-			this.emitError(toLuxError(error, 'LUX_SUBSCRIBE_INIT_ERROR'));
-		}
-	}
-
-	private async handleRawChange(raw: KSubEvent): Promise<void> {
-		const pk = this.extractPkFromKey(raw.key);
-		if (!pk) return;
-
-		try {
-			const previous = this.knownRows.get(pk) ?? null;
-			const rows = await this.fetchMatches([{ field: 'id', op: '=', value: pk }]);
-			const next = rows[0] ?? null;
-
-			if (!previous && !next) return;
-
-			if (!previous && next) {
-				this.knownRows.set(pk, next);
-				this.emitChange({
-					type: 'insert',
-					table: this.table,
-					pk,
-					operation: raw.operation,
-					new: next,
-					old: null,
-					raw,
-				});
-				return;
-			}
-
-			if (previous && !next) {
-				this.knownRows.delete(pk);
-				this.emitChange({
-					type: 'delete',
-					table: this.table,
-					pk,
-					operation: raw.operation,
-					new: null,
-					old: previous,
-					raw,
-				});
-				return;
-			}
-
-			if (!previous || !next) return;
-
-			this.knownRows.set(pk, next);
-			const previousRow = previous as Record<string, unknown>;
-			const nextRow = next as Record<string, unknown>;
-			const changed = Object.keys(nextRow).filter((key) => previousRow[key] !== nextRow[key]);
-			this.emitChange({
-				type: 'update',
-				table: this.table,
-				pk,
-				operation: raw.operation,
-				new: next,
-				old: previous,
-				changed,
-				raw,
-			});
-		} catch (error) {
-			this.emitError(toLuxError(error, 'LUX_SUBSCRIBE_EVENT_ERROR'));
-		}
-	}
 }
 
 /**
@@ -680,9 +520,5 @@ export class TableQueryBuilder<T extends object = TableRow> {
 		} catch (error) {
 			return err('TDELETE_ERROR', `Failed to delete from '${this.name}'`, toLuxError(error));
 		}
-	}
-
-	subscribe(): TableSubscription<T> {
-		return new TableSubscription<T>(this.client, this.name, (extra) => this.buildSelectArgs(extra));
 	}
 }

@@ -2,7 +2,6 @@ import Redis, { type RedisOptions } from 'ioredis';
 import { LuxAuthClient, type LuxAuthOptions } from './auth';
 import { createProjectClient, LuxProjectClient, type LuxProjectOptions } from './project';
 import { TimeSeriesNamespace, VectorNamespace } from './namespaces';
-import { LuxRealtimeManager } from './realtime';
 import { TableQueryBuilder, type TableQueryBuilderOptions } from './table';
 import type {
 	KSubEvent,
@@ -99,7 +98,7 @@ export type {
 	TSSample,
 	VSearchResult,
 } from './types';
-export { TableQueryBuilder, TableSubscription } from './table';
+export { TableQueryBuilder } from './table';
 export type { TableQueryBuilderOptions } from './table';
 
 export type LuxClientOptions = RedisOptions & LuxAuthOptions;
@@ -139,7 +138,6 @@ export class Lux extends Redis {
 	timeseries: TimeSeriesNamespace;
 	auth: LuxAuthNamespace;
 	authApi: LuxAuthClient;
-	private realtimeManager?: LuxRealtimeManager;
 	/** Per-table set of JSON/ARRAY column names, so reads decode them to objects. */
 	private jsonColsCache = new Map<string, Set<string>>();
 
@@ -164,13 +162,6 @@ export class Lux extends Redis {
 		options?: TableQueryBuilderOptions<LuxTypedRow<T>>,
 	): TableQueryBuilder<LuxTypedRow<T>> {
 		return new TableQueryBuilder<LuxTypedRow<T>>(this, name, options);
-	}
-
-	async _subscribePattern(pattern: string, handler: (event: KSubEvent) => void): Promise<() => void> {
-		if (!this.realtimeManager) {
-			this.realtimeManager = new LuxRealtimeManager(this);
-		}
-		return this.realtimeManager.subscribe(pattern, handler);
 	}
 
 	async _tselect(args: string[]): Promise<TableRow[]> {

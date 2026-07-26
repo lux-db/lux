@@ -88,7 +88,7 @@ export type {
 	TSSample,
 	VSearchResult,
 } from './types';
-export { TableQueryBuilder, TableSubscription } from './table';
+export { TableQueryBuilder } from './table';
 export type { TableQueryBuilderOptions } from './table';
 
 /**
