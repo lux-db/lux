@@ -103,7 +103,7 @@ Lux Cloud is the fastest path when you want to build an app backend around Lux w
 - **Zero-copy parser** -- RESP arguments are byte slices into the read buffer
 - **Pipeline batching** -- consecutive same-shard commands batched under a single lock
 - **Persistence** -- automatic snapshots, write-ahead log (WAL) with CRC32 checksums, tiered hot/cold storage with automatic eviction to disk
-- **Auth** -- password authentication via `LUX_PASSWORD`, plus optional app auth with users, identities, sessions, OAuth providers, JWTs, auth-owned system tables, and per-table row-level grants (`GRANT read, write ON t WHERE user_id = auth.uid()`) that gate reads, writes, and `.live()`
+- **Auth** -- project secret/publishable keys or the `LUX_PASSWORD` operator credential, plus optional app auth with users, identities, sessions, OAuth providers, JWTs, auth-owned system tables, and per-table row-level grants (`GRANT read, write ON t WHERE user_id = auth.uid()`) that gate reads, writes, and `.live()`
 - **Pub/Sub** -- SUBSCRIBE, PSUBSCRIBE, PUBLISH, plus KSUB/KUNSUB for realtime key change events
 - **TTL support** -- EX, PX, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL
 - **MIT licensed** -- no license rug-pulls, unlike Redis (RSALv2/SSPL)
@@ -512,16 +512,23 @@ curl -X POST http://localhost:5890/v1/exec \
   -d '{"command":["HSET","user:1","name","alice"]}'
 ```
 
-Auth via `Authorization: Bearer <password>` when `LUX_PASSWORD` is set. CORS enabled by default. 174K ops/sec at 256 concurrent connections with keep-alive.
+Auth via `Authorization: Bearer <credential>` where the credential is a project secret key (`lux_sec_*`) or the operator password. CORS enabled by default. 174K ops/sec at 256 concurrent connections with keep-alive.
 
 ### App Auth
 
-Lux can also expose a Supabase-style app auth surface. This is optional and is separate from the database password:
+Lux can also expose a Supabase-style app auth surface. Project keys are engine
+credentials in their own right, so one secret key covers auth, data, native
+commands, vectors, pubsub, lua and `.live()`:
 
-- `LUX_PASSWORD` protects direct RESP/admin HTTP access.
+- `LUX_PASSWORD` is the operator/break-glass credential; it still works everywhere.
 - `LUX_AUTH_ENABLED=true` creates and serves app auth endpoints.
 - `LUX_AUTH_PUBLISHABLE_KEY` is safe for browser/client auth calls.
-- `LUX_AUTH_SECRET_KEY` is for trusted servers and admin auth operations.
+- `LUX_AUTH_SECRET_KEY` is the server-side credential: full project access on
+  every surface, including RESP.
+
+An engine is credential-gated once it has a password *or* project keys.
+Publishable keys never reach RESP and, on HTTP, reach only `/auth/v1/*` until a
+signed-in user's JWT accompanies them; grants then decide which rows.
 
 ```bash
 LUX_HTTP_PORT=5890 \
@@ -567,7 +574,7 @@ curl -X PUT http://localhost:5890/auth/v1/admin/providers/google \
   }'
 ```
 
-Use `createBrowserClient(url, publishableKey)` in browsers and `createClient(url, secretKey)` on trusted servers. Browser live subscriptions use the publishable key plus the signed-in user's JWT; direct RESP access still uses the database password.
+Use `createBrowserClient(url, publishableKey)` in browsers and `createClient(url, secretKey)` on trusted servers. Browser live subscriptions use the publishable key plus the signed-in user's JWT. Direct RESP access takes the secret key (`AUTH lux_sec_...`) or the operator password.
 
 #### Grants (row-level access)
 
@@ -593,7 +600,7 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 |----------|---------|-------------|
 | `LUX_PORT` | `6379` | RESP (Redis-compatible) TCP port |
 | `LUX_HTTP_PORT` | (disabled) | HTTP API port (set to enable; `lux start` defaults it to `5890`) |
-| `LUX_PASSWORD` | (none) | Enable AUTH (applies to both RESP and HTTP) |
+| `LUX_PASSWORD` | (none) | Operator/break-glass AUTH (RESP and HTTP). Project keys also gate the engine |
 | `LUX_DATA_DIR` | `.` | Snapshot directory |
 | `LUX_SAVE_INTERVAL` | `60` | Snapshot interval in seconds (0 to disable) |
 | `LUX_SHARDS` | auto | Shard count (default: num_cpus * 16) |
