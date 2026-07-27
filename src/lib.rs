@@ -177,14 +177,14 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            issuer: "http://localhost:7379/auth/v1".to_string(),
+            issuer: "http://localhost:5890/auth/v1".to_string(),
             access_token_ttl: Duration::from_secs(3600),
             refresh_token_ttl: Duration::from_secs(30 * 24 * 60 * 60),
             email_password_enabled: true,
             email_confirmation_required: false,
             anonymous_enabled: true,
             flow_token_ttl: Duration::from_secs(24 * 60 * 60),
-            site_url: "http://localhost:7379".to_string(),
+            site_url: "http://localhost:5890".to_string(),
             initial_publishable_key: None,
             initial_secret_key: None,
             managed_email: None,

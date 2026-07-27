@@ -3747,7 +3747,22 @@ fn validate_auth_redirect(redirect: &str, settings: &AuthSettings) -> Result<Str
         return Ok(redirect);
     }
     let Some(target_origin) = url_origin(&redirect) else {
-        return Err("redirect URL must be relative or absolute http(s) URL".to_string());
+        // A custom scheme (`myapp://auth/callback`) has no http(s) origin, so it
+        // can only ever match an allow-list entry exactly. Native OAuth needs
+        // one of these or a universal link, and the allow list is the security
+        // boundary: an unlisted scheme is still refused. Without this the allow
+        // list accepted a value that `authorize` then rejected at sign-in time.
+        if settings
+            .redirect_allow_list
+            .iter()
+            .any(|allowed| allowed.trim() == redirect)
+        {
+            return Ok(redirect);
+        }
+        return Err(
+            "redirect URL must be relative, http(s), or a custom scheme on the redirect allow list"
+                .to_string(),
+        );
     };
     if url_origin(&settings.site_url).as_deref() == Some(target_origin.as_str()) {
         return Ok(redirect);
@@ -7438,5 +7453,77 @@ mod tests {
             user.get("email").map(String::as_str),
             Some("wal@example.com")
         );
+    }
+}
+
+#[cfg(test)]
+mod redirect_validation_tests {
+    use super::*;
+
+    fn settings(site_url: &str, allow: &[&str]) -> AuthSettings {
+        AuthSettings {
+            email_confirmation_required: false,
+            flow_token_ttl: Duration::from_secs(3600),
+            site_url: site_url.to_string(),
+            redirect_allow_list: allow.iter().map(|s| s.to_string()).collect(),
+            email_provider: "console".to_string(),
+            email_from: None,
+            email_reply_to: None,
+            email_postmark_server_token: None,
+            email_postmark_message_stream: "outbound".to_string(),
+            email_app_name: "Lux".to_string(),
+            email_from_name: None,
+        }
+    }
+
+    /// The allow list used to accept a custom scheme that `authorize` then
+    /// refused, so the setting looked configured and failed at sign-in on a
+    /// phone. Native OAuth needs custom schemes, and the allow list is the
+    /// security boundary, so an explicitly listed one is honoured.
+    #[test]
+    fn allow_listed_custom_scheme_is_accepted() {
+        let s = settings("http://localhost:5990", &["vigil://auth/callback"]);
+        assert_eq!(
+            validate_auth_redirect("vigil://auth/callback", &s).unwrap(),
+            "vigil://auth/callback"
+        );
+    }
+
+    #[test]
+    fn unlisted_custom_scheme_is_still_refused() {
+        let s = settings("http://localhost:5990", &["vigil://auth/callback"]);
+        let err = validate_auth_redirect("evil://auth/callback", &s).unwrap_err();
+        assert!(err.contains("allow list"), "unexpected error: {err}");
+
+        // And with no allow list at all.
+        let s = settings("http://localhost:5990", &[]);
+        assert!(validate_auth_redirect("vigil://auth/callback", &s).is_err());
+    }
+
+    /// A custom scheme matches only exactly: it has no origin to compare, so
+    /// prefix games must not get through.
+    #[test]
+    fn custom_scheme_matches_exactly_not_by_prefix() {
+        let s = settings("http://localhost:5990", &["vigil://auth/callback"]);
+        for attempt in [
+            "vigil://auth/callback/../elsewhere",
+            "vigil://auth/callbackevil",
+            "vigil://evil",
+            "vigil://auth",
+        ] {
+            assert!(
+                validate_auth_redirect(attempt, &s).is_err(),
+                "{attempt} must not match the allow-listed scheme"
+            );
+        }
+    }
+
+    #[test]
+    fn http_and_relative_redirects_still_behave() {
+        let s = settings("http://localhost:5990", &["http://localhost:3000/cb"]);
+        assert!(validate_auth_redirect("/dashboard", &s).is_ok());
+        assert!(validate_auth_redirect("http://localhost:5990/anything", &s).is_ok());
+        assert!(validate_auth_redirect("http://localhost:3000/cb", &s).is_ok());
+        assert!(validate_auth_redirect("http://evil.example/cb", &s).is_err());
     }
 }

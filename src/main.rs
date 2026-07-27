@@ -72,6 +72,16 @@ async fn async_main() -> std::io::Result<()> {
 
     let encryption = encryption_config_from_env()?;
 
+    // `site_url` and `issuer` default to the address this engine actually serves
+    // HTTP on. They used to hardcode port 7379, which is not the RESP port, the
+    // HTTP port, or the Studio port -- a default that looked derived and was not.
+    let auth_http_port = std::env::var("LUX_HTTP_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(5890);
+    let auth_base_url = format!("http://localhost:{auth_http_port}");
+
     let config = lux::ServerConfig {
         bind_host: std::env::var("LUX_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
         port: std::env::var("LUX_PORT")
@@ -119,7 +129,7 @@ async fn async_main() -> std::io::Result<()> {
         auth: lux::AuthConfig {
             enabled: auth_enabled,
             issuer: std::env::var("LUX_AUTH_ISSUER")
-                .unwrap_or_else(|_| "http://localhost:7379/auth/v1".to_string()),
+                .unwrap_or_else(|_| format!("{auth_base_url}/auth/v1")),
             access_token_ttl: std::time::Duration::from_secs(auth_access_token_ttl),
             refresh_token_ttl: std::time::Duration::from_secs(auth_refresh_token_ttl),
             email_password_enabled: std::env::var("LUX_AUTH_EMAIL_PASSWORD").map_or(true, |v| {
@@ -141,8 +151,7 @@ async fn async_main() -> std::io::Result<()> {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(24 * 60 * 60),
             ),
-            site_url: std::env::var("LUX_AUTH_SITE_URL")
-                .unwrap_or_else(|_| "http://localhost:7379".to_string()),
+            site_url: std::env::var("LUX_AUTH_SITE_URL").unwrap_or_else(|_| auth_base_url.clone()),
             initial_publishable_key: std::env::var("LUX_AUTH_PUBLISHABLE_KEY").ok(),
             initial_secret_key: std::env::var("LUX_AUTH_SECRET_KEY").ok(),
             managed_email,
