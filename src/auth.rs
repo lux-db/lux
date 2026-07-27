@@ -7479,7 +7479,7 @@ mod redirect_validation_tests {
     /// The allow list used to accept a custom scheme that `authorize` then
     /// refused, so the setting looked configured and failed at sign-in on a
     /// phone. Native OAuth needs custom schemes, and the allow list is the
-    /// security boundary, so an explicitly listed one is honoured.
+    /// security boundary, so an explicitly listed one is honored.
     #[test]
     fn allow_listed_custom_scheme_is_accepted() {
         let s = settings("http://localhost:5990", &["vigil://auth/callback"]);
