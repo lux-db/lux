@@ -418,9 +418,21 @@ fn validate_listener_security(config: &ServerConfig) -> std::io::Result<()> {
         return Ok(());
     }
 
-    let resp_exposed_without_auth =
-        config.enable_resp && (config.password.is_empty() || !config.require_auth);
-    let http_exposed_without_auth = config.http_port != 0 && config.password.is_empty();
+    // A project key is a credential in its own right, so a key-only engine (one
+    // with no LUX_PASSWORD) is authenticated and may bind a public interface.
+    // Judging this by the password alone would refuse to start exactly the
+    // configuration the unified credential model is moving towards.
+    //
+    // Publishable keys do not count for RESP: they can never use that protocol,
+    // so a publishable-only engine really would be unauthenticated there.
+    let resp_authenticated = (!config.password.is_empty() && config.require_auth)
+        || config.auth.initial_secret_key.is_some();
+    let http_authenticated = !config.password.is_empty()
+        || config.auth.initial_secret_key.is_some()
+        || config.auth.initial_publishable_key.is_some();
+
+    let resp_exposed_without_auth = config.enable_resp && !resp_authenticated;
+    let http_exposed_without_auth = config.http_port != 0 && !http_authenticated;
     if resp_exposed_without_auth || http_exposed_without_auth {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -4039,7 +4051,14 @@ async fn handle_connection(
     let mut write_buf = BytesMut::with_capacity(65536);
     let mut pending = BytesMut::new();
     let max_resp_request = runtime.config.max_resp_request;
-    let mut session = CommandSession::new(runtime.config.require_auth);
+    // An engine is credential-gated by a password *or* by project keys. Checked
+    // per connection rather than per command: `require_auth` is fixed at startup,
+    // so without this a key-only engine (no LUX_PASSWORD) would leave RESP wide
+    // open, and keys minted at runtime would never start gating it.
+    let mut session = CommandSession::new(
+        runtime.config.require_auth
+            || crate::auth::project_keys_configured(&runtime.store, &runtime.schema_cache),
+    );
     let executor = CommandExecutor::new(
         runtime.store.clone(),
         runtime.broker.clone(),
@@ -4924,5 +4943,72 @@ mod tx_tests {
             assert!(tx_error, "{command} should mark the transaction dirty");
             assert!(tx_queue.is_empty(), "{command} should not be queued");
         }
+    }
+}
+
+#[cfg(test)]
+mod listener_security_tests {
+    use super::*;
+
+    /// A public-interface config with no credentials at all.
+    fn public_config() -> ServerConfig {
+        ServerConfig {
+            bind_host: "0.0.0.0".to_string(),
+            enable_resp: true,
+            http_port: 8080,
+            password: String::new(),
+            require_auth: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn refuses_public_listener_with_no_credentials() {
+        assert!(validate_listener_security(&public_config()).is_err());
+    }
+
+    #[test]
+    fn allows_public_listener_with_a_password() {
+        let mut config = public_config();
+        config.password = "s3cret".to_string();
+        config.require_auth = true;
+        assert!(validate_listener_security(&config).is_ok());
+    }
+
+    /// The key-only shape the credential model moves towards: a secret key and
+    /// no password. Judging this by the password alone would refuse to boot a
+    /// perfectly authenticated engine.
+    #[test]
+    fn allows_public_listener_with_only_a_secret_key() {
+        let mut config = public_config();
+        config.auth.initial_secret_key = Some("lux_sec_listener".to_string());
+        assert!(
+            validate_listener_security(&config).is_ok(),
+            "a secret key is a credential; key-only engines must be able to bind"
+        );
+    }
+
+    /// Publishable keys cannot use RESP, so a publishable-only engine really is
+    /// unauthenticated there and must still be refused.
+    #[test]
+    fn refuses_public_resp_listener_with_only_a_publishable_key() {
+        let mut config = public_config();
+        config.auth.initial_publishable_key = Some("lux_pub_listener".to_string());
+        assert!(validate_listener_security(&config).is_err());
+
+        // HTTP alone is fine: publishable is a real credential there.
+        config.enable_resp = false;
+        assert!(validate_listener_security(&config).is_ok());
+    }
+
+    #[test]
+    fn loopback_and_explicit_opt_out_still_bypass_the_check() {
+        let mut config = public_config();
+        config.bind_host = "127.0.0.1".to_string();
+        assert!(validate_listener_security(&config).is_ok());
+
+        let mut config = public_config();
+        config.allow_insecure_no_auth = true;
+        assert!(validate_listener_security(&config).is_ok());
     }
 }

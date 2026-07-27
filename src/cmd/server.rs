@@ -186,21 +186,41 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub fn cmd_auth(args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+pub fn cmd_auth(
+    args: &[&[u8]],
+    store: &Store,
+    cache: &crate::tables::SharedSchemaCache,
+    out: &mut BytesMut,
+    _now: Instant,
+) -> CmdResult {
     if args.len() < 2 {
         resp::write_error(out, "ERR wrong number of arguments for 'auth' command");
         return CmdResult::Written;
     }
-    let expected = &store.config().password;
-    if expected.is_empty() {
+    // RESP accepts the operator password or a secret key. A publishable key is
+    // browser-embedded and must never reach this protocol, so the resolver
+    // rejects it for `Surface::Resp` and we surface that reason verbatim.
+    let presented = arg_str(args[1]);
+    let no_credentials =
+        store.config().password.is_empty() && !crate::auth::project_keys_configured(store, cache);
+    if no_credentials {
         resp::write_error(out, "ERR Client sent AUTH, but no password is set");
-    } else if constant_time_eq(arg_str(args[1]).as_bytes(), expected.as_bytes()) {
-        resp::write_ok(out);
-        return CmdResult::Authenticated;
-    } else {
-        resp::write_error(out, "WRONGPASS invalid password");
+        return CmdResult::Written;
     }
-    CmdResult::Written
+    match crate::auth::resolve_credential(presented, "", crate::auth::Surface::Resp, store, cache) {
+        Ok(crate::auth::Credential::Operator | crate::auth::Credential::Secret) => {
+            resp::write_ok(out);
+            CmdResult::Authenticated
+        }
+        Err(e) => {
+            resp::write_error(out, &format!("WRONGPASS {e}"));
+            CmdResult::Written
+        }
+        Ok(_) => {
+            resp::write_error(out, "WRONGPASS invalid password");
+            CmdResult::Written
+        }
+    }
 }
 
 pub fn cmd_config(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
