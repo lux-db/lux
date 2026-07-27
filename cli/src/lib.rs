@@ -3485,28 +3485,38 @@ async fn ensure_migrations_table(target: &mut MigrateTarget) {
     }
 }
 
+/// Only the filename is needed to decide what is pending. Selecting `*` also
+/// pulls `body`, the full source of every migration, which grows the response
+/// until the exec endpoint times out. That timeout used to be swallowed and
+/// reported as "0 applied", so every migration looked pending, re-running
+/// replayed them all and died on `table already exists`.
+const APPLIED_MIGRATIONS_QUERY: &str = "TSELECT filename FROM __migrations LIMIT 10000";
+
 async fn get_applied_migrations(target: &mut MigrateTarget) -> Result<HashSet<String>, String> {
-    // Probe reachability/auth first. A failing PING is fatal and must surface;
-    // errors from the TSELECT below are treated as "no __migrations table yet"
-    // (0 applied). Without this, an unreachable or unauthenticated target was
-    // silently reported as "all pending" (which masked a real control-plane bug).
+    // Probe reachability/auth first. A failing PING is fatal and must surface.
     target.exec("PING").await?;
+
+    // A missing table means nothing has been applied yet, which is a legitimate
+    // empty set. Any other read failure is fatal: reporting it as "0 applied" is
+    // what turns a transient error into a destructive replay.
+    if target.exec("TSCHEMA __migrations").await.is_err() {
+        return Ok(HashSet::new());
+    }
 
     let mut applied = HashSet::new();
 
     match target {
         MigrateTarget::Direct(conn) => {
-            if let Ok(rows) = conn
-                .exec_table_rows("TSELECT * FROM __migrations ORDER BY applied_at ASC LIMIT 1000")
-            {
-                // Each row: ["field", value, "field", value, ...]
-                for row in &rows {
-                    for i in 0..row.len().saturating_sub(1) {
-                        if row[i] == "filename" {
-                            let name = &row[i + 1];
-                            if !name.is_empty() {
-                                applied.insert(name.clone());
-                            }
+            let rows = conn
+                .exec_table_rows(APPLIED_MIGRATIONS_QUERY)
+                .map_err(|e| format!("could not read applied migrations: {e}"))?;
+            // Each row: ["field", value, "field", value, ...]
+            for row in &rows {
+                for i in 0..row.len().saturating_sub(1) {
+                    if row[i] == "filename" {
+                        let name = &row[i + 1];
+                        if !name.is_empty() {
+                            applied.insert(name.clone());
                         }
                     }
                 }
@@ -3518,25 +3528,24 @@ async fn get_applied_migrations(target: &mut MigrateTarget) -> Result<HashSet<St
             token,
             instance_id,
         } => {
-            if let Ok(body) = exec_command_json(
+            let body = exec_command_json(
                 client,
                 api_url,
                 token,
                 instance_id,
-                "TSELECT * FROM __migrations ORDER BY applied_at ASC LIMIT 1000",
+                APPLIED_MIGRATIONS_QUERY,
             )
             .await
-            {
-                // API returns [["field", "val", ...], ...]
-                if let Some(rows) = body.as_array() {
-                    for row in rows {
-                        if let Some(fields) = row.as_array() {
-                            for i in 0..fields.len().saturating_sub(1) {
-                                if fields[i].as_str() == Some("filename") {
-                                    if let Some(name) = fields[i + 1].as_str() {
-                                        if !name.is_empty() {
-                                            applied.insert(name.to_string());
-                                        }
+            .map_err(|e| format!("could not read applied migrations: {e}"))?;
+            // API returns [["field", "val", ...], ...]
+            if let Some(rows) = body.as_array() {
+                for row in rows {
+                    if let Some(fields) = row.as_array() {
+                        for i in 0..fields.len().saturating_sub(1) {
+                            if fields[i].as_str() == Some("filename") {
+                                if let Some(name) = fields[i + 1].as_str() {
+                                    if !name.is_empty() {
+                                        applied.insert(name.to_string());
                                     }
                                 }
                             }
