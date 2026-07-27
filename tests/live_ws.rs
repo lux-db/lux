@@ -1199,3 +1199,102 @@ async fn live_websocket_rejects_wrong_query_param_key() {
         assert!(err.contains("401"), "{query}: unexpected error: {err}");
     }
 }
+
+// --- Secret key on /live ------------------------------------------------------
+//
+// A secret key is the server-side credential, so it must reach the live socket
+// on its own. Before the unified model the engine only knew the password, so a
+// server-side client could not subscribe at all and had to be given a session
+// (or hand-roll RESP pub/sub) instead.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_accepts_secret_key() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux_with_env(
+        resp_port,
+        http_port,
+        None,
+        &[
+            ("LUX_AUTH_ENABLED", "1"),
+            ("LUX_AUTH_SECRET_KEY", "lux_sec_livetest"),
+            ("LUX_AUTH_PUBLISHABLE_KEY", "lux_pub_livetest"),
+        ],
+    );
+
+    // Both the header and the query-param handshake, since the SDK uses the
+    // latter and browsers cannot set headers.
+    let mut ws = connect_live(http_port, Some("lux_sec_livetest")).await;
+    assert_live_subscribes(&mut ws).await;
+
+    let mut ws = connect_live_query(http_port, "apikey=lux_sec_livetest")
+        .await
+        .expect("secret key should authenticate the /live handshake");
+    assert_live_subscribes(&mut ws).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_secret_key_subscribes_to_a_table() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux_with_env(
+        resp_port,
+        http_port,
+        None,
+        &[
+            ("LUX_AUTH_ENABLED", "1"),
+            ("LUX_AUTH_SECRET_KEY", "lux_sec_livetest"),
+        ],
+    );
+
+    // Create the table over HTTP with the same key, which also demonstrates the
+    // point: one secret key covers both the data route and the live socket.
+    let (status, created) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"notes","columns":[{"name":"id","type":"STR","primaryKey":true},{"name":"body","type":"STR"}]}"#,
+        Some("lux_sec_livetest"),
+    );
+    assert!(
+        status < 400,
+        "create table with secret key: {status} {created}"
+    );
+
+    let mut ws = connect_live_query(http_port, "apikey=lux_sec_livetest")
+        .await
+        .expect("secret key handshake");
+    send_json(
+        &mut ws,
+        json!({"type":"live.subscribe","id":"t","spec":{"kind":"table","table":"notes","select":"*"}}),
+    )
+    .await;
+    let subscribed = recv_json(&mut ws).await;
+    assert_eq!(
+        subscribed["type"], "live.subscribed",
+        "secret key must open a table subscription: {subscribed}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_refuses_publishable_key_without_a_user() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux_with_env(
+        resp_port,
+        http_port,
+        None,
+        &[
+            ("LUX_AUTH_ENABLED", "1"),
+            ("LUX_AUTH_SECRET_KEY", "lux_sec_livetest"),
+            ("LUX_AUTH_PUBLISHABLE_KEY", "lux_pub_livetest"),
+        ],
+    );
+
+    // Publishable identifies the project, not a person. Without an end-user
+    // token there is no principal to evaluate grants against, so no data.
+    let err = connect_live_query(http_port, "apikey=lux_pub_livetest")
+        .await
+        .expect_err("publishable alone must not open a live socket");
+    assert!(err.contains("401"), "unexpected error: {err}");
+}

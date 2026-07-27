@@ -1646,7 +1646,7 @@ pub fn execute(
     };
 
     if cmd_eq(cmd, b"AUTH") {
-        return server::cmd_auth(args, store, out, now);
+        return server::cmd_auth(args, store, cache, out, now);
     }
 
     // Reserve the internal table-storage namespace ("_t:") from direct command
