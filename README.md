@@ -332,17 +332,20 @@ lux start                              # run a local engine + Studio (web UI) in
 lux studio                             # open Lux Studio against the local engine
 lux stop                               # stop the local engine + Studio
 lux login                              # authenticate with a lux_ token
-lux link my-app                        # save a default project for this repo
+lux link my-app                        # associate this repo with a cloud project
+lux target                             # show local, linked-cloud, and app-env targets
 lux projects                           # list projects
 lux create my-app --accept-charges     # create a new project
-lux status                             # show linked project status and metrics
+lux status                             # show local engine status
+lux status my-app                      # show explicit cloud status and metrics
 lux exec my-app SET hello world        # run a command
-lux logs                               # fetch linked project logs
-lux restart                            # restart linked project
+lux logs my-app                        # fetch explicit cloud project logs
+lux restart my-app                     # restart explicit cloud project
 lux connect my-app                     # interactive REPL via cloud
 lux connect lux://localhost:6379       # connect to local instance
 lux keys list                          # list project API keys
-lux env pull                           # write .env.local for the linked project
+lux env pull my-app                    # save a private cloud env profile
+lux env use my-app                     # safely activate its Lux variables
 lux destroy my-app --accept-consequences  # delete project
 ```
 

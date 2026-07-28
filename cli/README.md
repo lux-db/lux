@@ -52,26 +52,33 @@ lux studio                                    # open Lux Studio (local web UI)
 lux stop                                      # stop the local engine + Studio
 lux login                                     # authenticate
 lux logout                                    # clear credentials
-lux link my-app                               # save a default project for this repo
+lux link my-app                               # associate this repo with a cloud project
+lux unlink                                    # remove the cloud association
+lux target                                    # show local, linked-cloud, and app-env targets
 lux projects                                  # list all projects
 lux create my-app --accept-charges            # create a Standard project
-lux status                                    # show linked project status and live metrics
+lux status                                    # show local engine status
+lux status my-app                             # show explicit cloud project status
+lux status --all                              # show local + linked cloud together
 lux exec my-app SET hello world               # execute a command
 lux exec my-app KEYS '*'                      # wildcards need quotes
-lux logs                                      # fetch linked project logs
+lux logs my-app                               # fetch explicit cloud project logs
 lux logs my-app -l 500                        # fetch 500 lines
-lux restart                                   # restart linked project
+lux restart my-app                            # restart explicit cloud project
 lux destroy my-app --accept-consequences      # permanently delete
 lux connect my-app                            # interactive REPL via Lux Cloud
 lux keys list                                 # list project API keys
 lux keys create --kind secret --name server   # create an additional project API key
 lux keys revoke <key-id>                      # revoke a project API key
-lux env pull                                  # write linked project env to .env.local
+lux env pull my-app                           # save a private cloud env profile
+lux env use my-app                            # safely merge its Lux keys into .env.local
+lux env use local                             # switch the app back to local
 lux migrate new create_users                  # create a migration file
 lux migrate status                            # check status (local instance)
 lux migrate run                               # run pending migrations (local instance)
 lux migrate run my-app                        # run against a cloud project
-lux seed run                                  # run lux/seed.lux against the linked project
+lux seed run                                  # run lux/seed.lux against local
+lux seed run my-app                           # run against explicit cloud
 lux types                                     # generate TypeScript types from your schema
 ```
 
@@ -93,8 +100,11 @@ lux stop                   # stop the engine + Studio
 lux stop --clear           # also delete the local data volume
 ```
 
-`lux start` writes `.env.local` with `LUX_URL`, `LUX_PUBLISHABLE_KEY`,
-`LUX_SECRET_KEY`, and `LUX_DIRECT_URL` so the SDK connects with no extra config.
+`lux start` refreshes a private `local` env profile containing `LUX_URL`,
+`LUX_PUBLISHABLE_KEY`, `LUX_SECRET_KEY`, and `LUX_DIRECT_URL`. On first setup it
+safely merges those Lux-managed keys into `.env.local`; later starts preserve
+whichever profile you selected with `lux env use`. Unrelated application
+variables and comments in `.env.local` are never replaced.
 The local secret key equals the engine password, so a secret-key client gets
 operator access while a publishable-key client must sign in (JWT → grant-enforced
 user), mirroring production. Studio runs as a container
@@ -125,7 +135,7 @@ lux migrate new create_users --dir db/migrations
 lux migrate status --dir db/migrations
 lux migrate run --dir db/migrations
 
-# Check migration status (defaults to localhost:6379)
+# Check migration status (an omitted project always means local)
 lux migrate status
 lux migrate status my-app              # cloud project
 lux migrate status --host 10.0.0.5     # specific host
@@ -141,6 +151,11 @@ lux migrate run --host 10.0.0.5 --port 6379   # specific host
 lux migrate pull my-app                       # cloud project
 lux migrate pull --host 10.0.0.5 --port 6379  # specific host
 ```
+
+`lux link` records the cloud project associated with the repository for
+comparison commands such as `lux status --all`. It never changes the target of
+an omitted command: `lux migrate run` is local and `lux migrate run my-app` is
+cloud.
 
 Migration files contain Lux commands (one per line). Lines starting with `#` or `--` are comments. Commands can be written as shell-like strings:
 

@@ -4,8 +4,11 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -64,15 +67,17 @@ enum Commands {
         #[arg(help = "Project name or ID")]
         project: String,
     },
+    /// Remove this repository's cloud-project association.
+    Unlink,
+    /// Show the local runtime, linked cloud project, and active app env profile.
+    Target,
     Projects,
     Status {
         #[arg(help = "Project name or ID (omit for the local engine)")]
         project: Option<String>,
-        #[arg(
-            short = 'o',
-            long,
-            help = "Output format: env (prints LUX_* env lines for the local engine)"
-        )]
+        #[arg(long, help = "Show local and linked-cloud status together")]
+        all: bool,
+        #[arg(short = 'o', long, help = "Output format (json)")]
         output: Option<String>,
     },
     Exec {
@@ -255,11 +260,26 @@ enum KeysAction {
 
 #[derive(Subcommand)]
 enum EnvAction {
+    /// Download a cloud project's Lux variables into a named, private profile.
     Pull {
         #[arg(help = "Project name or ID")]
         project: Option<String>,
-        #[arg(short, long, default_value = ".env.local", help = "Output env file")]
-        output: PathBuf,
+        #[arg(long, help = "Activate the downloaded profile in .env.local")]
+        use_env: bool,
+    },
+    /// List saved local/cloud profiles.
+    Profiles,
+    /// Show the profile currently merged into .env.local.
+    Current,
+    /// Merge a saved profile's Lux-managed keys into .env.local.
+    Use {
+        #[arg(help = "`local`, a cloud project name/ID, or a profile key")]
+        profile: String,
+    },
+    /// Print a saved profile. This intentionally includes its secrets.
+    Export {
+        #[arg(help = "`local`, a cloud project name/ID, or a profile key")]
+        profile: Option<String>,
     },
 }
 
@@ -379,6 +399,35 @@ struct LocalConfig {
     engine_version: Option<String>,
 }
 
+const ENV_PROFILE_DIR: &str = "lux/.env-profiles";
+const ENV_PROFILE_INDEX: &str = "lux/.env-profiles/index.json";
+const MANAGED_ENV_KEYS: &[&str] = &[
+    "LUX_PROJECT_ID",
+    "LUX_URL",
+    "LUX_DIRECT_URL",
+    "LUX_PUBLISHABLE_KEY",
+    "LUX_SECRET_KEY",
+    // Obsolete CLI outputs. Remove these when activating a modern profile so
+    // stale aliases cannot point an application at a different target.
+    "LUX_AUTH_URL",
+    "LUX_HTTP_URL",
+];
+
+#[derive(Serialize, Deserialize, Clone)]
+struct EnvProfile {
+    key: String,
+    kind: String,
+    display_name: String,
+    project_id: Option<String>,
+    filename: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct EnvProfileIndex {
+    active: Option<String>,
+    profiles: Vec<EnvProfile>,
+}
+
 /// The engine image `lux start` should run: a pinned `engine_version` from
 /// `lux/config.toml`, else `:latest`.
 fn desired_engine_image(config: Option<&LocalConfig>) -> String {
@@ -437,17 +486,56 @@ fn local_state_path() -> PathBuf {
 }
 
 fn load_local_state() -> Option<LocalState> {
-    let data = std::fs::read_to_string(local_state_path()).ok()?;
+    let path = local_state_path();
+    let data = std::fs::read_to_string(&path).ok()?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
     serde_json::from_str(&data).ok()
+}
+
+fn ensure_private_dir(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Atomically replace a secret-bearing file and force owner-only permissions.
+fn write_secret_file(path: &Path, data: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("lux-secret");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{filename}.tmp-{}-{nonce}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&tmp)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    file.write_all(data)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("replace {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    Ok(())
 }
 
 fn save_local_state(state: &LocalState) {
     let path = local_state_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
     let data = serde_json::to_string_pretty(state).unwrap();
-    std::fs::write(path, data).unwrap_or_else(|e| {
+    write_secret_file(&path, data.as_bytes()).unwrap_or_else(|e| {
         eprintln!("{} {e}", "Failed to write lux/.lux-local.json:".red());
         std::process::exit(1);
     });
@@ -680,32 +768,259 @@ fn ensure_gitignore(entries: &[&str]) {
     std::fs::write(&path, data).ok();
 }
 
-fn write_env_local(state: &LocalState) {
-    let mut lines = state.env_lines();
-    lines.push(String::new());
-    std::fs::write(".env.local", lines.join("\n")).unwrap_or_else(|e| {
-        eprintln!("{} {e}", "Failed to write .env.local:".red());
-    });
+fn profile_dir() -> PathBuf {
+    PathBuf::from(ENV_PROFILE_DIR)
+}
+
+fn load_profile_index() -> Result<EnvProfileIndex, String> {
+    let path = PathBuf::from(ENV_PROFILE_INDEX);
+    if !path.exists() {
+        return Ok(EnvProfileIndex::default());
+    }
+    let data =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    serde_json::from_str(&data).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+fn save_profile_index(index: &EnvProfileIndex) -> Result<(), String> {
+    ensure_private_dir(&profile_dir())?;
+    let data = serde_json::to_vec_pretty(index).map_err(|e| e.to_string())?;
+    write_secret_file(Path::new(ENV_PROFILE_INDEX), &data)
+}
+
+fn profile_path(profile: &EnvProfile) -> PathBuf {
+    profile_dir().join(&profile.filename)
+}
+
+fn profile_content(lines: &[String]) -> String {
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn write_profile(profile: &EnvProfile, content: &str) -> Result<(), String> {
+    ensure_private_dir(&profile_dir())?;
+    write_secret_file(&profile_path(profile), content.as_bytes())
+}
+
+fn upsert_profile(index: &mut EnvProfileIndex, profile: EnvProfile) {
+    if let Some(existing) = index.profiles.iter_mut().find(|p| p.key == profile.key) {
+        *existing = profile;
+    } else {
+        index.profiles.push(profile);
+    }
+    index.profiles.sort_by(|a, b| a.key.cmp(&b.key));
+}
+
+fn env_assignment(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let line = line.strip_prefix("export ").unwrap_or(line);
+    let (key, value) = line.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some((key, value))
+}
+
+fn managed_env_map(content: &str) -> HashMap<String, String> {
+    content
+        .lines()
+        .filter_map(env_assignment)
+        .filter(|(key, _)| MANAGED_ENV_KEYS.contains(key))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+/// Replace only Lux-owned connection keys. Every unrelated line remains
+/// byte-for-byte equivalent apart from the final newline.
+fn merge_managed_env(existing: &str, profile: &str) -> String {
+    let desired = managed_env_map(profile);
+    let mut seen = HashSet::new();
+    let mut output = Vec::new();
+
+    for line in existing.lines() {
+        let Some((key, _)) = env_assignment(line) else {
+            output.push(line.to_string());
+            continue;
+        };
+        if !MANAGED_ENV_KEYS.contains(&key) {
+            output.push(line.to_string());
+            continue;
+        }
+        if !seen.insert(key.to_string()) {
+            continue;
+        }
+        if let Some(value) = desired.get(key) {
+            output.push(format!("{key}={value}"));
+        }
+    }
+
+    for key in MANAGED_ENV_KEYS {
+        if !seen.contains(*key) {
+            if let Some(value) = desired.get(*key) {
+                output.push(format!("{key}={value}"));
+            }
+        }
+    }
+    while output.last().is_some_and(|line| line.is_empty()) {
+        output.pop();
+    }
+    output.push(String::new());
+    output.join("\n")
+}
+
+fn resolve_profile<'a>(index: &'a EnvProfileIndex, selector: &str) -> Option<&'a EnvProfile> {
+    let normalized = selector.trim();
+    index.profiles.iter().find(|profile| {
+        profile.key == normalized
+            || profile.display_name == normalized
+            || profile.project_id.as_deref() == Some(normalized)
+    })
+}
+
+fn activate_profile(index: &mut EnvProfileIndex, selector: &str) -> Result<EnvProfile, String> {
+    let profile = resolve_profile(index, selector)
+        .cloned()
+        .ok_or_else(|| format!("profile '{selector}' not found"))?;
+    let content = std::fs::read_to_string(profile_path(&profile))
+        .map_err(|e| format!("read profile '{}': {e}", profile.display_name))?;
+    let existing = std::fs::read_to_string(".env.local").unwrap_or_default();
+    let merged = merge_managed_env(&existing, &content);
+    write_secret_file(Path::new(".env.local"), merged.as_bytes())?;
+    index.active = Some(profile.key.clone());
+    save_profile_index(index)?;
+    Ok(profile)
+}
+
+fn refresh_local_profile(state: &LocalState) -> Result<(), String> {
+    ensure_gitignore(&[
+        ".env.local",
+        "lux/.lux-local.json",
+        "lux/.env-profiles/",
+        "lux/.backups/",
+    ]);
+    let mut index = load_profile_index()?;
+    let local = EnvProfile {
+        key: "local".to_string(),
+        kind: "local".to_string(),
+        display_name: "local".to_string(),
+        project_id: None,
+        filename: "local.env".to_string(),
+    };
+    write_profile(&local, &profile_content(&state.env_lines()))?;
+    upsert_profile(&mut index, local);
+
+    // Upgrade safely from the old single-file model: preserve any existing Lux
+    // target as the active legacy profile instead of silently switching it.
+    if index.active.is_none() {
+        let existing = std::fs::read_to_string(".env.local").unwrap_or_default();
+        let existing_keys = managed_env_map(&existing);
+        if existing_keys.is_empty() {
+            activate_profile(&mut index, "local")?;
+            return Ok(());
+        }
+        let legacy = EnvProfile {
+            key: "legacy".to_string(),
+            kind: "legacy".to_string(),
+            display_name: "legacy (.env.local)".to_string(),
+            project_id: existing_keys.get("LUX_PROJECT_ID").cloned(),
+            filename: "legacy.env".to_string(),
+        };
+        let lines: Vec<String> = MANAGED_ENV_KEYS
+            .iter()
+            .filter_map(|key| {
+                existing_keys
+                    .get(*key)
+                    .map(|value| format!("{key}={value}"))
+            })
+            .collect();
+        write_profile(&legacy, &profile_content(&lines))?;
+        index.active = Some(legacy.key.clone());
+        upsert_profile(&mut index, legacy);
+    }
+    save_profile_index(&index)
+}
+
+fn active_profile_label() -> String {
+    load_profile_index()
+        .ok()
+        .and_then(|index| {
+            let active = index.active.clone()?;
+            resolve_profile(&index, &active).map(|profile| profile.display_name.clone())
+        })
+        .unwrap_or_else(|| "not configured".to_string())
+}
+
+fn local_status_value(state: &LocalState) -> serde_json::Value {
+    let running = docker_container_state(&state.container).as_deref() == Some("running");
+    serde_json::json!({
+        "target": { "kind": "local", "name": "local" },
+        "status": if running { "running" } else { "stopped" },
+        "image": state.image,
+        "url": state.lux_url(),
+        "direct_host": "localhost",
+        "direct_port": state.resp_port,
+        "data_volume": state.volume,
+        "encryption": "enabled",
+        "active_env_profile": active_profile_label(),
+    })
+}
+
+fn print_local_status(state: &LocalState, json_output: bool) {
+    let value = local_status_value(state);
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        return;
+    }
+    let running = value["status"] == "running";
+    let status = if running {
+        "running".green().to_string()
+    } else {
+        "stopped".yellow().to_string()
+    };
+    println!("{} {status}", "Local engine:".bold());
+    println!("{} {}", "Image:".bold(), state.image.dimmed());
+    println!("{} {}", "LUX_URL:".bold(), state.lux_url());
+    println!(
+        "{} lux://localhost:{} (credentials hidden)",
+        "Direct:".bold(),
+        state.resp_port
+    );
+    println!("{} {}", "App env:".bold(), active_profile_label());
+    println!("{} {}", "Data volume:".bold(), state.volume);
+    println!("{} {}", "Encryption:".bold(), "enabled".green());
+    if !running {
+        println!("\nRun {} to boot it.", "lux start".cyan());
+    }
 }
 
 fn print_connection_block(state: &LocalState) {
     println!();
     println!("{}", "  Local Lux engine".bold());
     println!("  {}  {}", "LUX_URL          ".dimmed(), state.lux_url());
-    println!("  {}  {}", "LUX_DIRECT_URL   ".dimmed(), state.direct_url());
+    println!(
+        "  {}  lux://localhost:{} (credentials hidden)",
+        "Direct            ".dimmed(),
+        state.resp_port
+    );
     println!(
         "  {}  {}",
-        "LUX_PUBLISHABLE_KEY".dimmed(),
-        state.publishable_key
+        "App env profile   ".dimmed(),
+        active_profile_label()
     );
-    println!("  {}  {}", "LUX_SECRET_KEY   ".dimmed(), state.secret_key);
     println!("  {}  {}", "Data volume      ".dimmed(), state.volume);
     println!("  {}  {}", "Encryption       ".dimmed(), "enabled".green());
     println!();
     println!(
-        "  Written to {}. Point the SDK at {}.",
-        ".env.local".cyan(),
-        "LUX_URL".cyan()
+        "  Local credentials are stored in {}. Use {} to activate them.",
+        "lux/.env-profiles/local.env".cyan(),
+        "lux env use local".cyan()
     );
 }
 
@@ -980,20 +1295,27 @@ fn config_path() -> PathBuf {
     let dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".lux");
-    std::fs::create_dir_all(&dir).ok();
+    if ensure_private_dir(&dir).is_err() {
+        std::fs::create_dir_all(&dir).ok();
+    }
     dir.join("config.json")
 }
 
 fn load_config() -> Option<Config> {
     let path = config_path();
-    let data = std::fs::read_to_string(path).ok()?;
+    let data = std::fs::read_to_string(&path).ok()?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
     serde_json::from_str(&data).ok()
 }
 
 fn save_config(config: &Config) {
     let path = config_path();
     let data = serde_json::to_string_pretty(config).unwrap();
-    std::fs::write(path, data).ok();
+    if let Err(e) = write_secret_file(&path, data.as_bytes()) {
+        eprintln!("{} {e}", "Failed to save Lux credentials:".red());
+        std::process::exit(1);
+    }
 }
 
 fn delete_config() {
@@ -1006,30 +1328,53 @@ fn local_config_path() -> PathBuf {
 }
 
 fn load_local_config() -> Option<LocalConfig> {
-    let data = std::fs::read_to_string(local_config_path()).ok()?;
-    let mut config = LocalConfig::default();
-
-    for line in data.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-
-        match key.trim() {
-            "project_id" => config.project_id = parse_config_string(value),
-            "project_name" => config.project_name = parse_config_string(value),
-            "local_http_port" => config.local_http_port = parse_config_u16(value),
-            "local_resp_port" => config.local_resp_port = parse_config_u16(value),
-            "engine_version" => config.engine_version = parse_config_string(value),
-            _ => {}
-        }
-    }
-
-    Some(config)
+    let path = local_config_path();
+    let data = std::fs::read_to_string(&path).ok()?;
+    let doc = data.parse::<toml_edit::DocumentMut>().unwrap_or_else(|e| {
+        eprintln!("{} {}: {e}", "Invalid Lux config".red(), path.display());
+        std::process::exit(1);
+    });
+    let string = |key: &str| -> Option<String> {
+        let item = doc.get(key)?;
+        let value = item.as_str().unwrap_or_else(|| {
+            eprintln!(
+                "{} {} must be a string in {}",
+                "Invalid Lux config:".red(),
+                key,
+                path.display()
+            );
+            std::process::exit(1);
+        });
+        (!value.trim().is_empty()).then(|| value.to_string())
+    };
+    let port = |key: &str| -> Option<u16> {
+        let item = doc.get(key)?;
+        let value = item.as_integer().unwrap_or_else(|| {
+            eprintln!(
+                "{} {} must be an integer in {}",
+                "Invalid Lux config:".red(),
+                key,
+                path.display()
+            );
+            std::process::exit(1);
+        });
+        u16::try_from(value).ok().or_else(|| {
+            eprintln!(
+                "{} {} must be between 0 and 65535 in {}",
+                "Invalid Lux config:".red(),
+                key,
+                path.display()
+            );
+            std::process::exit(1);
+        })
+    };
+    Some(LocalConfig {
+        project_id: string("project_id"),
+        project_name: string("project_name"),
+        local_http_port: port("local_http_port"),
+        local_resp_port: port("local_resp_port"),
+        engine_version: string("engine_version"),
+    })
 }
 
 fn save_local_config(config: &LocalConfig) {
@@ -1037,56 +1382,41 @@ fn save_local_config(config: &LocalConfig) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let mut data = format!(
-        "project_id = \"{}\"\nproject_name = \"{}\"\n",
-        escape_config_string(config.project_id.as_deref().unwrap_or("")),
-        escape_config_string(config.project_name.as_deref().unwrap_or(""))
-    );
-    if let Some(p) = config.local_http_port {
-        data.push_str(&format!("local_http_port = {p}\n"));
-    }
-    if let Some(p) = config.local_resp_port {
-        data.push_str(&format!("local_resp_port = {p}\n"));
-    }
-    if let Some(v) = &config.engine_version {
-        if !v.is_empty() {
-            data.push_str(&format!(
-                "engine_version = \"{}\"\n",
-                escape_config_string(v)
-            ));
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap_or_else(|e| {
+            eprintln!("{} {}: {e}", "Invalid Lux config".red(), path.display());
+            std::process::exit(1);
+        });
+    doc["project_id"] = toml_edit::value(config.project_id.as_deref().unwrap_or(""));
+    doc["project_name"] = toml_edit::value(config.project_name.as_deref().unwrap_or(""));
+    match config.local_http_port {
+        Some(port) => doc["local_http_port"] = toml_edit::value(i64::from(port)),
+        None => {
+            doc.remove("local_http_port");
         }
     }
-    std::fs::write(path, data).unwrap_or_else(|e| {
+    match config.local_resp_port {
+        Some(port) => doc["local_resp_port"] = toml_edit::value(i64::from(port)),
+        None => {
+            doc.remove("local_resp_port");
+        }
+    }
+    match config
+        .engine_version
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+    {
+        Some(version) => doc["engine_version"] = toml_edit::value(version),
+        None => {
+            doc.remove("engine_version");
+        }
+    }
+    std::fs::write(&path, doc.to_string()).unwrap_or_else(|e| {
         eprintln!("{} {e}", "Failed to write lux/config.toml:".red());
         std::process::exit(1);
     });
-}
-
-fn parse_config_u16(value: &str) -> Option<u16> {
-    let value = value.trim();
-    let value = value
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .unwrap_or(value);
-    value.trim().parse().ok()
-}
-
-fn parse_config_string(value: &str) -> Option<String> {
-    let value = value.trim();
-    let value = value
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .unwrap_or(value);
-    let value = value.replace("\\\"", "\"").replace("\\\\", "\\");
-    if value.trim().is_empty() {
-        None
-    } else {
-        Some(value)
-    }
-}
-
-fn escape_config_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[derive(Debug)]
@@ -1126,26 +1456,26 @@ fn parse_connection_url(url: &str) -> ConnectionTarget {
     }
 }
 
-fn linked_project_or(project: Option<&str>) -> Option<String> {
-    if let Some(project) = project {
-        if !project.trim().is_empty() {
-            return Some(project.to_string());
-        }
-    }
+fn linked_project() -> Option<String> {
     load_local_config()
         .and_then(|config| config.project_id.or(config.project_name))
         .filter(|value| !value.trim().is_empty())
 }
 
+fn explicit_project(project: Option<&str>) -> Option<&str> {
+    project.filter(|value| !value.trim().is_empty())
+}
+
 fn require_project_arg(project: Option<&str>) -> String {
-    linked_project_or(project).unwrap_or_else(|| {
-        eprintln!(
-            "{} Provide a project name/ID or run {} first.",
-            "Error:".red(),
-            "lux link <project>".bold()
-        );
-        std::process::exit(1);
-    })
+    explicit_project(project)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            eprintln!(
+                "{} This is a cloud-only operation. Provide a project name or ID explicitly.",
+                "Error:".red(),
+            );
+            std::process::exit(1);
+        })
 }
 
 fn get_client(api_url_override: &Option<String>) -> (reqwest::Client, String, String) {
@@ -1283,7 +1613,12 @@ pub async fn run() {
                 });
             }
 
-            ensure_gitignore(&[".env.local", "lux/.lux-local.json"]);
+            ensure_gitignore(&[
+                ".env.local",
+                "lux/.lux-local.json",
+                "lux/.env-profiles/",
+                "lux/.backups/",
+            ]);
 
             println!("{}", "Initialized Lux project.".green());
             println!("{} {}", "Migrations:".bold(), migrations_dir.display());
@@ -1304,12 +1639,20 @@ pub async fn run() {
             }
 
             let mut state = ensure_local_state();
-            ensure_gitignore(&[".env.local", "lux/.lux-local.json"]);
+            ensure_gitignore(&[
+                ".env.local",
+                "lux/.lux-local.json",
+                "lux/.env-profiles/",
+                "lux/.backups/",
+            ]);
 
             // Already running? Just reprint the connection block.
             if docker_container_state(&state.container).as_deref() == Some("running") && !fresh {
                 println!("{}", "Local Lux engine already running.".green());
-                write_env_local(&state);
+                refresh_local_profile(&state).unwrap_or_else(|e| {
+                    eprintln!("{} {e}", "Failed to refresh local env profile:".red());
+                    std::process::exit(1);
+                });
                 print_connection_block(&state);
                 if !no_studio {
                     ensure_studio(&mut state, false);
@@ -1453,7 +1796,10 @@ pub async fn run() {
                 run_command_file(&mut target, &seed_path, "Seed").await;
             }
 
-            write_env_local(&state);
+            refresh_local_profile(&state).unwrap_or_else(|e| {
+                eprintln!("{} {e}", "Failed to refresh local env profile:".red());
+                std::process::exit(1);
+            });
             print_connection_block(&state);
             if !no_studio {
                 ensure_studio(&mut state, false);
@@ -1585,6 +1931,60 @@ pub async fn run() {
             println!("{} {}", "ID:".bold(), inst.id);
         }
 
+        Commands::Unlink => {
+            let Some(mut config) = load_local_config() else {
+                eprintln!("{}", "No lux/config.toml found.".red());
+                std::process::exit(1);
+            };
+            if config.project_id.is_none() && config.project_name.is_none() {
+                println!(
+                    "{}",
+                    "This repository is not linked to a cloud project.".dimmed()
+                );
+                return;
+            }
+            config.project_id = None;
+            config.project_name = None;
+            save_local_config(&config);
+            println!("{}", "Cloud project link removed.".green());
+        }
+
+        Commands::Target => {
+            println!("{}", "Lux targets".bold());
+            match load_local_state() {
+                Some(state) => {
+                    let running =
+                        docker_container_state(&state.container).as_deref() == Some("running");
+                    println!(
+                        "{} local ({})",
+                        "Local:".bold(),
+                        if running { "running" } else { "stopped" }
+                    );
+                }
+                None => println!("{} not initialized", "Local:".bold()),
+            }
+            match load_local_config() {
+                Some(config) if config.project_id.is_some() || config.project_name.is_some() => {
+                    println!(
+                        "{} {}{}",
+                        "Linked cloud:".bold(),
+                        config.project_name.as_deref().unwrap_or("unknown"),
+                        config
+                            .project_id
+                            .as_deref()
+                            .map(|id| format!(" ({id})"))
+                            .unwrap_or_default()
+                    );
+                }
+                _ => println!("{} none", "Linked cloud:".bold()),
+            }
+            println!("{} {}", "App env:".bold(), active_profile_label());
+            println!(
+                "{}",
+                "\nOmitted targets are local; a positional project name or ID is cloud.".dimmed()
+            );
+        }
+
         Commands::Projects => {
             let (client, api_url, token) = get_client(&api_url_override);
             let workspace_id = resolve_workspace_id(&client, &api_url, &token).await;
@@ -1632,7 +2032,69 @@ pub async fn run() {
             }
         }
 
-        Commands::Status { project, output } => {
+        Commands::Status {
+            project,
+            all,
+            output,
+        } => {
+            let json_output = output.as_deref() == Some("json");
+            if output.is_some() && !json_output {
+                eprintln!(
+                    "{} Supported status output is `json`. Use `lux env export local` for env.",
+                    "Error:".red()
+                );
+                std::process::exit(1);
+            }
+
+            if all {
+                let mut values = Vec::new();
+                if let Some(state) = load_local_state() {
+                    if json_output {
+                        values.push(local_status_value(&state));
+                    } else {
+                        print_local_status(&state, false);
+                    }
+                } else if !json_output {
+                    println!("{} not initialized", "Local engine:".bold());
+                }
+
+                let Some(linked) = linked_project() else {
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({ "targets": values }))
+                                .unwrap()
+                        );
+                    } else {
+                        println!("\n{} none", "Linked cloud:".bold());
+                    }
+                    return;
+                };
+                let (client, api_url, token) = get_client(&api_url_override);
+                let inst = find_project(&client, &api_url, &token, &linked).await;
+                let cloud = serde_json::json!({
+                    "target": { "kind": "cloud", "name": inst.name, "id": inst.id },
+                    "status": inst.status,
+                    "region": inst.region,
+                    "memory_mb": inst.memory_mb,
+                });
+                if json_output {
+                    values.push(cloud);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({ "targets": values }))
+                            .unwrap()
+                    );
+                } else {
+                    println!();
+                    println!("{} {}", "Linked cloud:".bold(), inst.name);
+                    println!("{} {}", "ID:".bold(), inst.id.dimmed());
+                    println!("{} {}", "Status:".bold(), inst.status);
+                    println!("{} {}", "Region:".bold(), inst.region);
+                }
+                return;
+            }
+
             // No project arg -> report on the local engine (Supabase parity).
             if project.is_none() {
                 let Some(state) = load_local_state() else {
@@ -1644,29 +2106,7 @@ pub async fn run() {
                     );
                     std::process::exit(1);
                 };
-                // `-o env` prints just the env lines, for `eval $(lux status -o env)`.
-                if output.as_deref() == Some("env") {
-                    for line in state.env_lines() {
-                        println!("{line}");
-                    }
-                    return;
-                }
-                let running =
-                    docker_container_state(&state.container).as_deref() == Some("running");
-                let status = if running {
-                    "running".green().to_string()
-                } else {
-                    "stopped".yellow().to_string()
-                };
-                println!("{} {status}", "Local engine:".bold());
-                println!("{} {}", "Image:".bold(), state.image.dimmed());
-                println!("{} {}", "LUX_URL:".bold(), state.lux_url());
-                println!("{} {}", "Direct:".bold(), state.direct_url());
-                println!("{} {}", "Data volume:".bold(), state.volume);
-                println!("{} {}", "Encryption:".bold(), "enabled".green());
-                if !running {
-                    println!("\nRun {} to boot it.", "lux start".cyan());
-                }
+                print_local_status(&state, json_output);
                 return;
             }
 
@@ -1679,6 +2119,20 @@ pub async fn run() {
                 "error" => inst.status.red().to_string(),
                 _ => inst.status.yellow().to_string(),
             };
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "target": { "kind": "cloud", "name": inst.name, "id": inst.id },
+                        "status": inst.status,
+                        "region": inst.region,
+                        "memory_mb": inst.memory_mb,
+                    }))
+                    .unwrap()
+                );
+                return;
+            }
 
             println!("{} {}", "Project:".bold(), inst.name);
             println!("{} {}", "ID:".bold(), inst.id.dimmed());
@@ -2395,7 +2849,7 @@ pub async fn run() {
         },
 
         Commands::Env { action } => match action {
-            EnvAction::Pull { project, output } => {
+            EnvAction::Pull { project, use_env } => {
                 let (client, api_url, token) = get_client(&api_url_override);
                 let project = require_project_arg(project.as_deref());
                 let inst = find_project(&client, &api_url, &token, &project).await;
@@ -2409,11 +2863,130 @@ pub async fn run() {
                     auth.publishable_key.as_deref(),
                     auth.secret_key.as_deref(),
                 );
-                std::fs::write(&output, content).unwrap_or_else(|e| {
-                    eprintln!("{} {e}", "Failed to write env file:".red());
+                let safe_id: String = inst
+                    .id
+                    .chars()
+                    .map(|ch| {
+                        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                            ch
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                let profile = EnvProfile {
+                    key: format!("cloud:{}", inst.id),
+                    kind: "cloud".to_string(),
+                    display_name: inst.name.clone(),
+                    project_id: Some(inst.id.clone()),
+                    filename: format!("cloud-{safe_id}.env"),
+                };
+                let mut index = load_profile_index().unwrap_or_else(|e| {
+                    eprintln!("{} {e}", "Failed to read env profiles:".red());
                     std::process::exit(1);
                 });
-                println!("{} Wrote {}", "Done.".green(), output.display());
+                write_profile(&profile, &content).unwrap_or_else(|e| {
+                    eprintln!("{} {e}", "Failed to write env profile:".red());
+                    std::process::exit(1);
+                });
+                upsert_profile(&mut index, profile.clone());
+                save_profile_index(&index).unwrap_or_else(|e| {
+                    eprintln!("{} {e}", "Failed to save env profiles:".red());
+                    std::process::exit(1);
+                });
+                println!(
+                    "{} Saved cloud profile '{}' without changing .env.local.",
+                    "Done.".green(),
+                    profile.display_name
+                );
+                if use_env {
+                    let activated =
+                        activate_profile(&mut index, &profile.key).unwrap_or_else(|e| {
+                            eprintln!("{} {e}", "Failed to activate env profile:".red());
+                            std::process::exit(1);
+                        });
+                    println!(
+                        "{} .env.local now uses '{}'.",
+                        "Active:".green(),
+                        activated.display_name
+                    );
+                } else {
+                    println!(
+                        "Run {} to activate it.",
+                        format!("lux env use {}", profile.display_name).cyan()
+                    );
+                }
+            }
+            EnvAction::Profiles => {
+                let index = load_profile_index().unwrap_or_else(|e| {
+                    eprintln!("{} {e}", "Failed to read env profiles:".red());
+                    std::process::exit(1);
+                });
+                if index.profiles.is_empty() {
+                    println!(
+                        "{}",
+                        "No env profiles. Run `lux start` or `lux env pull <project>`.".dimmed()
+                    );
+                    return;
+                }
+                println!(
+                    "  {:<28}  {:<8}  {}",
+                    "PROFILE".dimmed(),
+                    "KIND".dimmed(),
+                    "ACTIVE".dimmed()
+                );
+                for profile in &index.profiles {
+                    println!(
+                        "  {:<28}  {:<8}  {}",
+                        profile.display_name,
+                        profile.kind,
+                        if index.active.as_deref() == Some(&profile.key) {
+                            "yes"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+            EnvAction::Current => {
+                println!("{}", active_profile_label());
+            }
+            EnvAction::Use { profile } => {
+                let mut index = load_profile_index().unwrap_or_else(|e| {
+                    eprintln!("{} {e}", "Failed to read env profiles:".red());
+                    std::process::exit(1);
+                });
+                let active = activate_profile(&mut index, &profile).unwrap_or_else(|e| {
+                    eprintln!("{} {e}", "Failed to activate env profile:".red());
+                    std::process::exit(1);
+                });
+                println!(
+                    "{} .env.local now uses '{}'.",
+                    "Done.".green(),
+                    active.display_name
+                );
+            }
+            EnvAction::Export { profile } => {
+                let index = load_profile_index().unwrap_or_else(|e| {
+                    eprintln!("{} {e}", "Failed to read env profiles:".red());
+                    std::process::exit(1);
+                });
+                let selector = profile.or_else(|| index.active.clone()).unwrap_or_else(|| {
+                    eprintln!(
+                        "{} Provide a profile or activate one with `lux env use`.",
+                        "Error:".red()
+                    );
+                    std::process::exit(1);
+                });
+                let selected = resolve_profile(&index, &selector).unwrap_or_else(|| {
+                    eprintln!("{} Profile '{}' not found.", "Error:".red(), selector);
+                    std::process::exit(1);
+                });
+                let content = std::fs::read_to_string(profile_path(selected)).unwrap_or_else(|e| {
+                    eprintln!("{} {e}", "Failed to read env profile:".red());
+                    std::process::exit(1);
+                });
+                print!("{content}");
             }
         },
 
@@ -3407,8 +3980,8 @@ async fn resolve_migrate_target(
         }
     }
 
-    let linked = linked_project_or(project);
-    let project = match linked.as_deref() {
+    let explicit = explicit_project(project);
+    let project = match explicit {
         Some(p) if !p.is_empty() => p,
         _ => {
             // No project and no host/port: default to the local engine, using
@@ -4512,45 +5085,59 @@ mod tests {
     }
 
     #[test]
-    fn parses_config_port_override() {
-        assert_eq!(parse_config_u16("9000"), Some(9000));
-        assert_eq!(parse_config_u16(" \"7777\" "), Some(7777));
-        assert_eq!(parse_config_u16("notaport"), None);
+    fn toml_edit_preserves_unknown_config_and_comments() {
+        let source = "# keep me\ncustom = \"future\"\nproject_id = \"old\"\n";
+        let mut doc = source.parse::<toml_edit::DocumentMut>().unwrap();
+        doc["project_id"] = toml_edit::value("new");
+        let rendered = doc.to_string();
+        assert!(rendered.contains("# keep me"));
+        assert!(rendered.contains("custom = \"future\""));
+        assert!(rendered.contains("project_id = \"new\""));
     }
 
     #[test]
-    fn local_config_round_trips_port_overrides() {
-        let cfg = LocalConfig {
-            project_id: Some("p".to_string()),
-            project_name: Some("n".to_string()),
-            local_http_port: Some(9090),
-            local_resp_port: Some(6400),
-            engine_version: Some("0.23.0".to_string()),
-        };
-        // Re-parse the lines save_local_config would emit.
-        let serialized = format!(
-            "project_id = \"{}\"\nproject_name = \"{}\"\nlocal_http_port = {}\nlocal_resp_port = {}\nengine_version = \"{}\"\n",
-            cfg.project_id.as_deref().unwrap(),
-            cfg.project_name.as_deref().unwrap(),
-            cfg.local_http_port.unwrap(),
-            cfg.local_resp_port.unwrap(),
-            cfg.engine_version.as_deref().unwrap(),
+    fn env_merge_preserves_unrelated_values_and_removes_stale_lux_keys() {
+        let existing = "# app\nOPENROUTER_API_KEY=keep\nLUX_URL=https://old\nLUX_URL=duplicate\nLUX_AUTH_URL=https://stale\n";
+        let profile = "LUX_URL=http://localhost:5890\nLUX_SECRET_KEY=secret\n";
+        let merged = merge_managed_env(existing, profile);
+        assert!(merged.contains("# app\n"));
+        assert!(merged.contains("OPENROUTER_API_KEY=keep\n"));
+        assert!(merged.contains("LUX_URL=http://localhost:5890\n"));
+        assert!(merged.contains("LUX_SECRET_KEY=secret\n"));
+        assert!(!merged.contains("duplicate"));
+        assert!(!merged.contains("LUX_AUTH_URL"));
+    }
+
+    #[test]
+    fn env_merge_does_not_claim_unknown_lux_variables() {
+        let merged = merge_managed_env(
+            "LUX_CUSTOM_FEATURE=keep\nOTHER=value\n",
+            "LUX_URL=http://localhost:5890\n",
         );
-        let mut parsed = LocalConfig::default();
-        for line in serialized.lines() {
-            let (k, v) = line.split_once('=').unwrap();
-            match k.trim() {
-                "project_id" => parsed.project_id = parse_config_string(v),
-                "project_name" => parsed.project_name = parse_config_string(v),
-                "local_http_port" => parsed.local_http_port = parse_config_u16(v),
-                "local_resp_port" => parsed.local_resp_port = parse_config_u16(v),
-                "engine_version" => parsed.engine_version = parse_config_string(v),
-                _ => {}
-            }
-        }
-        assert_eq!(parsed.local_http_port, Some(9090));
-        assert_eq!(parsed.local_resp_port, Some(6400));
-        assert_eq!(parsed.engine_version.as_deref(), Some("0.23.0"));
+        assert!(merged.contains("LUX_CUSTOM_FEATURE=keep"));
+        assert!(merged.contains("OTHER=value"));
+    }
+
+    #[test]
+    fn omitted_project_is_local_and_only_a_positional_value_is_cloud() {
+        assert_eq!(explicit_project(None), None);
+        assert_eq!(explicit_project(Some("")), None);
+        assert_eq!(explicit_project(Some("   ")), None);
+        assert_eq!(explicit_project(Some("dialog")), Some("dialog"));
+        assert_eq!(explicit_project(Some("project-id")), Some("project-id"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("lux-cli-secret-test-{}", random_hex(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.env");
+        write_secret_file(&path, b"LUX_SECRET_KEY=test\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
