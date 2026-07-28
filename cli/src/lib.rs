@@ -2,7 +2,9 @@ use clap::{Args, Parser, Subcommand};
 use colored::Colorize;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -163,6 +165,17 @@ enum Commands {
         #[command(flatten)]
         run: MigrateConn,
     },
+    /// Diagnose local and cloud project setup without changing runtime state.
+    Doctor {
+        #[arg(help = "Project name or ID (omit for the local engine)")]
+        project: Option<String>,
+        #[arg(long, help = "Check local and the linked cloud project")]
+        all: bool,
+        #[arg(long, help = "Repair safe local filesystem configuration only")]
+        fix: bool,
+        #[arg(short = 'o', long, help = "Output format (json)")]
+        output: Option<String>,
+    },
     Seed {
         #[command(subcommand)]
         action: SeedAction,
@@ -213,11 +226,41 @@ enum MigrateAction {
         )]
         check: bool,
     },
+    /// Preview each local migration without applying it.
+    Plan(MigrateConn),
     /// Apply pending migrations (the default action for bare `lux migrate`).
     Run(MigrateConn),
     /// Fetch migrations recorded on the target into the local migration
     /// directory (e.g. ones authored in the Lux Cloud dashboard).
     Pull(MigrateConn),
+    /// Resolve an interrupted or failed migration after reviewing its progress.
+    Repair {
+        #[arg(help = "Exact migration filename")]
+        filename: String,
+        #[command(subcommand)]
+        action: MigrateRepairAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum MigrateRepairAction {
+    /// Resume at an explicitly reviewed zero-based command index.
+    Resume {
+        #[arg(help = "Zero-based command index to execute next")]
+        from_command: usize,
+        #[command(flatten)]
+        conn: MigrateConn,
+    },
+    /// Record every command as applied without executing anything.
+    MarkApplied {
+        #[command(flatten)]
+        conn: MigrateConn,
+    },
+    /// Abandon the record so later migrations may proceed.
+    Abandon {
+        #[command(flatten)]
+        conn: MigrateConn,
+    },
 }
 
 /// Shared target + directory args for `status`/`run`/`pull`. Kept flat so a
@@ -1163,73 +1206,114 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) {
     }
 }
 
-/// Apply pending migrations from `dir` against a local Direct target. Returns the
-/// count applied. Exits the process on a migration error (mirrors `migrate run`).
+/// Apply migrations through the engine-owned contract. The engine persists
+/// progress before executing commands, so a failed migration cannot be
+/// silently replayed by `lux start`.
 async fn apply_pending_migrations(target: &mut MigrateTarget, dir: &Path) -> usize {
-    ensure_migrations_table(target).await;
-    let applied = get_applied_migrations(target).await.unwrap_or_else(|e| {
-        eprintln!(
-            "{} Could not reach the target database: {}",
-            "Error:".red(),
-            e
-        );
-        std::process::exit(1);
-    });
     let local = get_local_migrations(dir);
-    let pending: Vec<_> = local
-        .iter()
-        .filter(|(name, _)| !applied.contains(name))
-        .collect();
-    if pending.is_empty() {
-        return 0;
-    }
-    println!(
-        "{} {} pending migration(s)",
-        "Running".bold(),
-        pending.len()
-    );
-    for (filename, content) in &pending {
-        print!("  {} {}...", "Applying".dimmed(), filename);
-        std::io::stdout().flush().ok();
-        let commands = parse_migration_commands(content).unwrap_or_else(|e| {
-            println!(" {}", "FAILED".red());
-            eprintln!("    {} {}", "Error:".red(), e);
-            std::process::exit(1);
-        });
-        for command in &commands {
-            if let Err(e) = target.exec_args(command).await {
-                println!(" {}", "FAILED".red());
-                eprintln!("    {} {}", "Command:".dimmed(), command.join(" "));
-                eprintln!("    {} {}", "Error:".red(), e);
+    let mut applied = 0usize;
+    for (filename, content) in &local {
+        let plan = target
+            .migration_plan(filename, content)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "{} Could not plan migration '{}': {e}",
+                    "Error:".red(),
+                    filename
+                );
+                std::process::exit(1);
+            });
+        match plan.action {
+            MigrationPlanAction::AlreadyApplied => continue,
+            MigrationPlanAction::Conflict | MigrationPlanAction::Blocked => {
+                migration_plan_error(&plan);
                 std::process::exit(1);
             }
+            MigrationPlanAction::Apply => {}
         }
-        let record_cmd = vec![
-            "TINSERT".to_string(),
-            "__migrations".to_string(),
-            "filename".to_string(),
-            filename.to_string(),
-            "checksum".to_string(),
-            simple_hash(content),
-            "applied_at".to_string(),
-            chrono::Utc::now().timestamp().to_string(),
-            "body".to_string(),
-            content.to_string(),
-        ];
-        if let Err(e) = target.exec_args(&record_cmd).await {
+        print!("  {} {}...", "Applying".dimmed(), filename);
+        std::io::stdout().flush().ok();
+        if let Err(e) = target.migration_apply(filename, content).await {
             println!(" {}", "FAILED".red());
-            eprintln!("    {} Failed to record migration: {}", "Error:".red(), e);
+            eprintln!("    {} {e}", "Error:".red());
+            eprintln!(
+                "    Inspect progress with {}, then repair explicitly with {}.",
+                "lux migrate status".cyan(),
+                format!("lux migrate repair {filename} ...").cyan()
+            );
             std::process::exit(1);
         }
         println!(" {}", "OK".green());
+        applied += 1;
     }
-    pending.len()
+    applied
 }
 
 #[derive(Deserialize)]
 struct ApiResponse<T> {
     data: Option<T>,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct MigrationRecord {
+    filename: String,
+    checksum: String,
+    #[serde(default)]
+    checksum_algorithm: String,
+    applied_at: u64,
+    #[serde(default)]
+    body: String,
+    status: String,
+    #[serde(default)]
+    command_count: usize,
+    #[serde(default)]
+    completed_commands: usize,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MigrationPlanAction {
+    Apply,
+    AlreadyApplied,
+    Conflict,
+    Blocked,
+}
+
+impl MigrationPlanAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Apply => "apply",
+            Self::AlreadyApplied => "already_applied",
+            Self::Conflict => "conflict",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct MigrationPlan {
+    filename: String,
+    checksum: String,
+    checksum_algorithm: String,
+    command_count: usize,
+    action: MigrationPlanAction,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DirectMigrationApplyResult {
+    migration: MigrationRecord,
+    already_applied: bool,
+}
+
+#[derive(Clone, Copy)]
+enum MigrationRepairRequest {
+    Resume { from_command: usize },
+    MarkApplied,
+    Abandon,
 }
 
 #[derive(Deserialize, Debug)]
@@ -2990,6 +3074,25 @@ pub async fn run() {
             }
         },
 
+        Commands::Doctor {
+            project,
+            all,
+            fix,
+            output,
+        } => {
+            let healthy = run_doctor(
+                project.as_deref(),
+                all,
+                fix,
+                output.as_deref(),
+                &api_url_override,
+            )
+            .await;
+            if !healthy {
+                std::process::exit(1);
+            }
+        }
+
         Commands::Migrate { action, run } => match action.unwrap_or(MigrateAction::Run(run)) {
             MigrateAction::New { name, dir } => {
                 std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
@@ -3025,41 +3128,29 @@ pub async fn run() {
                     &api_url_override,
                 )
                 .await;
-
-                let applied = get_applied_migrations(&mut target)
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!(
-                            "{} Could not reach the target database: {}",
-                            "Error:".red(),
-                            e
-                        );
-                        std::process::exit(1);
-                    });
-                let local = get_local_migrations(&dir);
-
-                if local.is_empty() {
-                    println!(
-                        "{} {}",
-                        "No migration files found in".dimmed(),
-                        dir.display()
-                    );
-                    return;
+                let clean = print_migration_status(&mut target, &dir).await;
+                if check && !clean {
+                    std::process::exit(1);
                 }
+            }
 
-                println!("  {:<40}  {}", "MIGRATION".dimmed(), "STATUS".dimmed());
-                let mut pending = 0usize;
-                for (filename, _) in &local {
-                    let status = if applied.contains(filename) {
-                        "applied".green().to_string()
-                    } else {
-                        pending += 1;
-                        "pending".yellow().to_string()
-                    };
-                    println!("  {:<40}  {}", filename, status);
-                }
-                if check && pending > 0 {
-                    eprintln!("\n{} {} migration(s) not applied.", "Error:".red(), pending);
+            MigrateAction::Plan(MigrateConn {
+                project,
+                dir,
+                host,
+                port,
+                password,
+            }) => {
+                let mut target = resolve_migrate_target(
+                    project.as_deref(),
+                    host.as_deref(),
+                    port,
+                    password.as_deref(),
+                    &api_url_override,
+                )
+                .await;
+                let clean = print_migration_plan(&mut target, &dir).await;
+                if !clean {
                     std::process::exit(1);
                 }
             }
@@ -3079,96 +3170,12 @@ pub async fn run() {
                     &api_url_override,
                 )
                 .await;
-
-                ensure_migrations_table(&mut target).await;
-
-                let applied = get_applied_migrations(&mut target)
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!(
-                            "{} Could not reach the target database: {}",
-                            "Error:".red(),
-                            e
-                        );
-                        std::process::exit(1);
-                    });
-                let local = get_local_migrations(&dir);
-
-                let pending: Vec<_> = local
-                    .iter()
-                    .filter(|(name, _)| !applied.contains(name))
-                    .collect();
-
-                if pending.is_empty() {
+                let applied = apply_pending_migrations(&mut target, &dir).await;
+                if applied == 0 {
                     println!("{}", "All migrations are applied.".green());
                     return;
                 }
-
-                println!(
-                    "{} {} pending migration(s)",
-                    "Running".bold(),
-                    pending.len()
-                );
-
-                for (filename, content) in &pending {
-                    print!("  {} {}...", "Applying".dimmed(), filename);
-                    std::io::stdout().flush().ok();
-
-                    let commands = parse_migration_commands(content).unwrap_or_else(|e| {
-                        println!(" {}", "FAILED".red());
-                        eprintln!("    {} {}", "Error:".red(), e);
-                        std::process::exit(1);
-                    });
-
-                    let mut failed = false;
-                    for command in &commands {
-                        if let Err(e) = target.exec_args(command).await {
-                            println!(" {}", "FAILED".red());
-                            eprintln!("    {} {}", "Command:".dimmed(), command.join(" "));
-                            eprintln!("    {} {}", "Error:".red(), e);
-                            failed = true;
-                            break;
-                        }
-                    }
-
-                    if failed {
-                        eprintln!(
-                            "\n{} Migration failed. Fix the issue and re-run.",
-                            "Error:".red()
-                        );
-                        std::process::exit(1);
-                    }
-
-                    let checksum = simple_hash(content);
-                    let record_cmd = vec![
-                        "TINSERT".to_string(),
-                        "__migrations".to_string(),
-                        "filename".to_string(),
-                        filename.to_string(),
-                        "checksum".to_string(),
-                        checksum,
-                        "applied_at".to_string(),
-                        chrono::Utc::now().timestamp().to_string(),
-                        // Store the source so `lux migrate pull` can recreate the
-                        // file on another machine. Passed as a single argv element,
-                        // so embedded spaces/newlines are preserved verbatim.
-                        "body".to_string(),
-                        content.to_string(),
-                    ];
-                    if let Err(e) = target.exec_args(&record_cmd).await {
-                        println!(" {}", "FAILED".red());
-                        eprintln!("    {} Failed to record migration: {}", "Error:".red(), e);
-                        std::process::exit(1);
-                    }
-
-                    println!(" {}", "OK".green());
-                }
-
-                println!(
-                    "{} Applied {} migration(s).",
-                    "Done.".green(),
-                    pending.len()
-                );
+                println!("{} Applied {} migration(s).", "Done.".green(), applied);
             }
 
             MigrateAction::Pull(MigrateConn {
@@ -3187,7 +3194,10 @@ pub async fn run() {
                 )
                 .await;
 
-                let remote = get_remote_migrations(&mut target).await;
+                let remote = target.migration_list().await.unwrap_or_else(|e| {
+                    eprintln!("{} Could not list target migrations: {e}", "Error:".red());
+                    std::process::exit(1);
+                });
                 if remote.is_empty() {
                     println!("{}", "No migrations recorded on the target.".dimmed());
                     return;
@@ -3202,35 +3212,35 @@ pub async fn run() {
 
                 let mut pulled = 0usize;
                 let mut skipped = 0usize;
-                for (filename, checksum, body) in &remote {
-                    if let Some(local_content) = local.get(filename) {
+                for record in remote.iter().filter(|record| record.status == "applied") {
+                    if let Some(local_content) = local.get(&record.filename) {
                         // Already present locally. Only flag genuine divergence.
-                        if simple_hash(local_content) != *checksum {
+                        if !migration_checksum_matches(record, local_content) {
                             println!(
                                 "  {} {} (local differs from target; keeping local)",
                                 "skip".yellow(),
-                                filename
+                                record.filename
                             );
                             skipped += 1;
                         }
                         continue;
                     }
-                    if body.is_empty() {
+                    if record.body.is_empty() {
                         // Applied before bodies were stored: nothing to recreate.
                         println!(
                             "  {} {} (no stored source on target)",
                             "skip".yellow(),
-                            filename
+                            record.filename
                         );
                         skipped += 1;
                         continue;
                     }
-                    let path = dir.join(filename);
-                    if let Err(e) = std::fs::write(&path, body) {
-                        eprintln!("  {} {}: {}", "FAILED".red(), filename, e);
+                    let path = dir.join(&record.filename);
+                    if let Err(e) = std::fs::write(&path, &record.body) {
+                        eprintln!("  {} {}: {}", "FAILED".red(), record.filename, e);
                         std::process::exit(1);
                     }
-                    println!("  {} {}", "pull".green(), filename);
+                    println!("  {} {}", "pull".green(), record.filename);
                     pulled += 1;
                 }
 
@@ -3240,6 +3250,48 @@ pub async fn run() {
                     pulled,
                     skipped
                 );
+            }
+
+            MigrateAction::Repair { filename, action } => {
+                let (conn, repair) = match action {
+                    MigrateRepairAction::Resume { from_command, conn } => {
+                        (conn, MigrationRepairRequest::Resume { from_command })
+                    }
+                    MigrateRepairAction::MarkApplied { conn } => {
+                        (conn, MigrationRepairRequest::MarkApplied)
+                    }
+                    MigrateRepairAction::Abandon { conn } => {
+                        (conn, MigrationRepairRequest::Abandon)
+                    }
+                };
+                let mut target = resolve_migrate_target(
+                    conn.project.as_deref(),
+                    conn.host.as_deref(),
+                    conn.port,
+                    conn.password.as_deref(),
+                    &api_url_override,
+                )
+                .await;
+                let before = target.migration_list().await.unwrap_or_else(|e| {
+                    eprintln!("{} Could not inspect migration: {e}", "Error:".red());
+                    std::process::exit(1);
+                });
+                let record = before
+                    .iter()
+                    .find(|record| record.filename == filename)
+                    .unwrap_or_else(|| {
+                        eprintln!("{} Migration '{}' was not found.", "Error:".red(), filename);
+                        std::process::exit(1);
+                    });
+                print_migration_record("Before", record);
+                let repaired = target
+                    .migration_repair(&filename, repair)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("{} Repair failed: {e}", "Error:".red());
+                        std::process::exit(1);
+                    });
+                print_migration_record("After", &repaired);
             }
         },
 
@@ -3474,38 +3526,6 @@ fn is_connection_url(value: &str) -> bool {
         || value.starts_with("luxs://")
         || value.starts_with("redis://")
         || value.starts_with("rediss://")
-}
-
-async fn exec_command_json(
-    client: &reqwest::Client,
-    api_url: &str,
-    token: &str,
-    instance_id: &str,
-    command: &str,
-) -> Result<serde_json::Value, String> {
-    let res = client
-        .post(format!("{api_url}/console/{instance_id}/exec"))
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&serde_json::json!({ "command": command }))
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
-
-    let status = res.status();
-    let body: serde_json::Value = res
-        .json()
-        .await
-        .map_err(|e| format!("invalid response: {e}"))?;
-
-    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
-        return Err(err.to_string());
-    }
-
-    if !status.is_success() {
-        return Err(format!("HTTP {status}"));
-    }
-
-    Ok(body)
 }
 
 async fn get_instance_credentials(
@@ -3870,52 +3890,6 @@ impl DirectConn {
             .map_err(|e| format!("write error: {e}"))?;
         resp_read_response(&mut self.reader)
     }
-
-    /// Execute a table select command and return rows as Vec<Vec<String>>
-    /// (each row is [field, value, field, value, ...]).
-    fn exec_table_rows(&mut self, command: &str) -> Result<Vec<Vec<String>>, String> {
-        let parts: Vec<&str> = command.split_whitespace().collect();
-        self.reader
-            .get_mut()
-            .write_all(&resp_encode(&parts))
-            .map_err(|e| format!("write error: {e}"))?;
-        self.reader
-            .get_mut()
-            .flush()
-            .map_err(|e| format!("write error: {e}"))?;
-
-        // Read outer array (rows)
-        let header = resp_read_line(&mut self.reader)?;
-        if let Some(err) = header.strip_prefix('-') {
-            return Err(err.to_string());
-        }
-        let row_count: i64 = header
-            .strip_prefix('*')
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        if row_count <= 0 {
-            return Ok(vec![]);
-        }
-
-        let mut rows = Vec::new();
-        for _ in 0..row_count {
-            // Read inner array (row fields)
-            let row_header = resp_read_line(&mut self.reader)?;
-            let field_count: i64 = row_header
-                .strip_prefix('*')
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let mut fields = Vec::new();
-            for _ in 0..field_count {
-                let val = resp_read_response(&mut self.reader)?;
-                // Strip "(integer) " prefix from integer values
-                let val = val.strip_prefix("(integer) ").unwrap_or(&val).to_string();
-                fields.push(val);
-            }
-            rows.push(fields);
-        }
-        Ok(rows)
-    }
 }
 
 enum MigrateTarget {
@@ -3952,6 +3926,207 @@ impl MigrateTarget {
             MigrateTarget::Direct(conn) => conn.exec_args(command),
         }
     }
+
+    async fn migration_list(&mut self) -> Result<Vec<MigrationRecord>, String> {
+        match self {
+            MigrateTarget::Direct(conn) => {
+                let args = vec![
+                    "LUX".to_string(),
+                    "MIGRATE".to_string(),
+                    "LIST".to_string(),
+                    "1000".to_string(),
+                    "0".to_string(),
+                ];
+                decode_json(&conn.exec_args(&args)?, "migration list")
+            }
+            MigrateTarget::Cloud {
+                client,
+                api_url,
+                token,
+                instance_id,
+            } => {
+                cloud_management_request(
+                    client,
+                    reqwest::Method::GET,
+                    format!("{api_url}/projects/{instance_id}/migrations"),
+                    token,
+                    None,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn migration_plan(
+        &mut self,
+        filename: &str,
+        body: &str,
+    ) -> Result<MigrationPlan, String> {
+        match self {
+            MigrateTarget::Direct(conn) => {
+                let args = vec![
+                    "LUX".to_string(),
+                    "MIGRATE".to_string(),
+                    "PLAN".to_string(),
+                    filename.to_string(),
+                    body.to_string(),
+                ];
+                decode_json(&conn.exec_args(&args)?, "migration plan")
+            }
+            MigrateTarget::Cloud {
+                client,
+                api_url,
+                token,
+                instance_id,
+            } => {
+                cloud_management_request(
+                    client,
+                    reqwest::Method::POST,
+                    format!("{api_url}/projects/{instance_id}/migrations/plan"),
+                    token,
+                    Some(serde_json::json!({ "filename": filename, "body": body })),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn migration_apply(
+        &mut self,
+        filename: &str,
+        body: &str,
+    ) -> Result<MigrationRecord, String> {
+        match self {
+            MigrateTarget::Direct(conn) => {
+                let args = vec![
+                    "LUX".to_string(),
+                    "MIGRATE".to_string(),
+                    "APPLY".to_string(),
+                    filename.to_string(),
+                    body.to_string(),
+                ];
+                let result: DirectMigrationApplyResult =
+                    decode_json(&conn.exec_args(&args)?, "migration apply")?;
+                let _ = result.already_applied;
+                Ok(result.migration)
+            }
+            MigrateTarget::Cloud {
+                client,
+                api_url,
+                token,
+                instance_id,
+            } => {
+                cloud_management_request(
+                    client,
+                    reqwest::Method::POST,
+                    format!("{api_url}/projects/{instance_id}/migrations/apply"),
+                    token,
+                    Some(serde_json::json!({ "filename": filename, "body": body })),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn migration_repair(
+        &mut self,
+        filename: &str,
+        repair: MigrationRepairRequest,
+    ) -> Result<MigrationRecord, String> {
+        match self {
+            MigrateTarget::Direct(conn) => {
+                let mut args = vec![
+                    "LUX".to_string(),
+                    "MIGRATE".to_string(),
+                    "REPAIR".to_string(),
+                    filename.to_string(),
+                ];
+                match repair {
+                    MigrationRepairRequest::Resume { from_command } => {
+                        args.push("RESUME".to_string());
+                        args.push(from_command.to_string());
+                    }
+                    MigrationRepairRequest::MarkApplied => {
+                        args.push("MARK-APPLIED".to_string());
+                    }
+                    MigrationRepairRequest::Abandon => args.push("ABANDON".to_string()),
+                }
+                decode_json(&conn.exec_args(&args)?, "migration repair")
+            }
+            MigrateTarget::Cloud {
+                client,
+                api_url,
+                token,
+                instance_id,
+            } => {
+                let payload = match repair {
+                    MigrationRepairRequest::Resume { from_command } => serde_json::json!({
+                        "filename": filename,
+                        "action": "resume",
+                        "from_command": from_command,
+                    }),
+                    MigrationRepairRequest::MarkApplied => serde_json::json!({
+                        "filename": filename,
+                        "action": "mark_applied",
+                    }),
+                    MigrationRepairRequest::Abandon => serde_json::json!({
+                        "filename": filename,
+                        "action": "abandon",
+                    }),
+                };
+                cloud_management_request(
+                    client,
+                    reqwest::Method::POST,
+                    format!("{api_url}/projects/{instance_id}/migrations/repair"),
+                    token,
+                    Some(payload),
+                )
+                .await
+            }
+        }
+    }
+}
+
+fn decode_json<T: DeserializeOwned>(raw: &str, operation: &str) -> Result<T, String> {
+    serde_json::from_str(raw).map_err(|e| format!("{operation} returned invalid JSON: {e}"))
+}
+
+async fn cloud_management_request<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+    token: &str,
+    payload: Option<serde_json::Value>,
+) -> Result<T, String> {
+    let mut request = client
+        .request(method, url)
+        .header("Authorization", format!("Bearer {token}"));
+    if let Some(payload) = payload {
+        request = request.json(&payload);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("cloud request failed: {e}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("cloud response could not be read: {e}"))?;
+    let envelope: ApiResponse<T> = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "cloud management API returned invalid JSON (HTTP {}): {e}",
+            status.as_u16()
+        )
+    })?;
+    if !status.is_success() {
+        return Err(envelope
+            .error
+            .unwrap_or_else(|| format!("cloud request failed (HTTP {})", status.as_u16())));
+    }
+    envelope
+        .data
+        .ok_or_else(|| "cloud management API returned no data".to_string())
 }
 
 async fn resolve_migrate_target(
@@ -4036,221 +4211,616 @@ async fn resolve_migrate_target(
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum MigrationsSchemaState {
-    Present,
-    Missing,
-}
-
-fn migrations_schema_state(
-    result: Result<String, String>,
-) -> Result<MigrationsSchemaState, String> {
-    match result {
-        Ok(_) => Ok(MigrationsSchemaState::Present),
-        Err(error) if is_missing_migrations_table_error(&error) => {
-            Ok(MigrationsSchemaState::Missing)
-        }
-        Err(error) => Err(format!("could not inspect __migrations schema: {error}")),
-    }
-}
-
-fn is_missing_migrations_table_error(error: &str) -> bool {
-    error
-        .to_ascii_lowercase()
-        .contains("table '__migrations' does not exist")
-}
-
-fn is_existing_migrations_body_error(error: &str) -> bool {
-    error
-        .to_ascii_lowercase()
-        .contains("field 'body' already exists")
-}
-
-async fn ensure_migrations_table(target: &mut MigrateTarget) {
-    let state = migrations_schema_state(target.exec("TSCHEMA __migrations").await).unwrap_or_else(
-        |error| {
-            eprintln!("{} {}", "Error:".red(), error);
-            std::process::exit(1);
-        },
+fn migration_plan_error(plan: &MigrationPlan) {
+    eprintln!(
+        "{} Migration '{}' is {}: {}",
+        "Error:".red(),
+        plan.filename,
+        plan.action.as_str(),
+        plan.reason.as_deref().unwrap_or("no reason returned")
     );
-    match state {
-        MigrationsSchemaState::Missing => {
-            if let Err(e) = target
-                .exec(
-                    "TCREATE __migrations filename TEXT, checksum TEXT, applied_at INT, body TEXT",
-                )
-                .await
-            {
-                eprintln!(
-                    "{} Failed to create __migrations table: {}",
-                    "Error:".red(),
-                    e
-                );
-                std::process::exit(1);
+    eprintln!(
+        "Inspect progress with {}, then use {} if the target has a partial migration.",
+        "lux migrate status".cyan(),
+        format!("lux migrate repair {} ...", plan.filename).cyan()
+    );
+}
+
+async fn migration_plans(
+    target: &mut MigrateTarget,
+    dir: &Path,
+) -> Result<Vec<MigrationPlan>, String> {
+    let mut plans = Vec::new();
+    for (filename, body) in get_local_migrations(dir) {
+        plans.push(target.migration_plan(&filename, &body).await?);
+    }
+    Ok(plans)
+}
+
+async fn print_migration_plan(target: &mut MigrateTarget, dir: &Path) -> bool {
+    let plans = migration_plans(target, dir).await.unwrap_or_else(|e| {
+        eprintln!("{} Could not plan migrations: {e}", "Error:".red());
+        std::process::exit(1);
+    });
+    if plans.is_empty() {
+        println!(
+            "{} {}",
+            "No migration files found in".dimmed(),
+            dir.display()
+        );
+        return true;
+    }
+    println!(
+        "  {:<40}  {:<16}  {:>8}  {}",
+        "MIGRATION".dimmed(),
+        "ACTION".dimmed(),
+        "COMMANDS".dimmed(),
+        "REASON".dimmed()
+    );
+    for plan in &plans {
+        let action = match plan.action {
+            MigrationPlanAction::Apply => plan.action.as_str().yellow().to_string(),
+            MigrationPlanAction::AlreadyApplied => "applied".green().to_string(),
+            MigrationPlanAction::Conflict | MigrationPlanAction::Blocked => {
+                plan.action.as_str().red().to_string()
             }
+        };
+        println!(
+            "  {:<40}  {:<16}  {:>8}  {}",
+            plan.filename,
+            action,
+            plan.command_count,
+            plan.reason.as_deref().unwrap_or("")
+        );
+    }
+    !plans.iter().any(|plan| {
+        matches!(
+            plan.action,
+            MigrationPlanAction::Conflict | MigrationPlanAction::Blocked
+        )
+    })
+}
+
+async fn print_migration_status(target: &mut MigrateTarget, dir: &Path) -> bool {
+    let records = target.migration_list().await.unwrap_or_else(|e| {
+        eprintln!("{} Could not list target migrations: {e}", "Error:".red());
+        std::process::exit(1);
+    });
+    let plans = migration_plans(target, dir).await.unwrap_or_else(|e| {
+        eprintln!("{} Could not compare local migrations: {e}", "Error:".red());
+        std::process::exit(1);
+    });
+
+    println!(
+        "  {:<40}  {:<12}  {:<12}  {}",
+        "MIGRATION".dimmed(),
+        "LOCAL".dimmed(),
+        "TARGET".dimmed(),
+        "PROGRESS / DETAIL".dimmed()
+    );
+    let mut seen = HashSet::new();
+    let mut clean = true;
+    for plan in &plans {
+        seen.insert(plan.filename.clone());
+        let record = records
+            .iter()
+            .find(|record| record.filename == plan.filename);
+        let (target_status, detail) = match record {
+            Some(record) => (record.status.clone(), migration_record_detail(record)),
+            None => (
+                "not_recorded".to_string(),
+                plan.reason.clone().unwrap_or_default(),
+            ),
+        };
+        let local_status = match plan.action {
+            MigrationPlanAction::AlreadyApplied => "applied",
+            MigrationPlanAction::Apply => "pending",
+            MigrationPlanAction::Conflict => "conflict",
+            MigrationPlanAction::Blocked => "blocked",
+        };
+        if plan.action != MigrationPlanAction::AlreadyApplied {
+            clean = false;
         }
-        MigrationsSchemaState::Present => {
-            // Older instances have a __migrations table without `body` (added so
-            // `lux migrate pull` can recreate migration files). Ignore only the
-            // exact idempotent "already exists" result; an auth, transport, or
-            // server failure here must not be reported as a usable schema.
-            if let Err(error) = target.exec("TALTER __migrations ADD body TEXT").await {
-                if !is_existing_migrations_body_error(&error) {
-                    eprintln!(
-                        "{} Failed to upgrade __migrations table: {}",
-                        "Error:".red(),
-                        error
-                    );
-                    std::process::exit(1);
-                }
-            }
+        println!(
+            "  {:<40}  {:<12}  {:<12}  {}",
+            plan.filename, local_status, target_status, detail
+        );
+    }
+    for record in records
+        .iter()
+        .filter(|record| !seen.contains(&record.filename))
+    {
+        if matches!(record.status.as_str(), "applying" | "failed") {
+            clean = false;
+        }
+        println!(
+            "  {:<40}  {:<12}  {:<12}  {}",
+            record.filename,
+            "remote_only",
+            record.status,
+            migration_record_detail(record)
+        );
+    }
+    if plans.is_empty() && records.is_empty() {
+        println!("  {}", "No local or target migrations.".dimmed());
+    }
+    if !clean {
+        eprintln!(
+            "\n{} Pending, conflicting, or partial migrations require attention.",
+            "Check failed:".red()
+        );
+    }
+    clean
+}
+
+fn migration_record_detail(record: &MigrationRecord) -> String {
+    let mut detail = format!(
+        "{}/{} commands",
+        record.completed_commands, record.command_count
+    );
+    if let Some(error) = record.error.as_deref().filter(|error| !error.is_empty()) {
+        detail.push_str(": ");
+        detail.push_str(error);
+    }
+    detail
+}
+
+fn print_migration_record(label: &str, record: &MigrationRecord) {
+    println!(
+        "{} {} — {} ({})",
+        format!("{label}:").bold(),
+        record.filename,
+        record.status,
+        migration_record_detail(record)
+    );
+}
+
+fn migration_checksum_matches(record: &MigrationRecord, body: &str) -> bool {
+    let algorithm = record.checksum_algorithm.as_str();
+    match algorithm {
+        "sha256" => record.checksum == sha256_hash(body),
+        "djb2-64" => record.checksum == legacy_djb2_hash(body),
+        "fnv1a-32-utf16" => record.checksum == legacy_fnv1a_hash(body),
+        "legacy" | "" => {
+            record.checksum == legacy_djb2_hash(body) || record.checksum == legacy_fnv1a_hash(body)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Deserialize)]
+struct EngineManagementVersion {
+    version: String,
+    api_version: String,
+    capabilities: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct DoctorCheck {
+    target: String,
+    check: String,
+    status: String,
+    detail: String,
+    fixed: bool,
+}
+
+#[derive(Serialize)]
+struct DoctorReport {
+    healthy: bool,
+    checks: Vec<DoctorCheck>,
+}
+
+fn add_doctor_check(
+    checks: &mut Vec<DoctorCheck>,
+    target: &str,
+    check: &str,
+    status: &str,
+    detail: impl Into<String>,
+    fixed: bool,
+) {
+    checks.push(DoctorCheck {
+        target: target.to_string(),
+        check: check.to_string(),
+        status: status.to_string(),
+        detail: detail.into(),
+        fixed,
+    });
+}
+
+async fn run_doctor(
+    project: Option<&str>,
+    all: bool,
+    fix: bool,
+    output: Option<&str>,
+    api_url_override: &Option<String>,
+) -> bool {
+    let mut checks = Vec::new();
+    let check_local = project.is_none() || all;
+    let check_cloud = project.is_some() || all;
+    if check_local {
+        doctor_local(fix, &mut checks).await;
+    }
+    if check_cloud {
+        let selector = project
+            .map(str::to_string)
+            .or_else(|| load_local_config().and_then(|config| config.project_id));
+        match selector {
+            Some(selector) => doctor_cloud(&selector, api_url_override, &mut checks).await,
+            None => add_doctor_check(
+                &mut checks,
+                "cloud",
+                "linked project",
+                "fail",
+                "`--all` needs a linked cloud project; run `lux link <project>`",
+                false,
+            ),
+        }
+    }
+    let healthy = !checks.iter().any(|check| check.status == "fail");
+    let report = DoctorReport { healthy, checks };
+    if output == Some("json") {
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    } else {
+        print_doctor_report(&report, fix);
+    }
+    healthy
+}
+
+async fn doctor_local(fix: bool, checks: &mut Vec<DoctorCheck>) {
+    let migration_dir = Path::new("lux/migrations");
+    let migration_missing = !migration_dir.is_dir();
+    let mut migration_fixed = false;
+    if migration_missing && fix {
+        migration_fixed = std::fs::create_dir_all(migration_dir).is_ok();
+    }
+    add_doctor_check(
+        checks,
+        "local",
+        "migration directory",
+        if migration_dir.is_dir() {
+            "pass"
+        } else {
+            "warn"
+        },
+        if migration_dir.is_dir() {
+            "lux/migrations is present"
+        } else {
+            "lux/migrations is missing; `doctor --fix` can create it"
+        },
+        migration_fixed,
+    );
+
+    let ignored = [
+        ".env.local",
+        "lux/.lux-local.json",
+        "lux/.env-profiles/",
+        "lux/.backups/",
+    ];
+    let gitignore_path = Path::new(".gitignore");
+    let existing = std::fs::read_to_string(gitignore_path).unwrap_or_default();
+    let missing_ignore = gitignore_merge(&existing, &ignored);
+    let mut gitignore_fixed = false;
+    if missing_ignore.is_some() && fix {
+        ensure_gitignore(&ignored);
+        gitignore_fixed = gitignore_merge(
+            &std::fs::read_to_string(gitignore_path).unwrap_or_default(),
+            &ignored,
+        )
+        .is_none();
+    }
+    add_doctor_check(
+        checks,
+        "local",
+        "secret ignores",
+        if missing_ignore.is_none() || gitignore_fixed {
+            "pass"
+        } else {
+            "fail"
+        },
+        if missing_ignore.is_none() || gitignore_fixed {
+            "Lux secret-bearing files are gitignored"
+        } else {
+            "Lux secret-bearing paths are missing from .gitignore"
+        },
+        gitignore_fixed,
+    );
+
+    let Some(state) = load_local_state() else {
+        add_doctor_check(
+            checks,
+            "local",
+            "runtime state",
+            "fail",
+            "lux/.lux-local.json is missing; run `lux start`",
+            false,
+        );
+        return;
+    };
+    add_doctor_check(
+        checks,
+        "local",
+        "runtime state",
+        "pass",
+        format!("local runtime targets {}", state.image),
+        false,
+    );
+
+    let docker_available = docker_preflight().is_ok();
+    add_doctor_check(
+        checks,
+        "local",
+        "Docker",
+        if docker_available { "pass" } else { "fail" },
+        if docker_available {
+            "Docker daemon is reachable"
+        } else {
+            "Docker is unavailable"
+        },
+        false,
+    );
+    let container_state = docker_container_state(&state.container);
+    add_doctor_check(
+        checks,
+        "local",
+        "engine container",
+        if container_state.as_deref() == Some("running") {
+            "pass"
+        } else {
+            "fail"
+        },
+        match container_state.as_deref() {
+            Some(value) => format!("{} is {value}", state.container),
+            None => format!("{} does not exist", state.container),
+        },
+        false,
+    );
+
+    let mut profile_fixed = false;
+    let profile_ok = load_profile_index().is_ok_and(|index| {
+        resolve_profile(&index, "local").is_some_and(|profile| profile_path(profile).is_file())
+    });
+    if !profile_ok && fix {
+        profile_fixed = refresh_local_profile(&state).is_ok();
+    }
+    add_doctor_check(
+        checks,
+        "local",
+        "env profile",
+        if profile_ok || profile_fixed {
+            "pass"
+        } else {
+            "fail"
+        },
+        if profile_ok || profile_fixed {
+            "saved local app environment matches runtime state"
+        } else {
+            "local env profile is missing or unreadable"
+        },
+        profile_fixed,
+    );
+
+    let conn = match DirectConn::connect("localhost", state.resp_port, &state.password) {
+        Ok(conn) => conn,
+        Err(error) => {
+            add_doctor_check(checks, "local", "engine connection", "fail", error, false);
+            return;
+        }
+    };
+    let mut target = MigrateTarget::Direct(Box::new(conn));
+    doctor_engine_contract("local", &mut target, checks).await;
+    doctor_migrations("local", &mut target, Path::new("lux/migrations"), checks).await;
+}
+
+async fn doctor_cloud(
+    selector: &str,
+    api_url_override: &Option<String>,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    let (client, api_url, token) = get_client(api_url_override);
+    let instance = find_project(&client, &api_url, &token, selector).await;
+    let target_name = format!("cloud:{}", instance.name);
+    add_doctor_check(
+        checks,
+        &target_name,
+        "project status",
+        if instance.status == "running" {
+            "pass"
+        } else {
+            "fail"
+        },
+        format!("project is {}", instance.status),
+        false,
+    );
+    let profile_ok = load_profile_index().is_ok_and(|index| {
+        index.profiles.iter().any(|profile| {
+            profile.kind == "cloud"
+                && profile.project_id.as_deref() == Some(instance.id.as_str())
+                && profile_path(profile).is_file()
+        })
+    });
+    add_doctor_check(
+        checks,
+        &target_name,
+        "env profile",
+        if profile_ok { "pass" } else { "warn" },
+        if profile_ok {
+            "saved cloud app environment is available"
+        } else {
+            "no saved env profile; run `lux env pull <project>`"
+        },
+        false,
+    );
+    if instance.status != "running" {
+        return;
+    }
+    let mut target = MigrateTarget::Cloud {
+        client,
+        api_url,
+        token,
+        instance_id: instance.id,
+    };
+    doctor_engine_contract(&target_name, &mut target, checks).await;
+    doctor_migrations(
+        &target_name,
+        &mut target,
+        Path::new("lux/migrations"),
+        checks,
+    )
+    .await;
+}
+
+async fn doctor_engine_contract(
+    target_name: &str,
+    target: &mut MigrateTarget,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    match target
+        .exec("LUX VERSION")
+        .await
+        .and_then(|raw| decode_json::<EngineManagementVersion>(&raw, "engine version"))
+    {
+        Ok(version) => {
+            let required = ["migrations.plan", "migrations.apply", "migrations.repair"];
+            let missing: Vec<&str> = required
+                .iter()
+                .filter(|capability| {
+                    !version
+                        .capabilities
+                        .iter()
+                        .any(|present| present == **capability)
+                })
+                .copied()
+                .collect();
+            add_doctor_check(
+                checks,
+                target_name,
+                "engine management API",
+                if missing.is_empty() { "pass" } else { "fail" },
+                if missing.is_empty() {
+                    format!(
+                        "engine {} (management API {}) supports managed migrations",
+                        version.version, version.api_version
+                    )
+                } else {
+                    format!("engine is missing capabilities: {}", missing.join(", "))
+                },
+                false,
+            );
+        }
+        Err(error) => add_doctor_check(
+            checks,
+            target_name,
+            "engine management API",
+            "fail",
+            error,
+            false,
+        ),
+    }
+}
+
+async fn doctor_migrations(
+    target_name: &str,
+    target: &mut MigrateTarget,
+    dir: &Path,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    let records = match target.migration_list().await {
+        Ok(records) => records,
+        Err(error) => {
+            add_doctor_check(checks, target_name, "migration state", "fail", error, false);
+            return;
+        }
+    };
+    if let Some(record) = records
+        .iter()
+        .find(|record| matches!(record.status.as_str(), "applying" | "failed"))
+    {
+        add_doctor_check(
+            checks,
+            target_name,
+            "migration state",
+            "fail",
+            format!(
+                "{} is {} at {}/{} commands; repair it explicitly",
+                record.filename, record.status, record.completed_commands, record.command_count
+            ),
+            false,
+        );
+        return;
+    }
+    match migration_plans(target, dir).await {
+        Ok(plans) => {
+            let conflicts = plans
+                .iter()
+                .filter(|plan| {
+                    matches!(
+                        plan.action,
+                        MigrationPlanAction::Conflict | MigrationPlanAction::Blocked
+                    )
+                })
+                .count();
+            let pending = plans
+                .iter()
+                .filter(|plan| plan.action == MigrationPlanAction::Apply)
+                .count();
+            add_doctor_check(
+                checks,
+                target_name,
+                "migration state",
+                if conflicts > 0 {
+                    "fail"
+                } else if pending > 0 {
+                    "warn"
+                } else {
+                    "pass"
+                },
+                if conflicts > 0 {
+                    format!("{conflicts} migration conflict(s) or blocker(s)")
+                } else if pending > 0 {
+                    format!("{pending} migration(s) pending")
+                } else {
+                    "local files and target ledger agree".to_string()
+                },
+                false,
+            );
+        }
+        Err(error) => {
+            add_doctor_check(checks, target_name, "migration state", "fail", error, false)
         }
     }
 }
 
-/// Only the filename is needed to decide what is pending. Selecting `*` also
-/// pulls `body`, the full source of every migration, which grows the response
-/// until the exec endpoint times out. That timeout used to be swallowed and
-/// reported as "0 applied", so every migration looked pending, re-running
-/// replayed them all and died on `table already exists`.
-const APPLIED_MIGRATIONS_QUERY: &str = "TSELECT filename FROM __migrations LIMIT 10000";
-
-async fn get_applied_migrations(target: &mut MigrateTarget) -> Result<HashSet<String>, String> {
-    // Probe reachability/auth first. A failing PING is fatal and must surface.
-    target.exec("PING").await?;
-
-    // A missing table means nothing has been applied yet, which is a legitimate
-    // empty set. Any other read failure is fatal: reporting it as "0 applied" is
-    // what turns a transient error into a destructive replay.
-    match migrations_schema_state(target.exec("TSCHEMA __migrations").await)? {
-        MigrationsSchemaState::Missing => return Ok(HashSet::new()),
-        MigrationsSchemaState::Present => {}
+fn print_doctor_report(report: &DoctorReport, fix: bool) {
+    println!(
+        "  {:<24}  {:<24}  {:<7}  {}",
+        "TARGET".dimmed(),
+        "CHECK".dimmed(),
+        "STATUS".dimmed(),
+        "DETAIL".dimmed()
+    );
+    for check in &report.checks {
+        let status = match check.status.as_str() {
+            "pass" => "pass".green().to_string(),
+            "warn" => "warn".yellow().to_string(),
+            _ => "fail".red().to_string(),
+        };
+        let fixed = if check.fixed { " (fixed)" } else { "" };
+        println!(
+            "  {:<24}  {:<24}  {:<7}  {}{}",
+            check.target, check.check, status, check.detail, fixed
+        );
     }
-
-    let mut applied = HashSet::new();
-
-    match target {
-        MigrateTarget::Direct(conn) => {
-            let rows = conn
-                .exec_table_rows(APPLIED_MIGRATIONS_QUERY)
-                .map_err(|e| format!("could not read applied migrations: {e}"))?;
-            // Each row: ["field", value, "field", value, ...]
-            for row in &rows {
-                for i in 0..row.len().saturating_sub(1) {
-                    if row[i] == "filename" {
-                        let name = &row[i + 1];
-                        if !name.is_empty() {
-                            applied.insert(name.clone());
-                        }
-                    }
-                }
-            }
-        }
-        MigrateTarget::Cloud {
-            client,
-            api_url,
-            token,
-            instance_id,
-        } => {
-            let body = exec_command_json(
-                client,
-                api_url,
-                token,
-                instance_id,
-                APPLIED_MIGRATIONS_QUERY,
-            )
-            .await
-            .map_err(|e| format!("could not read applied migrations: {e}"))?;
-            // API returns [["field", "val", ...], ...]
-            if let Some(rows) = body.as_array() {
-                for row in rows {
-                    if let Some(fields) = row.as_array() {
-                        for i in 0..fields.len().saturating_sub(1) {
-                            if fields[i].as_str() == Some("filename") {
-                                if let Some(name) = fields[i + 1].as_str() {
-                                    if !name.is_empty() {
-                                        applied.insert(name.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    if report.healthy {
+        println!("\n{}", "Doctor found no blocking problems.".green());
+    } else {
+        println!("\n{}", "Doctor found blocking problems.".red());
     }
-    Ok(applied)
-}
-
-/// Read every migration recorded on the target as (filename, checksum, body).
-/// `body` is empty for rows applied before the source was stored. Used by
-/// `lux migrate pull` to recreate dashboard-authored migrations locally.
-async fn get_remote_migrations(target: &mut MigrateTarget) -> Vec<(String, String, String)> {
-    // Each row is a flat ["field", value, "field", value, ...] list.
-    fn extract(row: &[String]) -> (String, String, String) {
-        let mut filename = String::new();
-        let mut checksum = String::new();
-        let mut body = String::new();
-        let mut i = 0;
-        while i + 1 < row.len() {
-            match row[i].as_str() {
-                "filename" => filename = row[i + 1].clone(),
-                "checksum" => checksum = row[i + 1].clone(),
-                "body" => body = row[i + 1].clone(),
-                _ => {}
-            }
-            i += 2;
-        }
-        (filename, checksum, body)
+    if !fix {
+        println!(
+            "{} only repairs migration directories, secret ignores, and local env profiles.",
+            "`lux doctor --fix`".cyan()
+        );
     }
-
-    let mut out = Vec::new();
-    match target {
-        MigrateTarget::Direct(conn) => {
-            if let Ok(rows) = conn
-                .exec_table_rows("TSELECT * FROM __migrations ORDER BY applied_at ASC LIMIT 1000")
-            {
-                for row in &rows {
-                    let r = extract(row);
-                    if !r.0.is_empty() {
-                        out.push(r);
-                    }
-                }
-            }
-        }
-        MigrateTarget::Cloud {
-            client,
-            api_url,
-            token,
-            instance_id,
-        } => {
-            if let Ok(body) = exec_command_json(
-                client,
-                api_url,
-                token,
-                instance_id,
-                "TSELECT * FROM __migrations ORDER BY applied_at ASC LIMIT 1000",
-            )
-            .await
-            {
-                if let Some(rows) = body.as_array() {
-                    for row in rows {
-                        if let Some(fields) = row.as_array() {
-                            let flat: Vec<String> = fields
-                                .iter()
-                                .map(|v| v.as_str().map(str::to_string).unwrap_or_default())
-                                .collect();
-                            let r = extract(&flat);
-                            if !r.0.is_empty() {
-                                out.push(r);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
 }
 
 fn get_local_migrations(dir: &Path) -> Vec<(String, String)> {
@@ -4577,12 +5147,26 @@ fn split_command_line(input: &str) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
-fn simple_hash(content: &str) -> String {
+fn sha256_hash(content: &str) -> String {
+    let digest = Sha256::digest(content.as_bytes());
+    format!("{digest:x}")
+}
+
+fn legacy_djb2_hash(content: &str) -> String {
     let mut hash: u64 = 5381;
     for byte in content.bytes() {
         hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
     }
     format!("{:016x}", hash)
+}
+
+fn legacy_fnv1a_hash(content: &str) -> String {
+    let mut hash: u32 = 0x811c9dc5;
+    for unit in content.encode_utf16() {
+        hash ^= u32::from(unit);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    format!("{hash:x}")
 }
 
 #[cfg(test)]
@@ -4920,9 +5504,13 @@ mod tests {
     }
 
     #[test]
-    fn simple_hash_is_stable() {
-        assert_eq!(simple_hash("PING\n"), simple_hash("PING\n"));
-        assert_ne!(simple_hash("PING\n"), simple_hash("PONG\n"));
+    fn migration_hashes_are_stable() {
+        assert_eq!(
+            sha256_hash("PING\n"),
+            "23b8be7673546c504142529fc88346b4d2b80f3205e7872453871b0f92e072c1"
+        );
+        assert_eq!(legacy_djb2_hash("PING\n"), "000000310dd0051d");
+        assert_eq!(legacy_fnv1a_hash("PING\n"), "8f80d239");
     }
 
     // ── Local engine (lux start/stop/status) ──
@@ -5195,46 +5783,87 @@ mod tests {
     }
 
     #[test]
-    fn migration_schema_probe_distinguishes_missing_from_operational_errors() {
-        assert_eq!(
-            migrations_schema_state(Ok("filename TEXT".to_string())).unwrap(),
-            MigrationsSchemaState::Present
-        );
-        assert_eq!(
-            migrations_schema_state(Err("ERR table '__migrations' does not exist".to_string()))
-                .unwrap(),
-            MigrationsSchemaState::Missing
-        );
+    fn migrate_plan_and_repair_commands_parse() {
+        let cli = Cli::try_parse_from(["lux", "migrate", "plan", "dialog"]).expect("plan parses");
+        match cli.command {
+            Commands::Migrate {
+                action: Some(MigrateAction::Plan(conn)),
+                ..
+            } => assert_eq!(conn.project.as_deref(), Some("dialog")),
+            _ => panic!("expected Migrate::Plan"),
+        }
 
-        for error in [
-            "request failed: operation timed out",
-            "NOAUTH Authentication required",
-            "HTTP 502 Bad Gateway",
-            "ERR table 'another_table' does not exist",
-        ] {
-            let result = migrations_schema_state(Err(error.to_string()));
-            assert!(
-                result.is_err(),
-                "operational error was treated as missing: {error}"
-            );
+        let cli = Cli::try_parse_from([
+            "lux",
+            "migrate",
+            "repair",
+            "001_create.lux",
+            "resume",
+            "2",
+            "dialog",
+        ])
+        .expect("repair resume parses");
+        match cli.command {
+            Commands::Migrate {
+                action:
+                    Some(MigrateAction::Repair {
+                        filename,
+                        action: MigrateRepairAction::Resume { from_command, conn },
+                    }),
+                ..
+            } => {
+                assert_eq!(filename, "001_create.lux");
+                assert_eq!(from_command, 2);
+                assert_eq!(conn.project.as_deref(), Some("dialog"));
+            }
+            _ => panic!("expected Migrate::Repair::Resume"),
         }
     }
 
     #[test]
-    fn migration_body_upgrade_ignores_only_existing_field() {
-        assert!(is_existing_migrations_body_error(
-            "ERR field 'body' already exists"
-        ));
-        for error in [
-            "request failed: operation timed out",
-            "NOAUTH Authentication required",
-            "HTTP 502 Bad Gateway",
-            "ERR field 'another_field' already exists",
-        ] {
-            assert!(
-                !is_existing_migrations_body_error(error),
-                "operational error was treated as an idempotent alter: {error}"
-            );
+    fn doctor_target_grammar_is_local_by_default() {
+        let cli = Cli::try_parse_from(["lux", "doctor", "--fix"]).expect("doctor parses");
+        match cli.command {
+            Commands::Doctor {
+                project, all, fix, ..
+            } => {
+                assert!(project.is_none());
+                assert!(!all);
+                assert!(fix);
+            }
+            _ => panic!("expected Doctor"),
         }
+    }
+
+    #[test]
+    fn migration_checksum_matching_supports_engine_and_legacy_ledgers() {
+        let record = |algorithm: &str, checksum: String| MigrationRecord {
+            filename: "001.lux".to_string(),
+            checksum,
+            checksum_algorithm: algorithm.to_string(),
+            applied_at: 0,
+            body: String::new(),
+            status: "applied".to_string(),
+            command_count: 1,
+            completed_commands: 1,
+            error: None,
+        };
+        let body = "PING\n";
+        assert!(migration_checksum_matches(
+            &record("sha256", sha256_hash(body)),
+            body
+        ));
+        assert!(migration_checksum_matches(
+            &record("djb2-64", legacy_djb2_hash(body)),
+            body
+        ));
+        assert!(migration_checksum_matches(
+            &record("fnv1a-32-utf16", legacy_fnv1a_hash(body)),
+            body
+        ));
+        assert!(!migration_checksum_matches(
+            &record("sha256", sha256_hash("PONG\n")),
+            body
+        ));
     }
 }

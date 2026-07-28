@@ -60,6 +60,7 @@ lux create my-app --accept-charges            # create a Standard project
 lux status                                    # show local engine status
 lux status my-app                             # show explicit cloud project status
 lux status --all                              # show local + linked cloud together
+lux doctor --all                              # diagnose local + linked cloud
 lux exec my-app SET hello world               # execute a command
 lux exec my-app KEYS '*'                      # wildcards need quotes
 lux logs my-app                               # fetch explicit cloud project logs
@@ -75,6 +76,7 @@ lux env use my-app                            # safely merge its Lux keys into .
 lux env use local                             # switch the app back to local
 lux migrate new create_users                  # create a migration file
 lux migrate status                            # check status (local instance)
+lux migrate plan                              # preview without applying
 lux migrate run                               # run pending migrations (local instance)
 lux migrate run my-app                        # run against a cloud project
 lux seed run                                  # run lux/seed.lux against local
@@ -140,6 +142,10 @@ lux migrate status
 lux migrate status my-app              # cloud project
 lux migrate status --host 10.0.0.5     # specific host
 
+# Preview exact engine decisions without executing anything
+lux migrate plan
+lux migrate plan my-app
+
 # Run all pending migrations
 lux migrate run                               # local instance
 lux migrate run my-app                        # cloud project
@@ -150,6 +156,11 @@ lux migrate run --host 10.0.0.5 --port 6379   # specific host
 # (e.g. ones authored in the Lux Cloud dashboard)
 lux migrate pull my-app                       # cloud project
 lux migrate pull --host 10.0.0.5 --port 6379  # specific host
+
+# Explicitly resolve an interrupted or failed migration after reviewing status
+lux migrate repair 202607280001_create_users.lux resume 1
+lux migrate repair 202607280001_create_users.lux mark-applied
+lux migrate repair 202607280001_create_users.lux abandon
 ```
 
 `lux link` records the cloud project associated with the repository for
@@ -178,10 +189,27 @@ For commands with complex quoted values, use JSON argv arrays:
 ["TINSERT", "posts", "id", "post_1", "body", "hello world"]
 ```
 
-Applied migrations are tracked in a `__migrations` table on your project, which
-also stores each migration's source so `lux migrate pull` can recreate the files
-on another machine. Pull never overwrites a local file that differs from the
-recorded version; it warns and keeps your copy.
+The engine owns parsing, SHA-256 checksums, execution, and the `__migrations`
+ledger. It records progress before executing commands. A failed or interrupted
+migration blocks later writes and is never replayed or resumed automatically;
+use `lux migrate status` to review its command cursor, then choose an explicit
+repair action. `pull` understands legacy checksums and never overwrites a local
+file that differs from the recorded version.
+
+## Doctor
+
+```bash
+lux doctor                         # local runtime, env, engine API, migrations
+lux doctor my-app                  # explicit cloud project
+lux doctor --all                   # local + linked cloud
+lux doctor --fix                   # safe filesystem hygiene only
+lux doctor --output json
+```
+
+`doctor --fix` is intentionally constrained: it may create
+`lux/migrations`, add Lux secret paths to `.gitignore`, and rebuild a missing
+local env profile from existing local state. It never starts, stops, updates,
+migrates, repairs, rotates credentials, or changes the active app target.
 
 ## Seeds
 
