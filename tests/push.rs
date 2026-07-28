@@ -51,6 +51,9 @@ fn start(dir: &std::path::Path, resp_port: u16, http_port: u16, keep_dir: bool) 
         .env("LUX_STORAGE_DIR", dir.join("storage").to_str().unwrap())
         .env("LUX_PASSWORD", "rootsecret")
         .env("LUX_AUTH_ENABLED", "true")
+        // Integration delivery uses a loopback mock push service. Production
+        // defaults reject private and non-HTTPS Web Push endpoints.
+        .env("LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let child = cmd.spawn().expect("spawn lux");
@@ -777,6 +780,7 @@ fn start_no_auth(dir: &std::path::Path, resp_port: u16, http_port: u16) -> PushS
         .env("LUX_STORAGE_MODE", "tiered")
         .env("LUX_STORAGE_DIR", dir.join("storage").to_str().unwrap())
         .env("LUX_PASSWORD", "rootsecret")
+        .env("LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let child = cmd.spawn().expect("spawn lux");

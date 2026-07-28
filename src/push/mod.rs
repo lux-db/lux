@@ -225,6 +225,9 @@ pub(crate) fn register_device(
     app_id: &str,
     now: Instant,
 ) -> Result<String, String> {
+    if platform.eq_ignore_ascii_case("web") {
+        webpush::validate_subscription_token(token)?;
+    }
     ensure_tables(store, cache, now)?;
     let now_s = unix_seconds().to_string();
     if let Some(existing) = find_row_by_field(store, cache, DEVICES_TABLE, "token", token, now)? {
