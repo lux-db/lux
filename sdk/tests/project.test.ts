@@ -36,6 +36,36 @@ describe('Lux project client', () => {
 		expect(seen?.body).toEqual({ command: ['PING'] });
 	});
 
+	test('push registration forwards the APNs device environment', async () => {
+		let seen: { url: string; body?: any } | null = null;
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			seen = {
+				url: String(input),
+				body: init?.body ? JSON.parse(String(init.body)) : undefined,
+			};
+			return new Response(JSON.stringify({ id: 'dev_1' }), { status: 200 });
+		};
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const result = await client.push.register({
+			token: 'apns-device-token',
+			environment: 'production',
+		});
+
+		expect(result.error).toBeNull();
+		expect(seen?.url).toBe('http://localhost:3957/v1/project/push/devices');
+		expect(seen?.body).toEqual({
+			token: 'apns-device-token',
+			platform: 'ios',
+			app_id: 'default',
+			environment: 'production',
+		});
+	});
+
 	test('default fetch is bound for browser project requests', async () => {
 		const originalFetch = globalThis.fetch;
 		let receiver: unknown;

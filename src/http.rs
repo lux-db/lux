@@ -3135,6 +3135,14 @@ fn push_register(
     // "sandbox" or "production". Optional: an app that omits it keeps the old
     // behaviour of routing by the project's credential.
     let environment = parsed["environment"].as_str().unwrap_or("");
+    // A self-registering end user is not trusted to name the delivery host, and
+    // this route accepts a user's own JWT. See `normalize_environment`.
+    let environment_source = match auth {
+        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+            crate::push::EnvironmentSource::Trusted
+        }
+        _ => crate::push::EnvironmentSource::User,
+    };
     match crate::push::register_device(
         store,
         cache,
@@ -3144,6 +3152,7 @@ fn push_register(
             platform,
             app_id,
             environment,
+            environment_source,
         },
         Instant::now(),
     ) {

@@ -1109,3 +1109,56 @@ fn push_device_environment_is_recorded_and_sticky() {
     assert_eq!(environment_of("sticky-token"), "production");
     drop(server);
 }
+
+/// The delivery worker sends the APNs provider JWT as a bearer token to
+/// whichever host the environment resolves to, and that JWT is signed with the
+/// team's `.p8` and is good for the whole app. `POST /v1/push/devices` accepts
+/// an end user's own session, so a user-supplied host would hand any signed-in
+/// user a way to collect it.
+#[test]
+fn user_session_cannot_redirect_delivery_to_its_own_host() {
+    let real = MockApns::start(200);
+    let attacker = MockApns::start(200);
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let server = start(dir.path(), resp_port, http_port, false);
+
+    set_creds(http_port, &real.url());
+    let (token, uid) = anon_login(http_port);
+
+    // A signed-in user self-registers and tries to name the delivery host.
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"token":"victim-token","platform":"ios","app_id":"default",
+                "environment": attacker.url()})
+        .to_string(),
+        Some(&token),
+    );
+    assert_eq!(s, 200, "register: {b}");
+
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({"subject_id": uid, "notification":{"title":"secret"}}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "send: {b}");
+
+    // Delivery goes to the project's own credential host, not the one the user
+    // named, so no provider token reaches it.
+    let got = real
+        .wait_for_request(Duration::from_secs(5))
+        .expect("the credential host should receive the delivery");
+    assert_eq!(got.path, "/3/device/victim-token");
+    assert!(
+        attacker
+            .wait_for_request(Duration::from_millis(750))
+            .is_none(),
+        "a user-named host received a delivery, leaking the APNs provider token"
+    );
+    drop(server);
+}

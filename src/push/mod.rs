@@ -176,6 +176,7 @@ pub(crate) fn migrate_from_auth_scope(
                 // The legacy layout had no per-device environment; delivery
                 // falls back to the app credential, as it did before.
                 environment: "",
+                environment_source: EnvironmentSource::Trusted,
             },
             now,
         )?;
@@ -231,15 +232,34 @@ pub(crate) struct ResolvedVapidCreds {
 // Device registry
 // ---------------------------------------------------------------------------
 
+/// Who supplied a device's environment. Registration is reachable with an end
+/// user's own JWT, so the two are not equally trusted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvironmentSource {
+    /// A secret key or operator: the project's own backend.
+    Trusted,
+    /// An end user self-registering with their session JWT.
+    User,
+}
+
 /// Normalize a caller-supplied APNs environment to what `resolve_base_url`
-/// understands. An explicit `http(s)://` base survives verbatim, matching the
-/// override the app credential already accepts. Anything else unrecognized is
-/// treated as unspecified rather than guessed at, so delivery falls back to the
-/// app credential instead of silently routing to the wrong host.
-pub(crate) fn normalize_environment(environment: &str) -> String {
+/// understands. Anything unrecognized is treated as unspecified rather than
+/// guessed at, so delivery falls back to the app credential instead of silently
+/// routing to the wrong host.
+///
+/// An explicit `http(s)://` base is only honored from a trusted caller. The
+/// delivery worker sends the APNs provider JWT as a bearer token to whatever
+/// host this resolves to, and that JWT is signed with the team's `.p8` and is
+/// good for the whole app, so letting an end user name the host would hand any
+/// signed-in user a way to collect it. Operators can already point the app
+/// credential at an arbitrary base, so they gain nothing new here.
+pub(crate) fn normalize_environment(environment: &str, source: EnvironmentSource) -> String {
     let trimmed = environment.trim();
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return trimmed.to_string();
+        return match source {
+            EnvironmentSource::Trusted => trimmed.to_string(),
+            EnvironmentSource::User => String::new(),
+        };
     }
     match trimmed.to_ascii_lowercase().as_str() {
         "production" | "prod" => "production".to_string(),
@@ -264,6 +284,9 @@ pub(crate) struct DeviceRegistration<'a> {
     pub app_id: &'a str,
     /// "sandbox", "production", or empty for unspecified.
     pub environment: &'a str,
+    /// Whether `environment` came from the project's backend or from the end
+    /// user's own session. Gates the explicit-host override.
+    pub environment_source: EnvironmentSource,
 }
 
 pub(crate) fn register_device(
@@ -278,12 +301,13 @@ pub(crate) fn register_device(
         platform,
         app_id,
         environment,
+        environment_source,
     } = device;
     if platform.eq_ignore_ascii_case("web") {
         webpush::validate_subscription_token(token)?;
     }
     ensure_tables(store, cache, now)?;
-    let environment = normalize_environment(environment);
+    let environment = normalize_environment(environment, environment_source);
     let now_s = unix_seconds().to_string();
     if let Some(existing) = find_row_by_field(store, cache, DEVICES_TABLE, "token", token, now)? {
         let id = existing.get("id").cloned().unwrap_or_default();
@@ -825,6 +849,8 @@ pub(crate) fn cmd_push(
                 platform: arg(5),
                 app_id: arg(6),
                 environment: arg(7),
+                // LUX PUSH is operator-level RESP; there is no end user here.
+                environment_source: EnvironmentSource::Trusted,
             };
             match register_device(store, cache, device, now) {
                 Ok(id) => resp::write_bulk(out, &id),
@@ -893,14 +919,18 @@ fn normalize_err(e: &str) -> String {
 mod tests {
     use super::*;
 
+    use EnvironmentSource::{Trusted, User};
+
     #[test]
     fn environment_normalizes_apple_spellings() {
-        assert_eq!(normalize_environment("production"), "production");
-        assert_eq!(normalize_environment("PROD"), "production");
-        assert_eq!(normalize_environment(" Production "), "production");
-        assert_eq!(normalize_environment("sandbox"), "sandbox");
-        assert_eq!(normalize_environment("development"), "sandbox");
-        assert_eq!(normalize_environment("dev"), "sandbox");
+        for source in [Trusted, User] {
+            assert_eq!(normalize_environment("production", source), "production");
+            assert_eq!(normalize_environment("PROD", source), "production");
+            assert_eq!(normalize_environment(" Production ", source), "production");
+            assert_eq!(normalize_environment("sandbox", source), "sandbox");
+            assert_eq!(normalize_environment("development", source), "sandbox");
+            assert_eq!(normalize_environment("dev", source), "sandbox");
+        }
     }
 
     // Unrecognized input must not be guessed at. Empty means "the device did
@@ -908,20 +938,37 @@ mod tests {
     // would send a typo straight to the wrong one.
     #[test]
     fn unknown_environment_is_unspecified() {
-        assert_eq!(normalize_environment(""), "");
-        assert_eq!(normalize_environment("staging"), "");
-        assert_eq!(normalize_environment("apns"), "");
+        for source in [Trusted, User] {
+            assert_eq!(normalize_environment("", source), "");
+            assert_eq!(normalize_environment("staging", source), "");
+            assert_eq!(normalize_environment("apns", source), "");
+        }
     }
 
     #[test]
-    fn explicit_base_url_survives_normalization() {
+    fn explicit_base_url_survives_for_a_trusted_caller() {
         assert_eq!(
-            normalize_environment("http://127.0.0.1:9000"),
+            normalize_environment("http://127.0.0.1:9000", Trusted),
             "http://127.0.0.1:9000"
         );
         assert_eq!(
-            normalize_environment("https://api.push.apple.com"),
+            normalize_environment("https://api.push.apple.com", Trusted),
             "https://api.push.apple.com"
+        );
+    }
+
+    // The delivery worker sends the APNs provider JWT as a bearer token to
+    // whatever host this resolves to. `POST /v1/push/devices` accepts an end
+    // user's own session, so honoring a user-supplied host would let any
+    // signed-in user collect a token that is signed with the team's .p8 and
+    // valid for the whole app.
+    #[test]
+    fn a_user_cannot_name_the_delivery_host() {
+        assert_eq!(normalize_environment("http://attacker.example/", User), "");
+        assert_eq!(normalize_environment("https://attacker.example/", User), "");
+        assert_eq!(
+            normalize_environment("  HTTP://attacker.example/", User),
+            ""
         );
     }
 }
