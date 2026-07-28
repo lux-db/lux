@@ -7,6 +7,9 @@ export interface LuxPushDevice {
 	subject_id?: string;
 	platform: string;
 	app_id: string;
+	/** The APNs host this token belongs to: `'sandbox'`, `'production'`, or
+	 *  `''` when the device did not say and the app credential decides. */
+	environment?: string;
 	created_at: string;
 	last_seen_at: string;
 }
@@ -18,6 +21,15 @@ export interface LuxPushRegisterOptions {
 	platform?: string;
 	/** App/credential set to route through. Defaults to `'default'`. */
 	app_id?: string;
+	/**
+	 * Which APNs host minted this token. Apple issues `'sandbox'` tokens to
+	 * development builds and `'production'` tokens to TestFlight and the App
+	 * Store, and a token only works against its own host, so a team that is
+	 * still developing while testers are on a build has both in use at once.
+	 * Read it from the `aps-environment` entitlement. Omit it and delivery falls
+	 * back to the environment on the app's credential.
+	 */
+	environment?: 'sandbox' | 'production';
 }
 
 /** A notification. `title`/`body` render the alert; the rest map to APNs `aps`
@@ -58,6 +70,7 @@ export class LuxPushNamespace {
 			token: options.token,
 			platform: options.platform ?? 'ios',
 			app_id: options.app_id ?? 'default',
+			environment: options.environment ?? '',
 		});
 	}
 
@@ -71,6 +84,7 @@ export class LuxPushNamespace {
 			token: options.token,
 			platform: options.platform ?? 'ios',
 			app_id: options.app_id ?? 'default',
+			environment: options.environment ?? '',
 		});
 	}
 

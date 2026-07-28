@@ -127,40 +127,42 @@ async fn process_pending(
             .get("platform")
             .cloned()
             .unwrap_or_else(|| "ios".to_string());
+        let environment = m.get("environment").cloned().unwrap_or_default();
         let payload = m.get("payload").cloned().unwrap_or_default();
         let attempts: i64 = m.get("attempts").and_then(|a| a.parse().ok()).unwrap_or(0);
         if id.is_empty() {
             continue;
         }
 
-        let app_sink = match resolve_sink(store, cache, sinks, &app_id, &platform, now) {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                apply(
-                    store,
-                    cache,
-                    &Action::Dead {
-                        attempts,
-                        error: format!("no push credentials for app '{app_id}'"),
-                    },
-                    &id,
-                    &token,
-                    now,
-                )?;
-                continue;
-            }
-            Err(e) => {
-                apply(
-                    store,
-                    cache,
-                    &Action::Dead { attempts, error: e },
-                    &id,
-                    &token,
-                    now,
-                )?;
-                continue;
-            }
-        };
+        let app_sink =
+            match resolve_sink(store, cache, sinks, &app_id, &platform, &environment, now) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    apply(
+                        store,
+                        cache,
+                        &Action::Dead {
+                            attempts,
+                            error: format!("no push credentials for app '{app_id}'"),
+                        },
+                        &id,
+                        &token,
+                        now,
+                    )?;
+                    continue;
+                }
+                Err(e) => {
+                    apply(
+                        store,
+                        cache,
+                        &Action::Dead { attempts, error: e },
+                        &id,
+                        &token,
+                        now,
+                    )?;
+                    continue;
+                }
+            };
 
         let result = match &*app_sink {
             AppSink::Apns { sink, topic } => {
@@ -188,15 +190,22 @@ async fn process_pending(
 /// Build (or reuse a cached) sink for an app from its stored credentials.
 /// `Ok(None)` means no credentials are configured; `Err` means the credential
 /// material is unusable (bad `.p8`) and the row should dead-letter.
+///
+/// `environment` is the outbox row's APNs host, recorded from the device that
+/// registered the token. One `.p8` key is valid against both hosts, so a project
+/// with a development build and a TestFlight build in flight at the same time
+/// gets one sink per host off the same credentials. An empty `environment` means
+/// the device did not say, and the app credential decides.
 fn resolve_sink(
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
     sinks: &mut HashMap<String, (String, Arc<AppSink>)>,
     app_id: &str,
     platform: &str,
+    environment: &str,
     now: Instant,
 ) -> Result<Option<Arc<AppSink>>, String> {
-    let cache_key = format!("{app_id}:{platform}");
+    let cache_key = format!("{app_id}:{platform}:{environment}");
 
     // Read the current credentials and derive a fingerprint. A cache hit skips
     // only the sink build (which holds the APNs provider-token cache); reading
@@ -223,16 +232,24 @@ fn resolve_sink(
                 sinks.remove(&cache_key);
                 return Ok(None);
             };
+            // The device's own environment wins. The credential's is only the
+            // fallback for tokens registered without one (including every token
+            // registered before `push.devices` carried the column).
+            let environment = if environment.is_empty() {
+                resolved.environment.as_str()
+            } else {
+                environment
+            };
             let fp = format!(
                 "apns|{}|{}|{}|{}",
-                resolved.environment, resolved.topic, resolved.creds.team_id, resolved.creds.key_id
+                environment, resolved.topic, resolved.creds.team_id, resolved.creds.key_id
             );
             if let Some((cached_fp, sink)) = sinks.get(&cache_key) {
                 if *cached_fp == fp {
                     return Ok(Some(sink.clone()));
                 }
             }
-            let base_url = ApnsSink::resolve_base_url(&resolved.environment);
+            let base_url = ApnsSink::resolve_base_url(environment);
             (
                 fp,
                 AppSink::Apns {

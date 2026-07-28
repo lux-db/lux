@@ -972,3 +972,136 @@ fn push_web_push_delivers_encrypted() {
     assert!(!got.body.is_empty(), "encrypted body should be non-empty");
     drop(server);
 }
+
+/// Item 12: a project has one APNs key but its devices live on two hosts. Apple
+/// issues sandbox tokens to development builds and production tokens to
+/// TestFlight, both at once while a team is still developing, and a token is
+/// only valid against the host that minted it. Before this, a project held a
+/// single environment and every send went to that one host, so half the fleet
+/// failed with BadDeviceToken depending on which way the toggle was set.
+#[test]
+fn push_routes_each_device_to_its_own_apns_host() {
+    // Two mocks stand in for the two APNs hosts.
+    let testflight = MockApns::start(200);
+    let development = MockApns::start(200);
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let server = start_no_auth(dir.path(), resp_port, http_port);
+
+    // One credential, pointed at the "production" host. The same .p8 signs for
+    // both, so nothing about the credentials forces a single environment.
+    set_creds(http_port, &testflight.url());
+
+    // The TestFlight build registers without naming an environment, which is
+    // every client written before this existed: it falls back to the credential.
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"subject_id":"dual-env-user","token":"testflight-token",
+                "platform":"ios","app_id":"default"})
+        .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "register testflight device: {b}");
+
+    // The development build names its own host and must not follow the
+    // credential.
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"subject_id":"dual-env-user","token":"development-token",
+                "platform":"ios","app_id":"default","environment":development.url()})
+        .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "register development device: {b}");
+
+    // One send fans out to both devices.
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({"subject_id":"dual-env-user","notification":{"title":"both"}}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "send: {b}");
+    assert_eq!(b["enqueued"], 2);
+
+    let to_testflight = testflight
+        .wait_for_request(Duration::from_secs(5))
+        .expect("the credential host should receive the unlabelled device");
+    let to_development = development
+        .wait_for_request(Duration::from_secs(5))
+        .expect("the device's own host should receive the labelled device");
+
+    // Each token reached its own host, off one set of credentials.
+    assert_eq!(to_testflight.path, "/3/device/testflight-token");
+    assert_eq!(to_development.path, "/3/device/development-token");
+    drop(server);
+}
+
+/// The environment is recorded on the device and readable back, and a
+/// re-register that omits it does not erase it. A token cannot change hosts, so
+/// silence has to mean "unchanged" rather than "reset to the credential".
+#[test]
+fn push_device_environment_is_recorded_and_sticky() {
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let server = start_no_auth(dir.path(), resp_port, http_port);
+
+    let register = |body: Value| {
+        let (s, b) = http(
+            http_port,
+            "POST",
+            "/v1/push/devices",
+            &body.to_string(),
+            Some("rootsecret"),
+        );
+        assert_eq!(s, 200, "register: {b}");
+    };
+
+    register(
+        json!({"subject_id":"env-user","token":"sticky-token","platform":"ios",
+                    "app_id":"default","environment":"development"}),
+    );
+
+    let environment_of = |token: &str| -> String {
+        let (s, b) = http(
+            http_port,
+            "GET",
+            "/v1/push/admin/devices",
+            "",
+            Some("rootsecret"),
+        );
+        assert_eq!(s, 200, "admin devices: {b}");
+        b["devices"]
+            .as_array()
+            .expect("devices array")
+            .iter()
+            .find(|d| d["id"].is_string() && d["subject_id"] == "env-user")
+            .map(|d| d["environment"].as_str().unwrap_or("").to_string())
+            .unwrap_or_else(|| panic!("no device row for {token}"))
+    };
+
+    // "development" is Apple's spelling for the sandbox host.
+    assert_eq!(environment_of("sticky-token"), "sandbox");
+
+    // A refresh that omits it keeps the stored value.
+    register(
+        json!({"subject_id":"env-user","token":"sticky-token","platform":"ios",
+                    "app_id":"default"}),
+    );
+    assert_eq!(environment_of("sticky-token"), "sandbox");
+
+    // An explicit value still updates it.
+    register(
+        json!({"subject_id":"env-user","token":"sticky-token","platform":"ios",
+                    "app_id":"default","environment":"production"}),
+    );
+    assert_eq!(environment_of("sticky-token"), "production");
+    drop(server);
+}
