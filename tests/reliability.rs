@@ -60,14 +60,16 @@ fn connect(port: u16) -> TcpStream {
     stream
 }
 
-fn wait_for_port(port: u16) {
-    for _ in 0..80 {
-        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
+/// A bare TCP connect is not readiness, and a 4s ceiling is too tight for a
+/// loaded CI runner. Share the harness check, which waits on an actual PING and
+/// reports a dead child as one.
+fn wait_for_port(child: &mut std::process::Child, port: u16) {
+    if !common::wait_for_resp_ready(port, child) {
+        panic!(
+            "lux never became ready on port {port} (exited: {:?})",
+            child.try_wait().ok().flatten()
+        );
     }
-    panic!("lux did not start on port {port}");
 }
 
 struct LuxServer {
@@ -82,8 +84,8 @@ impl LuxServer {
             std::env::temp_dir().join(format!("lux_reliability_{}_{}", std::process::id(), port));
         let _ = std::fs::remove_dir_all(&tmpdir);
         std::fs::create_dir_all(&tmpdir).unwrap();
-        let child = Self::spawn(port, &tmpdir, maxmemory);
-        wait_for_port(port);
+        let mut child = Self::spawn(port, &tmpdir, maxmemory);
+        wait_for_port(&mut child, port);
         Self {
             port,
             child,
@@ -116,7 +118,7 @@ impl LuxServer {
         self.child.wait().ok();
         thread::sleep(Duration::from_millis(300));
         self.child = Self::spawn(self.port, &self.tmpdir, maxmemory);
-        wait_for_port(self.port);
+        wait_for_port(&mut self.child, self.port);
     }
 }
 

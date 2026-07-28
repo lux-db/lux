@@ -69,17 +69,12 @@ fn start_lux_with_env(
         cmd.env(key, value);
     }
 
-    let child = cmd.spawn().expect("failed to start lux");
-    let server = LuxServer { child, tmpdir };
-    for _ in 0..80 {
-        if TcpStream::connect(("127.0.0.1", http_port)).is_ok()
-            && TcpStream::connect(("127.0.0.1", resp_port)).is_ok()
-        {
-            return server;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("lux did not start on resp={resp_port} http={http_port}");
+    let mut child = cmd.spawn().expect("failed to start lux");
+    // A bare TCP connect is not readiness: the listener can be up before the
+    // server answers. Share the harness check so a slow CI boot is waited out
+    // and a dead child is reported as one.
+    common::await_server_ready(&mut child, resp_port, http_port);
+    LuxServer { child, tmpdir }
 }
 
 fn http_json_request(

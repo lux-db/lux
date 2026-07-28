@@ -53,22 +53,16 @@ fn start(dir: &std::path::Path, resp_port: u16, http_port: u16, keep_dir: bool) 
         .env("LUX_AUTH_ENABLED", "true")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let child = cmd.spawn().expect("spawn lux");
-    let server = PushServer {
+    let mut child = cmd.spawn().expect("spawn lux");
+    // A bare TCP connect is not readiness: the listener can be up before the
+    // server answers. Share the harness check so a slow CI boot is waited out
+    // and a dead child is reported as one.
+    common::await_server_ready(&mut child, resp_port, http_port);
+    PushServer {
         child,
         dir: dir.to_path_buf(),
         keep_dir,
-    };
-    for _ in 0..80 {
-        if TcpStream::connect(("127.0.0.1", http_port)).is_ok()
-            && TcpStream::connect(("127.0.0.1", resp_port)).is_ok()
-        {
-            std::thread::sleep(Duration::from_millis(150));
-            return server;
-        }
-        std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("lux did not start");
 }
 
 fn http(port: u16, method: &str, path: &str, body: &str, auth: Option<&str>) -> (u16, Value) {
@@ -779,22 +773,13 @@ fn start_no_auth(dir: &std::path::Path, resp_port: u16, http_port: u16) -> PushS
         .env("LUX_PASSWORD", "rootsecret")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let child = cmd.spawn().expect("spawn lux");
-    let server = PushServer {
+    let mut child = cmd.spawn().expect("spawn lux");
+    common::await_server_ready(&mut child, resp_port, http_port);
+    PushServer {
         child,
         dir: dir.to_path_buf(),
         keep_dir: false,
-    };
-    for _ in 0..80 {
-        if TcpStream::connect(("127.0.0.1", http_port)).is_ok()
-            && TcpStream::connect(("127.0.0.1", resp_port)).is_ok()
-        {
-            std::thread::sleep(Duration::from_millis(150));
-            return server;
-        }
-        std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("lux did not start");
 }
 
 /// The Pompeii case: Lux auth OFF, a trusted secret-key caller registers a token

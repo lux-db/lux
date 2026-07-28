@@ -73,23 +73,15 @@ fn cmd(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| s.to_string()).collect()
 }
 
-fn wait_for_port(port: u16) {
-    for _ in 0..80 {
-        if let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{port}")) {
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-            if stream.write_all(&resp_cmd(&["PING".to_string()])).is_ok() {
-                let mut buf = [0u8; 64];
-                if stream
-                    .read(&mut buf)
-                    .is_ok_and(|n| String::from_utf8_lossy(&buf[..n]).contains("PONG"))
-                {
-                    return;
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
+/// Same PING check as before, but with the shared budget and a panic that says
+/// whether the child died rather than only that it never answered.
+fn wait_for_port(child: &mut std::process::Child, port: u16) {
+    if !common::wait_for_resp_ready(port, child) {
+        panic!(
+            "lux never became ready on port {port} (exited: {:?})",
+            child.try_wait().ok().flatten()
+        );
     }
-    panic!("lux did not start on port {port}");
 }
 
 struct LuxServer {
@@ -109,8 +101,8 @@ impl LuxServer {
         ));
         let _ = std::fs::remove_dir_all(&tmpdir);
         std::fs::create_dir_all(&tmpdir).unwrap();
-        let child = Self::spawn(port, &tmpdir, tiered);
-        wait_for_port(port);
+        let mut child = Self::spawn(port, &tmpdir, tiered);
+        wait_for_port(&mut child, port);
         Self {
             port,
             child,
@@ -150,7 +142,7 @@ impl LuxServer {
         common::terminate_child(&mut self.child);
         self.port = common::free_port();
         self.child = Self::spawn(self.port, &self.tmpdir, tiered);
-        wait_for_port(self.port);
+        wait_for_port(&mut self.child, self.port);
     }
 
     fn crash_and_restart(&mut self, tiered: bool) {
@@ -158,7 +150,7 @@ impl LuxServer {
         self.child.wait().ok();
         self.port = common::free_port();
         self.child = Self::spawn(self.port, &self.tmpdir, tiered);
-        wait_for_port(self.port);
+        wait_for_port(&mut self.child, self.port);
     }
 }
 

@@ -62,6 +62,32 @@ pub fn find_lux_binary() -> std::path::PathBuf {
 /// Reserve `n` distinct localhost ports by holding listeners on `:0`
 /// simultaneously, then releasing them. Binding all at once guarantees the
 /// ports differ; releasing lets the spawned server claim them.
+/// Startup poll budget, at 50ms per poll. Servers answer in well under a second
+/// locally; this is sized for a loaded CI runner building in debug mode.
+const STARTUP_POLLS: usize = 300;
+
+/// Wait for a spawned server to answer on both protocols, panicking with what
+/// actually went wrong. A bare "did not start" cannot distinguish a slow boot
+/// from a process that exited, which makes the failure impossible to diagnose
+/// from a CI log.
+pub fn await_server_ready(child: &mut Child, resp_port: u16, http_port: u16) {
+    if let Ok(Some(status)) = child.try_wait() {
+        panic!("lux exited before serving (status {status}) on resp={resp_port} http={http_port}");
+    }
+    if !wait_for_resp_ready(resp_port, child) {
+        panic!(
+            "lux RESP port never became ready on resp={resp_port} (exited: {:?})",
+            child.try_wait().ok().flatten()
+        );
+    }
+    if http_port != 0 && !wait_for_http_ready(http_port, child) {
+        panic!(
+            "lux HTTP port never became ready on http={http_port} (exited: {:?})",
+            child.try_wait().ok().flatten()
+        );
+    }
+}
+
 pub fn free_ports(n: usize) -> Vec<u16> {
     let listeners: Vec<TcpListener> = (0..n)
         .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port"))
@@ -408,8 +434,14 @@ pub fn spawn_lux_with_data_dir(
 }
 
 /// Poll until the RESP port answers PING, bailing early if the child dies.
-fn wait_for_resp_ready(port: u16, child: &mut Child) -> bool {
-    for _ in 0..100 {
+/// Poll until the RESP port answers PING, bailing early if the child dies.
+///
+/// The ceiling is generous on purpose: CI builds are unoptimized and the whole
+/// suite spawns servers in parallel, so a cold start can take several seconds.
+/// This returns as soon as the server answers, so a high ceiling costs nothing
+/// on the happy path and only buys headroom on a loaded machine.
+pub fn wait_for_resp_ready(port: u16, child: &mut Child) -> bool {
+    for _ in 0..STARTUP_POLLS {
         if let Ok(Some(_)) = child.try_wait() {
             return false;
         }
@@ -430,8 +462,8 @@ fn wait_for_resp_ready(port: u16, child: &mut Child) -> bool {
 }
 
 /// Poll until the HTTP port returns an HTTP response, bailing early if the child dies.
-fn wait_for_http_ready(port: u16, child: &mut Child) -> bool {
-    for _ in 0..100 {
+pub fn wait_for_http_ready(port: u16, child: &mut Child) -> bool {
+    for _ in 0..STARTUP_POLLS {
         if let Ok(Some(_)) = child.try_wait() {
             return false;
         }
