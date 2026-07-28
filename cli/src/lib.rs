@@ -144,7 +144,20 @@ enum Commands {
         #[arg(short = 'a', long, help = "Password (for direct connection)")]
         password: Option<String>,
     },
+    /// Inspect installed component versions and available updates.
+    Version {
+        #[arg(help = "Cloud project name or ID (omit for local components)")]
+        project: Option<String>,
+        #[arg(long, help = "Show CLI, local engine, Studio, and linked cloud")]
+        all: bool,
+        #[arg(short = 'o', long, help = "Output format (json)")]
+        output: Option<String>,
+    },
+    /// Update Lux components explicitly. Bare `lux update` updates the CLI.
+    #[command(args_conflicts_with_subcommands = true)]
     Update {
+        #[command(subcommand)]
+        action: Option<UpdateAction>,
         #[arg(long, help = "Check for updates without installing")]
         check: bool,
     },
@@ -260,6 +273,27 @@ enum MigrateRepairAction {
     Abandon {
         #[command(flatten)]
         conn: MigrateConn,
+    },
+}
+
+#[derive(Subcommand)]
+enum UpdateAction {
+    /// Update the Lux CLI binary.
+    Cli {
+        #[arg(long, help = "Check without installing")]
+        check: bool,
+    },
+    /// Update a local engine or cloud project.
+    Engine {
+        #[arg(help = "Cloud project name or ID (omit for the local engine)")]
+        project: Option<String>,
+        #[arg(long, help = "Check without installing")]
+        check: bool,
+    },
+    /// Update the local Lux Studio image.
+    Studio {
+        #[arg(long, help = "Check without installing")]
+        check: bool,
     },
 }
 
@@ -480,16 +514,16 @@ fn desired_engine_image(config: Option<&LocalConfig>) -> String {
     }
 }
 
-/// Engine image `lux start` pulls. Tracks `:latest` (CI publishes it on every
-/// release) and `lux start` does an explicit `docker pull` each run, so local
-/// dev follows the newest engine without the CLI needing a release per bump.
+/// Engine image `lux start` runs. `:latest` is resolved from the local cache;
+/// `lux update engine` is the explicit path that checks and pulls a newer image.
 const LOCAL_ENGINE_IMAGE: &str = "ghcr.io/lux-db/lux:latest";
 const DEFAULT_HTTP_PORT: u16 = 5890;
 const DEFAULT_RESP_PORT: u16 = 6379;
 
-/// Lux Studio image `lux studio` runs (tracks `:latest`, pulled each run, like
-/// the engine image). Serves the local web UI; talks to the engine from the
-/// browser over the engine's CORS-`*` HTTP API.
+/// Lux Studio image `lux studio` runs. Existing installs use the cached image
+/// until `lux update studio` explicitly pulls a newer digest. It serves the
+/// local web UI and talks to the engine from the browser over the engine's
+/// CORS-`*` HTTP API.
 const STUDIO_IMAGE: &str = "ghcr.io/lux-db/studio:latest";
 /// Default host port for Studio. Lux owns the 5890 block: 5890 = HTTP API,
 /// 5891 = Studio (RESP stays on 6379 for Redis drop-in compatibility).
@@ -775,6 +809,136 @@ fn docker_container_state(name: &str) -> Option<String> {
 
 fn docker_volume_exists(name: &str) -> bool {
     docker_output(&["volume", "inspect", name]).is_ok()
+}
+
+fn docker_remote_digest(image: &str) -> Result<String, String> {
+    let output = docker_output(&[
+        "buildx",
+        "imagetools",
+        "inspect",
+        image,
+        "--format",
+        "{{json .Manifest.Digest}}",
+    ])?;
+    let digest = output.trim().trim_matches('"');
+    if digest.starts_with("sha256:") {
+        Ok(digest.to_string())
+    } else {
+        Err(format!("registry returned an invalid digest for {image}"))
+    }
+}
+
+fn docker_container_digest(container: &str) -> Result<String, String> {
+    let image_id = docker_output(&["inspect", "-f", "{{.Image}}", container])?;
+    let raw = docker_output(&[
+        "image",
+        "inspect",
+        &image_id,
+        "--format",
+        "{{json .RepoDigests}}",
+    ])?;
+    let digests: Vec<String> =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid Docker image metadata: {e}"))?;
+    digests
+        .into_iter()
+        .find_map(|value| value.split_once('@').map(|(_, digest)| digest.to_string()))
+        .ok_or_else(|| format!("no repository digest recorded for container {container}"))
+}
+
+fn docker_image_digest(image: &str) -> Result<String, String> {
+    let raw = docker_output(&[
+        "image",
+        "inspect",
+        image,
+        "--format",
+        "{{json .RepoDigests}}",
+    ])?;
+    let digests: Vec<String> =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid Docker image metadata: {e}"))?;
+    digests
+        .into_iter()
+        .find_map(|value| value.split_once('@').map(|(_, digest)| digest.to_string()))
+        .ok_or_else(|| format!("no repository digest recorded for image {image}"))
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ImageUpdateStatus {
+    image: String,
+    current_digest: Option<String>,
+    latest_digest: Option<String>,
+    update_available: Option<bool>,
+    error: Option<String>,
+}
+
+fn image_update_status(container: &str, image: &str) -> ImageUpdateStatus {
+    let current = docker_container_digest(container);
+    let latest = docker_remote_digest(image);
+    match (current, latest) {
+        (Ok(current), Ok(latest)) => ImageUpdateStatus {
+            image: image.to_string(),
+            update_available: Some(current != latest),
+            current_digest: Some(current),
+            latest_digest: Some(latest),
+            error: None,
+        },
+        (current, latest) => {
+            let (current_digest, current_error) = match current {
+                Ok(value) => (Some(value), None),
+                Err(error) => (None, Some(error)),
+            };
+            let (latest_digest, latest_error) = match latest {
+                Ok(value) => (Some(value), None),
+                Err(error) => (None, Some(error)),
+            };
+            ImageUpdateStatus {
+                image: image.to_string(),
+                current_digest,
+                latest_digest,
+                update_available: None,
+                error: current_error
+                    .or(latest_error)
+                    .or_else(|| Some("version status unavailable".to_string())),
+            }
+        }
+    }
+}
+
+fn print_image_update_hint(label: &str, container: &str, image: &str, command: &str) {
+    let status = image_update_status(container, image);
+    if status.update_available == Some(true) {
+        println!(
+            "{} A newer {label} image is available; run {}.",
+            "Update:".yellow(),
+            command.cyan()
+        );
+    }
+}
+
+fn run_local_engine_container(state: &LocalState) -> Result<(), String> {
+    let resp_map = format!("{}:6379", state.resp_port);
+    let http_map = format!("{}:5890", state.http_port);
+    let vol_map = format!("{}:/data", state.volume);
+    let engine_env = local_engine_env(state);
+    let mut run_args: Vec<&str> = vec![
+        "run",
+        "-d",
+        "--name",
+        &state.container,
+        "-p",
+        &resp_map,
+        "-p",
+        &http_map,
+        "-v",
+        &vol_map,
+    ];
+    for entry in &engine_env {
+        run_args.push("-e");
+        run_args.push(entry);
+    }
+    run_args.push("--restart");
+    run_args.push("unless-stopped");
+    run_args.push(&state.image);
+    docker_output(&run_args).map(|_| ())
 }
 
 /// Merge `entries` into existing `.gitignore` content, appending only the ones
@@ -1113,14 +1277,20 @@ fn studio_project_name() -> String {
 /// going. The SPA runs in the browser, so LUX_URL must be reachable from the
 /// browser: defaults to host-visible localhost, but honors an explicit LUX_URL
 /// for remote/sandbox setups. LUX_KEY is the operator secret and stays local.
-fn ensure_studio(state: &mut LocalState, open_browser: bool) {
+fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
     if docker_container_state(&state.studio_container).as_deref() == Some("running") {
         let url = format!("http://localhost:{}", state.studio_port);
         println!("{} {}", "Lux Studio:".bold(), url.cyan());
+        print_image_update_hint(
+            "Studio",
+            &state.studio_container,
+            STUDIO_IMAGE,
+            "lux update studio",
+        );
         if open_browser {
             let _ = open::that(&url);
         }
-        return;
+        return true;
     }
     if docker_container_state(&state.studio_container).is_some() {
         let _ = docker_output(&["rm", "-f", &state.studio_container]);
@@ -1130,11 +1300,6 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) {
         state.studio_port = studio_port;
         save_local_state(state);
     }
-
-    println!("{} {}", "Pulling".bold(), STUDIO_IMAGE.dimmed());
-    let _ = std::process::Command::new("docker")
-        .args(["pull", STUDIO_IMAGE])
-        .status();
 
     let port_map = format!("{studio_port}:80");
     // The Studio SPA runs in the browser and calls the engine directly. Normally
@@ -1182,7 +1347,7 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) {
     ];
     if let Err(e) = docker_output(&run_args) {
         eprintln!("{} Studio failed to start: {e}", "Warning:".yellow());
-        return;
+        return false;
     }
 
     print!("{}", "Waiting for Studio...".dimmed());
@@ -1194,7 +1359,7 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) {
             "Warning:".yellow(),
             format!("docker logs {}", state.studio_container).cyan()
         );
-        return;
+        return false;
     }
     println!(" {}", "ready".green());
 
@@ -1204,6 +1369,7 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) {
     if open_browser {
         let _ = open::that(&url);
     }
+    true
 }
 
 /// Apply migrations through the engine-owned contract. The engine persists
@@ -1326,8 +1492,21 @@ struct Instance {
     port: Option<u16>,
     worker_host: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     current_image: Option<String>,
+    #[serde(default)]
+    latest_image: Option<String>,
+    #[serde(default)]
+    current_digest: Option<String>,
+    #[serde(default)]
+    latest_digest: Option<String>,
+    #[serde(default)]
+    engine_version: Option<EngineManagementVersion>,
+    #[serde(default)]
+    needs_update: bool,
+    #[serde(default)]
+    engine_update_phase: Option<String>,
+    #[serde(default)]
+    engine_update_error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1642,6 +1821,559 @@ async fn find_project(
         })
 }
 
+async fn get_project_detail(
+    client: &reqwest::Client,
+    api_url: &str,
+    token: &str,
+    id: &str,
+) -> Result<Instance, String> {
+    cloud_management_request(
+        client,
+        reqwest::Method::GET,
+        format!("{api_url}/projects/{id}"),
+        token,
+        None,
+    )
+    .await
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct VersionComponent {
+    component: String,
+    target: String,
+    current: String,
+    latest: String,
+    update_available: Option<bool>,
+    detail: String,
+}
+
+fn short_digest(value: Option<&str>) -> String {
+    value
+        .map(|digest| digest.chars().take(19).collect())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+async fn latest_cli_release() -> Result<(String, String), String> {
+    let client = reqwest::Client::builder()
+        .user_agent("lux-cli")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .get("https://api.github.com/repos/lux-db/lux/releases")
+        .send()
+        .await
+        .map_err(|e| format!("release check failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "release check failed (HTTP {})",
+            response.status().as_u16()
+        ));
+    }
+    let releases: Vec<serde_json::Value> = response
+        .json()
+        .await
+        .map_err(|e| format!("invalid GitHub release response: {e}"))?;
+    let tag = releases
+        .iter()
+        .filter_map(|release| release.get("tag_name")?.as_str())
+        .find(|tag| tag.starts_with("cli-v"))
+        .ok_or_else(|| "no Lux CLI releases found".to_string())?
+        .to_string();
+    let version = tag.trim_start_matches("cli-v").to_string();
+    Ok((tag, version))
+}
+
+fn newer_cli_version(current: &str, latest: &str) -> bool {
+    match (
+        semver::Version::parse(current),
+        semver::Version::parse(latest),
+    ) {
+        (Ok(current), Ok(latest)) => latest > current,
+        _ => latest != current,
+    }
+}
+
+async fn cli_version_component() -> VersionComponent {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    match latest_cli_release().await {
+        Ok((_, latest)) => VersionComponent {
+            component: "CLI".to_string(),
+            target: "this binary".to_string(),
+            update_available: Some(newer_cli_version(&current, &latest)),
+            current,
+            latest,
+            detail: String::new(),
+        },
+        Err(error) => VersionComponent {
+            component: "CLI".to_string(),
+            target: "this binary".to_string(),
+            current,
+            latest: "unknown".to_string(),
+            update_available: None,
+            detail: error,
+        },
+    }
+}
+
+async fn local_version_components() -> Vec<VersionComponent> {
+    let Some(state) = load_local_state() else {
+        return vec![
+            VersionComponent {
+                component: "Engine".to_string(),
+                target: "local".to_string(),
+                current: "not initialized".to_string(),
+                latest: "unknown".to_string(),
+                update_available: None,
+                detail: "run `lux start`".to_string(),
+            },
+            VersionComponent {
+                component: "Studio".to_string(),
+                target: "local".to_string(),
+                current: "not initialized".to_string(),
+                latest: "unknown".to_string(),
+                update_available: None,
+                detail: "run `lux studio` after starting the engine".to_string(),
+            },
+        ];
+    };
+
+    let engine_image = image_update_status(&state.container, &state.image);
+    let engine_version = if docker_container_state(&state.container).as_deref() == Some("running") {
+        DirectConn::connect("localhost", state.resp_port, &state.password)
+            .and_then(|mut conn| conn.exec("LUX VERSION"))
+            .and_then(|raw| decode_json::<EngineManagementVersion>(&raw, "engine version"))
+            .map(|version| version.version)
+            .unwrap_or_else(|_| short_digest(engine_image.current_digest.as_deref()))
+    } else {
+        "stopped".to_string()
+    };
+    let mut components = vec![VersionComponent {
+        component: "Engine".to_string(),
+        target: "local".to_string(),
+        current: engine_version,
+        latest: short_digest(engine_image.latest_digest.as_deref()),
+        update_available: engine_image.update_available,
+        detail: engine_image.error.unwrap_or_else(|| {
+            format!(
+                "{} → {}",
+                short_digest(engine_image.current_digest.as_deref()),
+                short_digest(engine_image.latest_digest.as_deref())
+            )
+        }),
+    }];
+    let studio_state = docker_container_state(&state.studio_container);
+    if studio_state.is_none() {
+        components.push(VersionComponent {
+            component: "Studio".to_string(),
+            target: "local".to_string(),
+            current: "not installed".to_string(),
+            latest: docker_remote_digest(STUDIO_IMAGE)
+                .map(|digest| short_digest(Some(&digest)))
+                .unwrap_or_else(|_| "unknown".to_string()),
+            update_available: None,
+            detail: "run `lux studio` to install".to_string(),
+        });
+    } else {
+        let studio_image = image_update_status(&state.studio_container, STUDIO_IMAGE);
+        components.push(VersionComponent {
+            component: "Studio".to_string(),
+            target: "local".to_string(),
+            current: short_digest(studio_image.current_digest.as_deref()),
+            latest: short_digest(studio_image.latest_digest.as_deref()),
+            update_available: studio_image.update_available,
+            detail: studio_image.error.unwrap_or_default(),
+        });
+    }
+    components
+}
+
+async fn cloud_version_component(
+    selector: &str,
+    api_url_override: &Option<String>,
+) -> VersionComponent {
+    let (client, api_url, token) = get_client(api_url_override);
+    let project = find_project(&client, &api_url, &token, selector).await;
+    match get_project_detail(&client, &api_url, &token, &project.id).await {
+        Ok(detail) => {
+            let management_available =
+                detail.current_digest.is_some() && detail.latest_digest.is_some();
+            VersionComponent {
+                component: "Engine".to_string(),
+                target: format!("cloud:{}", detail.name),
+                current: detail
+                    .engine_version
+                    .as_ref()
+                    .map(|version| version.version.clone())
+                    .unwrap_or_else(|| short_digest(detail.current_digest.as_deref())),
+                latest: short_digest(detail.latest_digest.as_deref()),
+                update_available: management_available.then_some(detail.needs_update),
+                detail: detail
+                    .engine_update_error
+                    .or(detail.engine_update_phase)
+                    .unwrap_or_else(|| {
+                        if management_available {
+                            format!(
+                                "{} → {}",
+                                detail.current_image.as_deref().unwrap_or("unknown"),
+                                detail.latest_image.as_deref().unwrap_or("unknown")
+                            )
+                        } else {
+                            "safe cloud update metadata is unavailable".to_string()
+                        }
+                    }),
+            }
+        }
+        Err(error) => VersionComponent {
+            component: "Engine".to_string(),
+            target: format!("cloud:{}", project.name),
+            current: "unknown".to_string(),
+            latest: "unknown".to_string(),
+            update_available: None,
+            detail: error,
+        },
+    }
+}
+
+async fn show_versions(
+    project: Option<&str>,
+    all: bool,
+    output: Option<&str>,
+    api_url_override: &Option<String>,
+) {
+    if output.is_some() && output != Some("json") {
+        eprintln!("{} Supported version output is `json`.", "Error:".red());
+        std::process::exit(1);
+    }
+    let mut components = Vec::new();
+    if project.is_none() || all {
+        components.push(cli_version_component().await);
+        components.extend(local_version_components().await);
+    }
+    if project.is_some() || all {
+        let selector = project
+            .map(str::to_string)
+            .or_else(linked_project)
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "{} `--all` needs a linked cloud project or an explicit project.",
+                    "Error:".red()
+                );
+                std::process::exit(1);
+            });
+        components.push(cloud_version_component(&selector, api_url_override).await);
+    }
+    if output == Some("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "components": components })).unwrap()
+        );
+        return;
+    }
+    println!(
+        "  {:<10}  {:<24}  {:<18}  {:<18}  {}",
+        "COMPONENT".dimmed(),
+        "TARGET".dimmed(),
+        "CURRENT".dimmed(),
+        "LATEST".dimmed(),
+        "STATUS".dimmed()
+    );
+    for component in components {
+        let status = match component.update_available {
+            Some(true) => "update available".yellow().to_string(),
+            Some(false) => "current".green().to_string(),
+            None => "unknown".dimmed().to_string(),
+        };
+        println!(
+            "  {:<10}  {:<24}  {:<18}  {:<18}  {}",
+            component.component, component.target, component.current, component.latest, status
+        );
+        if !component.detail.is_empty() {
+            println!("  {:<10}  {}", "", component.detail.dimmed());
+        }
+    }
+}
+
+async fn update_cli(check: bool) -> Result<(), String> {
+    let current = env!("CARGO_PKG_VERSION");
+    let (latest_tag, latest_version) = latest_cli_release().await?;
+    println!("{} v{current}", "Current CLI:".bold());
+    if !newer_cli_version(current, &latest_version) {
+        println!("{}", "CLI is already up to date.".green());
+        return Ok(());
+    }
+    println!(
+        "{} v{current} → v{latest_version}",
+        "Update available:".yellow()
+    );
+    if check {
+        println!("Run {} to install.", "lux update cli".cyan());
+        return Ok(());
+    }
+
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        return Err("unsupported OS for self-update".to_string());
+    };
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        return Err("unsupported architecture for self-update".to_string());
+    };
+    let artifact = format!("lux-cli-{os}-{arch}");
+    let download_url =
+        format!("https://github.com/lux-db/lux/releases/download/{latest_tag}/{artifact}.tar.gz");
+    let client = reqwest::Client::builder()
+        .user_agent("lux-cli")
+        .build()
+        .map_err(|e| e.to_string())?;
+    println!("{} Downloading v{latest_version}...", "...".dimmed());
+    let response = client
+        .get(download_url)
+        .send()
+        .await
+        .map_err(|e| format!("download failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "download failed (HTTP {})",
+            response.status().as_u16()
+        ));
+    }
+    let tar_bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("download failed: {e}"))?;
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("could not determine binary path: {e}"))?;
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lux-cli-update-{}-{}",
+        std::process::id(),
+        random_hex(8)
+    ));
+    ensure_private_dir(&tmp_dir)
+        .map_err(|e| format!("failed to create private update directory: {e}"))?;
+    let tar_path = tmp_dir.join("lux-cli.tar.gz");
+    std::fs::write(&tar_path, &tar_bytes).map_err(|e| format!("failed to stage update: {e}"))?;
+    let status = std::process::Command::new("tar")
+        .args([
+            "xzf",
+            tar_path.to_str().unwrap_or_default(),
+            "-C",
+            tmp_dir.to_str().unwrap_or_default(),
+        ])
+        .status()
+        .map_err(|e| format!("failed to extract update: {e}"))?;
+    if !status.success() {
+        return Err("failed to extract update".to_string());
+    }
+    let new_binary = tmp_dir.join(&artifact);
+    if !new_binary.is_file() {
+        return Err("binary not found in release archive".to_string());
+    }
+    #[cfg(unix)]
+    std::fs::set_permissions(&new_binary, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("failed to make update executable: {e}"))?;
+    std::fs::rename(&new_binary, &current_exe)
+        .or_else(|_| std::fs::copy(&new_binary, &current_exe).map(|_| ()))
+        .map_err(|_| "could not replace binary; try with appropriate permissions".to_string())?;
+    std::fs::remove_dir_all(&tmp_dir).ok();
+    println!("{} Updated CLI to v{latest_version}.", "Done.".green());
+    Ok(())
+}
+
+fn pull_image(image: &str) -> Result<(), String> {
+    println!("{} {}", "Pulling".bold(), image.dimmed());
+    let status = std::process::Command::new("docker")
+        .args(["pull", image])
+        .status()
+        .map_err(|e| format!("failed to run Docker: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Docker could not pull {image}"))
+    }
+}
+
+fn update_local_engine(check: bool) -> Result<(), String> {
+    docker_preflight()?;
+    let state = load_local_state().ok_or_else(|| "run `lux start` first".to_string())?;
+    let status = image_update_status(&state.container, &state.image);
+    if check {
+        if status.update_available == Some(true) {
+            println!(
+                "{} {} → {}",
+                "Engine update available:".yellow(),
+                short_digest(status.current_digest.as_deref()),
+                short_digest(status.latest_digest.as_deref())
+            );
+        } else if status.update_available == Some(false) {
+            println!("{}", "Local engine is up to date.".green());
+        } else {
+            return Err(status
+                .error
+                .unwrap_or_else(|| "engine version status unavailable".to_string()));
+        }
+        return Ok(());
+    }
+    let was_running = docker_container_state(&state.container).as_deref() == Some("running");
+    let existed = docker_container_state(&state.container).is_some();
+    let before = docker_container_digest(&state.container).ok();
+    pull_image(&state.image)?;
+    let after = docker_image_digest(&state.image)?;
+    if before.as_deref() == Some(after.as_str()) {
+        println!("{}", "Local engine is already up to date.".green());
+        return Ok(());
+    }
+    if existed {
+        docker_output(&["rm", "-f", &state.container])?;
+    }
+    if was_running {
+        run_local_engine_container(&state)?;
+        if !wait_for_local_ready(&state) {
+            return Err(format!(
+                "updated engine did not become ready; inspect `docker logs {}`",
+                state.container
+            ));
+        }
+        refresh_local_profile(&state)?;
+        println!("{} Local engine updated and restarted.", "Done.".green());
+    } else {
+        println!(
+            "{} Engine image updated; it will be used by the next `lux start`.",
+            "Done.".green()
+        );
+    }
+    Ok(())
+}
+
+fn update_local_studio(check: bool) -> Result<(), String> {
+    docker_preflight()?;
+    let mut state = load_local_state().ok_or_else(|| "run `lux start` first".to_string())?;
+    let status = image_update_status(&state.studio_container, STUDIO_IMAGE);
+    if check {
+        if status.update_available == Some(true) {
+            println!(
+                "{} {} → {}",
+                "Studio update available:".yellow(),
+                short_digest(status.current_digest.as_deref()),
+                short_digest(status.latest_digest.as_deref())
+            );
+        } else if status.update_available == Some(false) {
+            println!("{}", "Studio is up to date.".green());
+        } else {
+            return Err(status
+                .error
+                .unwrap_or_else(|| "Studio version status unavailable".to_string()));
+        }
+        return Ok(());
+    }
+    let was_running = docker_container_state(&state.studio_container).as_deref() == Some("running");
+    let existed = docker_container_state(&state.studio_container).is_some();
+    let before = docker_container_digest(&state.studio_container).ok();
+    pull_image(STUDIO_IMAGE)?;
+    let after = docker_image_digest(STUDIO_IMAGE)?;
+    if before.as_deref() == Some(after.as_str()) {
+        println!("{}", "Studio is already up to date.".green());
+        return Ok(());
+    }
+    if existed {
+        docker_output(&["rm", "-f", &state.studio_container])?;
+    }
+    if was_running {
+        if !ensure_studio(&mut state, false) {
+            return Err("updated Studio did not become ready".to_string());
+        }
+        println!("{} Studio updated and restarted.", "Done.".green());
+    } else {
+        println!(
+            "{} Studio image updated; it will be used next time.",
+            "Done.".green()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct CloudUpdateStart {
+    updated: bool,
+    image: String,
+    snapshot_id: Option<String>,
+    phase: Option<String>,
+}
+
+async fn update_cloud_engine(
+    selector: &str,
+    check: bool,
+    api_url_override: &Option<String>,
+) -> Result<(), String> {
+    let (client, api_url, token) = get_client(api_url_override);
+    let project = find_project(&client, &api_url, &token, selector).await;
+    let detail = get_project_detail(&client, &api_url, &token, &project.id).await?;
+    let safe_update_available = detail.current_digest.is_some() && detail.latest_digest.is_some();
+    if !safe_update_available {
+        return Err(
+            "cloud safe-update metadata is unavailable; update the Cloud control plane and project engine first"
+                .to_string(),
+        );
+    }
+    if check {
+        if detail.needs_update {
+            println!(
+                "{} {} ({})",
+                "Cloud engine update available:".yellow(),
+                detail.name,
+                short_digest(detail.latest_digest.as_deref())
+            );
+        } else {
+            println!("{} {} is up to date.", "Done.".green(), detail.name);
+        }
+        if let Some(phase) = detail.engine_update_phase {
+            println!("{} {phase}", "Current update phase:".bold());
+        }
+        if let Some(error) = detail.engine_update_error {
+            println!("{} {error}", "Previous update error:".red());
+        }
+        return Ok(());
+    }
+    let update: CloudUpdateStart = cloud_management_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{api_url}/projects/{}/update", project.id),
+        &token,
+        Some(serde_json::json!({})),
+    )
+    .await?;
+    if !update.updated {
+        println!(
+            "{} {} already uses {}.",
+            "Done.".green(),
+            project.name,
+            update.image
+        );
+        return Ok(());
+    }
+    println!(
+        "{} Cloud update accepted for {}. A snapshot is created before deployment; failures automatically roll back.",
+        "Started.".green(),
+        project.name
+    );
+    if let Some(snapshot_id) = update.snapshot_id {
+        println!("{} {snapshot_id}", "Snapshot:".bold());
+    }
+    if let Some(phase) = update.phase {
+        println!("{} {phase}", "Phase:".bold());
+    }
+    println!(
+        "Use {} to follow progress.",
+        format!("lux status {}", project.name).cyan()
+    );
+    Ok(())
+}
+
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -1738,6 +2470,12 @@ pub async fn run() {
                     std::process::exit(1);
                 });
                 print_connection_block(&state);
+                print_image_update_hint(
+                    "engine",
+                    &state.container,
+                    &state.image,
+                    "lux update engine",
+                );
                 if !no_studio {
                     ensure_studio(&mut state, false);
                 }
@@ -1800,41 +2538,10 @@ pub async fn run() {
                 save_local_state(&state);
             }
 
-            println!("{} {}", "Pulling".bold(), state.image.dimmed());
-            // Pull is best-effort: `docker run` will pull too, but doing it up
-            // front gives clearer progress/errors.
-            let _ = std::process::Command::new("docker")
-                .args(["pull", &state.image])
-                .status();
-
-            let resp_map = format!("{}:6379", state.resp_port);
-            let http_map = format!("{}:5890", state.http_port);
-            let vol_map = format!("{}:/data", state.volume);
-            let engine_env = local_engine_env(&state);
-
-            let mut run_args: Vec<&str> = vec![
-                "run",
-                "-d",
-                "--name",
-                &state.container,
-                "-p",
-                &resp_map,
-                "-p",
-                &http_map,
-                "-v",
-                &vol_map,
-            ];
-            // Engine env: auth keys, ports, tiered (WAL) storage so local data
-            // survives a restart, and LUX_ENC_AUTO_INIT=1 so encrypted columns
-            // work out of the box. See local_engine_env.
-            for entry in &engine_env {
-                run_args.push("-e");
-                run_args.push(entry);
-            }
-            run_args.push("--restart");
-            run_args.push("unless-stopped");
-            run_args.push(&state.image);
-            if let Err(e) = docker_output(&run_args) {
+            // Starting uses the locally installed image. Existing projects
+            // update only through `lux update engine`; Docker pulls here only
+            // when the image has never been installed.
+            if let Err(e) = run_local_engine_container(&state) {
                 eprintln!("{} Failed to start container: {e}", "Error:".red());
                 std::process::exit(1);
             }
@@ -1885,6 +2592,12 @@ pub async fn run() {
                 std::process::exit(1);
             });
             print_connection_block(&state);
+            print_image_update_hint(
+                "engine",
+                &state.container,
+                &state.image,
+                "lux update engine",
+            );
             if !no_studio {
                 ensure_studio(&mut state, false);
             }
@@ -2721,151 +3434,34 @@ pub async fn run() {
             }
         }
 
-        Commands::Update { check } => {
-            let current = env!("CARGO_PKG_VERSION");
-            println!("{} v{current}", "Current version:".bold());
-            println!("{}", "Checking for updates...".dimmed());
+        Commands::Version {
+            project,
+            all,
+            output,
+        } => {
+            show_versions(
+                project.as_deref(),
+                all,
+                output.as_deref(),
+                &api_url_override,
+            )
+            .await;
+        }
 
-            let client = reqwest::Client::builder()
-                .user_agent("lux-cli")
-                .build()
-                .unwrap();
-
-            let res = client
-                .get("https://api.github.com/repos/lux-db/lux/releases")
-                .send()
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("{} {e}", "Failed to check for updates:".red());
-                    std::process::exit(1);
-                });
-
-            let releases: Vec<serde_json::Value> = res.json().await.unwrap_or_default();
-            let latest_tag = releases
-                .iter()
-                .filter_map(|r| r.get("tag_name")?.as_str())
-                .find(|t| t.starts_with("cli-v"));
-
-            let latest_version = match latest_tag {
-                Some(tag) => tag.trim_start_matches("cli-v"),
-                None => {
-                    eprintln!("{}", "No Lux CLI releases found.".yellow());
-                    std::process::exit(1);
-                }
+        Commands::Update { action, check } => {
+            let result = match action {
+                None => update_cli(check).await,
+                Some(UpdateAction::Cli { check }) => update_cli(check).await,
+                Some(UpdateAction::Engine { project, check }) => match project {
+                    Some(project) => update_cloud_engine(&project, check, &api_url_override).await,
+                    None => update_local_engine(check),
+                },
+                Some(UpdateAction::Studio { check }) => update_local_studio(check),
             };
-
-            if latest_version == current {
-                println!("{}", "Already up to date.".green());
-                return;
-            }
-
-            println!(
-                "{} v{current} -> v{latest_version}",
-                "Update available:".yellow()
-            );
-
-            if check {
-                println!("Run {} to install.", "lux update".cyan());
-                return;
-            }
-
-            let os = if cfg!(target_os = "macos") {
-                "macos"
-            } else if cfg!(target_os = "linux") {
-                "linux"
-            } else {
-                eprintln!("{}", "Unsupported OS for self-update.".red());
-                std::process::exit(1);
-            };
-
-            let arch = if cfg!(target_arch = "aarch64") {
-                "arm64"
-            } else if cfg!(target_arch = "x86_64") {
-                "x86_64"
-            } else {
-                eprintln!("{}", "Unsupported architecture for self-update.".red());
-                std::process::exit(1);
-            };
-
-            let artifact = format!("lux-cli-{os}-{arch}");
-            let download_url = format!(
-                "https://github.com/lux-db/lux/releases/download/{}/{artifact}.tar.gz",
-                latest_tag.unwrap()
-            );
-
-            println!("{} Downloading v{latest_version}...", "...".dimmed());
-
-            let tar_bytes = client
-                .get(&download_url)
-                .send()
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("{} {e}", "Download failed:".red());
-                    std::process::exit(1);
-                })
-                .bytes()
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("{} {e}", "Download failed:".red());
-                    std::process::exit(1);
-                });
-
-            let current_exe = std::env::current_exe().unwrap_or_else(|e| {
-                eprintln!("{} {e}", "Could not determine binary path:".red());
-                std::process::exit(1);
-            });
-
-            let tmp_dir = std::env::temp_dir().join("lux-cli-update");
-            std::fs::create_dir_all(&tmp_dir).ok();
-            let tar_path = tmp_dir.join("lux-cli.tar.gz");
-            std::fs::write(&tar_path, &tar_bytes).unwrap_or_else(|e| {
-                eprintln!("{} {e}", "Failed to write temp file:".red());
-                std::process::exit(1);
-            });
-
-            let status = std::process::Command::new("tar")
-                .args([
-                    "xzf",
-                    tar_path.to_str().unwrap(),
-                    "-C",
-                    tmp_dir.to_str().unwrap(),
-                ])
-                .status()
-                .unwrap_or_else(|e| {
-                    eprintln!("{} {e}", "Failed to extract:".red());
-                    std::process::exit(1);
-                });
-
-            if !status.success() {
-                eprintln!("{}", "Failed to extract update.".red());
+            if let Err(error) = result {
+                eprintln!("{} {error}", "Update failed:".red());
                 std::process::exit(1);
             }
-
-            let new_binary = tmp_dir.join(&artifact);
-            if !new_binary.exists() {
-                eprintln!("{} Binary not found in archive.", "Error:".red());
-                std::process::exit(1);
-            }
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&new_binary, std::fs::Permissions::from_mode(0o755)).ok();
-            }
-
-            std::fs::rename(&new_binary, &current_exe).unwrap_or_else(|_| {
-                let copy_result = std::fs::copy(&new_binary, &current_exe);
-                if copy_result.is_err() {
-                    eprintln!(
-                        "{} Could not replace binary. Try: sudo lux update",
-                        "Permission denied:".red()
-                    );
-                    std::process::exit(1);
-                }
-            });
-
-            std::fs::remove_dir_all(&tmp_dir).ok();
-            println!("{} Updated to v{latest_version}", "Done.".green());
         }
 
         Commands::Keys { action } => match action {
@@ -4388,7 +4984,7 @@ fn migration_checksum_matches(record: &MigrationRecord, body: &str) -> bool {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct EngineManagementVersion {
     version: String,
     api_version: String,
@@ -5865,5 +6461,64 @@ mod tests {
             &record("sha256", sha256_hash("PONG\n")),
             body
         ));
+    }
+
+    #[test]
+    fn update_command_preserves_bare_cli_alias_and_parses_components() {
+        let cli = Cli::try_parse_from(["lux", "update", "--check"]).expect("bare update parses");
+        match cli.command {
+            Commands::Update { action, check } => {
+                assert!(action.is_none());
+                assert!(check);
+            }
+            _ => panic!("expected Update"),
+        }
+
+        let cli = Cli::try_parse_from(["lux", "update", "engine", "dialog", "--check"])
+            .expect("engine update parses");
+        match cli.command {
+            Commands::Update {
+                action: Some(UpdateAction::Engine { project, check }),
+                ..
+            } => {
+                assert_eq!(project.as_deref(), Some("dialog"));
+                assert!(check);
+            }
+            _ => panic!("expected Update::Engine"),
+        }
+
+        let cli = Cli::try_parse_from(["lux", "update", "studio"]).expect("studio update parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Update {
+                action: Some(UpdateAction::Studio { check: false }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn version_command_supports_all_and_json() {
+        let cli = Cli::try_parse_from(["lux", "version", "--all", "--output", "json"])
+            .expect("version parses");
+        match cli.command {
+            Commands::Version {
+                project,
+                all,
+                output,
+            } => {
+                assert!(project.is_none());
+                assert!(all);
+                assert_eq!(output.as_deref(), Some("json"));
+            }
+            _ => panic!("expected Version"),
+        }
+    }
+
+    #[test]
+    fn cli_update_check_never_offers_a_downgrade() {
+        assert!(newer_cli_version("0.26.2", "0.27.0"));
+        assert!(!newer_cli_version("0.27.0", "0.26.2"));
+        assert!(!newer_cli_version("0.27.0", "0.27.0"));
     }
 }

@@ -61,6 +61,11 @@ lux status                                    # show local engine status
 lux status my-app                             # show explicit cloud project status
 lux status --all                              # show local + linked cloud together
 lux doctor --all                              # diagnose local + linked cloud
+lux version                                   # CLI, local engine, and Studio versions
+lux version my-app                            # cloud engine version/update status
+lux update engine                             # explicitly update local engine in place
+lux update engine my-app                      # snapshot-gated cloud engine update
+lux update studio                             # explicitly update local Studio
 lux exec my-app SET hello world               # execute a command
 lux exec my-app KEYS '*'                      # wildcards need quotes
 lux logs my-app                               # fetch explicit cloud project logs
@@ -97,7 +102,7 @@ lux start --no-studio      # engine only
 lux start --fresh          # recreate from a clean data volume (drops local data)
 lux studio                 # open Lux Studio in your browser (starts it if needed)
 lux status                 # show local engine status
-lux status -o env          # print LUX_* env lines for `eval`
+lux env export local       # print the local profile when explicitly needed
 lux stop                   # stop the engine + Studio
 lux stop --clear           # also delete the local data volume
 ```
@@ -110,8 +115,15 @@ variables and comments in `.env.local` are never replaced.
 The local secret key equals the engine password, so a secret-key client gets
 operator access while a publishable-key client must sign in (JWT → grant-enforced
 user), mirroring production. Studio runs as a container
-(`ghcr.io/lux-db/studio`), pulled on each `lux start`, and talks to the engine
+(`ghcr.io/lux-db/studio`) and talks to the engine
 directly from your browser; credentials never leave your machine.
+
+Existing engine and Studio containers never change versions implicitly during
+`lux start`. Start reports available image updates; `lux update engine` and
+`lux update studio` perform them explicitly. Local engine updates preserve the
+data volume and restart a running engine. Cloud updates first create a completed
+snapshot and automatically roll back to the prior immutable image if the new
+engine fails its management health check.
 
 ## Local Connections
 
@@ -196,7 +208,7 @@ use `lux migrate status` to review its command cursor, then choose an explicit
 repair action. `pull` understands legacy checksums and never overwrites a local
 file that differs from the recorded version.
 
-## Doctor
+## Doctor, versions, and updates
 
 ```bash
 lux doctor                         # local runtime, env, engine API, migrations
@@ -204,6 +216,15 @@ lux doctor my-app                  # explicit cloud project
 lux doctor --all                   # local + linked cloud
 lux doctor --fix                   # safe filesystem hygiene only
 lux doctor --output json
+
+lux version                        # CLI + local engine + Studio
+lux version my-app                 # cloud engine
+lux version --all                  # include linked cloud
+lux update --check                 # legacy alias: check CLI
+lux update cli                     # update CLI
+lux update engine                  # local engine
+lux update engine my-app           # cloud engine
+lux update studio                  # local Studio
 ```
 
 `doctor --fix` is intentionally constrained: it may create
