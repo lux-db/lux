@@ -531,6 +531,10 @@ impl StoreMetrics {
 pub struct Store {
     config: Arc<crate::ServerConfig>,
     encryption: crate::encryption::EncryptionKeyring,
+    /// Short-lived API-key resolutions belong to this engine instance. Keeping
+    /// this on `Store` prevents one embedded server from authenticating against
+    /// another server's `auth.keys` table.
+    pub(crate) api_key_cache: crate::auth::ApiKeyCache,
     shards: Box<[RwLock<Shard>]>,
     metrics: StoreMetrics,
     /// Serializes Lua script execution for this runtime without blocking other
@@ -757,6 +761,7 @@ impl Store {
         Self {
             config,
             encryption,
+            api_key_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             shards: shards.into_boxed_slice(),
             metrics: StoreMetrics::new(),
             script_gate: RwLock::new(()),

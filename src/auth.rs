@@ -41,7 +41,7 @@ const ACCESS_REVOKED_AFTER_PREFIX: &[u8] = b"_auth:access_revoked_after:";
 static FLOW_TOKEN_CONSUME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ApiKeyKind {
+pub(crate) enum ApiKeyKind {
     Publishable,
     Secret,
 }
@@ -2569,7 +2569,7 @@ fn admin_revoke_key(
         Ok(0) => error(404, "Not Found", "key not found"),
         Ok(_) => {
             // Revocation must take effect now, not when the cache entry ages out.
-            invalidate_api_key_cache();
+            invalidate_api_key_cache(store);
             ok(json!({"result":"OK"}))
         }
         Err(e) => error(400, "Bad Request", &e),
@@ -2755,7 +2755,7 @@ fn insert_api_key(
     )?;
     // A negative result for this key may already be cached (something tried it
     // before it existed); drop it so the new key works immediately.
-    invalidate_api_key_cache();
+    invalidate_api_key_cache(store);
     Ok(json!({
         "id": key_id,
         "name": name,
@@ -2932,7 +2932,7 @@ fn lookup_api_key(
     // table read on the hot path (measured at roughly +5us/req against the
     // password memcmp). Cache the resolution briefly. Misses are cached too, so
     // a client looping with a bad key cannot turn into a read storm.
-    if let Some(kind) = cached_api_key(&hash) {
+    if let Some(kind) = cached_api_key(store, &hash) {
         return Ok(kind);
     }
 
@@ -2953,7 +2953,7 @@ fn lookup_api_key(
             },
             None => None,
         };
-    store_cached_api_key(hash, resolved);
+    store_cached_api_key(store, hash, resolved);
     Ok(resolved)
 }
 
@@ -2962,16 +2962,11 @@ fn lookup_api_key(
 /// normal path: minting and revoking both clear the cache outright.
 const API_KEY_CACHE_TTL: Duration = Duration::from_secs(5);
 
-type ApiKeyCache = parking_lot::RwLock<HashMap<String, (Option<ApiKeyKind>, Instant)>>;
-
-fn api_key_cache() -> &'static ApiKeyCache {
-    static CACHE: OnceLock<ApiKeyCache> = OnceLock::new();
-    CACHE.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
-}
+pub(crate) type ApiKeyCache = parking_lot::RwLock<HashMap<String, (Option<ApiKeyKind>, Instant)>>;
 
 /// `Some(kind)` on a live cache hit, `None` when the caller must do the lookup.
-fn cached_api_key(hash: &str) -> Option<Option<ApiKeyKind>> {
-    let cache = api_key_cache().read();
+fn cached_api_key(store: &Store, hash: &str) -> Option<Option<ApiKeyKind>> {
+    let cache = store.api_key_cache.read();
     let (kind, stored_at) = cache.get(hash)?;
     if stored_at.elapsed() >= API_KEY_CACHE_TTL {
         return None;
@@ -2979,8 +2974,8 @@ fn cached_api_key(hash: &str) -> Option<Option<ApiKeyKind>> {
     Some(*kind)
 }
 
-fn store_cached_api_key(hash: String, kind: Option<ApiKeyKind>) {
-    let mut cache = api_key_cache().write();
+fn store_cached_api_key(store: &Store, hash: String, kind: Option<ApiKeyKind>) {
+    let mut cache = store.api_key_cache.write();
     // Bounded so an attacker spraying distinct keys cannot grow it without
     // limit; the working set is a handful of real keys.
     if cache.len() > 1024 {
@@ -2994,8 +2989,8 @@ fn store_cached_api_key(hash: String, kind: Option<ApiKeyKind>) {
 
 /// Drop every cached resolution. Called whenever a key is minted or revoked so
 /// the TTL is a backstop rather than the mechanism.
-pub(crate) fn invalidate_api_key_cache() {
-    api_key_cache().write().clear();
+pub(crate) fn invalidate_api_key_cache(store: &Store) {
+    store.api_key_cache.write().clear();
 }
 
 /// Whether this engine has project keys, i.e. whether key-based auth is in play.
@@ -5491,6 +5486,37 @@ mod tests {
             role: "authenticated".into(),
             is_anonymous: false,
         }
+    }
+
+    #[test]
+    fn api_key_cache_is_isolated_per_store() {
+        let store_a = Store::new();
+        let store_b = Store::new();
+        let cache_a = Arc::new(RwLock::new(SchemaCache::new()));
+        let cache_b = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store_a, &cache_a, &store_a.config().auth).unwrap();
+        bootstrap(&store_b, &cache_b, &store_b.config().auth).unwrap();
+
+        let raw_key = "lux_sec_store_a_only";
+        insert_api_key(
+            &store_a,
+            &cache_a,
+            raw_key,
+            ApiKeyKind::Secret,
+            "store-a",
+            Instant::now(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            lookup_api_key(raw_key, &store_a, &cache_a).unwrap(),
+            Some(ApiKeyKind::Secret)
+        );
+        assert_eq!(
+            lookup_api_key(raw_key, &store_b, &cache_b).unwrap(),
+            None,
+            "a cache hit from store A must not authenticate against store B"
+        );
     }
 
     #[test]
