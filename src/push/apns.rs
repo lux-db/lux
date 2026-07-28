@@ -307,6 +307,35 @@ mod tests {
             .to_string()
     }
 
+    // The two hosts are the whole reason a device carries an environment: one
+    // `.p8` signs for both, and a token minted for one is rejected by the other.
+    #[test]
+    fn base_url_splits_sandbox_from_production() {
+        assert_eq!(
+            ApnsSink::resolve_base_url("production"),
+            "https://api.push.apple.com"
+        );
+        assert_eq!(
+            ApnsSink::resolve_base_url("prod"),
+            "https://api.push.apple.com"
+        );
+        assert_eq!(
+            ApnsSink::resolve_base_url("sandbox"),
+            "https://api.sandbox.push.apple.com"
+        );
+        // Unknown values are sandbox, so a misconfiguration cannot silently
+        // deliver to real users.
+        assert_eq!(
+            ApnsSink::resolve_base_url(""),
+            "https://api.sandbox.push.apple.com"
+        );
+        // An explicit base survives verbatim; the tests point it at a mock.
+        assert_eq!(
+            ApnsSink::resolve_base_url("http://127.0.0.1:9000/"),
+            "http://127.0.0.1:9000"
+        );
+    }
+
     fn sink_with(p8: String) -> ApnsSink {
         ApnsSink::new(
             "https://api.sandbox.push.apple.com",

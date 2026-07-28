@@ -2589,6 +2589,43 @@ pub(crate) fn create_table_if_missing(
     }
 }
 
+/// Add a column to an existing internal table if it isn't there already. The
+/// companion to `create_table_if_missing` for schema that arrives after a table
+/// has already shipped: new projects pick the column up from the CREATE, and
+/// projects created before it get it from here.
+///
+/// `tables::table_add_column` does not append to the WAL of its own accord. RESP
+/// and HTTP `TALTER` are raw-logged by `execute_with_wal`, which internal callers
+/// never reach, so log the resolved command here or the column is lost on replay.
+pub(crate) fn add_column_if_missing(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_spec: &str,
+    now: Instant,
+) -> Result<(), String> {
+    let mut tokens = field_spec.split_whitespace();
+    let Some(column) = tokens.next() else {
+        return Err("ERR empty column spec".to_string());
+    };
+    let schema = tables::table_schema(store, cache, table, now)?;
+    if schema
+        .iter()
+        .any(|field| field.split_whitespace().next() == Some(column))
+    {
+        return Ok(());
+    }
+
+    let mut args: Vec<Vec<u8>> = vec![
+        b"TALTER".to_vec(),
+        table.as_bytes().to_vec(),
+        b"ADD".to_vec(),
+    ];
+    args.extend(field_spec.split_whitespace().map(|t| t.as_bytes().to_vec()));
+    log_command(store, &args)?;
+    tables::table_add_column(store, cache, table, field_spec, now)
+}
+
 pub(crate) fn durable_table_insert(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -5540,6 +5577,88 @@ mod tests {
             op: o.into(),
             value: v.into(),
         }
+    }
+
+    #[test]
+    fn add_column_if_missing_is_idempotent_and_leaves_existing_schema_alone() {
+        let store = Store::new();
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+
+        create_table_if_missing(
+            &store,
+            &cache,
+            "widgets",
+            &["id STR PRIMARY KEY,", "name STR"],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "widgets",
+            &[("id", "w1"), ("name", "bolt")],
+            now,
+        )
+        .unwrap();
+
+        add_column_if_missing(&store, &cache, "widgets", "environment STR", now).unwrap();
+        let schema = crate::tables::table_schema(&store, &cache, "widgets", now).unwrap();
+        assert!(
+            schema.iter().any(|f| f.starts_with("environment ")),
+            "column not added: {schema:?}"
+        );
+
+        // Called on every `ensure_tables`, so a second call must be a no-op
+        // rather than the "field already exists" error `table_add_column` raises.
+        add_column_if_missing(&store, &cache, "widgets", "environment STR", now).unwrap();
+        let after = crate::tables::table_schema(&store, &cache, "widgets", now).unwrap();
+        assert_eq!(schema, after);
+
+        // The existing row survives the backfill.
+        let row = find_row_by_field(&store, &cache, "widgets", "id", "w1", now)
+            .unwrap()
+            .expect("row should survive the column add");
+        assert_eq!(row.get("name").map(String::as_str), Some("bolt"));
+    }
+
+    // `table_add_column` does not log itself, and internal callers never reach
+    // `execute_with_wal`, so without the explicit log in `add_column_if_missing`
+    // the column would vanish on any restart that replays from the WAL.
+    #[test]
+    fn add_column_if_missing_survives_wal_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            storage: crate::StorageConfig {
+                mode: crate::StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Arc::new(Store::new_with_config(config.clone()));
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+
+        create_table_if_missing(
+            &store,
+            &cache,
+            "widgets",
+            &["id STR PRIMARY KEY,", "name STR"],
+            now,
+        )
+        .unwrap();
+        add_column_if_missing(&store, &cache, "widgets", "environment STR", now).unwrap();
+        store.fsync_wal();
+
+        let restored = Arc::new(Store::new_with_config(config));
+        restored.replay_wal(&crate::pubsub::Broker::new());
+        let restored_cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let schema =
+            crate::tables::table_schema(&restored, &restored_cache, "widgets", now).unwrap();
+        assert!(
+            schema.iter().any(|f| f.starts_with("environment ")),
+            "column lost on replay: {schema:?}"
+        );
     }
 
     #[test]

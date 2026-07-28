@@ -17,8 +17,8 @@ use bytes::BytesMut;
 use serde_json::{json, Value};
 
 use crate::auth::{
-    create_table_if_missing, durable_table_delete_where, durable_table_insert,
-    durable_table_update_where, find_row_by_field, random_id, unix_seconds,
+    add_column_if_missing, create_table_if_missing, durable_table_delete_where,
+    durable_table_insert, durable_table_update_where, find_row_by_field, random_id, unix_seconds,
 };
 use crate::resp;
 use crate::store::Store;
@@ -53,12 +53,21 @@ pub(crate) fn ensure_tables(
             "token STR,",
             "platform STR,",
             "app_id STR,",
+            // Which APNs host this token was minted for. Apple issues sandbox
+            // tokens to development builds and production tokens to TestFlight
+            // and the App Store, and a token is only valid against its own host.
+            // Empty means the registrant did not say, and delivery falls back to
+            // the app credential's `environment`.
+            "environment STR,",
             "created_at INT,",
             "last_seen_at INT,",
             "disabled_at INT",
         ],
         now,
     )?;
+    // `environment` arrived after `push.devices` shipped, so projects that
+    // registered a device on an older engine still have the original schema.
+    add_column_if_missing(store, cache, DEVICES_TABLE, "environment STR", now)?;
     create_table_if_missing(
         store,
         cache,
@@ -88,6 +97,10 @@ pub(crate) fn ensure_tables(
             "app_id STR,",
             "target_token STR,",
             "platform STR,",
+            // Copied from the device at enqueue so the row still routes to the
+            // right APNs host if the device re-registers or is deleted before
+            // the worker drains it.
+            "environment STR,",
             "payload STR,",
             "attempts INT,",
             "next_attempt_at INT,",
@@ -97,6 +110,7 @@ pub(crate) fn ensure_tables(
         ],
         now,
     )?;
+    add_column_if_missing(store, cache, OUTBOX_TABLE, "environment STR", now)?;
     Ok(())
 }
 
@@ -154,10 +168,15 @@ pub(crate) fn migrate_from_auth_scope(
         register_device(
             store,
             cache,
-            &m.get("user_id").cloned().unwrap_or_default(),
-            &token,
-            &m.get("platform").cloned().unwrap_or_else(|| "ios".into()),
-            &m.get("app_id").cloned().unwrap_or_else(|| "default".into()),
+            DeviceRegistration {
+                subject_id: &m.get("user_id").cloned().unwrap_or_default(),
+                token: &token,
+                platform: &m.get("platform").cloned().unwrap_or_else(|| "ios".into()),
+                app_id: &m.get("app_id").cloned().unwrap_or_else(|| "default".into()),
+                // The legacy layout had no per-device environment; delivery
+                // falls back to the app credential, as it did before.
+                environment: "",
+            },
             now,
         )?;
     }
@@ -212,26 +231,69 @@ pub(crate) struct ResolvedVapidCreds {
 // Device registry
 // ---------------------------------------------------------------------------
 
+/// Normalize a caller-supplied APNs environment to what `resolve_base_url`
+/// understands. An explicit `http(s)://` base survives verbatim, matching the
+/// override the app credential already accepts. Anything else unrecognized is
+/// treated as unspecified rather than guessed at, so delivery falls back to the
+/// app credential instead of silently routing to the wrong host.
+pub(crate) fn normalize_environment(environment: &str) -> String {
+    let trimmed = environment.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.to_string();
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "production" | "prod" => "production".to_string(),
+        "sandbox" | "development" | "dev" => "sandbox".to_string(),
+        _ => String::new(),
+    }
+}
+
 /// Register (or refresh) a device token for `subject_id`. A token is unique
 /// across the registry: re-registering an existing token re-points it at the
 /// current subject and re-activates it rather than duplicating. Returns the
 /// device id.
+///
+/// `environment` is the APNs host the token belongs to ("sandbox" or
+/// "production"); empty means unspecified. A development build and a TestFlight
+/// build of the same app hold tokens for different hosts at the same time, so
+/// this is per device, not per project.
+pub(crate) struct DeviceRegistration<'a> {
+    pub subject_id: &'a str,
+    pub token: &'a str,
+    pub platform: &'a str,
+    pub app_id: &'a str,
+    /// "sandbox", "production", or empty for unspecified.
+    pub environment: &'a str,
+}
+
 pub(crate) fn register_device(
     store: &Store,
     cache: &SharedSchemaCache,
-    subject_id: &str,
-    token: &str,
-    platform: &str,
-    app_id: &str,
+    device: DeviceRegistration<'_>,
     now: Instant,
 ) -> Result<String, String> {
+    let DeviceRegistration {
+        subject_id,
+        token,
+        platform,
+        app_id,
+        environment,
+    } = device;
     if platform.eq_ignore_ascii_case("web") {
         webpush::validate_subscription_token(token)?;
     }
     ensure_tables(store, cache, now)?;
+    let environment = normalize_environment(environment);
     let now_s = unix_seconds().to_string();
     if let Some(existing) = find_row_by_field(store, cache, DEVICES_TABLE, "token", token, now)? {
         let id = existing.get("id").cloned().unwrap_or_default();
+        // A re-register that omits the environment must not erase a known one:
+        // the same token cannot move hosts, so silence means "unchanged".
+        let environment = if environment.is_empty() {
+            existing.get("environment").cloned().unwrap_or_default()
+        } else {
+            environment
+        };
         durable_table_update_where(
             store,
             cache,
@@ -240,6 +302,7 @@ pub(crate) fn register_device(
                 ("subject_id", subject_id),
                 ("platform", platform),
                 ("app_id", app_id),
+                ("environment", environment.as_str()),
                 ("last_seen_at", now_s.as_str()),
                 ("disabled_at", "0"),
             ],
@@ -259,6 +322,7 @@ pub(crate) fn register_device(
             ("token", token),
             ("platform", platform),
             ("app_id", app_id),
+            ("environment", environment.as_str()),
             ("created_at", now_s.as_str()),
             ("last_seen_at", now_s.as_str()),
             ("disabled_at", "0"),
@@ -295,6 +359,7 @@ pub(crate) fn list_devices(
                 "id": m.get("id").cloned().unwrap_or_default(),
                 "platform": m.get("platform").cloned().unwrap_or_default(),
                 "app_id": m.get("app_id").cloned().unwrap_or_default(),
+                "environment": m.get("environment").cloned().unwrap_or_default(),
                 "created_at": m.get("created_at").cloned().unwrap_or_default(),
                 "last_seen_at": m.get("last_seen_at").cloned().unwrap_or_default(),
             })
@@ -374,6 +439,7 @@ pub(crate) fn list_all_devices(
                 "subject_id": m.get("subject_id").cloned().unwrap_or_default(),
                 "platform": m.get("platform").cloned().unwrap_or_default(),
                 "app_id": m.get("app_id").cloned().unwrap_or_default(),
+                "environment": m.get("environment").cloned().unwrap_or_default(),
                 "created_at": m.get("created_at").cloned().unwrap_or_default(),
                 "last_seen_at": m.get("last_seen_at").cloned().unwrap_or_default(),
                 "disabled_at": m.get("disabled_at").cloned().unwrap_or_default(),
@@ -409,6 +475,7 @@ pub(crate) fn list_dead_letters(
                 "subject_id": m.get("subject_id").cloned().unwrap_or_default(),
                 "app_id": m.get("app_id").cloned().unwrap_or_default(),
                 "platform": m.get("platform").cloned().unwrap_or_default(),
+                "environment": m.get("environment").cloned().unwrap_or_default(),
                 "attempts": m.get("attempts").cloned().unwrap_or_default(),
                 "last_error": m.get("last_error").cloned().unwrap_or_default(),
                 "created_at": m.get("created_at").cloned().unwrap_or_default(),
@@ -635,6 +702,10 @@ fn enqueue_to_subject(
                     "platform",
                     m.get("platform").map(String::as_str).unwrap_or(""),
                 ),
+                (
+                    "environment",
+                    m.get("environment").map(String::as_str).unwrap_or(""),
+                ),
                 ("payload", payload),
                 ("attempts", "0"),
                 ("next_attempt_at", now_s.as_str()),
@@ -719,7 +790,7 @@ pub(crate) fn append_info(out: &mut String) {
 // RESP command: LUX PUSH ...
 // ---------------------------------------------------------------------------
 
-/// `LUX PUSH REGISTER <subject_id> <token> <platform> <app_id>`
+/// `LUX PUSH REGISTER <subject_id> <token> <platform> <app_id> [environment]`
 /// `LUX PUSH SEND <subject_id> <json>`
 /// `LUX PUSH CRED <app_id> <team_id> <key_id> <topic> <environment> <p8_pem>`
 /// `LUX PUSH DEVICES <subject_id>`
@@ -747,7 +818,15 @@ pub(crate) fn cmd_push(
     };
     match sub.as_str() {
         "REGISTER" if args.len() >= 7 => {
-            match register_device(store, cache, arg(3), arg(4), arg(5), arg(6), now) {
+            // args[7] (environment) is optional so existing callers still parse.
+            let device = DeviceRegistration {
+                subject_id: arg(3),
+                token: arg(4),
+                platform: arg(5),
+                app_id: arg(6),
+                environment: arg(7),
+            };
+            match register_device(store, cache, device, now) {
                 Ok(id) => resp::write_bulk(out, &id),
                 Err(e) => resp::write_error(out, &normalize_err(&e)),
             }
@@ -807,5 +886,42 @@ fn normalize_err(e: &str) -> String {
         e.to_string()
     } else {
         format!("ERR {e}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_normalizes_apple_spellings() {
+        assert_eq!(normalize_environment("production"), "production");
+        assert_eq!(normalize_environment("PROD"), "production");
+        assert_eq!(normalize_environment(" Production "), "production");
+        assert_eq!(normalize_environment("sandbox"), "sandbox");
+        assert_eq!(normalize_environment("development"), "sandbox");
+        assert_eq!(normalize_environment("dev"), "sandbox");
+    }
+
+    // Unrecognized input must not be guessed at. Empty means "the device did
+    // not say", which falls back to the app credential; picking a host here
+    // would send a typo straight to the wrong one.
+    #[test]
+    fn unknown_environment_is_unspecified() {
+        assert_eq!(normalize_environment(""), "");
+        assert_eq!(normalize_environment("staging"), "");
+        assert_eq!(normalize_environment("apns"), "");
+    }
+
+    #[test]
+    fn explicit_base_url_survives_normalization() {
+        assert_eq!(
+            normalize_environment("http://127.0.0.1:9000"),
+            "http://127.0.0.1:9000"
+        );
+        assert_eq!(
+            normalize_environment("https://api.push.apple.com"),
+            "https://api.push.apple.com"
+        );
     }
 }
