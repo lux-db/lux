@@ -3463,25 +3463,59 @@ async fn resolve_migrate_target(
     }
 }
 
-async fn ensure_migrations_table(target: &mut MigrateTarget) {
-    let needs_create = target.exec("TSCHEMA __migrations").await.is_err();
-    if needs_create {
-        if let Err(e) = target
-            .exec("TCREATE __migrations filename TEXT, checksum TEXT, applied_at INT, body TEXT")
-            .await
-        {
-            eprintln!(
-                "{} Failed to create __migrations table: {}",
-                "Error:".red(),
-                e
-            );
-            std::process::exit(1);
+#[derive(Debug, Eq, PartialEq)]
+enum MigrationsSchemaState {
+    Present,
+    Missing,
+}
+
+fn migrations_schema_state(
+    result: Result<String, String>,
+) -> Result<MigrationsSchemaState, String> {
+    match result {
+        Ok(_) => Ok(MigrationsSchemaState::Present),
+        Err(error) if is_missing_migrations_table_error(&error) => {
+            Ok(MigrationsSchemaState::Missing)
         }
-    } else {
-        // Older instances have a __migrations table without `body` (added so
-        // `lux migrate pull` can recreate migration files). Adding it is
-        // idempotent: ignore the "already exists" error.
-        let _ = target.exec("TALTER __migrations ADD body TEXT").await;
+        Err(error) => Err(format!("could not inspect __migrations schema: {error}")),
+    }
+}
+
+fn is_missing_migrations_table_error(error: &str) -> bool {
+    error
+        .to_ascii_lowercase()
+        .contains("table '__migrations' does not exist")
+}
+
+async fn ensure_migrations_table(target: &mut MigrateTarget) {
+    let state = migrations_schema_state(target.exec("TSCHEMA __migrations").await).unwrap_or_else(
+        |error| {
+            eprintln!("{} {}", "Error:".red(), error);
+            std::process::exit(1);
+        },
+    );
+    match state {
+        MigrationsSchemaState::Missing => {
+            if let Err(e) = target
+                .exec(
+                    "TCREATE __migrations filename TEXT, checksum TEXT, applied_at INT, body TEXT",
+                )
+                .await
+            {
+                eprintln!(
+                    "{} Failed to create __migrations table: {}",
+                    "Error:".red(),
+                    e
+                );
+                std::process::exit(1);
+            }
+        }
+        MigrationsSchemaState::Present => {
+            // Older instances have a __migrations table without `body` (added so
+            // `lux migrate pull` can recreate migration files). Adding it is
+            // idempotent: ignore the "already exists" error.
+            let _ = target.exec("TALTER __migrations ADD body TEXT").await;
+        }
     }
 }
 
@@ -3499,8 +3533,9 @@ async fn get_applied_migrations(target: &mut MigrateTarget) -> Result<HashSet<St
     // A missing table means nothing has been applied yet, which is a legitimate
     // empty set. Any other read failure is fatal: reporting it as "0 applied" is
     // what turns a transient error into a destructive replay.
-    if target.exec("TSCHEMA __migrations").await.is_err() {
-        return Ok(HashSet::new());
+    match migrations_schema_state(target.exec("TSCHEMA __migrations").await)? {
+        MigrationsSchemaState::Missing => return Ok(HashSet::new()),
+        MigrationsSchemaState::Present => {}
     }
 
     let mut applied = HashSet::new();
@@ -4553,6 +4588,32 @@ mod tests {
                 assert_eq!(conn.project.as_deref(), Some("dialog"));
             }
             _ => panic!("expected Migrate::Status"),
+        }
+    }
+
+    #[test]
+    fn migration_schema_probe_distinguishes_missing_from_operational_errors() {
+        assert_eq!(
+            migrations_schema_state(Ok("filename TEXT".to_string())).unwrap(),
+            MigrationsSchemaState::Present
+        );
+        assert_eq!(
+            migrations_schema_state(Err("ERR table '__migrations' does not exist".to_string()))
+                .unwrap(),
+            MigrationsSchemaState::Missing
+        );
+
+        for error in [
+            "request failed: operation timed out",
+            "NOAUTH Authentication required",
+            "HTTP 502 Bad Gateway",
+            "ERR table 'another_table' does not exist",
+        ] {
+            let result = migrations_schema_state(Err(error.to_string()));
+            assert!(
+                result.is_err(),
+                "operational error was treated as missing: {error}"
+            );
         }
     }
 }
