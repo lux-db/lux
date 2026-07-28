@@ -3487,6 +3487,12 @@ fn is_missing_migrations_table_error(error: &str) -> bool {
         .contains("table '__migrations' does not exist")
 }
 
+fn is_existing_migrations_body_error(error: &str) -> bool {
+    error
+        .to_ascii_lowercase()
+        .contains("field 'body' already exists")
+}
+
 async fn ensure_migrations_table(target: &mut MigrateTarget) {
     let state = migrations_schema_state(target.exec("TSCHEMA __migrations").await).unwrap_or_else(
         |error| {
@@ -3512,9 +3518,19 @@ async fn ensure_migrations_table(target: &mut MigrateTarget) {
         }
         MigrationsSchemaState::Present => {
             // Older instances have a __migrations table without `body` (added so
-            // `lux migrate pull` can recreate migration files). Adding it is
-            // idempotent: ignore the "already exists" error.
-            let _ = target.exec("TALTER __migrations ADD body TEXT").await;
+            // `lux migrate pull` can recreate migration files). Ignore only the
+            // exact idempotent "already exists" result; an auth, transport, or
+            // server failure here must not be reported as a usable schema.
+            if let Err(error) = target.exec("TALTER __migrations ADD body TEXT").await {
+                if !is_existing_migrations_body_error(&error) {
+                    eprintln!(
+                        "{} Failed to upgrade __migrations table: {}",
+                        "Error:".red(),
+                        error
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }
@@ -4613,6 +4629,24 @@ mod tests {
             assert!(
                 result.is_err(),
                 "operational error was treated as missing: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_body_upgrade_ignores_only_existing_field() {
+        assert!(is_existing_migrations_body_error(
+            "ERR field 'body' already exists"
+        ));
+        for error in [
+            "request failed: operation timed out",
+            "NOAUTH Authentication required",
+            "HTTP 502 Bad Gateway",
+            "ERR field 'another_field' already exists",
+        ] {
+            assert!(
+                !is_existing_migrations_body_error(error),
+                "operational error was treated as an idempotent alter: {error}"
             );
         }
     }
