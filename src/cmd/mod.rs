@@ -370,7 +370,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: b"LUX",
-        min_arity: 3,
+        min_arity: 2,
     },
     CommandSpec {
         name: b"CONFIG",
@@ -1975,7 +1975,25 @@ pub fn execute(
         }
         b'L' => {
             if cmd_eq(cmd, b"LUX") {
-                crate::push::cmd_push(args, store, cache, out, now);
+                if args.get(1).is_some_and(|arg| cmd_eq(arg, b"PUSH")) {
+                    crate::push::cmd_push(args, store, cache, out, now);
+                } else if args.get(1).is_some_and(|arg| cmd_eq(arg, b"MIGRATE")) {
+                    crate::migrations::cmd_migrate(args, store, cache, broker, out, now);
+                } else if args.get(1).is_some_and(|arg| cmd_eq(arg, b"VERSION")) {
+                    let build_sha = option_env!("LUX_BUILD_SHA").unwrap_or("unknown");
+                    resp::write_bulk(
+                        out,
+                        &serde_json::json!({
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "build_sha": build_sha,
+                            "api_version": crate::migrations::API_VERSION,
+                            "capabilities": crate::migrations::CAPABILITIES
+                        })
+                        .to_string(),
+                    );
+                } else {
+                    resp::write_error(out, "ERR usage: LUX <VERSION|MIGRATE|PUSH> ...");
+                }
                 return CmdResult::Written;
             }
             if cmd_eq(cmd, b"LCS") {
@@ -5607,6 +5625,28 @@ mod tests {
         let out = exec_str(&store, &[b"HELLO"]);
         assert!(out.contains("lux"), "contains server name: {out}");
         assert!(out.contains("proto"), "contains proto: {out}");
+    }
+
+    #[test]
+    fn lux_version_and_migrate_have_resp_parity() {
+        let store = Store::new();
+        let version = exec_str(&store, &[b"LUX", b"VERSION"]);
+        assert!(version.contains("\"version\""), "{version}");
+        assert!(version.contains("\"migrations.apply\""), "{version}");
+
+        let applied = exec_str(
+            &store,
+            &[
+                b"LUX",
+                b"MIGRATE",
+                b"APPLY",
+                b"001_resp.lux",
+                b"TCREATE resp_migrated id INT PRIMARY KEY;",
+            ],
+        );
+        assert!(applied.contains("\"status\":\"applied\""), "{applied}");
+        let schema = exec_str(&store, &[b"TSCHEMA", b"resp_migrated"]);
+        assert!(!schema.starts_with('-'), "{schema}");
     }
 
     #[test]

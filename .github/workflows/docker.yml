@@ -41,6 +41,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
+          build-args: LUX_BUILD_SHA=${{ github.sha }}
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:build-amd64
           cache-from: type=gha,scope=docker-amd64
@@ -75,6 +76,7 @@ jobs:
         with:
           context: .
           platforms: linux/arm64
+          build-args: LUX_BUILD_SHA=${{ github.sha }}
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:build-arm64
           cache-from: type=gha,scope=docker-arm64

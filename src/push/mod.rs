@@ -77,6 +77,8 @@ pub(crate) fn ensure_tables(
             "platform STR,",
             "apns_team_id STR,",
             "apns_key_id STR,",
+            // Legacy plaintext columns remain readable for pre-encryption
+            // projects. New writes go only to the ENCRYPTED replacements below.
             "apns_p8_pem STR,",
             "apns_topic STR,",
             "environment STR,",
@@ -87,6 +89,7 @@ pub(crate) fn ensure_tables(
         ],
         now,
     )?;
+    ensure_encrypted_credential_columns(store, cache, now)?;
     create_table_if_missing(
         store,
         cache,
@@ -111,6 +114,84 @@ pub(crate) fn ensure_tables(
         now,
     )?;
     add_column_if_missing(store, cache, OUTBOX_TABLE, "environment STR", now)?;
+    Ok(())
+}
+
+fn ensure_encrypted_credential_columns(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    now: Instant,
+) -> Result<(), String> {
+    // Device registration and delivery remain usable without ENC, but provider
+    // secrets may never be newly persisted in plaintext.
+    if !store.encryption().has_active_key() {
+        return Ok(());
+    }
+    add_column_if_missing(
+        store,
+        cache,
+        CREDENTIALS_TABLE,
+        "apns_p8_pem_encrypted STR ENCRYPTED",
+        now,
+    )?;
+    add_column_if_missing(
+        store,
+        cache,
+        CREDENTIALS_TABLE,
+        "vapid_private_encrypted STR ENCRYPTED",
+        now,
+    )?;
+    migrate_plaintext_credential_secrets(store, cache, now)
+}
+
+fn migrate_plaintext_credential_secrets(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    now: Instant,
+) -> Result<(), String> {
+    for row in select_rows(store, cache, CREDENTIALS_TABLE, Vec::new(), None, now)? {
+        let fields: std::collections::HashMap<String, String> = row.into_iter().collect();
+        let app_id = fields.get("app_id").cloned().unwrap_or_default();
+        if app_id.is_empty() {
+            continue;
+        }
+        let legacy_apns = fields.get("apns_p8_pem").cloned().unwrap_or_default();
+        let encrypted_apns = fields
+            .get("apns_p8_pem_encrypted")
+            .cloned()
+            .unwrap_or_default();
+        if !legacy_apns.is_empty() && encrypted_apns.is_empty() {
+            durable_table_update_where(
+                store,
+                cache,
+                CREDENTIALS_TABLE,
+                &[
+                    ("apns_p8_pem_encrypted", legacy_apns.as_str()),
+                    ("apns_p8_pem", ""),
+                ],
+                &["app_id", "=", app_id.as_str()],
+                now,
+            )?;
+        }
+        let legacy_vapid = fields.get("vapid_private").cloned().unwrap_or_default();
+        let encrypted_vapid = fields
+            .get("vapid_private_encrypted")
+            .cloned()
+            .unwrap_or_default();
+        if !legacy_vapid.is_empty() && encrypted_vapid.is_empty() {
+            durable_table_update_where(
+                store,
+                cache,
+                CREDENTIALS_TABLE,
+                &[
+                    ("vapid_private_encrypted", legacy_vapid.as_str()),
+                    ("vapid_private", ""),
+                ],
+                &["app_id", "=", app_id.as_str()],
+                now,
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -143,17 +224,54 @@ pub(crate) fn migrate_from_auth_scope(
             continue;
         }
         let g = |k: &str| m.get(k).cloned().unwrap_or_default();
-        set_apns_credentials(
-            store,
-            cache,
-            &app_id,
-            &g("apns_team_id"),
-            &g("apns_key_id"),
-            &g("apns_p8_pem"),
-            &g("apns_topic"),
-            &g("environment"),
-            now,
-        )?;
+        let apns_private = g("apns_p8_pem");
+        let vapid_private = g("vapid_private");
+        if store.encryption().has_active_key() {
+            if !apns_private.is_empty() {
+                set_apns_credentials(
+                    store,
+                    cache,
+                    &app_id,
+                    &g("apns_team_id"),
+                    &g("apns_key_id"),
+                    &apns_private,
+                    &g("apns_topic"),
+                    &g("environment"),
+                    now,
+                )?;
+            }
+            if !vapid_private.is_empty() {
+                set_vapid_credentials(
+                    store,
+                    cache,
+                    &app_id,
+                    &g("vapid_public"),
+                    &vapid_private,
+                    &g("vapid_subject"),
+                    now,
+                )?;
+            }
+        } else {
+            // This copies already-plaintext legacy data; it is not a new secret
+            // write surface. Reads report it unhealthy, and ensure_tables
+            // migrates it into ENCRYPTED columns once ENC becomes available.
+            upsert_credential_fields(
+                store,
+                cache,
+                &app_id,
+                &[
+                    ("apns_team_id", g("apns_team_id").as_str()),
+                    ("apns_key_id", g("apns_key_id").as_str()),
+                    ("apns_p8_pem", apns_private.as_str()),
+                    ("apns_topic", g("apns_topic").as_str()),
+                    ("environment", g("environment").as_str()),
+                    ("vapid_public", g("vapid_public").as_str()),
+                    ("vapid_private", vapid_private.as_str()),
+                    ("vapid_subject", g("vapid_subject").as_str()),
+                ],
+                now,
+            )?;
+        }
     }
 
     // Devices: user_id -> subject_id, re-keyed by token.
@@ -555,19 +673,82 @@ pub(crate) fn set_apns_credentials(
     environment: &str,
     now: Instant,
 ) -> Result<(), String> {
-    upsert_credential_fields(
+    update_apns_credentials(
         store,
         cache,
         app_id,
-        &[
-            ("apns_team_id", team_id),
-            ("apns_key_id", key_id),
-            ("apns_p8_pem", p8_pem),
-            ("apns_topic", topic),
-            ("environment", environment),
-        ],
+        team_id,
+        key_id,
+        Some(p8_pem),
+        topic,
+        environment,
         now,
     )
+}
+
+/// Update APNs metadata while preserving the existing private key when
+/// `p8_pem` is omitted. New secret writes require engine encryption.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_apns_credentials(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    app_id: &str,
+    team_id: &str,
+    key_id: &str,
+    p8_pem: Option<&str>,
+    topic: &str,
+    environment: &str,
+    now: Instant,
+) -> Result<(), String> {
+    if p8_pem.is_some() && !store.encryption().has_active_key() {
+        return Err("new push secrets require ENC INIT or an active encryption key".to_string());
+    }
+    ensure_tables(store, cache, now)?;
+    if p8_pem.is_none() {
+        let existing = get_apns_credentials(store, cache, app_id, now)?;
+        if existing
+            .as_ref()
+            .is_none_or(|credentials| credentials.creds.p8_pem.is_empty())
+        {
+            return Err("p8_pem is required when APNs has no existing key".to_string());
+        }
+    }
+    let mut fields = vec![
+        ("apns_team_id", team_id),
+        ("apns_key_id", key_id),
+        ("apns_topic", topic),
+        ("environment", environment),
+    ];
+    if store.encryption().has_active_key() {
+        fields.push(("apns_p8_pem", ""));
+    }
+    if let Some(p8_pem) = p8_pem {
+        if p8_pem.trim().is_empty() {
+            return Err("p8_pem cannot be empty; use clear to remove APNs".to_string());
+        }
+        fields.push(("apns_p8_pem_encrypted", p8_pem));
+    }
+    upsert_credential_fields(store, cache, app_id, &fields, now)
+}
+
+pub(crate) fn clear_apns_credentials(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    app_id: &str,
+    now: Instant,
+) -> Result<(), String> {
+    ensure_tables(store, cache, now)?;
+    let mut fields = vec![
+        ("apns_team_id", ""),
+        ("apns_key_id", ""),
+        ("apns_p8_pem", ""),
+        ("apns_topic", ""),
+        ("environment", ""),
+    ];
+    if store.encryption().has_active_key() {
+        fields.push(("apns_p8_pem_encrypted", ""));
+    }
+    upsert_credential_fields(store, cache, app_id, &fields, now)
 }
 
 /// Upsert an app's Web Push (VAPID) credentials (operator only). Preserves APNs.
@@ -580,17 +761,62 @@ pub(crate) fn set_vapid_credentials(
     subject: &str,
     now: Instant,
 ) -> Result<(), String> {
+    if !store.encryption().has_active_key() {
+        return Err(
+            "push credential writes require ENC INIT or an active encryption key".to_string(),
+        );
+    }
+    ensure_tables(store, cache, now)?;
     upsert_credential_fields(
         store,
         cache,
         app_id,
         &[
             ("vapid_public", public_key),
-            ("vapid_private", private_pem),
+            ("vapid_private", ""),
+            ("vapid_private_encrypted", private_pem),
             ("vapid_subject", subject),
         ],
         now,
     )
+}
+
+pub(crate) fn rotate_vapid_credentials(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    app_id: &str,
+    subject: &str,
+    now: Instant,
+) -> Result<String, String> {
+    let (public_key, private_pem) = webpush::generate_vapid_keypair()?;
+    set_vapid_credentials(
+        store,
+        cache,
+        app_id,
+        &public_key,
+        &private_pem,
+        subject,
+        now,
+    )?;
+    Ok(public_key)
+}
+
+pub(crate) fn disable_vapid_credentials(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    app_id: &str,
+    now: Instant,
+) -> Result<(), String> {
+    ensure_tables(store, cache, now)?;
+    let mut fields = vec![
+        ("vapid_public", ""),
+        ("vapid_private", ""),
+        ("vapid_subject", ""),
+    ];
+    if store.encryption().has_active_key() {
+        fields.push(("vapid_private_encrypted", ""));
+    }
+    upsert_credential_fields(store, cache, app_id, &fields, now)
 }
 
 pub(crate) fn get_vapid_credentials(
@@ -605,7 +831,14 @@ pub(crate) fn get_vapid_credentials(
     };
     let get = |k: &str| row.get(k).cloned().unwrap_or_default();
     let public_key = get("vapid_public");
-    let private_pem = get("vapid_private");
+    let private_pem = {
+        let encrypted = get("vapid_private_encrypted");
+        if encrypted.is_empty() {
+            get("vapid_private")
+        } else {
+            encrypted
+        }
+    };
     if public_key.is_empty() || private_pem.is_empty() {
         return Ok(None);
     }
@@ -641,10 +874,70 @@ pub(crate) fn get_apns_credentials(
         creds: apns::ApnsCredentials {
             team_id: get("apns_team_id"),
             key_id: get("apns_key_id"),
-            p8_pem: get("apns_p8_pem"),
+            p8_pem: {
+                let encrypted = get("apns_p8_pem_encrypted");
+                if encrypted.is_empty() {
+                    get("apns_p8_pem")
+                } else {
+                    encrypted
+                }
+            },
         },
         topic: get("apns_topic"),
         environment: get("environment"),
+    }))
+}
+
+/// Secret-free operator metadata for CLI/Studio configuration and health.
+pub(crate) fn credential_config(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    app_id: &str,
+    now: Instant,
+) -> Result<Value, String> {
+    ensure_tables(store, cache, now)?;
+    let row = find_row_by_field(store, cache, CREDENTIALS_TABLE, "app_id", app_id, now)?;
+    let fields = row.unwrap_or_default();
+    let get = |key: &str| fields.get(key).cloned().unwrap_or_default();
+    let apns_encrypted = !get("apns_p8_pem_encrypted").is_empty();
+    let apns_legacy = !get("apns_p8_pem").is_empty();
+    let vapid_encrypted = !get("vapid_private_encrypted").is_empty();
+    let vapid_legacy = !get("vapid_private").is_empty();
+    let encryption_available = store.encryption().has_active_key();
+    let plaintext_secrets = apns_legacy || vapid_legacy;
+    let any_configured = apns_encrypted || apns_legacy || vapid_encrypted || vapid_legacy;
+    let mut warnings = Vec::new();
+    if plaintext_secrets {
+        warnings.push(
+            "legacy plaintext push secrets are readable but unhealthy; configure engine encryption to migrate them"
+                .to_string(),
+        );
+    }
+    if !encryption_available {
+        warnings.push(
+            "push credential changes are disabled until engine encryption is initialized"
+                .to_string(),
+        );
+    }
+    Ok(json!({
+        "app_id": app_id,
+        "healthy": !plaintext_secrets && (!any_configured || encryption_available),
+        "encryption_available": encryption_available,
+        "warnings": warnings,
+        "apns": {
+            "configured": apns_encrypted || apns_legacy,
+            "team_id": get("apns_team_id"),
+            "key_id": get("apns_key_id"),
+            "topic": get("apns_topic"),
+            "environment": get("environment"),
+            "secret_storage": if apns_encrypted { "encrypted" } else if apns_legacy { "legacy_plaintext" } else { "none" }
+        },
+        "vapid": {
+            "configured": vapid_encrypted || vapid_legacy,
+            "public_key": get("vapid_public"),
+            "subject": get("vapid_subject"),
+            "secret_storage": if vapid_encrypted { "encrypted" } else if vapid_legacy { "legacy_plaintext" } else { "none" }
+        }
     }))
 }
 
@@ -760,8 +1053,12 @@ pub(crate) fn select_rows(
     // Push tables are created lazily on first write, so a project that has never
     // used push has no `push.*` tables. Treat a missing table as no rows — this
     // keeps reads (and the worker's outbox scan) quiet until push is configured.
-    if tables::table_schema(store, cache, table, now).is_err() {
-        return Ok(Vec::new());
+    match tables::table_schema(store, cache, table, now) {
+        Ok(_) => {}
+        Err(error) if error == format!("ERR table '{table}' does not exist") => {
+            return Ok(Vec::new())
+        }
+        Err(error) => return Err(error),
     }
     let plan = SelectPlan {
         table: table.to_string(),
@@ -919,7 +1216,28 @@ fn normalize_err(e: &str) -> String {
 mod tests {
     use super::*;
 
+    use crate::{EncryptionConfig, EncryptionKeyConfig, ServerConfig};
+    use std::sync::Arc;
     use EnvironmentSource::{Trusted, User};
+
+    fn cache() -> SharedSchemaCache {
+        Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()))
+    }
+
+    fn encrypted_store() -> Store {
+        Store::new_with_config(Arc::new(ServerConfig {
+            encryption: EncryptionConfig {
+                active_key_id: Some("push-test".to_string()),
+                keys: vec![EncryptionKeyConfig {
+                    id: "push-test".to_string(),
+                    secret: b"push-test-secret".to_vec(),
+                    decrypt_only: false,
+                }],
+                ..Default::default()
+            },
+            ..ServerConfig::default()
+        }))
+    }
 
     #[test]
     fn environment_normalizes_apple_spellings() {
@@ -969,6 +1287,145 @@ mod tests {
         assert_eq!(
             normalize_environment("  HTTP://attacker.example/", User),
             ""
+        );
+    }
+
+    #[test]
+    fn plaintext_push_secret_writes_are_rejected() {
+        let store = Store::new();
+        let error = update_apns_credentials(
+            &store,
+            &cache(),
+            "default",
+            "team",
+            "key",
+            Some("private"),
+            "com.example.app",
+            "sandbox",
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(error.contains("encryption key"));
+    }
+
+    #[test]
+    fn apns_metadata_update_preserves_encrypted_key_and_clear_removes_it() {
+        let store = encrypted_store();
+        let cache = cache();
+        let now = Instant::now();
+        update_apns_credentials(
+            &store,
+            &cache,
+            "default",
+            "team",
+            "key",
+            Some("private-v1"),
+            "com.example.app",
+            "sandbox",
+            now,
+        )
+        .unwrap();
+        update_apns_credentials(
+            &store,
+            &cache,
+            "default",
+            "team",
+            "key-2",
+            None,
+            "com.example.app",
+            "production",
+            now,
+        )
+        .unwrap();
+        let credentials = get_apns_credentials(&store, &cache, "default", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(credentials.creds.p8_pem, "private-v1");
+        assert_eq!(credentials.creds.key_id, "key-2");
+        let config = credential_config(&store, &cache, "default", now).unwrap();
+        assert_eq!(
+            config["apns"]["secret_storage"],
+            Value::String("encrypted".to_string())
+        );
+        assert!(config.to_string().find("private-v1").is_none());
+
+        clear_apns_credentials(&store, &cache, "default", now).unwrap();
+        let cleared = get_apns_credentials(&store, &cache, "default", now)
+            .unwrap()
+            .unwrap();
+        assert!(cleared.creds.p8_pem.is_empty());
+    }
+
+    #[test]
+    fn vapid_rotation_generates_and_encrypts_a_new_keypair() {
+        let store = encrypted_store();
+        let cache = cache();
+        let now = Instant::now();
+        let first =
+            rotate_vapid_credentials(&store, &cache, "default", "mailto:test@example.com", now)
+                .unwrap();
+        let second =
+            rotate_vapid_credentials(&store, &cache, "default", "mailto:test@example.com", now)
+                .unwrap();
+        assert_ne!(first, second);
+        let resolved = get_vapid_credentials(&store, &cache, "default", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.public_key, second);
+        assert!(resolved.private_pem.contains("PRIVATE KEY"));
+    }
+
+    #[test]
+    fn legacy_plaintext_credentials_migrate_when_encryption_is_available() {
+        let store = encrypted_store();
+        let cache = cache();
+        let now = Instant::now();
+        tables::table_create(
+            &store,
+            &cache,
+            CREDENTIALS_TABLE,
+            &[
+                "app_id STR PRIMARY KEY,",
+                "platform STR,",
+                "apns_team_id STR,",
+                "apns_key_id STR,",
+                "apns_p8_pem STR,",
+                "apns_topic STR,",
+                "environment STR,",
+                "vapid_public STR,",
+                "vapid_private STR,",
+                "vapid_subject STR,",
+                "created_at INT",
+            ],
+            now,
+        )
+        .unwrap();
+        tables::table_insert(
+            &store,
+            &cache,
+            CREDENTIALS_TABLE,
+            &[
+                ("app_id", "default"),
+                ("apns_p8_pem", "legacy-apns-secret"),
+                ("vapid_private", "legacy-vapid-secret"),
+                ("created_at", "1"),
+            ],
+            now,
+        )
+        .unwrap();
+        ensure_tables(&store, &cache, now).unwrap();
+        let config = credential_config(&store, &cache, "default", now).unwrap();
+        assert_eq!(config["healthy"], true);
+        assert_eq!(config["apns"]["secret_storage"], "encrypted");
+        assert_eq!(config["vapid"]["secret_storage"], "encrypted");
+        let row = find_row_by_field(&store, &cache, CREDENTIALS_TABLE, "app_id", "default", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get("apns_p8_pem").map(String::as_str), Some(""));
+        assert_eq!(row.get("vapid_private").map(String::as_str), Some(""));
+        assert_eq!(
+            row.get("apns_p8_pem_encrypted").map(String::as_str),
+            Some("legacy-apns-secret")
         );
     }
 }

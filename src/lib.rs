@@ -21,6 +21,7 @@ mod hnsw;
 mod http;
 mod jsonb;
 mod lua;
+mod migrations;
 mod pubsub;
 mod push;
 mod resp;

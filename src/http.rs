@@ -2676,6 +2676,17 @@ fn route_request_with_auth(
     }
 
     match (method, base) {
+        // ── engine management contract ──
+        ("GET", ["version"]) => engine_version(),
+        ("GET", ["migrations"]) => migration_list(params, store, cache),
+        ("POST", ["migrations", "plan"]) => migration_plan(body, store, cache),
+        ("POST", ["migrations", "apply"]) => {
+            migration_apply(body, store, broker, cache, script_engine)
+        }
+        ("POST", ["migrations", "repair"]) => {
+            migration_repair(body, store, broker, cache, script_engine)
+        }
+
         // ── exec (escape hatch) ──
         ("POST", ["exec"]) => ok(handle_exec(body, store, broker, cache, script_engine)),
 
@@ -2686,6 +2697,11 @@ fn route_request_with_auth(
         ("DELETE", ["push", "devices"]) => push_delete_device_by_token(body, store, cache),
         ("POST", ["push", "send"]) => push_send(body, store, cache),
         ("POST", ["push", "credentials"]) => push_set_credentials(body, store, cache),
+        ("GET", ["push", "config"]) => push_config(params, store, cache),
+        ("PUT", ["push", "config", "apns"]) => push_update_apns(body, store, cache),
+        ("DELETE", ["push", "config", "apns"]) => push_clear_apns(params, store, cache),
+        ("POST", ["push", "config", "vapid"]) => push_enable_vapid(body, store, cache),
+        ("DELETE", ["push", "config", "vapid"]) => push_disable_vapid(params, store, cache),
         ("GET", ["push", "admin", "devices"]) => push_admin_devices(store, cache),
         ("GET", ["push", "admin", "outbox"]) => push_admin_outbox(store, cache),
         ("GET", ["push", "admin", "stats"]) => push_admin_stats(),
@@ -3045,6 +3061,10 @@ fn route_requires_project_access(method: &str, base: &[&str]) -> bool {
     matches!(
         (method, base),
         ("POST", ["exec"])
+            | ("GET", ["migrations"])
+            | ("POST", ["migrations", "plan"])
+            | ("POST", ["migrations", "apply"])
+            | ("POST", ["migrations", "repair"])
             | ("GET", ["dbsize"])
             | ("GET", ["keys"])
             | ("GET", ["keys", _])
@@ -3067,11 +3087,185 @@ fn route_requires_project_access(method: &str, base: &[&str]) -> bool {
             | ("DELETE", ["vectors", _])
             | ("POST", ["push", "send"])
             | ("POST", ["push", "credentials"])
+            | ("GET", ["push", "config"])
+            | ("PUT", ["push", "config", "apns"])
+            | ("DELETE", ["push", "config", "apns"])
+            | ("POST", ["push", "config", "vapid"])
+            | ("DELETE", ["push", "config", "vapid"])
             | ("DELETE", ["push", "devices"])
             | ("GET", ["push", "admin", "devices"])
             | ("GET", ["push", "admin", "outbox"])
             | ("GET", ["push", "admin", "stats"])
     )
+}
+
+fn engine_version() -> (u16, &'static str, String) {
+    let build_sha = option_env!("LUX_BUILD_SHA").unwrap_or("unknown");
+    ok(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "build_sha": build_sha,
+        "api_version": crate::migrations::API_VERSION,
+        "capabilities": crate::migrations::CAPABILITIES
+    })
+    .to_string())
+}
+
+fn migration_list(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let limit = get_param(params, "limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100);
+    let offset = get_param(params, "offset")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    match crate::migrations::list(store, cache, limit, offset, Instant::now()) {
+        Ok(migrations) => ok(json!({
+            "migrations": migrations,
+            "limit": limit.clamp(1, 1000),
+            "offset": offset
+        })
+        .to_string()),
+        Err(error) => migration_json_error(&error),
+    }
+}
+
+fn parse_migration_request(body: &str) -> Result<(String, String), (u16, &'static str, String)> {
+    let parsed: Value = serde_json::from_str(body)
+        .map_err(|_| push_json_error(400, "Bad Request", "invalid json"))?;
+    let filename = crate::migrations::resolve_filename(
+        parsed.get("filename").and_then(Value::as_str),
+        parsed.get("name").and_then(Value::as_str),
+    )
+    .map_err(|error| migration_json_error(&error))?;
+    let migration_body = parsed
+        .get("body")
+        .and_then(Value::as_str)
+        .ok_or_else(|| push_json_error(400, "Bad Request", "body is required"))?
+        .to_string();
+    Ok((filename, migration_body))
+}
+
+fn migration_plan(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let (filename, migration_body) = match parse_migration_request(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match crate::migrations::plan(store, cache, &filename, &migration_body, Instant::now()) {
+        Ok(plan) => ok(json!({ "plan": plan }).to_string()),
+        Err(error) => migration_json_error(&error),
+    }
+}
+
+fn execute_migration_command(
+    command: &[String],
+    store: &Arc<Store>,
+    broker: &Broker,
+    cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
+) -> Result<(), String> {
+    if command
+        .first()
+        .is_some_and(|value| value.eq_ignore_ascii_case("LUX"))
+    {
+        return Err("nested LUX commands are not allowed in migrations".to_string());
+    }
+    let args: Vec<&str> = command.iter().map(String::as_str).collect();
+    let response =
+        exec_resp(store, broker, cache, script_engine, &args).map_err(|error| error.to_string())?;
+    if response.first() == Some(&b'-') {
+        let message = std::str::from_utf8(&response[1..])
+            .unwrap_or("engine command failed")
+            .trim_end_matches("\r\n");
+        Err(message.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn migration_apply(
+    body: &str,
+    store: &Arc<Store>,
+    broker: &Broker,
+    cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
+) -> (u16, &'static str, String) {
+    let (filename, migration_body) = match parse_migration_request(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match crate::migrations::apply(
+        store,
+        cache,
+        &filename,
+        &migration_body,
+        Instant::now(),
+        |command| execute_migration_command(command, store, broker, cache, script_engine),
+    ) {
+        Ok(result) => ok(json!({
+            "migration": result.migration,
+            "already_applied": result.already_applied
+        })
+        .to_string()),
+        Err(error) => migration_json_error(&error),
+    }
+}
+
+fn migration_repair(
+    body: &str,
+    store: &Arc<Store>,
+    broker: &Broker,
+    cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
+) -> (u16, &'static str, String) {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let filename = match parsed.get("filename").and_then(Value::as_str) {
+        Some(value) => value,
+        None => return push_json_error(400, "Bad Request", "filename is required"),
+    };
+    let action = match parsed.get("action").and_then(Value::as_str) {
+        Some("resume") => {
+            let Some(from_command) = parsed.get("from_command").and_then(Value::as_u64) else {
+                return push_json_error(
+                    400,
+                    "Bad Request",
+                    "resume requires an explicit zero-based from_command",
+                );
+            };
+            crate::migrations::RepairAction::Resume {
+                from_command: from_command as usize,
+            }
+        }
+        Some("mark_applied") => crate::migrations::RepairAction::MarkApplied,
+        Some("abandon") => crate::migrations::RepairAction::Abandon,
+        _ => {
+            return push_json_error(
+                400,
+                "Bad Request",
+                "action must be resume, mark_applied, or abandon",
+            )
+        }
+    };
+    match crate::migrations::repair(store, cache, filename, action, Instant::now(), |command| {
+        execute_migration_command(command, store, broker, cache, script_engine)
+    }) {
+        Ok(migration) => ok(json!({ "migration": migration }).to_string()),
+        Err(error) => migration_json_error(&error),
+    }
+}
+
+fn migration_json_error(message: &str) -> (u16, &'static str, String) {
+    let message = message.strip_prefix("ERR ").unwrap_or(message);
+    push_json_error(400, "Bad Request", message)
 }
 
 fn ok(result: String) -> (u16, &'static str, String) {
@@ -3296,6 +3490,132 @@ fn push_admin_stats() -> (u16, &'static str, String) {
     .to_string())
 }
 
+/// `GET /v1/push/config?app_id=...` — secret-free configuration and health.
+fn push_config(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let app_id = get_param(params, "app_id").unwrap_or("default");
+    match crate::push::credential_config(store, cache, app_id, Instant::now()) {
+        Ok(config) => ok(json!({ "config": config }).to_string()),
+        Err(error) => push_json_error(400, "Bad Request", &error),
+    }
+}
+
+/// `PUT /v1/push/config/apns` — update APNs metadata. Omitting `p8_pem`
+/// preserves the existing encrypted key; first-time setup requires it.
+fn push_update_apns(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let app_id = parsed["app_id"].as_str().unwrap_or("default");
+    let team_id = parsed["team_id"].as_str().unwrap_or("");
+    let key_id = parsed["key_id"].as_str().unwrap_or("");
+    let topic = parsed["topic"].as_str().unwrap_or("");
+    let environment = parsed["environment"].as_str().unwrap_or("sandbox");
+    let p8_pem = parsed.get("p8_pem").and_then(Value::as_str);
+    if team_id.is_empty() || key_id.is_empty() || topic.is_empty() {
+        return push_json_error(
+            400,
+            "Bad Request",
+            "team_id, key_id, and topic are required",
+        );
+    }
+    match crate::push::update_apns_credentials(
+        store,
+        cache,
+        app_id,
+        team_id,
+        key_id,
+        p8_pem,
+        topic,
+        environment,
+        Instant::now(),
+    ) {
+        Ok(()) => match crate::push::credential_config(store, cache, app_id, Instant::now()) {
+            Ok(config) => ok(json!({ "config": config }).to_string()),
+            Err(error) => push_json_error(400, "Bad Request", &error),
+        },
+        Err(error) => push_json_error(400, "Bad Request", &error),
+    }
+}
+
+fn push_clear_apns(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let app_id = get_param(params, "app_id").unwrap_or("default");
+    match crate::push::clear_apns_credentials(store, cache, app_id, Instant::now()) {
+        Ok(()) => ok(json!({ "ok": true, "app_id": app_id }).to_string()),
+        Err(error) => push_json_error(400, "Bad Request", &error),
+    }
+}
+
+/// `POST /v1/push/config/vapid` with `action=enable|rotate`. Enable is
+/// idempotent; rotate intentionally replaces the browser-facing public key.
+fn push_enable_vapid(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let app_id = parsed["app_id"].as_str().unwrap_or("default");
+    let action = parsed["action"].as_str().unwrap_or("enable");
+    let subject = parsed["subject"]
+        .as_str()
+        .unwrap_or("mailto:push@luxdb.dev");
+    if let Err(error) = crate::push::credential_config(store, cache, app_id, Instant::now()) {
+        return push_json_error(400, "Bad Request", &error);
+    }
+    if action == "enable" {
+        match crate::push::vapid_public_key(store, cache, app_id, Instant::now()) {
+            Ok(Some(public_key)) => {
+                return ok(json!({
+                    "ok": true,
+                    "rotated": false,
+                    "public_key": public_key
+                })
+                .to_string())
+            }
+            Ok(None) => {}
+            Err(error) => return push_json_error(400, "Bad Request", &error),
+        }
+    } else if action != "rotate" {
+        return push_json_error(400, "Bad Request", "action must be enable or rotate");
+    }
+    match crate::push::rotate_vapid_credentials(store, cache, app_id, subject, Instant::now()) {
+        Ok(public_key) => ok(json!({
+            "ok": true,
+            "rotated": action == "rotate",
+            "public_key": public_key
+        })
+        .to_string()),
+        Err(error) => push_json_error(400, "Bad Request", &error),
+    }
+}
+
+fn push_disable_vapid(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let app_id = get_param(params, "app_id").unwrap_or("default");
+    match crate::push::disable_vapid_credentials(store, cache, app_id, Instant::now()) {
+        Ok(()) => ok(json!({ "ok": true, "app_id": app_id }).to_string()),
+        Err(error) => push_json_error(400, "Bad Request", &error),
+    }
+}
+
 /// `POST /v1/push/credentials` (operator) — set an app's APNs credentials.
 fn push_set_credentials(
     body: &str,
@@ -3333,17 +3653,17 @@ fn push_set_credentials(
     // APNs credentials.
     let team_id = parsed["team_id"].as_str().unwrap_or("");
     let key_id = parsed["key_id"].as_str().unwrap_or("");
-    let p8_pem = parsed["p8_pem"].as_str().unwrap_or("");
+    let p8_pem = parsed.get("p8_pem").and_then(Value::as_str);
     let topic = parsed["topic"].as_str().unwrap_or("");
     let environment = parsed["environment"].as_str().unwrap_or("sandbox");
-    if team_id.is_empty() || key_id.is_empty() || p8_pem.is_empty() || topic.is_empty() {
+    if team_id.is_empty() || key_id.is_empty() || topic.is_empty() {
         return push_json_error(
             400,
             "Bad Request",
-            "team_id, key_id, p8_pem, and topic are required",
+            "team_id, key_id, and topic are required; p8_pem is required only for first-time setup",
         );
     }
-    match crate::push::set_apns_credentials(
+    match crate::push::update_apns_credentials(
         store,
         cache,
         app_id,
@@ -4830,6 +5150,10 @@ mod tests {
         // A bug here hands token users raw KV / exec / catalog. Lock it down.
         for (m, base) in [
             ("POST", vec!["exec"]),
+            ("GET", vec!["migrations"]),
+            ("POST", vec!["migrations", "plan"]),
+            ("POST", vec!["migrations", "apply"]),
+            ("POST", vec!["migrations", "repair"]),
             ("GET", vec!["dbsize"]),
             ("GET", vec!["keys"]),
             ("GET", vec!["kv", "secret"]),
@@ -4843,6 +5167,11 @@ mod tests {
             ("GET", vec!["vectors", "idx"]),
             ("POST", vec!["vectors", "idx"]),
             ("DELETE", vec!["vectors", "idx"]),
+            ("GET", vec!["push", "config"]),
+            ("PUT", vec!["push", "config", "apns"]),
+            ("DELETE", vec!["push", "config", "apns"]),
+            ("POST", vec!["push", "config", "vapid"]),
+            ("DELETE", vec!["push", "config", "vapid"]),
         ] {
             assert!(
                 route_requires_project_access(m, &base),
@@ -4850,6 +5179,41 @@ mod tests {
                 base.join("/")
             );
         }
+    }
+
+    #[test]
+    fn migration_http_contract_executes_and_is_idempotent() {
+        let (store, broker, cache, script_engine) = encrypted_http_fixture();
+        let body = json!({
+            "filename": "001_messages.lux",
+            "body": "TCREATE messages id INT PRIMARY KEY, body STR;\nTINSERT messages id 1 body hello;"
+        })
+        .to_string();
+        let (status, _, response) = migration_apply(&body, &store, &broker, &cache, &script_engine);
+        assert_eq!(status, 200, "{response}");
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["migration"]["status"], "applied");
+        assert_eq!(parsed["migration"]["completed_commands"], 2);
+        assert_eq!(parsed["already_applied"], false);
+
+        let (status, _, response) = migration_apply(&body, &store, &broker, &cache, &script_engine);
+        assert_eq!(status, 200, "{response}");
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["already_applied"], true);
+    }
+
+    #[test]
+    fn version_contract_advertises_management_capabilities() {
+        let (status, _, response) = engine_version();
+        assert_eq!(status, 200);
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(parsed["api_version"], crate::migrations::API_VERSION);
+        assert!(parsed["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "migrations.apply"));
     }
 
     #[test]

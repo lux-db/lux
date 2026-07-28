@@ -13,6 +13,8 @@ RUN mkdir src \
     && rm -rf src
 
 COPY src/ src/
+ARG LUX_BUILD_SHA=unknown
+ENV LUX_BUILD_SHA=${LUX_BUILD_SHA}
 RUN touch src/lib.rs src/main.rs && cargo build --release
 
 FROM scratch

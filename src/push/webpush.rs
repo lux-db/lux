@@ -13,6 +13,7 @@ use base64::Engine as _;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use p256::ecdh::diffie_hellman;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::pkcs8::{EncodePrivateKey, LineEnding};
 use p256::{PublicKey, SecretKey};
 use rand_core::{OsRng, RngCore};
 use ring::{aead, hmac};
@@ -30,6 +31,19 @@ const ALLOW_PRIVATE_ENDPOINTS_ENV: &str = "LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS";
 
 const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+/// Generate an RFC 8292 VAPID key pair. The public key is the browser-facing
+/// base64url uncompressed P-256 point; the private key is PKCS#8 PEM for ES256
+/// signing and must only be stored in an engine ENCRYPTED column.
+pub(crate) fn generate_vapid_keypair() -> Result<(String, String), String> {
+    let secret = SecretKey::random(&mut OsRng);
+    let public = B64.encode(secret.public_key().to_encoded_point(false).as_bytes());
+    let private = secret
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|error| format!("could not encode VAPID private key: {error}"))?
+        .to_string();
+    Ok((public, private))
+}
 
 /// Decode a base64url (no-pad) subscription field.
 pub(crate) fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {

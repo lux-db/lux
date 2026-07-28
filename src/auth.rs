@@ -2585,7 +2585,10 @@ pub(crate) fn create_table_if_missing(
 ) -> Result<(), String> {
     match tables::table_schema(store, cache, table, now) {
         Ok(_) => Ok(()),
-        Err(_) => tables::table_create(store, cache, table, columns, now),
+        Err(error) if error == format!("ERR table '{table}' does not exist") => {
+            tables::table_create(store, cache, table, columns, now)
+        }
+        Err(error) => Err(format!("ERR could not inspect table '{table}': {error}")),
     }
 }
 

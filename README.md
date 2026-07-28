@@ -720,6 +720,7 @@ Lux 1.0 is defined by public contracts, not by an open-ended feature list:
 - [GA.md](GA.md) -- release criteria and 1.0 gate
 - [COMPATIBILITY.md](COMPATIBILITY.md) -- Redis-compatible, Lux-native, divergent, and unsupported behavior
 - [DURABILITY.md](DURABILITY.md) -- snapshot, WAL, restore, crash recovery, and data-loss expectations
+- [MANAGEMENT_API.md](MANAGEMENT_API.md) -- version discovery, engine-owned migrations, repair, and push configuration
 - [SECURITY.md](SECURITY.md) -- disclosure, deployment model, sensitive surfaces, and supported versions
 
 After 1.0, Lux follows semantic versioning for documented public APIs.

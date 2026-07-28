@@ -51,6 +51,10 @@ fn start(dir: &std::path::Path, resp_port: u16, http_port: u16, keep_dir: bool) 
         .env("LUX_STORAGE_DIR", dir.join("storage").to_str().unwrap())
         .env("LUX_PASSWORD", "rootsecret")
         .env("LUX_AUTH_ENABLED", "true")
+        // Provider private keys are accepted only when the engine can persist
+        // them in ENCRYPTED columns. Keep this stable across restart tests.
+        .env("LUX_ENCRYPTION_KEY_ID", "push-integration")
+        .env("LUX_ENCRYPTION_KEY", "push-integration-secret")
         // Integration delivery uses a loopback mock push service. Production
         // defaults reject private and non-HTTPS Web Push endpoints.
         .env("LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS", "1")
@@ -62,7 +66,7 @@ fn start(dir: &std::path::Path, resp_port: u16, http_port: u16, keep_dir: bool) 
         dir: dir.to_path_buf(),
         keep_dir,
     };
-    for _ in 0..80 {
+    for _ in 0..160 {
         if TcpStream::connect(("127.0.0.1", http_port)).is_ok()
             && TcpStream::connect(("127.0.0.1", resp_port)).is_ok()
         {
@@ -780,6 +784,8 @@ fn start_no_auth(dir: &std::path::Path, resp_port: u16, http_port: u16) -> PushS
         .env("LUX_STORAGE_MODE", "tiered")
         .env("LUX_STORAGE_DIR", dir.join("storage").to_str().unwrap())
         .env("LUX_PASSWORD", "rootsecret")
+        .env("LUX_ENCRYPTION_KEY_ID", "push-integration")
+        .env("LUX_ENCRYPTION_KEY", "push-integration-secret")
         .env("LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -789,7 +795,7 @@ fn start_no_auth(dir: &std::path::Path, resp_port: u16, http_port: u16) -> PushS
         dir: dir.to_path_buf(),
         keep_dir: false,
     };
-    for _ in 0..80 {
+    for _ in 0..160 {
         if TcpStream::connect(("127.0.0.1", http_port)).is_ok()
             && TcpStream::connect(("127.0.0.1", resp_port)).is_ok()
         {
