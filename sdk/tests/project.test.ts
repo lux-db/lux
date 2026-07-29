@@ -66,6 +66,37 @@ describe('Lux project client', () => {
 		});
 	});
 
+	test('push send forwards the APNs interruption level', async () => {
+		let seen: { url: string; body?: any } | null = null;
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			seen = {
+				url: String(input),
+				body: init?.body ? JSON.parse(String(init.body)) : undefined,
+			};
+			return new Response(JSON.stringify({ enqueued: 1 }), { status: 200 });
+		};
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const result = await client.push.send('user-1', {
+			title: 'Question',
+			interruption_level: 'time-sensitive',
+		});
+
+		expect(result).toEqual({ data: { enqueued: 1 }, error: null });
+		expect(seen?.url).toBe('http://localhost:3957/v1/project/push/send');
+		expect(seen?.body).toEqual({
+			subject_id: 'user-1',
+			notification: {
+				title: 'Question',
+				interruption_level: 'time-sensitive',
+			},
+		});
+	});
+
 	test('default fetch is bound for browser project requests', async () => {
 		const originalFetch = globalThis.fetch;
 		let receiver: unknown;

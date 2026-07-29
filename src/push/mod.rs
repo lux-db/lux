@@ -945,6 +945,27 @@ pub(crate) fn credential_config(
 // Send / enqueue
 // ---------------------------------------------------------------------------
 
+const APNS_INTERRUPTION_LEVELS: [&str; 4] = ["passive", "active", "time-sensitive", "critical"];
+
+fn is_valid_interruption_level(level: &str) -> bool {
+    APNS_INTERRUPTION_LEVELS.contains(&level)
+}
+
+fn validate_notification(notification: &Value) -> Result<(), String> {
+    let Some(value) = notification.get("interruption_level") else {
+        return Ok(());
+    };
+    let Some(level) = value.as_str() else {
+        return Err("interruption_level must be a string".to_string());
+    };
+    if !is_valid_interruption_level(level) {
+        return Err(
+            "interruption_level must be passive, active, time-sensitive, or critical".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Fan a notification out to all of `subject_id`'s active devices by inserting
 /// one pending outbox row each. Returns the number enqueued. The worker delivers
 /// asynchronously.
@@ -955,6 +976,7 @@ pub(crate) fn enqueue_send(
     notification: &Value,
     now: Instant,
 ) -> Result<usize, String> {
+    validate_notification(notification)?;
     let payload = serde_json::to_string(notification).unwrap_or_else(|_| "{}".to_string());
     enqueue_to_subject(store, cache, subject_id, &payload, now)
 }
@@ -968,6 +990,7 @@ pub(crate) fn enqueue_send_many(
     notification: &Value,
     now: Instant,
 ) -> Result<usize, String> {
+    validate_notification(notification)?;
     let payload = serde_json::to_string(notification).unwrap_or_else(|_| "{}".to_string());
     let mut total = 0usize;
     for subject_id in subject_ids {
@@ -1249,6 +1272,22 @@ mod tests {
             assert_eq!(normalize_environment("development", source), "sandbox");
             assert_eq!(normalize_environment("dev", source), "sandbox");
         }
+    }
+
+    #[test]
+    fn notification_interruption_level_accepts_only_apns_values() {
+        for level in APNS_INTERRUPTION_LEVELS {
+            assert!(validate_notification(&json!({ "interruption_level": level })).is_ok());
+        }
+        assert!(validate_notification(&json!({ "title": "normal" })).is_ok());
+        assert_eq!(
+            validate_notification(&json!({ "interruption_level": "urgent" })).unwrap_err(),
+            "interruption_level must be passive, active, time-sensitive, or critical"
+        );
+        assert_eq!(
+            validate_notification(&json!({ "interruption_level": 1 })).unwrap_err(),
+            "interruption_level must be a string"
+        );
     }
 
     // Unrecognized input must not be guessed at. Empty means "the device did

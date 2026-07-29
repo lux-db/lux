@@ -34,6 +34,28 @@ const { data: session, error } = await lux.auth.signInWithPassword({
 if (error) throw error;
 ```
 
+## Push notifications
+
+Server-side callers can send to one subject or many with a secret key. Set
+`interruption_level` when an Apple notification should be quieter or more
+prominent; omit it for the normal `active` behavior.
+
+```ts
+import { createClient } from "@luxdb/sdk";
+
+const lux = createClient(process.env.LUX_URL!, process.env.LUX_SECRET_KEY!);
+
+await lux.push.send("agent-123", {
+  title: "Input needed",
+  body: "The agent is waiting for your answer.",
+  interruption_level: "time-sensitive",
+});
+```
+
+The supported values are `passive`, `active`, `time-sensitive`, and `critical`.
+Time-sensitive notifications may break through Focus when the user allows it.
+Critical notifications require Apple's Critical Alerts entitlement.
+
 ## Tables
 
 Queries and mutations return a Supabase-style result object:

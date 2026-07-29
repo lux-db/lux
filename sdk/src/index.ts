@@ -68,6 +68,7 @@ export type {
 } from './project';
 export type {
 	LuxPushDevice,
+	LuxPushInterruptionLevel,
 	LuxPushNotification,
 	LuxPushRegisterOptions,
 } from './push';

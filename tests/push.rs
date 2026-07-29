@@ -590,7 +590,15 @@ fn push_end_to_end_delivers_to_apns_mock() {
         http_port,
         "POST",
         "/v1/push/send",
-        &json!({"subject_id": uid, "notification": {"title":"Hi","body":"There"}}).to_string(),
+        &json!({
+            "subject_id": uid,
+            "notification": {
+                "title": "Hi",
+                "body": "There",
+                "interruption_level": "time-sensitive"
+            }
+        })
+        .to_string(),
         Some("rootsecret"),
     );
     assert_eq!(s, 200, "send: {b}");
@@ -609,6 +617,7 @@ fn push_end_to_end_delivers_to_apns_mock() {
     let body: Value = serde_json::from_str(&got.body).unwrap();
     assert_eq!(body["aps"]["alert"]["title"], "Hi");
     assert_eq!(body["aps"]["alert"]["body"], "There");
+    assert_eq!(body["aps"]["interruption-level"], "time-sensitive");
 
     // Delivered: the outbox drains and the counter increments.
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -616,6 +625,33 @@ fn push_end_to_end_delivers_to_apns_mock() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(info_field(resp_port, "push_delivered_total") >= 1);
+    drop(server);
+}
+
+#[test]
+fn push_send_rejects_invalid_interruption_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let server = start(dir.path(), resp_port, http_port, false);
+
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({
+            "subject_id": "user-1",
+            "notification": {"title": "Hi", "interruption_level": "urgent"}
+        })
+        .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 400, "invalid interruption level: {b}");
+    assert!(
+        b.to_string()
+            .contains("interruption_level must be passive, active, time-sensitive, or critical"),
+        "error response: {b}"
+    );
     drop(server);
 }
 

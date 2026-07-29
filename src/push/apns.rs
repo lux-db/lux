@@ -203,6 +203,9 @@ pub(crate) fn apns_body_from_payload(payload: &[u8]) -> Vec<u8> {
     if let Some(v) = s("sound") {
         aps.insert("sound".into(), json!(v));
     }
+    if let Some(v) = s("interruption_level").filter(|v| super::is_valid_interruption_level(v)) {
+        aps.insert("interruption-level".into(), json!(v));
+    }
     if let Some(v) = parsed.get("badge").and_then(|v| v.as_i64()) {
         aps.insert("badge".into(), json!(v));
     }
@@ -416,6 +419,7 @@ mod tests {
         let payload = br#"{
             "title":"T","body":"B","subtitle":"S","thread_id":"th1",
             "category":"MSG","sound":"ping.caf","badge":3,"image":"https://x/i.png",
+            "interruption_level":"time-sensitive",
             "data":{"route":"/w/1"}
         }"#;
         let v: serde_json::Value =
@@ -424,10 +428,19 @@ mod tests {
         assert_eq!(v["aps"]["thread-id"], "th1");
         assert_eq!(v["aps"]["category"], "MSG");
         assert_eq!(v["aps"]["sound"], "ping.caf");
+        assert_eq!(v["aps"]["interruption-level"], "time-sensitive");
         assert_eq!(v["aps"]["badge"], 3);
         assert_eq!(v["aps"]["mutable-content"], 1); // image → NSE
         assert_eq!(v["image_url"], "https://x/i.png");
         assert_eq!(v["route"], "/w/1");
+    }
+
+    #[test]
+    fn body_omits_invalid_interruption_level() {
+        let payload = br#"{"title":"Hi","interruption_level":"urgent"}"#;
+        let v: serde_json::Value =
+            serde_json::from_slice(&apns_body_from_payload(payload)).unwrap();
+        assert!(v["aps"].get("interruption-level").is_none());
     }
 
     #[test]

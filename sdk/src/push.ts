@@ -32,6 +32,9 @@ export interface LuxPushRegisterOptions {
 	environment?: 'sandbox' | 'production';
 }
 
+/** APNs notification prominence. `active` is Apple's normal/default behavior. */
+export type LuxPushInterruptionLevel = 'passive' | 'active' | 'time-sensitive' | 'critical';
+
 /** A notification. `title`/`body` render the alert; the rest map to APNs `aps`
  *  fields (and their platform equivalents). `data` arrives in the client. */
 export interface LuxPushNotification {
@@ -50,6 +53,12 @@ export interface LuxPushNotification {
 	mutable_content?: boolean;
 	/** Silent/background delivery (APNs `content-available`). */
 	content_available?: boolean;
+	/**
+	 * Delivery prominence on Apple devices. `passive` is quiet, `active` is
+	 * normal, and `time-sensitive` may break through Focus when the user allows
+	 * it. `critical` requires Apple's Critical Alerts entitlement.
+	 */
+	interruption_level?: LuxPushInterruptionLevel;
 	/** Arbitrary string key/values delivered to the client. */
 	data?: Record<string, string>;
 }
