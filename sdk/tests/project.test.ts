@@ -82,8 +82,20 @@ describe('Lux project client', () => {
 		});
 
 		const result = await client.push.send('user-1', {
-			title: 'Question',
+			title_loc_key: 'QUESTION_TITLE',
+			title_loc_args: ['Codex'],
+			body: 'The agent is waiting.',
 			interruption_level: 'time-sensitive',
+			sound: 'alarm.caf',
+			target_content_id: 'question-window',
+			relevance_score: 0.9,
+			filter_criteria: 'work',
+			apns: {
+				collapse_id: 'question-user-1',
+				expiration: 1_900_000_000,
+				priority: 10,
+			},
+			data: { question: { id: 7 }, requires_reply: true },
 		});
 
 		expect(result).toEqual({ data: { enqueued: 1 }, error: null });
@@ -91,8 +103,20 @@ describe('Lux project client', () => {
 		expect(seen?.body).toEqual({
 			subject_id: 'user-1',
 			notification: {
-				title: 'Question',
+				title_loc_key: 'QUESTION_TITLE',
+				title_loc_args: ['Codex'],
+				body: 'The agent is waiting.',
 				interruption_level: 'time-sensitive',
+				sound: 'alarm.caf',
+				target_content_id: 'question-window',
+				relevance_score: 0.9,
+				filter_criteria: 'work',
+				apns: {
+					collapse_id: 'question-user-1',
+					expiration: 1_900_000_000,
+					priority: 10,
+				},
+				data: { question: { id: 7 }, requires_reply: true },
 			},
 		});
 	});

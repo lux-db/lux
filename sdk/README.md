@@ -36,9 +36,9 @@ if (error) throw error;
 
 ## Push notifications
 
-Server-side callers can send to one subject or many with a secret key. Set
-`interruption_level` when an Apple notification should be quieter or more
-prominent; omit it for the normal `active` behavior.
+Server-side callers can send to one subject or many with a secret key. Lux
+derives the APNs topic and push type, routes each device to its sandbox or
+production host, and validates the final APNs payload before enqueue.
 
 ```ts
 import { createClient } from "@luxdb/sdk";
@@ -48,13 +48,47 @@ const lux = createClient(process.env.LUX_URL!, process.env.LUX_SECRET_KEY!);
 await lux.push.send("agent-123", {
   title: "Input needed",
   body: "The agent is waiting for your answer.",
+  subtitle: "Vigil",
+  image: "https://example.com/question.png",
   interruption_level: "time-sensitive",
+  target_content_id: "question-window",
+  relevance_score: 0.9,
+  filter_criteria: "work",
+  apns: {
+    collapse_id: "agent-123-question",
+    expiration: Math.floor(Date.now() / 1000) + 300,
+    priority: 10,
+  },
+  data: { question: { id: "q_123" }, requires_reply: true },
 });
 ```
 
 The supported values are `passive`, `active`, `time-sensitive`, and `critical`.
 Time-sensitive notifications may break through Focus when the user allows it.
-Critical notifications require Apple's Critical Alerts entitlement.
+Omit `interruption_level` for the normal `active` behavior.
+
+Images are delivered through a custom `image_url` payload field and
+automatically enable APNs `mutable-content`; the iOS app needs a Notification
+Service Extension that downloads the URL and attaches it to the notification.
+Action buttons use `category`, which must match a category registered by the
+app. Bundle localization is available through `title_loc_key`,
+`subtitle_loc_key`, `body_loc_key`, and their corresponding `_loc_args`.
+
+Critical notifications require Apple's Critical Alerts entitlement and can use
+a critical sound object:
+
+```ts
+await lux.push.send("agent-123", {
+  title: "Immediate action required",
+  interruption_level: "critical",
+  sound: { critical: true, name: "default", volume: 1 },
+});
+```
+
+APNs transport options support collapse IDs, delivery expiration, and
+priorities `1`, `5`, or `10`. Background-only notifications use push type
+`background` and require priority `5`; other notifications use `alert`. Lux
+generates a stable, unique APNs request UUID per durable outbox delivery.
 
 ## Tables
 

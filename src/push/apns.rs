@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 /// A single delivery target: the platform token plus whatever routing metadata
 /// the sink needs (APNs topic, etc.).
@@ -16,25 +17,33 @@ use serde_json::json;
 pub(crate) struct DeliveryTarget {
     pub token: String,
     pub topic: String,
+    /// Stable per-outbox-row APNs request UUID, reused across retries.
+    pub request_id: String,
 }
 
-/// Outcome of a failed delivery. `Retryable` is re-attempted with backoff;
-/// `Terminal` means the token is dead (prune the device) or the request is
-/// permanently malformed.
+/// Outcome of a failed delivery. `Retryable` is re-attempted with backoff,
+/// `Permanent` dead-letters the request without touching the device, and
+/// `InvalidTarget` prunes a token or subscription that cannot receive again.
 #[derive(Debug)]
 pub(crate) enum DeliveryError {
     Retryable(String),
-    Terminal(String),
+    Permanent(String),
+    InvalidTarget(String),
 }
 
 impl DeliveryError {
     pub fn message(&self) -> &str {
         match self {
-            DeliveryError::Retryable(m) | DeliveryError::Terminal(m) => m,
+            DeliveryError::Retryable(m)
+            | DeliveryError::Permanent(m)
+            | DeliveryError::InvalidTarget(m) => m,
         }
     }
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, DeliveryError::Terminal(_))
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, DeliveryError::Permanent(_))
+    }
+    pub fn invalidates_target(&self) -> bool {
+        matches!(self, DeliveryError::InvalidTarget(_))
     }
 }
 
@@ -121,7 +130,9 @@ impl ApnsSink {
                 return Ok(cached.jwt.clone());
             }
         }
-        let jwt = self.mint_token(now_secs).map_err(DeliveryError::Terminal)?;
+        let jwt = self
+            .mint_token(now_secs)
+            .map_err(DeliveryError::Permanent)?;
         *cache = Some(CachedToken {
             jwt: jwt.clone(),
             minted: Instant::now(),
@@ -147,13 +158,15 @@ impl ApnsSink {
     fn classify_status(status: u16, reason: &str) -> Result<(), DeliveryError> {
         match status {
             200 => Ok(()),
-            410 => Err(DeliveryError::Terminal(format!("unregistered: {reason}"))),
+            410 => Err(DeliveryError::InvalidTarget(format!(
+                "unregistered: {reason}"
+            ))),
             400 if reason.contains("BadDeviceToken")
                 || reason.contains("DeviceTokenNotForTopic") =>
             {
-                Err(DeliveryError::Terminal(format!("bad token: {reason}")))
+                Err(DeliveryError::InvalidTarget(format!("bad token: {reason}")))
             }
-            400 | 403 | 404 => Err(DeliveryError::Terminal(format!(
+            400 | 403 | 404 | 405 | 413 => Err(DeliveryError::Permanent(format!(
                 "rejected ({status}): {reason}"
             ))),
             429 => Err(DeliveryError::Retryable(format!("throttled: {reason}"))),
@@ -178,16 +191,31 @@ pub(crate) fn apns_body_from_payload(payload: &[u8]) -> Vec<u8> {
             .filter(|v| !v.is_empty())
     };
 
-    // aps.alert (title / body / subtitle)
+    // aps.alert (literal text, bundle localization, and launch image)
     let mut alert = serde_json::Map::new();
-    if let Some(v) = s("title") {
-        alert.insert("title".into(), json!(v));
+    for (source, target) in [
+        ("title", "title"),
+        ("body", "body"),
+        ("subtitle", "subtitle"),
+        ("title_loc_key", "title-loc-key"),
+        ("subtitle_loc_key", "subtitle-loc-key"),
+        ("body_loc_key", "loc-key"),
+        ("launch_image", "launch-image"),
+    ] {
+        if let Some(value) = s(source) {
+            alert.insert(target.into(), json!(value));
+        }
     }
-    if let Some(v) = s("body") {
-        alert.insert("body".into(), json!(v));
-    }
-    if let Some(v) = s("subtitle") {
-        alert.insert("subtitle".into(), json!(v));
+    for (source, target) in [
+        ("title_loc_args", "title-loc-args"),
+        ("subtitle_loc_args", "subtitle-loc-args"),
+        ("body_loc_args", "loc-args"),
+    ] {
+        if let Some(values) = parsed.get(source).and_then(Value::as_array) {
+            if values.iter().all(Value::is_string) {
+                alert.insert(target.into(), Value::Array(values.clone()));
+            }
+        }
     }
 
     let mut aps = serde_json::Map::new();
@@ -200,11 +228,48 @@ pub(crate) fn apns_body_from_payload(payload: &[u8]) -> Vec<u8> {
     if let Some(v) = s("category") {
         aps.insert("category".into(), json!(v));
     }
-    if let Some(v) = s("sound") {
-        aps.insert("sound".into(), json!(v));
+    if let Some(sound) = parsed.get("sound") {
+        match sound {
+            Value::String(value) if !value.is_empty() => {
+                aps.insert("sound".into(), json!(value));
+            }
+            Value::Object(sound)
+                if sound.get("critical").and_then(Value::as_bool) == Some(true)
+                    && sound
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.is_empty()) =>
+            {
+                let mut critical = serde_json::Map::new();
+                critical.insert("critical".into(), json!(1));
+                critical.insert("name".into(), sound["name"].clone());
+                if let Some(volume) = sound
+                    .get("volume")
+                    .and_then(Value::as_f64)
+                    .filter(|volume| (0.0..=1.0).contains(volume))
+                {
+                    critical.insert("volume".into(), json!(volume));
+                }
+                aps.insert("sound".into(), Value::Object(critical));
+            }
+            _ => {}
+        }
     }
     if let Some(v) = s("interruption_level").filter(|v| super::is_valid_interruption_level(v)) {
         aps.insert("interruption-level".into(), json!(v));
+    }
+    if let Some(v) = s("target_content_id") {
+        aps.insert("target-content-id".into(), json!(v));
+    }
+    if let Some(v) = parsed
+        .get("relevance_score")
+        .and_then(Value::as_f64)
+        .filter(|value| (0.0..=1.0).contains(value))
+    {
+        aps.insert("relevance-score".into(), json!(v));
+    }
+    if let Some(v) = s("filter_criteria") {
+        aps.insert("filter-criteria".into(), json!(v));
     }
     if let Some(v) = parsed.get("badge").and_then(|v| v.as_i64()) {
         aps.insert("badge".into(), json!(v));
@@ -229,38 +294,100 @@ pub(crate) fn apns_body_from_payload(payload: &[u8]) -> Vec<u8> {
 
     let mut envelope = serde_json::Map::new();
     envelope.insert("aps".into(), serde_json::Value::Object(aps));
-    if let Some(v) = s("image") {
-        envelope.insert("image_url".into(), json!(v));
-    }
     // Arbitrary custom data merged at top level (arrives in the client userInfo).
     if let Some(data) = parsed.get("data").and_then(|v| v.as_object()) {
         for (k, v) in data {
-            envelope.insert(k.clone(), v.clone());
+            if k != "aps" {
+                envelope.insert(k.clone(), v.clone());
+            }
         }
+    }
+    // This is the contract with Lux's iOS notification-service extension.
+    // Insert it after custom data so callers cannot accidentally replace it.
+    if let Some(v) = s("image") {
+        envelope.insert("image_url".into(), json!(v));
     }
     serde_json::to_vec(&serde_json::Value::Object(envelope)).unwrap_or_else(|_| b"{}".to_vec())
 }
 
-/// `(apns-push-type, apns-priority)` for a payload. A `content_available` push
-/// with no visible alert is a background push (type `background`, priority 5);
-/// everything else is a normal alert (type `alert`, priority 10).
-pub(crate) fn apns_delivery_headers(payload: &[u8]) -> (&'static str, &'static str) {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ApnsDeliveryHeaders {
+    push_type: &'static str,
+    priority: &'static str,
+    expiration: Option<String>,
+    collapse_id: Option<String>,
+}
+
+/// APNs request headers for a payload. Lux derives the push type so callers
+/// cannot accidentally mismatch the payload and header; the remaining optional
+/// transport controls are validated before enqueue.
+pub(crate) fn apns_delivery_headers(payload: &[u8]) -> ApnsDeliveryHeaders {
     let parsed: serde_json::Value = serde_json::from_slice(payload).unwrap_or(json!({}));
-    let s = |k: &str| {
-        parsed
-            .get(k)
-            .and_then(|v| v.as_str())
-            .filter(|v| !v.is_empty())
-    };
-    let has_alert = s("title").is_some() || s("body").is_some();
-    let content_available = parsed
-        .get("content_available")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if content_available && !has_alert {
-        ("background", "5")
+    let background = super::notification_is_background(&parsed);
+    let apns = parsed.get("apns").and_then(Value::as_object);
+    let configured_priority = apns
+        .and_then(|options| options.get("priority"))
+        .and_then(Value::as_u64);
+    let priority = if background {
+        "5"
     } else {
-        ("alert", "10")
+        match configured_priority {
+            Some(1) => "1",
+            Some(5) => "5",
+            Some(10) => "10",
+            _ => "10",
+        }
+    };
+    ApnsDeliveryHeaders {
+        push_type: if background { "background" } else { "alert" },
+        priority,
+        expiration: apns
+            .and_then(|options| options.get("expiration"))
+            .and_then(Value::as_u64)
+            .map(|value| value.to_string()),
+        collapse_id: apns
+            .and_then(|options| options.get("collapse_id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 64)
+            .map(str::to_string),
+    }
+}
+
+/// Derive a stable canonical request UUID from the durable outbox id. APNs
+/// echoes this value in error responses, and retries of one delivery keep the
+/// same id while fan-out rows get distinct ids.
+pub(crate) fn apns_request_id(outbox_id: &str) -> String {
+    let digest = Sha256::digest(outbox_id.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // RFC 9562 UUIDv8: application-defined bytes plus the RFC variant bits.
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let id = format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    );
+    debug_assert!(super::is_canonical_uuid(&id));
+    id
+}
+
+fn with_optional_header(
+    request: reqwest::RequestBuilder,
+    name: &'static str,
+    value: &Option<String>,
+) -> reqwest::RequestBuilder {
+    if let Some(value) = value {
+        request.header(name, value)
+    } else {
+        request
     }
 }
 
@@ -270,27 +397,39 @@ impl Sink for ApnsSink {
         let jwt = self.provider_token(now_secs)?;
         let url = format!("{}/3/device/{}", self.base_url, target.token);
         let body = apns_body_from_payload(payload);
-        let (push_type, priority) = apns_delivery_headers(payload);
-        let resp = self
+        if body.len() > super::APNS_PAYLOAD_LIMIT_BYTES {
+            return Err(DeliveryError::Permanent(format!(
+                "APNs payload exceeds {} bytes",
+                super::APNS_PAYLOAD_LIMIT_BYTES
+            )));
+        }
+        let headers = apns_delivery_headers(payload);
+        let request = self
             .client
             .post(&url)
             .header("authorization", format!("bearer {jwt}"))
             .header("apns-topic", &target.topic)
-            .header("apns-push-type", push_type)
-            .header("apns-priority", priority)
+            .header("apns-id", &target.request_id)
+            .header("apns-push-type", headers.push_type)
+            .header("apns-priority", headers.priority)
             .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() || e.is_connect() {
-                    DeliveryError::Retryable(format!("apns transport: {e}"))
-                } else {
-                    DeliveryError::Retryable(format!("apns request failed: {e}"))
-                }
-            })?;
+            .body(body);
+        let request = with_optional_header(request, "apns-expiration", &headers.expiration);
+        let request = with_optional_header(request, "apns-collapse-id", &headers.collapse_id);
+        let resp = request.send().await.map_err(|e| {
+            if e.is_timeout() || e.is_connect() {
+                DeliveryError::Retryable(format!("apns transport: {e}"))
+            } else {
+                DeliveryError::Retryable(format!("apns request failed: {e}"))
+            }
+        })?;
         let status = resp.status().as_u16();
-        let reason = resp.text().await.unwrap_or_default();
+        let response_body = resp.text().await.unwrap_or_default();
+        let reason = if target.request_id.is_empty() {
+            response_body
+        } else {
+            format!("apns-id {}: {response_body}", target.request_id)
+        };
         ApnsSink::classify_status(status, &reason)
     }
 }
@@ -379,12 +518,22 @@ mod tests {
     }
 
     #[test]
-    fn invalid_p8_is_terminal() {
+    fn request_id_is_stable_canonical_and_unique_per_outbox_row() {
+        let first = apns_request_id("out_first");
+        assert_eq!(first, apns_request_id("out_first"));
+        assert_ne!(first, apns_request_id("out_second"));
+        assert!(super::super::is_canonical_uuid(&first));
+        assert_eq!(&first[14..15], "8");
+    }
+
+    #[test]
+    fn invalid_p8_is_permanent_without_invalidating_device() {
         let sink = sink_with(
             "-----BEGIN PRIVATE KEY-----\nnonsense\n-----END PRIVATE KEY-----".to_string(),
         );
         let err = sink.provider_token(1_700_000_000).unwrap_err();
-        assert!(err.is_terminal(), "bad key must be terminal, got {err:?}");
+        assert!(err.is_permanent(), "bad key must be permanent, got {err:?}");
+        assert!(!err.invalidates_target());
     }
 
     #[test]
@@ -392,16 +541,19 @@ mod tests {
         assert!(ApnsSink::classify_status(200, "").is_ok());
         assert!(ApnsSink::classify_status(410, "Unregistered")
             .unwrap_err()
-            .is_terminal());
+            .invalidates_target());
         assert!(ApnsSink::classify_status(400, "BadDeviceToken")
             .unwrap_err()
-            .is_terminal());
-        assert!(!ApnsSink::classify_status(429, "TooManyRequests")
-            .unwrap_err()
-            .is_terminal());
-        assert!(!ApnsSink::classify_status(503, "ServiceUnavailable")
-            .unwrap_err()
-            .is_terminal());
+            .invalidates_target());
+        let bad_payload = ApnsSink::classify_status(400, "BadCollapseId").unwrap_err();
+        assert!(bad_payload.is_permanent());
+        assert!(!bad_payload.invalidates_target());
+        let throttled = ApnsSink::classify_status(429, "TooManyRequests").unwrap_err();
+        assert!(!throttled.is_permanent());
+        assert!(!throttled.invalidates_target());
+        let unavailable = ApnsSink::classify_status(503, "ServiceUnavailable").unwrap_err();
+        assert!(!unavailable.is_permanent());
+        assert!(!unavailable.invalidates_target());
     }
 
     #[test]
@@ -419,8 +571,9 @@ mod tests {
         let payload = br#"{
             "title":"T","body":"B","subtitle":"S","thread_id":"th1",
             "category":"MSG","sound":"ping.caf","badge":3,"image":"https://x/i.png",
-            "interruption_level":"time-sensitive",
-            "data":{"route":"/w/1"}
+            "interruption_level":"time-sensitive","target_content_id":"message-window",
+            "relevance_score":0.75,"filter_criteria":"work",
+            "data":{"route":"/w/1","nested":{"count":2}}
         }"#;
         let v: serde_json::Value =
             serde_json::from_slice(&apns_body_from_payload(payload)).unwrap();
@@ -429,10 +582,52 @@ mod tests {
         assert_eq!(v["aps"]["category"], "MSG");
         assert_eq!(v["aps"]["sound"], "ping.caf");
         assert_eq!(v["aps"]["interruption-level"], "time-sensitive");
+        assert_eq!(v["aps"]["target-content-id"], "message-window");
+        assert_eq!(v["aps"]["relevance-score"], 0.75);
+        assert_eq!(v["aps"]["filter-criteria"], "work");
         assert_eq!(v["aps"]["badge"], 3);
         assert_eq!(v["aps"]["mutable-content"], 1); // image → NSE
         assert_eq!(v["image_url"], "https://x/i.png");
         assert_eq!(v["route"], "/w/1");
+        assert_eq!(v["nested"]["count"], 2);
+    }
+
+    #[test]
+    fn body_maps_localization_launch_image_and_critical_sound() {
+        let payload = br#"{
+            "title_loc_key":"QUESTION_TITLE","title_loc_args":["Codex"],
+            "subtitle_loc_key":"PROJECT_NAME","subtitle_loc_args":["Vigil"],
+            "body_loc_key":"QUESTION_BODY","body_loc_args":["Deploy"],
+            "launch_image":"LaunchQuestion",
+            "sound":{"critical":true,"name":"alarm.caf","volume":0.4}
+        }"#;
+        let v: Value = serde_json::from_slice(&apns_body_from_payload(payload)).unwrap();
+        let alert = &v["aps"]["alert"];
+        assert_eq!(alert["title-loc-key"], "QUESTION_TITLE");
+        assert_eq!(alert["title-loc-args"], json!(["Codex"]));
+        assert_eq!(alert["subtitle-loc-key"], "PROJECT_NAME");
+        assert_eq!(alert["subtitle-loc-args"], json!(["Vigil"]));
+        assert_eq!(alert["loc-key"], "QUESTION_BODY");
+        assert_eq!(alert["loc-args"], json!(["Deploy"]));
+        assert_eq!(alert["launch-image"], "LaunchQuestion");
+        assert_eq!(v["aps"]["sound"]["critical"], 1);
+        assert_eq!(v["aps"]["sound"]["name"], "alarm.caf");
+        assert_eq!(v["aps"]["sound"]["volume"], 0.4);
+    }
+
+    #[test]
+    fn custom_data_cannot_replace_aps_envelope() {
+        let payload = br#"{
+            "title":"Safe",
+            "image":"https://example.com/safe.png",
+            "data":{
+                "aps":{"alert":"overridden"},
+                "image_url":"https://example.com/overridden.png"
+            }
+        }"#;
+        let v: Value = serde_json::from_slice(&apns_body_from_payload(payload)).unwrap();
+        assert_eq!(v["aps"]["alert"]["title"], "Safe");
+        assert_eq!(v["image_url"], "https://example.com/safe.png");
     }
 
     #[test]
@@ -447,12 +642,53 @@ mod tests {
     fn content_available_is_a_background_push() {
         assert_eq!(
             apns_delivery_headers(br#"{"content_available":true}"#),
-            ("background", "5")
+            ApnsDeliveryHeaders {
+                push_type: "background",
+                priority: "5",
+                expiration: None,
+                collapse_id: None,
+            }
         );
         assert_eq!(
             apns_delivery_headers(br#"{"title":"hi","content_available":true}"#),
-            ("alert", "10")
+            ApnsDeliveryHeaders {
+                push_type: "alert",
+                priority: "10",
+                expiration: None,
+                collapse_id: None,
+            }
         );
-        assert_eq!(apns_delivery_headers(br#"{"title":"hi"}"#), ("alert", "10"));
+        assert_eq!(
+            apns_delivery_headers(br#"{"badge":1,"content_available":true}"#).push_type,
+            "alert"
+        );
+        assert_eq!(
+            apns_delivery_headers(br#"{"title_loc_key":"TITLE","content_available":true}"#)
+                .push_type,
+            "alert"
+        );
+    }
+
+    #[test]
+    fn delivery_headers_map_transport_controls() {
+        let headers = apns_delivery_headers(
+            br#"{
+                "title":"Hi",
+                "apns":{
+                    "priority":5,
+                    "expiration":1700000000,
+                    "collapse_id":"thread-1"
+                }
+            }"#,
+        );
+        assert_eq!(
+            headers,
+            ApnsDeliveryHeaders {
+                push_type: "alert",
+                priority: "5",
+                expiration: Some("1700000000".to_string()),
+                collapse_id: Some("thread-1".to_string()),
+            }
+        );
     }
 }

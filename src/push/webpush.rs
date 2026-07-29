@@ -327,7 +327,7 @@ impl WebPushSink {
     /// Sign a VAPID JWT (RFC 8292) scoped to the push service origin.
     fn vapid_jwt(&self, endpoint: &str) -> Result<String, DeliveryError> {
         let endpoint = validate_endpoint(endpoint, private_endpoints_allowed())
-            .map_err(DeliveryError::Terminal)?;
+            .map_err(DeliveryError::InvalidTarget)?;
         let aud = endpoint.origin().ascii_serialization();
         let claims = VapidClaims {
             aud,
@@ -335,22 +335,23 @@ impl WebPushSink {
             sub: self.subject.clone(),
         };
         let key = EncodingKey::from_ec_pem(self.private_pem.as_bytes())
-            .map_err(|e| DeliveryError::Terminal(format!("invalid VAPID key: {e}")))?;
+            .map_err(|e| DeliveryError::Permanent(format!("invalid VAPID key: {e}")))?;
         encode(&Header::new(Algorithm::ES256), &claims, &key)
-            .map_err(|e| DeliveryError::Terminal(format!("VAPID JWT sign failed: {e}")))
+            .map_err(|e| DeliveryError::Permanent(format!("VAPID JWT sign failed: {e}")))
     }
 }
 
 impl Sink for WebPushSink {
     async fn deliver(&self, target: &DeliveryTarget, payload: &[u8]) -> Result<(), DeliveryError> {
         // The web "token" is the serialized browser PushSubscription.
-        let sub: Subscription = serde_json::from_str(&target.token)
-            .map_err(|e| DeliveryError::Terminal(format!("invalid web push subscription: {e}")))?;
+        let sub: Subscription = serde_json::from_str(&target.token).map_err(|e| {
+            DeliveryError::InvalidTarget(format!("invalid web push subscription: {e}"))
+        })?;
         validate_endpoint(&sub.endpoint, private_endpoints_allowed())
-            .map_err(DeliveryError::Terminal)?;
-        let p256dh = b64url_decode(&sub.keys.p256dh).map_err(DeliveryError::Terminal)?;
-        let auth = b64url_decode(&sub.keys.auth).map_err(DeliveryError::Terminal)?;
-        let body = seal(payload, &p256dh, &auth).map_err(DeliveryError::Terminal)?;
+            .map_err(DeliveryError::InvalidTarget)?;
+        let p256dh = b64url_decode(&sub.keys.p256dh).map_err(DeliveryError::InvalidTarget)?;
+        let auth = b64url_decode(&sub.keys.auth).map_err(DeliveryError::InvalidTarget)?;
+        let body = seal(payload, &p256dh, &auth).map_err(DeliveryError::InvalidTarget)?;
         let jwt = self.vapid_jwt(&sub.endpoint)?;
 
         let resp = self
@@ -376,10 +377,10 @@ impl Sink for WebPushSink {
 fn classify_web_push(status: u16) -> Result<(), DeliveryError> {
     match status {
         200..=202 => Ok(()),
-        404 | 410 => Err(DeliveryError::Terminal(format!(
+        404 | 410 => Err(DeliveryError::InvalidTarget(format!(
             "subscription gone ({status})"
         ))),
-        400 | 401 | 403 => Err(DeliveryError::Terminal(format!("rejected ({status})"))),
+        400 | 401 | 403 => Err(DeliveryError::Permanent(format!("rejected ({status})"))),
         429 => Err(DeliveryError::Retryable("throttled".to_string())),
         500..=599 => Err(DeliveryError::Retryable(format!(
             "push service error ({status})"
@@ -481,5 +482,19 @@ mod tests {
         )
         .is_ok());
         assert!(validate_endpoint("http://127.0.0.1:9000/mock", true).is_ok());
+    }
+
+    #[test]
+    fn response_classification_only_prunes_gone_subscriptions() {
+        assert!(classify_web_push(201).is_ok());
+        assert!(classify_web_push(410).unwrap_err().invalidates_target());
+
+        let bad_request = classify_web_push(400).unwrap_err();
+        assert!(bad_request.is_permanent());
+        assert!(!bad_request.invalidates_target());
+
+        let unavailable = classify_web_push(503).unwrap_err();
+        assert!(!unavailable.is_permanent());
+        assert!(!unavailable.invalidates_target());
     }
 }

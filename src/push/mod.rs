@@ -946,14 +946,128 @@ pub(crate) fn credential_config(
 // ---------------------------------------------------------------------------
 
 const APNS_INTERRUPTION_LEVELS: [&str; 4] = ["passive", "active", "time-sensitive", "critical"];
+const APNS_PAYLOAD_LIMIT_BYTES: usize = 4096;
 
 fn is_valid_interruption_level(level: &str) -> bool {
     APNS_INTERRUPTION_LEVELS.contains(&level)
 }
 
+fn notification_has_alert(notification: &Value) -> bool {
+    [
+        "title",
+        "body",
+        "subtitle",
+        "title_loc_key",
+        "subtitle_loc_key",
+        "body_loc_key",
+    ]
+    .iter()
+    .any(|field| {
+        notification
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    })
+}
+
+fn notification_is_background(notification: &Value) -> bool {
+    let content_available = notification
+        .get("content_available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let has_badge = notification.get("badge").is_some();
+    let has_sound = notification.get("sound").is_some_and(|sound| match sound {
+        Value::String(value) => !value.is_empty(),
+        Value::Object(_) => true,
+        _ => false,
+    });
+    content_available && !notification_has_alert(notification) && !has_badge && !has_sound
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(index, byte)| {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            *byte == b'-'
+        } else {
+            byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+        }
+    })
+}
+
 fn validate_notification(notification: &Value) -> Result<(), String> {
+    let Some(object) = notification.as_object() else {
+        return Err("notification must be a JSON object".to_string());
+    };
+    for field in [
+        "title",
+        "body",
+        "subtitle",
+        "title_loc_key",
+        "subtitle_loc_key",
+        "body_loc_key",
+        "launch_image",
+        "thread_id",
+        "category",
+        "image",
+        "target_content_id",
+        "filter_criteria",
+    ] {
+        if object.get(field).is_some_and(|value| !value.is_string()) {
+            return Err(format!("{field} must be a string"));
+        }
+    }
+    for field in ["title_loc_args", "subtitle_loc_args", "body_loc_args"] {
+        if let Some(value) = object.get(field) {
+            let valid = value
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_string));
+            if !valid {
+                return Err(format!("{field} must be an array of strings"));
+            }
+        }
+    }
+    for field in ["mutable_content", "content_available"] {
+        if object.get(field).is_some_and(|value| !value.is_boolean()) {
+            return Err(format!("{field} must be a boolean"));
+        }
+    }
+    if let Some(badge) = object.get("badge") {
+        if badge.as_i64().is_none_or(|value| value < 0) {
+            return Err("badge must be a non-negative integer".to_string());
+        }
+    }
+    if let Some(sound) = object.get("sound") {
+        match sound {
+            Value::String(_) => {}
+            Value::Object(sound) => {
+                if sound.get("critical").and_then(Value::as_bool) != Some(true) {
+                    return Err("critical sound must set critical to true".to_string());
+                }
+                if sound
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Err("critical sound name must be a non-empty string".to_string());
+                }
+                if let Some(volume) = sound.get("volume") {
+                    if volume
+                        .as_f64()
+                        .is_none_or(|value| !(0.0..=1.0).contains(&value))
+                    {
+                        return Err("critical sound volume must be between 0 and 1".to_string());
+                    }
+                }
+            }
+            _ => return Err("sound must be a string or critical sound object".to_string()),
+        }
+    }
     let Some(value) = notification.get("interruption_level") else {
-        return Ok(());
+        return validate_notification_tail(notification);
     };
     let Some(level) = value.as_str() else {
         return Err("interruption_level must be a string".to_string());
@@ -962,6 +1076,74 @@ fn validate_notification(notification: &Value) -> Result<(), String> {
         return Err(
             "interruption_level must be passive, active, time-sensitive, or critical".to_string(),
         );
+    }
+    validate_notification_tail(notification)
+}
+
+fn validate_notification_tail(notification: &Value) -> Result<(), String> {
+    if let Some(score) = notification.get("relevance_score") {
+        if score
+            .as_f64()
+            .is_none_or(|value| !(0.0..=1.0).contains(&value))
+        {
+            return Err("relevance_score must be between 0 and 1".to_string());
+        }
+    }
+    if notification
+        .get("image")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+        && !notification_has_alert(notification)
+    {
+        return Err(
+            "image requires an alert title, subtitle, body, or localization key".to_string(),
+        );
+    }
+    if let Some(data) = notification.get("data") {
+        let Some(data) = data.as_object() else {
+            return Err("data must be a JSON object".to_string());
+        };
+        if data.contains_key("aps") {
+            return Err("data.aps is reserved by APNs".to_string());
+        }
+    }
+    if let Some(apns) = notification.get("apns") {
+        let Some(apns) = apns.as_object() else {
+            return Err("apns must be a JSON object".to_string());
+        };
+        if let Some(collapse_id) = apns.get("collapse_id") {
+            let Some(collapse_id) = collapse_id.as_str() else {
+                return Err("apns.collapse_id must be a string".to_string());
+            };
+            if collapse_id.is_empty() {
+                return Err("apns.collapse_id must not be empty".to_string());
+            }
+            if collapse_id.len() > 64 {
+                return Err("apns.collapse_id must not exceed 64 bytes".to_string());
+            }
+        }
+        if let Some(expiration) = apns.get("expiration") {
+            if expiration.as_u64().is_none() {
+                return Err("apns.expiration must be a non-negative integer".to_string());
+            }
+        }
+        if let Some(priority) = apns.get("priority") {
+            let priority = priority.as_u64();
+            if !matches!(priority, Some(1 | 5 | 10)) {
+                return Err("apns.priority must be 1, 5, or 10".to_string());
+            }
+            if notification_is_background(notification) && priority != Some(5) {
+                return Err("background notifications require apns.priority 5".to_string());
+            }
+        }
+    }
+    let payload = serde_json::to_vec(notification)
+        .map_err(|error| format!("invalid notification: {error}"))?;
+    let apns_body = apns::apns_body_from_payload(&payload);
+    if apns_body.len() > APNS_PAYLOAD_LIMIT_BYTES {
+        return Err(format!(
+            "APNs payload exceeds {APNS_PAYLOAD_LIMIT_BYTES} bytes"
+        ));
     }
     Ok(())
 }
@@ -1287,6 +1469,85 @@ mod tests {
         assert_eq!(
             validate_notification(&json!({ "interruption_level": 1 })).unwrap_err(),
             "interruption_level must be a string"
+        );
+    }
+
+    #[test]
+    fn notification_accepts_complete_standard_apns_surface() {
+        let notification = json!({
+            "title_loc_key": "TITLE",
+            "title_loc_args": ["Codex"],
+            "subtitle_loc_key": "PROJECT",
+            "subtitle_loc_args": ["Lux"],
+            "body_loc_key": "BODY",
+            "body_loc_args": ["Deploy"],
+            "launch_image": "LaunchQuestion",
+            "sound": {"critical": true, "name": "alarm.caf", "volume": 0.5},
+            "badge": 1,
+            "target_content_id": "question-window",
+            "relevance_score": 0.9,
+            "filter_criteria": "work",
+            "apns": {
+                "collapse_id": "agent-question",
+                "expiration": 1_900_000_000,
+                "priority": 10
+            },
+            "data": {"question": {"id": 7}, "urgent": true}
+        });
+        assert!(validate_notification(&notification).is_ok());
+    }
+
+    #[test]
+    fn notification_rejects_invalid_apns_fields_before_enqueue() {
+        let cases = [
+            (json!({"badge": -1}), "badge must be a non-negative integer"),
+            (
+                json!({"sound": {"critical": true, "name": "default", "volume": 1.1}}),
+                "critical sound volume must be between 0 and 1",
+            ),
+            (
+                json!({"relevance_score": 2}),
+                "relevance_score must be between 0 and 1",
+            ),
+            (
+                json!({"content_available": true, "apns": {"priority": 10}}),
+                "background notifications require apns.priority 5",
+            ),
+            (
+                json!({"apns": {"collapse_id": ""}}),
+                "apns.collapse_id must not be empty",
+            ),
+            (json!({"data": {"aps": {}}}), "data.aps is reserved by APNs"),
+            (
+                json!({"image": "https://example.com/image.png"}),
+                "image requires an alert title, subtitle, body, or localization key",
+            ),
+        ];
+        for (notification, expected) in cases {
+            assert_eq!(
+                validate_notification(&notification).unwrap_err(),
+                expected,
+                "notification: {notification}"
+            );
+        }
+        assert_eq!(
+            validate_notification(&json!({
+                "apns": {"collapse_id": "x".repeat(65)}
+            }))
+            .unwrap_err(),
+            "apns.collapse_id must not exceed 64 bytes"
+        );
+    }
+
+    #[test]
+    fn notification_rejects_payloads_larger_than_apns_limit() {
+        let notification = json!({
+            "title": "Too large",
+            "data": {"blob": "x".repeat(APNS_PAYLOAD_LIMIT_BYTES)}
+        });
+        assert_eq!(
+            validate_notification(&notification).unwrap_err(),
+            format!("APNs payload exceeds {APNS_PAYLOAD_LIMIT_BYTES} bytes")
         );
     }
 

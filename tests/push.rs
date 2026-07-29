@@ -176,6 +176,11 @@ struct Captured {
     path: String,
     authorization: String,
     apns_topic: String,
+    apns_push_type: String,
+    apns_priority: String,
+    apns_expiration: String,
+    apns_collapse_id: String,
+    apns_id: String,
     content_encoding: String,
     body: String,
 }
@@ -187,10 +192,20 @@ struct MockApns {
 
 impl MockApns {
     fn start(status: u16) -> Self {
+        let reason = if status == 200 {
+            "{}"
+        } else {
+            "{\"reason\":\"Unregistered\"}"
+        };
+        Self::start_with_reason(status, reason)
+    }
+
+    fn start_with_reason(status: u16, reason: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let reqs = requests.clone();
+        let reason = reason.to_string();
         std::thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(mut stream) = conn else { continue };
@@ -219,6 +234,11 @@ impl MockApns {
                         match k.trim().to_ascii_lowercase().as_str() {
                             "authorization" => cap.authorization = v.trim().to_string(),
                             "apns-topic" => cap.apns_topic = v.trim().to_string(),
+                            "apns-push-type" => cap.apns_push_type = v.trim().to_string(),
+                            "apns-priority" => cap.apns_priority = v.trim().to_string(),
+                            "apns-expiration" => cap.apns_expiration = v.trim().to_string(),
+                            "apns-collapse-id" => cap.apns_collapse_id = v.trim().to_string(),
+                            "apns-id" => cap.apns_id = v.trim().to_string(),
                             "content-encoding" => cap.content_encoding = v.trim().to_string(),
                             _ => {}
                         }
@@ -240,11 +260,6 @@ impl MockApns {
                 }
                 cap.body = String::from_utf8_lossy(&body).to_string();
                 reqs.lock().unwrap().push(cap);
-                let reason = if status == 200 {
-                    "{}"
-                } else {
-                    "{\"reason\":\"Unregistered\"}"
-                };
                 let response = format!(
                     "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reason}",
                     reason.len()
@@ -595,7 +610,15 @@ fn push_end_to_end_delivers_to_apns_mock() {
             "notification": {
                 "title": "Hi",
                 "body": "There",
-                "interruption_level": "time-sensitive"
+                "interruption_level": "time-sensitive",
+                "target_content_id": "question-window",
+                "relevance_score": 0.8,
+                "filter_criteria": "work",
+                "apns": {
+                    "priority": 5,
+                    "expiration": 1_900_000_000,
+                    "collapse_id": "question-user"
+                }
             }
         })
         .to_string(),
@@ -614,10 +637,25 @@ fn push_end_to_end_delivers_to_apns_mock() {
         got.authorization
     );
     assert_eq!(got.apns_topic, "com.example.app");
+    assert_eq!(got.apns_push_type, "alert");
+    assert_eq!(got.apns_priority, "5");
+    assert_eq!(got.apns_expiration, "1900000000");
+    assert_eq!(got.apns_collapse_id, "question-user");
+    assert_eq!(got.apns_id.len(), 36);
+    assert_eq!(
+        got.apns_id
+            .chars()
+            .filter(|character| *character == '-')
+            .count(),
+        4
+    );
     let body: Value = serde_json::from_str(&got.body).unwrap();
     assert_eq!(body["aps"]["alert"]["title"], "Hi");
     assert_eq!(body["aps"]["alert"]["body"], "There");
     assert_eq!(body["aps"]["interruption-level"], "time-sensitive");
+    assert_eq!(body["aps"]["target-content-id"], "question-window");
+    assert_eq!(body["aps"]["relevance-score"], 0.8);
+    assert_eq!(body["aps"]["filter-criteria"], "work");
 
     // Delivered: the outbox drains and the counter increments.
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -699,6 +737,77 @@ fn push_unregistered_token_disables_device() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    drop(server);
+}
+
+#[test]
+fn push_bad_request_dead_letters_without_disabling_device() {
+    let mock = MockApns::start_with_reason(400, r#"{"reason":"BadCollapseId"}"#);
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let server = start(dir.path(), resp_port, http_port, false);
+
+    set_creds(http_port, &mock.url());
+    let (token, uid) = anon_login(http_port);
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"token":"healthy-token","platform":"ios","app_id":"default"}).to_string(),
+        Some(&token),
+    );
+    assert_eq!(s, 200, "register: {b}");
+
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({"subject_id": uid, "notification": {"title":"Hi"}}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200, "send: {b}");
+    assert!(
+        mock.wait_for_request(Duration::from_secs(5)).is_some(),
+        "mock should receive the attempt"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let dead = loop {
+        let (s, body) = http(
+            http_port,
+            "GET",
+            "/v1/push/admin/outbox",
+            "",
+            Some("rootsecret"),
+        );
+        assert_eq!(s, 200, "dead letters: {body}");
+        if body["dead_letters"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+        {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "delivery was not dead-lettered: {body}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        dead["dead_letters"][0]["last_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("BadCollapseId") && error.contains("apns-id")),
+        "dead letter should retain APNs diagnostics: {dead}"
+    );
+
+    let (s, devices) = http(http_port, "GET", "/v1/push/devices", "", Some(&token));
+    assert_eq!(s, 200, "devices: {devices}");
+    assert_eq!(
+        devices["devices"].as_array().map(Vec::len),
+        Some(1),
+        "request errors must not disable a healthy device: {devices}"
+    );
     drop(server);
 }
 

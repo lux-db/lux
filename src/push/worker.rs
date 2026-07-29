@@ -12,7 +12,7 @@ use crate::auth::{durable_table_delete_where, durable_table_update_where, unix_s
 use crate::store::Store;
 use crate::tables::{CmpOp, SharedSchemaCache, WhereClause};
 
-use super::apns::{ApnsSink, DeliveryError, DeliveryTarget, Sink};
+use super::apns::{apns_request_id, ApnsSink, DeliveryError, DeliveryTarget, Sink};
 use super::webpush::WebPushSink;
 use super::{
     get_apns_credentials, get_vapid_credentials, metrics, select_rows, DEVICES_TABLE, OUTBOX_TABLE,
@@ -55,7 +55,11 @@ pub(crate) enum Action {
 pub(crate) fn decide(attempts: i64, result: Result<(), DeliveryError>, now_secs: u64) -> Action {
     match result {
         Ok(()) => Action::Delivered,
-        Err(e) if e.is_terminal() => Action::DisableDevice {
+        Err(e) if e.invalidates_target() => Action::DisableDevice {
+            error: e.message().to_string(),
+        },
+        Err(e) if e.is_permanent() => Action::Dead {
+            attempts: attempts + 1,
             error: e.message().to_string(),
         },
         Err(e) => {
@@ -169,6 +173,7 @@ async fn process_pending(
                 let target = DeliveryTarget {
                     token: token.clone(),
                     topic: topic.clone(),
+                    request_id: apns_request_id(&id),
                 };
                 sink.deliver(&target, payload.as_bytes()).await
             }
@@ -177,6 +182,7 @@ async fn process_pending(
                 let target = DeliveryTarget {
                     token: token.clone(),
                     topic: String::new(),
+                    request_id: String::new(),
                 };
                 sink.deliver(&target, payload.as_bytes()).await
             }
@@ -362,12 +368,27 @@ mod tests {
     }
 
     #[test]
-    fn terminal_disables_device() {
-        let action = decide(0, Err(DeliveryError::Terminal("unregistered".into())), 1000);
+    fn invalid_target_disables_device() {
+        let action = decide(
+            0,
+            Err(DeliveryError::InvalidTarget("unregistered".into())),
+            1000,
+        );
         assert_eq!(
             action,
             Action::DisableDevice {
                 error: "unregistered".into()
+            }
+        );
+    }
+
+    #[test]
+    fn permanent_delivery_error_dead_letters_without_disabling_device() {
+        assert_eq!(
+            decide(0, Err(DeliveryError::Permanent("bad payload".into())), 1000),
+            Action::Dead {
+                attempts: 1,
+                error: "bad payload".into(),
             }
         );
     }
