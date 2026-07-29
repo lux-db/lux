@@ -4765,20 +4765,28 @@ async fn get_instance_credentials(
     token: &str,
     instance_id: &str,
 ) -> Credentials {
-    let res = client
-        .get(format!("{api_url}/projects/{instance_id}/credentials"))
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
+    try_get_instance_credentials(client, api_url, token, instance_id)
         .await
-        .unwrap_or_else(|e| {
-            eprintln!("{} {e}", "Failed:".red());
+        .unwrap_or_else(|error| {
+            eprintln!("{} {error}", "Failed:".red());
             std::process::exit(1);
-        });
-    let body: ApiResponse<Credentials> = res.json().await.unwrap_or_else(|e| {
-        eprintln!("{} {e}", "Failed to parse response:".red());
-        std::process::exit(1);
-    });
-    unwrap_api(body)
+        })
+}
+
+async fn try_get_instance_credentials(
+    client: &reqwest::Client,
+    api_url: &str,
+    token: &str,
+    instance_id: &str,
+) -> Result<Credentials, String> {
+    cloud_management_request(
+        client,
+        reqwest::Method::GET,
+        format!("{api_url}/projects/{instance_id}/credentials"),
+        token,
+        None,
+    )
+    .await
 }
 
 async fn get_auth_credentials(
@@ -5884,13 +5892,21 @@ async fn doctor_cloud(
     if instance.status != "running" {
         return;
     }
+    // Cloud intentionally rejects generic `LUX` commands through its console.
+    // Version/capability discovery is a read-only operator check, so run it
+    // against the project's authenticated direct RESP endpoint instead.
+    let engine_contract = try_get_instance_credentials(&client, &api_url, &token, &instance.id)
+        .await
+        .and_then(|credentials| direct_engine_contract(&credentials.resp));
+    record_engine_contract_check(&target_name, engine_contract, checks);
+
+    // Migration operations keep using Cloud's dedicated management endpoints.
     let mut target = MigrateTarget::Cloud {
         client,
         api_url,
         token,
         instance_id: instance.id,
     };
-    doctor_engine_contract(&target_name, &mut target, checks).await;
     doctor_migrations(
         &target_name,
         &mut target,
@@ -5905,11 +5921,26 @@ async fn doctor_engine_contract(
     target: &mut MigrateTarget,
     checks: &mut Vec<DoctorCheck>,
 ) {
-    match target
+    let version = target
         .exec("LUX VERSION")
         .await
-        .and_then(|raw| decode_json::<EngineManagementVersion>(&raw, "engine version"))
-    {
+        .and_then(|raw| decode_json::<EngineManagementVersion>(&raw, "engine version"));
+    record_engine_contract_check(target_name, version, checks);
+}
+
+fn direct_engine_contract(url: &str) -> Result<EngineManagementVersion, String> {
+    let target = parse_connection_url(url);
+    let mut conn = DirectConn::connect_target(&target)?;
+    let raw = conn.exec("LUX VERSION")?;
+    decode_json(&raw, "engine version")
+}
+
+fn record_engine_contract_check(
+    target_name: &str,
+    version: Result<EngineManagementVersion, String>,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    match version {
         Ok(version) => {
             let required = ["migrations.plan", "migrations.apply", "migrations.repair"];
             let missing: Vec<&str> = required
@@ -7064,6 +7095,77 @@ mod tests {
             }
             _ => panic!("expected Doctor"),
         }
+    }
+
+    #[test]
+    fn cloud_doctor_contract_uses_the_direct_resp_endpoint() {
+        fn read_command(stream: &mut TcpStream, suffix: &[u8]) -> Vec<u8> {
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0u8; 128];
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0, "client closed before sending a complete command");
+                request.extend_from_slice(&chunk[..read]);
+                if request.ends_with(suffix) {
+                    return request;
+                }
+            }
+        }
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let auth = read_command(&mut stream, b"doctor-secret\r\n");
+            assert!(auth.windows(4).any(|window| window == b"AUTH"));
+            stream.write_all(b"+OK\r\n").unwrap();
+
+            let request = read_command(&mut stream, b"VERSION\r\n");
+            assert!(request.windows(3).any(|window| window == b"LUX"));
+            let payload = serde_json::json!({
+                "version": "0.34.0",
+                "api_version": "1",
+                "capabilities": [
+                    "migrations.plan",
+                    "migrations.apply",
+                    "migrations.repair"
+                ]
+            })
+            .to_string();
+            stream
+                .write_all(format!("${}\r\n{payload}\r\n", payload.len()).as_bytes())
+                .unwrap();
+        });
+
+        let version = direct_engine_contract(&format!("lux://:doctor-secret@127.0.0.1:{port}"))
+            .expect("direct contract");
+        server.join().unwrap();
+
+        let mut checks = Vec::new();
+        record_engine_contract_check("cloud:test", Ok(version), &mut checks);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].target, "cloud:test");
+        assert_eq!(checks[0].check, "engine management API");
+        assert_eq!(checks[0].status, "pass");
+        assert!(checks[0].detail.contains("engine 0.34.0"));
+    }
+
+    #[test]
+    fn doctor_contract_reports_missing_capabilities() {
+        let mut checks = Vec::new();
+        record_engine_contract_check(
+            "cloud:test",
+            Ok(EngineManagementVersion {
+                version: "0.34.0".to_string(),
+                api_version: "1".to_string(),
+                capabilities: vec!["migrations.plan".to_string()],
+            }),
+            &mut checks,
+        );
+
+        assert_eq!(checks[0].status, "fail");
+        assert!(checks[0].detail.contains("migrations.apply"));
+        assert!(checks[0].detail.contains("migrations.repair"));
     }
 
     #[test]

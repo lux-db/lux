@@ -233,6 +233,10 @@ lux update studio                  # local Studio
 `lux/migrations`, add Lux secret paths to `.gitignore`, and rebuild a missing
 local env profile from existing local state. It never starts, stops, updates,
 migrates, repairs, rotates credentials, or changes the active app target.
+For Cloud projects, `doctor` checks version and capability support over the
+authenticated direct connection while migration state uses Cloud's dedicated
+management endpoints; it never sends generic `LUX` commands through the
+restricted Cloud console.
 
 ## Push configuration
 
