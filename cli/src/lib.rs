@@ -14,6 +14,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod cloud;
+
 const DEFAULT_API_URL: &str = "https://api.luxdb.dev";
 
 #[derive(Parser)]
@@ -24,6 +26,25 @@ struct Cli {
 
     #[arg(long, global = true, env = "LUX_API_URL")]
     api_url: Option<String>,
+
+    #[arg(long, global = true, help = "Emit machine-readable JSON")]
+    json: bool,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Return after Cloud accepts an asynchronous mutation"
+    )]
+    no_wait: bool,
+
+    #[arg(
+        long,
+        global = true,
+        default_value = "900",
+        value_name = "SECONDS",
+        help = "Maximum time to wait for a Cloud operation"
+    )]
+    wait_timeout: u64,
 }
 
 #[derive(Subcommand)]
@@ -134,6 +155,11 @@ enum Commands {
         #[arg(long, help = "Acknowledge data will be permanently deleted")]
         accept_consequences: bool,
     },
+    /// Inspect durable Lux Cloud operations.
+    Operations {
+        #[command(subcommand)]
+        action: OperationsAction,
+    },
     Connect {
         #[arg(help = "Project name, ID, or connection URL (lux://...)")]
         project: Option<String>,
@@ -222,6 +248,22 @@ enum Commands {
         out: Option<String>,
         #[arg(long, help = "Print to stdout instead of writing a file")]
         stdout: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum OperationsAction {
+    /// List recent operations for a project.
+    List {
+        #[arg(help = "Project name or ID")]
+        project: String,
+    },
+    /// Get an operation, optionally following it until completion.
+    Get {
+        #[arg(help = "Operation ID")]
+        operation: String,
+        #[arg(long, help = "Follow until the operation reaches a terminal state")]
+        wait: bool,
     },
 }
 
@@ -2124,6 +2166,97 @@ fn get_client(api_url_override: &Option<String>) -> (reqwest::Client, String, St
     (client, api_url, config.token)
 }
 
+fn get_cloud_client(api_url_override: &Option<String>) -> cloud::CloudClient {
+    let (client, api_url, token) = get_client(api_url_override);
+    cloud::CloudClient::new(client, &api_url, &token)
+}
+
+fn cloud_error<T>(error: impl std::fmt::Display) -> T {
+    eprintln!("{} {error}", "Cloud error:".red());
+    std::process::exit(1);
+}
+
+fn cloud_idempotency_key(kind: &str) -> String {
+    format!("cli-{kind}-{}", random_hex(16))
+}
+
+fn print_cloud_operation(operation: &cloud::Operation) {
+    let message = operation
+        .message
+        .as_deref()
+        .filter(|message| !message.is_empty())
+        .map(|message| format!(" — {message}"))
+        .unwrap_or_default();
+    println!(
+        "  {:>3}%  {:<10} {}{}",
+        operation.progress, operation.status, operation.phase, message
+    );
+}
+
+async fn finish_cloud_mutation<T: Serialize>(
+    client: &cloud::CloudClient,
+    accepted: cloud::Accepted<T>,
+    no_wait: bool,
+    json: bool,
+    wait_timeout: u64,
+) {
+    if no_wait {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&accepted).unwrap());
+        } else {
+            println!(
+                "{} Operation accepted: {}",
+                "Accepted.".green(),
+                accepted.operation.id
+            );
+            println!(
+                "Use {} to follow progress.",
+                format!("lux operations get {} --wait", accepted.operation.id).cyan()
+            );
+        }
+        return;
+    }
+
+    if !json {
+        println!("{} {}", "Operation:".bold(), accepted.operation.id);
+    }
+    let operation = client
+        .wait_for_operation(
+            &accepted.operation.id,
+            std::time::Duration::from_secs(wait_timeout),
+            |operation| {
+                if !json {
+                    print_cloud_operation(operation);
+                }
+            },
+        )
+        .await
+        .unwrap_or_else(cloud_error);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "resource": accepted.resource,
+                "operation": operation,
+            }))
+            .unwrap()
+        );
+    } else if operation.succeeded() {
+        println!("{}", "Done.".green());
+    }
+
+    if !operation.succeeded() {
+        let message = operation
+            .error_message
+            .as_deref()
+            .or(operation.message.as_deref())
+            .unwrap_or("Cloud operation did not succeed.");
+        eprintln!("{} {message}", "Operation failed:".red());
+        std::process::exit(1);
+    }
+}
+
 /// A `lux_` token is scoped to one workspace. Resolve it so workspace-scoped
 /// endpoints (project list/create) can name it. Exits on failure.
 async fn resolve_workspace_id(client: &reqwest::Client, api_url: &str, token: &str) -> String {
@@ -2865,6 +2998,9 @@ fn format_bytes(bytes: u64) -> String {
 pub async fn run() {
     let cli = Cli::parse();
     let api_url_override = cli.api_url.clone();
+    let json = cli.json;
+    let no_wait = cli.no_wait;
+    let wait_timeout = cli.wait_timeout;
 
     match cli.command {
         Commands::Init => {
@@ -3261,26 +3397,24 @@ pub async fn run() {
         }
 
         Commands::Projects => {
-            let (client, api_url, token) = get_client(&api_url_override);
-            let workspace_id = resolve_workspace_id(&client, &api_url, &token).await;
-
-            let res = client
-                .get(format!("{api_url}/projects?workspace_id={workspace_id}"))
-                .header("Authorization", format!("Bearer {token}"))
-                .send()
+            let client = get_cloud_client(&api_url_override);
+            let workspace = client
+                .workspaces()
                 .await
-                .unwrap_or_else(|e| {
-                    eprintln!("{} {e}", "Failed:".red());
-                    std::process::exit(1);
-                });
+                .unwrap_or_else(cloud_error)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| cloud_error("No workspace found for this token."));
+            let projects = client
+                .projects(&workspace.id)
+                .await
+                .unwrap_or_else(cloud_error);
 
-            let body: ApiResponse<Vec<Instance>> = res.json().await.unwrap_or_else(|e| {
-                eprintln!("{} {e}", "Failed to parse response:".red());
-                std::process::exit(1);
-            });
-            let instances = unwrap_api(body);
-
-            if instances.is_empty() {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&projects).unwrap());
+                return;
+            }
+            if projects.is_empty() {
                 println!("{}", "No projects found.".dimmed());
                 return;
             }
@@ -3293,16 +3427,16 @@ pub async fn run() {
                 "MEMORY".dimmed()
             );
 
-            for inst in &instances {
-                let status = match inst.status.as_str() {
-                    "running" => inst.status.green().to_string(),
-                    "error" => inst.status.red().to_string(),
-                    _ => inst.status.yellow().to_string(),
+            for project in &projects {
+                let status = match project.status.as_str() {
+                    "running" => project.status.green().to_string(),
+                    "error" => project.status.red().to_string(),
+                    _ => project.status.yellow().to_string(),
                 };
 
                 println!(
                     "  {:<16}  {:<10}  {:<6}  {}MB",
-                    inst.name, status, inst.region, inst.memory_mb,
+                    project.name, status, project.region, project.memory_mb,
                 );
             }
         }
@@ -3542,127 +3676,63 @@ pub async fn run() {
             memory,
             accept_charges,
         } => {
-            let (client, api_url, token) = get_client(&api_url_override);
-
-            let sizes_res = client
-                .get(format!("{api_url}/billing/sizes"))
-                .header("Authorization", format!("Bearer {token}"))
-                .send()
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("{} {e}", "Failed:".red());
-                    std::process::exit(1);
-                });
-
-            let sizes_body: ApiResponse<Vec<serde_json::Value>> = sizes_res.json().await.unwrap();
-            let sizes = sizes_body.data.unwrap_or_default();
-
-            let size = sizes
-                .iter()
-                .find(|s| s.get("memory_mb").and_then(|v| v.as_u64()) == Some(memory as u64))
-                .unwrap_or_else(|| {
-                    let available: Vec<String> = sizes
-                        .iter()
-                        .filter_map(|s| {
-                            let mb = s.get("memory_mb")?.as_u64()?;
-                            let label = s.get("label")?.as_str()?;
-                            Some(format!("{mb}MB ({label})"))
-                        })
-                        .collect();
-                    eprintln!(
-                        "{} No size with {}MB. Available: {}",
-                        "Error:".red(),
-                        memory,
-                        available.join(", ")
-                    );
-                    std::process::exit(1);
-                });
-
-            let price_id = size.get("price_id").and_then(|v| v.as_str()).unwrap_or("");
-            let price_cents = size
-                .get("price_cents")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            if memory != 512 {
+                cloud_error::<()>("Only the Standard 512 MB project size is currently available.");
+            }
 
             if !accept_charges {
                 eprintln!(
-                    "{} This will create a {}MB instance at ${}/mo.",
+                    "{} This creates a {}MB Standard project under your workspace's current billing plan.",
                     "Billing:".yellow(),
                     memory,
-                    price_cents / 100
                 );
                 eprintln!("Run with {} to confirm.", "--accept-charges".bold());
                 std::process::exit(1);
             }
 
-            println!("{} Creating project '{}'...", "...".dimmed(), name);
-
-            let workspace_id = resolve_workspace_id(&client, &api_url, &token).await;
-            let res = client
-                .post(format!("{api_url}/projects"))
-                .header("Authorization", format!("Bearer {token}"))
-                .json(&serde_json::json!({
-                    "name": name,
-                    "price_id": price_id,
-                    "workspace_id": workspace_id,
-                }))
-                .send()
+            if !json {
+                println!("{} Creating project '{}'...", "...".dimmed(), name);
+            }
+            let client = get_cloud_client(&api_url_override);
+            let workspace = client
+                .workspaces()
                 .await
-                .unwrap_or_else(|e| {
-                    eprintln!("{} {e}", "Failed:".red());
-                    std::process::exit(1);
-                });
-
-            let body: ApiResponse<Instance> = res.json().await.unwrap_or_else(|e| {
-                eprintln!("{} {e}", "Failed to parse:".red());
-                std::process::exit(1);
-            });
-
-            if let Some(error) = body.error {
-                eprintln!("{} {error}", "Error:".red());
-                std::process::exit(1);
-            }
-
-            if let Some(inst) = body.data {
-                println!("{} Project '{}' created", "Done.".green(), inst.name);
-                println!("{} {}", "ID:".bold(), inst.id);
-                println!("{} {}MB", "Memory:".bold(), inst.memory_mb);
-                println!("{} {}", "Region:".bold(), inst.region);
-                println!(
-                    "\n{} Run {} to check when it's ready",
-                    "Tip:".bold(),
-                    format!("lux status {}", inst.name).cyan()
-                );
-            }
+                .unwrap_or_else(cloud_error)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| cloud_error("No workspace found for this token."));
+            let accepted = client
+                .create_project(
+                    &workspace.id,
+                    &name,
+                    memory,
+                    &cloud_idempotency_key("project-create"),
+                )
+                .await
+                .unwrap_or_else(cloud_error);
+            finish_cloud_mutation(&client, accepted, no_wait, json, wait_timeout).await;
         }
 
         Commands::Restart { project } => {
-            let (client, api_url, token) = get_client(&api_url_override);
             let project = require_project_arg(project.as_deref());
-            let inst = find_project(&client, &api_url, &token, &project).await;
-
-            println!("{} Restarting '{}'...", "...".dimmed(), inst.name);
-
-            let res = client
-                .post(format!("{api_url}/projects/{}/restart", inst.id))
-                .header("Authorization", format!("Bearer {token}"))
-                .send()
+            let client = get_cloud_client(&api_url_override);
+            let target = client
+                .resolve_project(&project)
                 .await
-                .unwrap_or_else(|e| {
-                    eprintln!("{} {e}", "Failed:".red());
-                    std::process::exit(1);
-                });
-
-            if res.status().is_success() {
-                println!("{} Project '{}' is restarting.", "Done.".green(), inst.name);
-            } else {
-                let body: serde_json::Value = res.json().await.unwrap_or_default();
-                let msg = body
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown error");
-                eprintln!("{} {msg}", "Error:".red());
+                .unwrap_or_else(cloud_error);
+            if !json {
+                println!("{} Restarting '{}'...", "...".dimmed(), target.name);
             }
+            let accepted = client
+                .project_action(
+                    &target.id,
+                    "restart",
+                    serde_json::json!({}),
+                    &cloud_idempotency_key("project-restart"),
+                )
+                .await
+                .unwrap_or_else(cloud_error);
+            finish_cloud_mutation(&client, accepted, no_wait, json, wait_timeout).await;
         }
 
         Commands::Snapshot {
@@ -3670,124 +3740,67 @@ pub async fn run() {
             list,
             restore,
         } => {
-            let (client, api_url, token) = get_client(&api_url_override);
             let project = require_project_arg(project.as_deref());
-            let inst = find_project(&client, &api_url, &token, &project).await;
+            let client = get_cloud_client(&api_url_override);
+            let target = client
+                .resolve_project(&project)
+                .await
+                .unwrap_or_else(cloud_error);
 
             if let Some(snapshot_id) = restore {
-                println!(
-                    "{} Restoring '{}' from {}...",
-                    "...".dimmed(),
-                    inst.name,
-                    snapshot_id
-                );
-                let res = client
-                    .post(format!(
-                        "{api_url}/snapshots/{}/{}/restore",
-                        inst.id, snapshot_id
-                    ))
-                    .header("Authorization", format!("Bearer {token}"))
-                    .send()
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!("{} {e}", "Failed:".red());
-                        std::process::exit(1);
-                    });
-                if res.status().is_success() {
-                    println!("{} Restore started for '{}'.", "Done.".green(), inst.name);
-                } else {
-                    let body: serde_json::Value = res.json().await.unwrap_or_default();
-                    let msg = body
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Unknown error");
-                    eprintln!("{} {msg}", "Error:".red());
+                if !json {
+                    println!(
+                        "{} Restoring '{}' from {}...",
+                        "...".dimmed(),
+                        target.name,
+                        snapshot_id
+                    );
                 }
-            } else if list {
-                let res = client
-                    .get(format!("{api_url}/snapshots/{}", inst.id))
-                    .header("Authorization", format!("Bearer {token}"))
-                    .send()
+                let accepted = client
+                    .restore_snapshot(
+                        &target.id,
+                        &snapshot_id,
+                        &cloud_idempotency_key("snapshot-restore"),
+                    )
                     .await
-                    .unwrap_or_else(|e| {
-                        eprintln!("{} {e}", "Failed:".red());
-                        std::process::exit(1);
-                    });
-                let body: serde_json::Value = res.json().await.unwrap_or_default();
-                let rows = body
-                    .get("data")
-                    .and_then(|d| d.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                if rows.is_empty() {
-                    println!("No snapshots for '{}'.", inst.name);
+                    .unwrap_or_else(cloud_error);
+                finish_cloud_mutation(&client, accepted, no_wait, json, wait_timeout).await;
+            } else if list {
+                let snapshots = client
+                    .snapshots(&target.id)
+                    .await
+                    .unwrap_or_else(cloud_error);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&snapshots).unwrap());
+                } else if snapshots.is_empty() {
+                    println!("No snapshots for '{}'.", target.name);
                 } else {
                     println!("{:<10} {:<10} {:<26} ID", "STATUS", "SIZE", "CREATED");
-                    for r in rows {
-                        let status = r.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                        let size = r
-                            .get("file_size_bytes")
-                            .and_then(|v| v.as_u64())
+                    for snapshot in snapshots {
+                        let size = snapshot
+                            .file_size_bytes
                             .map(format_bytes)
                             .unwrap_or_else(|| "-".to_string());
-                        let created = r.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
-                        let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        let err = r
-                            .get("error_message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let err_suffix = if err.is_empty() {
-                            String::new()
-                        } else {
-                            format!("  {}", err.red())
-                        };
-                        println!("{status:<10} {size:<10} {created:<26} {id}{err_suffix}");
+                        let error = snapshot
+                            .error_message
+                            .as_deref()
+                            .map(|error| format!("  {}", error.red()))
+                            .unwrap_or_default();
+                        println!(
+                            "{:<10} {:<10} {:<26} {}{}",
+                            snapshot.status, size, snapshot.created_at, snapshot.id, error
+                        );
                     }
                 }
             } else {
-                println!("{} Snapshotting '{}'...", "...".dimmed(), inst.name);
-
-                let res = client
-                    .post(format!("{api_url}/snapshots/{}", inst.id))
-                    .header("Authorization", format!("Bearer {token}"))
-                    .send()
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!("{} {e}", "Failed:".red());
-                        std::process::exit(1);
-                    });
-
-                if res.status().is_success() {
-                    let body: serde_json::Value = res.json().await.unwrap_or_default();
-                    let id = body
-                        .get("data")
-                        .and_then(|d| d.get("id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let suffix = if id.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({id})")
-                    };
-                    println!(
-                        "{} Snapshot started for '{}'.{}",
-                        "Done.".green(),
-                        inst.name,
-                        suffix
-                    );
-                    println!(
-                        "{} {}",
-                        "Tip:".bold(),
-                        format!("lux snapshot {} --list", inst.name).cyan()
-                    );
-                } else {
-                    let body: serde_json::Value = res.json().await.unwrap_or_default();
-                    let msg = body
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Unknown error");
-                    eprintln!("{} {msg}", "Error:".red());
+                if !json {
+                    println!("{} Snapshotting '{}'...", "...".dimmed(), target.name);
                 }
+                let accepted = client
+                    .create_snapshot(&target.id, &cloud_idempotency_key("snapshot-create"))
+                    .await
+                    .unwrap_or_else(cloud_error);
+                finish_cloud_mutation(&client, accepted, no_wait, json, wait_timeout).await;
             }
         }
 
@@ -3795,40 +3808,96 @@ pub async fn run() {
             project,
             accept_consequences,
         } => {
-            let (client, api_url, token) = get_client(&api_url_override);
-            let inst = find_project(&client, &api_url, &token, &project).await;
+            let client = get_cloud_client(&api_url_override);
+            let target = client
+                .resolve_project(&project)
+                .await
+                .unwrap_or_else(cloud_error);
 
             if !accept_consequences {
                 eprintln!(
                     "{} This will permanently delete '{}' and all its data.",
                     "Warning:".red(),
-                    inst.name
+                    target.name
                 );
                 eprintln!("Run with {} to confirm.", "--accept-consequences".bold());
                 std::process::exit(1);
             }
 
-            println!("{} Destroying '{}'...", "...".dimmed(), inst.name);
-
-            let res = client
-                .delete(format!("{api_url}/projects/{}", inst.id))
-                .header("Authorization", format!("Bearer {token}"))
-                .send()
+            if !json {
+                println!("{} Destroying '{}'...", "...".dimmed(), target.name);
+            }
+            let accepted = client
+                .delete_project(&target.id, &cloud_idempotency_key("project-delete"))
                 .await
-                .unwrap_or_else(|e| {
-                    eprintln!("{} {e}", "Failed:".red());
-                    std::process::exit(1);
-                });
+                .unwrap_or_else(cloud_error);
+            finish_cloud_mutation(&client, accepted, no_wait, json, wait_timeout).await;
+        }
 
-            if res.status().is_success() {
-                println!("{} Project '{}' destroyed.", "Done.".green(), inst.name);
-            } else {
-                let body: serde_json::Value = res.json().await.unwrap_or_default();
-                let msg = body
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown error");
-                eprintln!("{} {msg}", "Error:".red());
+        Commands::Operations { action } => {
+            let client = get_cloud_client(&api_url_override);
+            match action {
+                OperationsAction::List { project } => {
+                    let target = client
+                        .resolve_project(&project)
+                        .await
+                        .unwrap_or_else(cloud_error);
+                    let operations = client
+                        .operations(&target.id)
+                        .await
+                        .unwrap_or_else(cloud_error);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&operations).unwrap());
+                    } else if operations.is_empty() {
+                        println!("No operations for '{}'.", target.name);
+                    } else {
+                        println!(
+                            "{:<12} {:<9} {:>4}  {:<24} ID",
+                            "KIND", "STATUS", "%", "UPDATED"
+                        );
+                        for operation in operations {
+                            println!(
+                                "{:<12} {:<9} {:>3}%  {:<24} {}",
+                                operation.kind,
+                                operation.status,
+                                operation.progress,
+                                operation.updated_at,
+                                operation.id
+                            );
+                        }
+                    }
+                }
+                OperationsAction::Get { operation, wait } => {
+                    let operation = if wait {
+                        client
+                            .wait_for_operation(
+                                &operation,
+                                std::time::Duration::from_secs(wait_timeout),
+                                |current| {
+                                    if !json {
+                                        print_cloud_operation(current);
+                                    }
+                                },
+                            )
+                            .await
+                            .unwrap_or_else(cloud_error)
+                    } else {
+                        client
+                            .operation(&operation)
+                            .await
+                            .unwrap_or_else(cloud_error)
+                    };
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&operation).unwrap());
+                    } else if !wait {
+                        print_cloud_operation(&operation);
+                        println!("{} {}", "ID:".bold(), operation.id);
+                        println!("{} {}", "Kind:".bold(), operation.kind);
+                    }
+                    if operation.is_terminal() && !operation.succeeded() {
+                        std::process::exit(1);
+                    }
+                }
             }
         }
 
