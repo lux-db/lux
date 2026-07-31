@@ -293,8 +293,8 @@ enum AuthProviderAction {
     Google {
         #[arg(long)]
         client_id: String,
-        #[arg(long)]
-        client_secret: String,
+        #[arg(long, help = "Required for initial setup; omit later to keep the stored secret")]
+        client_secret: Option<String>,
         #[arg(long, help = "Override the callback URL (default: engine callback)")]
         redirect_uri: Option<String>,
         #[arg(long)]
@@ -308,8 +308,8 @@ enum AuthProviderAction {
     Github {
         #[arg(long)]
         client_id: String,
-        #[arg(long)]
-        client_secret: String,
+        #[arg(long, help = "Required for initial setup; omit later to keep the stored secret")]
+        client_secret: Option<String>,
         #[arg(long, help = "Override the callback URL (default: engine callback)")]
         redirect_uri: Option<String>,
         #[arg(long)]
@@ -2429,7 +2429,7 @@ async fn put_oauth(
     conn: &EngineConn,
     provider: &str,
     client_id: String,
-    client_secret: String,
+    client_secret: Option<String>,
     redirect_uri: Option<String>,
     scopes: Option<String>,
     disable: bool,
@@ -2439,7 +2439,9 @@ async fn put_oauth(
     let mut body = serde_json::Map::new();
     body.insert("enabled".into(), serde_json::json!(!disable));
     body.insert("client_id".into(), serde_json::json!(client_id));
-    body.insert("client_secret".into(), serde_json::json!(client_secret));
+    if let Some(client_secret) = client_secret {
+        body.insert("client_secret".into(), serde_json::json!(client_secret));
+    }
     body.insert("redirect_uri".into(), serde_json::json!(redirect));
     if let Some(scopes) = scopes {
         body.insert("scopes".into(), serde_json::json!(scopes));
@@ -6862,6 +6864,36 @@ mod tests {
         assert_eq!(p8, Some(PathBuf::from("AuthKey.p8")));
         assert_eq!(conn.url.as_deref(), Some("https://db.example.com"));
         assert_eq!(conn.password.as_deref(), Some("operator-secret"));
+    }
+
+    #[test]
+    fn provider_secret_is_optional_for_google_updates() {
+        let cli = Cli::try_parse_from([
+            "lux",
+            "auth",
+            "provider",
+            "google",
+            "--client-id",
+            "google-client",
+        ])
+        .expect("Google provider update parses without re-entering the secret");
+
+        let Commands::Auth {
+            action:
+                AuthAction::Provider {
+                    action:
+                        AuthProviderAction::Google {
+                            client_id,
+                            client_secret,
+                            ..
+                        },
+                },
+        } = cli.command
+        else {
+            panic!("expected Google provider command");
+        };
+        assert_eq!(client_id, "google-client");
+        assert_eq!(client_secret, None);
     }
 
     #[test]

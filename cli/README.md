@@ -240,24 +240,42 @@ restricted Cloud console.
 
 ## Auth providers
 
-Provider commands target the local `lux start` engine by default. For a remote
-self-hosted engine, pass `--url` and `--password`, or set `LUX_ENGINE_URL` and
-`LUX_ENGINE_PASSWORD`. Remote URLs must use HTTPS; HTTP is accepted only for
-localhost.
+Lux Auth supports Google, GitHub, and Apple. Provider commands target the local
+`lux start` engine by default. For a remote self-hosted engine, pass `--url` and
+`--password`, or set `LUX_ENGINE_URL` and `LUX_ENGINE_PASSWORD`. Remote URLs must
+use HTTPS; HTTP is accepted only for localhost. Managed Cloud providers are
+normally configured on the project's **Auth** page.
 
 ```bash
+# Google and GitHub (callback defaults to the target engine's auth callback)
+lux auth provider google \
+  --client-id GOOGLE_CLIENT_ID \
+  --client-secret GOOGLE_CLIENT_SECRET
+lux auth provider github \
+  --client-id GITHUB_CLIENT_ID \
+  --client-secret GITHUB_CLIENT_SECRET
+
+# Native Sign in with Apple on the local engine
 lux auth provider apple --bundle-id com.example.app
+
+# Apple web sign-in on a publicly reachable HTTPS engine
 lux auth provider apple \
   --url https://db.example.com \
+  --password "$LUX_ENGINE_PASSWORD" \
   --services-id com.example.web \
   --team-id TEAM_ID \
   --key-id KEY_ID \
   --p8 AuthKey_KEY_ID.p8
+
+# Secrets are redacted from this output
 lux auth provider list
 ```
 
-The `.p8` file is sent directly to the engine's encrypted provider storage and
-is never written to CLI configuration or printed.
+Use `--redirect-uri` with Google or GitHub when their registered callback differs
+from the engine default. Re-running a command with an omitted client secret or
+Apple key retains the encrypted value already stored by the engine. The `.p8`
+file and provider secrets are sent directly to encrypted provider storage; they
+are never written to CLI configuration or printed.
 
 ## Push configuration
 

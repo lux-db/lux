@@ -318,7 +318,7 @@ redis-cli TALTER users DROP role
 
 Field types: `STR`, `INT`, `FLOAT`, `BOOL`, `TIMESTAMP`, `UUID`, `VECTOR(n)`, `JSON`, `ARRAY`.
 WHERE operators: `= != < > <= >=`, `IN`/`NOT IN`, JSON `IS VALID`/`IS NOT VALID`, and `CONTAINS`.
-Use SQL-style constraints like `UNIQUE`, `PRIMARY KEY`, and `REFERENCES table(field)`. Self-hosted encrypted columns use native `ENC` state (`ENC INIT`, `ENC ROTATE`, `ENC LIST`); Lux Cloud auto-initializes hosted projects.
+Use SQL-style constraints like `UNIQUE`, `PRIMARY KEY`, and `REFERENCES table(field)`. Encrypted columns and encrypted provider secrets use native `ENC` state (`ENC INIT`, `ENC ROTATE`, `ENC LIST`); `lux start` and Lux Cloud auto-initialize their managed keyrings.
 
 ### CLI
 
@@ -563,24 +563,40 @@ GET  /auth/v1/authorize?provider=google&redirect_to=http://localhost:5173/callba
 POST /auth/v1/signin/apple
 ```
 
-Sign in with Apple supports native Apple identity tokens and web OAuth. Configure
-native Bundle IDs, web credentials, or both with the CLI:
+Lux supports Google, GitHub, and Apple OAuth. Configure a local or remote
+self-hosted engine with the CLI; managed Cloud projects use the **Auth** page in
+the Lux dashboard.
 
 ```bash
+# Google
+lux auth provider google \
+  --client-id GOOGLE_CLIENT_ID \
+  --client-secret GOOGLE_CLIENT_SECRET
+
+# GitHub
+lux auth provider github \
+  --client-id GITHUB_CLIENT_ID \
+  --client-secret GITHUB_CLIENT_SECRET
+
 # Native iOS/macOS
 lux auth provider apple --bundle-id com.example.app
 
-# Web (requires an active Lux encryption keyring for .p8 storage)
+# Apple web (the engine must be reachable at a public HTTPS URL)
 lux auth provider apple \
+  --url https://db.example.com \
+  --password "$LUX_ENGINE_PASSWORD" \
   --services-id com.example.web \
   --team-id YOUR_TEAM_ID \
   --key-id YOUR_KEY_ID \
   --p8 /path/to/AuthKey.p8
 ```
 
-Set up `LUX_ENCRYPTION_KEYS` before configuring Apple web sign-in. Lux refuses
-to persist an Apple `.p8` without an active encryption key. Remote provider
-configuration requires HTTPS; plain HTTP is accepted only for localhost.
+`lux start` initializes encrypted provider storage automatically. Other
+self-hosted deployments must initialize the keyring before uploading an Apple
+`.p8`; Lux refuses to persist that key in plaintext. Remote provider
+configuration requires HTTPS, while plain HTTP is accepted only for localhost.
+Local Studio exposes the same Google, GitHub, and Apple provider settings from
+its **Auth -> Providers** tab.
 
 OAuth providers are configured through admin routes with a secret key:
 
