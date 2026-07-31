@@ -2656,11 +2656,7 @@ fn route_request_with_auth(
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     if segments.is_empty() || (segments.len() == 1 && segments[0] == "v1") {
-        return (
-            200,
-            "OK",
-            r#"{"lux":"ok","version":""#.to_string() + env!("CARGO_PKG_VERSION") + r#""}"#,
-        );
+        return engine_root();
     }
 
     let base = if segments[0] == "v1" {
@@ -3105,6 +3101,17 @@ fn engine_version() -> (u16, &'static str, String) {
         "version": env!("CARGO_PKG_VERSION"),
         "build_sha": build_sha,
         "api_version": crate::migrations::API_VERSION,
+        "studio_api": crate::migrations::STUDIO_API_VERSION,
+        "capabilities": crate::migrations::CAPABILITIES
+    })
+    .to_string())
+}
+
+fn engine_root() -> (u16, &'static str, String) {
+    ok(json!({
+        "lux": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "studio_api": crate::migrations::STUDIO_API_VERSION,
         "capabilities": crate::migrations::CAPABILITIES
     })
     .to_string())
@@ -5209,11 +5216,35 @@ mod tests {
         let parsed: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(parsed["api_version"], crate::migrations::API_VERSION);
+        assert_eq!(parsed["studio_api"], crate::migrations::STUDIO_API_VERSION);
         assert!(parsed["capabilities"]
             .as_array()
             .unwrap()
             .iter()
             .any(|value| value == "migrations.apply"));
+    }
+
+    #[test]
+    fn root_contract_advertises_studio_capabilities() {
+        let (status, _, response) = engine_root();
+        assert_eq!(status, 200);
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["lux"], "ok");
+        assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(parsed["studio_api"], crate::migrations::STUDIO_API_VERSION);
+        let capabilities = parsed["capabilities"].as_array().unwrap();
+        for required in [
+            "engine.exec",
+            "engine.tables",
+            "engine.auth.providers.apple.web",
+            "engine.push.apns",
+            "engine.snapshots.restore",
+        ] {
+            assert!(
+                capabilities.iter().any(|value| value == required),
+                "missing {required}: {capabilities:?}"
+            );
+        }
     }
 
     #[test]

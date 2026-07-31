@@ -102,6 +102,7 @@ manage auth — pointed at that engine.
 lux start                  # engine + Studio; prints connection info + the Studio URL
 lux start --no-studio      # engine only
 lux start --fresh          # recreate from a clean data volume (drops local data)
+lux start --bind 0.0.0.0   # explicitly expose both services on every interface
 lux studio                 # open Lux Studio in your browser (starts it if needed)
 lux status                 # show local engine status
 lux env export local       # print the local profile when explicitly needed
@@ -118,7 +119,13 @@ The local secret key equals the engine password, so a secret-key client gets
 operator access while a publishable-key client must sign in (JWT → grant-enforced
 user), mirroring production. Studio runs as a container
 (`ghcr.io/lux-db/studio`) and talks to the engine
-directly from your browser; credentials never leave your machine.
+directly from your browser. With the default loopback binding, credentials
+never leave your machine.
+
+Engine and Studio ports bind to `127.0.0.1` by default. Use `--bind <IP>` only
+when another device or development environment must reach them. Non-loopback
+bindings expose an operator credential through Studio, so they are intended for
+trusted networks and explicit port-forwarding setups.
 
 Existing engine and Studio containers never change versions implicitly during
 `lux start`. Start reports available image updates; `lux update engine` and
@@ -237,6 +244,12 @@ For Cloud projects, `doctor` checks version and capability support over the
 authenticated direct connection while migration state uses Cloud's dedicated
 management endpoints; it never sends generic `LUX` commands through the
 restricted Cloud console.
+
+Self-hosted tooling can discover the engine's Studio contract without
+credentials from `GET /v1` (or the richer `GET /v1/version`). Both responses
+advertise `studio_api` and a capability list, allowing a Studio client to hide
+or label unavailable features instead of inferring support from a version
+number.
 
 ## Auth providers
 

@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, Ipv4Addr, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -47,6 +47,12 @@ enum Commands {
             help = "Host port for the HTTP API (default 5890, auto-bumps if taken)"
         )]
         http_port: Option<u16>,
+        #[arg(
+            long,
+            value_name = "IP",
+            help = "Host address for local engine and Studio ports (default 127.0.0.1)"
+        )]
+        bind: Option<IpAddr>,
     },
     /// Stop the local Lux engine.
     Stop {
@@ -744,6 +750,10 @@ fn default_studio_port() -> u16 {
     DEFAULT_STUDIO_PORT
 }
 
+fn default_bind_host() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::LOCALHOST)
+}
+
 /// Persisted local-dev credentials + runtime knobs for the Docker engine. Lives
 /// in the gitignored `lux/.lux-local.json` and is reused across restarts so keys
 /// and data stay stable. `password` is intentionally equal to `secret_key`: the
@@ -761,6 +771,8 @@ struct LocalState {
     container: String,
     volume: String,
     image: String,
+    #[serde(default = "default_bind_host")]
+    bind_host: IpAddr,
     // serde defaults so a `.lux-local.json` written before Studio existed still
     // loads; backfilled in ensure_local_state.
     #[serde(default = "default_studio_port")]
@@ -779,6 +791,13 @@ fn load_local_state() -> Option<LocalState> {
     #[cfg(unix)]
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
     serde_json::from_str(&data).ok()
+}
+
+fn local_state_missing_bind_host() -> bool {
+    std::fs::read_to_string(local_state_path())
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .is_some_and(|value| value.get("bind_host").is_none())
 }
 
 fn ensure_private_dir(path: &Path) -> Result<(), String> {
@@ -893,22 +912,17 @@ fn project_slug() -> String {
     )
 }
 
-/// True if `port` is bindable right now (so we can detect a port already taken
-/// and pick a free one instead). Binds `0.0.0.0` to match how Docker publishes
-/// ports (`-p host:container` binds all interfaces): a check against `127.0.0.1`
-/// can pass while another container already holds `0.0.0.0:port` (common on
-/// macOS), and then `docker run` fails to bind. `0.0.0.0` is the bind that
-/// actually conflicts with Docker's, so it's the correct probe.
-fn port_is_free(port: u16) -> bool {
-    std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
+/// True if `port` is bindable on the same host address Docker will publish.
+fn port_is_free(bind_host: IpAddr, port: u16) -> bool {
+    std::net::TcpListener::bind((bind_host, port)).is_ok()
 }
 
 /// Return `preferred` if free, else the next free port above it. Lets multiple
 /// projects run at once: the first gets the default port, the next bumps up.
-fn free_port_from(preferred: u16) -> u16 {
+fn free_port_from(bind_host: IpAddr, preferred: u16) -> u16 {
     let mut p = preferred;
     for _ in 0..500 {
-        if port_is_free(p) {
+        if port_is_free(bind_host, p) {
             return p;
         }
         p = p.saturating_add(1);
@@ -921,8 +935,9 @@ fn free_port_from(preferred: u16) -> u16 {
 
 /// Load the persisted local state, generating + saving fresh creds on first use.
 fn ensure_local_state() -> LocalState {
+    let missing_bind_host = local_state_missing_bind_host();
     if let Some(mut state) = load_local_state() {
-        let mut dirty = false;
+        let mut dirty = missing_bind_host;
         // Follow the engine image config.toml asks for: a pinned `engine_version`,
         // else `:latest`. Re-evaluated each load so editing config.toml takes
         // effect on the next `lux start`.
@@ -964,6 +979,7 @@ fn ensure_local_state() -> LocalState {
         image: desired_engine_image(local.as_ref()),
         studio_port: DEFAULT_STUDIO_PORT,
         studio_container: format!("lux-{slug}-studio"),
+        bind_host: default_bind_host(),
     };
     // secret_key == password: the operator credential and the SDK secret key are
     // the same value locally (see LocalState doc comment).
@@ -976,11 +992,31 @@ fn ensure_local_state() -> LocalState {
 }
 
 impl LocalState {
+    fn connection_ip(&self) -> IpAddr {
+        if self.bind_host.is_unspecified() {
+            default_bind_host()
+        } else {
+            self.bind_host
+        }
+    }
+
+    fn connection_host(&self) -> String {
+        if self.connection_ip().is_loopback() {
+            "localhost".to_string()
+        } else {
+            self.connection_ip().to_string()
+        }
+    }
+
     fn lux_url(&self) -> String {
-        format!("http://localhost:{}", self.http_port)
+        format_host_url("http", &self.connection_host(), self.http_port)
     }
     fn direct_url(&self) -> String {
-        format!("lux://:{}@localhost:{}", self.password, self.resp_port)
+        format_host_url(
+            &format!("lux://:{}@", self.password),
+            &self.connection_host(),
+            self.resp_port,
+        )
     }
     /// The LUX_* lines for `.env.local` / `lux status -o env`.
     fn env_lines(&self) -> Vec<String> {
@@ -990,6 +1026,26 @@ impl LocalState {
             format!("LUX_PUBLISHABLE_KEY={}", self.publishable_key),
             format!("LUX_SECRET_KEY={}", self.secret_key),
         ]
+    }
+}
+
+fn format_host_url(scheme: &str, host: &str, port: u16) -> String {
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    if scheme.ends_with('@') {
+        format!("{scheme}{host}:{port}")
+    } else {
+        format!("{scheme}://{host}:{port}")
+    }
+}
+
+fn docker_port_map(bind_host: IpAddr, host_port: u16, container_port: u16) -> String {
+    match bind_host {
+        IpAddr::V4(address) => format!("{address}:{host_port}:{container_port}"),
+        IpAddr::V6(address) => format!("[{address}]:{host_port}:{container_port}"),
     }
 }
 
@@ -1016,6 +1072,44 @@ fn docker_preflight() -> Result<(), String> {
 /// Container state: "running", "exited", "created", ... or None if absent.
 fn docker_container_state(name: &str) -> Option<String> {
     docker_output(&["inspect", "-f", "{{.State.Status}}", name]).ok()
+}
+
+fn published_binding_matches(output: &str, bind_host: IpAddr, host_port: u16) -> bool {
+    let mut fields = output.split_whitespace();
+    let Some(host) = fields.next() else {
+        return false;
+    };
+    let Some(port) = fields.next().and_then(|value| value.parse::<u16>().ok()) else {
+        return false;
+    };
+    fields.next().is_none() && host.parse::<IpAddr>().ok() == Some(bind_host) && port == host_port
+}
+
+fn docker_port_binding_matches(
+    container: &str,
+    container_port: &str,
+    bind_host: IpAddr,
+    host_port: u16,
+) -> bool {
+    let template = format!(
+        "{{{{with (index .HostConfig.PortBindings \"{container_port}\")}}}}{{{{(index . 0).HostIp}}}} {{{{(index . 0).HostPort}}}}{{{{end}}}}"
+    );
+    docker_output(&["inspect", "-f", &template, container])
+        .is_ok_and(|output| published_binding_matches(&output, bind_host, host_port))
+}
+
+fn engine_bindings_match(state: &LocalState) -> bool {
+    docker_port_binding_matches(
+        &state.container,
+        "6379/tcp",
+        state.bind_host,
+        state.resp_port,
+    ) && docker_port_binding_matches(
+        &state.container,
+        "5890/tcp",
+        state.bind_host,
+        state.http_port,
+    )
 }
 
 fn docker_volume_exists(name: &str) -> bool {
@@ -1126,8 +1220,8 @@ fn print_image_update_hint(label: &str, container: &str, image: &str, command: &
 }
 
 fn run_local_engine_container(state: &LocalState) -> Result<(), String> {
-    let resp_map = format!("{}:6379", state.resp_port);
-    let http_map = format!("{}:5890", state.http_port);
+    let resp_map = docker_port_map(state.bind_host, state.resp_port, 6379);
+    let http_map = docker_port_map(state.bind_host, state.http_port, 5890);
     let vol_map = format!("{}:/data", state.volume);
     let engine_env = local_engine_env(state);
     let mut run_args: Vec<&str> = vec![
@@ -1382,7 +1476,8 @@ fn local_status_value(state: &LocalState) -> serde_json::Value {
         "status": if running { "running" } else { "stopped" },
         "image": state.image,
         "url": state.lux_url(),
-        "direct_host": "localhost",
+        "bind_host": state.bind_host,
+        "direct_host": state.connection_host(),
         "direct_port": state.resp_port,
         "data_volume": state.volume,
         "encryption": "enabled",
@@ -1406,9 +1501,9 @@ fn print_local_status(state: &LocalState, json_output: bool) {
     println!("{} {}", "Image:".bold(), state.image.dimmed());
     println!("{} {}", "LUX_URL:".bold(), state.lux_url());
     println!(
-        "{} lux://localhost:{} (credentials hidden)",
+        "{} {} (credentials hidden)",
         "Direct:".bold(),
-        state.resp_port
+        format_host_url("lux", &state.connection_host(), state.resp_port)
     );
     println!("{} {}", "App env:".bold(), active_profile_label());
     println!("{} {}", "Data volume:".bold(), state.volume);
@@ -1423,9 +1518,9 @@ fn print_connection_block(state: &LocalState) {
     println!("{}", "  Local Lux engine".bold());
     println!("  {}  {}", "LUX_URL          ".dimmed(), state.lux_url());
     println!(
-        "  {}  lux://localhost:{} (credentials hidden)",
+        "  {}  {} (credentials hidden)",
         "Direct            ".dimmed(),
-        state.resp_port
+        format_host_url("lux", &state.connection_host(), state.resp_port)
     );
     println!(
         "  {}  {}",
@@ -1445,7 +1540,9 @@ fn print_connection_block(state: &LocalState) {
 /// Poll the local RESP port until the engine answers an authed PING (or timeout).
 fn wait_for_local_ready(state: &LocalState) -> bool {
     for _ in 0..40 {
-        if let Ok(mut conn) = DirectConn::connect("localhost", state.resp_port, &state.password) {
+        if let Ok(mut conn) =
+            DirectConn::connect(&state.connection_host(), state.resp_port, &state.password)
+        {
             if conn.exec("PING").is_ok() {
                 return true;
             }
@@ -1456,8 +1553,8 @@ fn wait_for_local_ready(state: &LocalState) -> bool {
 }
 
 /// Poll until the Studio container's HTTP port accepts connections (nginx up).
-fn wait_for_studio_ready(port: u16) -> bool {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+fn wait_for_studio_ready(state: &LocalState) -> bool {
+    let addr = std::net::SocketAddr::new(state.connection_ip(), state.studio_port);
     for _ in 0..40 {
         if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300))
             .is_ok()
@@ -1489,8 +1586,16 @@ fn studio_project_name() -> String {
 /// browser: defaults to host-visible localhost, but honors an explicit LUX_URL
 /// for remote/sandbox setups. LUX_KEY is the operator secret and stays local.
 fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
-    if docker_container_state(&state.studio_container).as_deref() == Some("running") {
-        let url = format!("http://localhost:{}", state.studio_port);
+    let binding_matches = docker_port_binding_matches(
+        &state.studio_container,
+        "80/tcp",
+        state.bind_host,
+        state.studio_port,
+    );
+    if docker_container_state(&state.studio_container).as_deref() == Some("running")
+        && binding_matches
+    {
+        let url = format_host_url("http", &state.connection_host(), state.studio_port);
         println!("{} {}", "Lux Studio:".bold(), url.cyan());
         print_image_update_hint(
             "Studio",
@@ -1506,13 +1611,13 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
     if docker_container_state(&state.studio_container).is_some() {
         let _ = docker_output(&["rm", "-f", &state.studio_container]);
     }
-    let studio_port = free_port_from(state.studio_port);
+    let studio_port = free_port_from(state.bind_host, state.studio_port);
     if studio_port != state.studio_port {
         state.studio_port = studio_port;
         save_local_state(state);
     }
 
-    let port_map = format!("{studio_port}:80");
+    let port_map = docker_port_map(state.bind_host, studio_port, 80);
     // The Studio SPA runs in the browser and calls the engine directly. Normally
     // that's the host-visible localhost, but in a remote/sandbox context (e2b,
     // a dev container, an SSH port-forward) the browser can't reach the engine
@@ -1520,7 +1625,7 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
     // is actually reachable from the browser; fall back to localhost otherwise.
     let engine_url = match std::env::var("LUX_URL") {
         Ok(u) if !u.trim().is_empty() => u.trim().to_string(),
-        _ => format!("http://localhost:{}", state.http_port),
+        _ => state.lux_url(),
     };
     let e_url = format!("LUX_URL={engine_url}");
     let e_key = format!("LUX_KEY={}", state.secret_key);
@@ -1563,7 +1668,7 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
 
     print!("{}", "Waiting for Studio...".dimmed());
     std::io::stdout().flush().ok();
-    if !wait_for_studio_ready(studio_port) {
+    if !wait_for_studio_ready(state) {
         println!(" {}", "TIMEOUT".red());
         eprintln!(
             "{} Studio did not become ready. Check {}.",
@@ -1574,7 +1679,7 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
     }
     println!(" {}", "ready".green());
 
-    let url = format!("http://localhost:{studio_port}");
+    let url = format_host_url("http", &state.connection_host(), studio_port);
     println!("{} {}", "Lux Studio:".bold(), url.cyan());
     println!("{} {}", "  → engine:".dimmed(), engine_url.dimmed());
     if open_browser {
@@ -2798,7 +2903,7 @@ async fn local_version_components() -> Vec<VersionComponent> {
 
     let engine_image = image_update_status(&state.container, &state.image);
     let engine_version = if docker_container_state(&state.container).as_deref() == Some("running") {
-        DirectConn::connect("localhost", state.resp_port, &state.password)
+        DirectConn::connect(&state.connection_host(), state.resp_port, &state.password)
             .and_then(|mut conn| conn.exec("LUX VERSION"))
             .and_then(|raw| decode_json::<EngineManagementVersion>(&raw, "engine version"))
             .map(|version| version.version)
@@ -3307,6 +3412,7 @@ pub async fn run() {
             no_studio,
             resp_port: resp_port_flag,
             http_port: http_port_flag,
+            bind,
         } => {
             if let Err(e) = docker_preflight() {
                 eprintln!("{} {e}", "Error:".red());
@@ -3314,6 +3420,18 @@ pub async fn run() {
             }
 
             let mut state = ensure_local_state();
+            let bind_changed = bind.is_some_and(|host| host != state.bind_host);
+            if let Some(bind_host) = bind.filter(|host| *host != state.bind_host) {
+                state.bind_host = bind_host;
+                save_local_state(&state);
+            }
+            if !state.bind_host.is_loopback() {
+                eprintln!(
+                    "{} local engine and Studio are exposed on {}. Studio contains operator credentials; use only a trusted network.",
+                    "Warning:".yellow(),
+                    state.bind_host.to_string().cyan()
+                );
+            }
             ensure_gitignore(&[
                 ".env.local",
                 "lux/.lux-local.json",
@@ -3322,7 +3440,10 @@ pub async fn run() {
             ]);
 
             // Already running? Just reprint the connection block.
-            if docker_container_state(&state.container).as_deref() == Some("running") && !fresh {
+            let engine_running =
+                docker_container_state(&state.container).as_deref() == Some("running");
+            let bindings_match = engine_running && engine_bindings_match(&state);
+            if engine_running && !fresh && bindings_match {
                 println!("{}", "Local Lux engine already running.".green());
                 refresh_local_profile(&state).unwrap_or_else(|e| {
                     eprintln!("{} {e}", "Failed to refresh local env profile:".red());
@@ -3339,6 +3460,22 @@ pub async fn run() {
                     ensure_studio(&mut state, false);
                 }
                 return;
+            }
+
+            if engine_running && !fresh && !bindings_match {
+                println!(
+                    "{} Recreating the local containers on {} without deleting the data volume.",
+                    "Binding changed.".yellow(),
+                    state.bind_host
+                );
+            }
+
+            // Never leave a credential-bearing Studio container published on
+            // the previous address, including when --no-studio was requested.
+            if (bind_changed || (engine_running && !bindings_match))
+                && docker_container_state(&state.studio_container).is_some()
+            {
+                let _ = docker_output(&["rm", "-f", &state.studio_container]);
             }
 
             // Remove any stale container (stopped, or `--fresh`).
@@ -3360,7 +3497,7 @@ pub async fn run() {
             // a flag, fall back to the configured port and auto-bump past any
             // conflict so multiple projects can run at once.
             let pin = |label: &str, p: u16| {
-                if !port_is_free(p) {
+                if !port_is_free(state.bind_host, p) {
                     eprintln!("{} {label} port {p} is already in use", "Error:".red());
                     std::process::exit(1);
                 }
@@ -3368,7 +3505,7 @@ pub async fn run() {
             };
             let resp_port = match resp_port_flag {
                 Some(p) => pin("RESP", p),
-                None => free_port_from(state.resp_port),
+                None => free_port_from(state.bind_host, state.resp_port),
             };
             let http_port = match http_port_flag {
                 Some(p) => {
@@ -3378,7 +3515,7 @@ pub async fn run() {
                     }
                     pin("HTTP", p)
                 }
-                None => free_port_from(state.http_port),
+                None => free_port_from(state.bind_host, state.http_port),
             };
             if resp_port != state.resp_port || http_port != state.http_port {
                 // Only narrate auto-bumps; an explicit flag is the user's choice.
@@ -3420,7 +3557,11 @@ pub async fn run() {
 
             // Apply migrations (idempotent). Seed only on a fresh volume, since
             // seed scripts generally aren't idempotent.
-            let conn = match DirectConn::connect("localhost", state.resp_port, &state.password) {
+            let conn = match DirectConn::connect(
+                &state.connection_host(),
+                state.resp_port,
+                &state.password,
+            ) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("{} {e}", "Error:".red());
@@ -5791,7 +5932,11 @@ async fn resolve_migrate_target(
                 .unwrap_or(DEFAULT_RESP_PORT);
             let owned_pw = password.map(str::to_string).or_else(local_pw);
             let pw = owned_pw.as_deref().unwrap_or("");
-            match DirectConn::connect("localhost", local_port, pw) {
+            let local_host = local_state
+                .as_ref()
+                .map(LocalState::connection_host)
+                .unwrap_or_else(|| "localhost".to_string());
+            match DirectConn::connect(&local_host, local_port, pw) {
                 Ok(conn) => return MigrateTarget::Direct(Box::new(conn)),
                 Err(e) => {
                     eprintln!(
@@ -6223,7 +6368,8 @@ async fn doctor_local(fix: bool, checks: &mut Vec<DoctorCheck>) {
         profile_fixed,
     );
 
-    let conn = match DirectConn::connect("localhost", state.resp_port, &state.password) {
+    let conn = match DirectConn::connect(&state.connection_host(), state.resp_port, &state.password)
+    {
         Ok(conn) => conn,
         Err(error) => {
             add_doctor_check(checks, "local", "engine connection", "fail", error, false);
@@ -7069,14 +7215,43 @@ mod tests {
 
     #[test]
     fn free_port_returns_preferred_when_open() {
-        // Bind on 0.0.0.0 (what `port_is_free` probes, matching Docker's publish
-        // bind), then confirm free_port_from skips it to a higher free one.
-        let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let bind_host = default_bind_host();
+        let listener = std::net::TcpListener::bind((bind_host, 0)).unwrap();
         let taken = listener.local_addr().unwrap().port();
-        let chosen = free_port_from(taken);
+        let chosen = free_port_from(bind_host, taken);
         assert_ne!(chosen, taken, "should not pick the bound port");
         assert!(chosen > taken);
-        assert!(port_is_free(chosen));
+        assert!(port_is_free(bind_host, chosen));
+    }
+
+    #[test]
+    fn docker_port_maps_are_address_scoped() {
+        assert_eq!(
+            docker_port_map("127.0.0.1".parse().unwrap(), 5890, 5890),
+            "127.0.0.1:5890:5890"
+        );
+        assert_eq!(
+            docker_port_map("::1".parse().unwrap(), 5891, 80),
+            "[::1]:5891:80"
+        );
+    }
+
+    #[test]
+    fn published_bindings_must_match_address_and_port() {
+        let loopback = "127.0.0.1".parse().unwrap();
+        assert!(published_binding_matches("127.0.0.1 5890", loopback, 5890));
+        assert!(!published_binding_matches("0.0.0.0 5890", loopback, 5890));
+        assert!(!published_binding_matches("127.0.0.1 5891", loopback, 5890));
+        assert!(!published_binding_matches("127.0.0.1", loopback, 5890));
+    }
+
+    #[test]
+    fn start_bind_flag_parses_ip_addresses() {
+        let cli = Cli::try_parse_from(["lux", "start", "--bind", "192.0.2.10"]).unwrap();
+        let Commands::Start { bind, .. } = cli.command else {
+            panic!("expected start command");
+        };
+        assert_eq!(bind, Some("192.0.2.10".parse().unwrap()));
     }
 
     #[test]
@@ -7301,6 +7476,7 @@ mod tests {
             container: "lux-sample-abc123".to_string(),
             volume: "lux-sample-abc123-data".to_string(),
             image: LOCAL_ENGINE_IMAGE.to_string(),
+            bind_host: default_bind_host(),
             studio_port: DEFAULT_STUDIO_PORT,
             studio_container: "lux-sample-abc123-studio".to_string(),
         }
@@ -7322,6 +7498,44 @@ mod tests {
         );
         assert_eq!(env[2], "LUX_PUBLISHABLE_KEY=lux_pub_local_cafef00d");
         assert_eq!(env[3], "LUX_SECRET_KEY=lux_sec_local_deadbeef");
+    }
+
+    #[test]
+    fn legacy_local_state_defaults_to_loopback() {
+        let legacy = serde_json::json!({
+            "password": "secret",
+            "publishable_key": "publishable",
+            "secret_key": "secret",
+            "http_port": 5890,
+            "resp_port": 6379,
+            "container": "lux-test",
+            "volume": "lux-test-data",
+            "image": LOCAL_ENGINE_IMAGE,
+            "studio_port": DEFAULT_STUDIO_PORT,
+            "studio_container": "lux-test-studio"
+        });
+        let state: LocalState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(state.bind_host, default_bind_host());
+        assert_eq!(state.connection_host(), "localhost");
+    }
+
+    #[test]
+    fn local_state_urls_support_ipv6() {
+        let state = LocalState {
+            bind_host: "::1".parse().unwrap(),
+            ..sample_state()
+        };
+        assert_eq!(state.lux_url(), "http://localhost:5890");
+
+        let state = LocalState {
+            bind_host: "2001:db8::10".parse().unwrap(),
+            ..sample_state()
+        };
+        assert_eq!(state.lux_url(), "http://[2001:db8::10]:5890");
+        assert_eq!(
+            state.direct_url(),
+            "lux://:lux_sec_local_deadbeef@[2001:db8::10]:6379"
+        );
     }
 
     #[test]

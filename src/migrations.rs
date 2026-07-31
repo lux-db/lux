@@ -25,8 +25,28 @@ use crate::tables::{self, SelectPlan, SelectResult, SharedSchemaCache};
 
 pub(crate) const LEDGER_TABLE: &str = "__migrations";
 pub(crate) const API_VERSION: &str = "1";
+pub(crate) const STUDIO_API_VERSION: u32 = 1;
 pub(crate) const CHECKSUM_ALGORITHM: &str = "sha256";
 pub(crate) const CAPABILITIES: &[&str] = &[
+    "engine.exec",
+    "engine.tables",
+    "engine.vectors",
+    "engine.streams",
+    "engine.timeseries",
+    "engine.realtime",
+    "engine.migrations",
+    "engine.snapshots.export",
+    "engine.snapshots.restore",
+    "engine.auth.users",
+    "engine.auth.sessions",
+    "engine.auth.grants",
+    "engine.auth.keys",
+    "engine.auth.providers.google",
+    "engine.auth.providers.github",
+    "engine.auth.providers.apple.native",
+    "engine.auth.providers.apple.web",
+    "engine.push.apns",
+    "engine.push.web",
     "migrations.plan",
     "migrations.apply",
     "migrations.repair",

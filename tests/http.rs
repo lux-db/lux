@@ -58,6 +58,13 @@ fn http_stays_responsive_while_resp_lua_script_is_busy() {
         "HTTP health should respond while Lua is busy: {health}"
     );
     assert!(health.contains("\"lux\""), "health body: {health}");
+    let parsed: serde_json::Value = serde_json::from_str(&health).unwrap();
+    assert_eq!(parsed["studio_api"], 1);
+    assert!(parsed["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|capability| capability == "engine.tables"));
 
     let (status, ping) = http_request(http, "GET", "/v1/ping", None, None);
     assert_eq!(
