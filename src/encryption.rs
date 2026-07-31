@@ -336,9 +336,11 @@ impl EncryptionKeyring {
         if let Ok((sealed_table, sealed_field, sealed_pk, sealed_envelope)) =
             decode_sealed_value(envelope)
         {
-            let plaintext =
-                self.decrypt(&sealed_table, &sealed_field, &sealed_pk, &sealed_envelope)?;
-            return self.seal(&sealed_table, &sealed_field, &sealed_pk, &plaintext);
+            if sealed_table != table || sealed_field != field || sealed_pk != pk {
+                return Err("ERR sealed value location mismatch".to_string());
+            }
+            let plaintext = self.decrypt(table, field, pk, &sealed_envelope)?;
+            return self.seal(table, field, pk, &plaintext);
         }
         let plaintext = self.decrypt(table, field, pk, envelope)?;
         self.encrypt(table, field, pk, &plaintext)
@@ -369,9 +371,18 @@ impl EncryptionKeyring {
         Ok(value)
     }
 
-    pub(crate) fn unseal(&self, value: &[u8]) -> Result<Vec<u8>, String> {
-        let (table, field, pk, envelope) = decode_sealed_value(value)?;
-        self.decrypt(&table, &field, &pk, &envelope)
+    pub(crate) fn unseal(
+        &self,
+        table: &str,
+        field: &str,
+        pk: &str,
+        value: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let (sealed_table, sealed_field, sealed_pk, envelope) = decode_sealed_value(value)?;
+        if sealed_table != table || sealed_field != field || sealed_pk != pk {
+            return Err("ERR sealed value location mismatch".to_string());
+        }
+        self.decrypt(table, field, pk, &envelope)
     }
 
     pub(crate) fn has_active_key(&self) -> bool {
@@ -1238,14 +1249,40 @@ mod adversarial_tests {
 
         ring.rotate(Some("k2")).unwrap();
         let rewrapped = ring
-            .reencrypt("ignored", "ignored", "ignored", &sealed)
+            .reencrypt("auth.providers", "apple_private_key", "apple", &sealed)
             .unwrap();
         let remaining = ring.remaining_key_ids_without("k1");
         assert!(EncryptionKeyring::envelope_decryptable_by_any(
             &rewrapped, &remaining
         ));
         ring.retire("k1").unwrap();
-        assert_eq!(ring.unseal(&rewrapped).unwrap(), b"p8");
+        assert_eq!(
+            ring.unseal("auth.providers", "apple_private_key", "apple", &rewrapped)
+                .unwrap(),
+            b"p8"
+        );
+    }
+
+    #[test]
+    fn sealed_values_reject_relocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let ring = EncryptionKeyring::open(&EncryptionConfig::default(), &data_dir).unwrap();
+        ring.init(Some("k1")).unwrap();
+        let sealed = ring
+            .seal("auth.providers", "apple_private_key", "apple", b"p8")
+            .unwrap();
+
+        assert_eq!(
+            ring.unseal("auth.providers", "apple_private_key", "google", &sealed)
+                .unwrap_err(),
+            "ERR sealed value location mismatch"
+        );
+        assert_eq!(
+            ring.reencrypt("auth.providers", "client_secret", "apple", &sealed)
+                .unwrap_err(),
+            "ERR sealed value location mismatch"
+        );
     }
 
     // ---- seal sourcing: env seal, file->env migration, rotation ----

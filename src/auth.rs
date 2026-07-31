@@ -2304,7 +2304,7 @@ fn admin_upsert_apple_provider(
         return error(
             400,
             "Bad Request",
-            "Apple web sign-in requires an HTTPS redirect_uri with a public domain",
+            "Apple web sign-in requires an HTTPS redirect_uri with a public domain and no fragment",
         );
     }
     if !native_ok && !web_ok {
@@ -3890,7 +3890,12 @@ fn unseal_apple_private_key(store: &Store, stored: &str) -> Result<String, Strin
     if !crate::encryption::EncryptionKeyring::is_encrypted_value(stored.as_bytes()) {
         return Err("ERR refusing to load an unencrypted Apple private key".to_string());
     }
-    let plain = store.encryption().unseal(stored.as_bytes())?;
+    let plain = store.encryption().unseal(
+        PROVIDERS_TABLE,
+        "apple_private_key",
+        APPLE_KEY_AAD_PK,
+        stored.as_bytes(),
+    )?;
     String::from_utf8(plain).map_err(|e| format!("ERR apple private key not utf-8: {e}"))
 }
 
@@ -3940,7 +3945,11 @@ fn valid_apple_web_redirect_uri(value: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(value) else {
         return false;
     };
-    if url.scheme() != "https" || url.username() != "" || url.password().is_some() {
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
         return false;
     }
     let Some(host) = url.host_str() else {
@@ -9183,6 +9192,17 @@ mod tests {
         let (status, _, body) = admin_upsert_apple_provider(&invalid_redirect, &store, &cache);
         assert_eq!(status, 400, "{body}");
         assert!(body.contains("HTTPS redirect_uri"), "{body}");
+
+        let fragment_redirect = json!({
+            "apple_services_id": "com.pompeii.web",
+            "apple_team_id": "TEAM123456",
+            "apple_key_id": "KEY7890ABC",
+            "apple_private_key": APPLE_TEST_EC_P8,
+            "redirect_uri": "https://app.example.com/auth/callback/apple#fragment",
+        });
+        let (status, _, body) = admin_upsert_apple_provider(&fragment_redirect, &store, &cache);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("no fragment"), "{body}");
     }
 
     #[test]
