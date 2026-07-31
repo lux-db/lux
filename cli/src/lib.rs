@@ -293,7 +293,10 @@ enum AuthProviderAction {
     Google {
         #[arg(long)]
         client_id: String,
-        #[arg(long, help = "Required for initial setup; omit later to keep the stored secret")]
+        #[arg(
+            long,
+            help = "Required for initial setup; omit later to keep the stored secret"
+        )]
         client_secret: Option<String>,
         #[arg(long, help = "Override the callback URL (default: engine callback)")]
         redirect_uri: Option<String>,
@@ -308,7 +311,10 @@ enum AuthProviderAction {
     Github {
         #[arg(long)]
         client_id: String,
-        #[arg(long, help = "Required for initial setup; omit later to keep the stored secret")]
+        #[arg(
+            long,
+            help = "Required for initial setup; omit later to keep the stored secret"
+        )]
         client_secret: Option<String>,
         #[arg(long, help = "Override the callback URL (default: engine callback)")]
         redirect_uri: Option<String>,
