@@ -1014,6 +1014,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rmp",
+ "rsa",
  "serde",
  "serde_json",
  "sha1_smol",

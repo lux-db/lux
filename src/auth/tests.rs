@@ -1,0 +1,2839 @@
+use std::sync::Arc;
+
+use p256::pkcs8::EncodePublicKey;
+use parking_lot::RwLock;
+use rsa::pkcs8::EncodePrivateKey as EncodeRsaPrivateKey;
+use rsa::traits::PublicKeyParts;
+use rsa::RsaPrivateKey;
+
+use super::*;
+use crate::tables::SchemaCache;
+
+fn principal(uid: &str) -> AuthPrincipal {
+    AuthPrincipal {
+        user_id: uid.into(),
+        email: "u@x.dev".into(),
+        session_id: "sess".into(),
+        role: "authenticated".into(),
+        is_anonymous: false,
+    }
+}
+
+#[test]
+fn api_key_cache_is_isolated_per_store() {
+    let store_a = Store::new();
+    let store_b = Store::new();
+    let cache_a = Arc::new(RwLock::new(SchemaCache::new()));
+    let cache_b = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store_a, &cache_a, &store_a.config().auth).unwrap();
+    bootstrap(&store_b, &cache_b, &store_b.config().auth).unwrap();
+
+    let raw_key = "lux_sec_store_a_only";
+    insert_api_key(
+        &store_a,
+        &cache_a,
+        raw_key,
+        ApiKeyKind::Secret,
+        "store-a",
+        Instant::now(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        lookup_api_key(raw_key, &store_a, &cache_a).unwrap(),
+        Some(ApiKeyKind::Secret)
+    );
+    assert_eq!(
+        lookup_api_key(raw_key, &store_b, &cache_b).unwrap(),
+        None,
+        "a cache hit from store A must not authenticate against store B"
+    );
+}
+
+#[test]
+fn row_is_anonymous_detects_provider() {
+    let anon = HashMap::from([(
+        "raw_app_meta_data".to_string(),
+        r#"{"provider":"anonymous"}"#.to_string(),
+    )]);
+    assert!(row_is_anonymous(&anon));
+    let real = HashMap::from([(
+        "raw_app_meta_data".to_string(),
+        r#"{"provider":"email","providers":["email"]}"#.to_string(),
+    )]);
+    assert!(!row_is_anonymous(&real));
+    assert!(!row_is_anonymous(&HashMap::new())); // missing metadata -> not anonymous
+}
+
+fn cond(c: &str, o: &str, v: &str) -> crate::grants::ResolvedCond {
+    crate::grants::ResolvedCond {
+        column: c.into(),
+        op: o.into(),
+        value: v.into(),
+    }
+}
+
+#[test]
+fn add_column_if_missing_is_idempotent_and_leaves_existing_schema_alone() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+
+    create_table_if_missing(
+        &store,
+        &cache,
+        "widgets",
+        &["id STR PRIMARY KEY,", "name STR"],
+        now,
+    )
+    .unwrap();
+    crate::tables::table_insert(
+        &store,
+        &cache,
+        "widgets",
+        &[("id", "w1"), ("name", "bolt")],
+        now,
+    )
+    .unwrap();
+
+    add_column_if_missing(&store, &cache, "widgets", "environment STR", now).unwrap();
+    let schema = crate::tables::table_schema(&store, &cache, "widgets", now).unwrap();
+    assert!(
+        schema.iter().any(|f| f.starts_with("environment ")),
+        "column not added: {schema:?}"
+    );
+
+    // Called on every `ensure_tables`, so a second call must be a no-op
+    // rather than the "field already exists" error `table_add_column` raises.
+    add_column_if_missing(&store, &cache, "widgets", "environment STR", now).unwrap();
+    let after = crate::tables::table_schema(&store, &cache, "widgets", now).unwrap();
+    assert_eq!(schema, after);
+
+    // The existing row survives the backfill.
+    let row = find_row_by_field(&store, &cache, "widgets", "id", "w1", now)
+        .unwrap()
+        .expect("row should survive the column add");
+    assert_eq!(row.get("name").map(String::as_str), Some("bolt"));
+}
+
+// `table_add_column` does not log itself, and internal callers never reach
+// `execute_with_wal`, so without the explicit log in `add_column_if_missing`
+// the column would vanish on any restart that replays from the WAL.
+#[test]
+fn add_column_if_missing_survives_wal_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(crate::ServerConfig {
+        storage: crate::StorageConfig {
+            mode: crate::StorageMode::Tiered,
+            dir: dir.path().to_string_lossy().to_string(),
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Arc::new(Store::new_with_config(config.clone()));
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+
+    create_table_if_missing(
+        &store,
+        &cache,
+        "widgets",
+        &["id STR PRIMARY KEY,", "name STR"],
+        now,
+    )
+    .unwrap();
+    add_column_if_missing(&store, &cache, "widgets", "environment STR", now).unwrap();
+    store.fsync_wal();
+
+    let restored = Arc::new(Store::new_with_config(config));
+    restored.replay_wal(&crate::pubsub::Broker::new());
+    let restored_cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let schema = crate::tables::table_schema(&restored, &restored_cache, "widgets", now).unwrap();
+    assert!(
+        schema.iter().any(|f| f.starts_with("environment ")),
+        "column lost on replay: {schema:?}"
+    );
+}
+
+#[test]
+fn read_grant_enforced_end_to_end() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+
+    // GRANT read ON messages WHERE user_id = auth.uid()
+    let grant = crate::grants::parse_grant(&[
+        "read",
+        "ON",
+        "messages",
+        "WHERE",
+        "user_id",
+        "=",
+        "auth.uid()",
+    ])
+    .unwrap();
+    put_grant(&store, &cache, &grant, now).unwrap();
+
+    let p = principal("123abc");
+    // Read grant resolves to a filter scoping the query to the caller's
+    // own rows (RLS USING) -- the caller's uid is substituted for auth.uid().
+    let filter = read_filter(&store, &cache, &p, "messages", now).unwrap();
+    assert_eq!(filter, "user_id = 123abc");
+    // A different principal gets a filter scoped to *their* uid, never others'.
+    let other = principal("999zzz");
+    let other_filter = read_filter(&store, &cache, &other, "messages", now).unwrap();
+    assert_eq!(other_filter, "user_id = 999zzz");
+    // No grant on another table -> deny-by-default (Err, not an open filter).
+    assert!(read_filter(&store, &cache, &p, "secrets", now).is_err());
+}
+
+#[test]
+fn write_grant_with_check_end_to_end() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+
+    let grant = crate::grants::parse_grant(&[
+        "write",
+        "ON",
+        "messages",
+        "WHERE",
+        "user_id",
+        "=",
+        "auth.uid()",
+    ])
+    .unwrap();
+    put_grant(&store, &cache, &grant, now).unwrap();
+    let p = principal("123abc");
+
+    // Inserting a row owned by self -> allowed.
+    let own = |c: &str| match c {
+        "user_id" => Some("123abc".to_string()),
+        _ => None,
+    };
+    assert!(check_write_row(&store, &cache, &p, "messages", own, now).is_ok());
+    // Inserting a row for someone else -> denied (WITH CHECK).
+    let other = |c: &str| match c {
+        "user_id" => Some("evil".to_string()),
+        _ => None,
+    };
+    assert!(check_write_row(&store, &cache, &p, "messages", other, now).is_err());
+    // UPDATE/DELETE: the write grant resolves to a filter that scopes the
+    // statement to the caller's own rows (RLS USING).
+    let filter = write_filter(&store, &cache, &p, "messages", now).unwrap();
+    assert_eq!(filter, "user_id = 123abc");
+    // No write grant on another table -> deny-by-default (Err).
+    assert!(write_filter(&store, &cache, &p, "other", now).is_err());
+}
+
+#[test]
+fn update_with_check_single_condition() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    grant(
+        &store,
+        &cache,
+        &["write", "ON", "t", "WHERE", "owner", "=", "auth.uid()"],
+        now,
+    );
+    let p = principal("u1");
+    // moving ownership away -> rejected
+    assert!(check_update_set(&store, &cache, &p, "t", &[("owner", "u2")], now).is_err());
+    // setting owner to self -> ok
+    assert!(check_update_set(&store, &cache, &p, "t", &[("owner", "u1")], now).is_ok());
+    // a non-grant column -> ok (grant column untouched)
+    assert!(check_update_set(&store, &cache, &p, "t", &[("body", "hi")], now).is_ok());
+    // empty set -> ok
+    assert!(check_update_set(&store, &cache, &p, "t", &[], now).is_ok());
+    // no write grant on another table -> deny-by-default
+    assert!(check_update_set(&store, &cache, &p, "other", &[("x", "y")], now).is_err());
+}
+
+#[test]
+fn update_with_check_multi_condition_enforces_each() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    grant(
+        &store,
+        &cache,
+        &[
+            "write",
+            "ON",
+            "t",
+            "WHERE",
+            "owner",
+            "=",
+            "auth.uid()",
+            "AND",
+            "status",
+            "=",
+            "active",
+        ],
+        now,
+    );
+    let p = principal("u1");
+    // changing a *second* grant column to an invalid value is caught even
+    // though owner is untouched (every condition is enforced, not just the first)
+    assert!(check_update_set(&store, &cache, &p, "t", &[("status", "archived")], now).is_err());
+    assert!(check_update_set(&store, &cache, &p, "t", &[("status", "active")], now).is_ok());
+    assert!(check_update_set(&store, &cache, &p, "t", &[("owner", "u2")], now).is_err());
+    // both set validly -> ok; one of them invalid -> rejected
+    assert!(check_update_set(
+        &store,
+        &cache,
+        &p,
+        "t",
+        &[("owner", "u1"), ("status", "active")],
+        now
+    )
+    .is_ok());
+    assert!(check_update_set(
+        &store,
+        &cache,
+        &p,
+        "t",
+        &[("owner", "u1"), ("status", "x")],
+        now
+    )
+    .is_err());
+    // touching neither grant column -> ok
+    assert!(check_update_set(&store, &cache, &p, "t", &[("body", "z")], now).is_ok());
+}
+
+#[test]
+fn update_with_check_comparison_operator() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    grant(
+        &store,
+        &cache,
+        &["write", "ON", "t", "WHERE", "priority", ">=", "5"],
+        now,
+    );
+    let p = principal("u1");
+    // the >= operator is applied to the set value, numerically
+    assert!(check_update_set(&store, &cache, &p, "t", &[("priority", "3")], now).is_err());
+    assert!(check_update_set(&store, &cache, &p, "t", &[("priority", "5")], now).is_ok());
+    assert!(check_update_set(&store, &cache, &p, "t", &[("priority", "9")], now).is_ok());
+}
+
+#[test]
+fn revoke_removes_grant() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    let grant = crate::grants::parse_grant(&[
+        "read",
+        "ON",
+        "messages",
+        "WHERE",
+        "user_id",
+        "=",
+        "auth.uid()",
+    ])
+    .unwrap();
+    put_grant(&store, &cache, &grant, now).unwrap();
+    let p = principal("123abc");
+    assert!(read_filter(&store, &cache, &p, "messages", now).is_ok());
+    delete_grant(&store, &cache, "messages", crate::grants::Scope::Read, now).unwrap();
+    // After revoke -> deny-by-default.
+    assert!(read_filter(&store, &cache, &p, "messages", now).is_err());
+}
+
+#[test]
+fn nested_membership_subquery_read_filter_resolves() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    crate::tables::table_create(
+        &store,
+        &cache,
+        "profiles",
+        &["id", "STR", "PRIMARY", "KEY,", "name", "STR"],
+        now,
+    )
+    .unwrap();
+    crate::tables::table_create(
+        &store,
+        &cache,
+        "members",
+        &[
+            "id", "STR", "PRIMARY", "KEY,", "user_id", "STR,", "team_id", "STR",
+        ],
+        now,
+    )
+    .unwrap();
+    for (id, name) in [("alice", "Alice"), ("bob", "Bob"), ("cyd", "Cyd")] {
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "profiles",
+            &[("id", id), ("name", name)],
+            now,
+        )
+        .unwrap();
+    }
+    for (id, uid, team) in [
+        ("1", "alice", "team-a"),
+        ("2", "bob", "team-a"),
+        ("3", "cyd", "team-b"),
+    ] {
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "members",
+            &[("id", id), ("user_id", uid), ("team_id", team)],
+            now,
+        )
+        .unwrap();
+    }
+    grant(
+        &store,
+        &cache,
+        &[
+            "read",
+            "ON",
+            "profiles",
+            "WHERE",
+            "id",
+            "IN",
+            "(",
+            "SELECT",
+            "user_id",
+            "FROM",
+            "members",
+            "WHERE",
+            "team_id",
+            "IN",
+            "(",
+            "SELECT",
+            "team_id",
+            "FROM",
+            "members",
+            "WHERE",
+            "user_id",
+            "=",
+            "auth.uid()",
+            ")",
+            ")",
+        ],
+        now,
+    );
+    let filter = read_filter(&store, &cache, &principal("alice"), "profiles", now).unwrap();
+    assert!(filter.starts_with("id IN ( "), "got: {filter}");
+    assert!(filter.contains("alice"), "got: {filter}");
+    assert!(filter.contains("bob"), "got: {filter}");
+    assert!(!filter.contains("cyd"), "got: {filter}");
+
+    let deps =
+        read_filter_dependencies(&store, &cache, &principal("alice"), "profiles", now).unwrap();
+    assert_eq!(deps, vec!["members".to_string()]);
+}
+
+#[test]
+fn repeated_profile_read_grants_accumulate_as_alternatives() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    crate::tables::table_create(
+        &store,
+        &cache,
+        "profiles",
+        &["id", "STR", "PRIMARY", "KEY,", "name", "STR"],
+        now,
+    )
+    .unwrap();
+    crate::tables::table_create(
+        &store,
+        &cache,
+        "members",
+        &[
+            "id", "STR", "PRIMARY", "KEY,", "user_id", "STR,", "team_id", "STR",
+        ],
+        now,
+    )
+    .unwrap();
+
+    grant(
+        &store,
+        &cache,
+        &[
+            "read,",
+            "write",
+            "ON",
+            "profiles",
+            "WHERE",
+            "id",
+            "=",
+            "auth.uid()",
+        ],
+        now,
+    );
+    grant(
+        &store,
+        &cache,
+        &[
+            "read",
+            "ON",
+            "profiles",
+            "WHERE",
+            "id",
+            "IN",
+            "(",
+            "SELECT",
+            "user_id",
+            "FROM",
+            "members",
+            "WHERE",
+            "team_id",
+            "IN",
+            "(",
+            "SELECT",
+            "team_id",
+            "FROM",
+            "members",
+            "WHERE",
+            "user_id",
+            "=",
+            "auth.uid()",
+            ")",
+            ")",
+        ],
+        now,
+    );
+
+    let alice_filter = read_filter(&store, &cache, &principal("alice"), "profiles", now).unwrap();
+    assert_eq!(alice_filter, "id IN ( alice )");
+    assert_eq!(
+        write_filter(&store, &cache, &principal("alice"), "profiles", now).unwrap(),
+        "id = alice"
+    );
+
+    crate::tables::table_insert(
+        &store,
+        &cache,
+        "members",
+        &[("id", "1"), ("user_id", "alice"), ("team_id", "team-a")],
+        now,
+    )
+    .unwrap();
+    crate::tables::table_insert(
+        &store,
+        &cache,
+        "members",
+        &[("id", "2"), ("user_id", "bob"), ("team_id", "team-a")],
+        now,
+    )
+    .unwrap();
+
+    let teamed_filter = read_filter(&store, &cache, &principal("alice"), "profiles", now).unwrap();
+    assert!(
+        teamed_filter.starts_with("id IN ( "),
+        "got: {teamed_filter}"
+    );
+    assert!(teamed_filter.contains("alice"), "got: {teamed_filter}");
+    assert!(teamed_filter.contains("bob"), "got: {teamed_filter}");
+}
+
+#[test]
+fn repeated_read_grants_on_different_columns_render_or_alternatives() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    crate::tables::table_create(
+        &store,
+        &cache,
+        "invites",
+        &[
+            "id", "STR", "PRIMARY", "KEY,", "team_id", "STR,", "email", "STR",
+        ],
+        now,
+    )
+    .unwrap();
+    crate::tables::table_create(
+        &store,
+        &cache,
+        "members",
+        &[
+            "id", "STR", "PRIMARY", "KEY,", "user_id", "STR,", "team_id", "STR",
+        ],
+        now,
+    )
+    .unwrap();
+    crate::tables::table_insert(
+        &store,
+        &cache,
+        "members",
+        &[("id", "1"), ("user_id", "alice"), ("team_id", "team-a")],
+        now,
+    )
+    .unwrap();
+
+    grant(
+        &store,
+        &cache,
+        &[
+            "read",
+            "ON",
+            "invites",
+            "WHERE",
+            "team_id",
+            "IN",
+            "(",
+            "SELECT",
+            "team_id",
+            "FROM",
+            "members",
+            "WHERE",
+            "user_id",
+            "=",
+            "auth.uid()",
+            ")",
+        ],
+        now,
+    );
+    grant(
+        &store,
+        &cache,
+        &["read", "ON", "invites", "WHERE", "email", "=", "auth.email"],
+        now,
+    );
+
+    let filter = read_filter(&store, &cache, &principal("alice"), "invites", now).unwrap();
+    assert_eq!(filter, "team_id IN ( team-a ) OR email = u@x.dev");
+}
+
+// ── RLS auto-filter (USING) coverage ──
+
+fn grant(store: &Store, cache: &SharedSchemaCache, args: &[&str], now: Instant) {
+    let g = crate::grants::parse_grant(args).unwrap();
+    put_grant(store, cache, &g, now).unwrap();
+}
+
+#[test]
+fn read_filter_conds_returns_structured_conditions() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    grant(
+        &store,
+        &cache,
+        &[
+            "read",
+            "ON",
+            "messages",
+            "WHERE",
+            "user_id",
+            "=",
+            "auth.uid()",
+        ],
+        now,
+    );
+    let p = principal("abc123");
+    let conds = read_filter_conds(&store, &cache, &p, "messages", now).unwrap();
+    assert_eq!(
+        conds,
+        vec![crate::grants::EnforcedCondition::Cmp(cond(
+            "user_id", "=", "abc123"
+        ))]
+    );
+}
+
+#[test]
+fn unconditional_grant_yields_empty_filter() {
+    // GRANT read ON public_posts (no WHERE) -> everyone with the grant reads
+    // all rows; the filter is empty (no narrowing), but access is NOT denied.
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    grant(&store, &cache, &["read", "ON", "public_posts"], now);
+    let p = principal("anyone");
+    let filter = read_filter(&store, &cache, &p, "public_posts", now).unwrap();
+    assert_eq!(filter, "");
+    assert!(read_filter_conds(&store, &cache, &p, "public_posts", now)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn multi_condition_grant_renders_and_chain() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    grant(
+        &store,
+        &cache,
+        &[
+            "read",
+            "ON",
+            "messages",
+            "WHERE",
+            "user_id",
+            "=",
+            "auth.uid()",
+            "AND",
+            "room",
+            "=",
+            "general",
+        ],
+        now,
+    );
+    let p = principal("u1");
+    let filter = read_filter(&store, &cache, &p, "messages", now).unwrap();
+    assert_eq!(filter, "user_id = u1 AND room = general");
+}
+
+#[test]
+fn grant_resolves_non_uid_claims() {
+    // auth.role / auth.email operands resolve from the principal's claims.
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    grant(
+        &store,
+        &cache,
+        &["read", "ON", "audit", "WHERE", "owner", "=", "auth.email"],
+        now,
+    );
+    let p = principal("u1");
+    let filter = read_filter(&store, &cache, &p, "audit", now).unwrap();
+    assert_eq!(filter, "owner = u@x.dev");
+}
+
+fn encrypted_test_store() -> Store {
+    Store::new_with_config(Arc::new(crate::ServerConfig {
+        encryption: crate::EncryptionConfig {
+            active_key_id: Some("k1".to_string()),
+            keys: vec![crate::EncryptionKeyConfig {
+                id: "k1".to_string(),
+                secret: b"grant-encryption-secret".to_vec(),
+                decrypt_only: false,
+            }],
+            ..Default::default()
+        },
+        ..crate::ServerConfig::default()
+    }))
+}
+
+fn selected_rows(result: crate::tables::SelectResult) -> Vec<Vec<(String, String)>> {
+    match result {
+        crate::tables::SelectResult::Rows(rows) => rows,
+        crate::tables::SelectResult::Aggregate(_) => panic!("expected row result"),
+    }
+}
+
+#[test]
+fn read_grant_on_encrypted_searchable_column_filters_through_blind_index() {
+    let store = encrypted_test_store();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    crate::tables::table_create(
+        &store,
+        &cache,
+        "messages",
+        &[
+            "id",
+            "STR",
+            "PRIMARY",
+            "KEY,",
+            "owner_email",
+            "STR",
+            "ENCRYPTED",
+            "SEARCHABLE,",
+            "body",
+            "STR",
+        ],
+        now,
+    )
+    .unwrap();
+    crate::tables::table_insert(
+        &store,
+        &cache,
+        "messages",
+        &[
+            ("id", "m1"),
+            ("owner_email", "u@x.dev"),
+            ("body", "allowed"),
+        ],
+        now,
+    )
+    .unwrap();
+    crate::tables::table_insert(
+        &store,
+        &cache,
+        "messages",
+        &[
+            ("id", "m2"),
+            ("owner_email", "other@x.dev"),
+            ("body", "blocked"),
+        ],
+        now,
+    )
+    .unwrap();
+    grant(
+        &store,
+        &cache,
+        &[
+            "read",
+            "ON",
+            "messages",
+            "WHERE",
+            "owner_email",
+            "=",
+            "auth.email",
+        ],
+        now,
+    );
+
+    let p = principal("u1");
+    let filter = read_filter(&store, &cache, &p, "messages", now).unwrap();
+    assert_eq!(filter, "owner_email = u@x.dev");
+    let mut tokens = vec!["*", "FROM", "messages", "WHERE"];
+    tokens.extend(filter.split_whitespace());
+    let plan = crate::tables::parse_select(&tokens).unwrap();
+    let rows = selected_rows(crate::tables::table_select(&store, &cache, &plan, now).unwrap());
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].iter().any(|(k, v)| k == "body" && v == "allowed"));
+    assert!(rows[0]
+        .iter()
+        .any(|(k, v)| k == "owner_email" && v == "u@x.dev"));
+}
+
+#[test]
+fn grant_on_encrypted_non_searchable_column_is_rejected() {
+    let store = encrypted_test_store();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    crate::tables::table_create(
+        &store,
+        &cache,
+        "messages",
+        &[
+            "id",
+            "UUID",
+            "PRIMARY",
+            "KEY,",
+            "secret",
+            "STR",
+            "ENCRYPTED",
+        ],
+        now,
+    )
+    .unwrap();
+    let grant = crate::grants::parse_grant(&[
+        "read",
+        "ON",
+        "messages",
+        "WHERE",
+        "secret",
+        "=",
+        "auth.email",
+    ])
+    .unwrap();
+
+    let err = put_grant(&store, &cache, &grant, now).unwrap_err();
+    assert!(err.contains("must be SEARCHABLE"), "{err}");
+}
+
+#[test]
+fn read_and_write_grants_are_independent_scopes() {
+    // A read grant does not imply a write filter and vice versa: each scope
+    // is loaded separately, so a read-only table denies write_filter.
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    grant(
+        &store,
+        &cache,
+        &["read", "ON", "feed", "WHERE", "user_id", "=", "auth.uid()"],
+        now,
+    );
+    let p = principal("u1");
+    assert_eq!(
+        read_filter(&store, &cache, &p, "feed", now).unwrap(),
+        "user_id = u1"
+    );
+    // No write grant -> writes denied even though reads are allowed.
+    assert!(write_filter(&store, &cache, &p, "feed", now).is_err());
+    assert!(check_write_row(&store, &cache, &p, "feed", |_| None, now).is_err());
+}
+
+#[test]
+fn comparison_operators_round_trip_into_filter() {
+    // Non-equality operators (>, >=, etc.) survive into the rendered filter
+    // so range grants (e.g. "created_at > X") scope correctly.
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    grant(
+        &store,
+        &cache,
+        &["read", "ON", "events", "WHERE", "priority", ">=", "5"],
+        now,
+    );
+    let p = principal("u1");
+    assert_eq!(
+        read_filter(&store, &cache, &p, "events", now).unwrap(),
+        "priority >= 5"
+    );
+}
+
+#[test]
+fn bootstrap_creates_auth_tables_idempotently() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+
+    bootstrap(&store, &cache, &AuthConfig::default()).unwrap();
+    bootstrap(&store, &cache, &AuthConfig::default()).unwrap();
+
+    let now = Instant::now();
+    assert!(tables::table_schema(&store, &cache, USERS_TABLE, now).is_ok());
+    assert!(tables::table_schema(&store, &cache, SESSIONS_TABLE, now).is_ok());
+    assert_eq!(
+        store.get(AUTH_SCHEMA_VERSION_KEY, now).unwrap(),
+        AUTH_SCHEMA_VERSION
+    );
+}
+
+#[test]
+fn auth_tables_are_reserved() {
+    assert!(is_reserved_auth_table("auth.users"));
+    assert!(!is_reserved_auth_table("users"));
+}
+
+#[test]
+fn auth_config_debug_redacts_initial_keys() {
+    let config = AuthConfig {
+        enabled: true,
+        initial_publishable_key: Some("lux_pub_secret".to_string()),
+        initial_secret_key: Some("lux_sec_secret".to_string()),
+        managed_email: Some(crate::AuthManagedEmailConfig {
+            provider: "postmark".to_string(),
+            from: "auth@app.test".to_string(),
+            reply_to: None,
+            postmark_server_token: Some("pm_secret".to_string()),
+            postmark_message_stream: None,
+        }),
+        ..AuthConfig::default()
+    };
+    let debug = format!("{config:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("lux_pub_secret"));
+    assert!(!debug.contains("lux_sec_secret"));
+    assert!(!debug.contains("pm_secret"));
+}
+
+#[test]
+fn password_hashes_verify_without_storing_plaintext() {
+    let hash = hash_password("correct horse battery staple").unwrap();
+    assert_ne!(hash, "correct horse battery staple");
+    assert!(verify_password("correct horse battery staple", &hash).unwrap());
+    assert!(!verify_password("wrong password", &hash).unwrap());
+}
+
+#[test]
+fn bcrypt_password_hashes_verify_and_request_rehash() {
+    let hash = bcrypt::hash("correct horse battery staple", 4).unwrap();
+    assert_eq!(
+        verify_password_state("correct horse battery staple", &hash).unwrap(),
+        PasswordVerification::ValidNeedsRehash
+    );
+    assert_eq!(
+        verify_password_state("wrong password", &hash).unwrap(),
+        PasswordVerification::Invalid
+    );
+}
+
+#[test]
+fn reserved_table_mutations_are_blocked_for_client_commands() {
+    let store = Store::new();
+    let err = reserved_table_mutation_error(&[b"TINSERT", b"auth.users"], &store).unwrap();
+    assert!(err.contains("managed by Lux Auth"));
+
+    store
+        .wal_suppress
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(reserved_table_mutation_error(&[b"TINSERT", b"auth.users"], &store).is_none());
+}
+
+#[test]
+fn reserved_auth_tables_are_readable_through_direct_table_commands() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &AuthConfig::default()).unwrap();
+
+    let broker = crate::pubsub::Broker::new();
+    // Direct operator command surfaces (CLI/cloud command prompt/RESP) can
+    // inspect auth internals. Public REST/table/live paths still carry their
+    // own reserved-table guards, and mutations remain blocked.
+    for cmd in [
+        &[b"TSCHEMA".as_ref(), b"auth.users".as_ref()][..],
+        &[
+            b"TSELECT".as_ref(),
+            b"*".as_ref(),
+            b"FROM".as_ref(),
+            b"auth.users".as_ref(),
+        ][..],
+    ] {
+        let mut out = bytes::BytesMut::new();
+        crate::cmd::execute(&store, &cache, &broker, cmd, &mut out, Instant::now());
+        let response = std::str::from_utf8(&out).unwrap();
+        assert!(
+            !response.starts_with("-ERR"),
+            "direct auth table read should be allowed: {response}"
+        );
+    }
+}
+
+#[test]
+fn direct_auth_table_reads_redact_sensitive_values() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+    set_auth_setting(
+        &store,
+        &cache,
+        "email_postmark_server_token",
+        "server-token",
+        Instant::now(),
+    )
+    .unwrap();
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/signup",
+        r#"{"email":"redact@example.com","password":"password123"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "signup: {body}");
+    let signup_json: Value = serde_json::from_str(&body).unwrap();
+    let user_id = signup_json["user"]["id"].as_str().unwrap();
+    tables::table_create(
+        &store,
+        &cache,
+        "redaction_posts",
+        &["id STR PRIMARY KEY,", "user_id UUID"],
+        Instant::now(),
+    )
+    .unwrap();
+    durable_table_insert(
+        &store,
+        &cache,
+        "redaction_posts",
+        &[("id", "post_1"), ("user_id", user_id)],
+        Instant::now(),
+    )
+    .unwrap();
+
+    let broker = crate::pubsub::Broker::new();
+    let mut users = bytes::BytesMut::new();
+    crate::cmd::execute(
+        &store,
+        &cache,
+        &broker,
+        &[
+            b"TSELECT",
+            b"*",
+            b"FROM",
+            b"auth.users",
+            b"WHERE",
+            b"email",
+            b"=",
+            b"redact@example.com",
+        ],
+        &mut users,
+        Instant::now(),
+    );
+    let users = std::str::from_utf8(&users).unwrap();
+    assert!(
+        users.contains("<redacted>"),
+        "password hash should be redacted: {users}"
+    );
+    assert!(!users.contains("$argon2"), "password hash leaked: {users}");
+
+    let mut joined_users = bytes::BytesMut::new();
+    crate::cmd::execute(
+        &store,
+        &cache,
+        &broker,
+        &[
+            b"TSELECT",
+            b"*",
+            b"FROM",
+            b"redaction_posts",
+            b"p",
+            b"JOIN",
+            b"auth.users",
+            b"u",
+            b"ON",
+            b"p.user_id",
+            b"=",
+            b"u.id",
+        ],
+        &mut joined_users,
+        Instant::now(),
+    );
+    let joined_users = std::str::from_utf8(&joined_users).unwrap();
+    assert!(
+        joined_users.contains("<redacted>"),
+        "joined password hash should be redacted: {joined_users}"
+    );
+    assert!(
+        !joined_users.contains("$argon2"),
+        "joined password hash leaked: {joined_users}"
+    );
+
+    let mut signing_keys = bytes::BytesMut::new();
+    crate::cmd::execute(
+        &store,
+        &cache,
+        &broker,
+        &[b"TSELECT", b"*", b"FROM", b"auth.signing_keys"],
+        &mut signing_keys,
+        Instant::now(),
+    );
+    let signing_keys = std::str::from_utf8(&signing_keys).unwrap();
+    assert!(
+        signing_keys.contains("<redacted>"),
+        "private signing key should be redacted: {signing_keys}"
+    );
+    assert!(
+        !signing_keys.contains("BEGIN PRIVATE KEY"),
+        "private signing key leaked: {signing_keys}"
+    );
+
+    let mut settings = bytes::BytesMut::new();
+    crate::cmd::execute(
+        &store,
+        &cache,
+        &broker,
+        &[
+            b"TSELECT",
+            b"*",
+            b"FROM",
+            b"auth.settings",
+            b"WHERE",
+            b"key",
+            b"=",
+            b"email_postmark_server_token",
+        ],
+        &mut settings,
+        Instant::now(),
+    );
+    let settings = std::str::from_utf8(&settings).unwrap();
+    assert!(
+        settings.contains("<redacted>"),
+        "postmark token should be redacted: {settings}"
+    );
+    assert!(
+        !settings.contains("server-token"),
+        "postmark token leaked: {settings}"
+    );
+}
+
+#[test]
+fn signup_and_password_grant_issue_tokens() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (_, _, signup_body) = route_http(
+        "POST",
+        "/auth/v1/signup",
+        r#"{"email":"Test@Example.com","password":"password123"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    let signup_json: Value = serde_json::from_str(&signup_body).unwrap();
+    assert!(signup_json.get("access_token").is_some(), "{signup_body}");
+    assert_eq!(signup_json["user"]["email"], "test@example.com");
+
+    let (_, _, token_body) = route_http(
+        "POST",
+        "/auth/v1/token",
+        r#"{"grant_type":"password","email":"test@example.com","password":"password123"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    let token_json: Value = serde_json::from_str(&token_body).unwrap();
+    assert!(token_json.get("access_token").is_some(), "{token_body}");
+    assert!(token_json.get("refresh_token").is_some(), "{token_body}");
+}
+
+fn flow_token_for_email(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    email: &str,
+    kind: &str,
+) -> String {
+    let rows = find_rows_by_field(
+        store,
+        cache,
+        FLOW_TOKENS_TABLE,
+        "email",
+        email,
+        Instant::now(),
+    )
+    .unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.get("type").map(String::as_str) == Some(kind))
+        .expect("flow token should exist");
+    let metadata: Value =
+        serde_json::from_str(row.get("metadata").map(String::as_str).unwrap_or("{}")).unwrap();
+    metadata["action_link"]
+        .as_str()
+        .and_then(|link| link.split("token_hash=").nth(1))
+        .map(|rest| rest.split('&').next().unwrap_or(rest).to_string())
+        .expect("action link should carry token_hash")
+}
+
+#[test]
+fn signup_rejects_untrusted_redirect_before_creating_user() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            email_confirmation_required: true,
+            site_url: "http://app.test/auth".to_string(),
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/signup",
+        r#"{"email":"evil-redirect@example.com","password":"password123","email_redirect_to":"https://evil.test/steal"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("redirect URL is not allowed"), "{body}");
+    assert!(
+        find_row_by_field(
+            &store,
+            &cache,
+            USERS_TABLE,
+            "email",
+            "evil-redirect@example.com",
+            Instant::now(),
+        )
+        .unwrap()
+        .is_none(),
+        "bad redirect signup should not leave a user row"
+    );
+}
+
+#[test]
+fn recover_rejects_untrusted_redirect() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            site_url: "http://app.test/auth".to_string(),
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/signup",
+        r#"{"email":"recover-redirect@example.com","password":"password123"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "signup: {body}");
+
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/recover",
+        r#"{"email":"recover-redirect@example.com","redirect_to":"https://evil.test/update"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("redirect URL is not allowed"), "{body}");
+}
+
+#[test]
+fn signup_confirmation_flow_confirms_email_and_issues_session() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            email_confirmation_required: true,
+            site_url: "http://app.test/auth".to_string(),
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (status, _, signup_body) = route_http(
+        "POST",
+        "/auth/v1/signup",
+        r#"{"email":"confirm@example.com","password":"password123","email_redirect_to":"http://app.test/confirm"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "{signup_body}");
+    let signup_json: Value = serde_json::from_str(&signup_body).unwrap();
+    assert!(signup_json["access_token"].is_null(), "{signup_body}");
+
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/token",
+        r#"{"grant_type":"password","email":"confirm@example.com","password":"password123"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 401, "unconfirmed login should fail: {body}");
+
+    let token = flow_token_for_email(&store, &cache, "confirm@example.com", "signup");
+    let (status, _, verify_body) = route_http(
+        "POST",
+        "/auth/v1/verify",
+        &format!(r#"{{"type":"signup","token_hash":"{token}"}}"#),
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "verify: {verify_body}");
+    let verified: Value = serde_json::from_str(&verify_body).unwrap();
+    assert!(verified["access_token"].is_string(), "{verify_body}");
+
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/token",
+        r#"{"grant_type":"password","email":"confirm@example.com","password":"password123"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "confirmed login should succeed: {body}");
+}
+
+#[test]
+fn admin_settings_update_auth_flows_without_restart() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            initial_secret_key: Some("lux_sec_test".to_string()),
+            email_confirmation_required: false,
+            site_url: "http://initial.test/auth".to_string(),
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (status, _, body) = route_http(
+        "PATCH",
+        "/auth/v1/admin/settings",
+        r#"{"email_confirmation_required":true,"flow_token_ttl_seconds":120,"site_url":"http://updated.test/auth"}"#,
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "settings update: {body}");
+    let settings: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(settings["settings"]["email_confirmation_required"], true);
+    assert_eq!(settings["settings"]["flow_token_ttl_seconds"], 120);
+    assert_eq!(settings["settings"]["site_url"], "http://updated.test/auth");
+
+    let (status, _, signup_body) = route_http(
+        "POST",
+        "/auth/v1/signup",
+        r#"{"email":"dynamic@example.com","password":"password123"}"#,
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "signup: {signup_body}");
+    let signup: Value = serde_json::from_str(&signup_body).unwrap();
+    assert!(signup["session"].is_null(), "{signup_body}");
+
+    let token_row = find_rows_by_field(
+        &store,
+        &cache,
+        FLOW_TOKENS_TABLE,
+        "email",
+        "dynamic@example.com",
+        Instant::now(),
+    )
+    .unwrap()
+    .pop()
+    .expect("signup flow token should exist after dynamic settings update");
+    let metadata: Value =
+        serde_json::from_str(token_row.get("metadata").map(String::as_str).unwrap()).unwrap();
+    assert!(
+        metadata["action_link"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://updated.test/auth?token_hash="),
+        "{metadata}"
+    );
+}
+
+#[test]
+fn postmark_payload_renders_builtin_signup_and_recovery_emails() {
+    let delivery = EffectiveEmailDelivery {
+        provider: "postmark".to_string(),
+        from: Some("Auth <auth@app.test>".to_string()),
+        reply_to: Some("support@app.test".to_string()),
+        postmark_server_token: Some("server-token".to_string()),
+        postmark_message_stream: "outbound".to_string(),
+        app_name: "Pompeii".to_string(),
+    };
+
+    let signup = auth_email_message(
+        "signup",
+        "user@app.test",
+        "http://app.test/confirm",
+        &delivery,
+    )
+    .unwrap();
+    let signup_payload = postmark_payload(&signup);
+    assert_eq!(signup_payload.from, "Auth <auth@app.test>");
+    assert_eq!(signup_payload.to, "user@app.test");
+    assert_eq!(signup_payload.reply_to.as_deref(), Some("support@app.test"));
+    assert_eq!(signup_payload.subject, "Confirm your email for Pompeii");
+    assert!(signup_payload.text_body.contains("http://app.test/confirm"));
+    assert!(signup_payload.html_body.contains("Confirm your email"));
+
+    let recovery = auth_email_message(
+        "recovery",
+        "user@app.test",
+        "http://app.test/reset",
+        &delivery,
+    )
+    .unwrap();
+    let recovery_payload = postmark_payload(&recovery);
+    assert_eq!(recovery_payload.subject, "Reset your password for Pompeii");
+    assert!(recovery_payload.text_body.contains("http://app.test/reset"));
+    assert!(recovery_payload.html_body.contains("Reset your password"));
+}
+
+#[test]
+fn admin_settings_redacts_and_preserves_postmark_token() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            initial_secret_key: Some("lux_sec_test".to_string()),
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (status, _, body) = route_http(
+        "PATCH",
+        "/auth/v1/admin/settings",
+        r#"{"email_provider":"postmark","email_from":"Auth <auth@app.test>","email_postmark_server_token":"server-token","email_postmark_message_stream":"outbound","email_app_name":"Pompeii"}"#,
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "settings update: {body}");
+    assert!(!body.contains("server-token"), "{body}");
+    let settings: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(settings["settings"]["email_provider"], "postmark");
+    assert_eq!(
+        settings["settings"]["has_email_postmark_server_token"],
+        true
+    );
+
+    let (status, _, body) = route_http(
+        "PATCH",
+        "/auth/v1/admin/settings",
+        r#"{"email_app_name":"Pompeii AI"}"#,
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "settings update without token: {body}");
+    let settings: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        settings["settings"]["has_email_postmark_server_token"],
+        true
+    );
+    assert_eq!(settings["settings"]["email_app_name"], "Pompeii AI");
+    assert!(!body.contains("server-token"), "{body}");
+}
+
+#[test]
+fn signup_delivery_failure_invalidates_flow_token() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            initial_secret_key: Some("lux_sec_test".to_string()),
+            email_confirmation_required: true,
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (status, _, body) = route_http(
+        "PATCH",
+        "/auth/v1/admin/settings",
+        r#"{"email_provider":"postmark","email_from":"Auth <auth@app.test>"}"#,
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "settings update: {body}");
+
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/signup",
+        r#"{"email":"sendfail@example.com","password":"password123"}"#,
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    );
+    assert_eq!(
+        status, 502,
+        "signup should fail when delivery fails: {body}"
+    );
+    assert!(
+        find_rows_by_field(
+            &store,
+            &cache,
+            FLOW_TOKENS_TABLE,
+            "email",
+            "sendfail@example.com",
+            Instant::now(),
+        )
+        .unwrap()
+        .is_empty(),
+        "unsent flow token should be removed"
+    );
+}
+
+#[test]
+fn managed_email_delivery_overrides_project_provider_settings() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            initial_secret_key: Some("lux_sec_test".to_string()),
+            managed_email: Some(crate::AuthManagedEmailConfig {
+                provider: "postmark".to_string(),
+                from: "managed@app.test".to_string(),
+                reply_to: None,
+                postmark_server_token: Some("managed-token".to_string()),
+                postmark_message_stream: Some("broadcast".to_string()),
+            }),
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (status, _, body) = route_http(
+        "PATCH",
+        "/auth/v1/admin/settings",
+        r#"{"email_provider":"postmark"}"#,
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 400, "managed provider should be immutable: {body}");
+
+    let (status, _, body) = route_http(
+        "PATCH",
+        "/auth/v1/admin/settings",
+        r#"{"email_from_name":"Pompeii","email_app_name":"Pompeii"}"#,
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "safe branding update: {body}");
+    let settings_json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(settings_json["settings"]["email_provider"], "managed");
+    assert_eq!(settings_json["settings"]["email_delivery_managed"], true);
+    assert_eq!(
+        settings_json["settings"]["has_email_postmark_server_token"],
+        false
+    );
+    assert!(!body.contains("managed-token"), "{body}");
+
+    let settings = auth_settings(&store, &cache, Instant::now()).unwrap();
+    let delivery =
+        effective_email_delivery(&settings, store.config().auth.managed_email.as_ref()).unwrap();
+    assert_eq!(delivery.provider, "postmark");
+    assert_eq!(delivery.from.as_deref(), Some("Pompeii <managed@app.test>"));
+    assert_eq!(
+        delivery.postmark_server_token.as_deref(),
+        Some("managed-token")
+    );
+    assert_eq!(delivery.postmark_message_stream, "broadcast");
+}
+
+#[test]
+fn recovery_flow_issues_session_and_allows_password_update() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            site_url: "http://app.test/auth".to_string(),
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/signup",
+        r#"{"email":"recover@example.com","password":"password123"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "signup: {body}");
+
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/recover",
+        r#"{"email":"recover@example.com","redirect_to":"http://app.test/update-password"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "recover: {body}");
+    let token = flow_token_for_email(&store, &cache, "recover@example.com", "recovery");
+
+    let (status, _, verify_body) = route_http(
+        "POST",
+        "/auth/v1/verify",
+        &format!(r#"{{"type":"recovery","token_hash":"{token}"}}"#),
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "verify recovery: {verify_body}");
+    let session: Value = serde_json::from_str(&verify_body).unwrap();
+    let access = session["access_token"].as_str().unwrap();
+
+    let (status, _, update_body) = route_http(
+        "PUT",
+        "/auth/v1/user",
+        r#"{"password":"newpassword123"}"#,
+        &[],
+        &[("authorization".to_string(), format!("Bearer {access}"))],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "update password: {update_body}");
+
+    let (status, _, old_body) = route_http(
+        "POST",
+        "/auth/v1/token",
+        r#"{"grant_type":"password","email":"recover@example.com","password":"password123"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 400, "old password should fail: {old_body}");
+
+    let (status, _, new_body) = route_http(
+        "POST",
+        "/auth/v1/token",
+        r#"{"grant_type":"password","email":"recover@example.com","password":"newpassword123"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "new password should login: {new_body}");
+}
+
+#[test]
+fn authorization_code_flow_is_one_time_use() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (_, _, signup_body) = route_http(
+        "POST",
+        "/auth/v1/signup",
+        r#"{"email":"code@example.com","password":"password123"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    let signup: Value = serde_json::from_str(&signup_body).unwrap();
+    let user_id = signup["user"]["id"].as_str().unwrap();
+    let settings = auth_settings(&store, &cache, Instant::now()).unwrap();
+    let code = create_flow_token(
+        &store,
+        &cache,
+        FlowTokenInsert {
+            settings: &settings,
+            kind: "oauth_code",
+            user_id,
+            email: "code@example.com",
+            redirect_to: "http://app.test/callback",
+            metadata: json!({}),
+        },
+        Instant::now(),
+    )
+    .unwrap();
+
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/token",
+        &format!(r#"{{"grant_type":"authorization_code","code":"{code}"}}"#),
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "code exchange: {body}");
+
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/token",
+        &format!(r#"{{"grant_type":"authorization_code","code":"{code}"}}"#),
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 400, "code should be single-use: {body}");
+}
+
+#[test]
+fn flow_token_consume_has_single_winner_under_concurrency() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Arc::new(Store::new_with_config(config));
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let settings = auth_settings(&store, &cache, Instant::now()).unwrap();
+    let user_id = tables::generate_uuid_v7();
+    let token = create_flow_token(
+        &store,
+        &cache,
+        FlowTokenInsert {
+            settings: &settings,
+            kind: "recovery",
+            user_id: &user_id,
+            email: "race@example.com",
+            redirect_to: "/",
+            metadata: json!({}),
+        },
+        Instant::now(),
+    )
+    .unwrap();
+
+    let workers = 8;
+    let barrier = Arc::new(std::sync::Barrier::new(workers));
+    let successes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..workers {
+        let store = Arc::clone(&store);
+        let cache = Arc::clone(&cache);
+        let barrier = Arc::clone(&barrier);
+        let successes = Arc::clone(&successes);
+        let token = token.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            if consume_flow_token(&store, &cache, "recovery", &token, Instant::now()).is_ok() {
+                successes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    assert_eq!(
+        successes.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only one concurrent consumer may redeem a flow token"
+    );
+}
+
+#[tokio::test]
+async fn oauth_provider_config_and_authorize_redirect_are_core_owned() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            initial_secret_key: Some("lux_sec_test".to_string()),
+            site_url: "http://app.test/auth".to_string(),
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (status, _, body) = route_http(
+        "PUT",
+        "/auth/v1/admin/providers/google",
+        r#"{"client_id":"google-client","client_secret":"google-secret","redirect_uri":"http://app.test/auth/callback","enabled":true}"#,
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "{body}");
+    let provider: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(provider["provider"]["provider"], "google");
+    assert_eq!(provider["provider"]["has_client_secret"], true);
+    assert!(
+        !body.contains("google-secret"),
+        "admin provider response must not expose client secret: {body}"
+    );
+    let (status, _, body) = route_http(
+        "GET",
+        "/auth/v1/admin/providers",
+        "",
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "{body}");
+    let listed: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(listed["capabilities"]["apple_native"], true);
+    assert_eq!(listed["capabilities"]["apple_web"], true);
+
+    let response = route_http_response(
+        "GET",
+        "/auth/v1/authorize",
+        "",
+        &[
+            ("provider".to_string(), "google".to_string()),
+            (
+                "redirect_to".to_string(),
+                "http://app.test/welcome".to_string(),
+            ),
+        ],
+        &[("host".to_string(), "localhost:17777".to_string())],
+        &store,
+        &cache,
+    )
+    .await;
+    assert_eq!(response.status, 302);
+    let location = response
+        .headers
+        .iter()
+        .find(|(key, _)| key == "Location")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or("");
+    assert!(location.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
+    assert!(location.contains("client_id=google-client"), "{location}");
+    assert!(
+        location.contains("redirect_uri=http%3A%2F%2Fapp.test%2Fauth%2Fcallback"),
+        "{location}"
+    );
+    assert!(
+        location.contains("scope=openid%20email%20profile"),
+        "{location}"
+    );
+}
+
+#[test]
+fn oauth_sign_in_links_identity_and_issues_session() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let oauth_user = OAuthUser {
+        provider: "github".to_string(),
+        provider_id: "42".to_string(),
+        email: "octo@example.com".to_string(),
+        email_verified: true,
+        user_metadata: json!({"name":"Octo"}),
+        identity_data: json!({"login":"octo"}),
+    };
+    let (status, _, body) = oauth_sign_in(&oauth_user, &[], &store, &cache);
+    assert_eq!(status, 200, "{body}");
+    let session: Value = serde_json::from_str(&body).unwrap();
+    assert!(session["access_token"].is_string(), "{body}");
+    assert_eq!(session["user"]["email"], "octo@example.com");
+
+    let identity = find_row_by_field(
+        &store,
+        &cache,
+        IDENTITIES_TABLE,
+        "provider_id",
+        "github:42",
+        Instant::now(),
+    )
+    .unwrap()
+    .expect("oauth identity should be stored");
+    assert_eq!(identity.get("provider").map(String::as_str), Some("github"));
+}
+
+#[test]
+fn deleted_users_cannot_use_or_refresh_tokens() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (_, _, signup_body) = route_http(
+        "POST",
+        "/auth/v1/signup",
+        r#"{"email":"deleted@example.com","password":"password123"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    let signup_json: Value = serde_json::from_str(&signup_body).unwrap();
+    let user_id = signup_json["user"]["id"].as_str().unwrap();
+    let access_token = signup_json["access_token"].as_str().unwrap();
+    let refresh_token = signup_json["refresh_token"].as_str().unwrap();
+
+    let deleted_at = unix_seconds().to_string();
+    durable_table_update_where(
+        &store,
+        &cache,
+        USERS_TABLE,
+        &[("deleted_at", deleted_at.as_str())],
+        &["id", "=", user_id],
+        Instant::now(),
+    )
+    .unwrap();
+
+    let (status, _, body) = route_http(
+        "GET",
+        "/auth/v1/user",
+        "",
+        &[],
+        &[(
+            "Authorization".to_string(),
+            format!("Bearer {access_token}"),
+        )],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 401, "{body}");
+    assert!(body.contains("user deleted"), "{body}");
+
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/token",
+        &format!(
+            r#"{{"grant_type":"refresh_token","refresh_token":"{}"}}"#,
+            refresh_token
+        ),
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 401, "{body}");
+
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/token",
+        r#"{"grant_type":"password","email":"deleted@example.com","password":"password123"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 401, "{body}");
+}
+
+#[test]
+fn auth_users_survive_wal_replay() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        storage: crate::StorageConfig {
+            mode: crate::StorageMode::Tiered,
+            dir: temp.path().to_string_lossy().to_string(),
+        },
+        ..crate::ServerConfig::default()
+    });
+
+    let store = Store::new_with_config(config.clone());
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (_, _, signup_body) = route_http(
+        "POST",
+        "/auth/v1/signup",
+        r#"{"email":"wal@example.com","password":"password123"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert!(
+        serde_json::from_str::<Value>(&signup_body).unwrap()["access_token"].is_string(),
+        "{signup_body}"
+    );
+
+    let restored = Store::new_with_config(config);
+    let restored_cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&restored, &restored_cache, &restored.config().auth).unwrap();
+    restored.replay_wal(&crate::pubsub::Broker::new());
+    bootstrap_runtime(&restored, &restored_cache, &restored.config().auth).unwrap();
+
+    let user = find_row_by_field(
+        &restored,
+        &restored_cache,
+        USERS_TABLE,
+        "email",
+        "wal@example.com",
+        Instant::now(),
+    )
+    .unwrap()
+    .expect("auth user should replay from WAL");
+    assert_eq!(
+        user.get("email").map(String::as_str),
+        Some("wal@example.com")
+    );
+}
+
+// ---- Sign in with Apple ------------------------------------------------
+
+const APPLE_TEST_KID: &str = "apple-test-kid";
+
+struct AppleTestRsaKey {
+    private_pem: String,
+    jwks: JwkSet,
+}
+
+fn apple_test_rsa_key() -> &'static AppleTestRsaKey {
+    static KEY: OnceLock<AppleTestRsaKey> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let private = RsaPrivateKey::new(&mut OsRng, 2048).expect("generate test RSA key");
+        let private_pem = private
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("encode test RSA key")
+            .to_string();
+        let n = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(private.n().to_bytes_be());
+        let e = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(private.e().to_bytes_be());
+        let jwks = serde_json::from_value(json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": APPLE_TEST_KID,
+                "use": "sig",
+                "alg": "RS256",
+                "n": n,
+                "e": e,
+            }],
+        }))
+        .expect("build test Apple JWKS");
+        AppleTestRsaKey { private_pem, jwks }
+    })
+}
+
+fn apple_test_jwks() -> JwkSet {
+    apple_test_rsa_key().jwks.clone()
+}
+
+fn apple_encrypted_store(key_id: &str) -> Store {
+    Store::new_with_config(Arc::new(crate::ServerConfig {
+        encryption: crate::EncryptionConfig {
+            active_key_id: Some(key_id.to_string()),
+            keys: vec![crate::EncryptionKeyConfig {
+                id: key_id.to_string(),
+                secret: format!("{key_id}-secret").into_bytes(),
+                decrypt_only: false,
+            }],
+            ..Default::default()
+        },
+        ..crate::ServerConfig::default()
+    }))
+}
+
+fn mint_apple_id_token(
+    aud: &str,
+    sub: &str,
+    email: Option<&str>,
+    nonce_claim: Option<&str>,
+    exp_offset_secs: i64,
+) -> String {
+    let now = unix_seconds() as i64;
+    let mut claims = json!({
+        "iss": APPLE_ISSUER,
+        "aud": aud,
+        "sub": sub,
+        "iat": now,
+        "exp": now + exp_offset_secs,
+    });
+    if let Some(email) = email {
+        claims["email"] = json!(email);
+        claims["email_verified"] = json!(true);
+    }
+    if let Some(nonce) = nonce_claim {
+        claims["nonce"] = json!(nonce);
+    }
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(APPLE_TEST_KID.to_string());
+    encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_pem(apple_test_rsa_key().private_pem.as_bytes()).unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn verify_apple_id_token_accepts_valid_token() {
+    let jwks = apple_test_jwks();
+    let nonce_claim = sha256_hex("raw-nonce-123");
+    let token = mint_apple_id_token(
+        "com.pompeii.app",
+        "apple-sub-001",
+        Some("user@privaterelay.appleid.com"),
+        Some(&nonce_claim),
+        3600,
+    );
+    let claims = verify_apple_id_token(
+        &jwks,
+        &token,
+        &["com.pompeii.app".to_string()],
+        Some(&nonce_claim),
+    )
+    .expect("valid token should verify");
+    assert_eq!(claims.sub, "apple-sub-001");
+    assert_eq!(
+        claims.email.as_deref(),
+        Some("user@privaterelay.appleid.com")
+    );
+}
+
+#[test]
+fn verify_apple_id_token_rejects_wrong_audience() {
+    let jwks = apple_test_jwks();
+    let token = mint_apple_id_token("com.pompeii.app", "s", None, None, 3600);
+    assert!(verify_apple_id_token(&jwks, &token, &["com.someone.else".to_string()], None).is_err());
+}
+
+#[test]
+fn verify_apple_id_token_rejects_expired() {
+    let jwks = apple_test_jwks();
+    let token = mint_apple_id_token("com.pompeii.app", "s", None, None, -3600);
+    assert!(verify_apple_id_token(&jwks, &token, &["com.pompeii.app".to_string()], None).is_err());
+}
+
+#[test]
+fn verify_apple_id_token_rejects_nonce_mismatch() {
+    let jwks = apple_test_jwks();
+    let token = mint_apple_id_token(
+        "com.pompeii.app",
+        "s",
+        None,
+        Some(&sha256_hex("expected")),
+        3600,
+    );
+    assert!(verify_apple_id_token(
+        &jwks,
+        &token,
+        &["com.pompeii.app".to_string()],
+        Some("attacker-supplied")
+    )
+    .is_err());
+}
+
+#[test]
+fn apple_private_key_seals_and_unseals_with_active_key() {
+    let store = apple_encrypted_store("k1");
+    let p8 = "-----BEGIN PRIVATE KEY-----\nMOCKAPPLEP8\n-----END PRIVATE KEY-----\n";
+    let sealed = seal_apple_private_key(&store, p8).unwrap();
+    assert!(sealed.starts_with("luxsealed:"), "{sealed}");
+    assert!(
+        !sealed.contains("MOCKAPPLEP8"),
+        "sealed key leaked plaintext"
+    );
+    assert_eq!(unseal_apple_private_key(&store, &sealed).unwrap(), p8);
+}
+
+#[test]
+fn apple_private_key_refuses_plaintext_storage_without_key() {
+    let store = Store::new();
+    let p8 = "-----BEGIN PRIVATE KEY-----\nNOKEY\n-----END PRIVATE KEY-----\n";
+    if store.encryption().has_active_key() {
+        let stored = seal_apple_private_key(&store, p8).unwrap();
+        assert!(stored.starts_with("luxsealed:"), "{stored}");
+        assert_eq!(unseal_apple_private_key(&store, &stored).unwrap(), p8);
+    } else {
+        assert!(seal_apple_private_key(&store, p8).is_err());
+    }
+}
+
+#[test]
+fn legacy_plaintext_apple_private_key_is_migrated() {
+    let store = apple_encrypted_store("apple-migration-key");
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    durable_table_insert(
+        &store,
+        &cache,
+        PROVIDERS_TABLE,
+        &[
+            ("provider", "apple"),
+            ("enabled", "true"),
+            ("apple_bundle_ids", "com.example.app"),
+            (
+                "apple_private_key",
+                apple_test_ec_key().private_pem.as_str(),
+            ),
+        ],
+        Instant::now(),
+    )
+    .unwrap();
+
+    migrate_apple_private_key_storage(&store, &cache, Instant::now()).unwrap();
+    let row = find_row_by_field(
+        &store,
+        &cache,
+        PROVIDERS_TABLE,
+        "provider",
+        "apple",
+        Instant::now(),
+    )
+    .unwrap()
+    .unwrap();
+    let stored = row.get("apple_private_key").unwrap();
+    assert!(stored.starts_with("luxsealed:"));
+    assert!(!stored.contains("BEGIN PRIVATE KEY"));
+    assert_eq!(
+        unseal_apple_private_key(&store, stored).unwrap(),
+        apple_test_ec_key().private_pem
+    );
+}
+
+#[test]
+fn legacy_plaintext_apple_private_key_is_preserved_without_keyring() {
+    let store = Store::new();
+    if store.encryption().has_active_key() {
+        return;
+    }
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    durable_table_insert(
+        &store,
+        &cache,
+        PROVIDERS_TABLE,
+        &[
+            ("provider", "apple"),
+            ("enabled", "true"),
+            (
+                "apple_private_key",
+                apple_test_ec_key().private_pem.as_str(),
+            ),
+        ],
+        Instant::now(),
+    )
+    .unwrap();
+    assert!(migrate_apple_private_key_storage(&store, &cache, Instant::now()).is_err());
+    let row = find_row_by_field(
+        &store,
+        &cache,
+        PROVIDERS_TABLE,
+        "provider",
+        "apple",
+        Instant::now(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        row.get("apple_private_key").unwrap(),
+        &apple_test_ec_key().private_pem
+    );
+}
+
+#[tokio::test]
+async fn signin_apple_native_creates_and_relinks_user() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            initial_secret_key: Some("lux_sec_test".to_string()),
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (status, _, body) = route_http(
+        "PUT",
+        "/auth/v1/admin/providers/apple",
+        r#"{"enabled":true,"apple_bundle_ids":"com.pompeii.app"}"#,
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "provider upsert: {body}");
+
+    seed_apple_jwks_for_test(apple_test_jwks());
+    let missing_key_nonce = route_http_response(
+        "POST",
+        "/auth/v1/signin/apple/nonce",
+        "",
+        &[],
+        &[],
+        &store,
+        &cache,
+    )
+    .await;
+    assert_eq!(missing_key_nonce.status, 401);
+    let nonce_response = route_http_response(
+        "POST",
+        "/auth/v1/signin/apple/nonce",
+        "",
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    )
+    .await;
+    assert_eq!(nonce_response.status, 200, "{}", nonce_response.body);
+    let nonce_json: Value = serde_json::from_str(&nonce_response.body).unwrap();
+    let raw_nonce = nonce_json["nonce"].as_str().unwrap();
+    let token = mint_apple_id_token(
+        "com.pompeii.app",
+        "apple-sub-777",
+        Some("ada@privaterelay.appleid.com"),
+        Some(&sha256_hex(raw_nonce)),
+        3600,
+    );
+    let no_key = route_http_response(
+        "POST",
+        "/auth/v1/signin/apple",
+        &json!({"id_token": token.clone(), "nonce": raw_nonce}).to_string(),
+        &[],
+        &[("host".to_string(), "localhost".to_string())],
+        &store,
+        &cache,
+    )
+    .await;
+    assert_eq!(no_key.status, 401, "{}", no_key.body);
+    let no_nonce = route_http_response(
+        "POST",
+        "/auth/v1/signin/apple",
+        &json!({"id_token": token.clone()}).to_string(),
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    )
+    .await;
+    assert_eq!(no_nonce.status, 400, "{}", no_nonce.body);
+    let signin_body =
+        json!({"id_token": token, "nonce": raw_nonce, "user": {"name": "Ada Lovelace"}})
+            .to_string();
+    let response = route_http_response(
+        "POST",
+        "/auth/v1/signin/apple",
+        &signin_body,
+        &[],
+        &[
+            ("host".to_string(), "localhost".to_string()),
+            ("apikey".to_string(), "lux_sec_test".to_string()),
+        ],
+        &store,
+        &cache,
+    )
+    .await;
+    assert_eq!(response.status, 200, "signin: {}", response.body);
+    let session: Value = serde_json::from_str(&response.body).unwrap();
+    assert!(
+        session
+            .get("access_token")
+            .and_then(Value::as_str)
+            .is_some(),
+        "expected a session: {}",
+        response.body
+    );
+    let first_user_id = session["user"]["id"].as_str().unwrap().to_string();
+    let replay = route_http_response(
+        "POST",
+        "/auth/v1/signin/apple",
+        &signin_body,
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    )
+    .await;
+    assert_eq!(replay.status, 401, "{}", replay.body);
+
+    // The captured first-login name is persisted on the user.
+    let user = find_row_by_field(
+        &store,
+        &cache,
+        USERS_TABLE,
+        "id",
+        &first_user_id,
+        Instant::now(),
+    )
+    .unwrap()
+    .expect("user row exists");
+    assert!(
+        user.get("raw_user_meta_data")
+            .map(|m| m.contains("Ada Lovelace"))
+            .unwrap_or(false),
+        "name not stored: {user:?}"
+    );
+
+    // A second sign-in for the same Apple sub reuses the same user (relink),
+    // not a duplicate.
+    let nonce_response2 = route_http_response(
+        "POST",
+        "/auth/v1/signin/apple/nonce",
+        "",
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    )
+    .await;
+    let nonce_json2: Value = serde_json::from_str(&nonce_response2.body).unwrap();
+    let raw_nonce2 = nonce_json2["nonce"].as_str().unwrap();
+    let token2 = mint_apple_id_token(
+        "com.pompeii.app",
+        "apple-sub-777",
+        None,
+        Some(&sha256_hex(raw_nonce2)),
+        3600,
+    );
+    let signin_body2 = json!({"id_token": token2, "nonce": raw_nonce2}).to_string();
+    let response2 = route_http_response(
+        "POST",
+        "/auth/v1/signin/apple",
+        &signin_body2,
+        &[],
+        &[
+            ("host".to_string(), "localhost".to_string()),
+            ("apikey".to_string(), "lux_sec_test".to_string()),
+        ],
+        &store,
+        &cache,
+    )
+    .await;
+    assert_eq!(response2.status, 200, "second signin: {}", response2.body);
+    let session2: Value = serde_json::from_str(&response2.body).unwrap();
+    assert_eq!(session2["user"]["id"].as_str().unwrap(), first_user_id);
+}
+
+struct AppleTestEcKey {
+    private_pem: String,
+    public_pem: String,
+}
+
+fn apple_test_ec_key() -> &'static AppleTestEcKey {
+    static KEY: OnceLock<AppleTestEcKey> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let private = SecretKey::random(&mut OsRng);
+        let private_pem = private
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("encode test Apple .p8")
+            .to_string();
+        let public_pem = private
+            .public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .expect("encode test Apple public key");
+        AppleTestEcKey {
+            private_pem,
+            public_pem,
+        }
+    })
+}
+
+fn apple_web_config() -> OAuthProviderConfig {
+    OAuthProviderConfig {
+        provider: "apple".to_string(),
+        enabled: true,
+        client_id: String::new(),
+        client_secret: String::new(),
+        redirect_uri: "https://app.test/auth/callback/apple".to_string(),
+        scopes: "name email".to_string(),
+        apple_team_id: "TEAM123456".to_string(),
+        apple_key_id: "KEY7890ABC".to_string(),
+        apple_services_id: "com.pompeii.web".to_string(),
+        apple_bundle_ids: "com.pompeii.app".to_string(),
+        apple_private_key: apple_test_ec_key().private_pem.clone(),
+        created_at: Value::Null,
+        updated_at: Value::Null,
+    }
+}
+
+#[test]
+fn mint_apple_client_secret_produces_verifiable_es256() {
+    let secret = mint_apple_client_secret(&apple_web_config()).expect("mint");
+    let header = decode_header(&secret).unwrap();
+    assert_eq!(header.alg, Algorithm::ES256);
+    assert_eq!(header.kid.as_deref(), Some("KEY7890ABC"));
+
+    let mut validation = Validation::new(Algorithm::ES256);
+    validation.validate_aud = false;
+    let claims = decode::<Value>(
+        &secret,
+        &DecodingKey::from_ec_pem(apple_test_ec_key().public_pem.as_bytes()).unwrap(),
+        &validation,
+    )
+    .expect("client secret verifies against the .p8 public key")
+    .claims;
+    assert_eq!(claims["iss"], "TEAM123456");
+    assert_eq!(claims["sub"], "com.pompeii.web");
+    assert_eq!(claims["aud"], APPLE_ISSUER);
+}
+
+#[test]
+fn mint_apple_client_secret_requires_web_config() {
+    let mut config = apple_web_config();
+    config.apple_private_key = String::new();
+    assert!(mint_apple_client_secret(&config).is_err());
+}
+
+#[test]
+fn parse_form_urlencoded_decodes_apple_callback() {
+    let parsed = parse_form_urlencoded("code=abc123&state=xyz&user=%7B%22name%22%3A%22Ada%22%7D");
+    assert_eq!(get_param(&parsed, "code"), Some("abc123"));
+    assert_eq!(get_param(&parsed, "state"), Some("xyz"));
+    assert_eq!(get_param(&parsed, "user"), Some(r#"{"name":"Ada"}"#));
+    assert_eq!(
+        parse_apple_callback_name(r#"{"name":{"firstName":"Ada","lastName":"Lovelace"}}"#),
+        Some("Ada Lovelace".to_string())
+    );
+}
+
+#[test]
+fn new_oauth_identity_requires_a_verified_email() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    for oauth_user in [
+        OAuthUser {
+            provider: "apple".to_string(),
+            provider_id: "missing-email".to_string(),
+            email: String::new(),
+            email_verified: false,
+            user_metadata: json!({}),
+            identity_data: json!({}),
+        },
+        OAuthUser {
+            provider: "apple".to_string(),
+            provider_id: "unverified-email".to_string(),
+            email: "person@example.com".to_string(),
+            email_verified: false,
+            user_metadata: json!({}),
+            identity_data: json!({}),
+        },
+    ] {
+        let (status, _, body) = oauth_sign_in(&oauth_user, &[], &store, &cache);
+        assert_eq!(status, 400, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn oauth_error_callback_requires_and_consumes_stored_state() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let state = "valid-state";
+    let state_key = oauth_state_key(state);
+    store.set(
+        state_key.as_bytes(),
+        json!({
+            "provider": "apple",
+            "redirect_to": "https://app.example.com/callback",
+            "oidc_nonce": "nonce",
+        })
+        .to_string()
+        .as_bytes(),
+        Some(OAUTH_STATE_TTL),
+        Instant::now(),
+    );
+
+    let response = oauth_callback(
+        "apple",
+        &[
+            ("state".to_string(), state.to_string()),
+            ("error".to_string(), "access_denied".to_string()),
+            (
+                "redirect_to".to_string(),
+                "https://attacker.example.com".to_string(),
+            ),
+        ],
+        &[],
+        &store,
+        &cache,
+    )
+    .await;
+    assert_eq!(response.status, 302);
+    let location = response
+        .headers
+        .iter()
+        .find(|(key, _)| key == "Location")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or("");
+    assert!(location.starts_with("https://app.example.com/callback?"));
+    assert!(!location.contains("attacker.example.com"));
+    assert!(store.get(state_key.as_bytes(), Instant::now()).is_none());
+
+    let replay = oauth_callback(
+        "apple",
+        &[
+            ("state".to_string(), state.to_string()),
+            ("error".to_string(), "access_denied".to_string()),
+        ],
+        &[],
+        &store,
+        &cache,
+    )
+    .await;
+    assert_eq!(replay.status, 400);
+}
+
+#[tokio::test]
+async fn signin_apple_rejects_unconfigured_provider() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            initial_publishable_key: Some("lux_pub_test".to_string()),
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    seed_apple_jwks_for_test(apple_test_jwks());
+    let nonce_response = route_http_response(
+        "POST",
+        "/auth/v1/signin/apple/nonce",
+        "",
+        &[],
+        &[("apikey".to_string(), "lux_pub_test".to_string())],
+        &store,
+        &cache,
+    )
+    .await;
+    let nonce_json: Value = serde_json::from_str(&nonce_response.body).unwrap();
+    let nonce = nonce_json["nonce"].as_str().unwrap();
+    let token = mint_apple_id_token("com.pompeii.app", "s", None, Some(&sha256_hex(nonce)), 3600);
+    let signin_body = json!({"id_token": token, "nonce": nonce}).to_string();
+    let response = route_http_response(
+        "POST",
+        "/auth/v1/signin/apple",
+        &signin_body,
+        &[],
+        &[
+            ("host".to_string(), "localhost".to_string()),
+            ("apikey".to_string(), "lux_pub_test".to_string()),
+        ],
+        &store,
+        &cache,
+    )
+    .await;
+    assert_eq!(response.status, 400, "{}", response.body);
+}
+
+#[test]
+fn admin_upsert_apple_provider_rejects_invalid_p8() {
+    let store = apple_encrypted_store("apple-test-key");
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    // A web config with a bad .p8 is rejected up front with a clear message.
+    let bad = json!({
+        "apple_services_id": "com.pompeii.web",
+        "apple_team_id": "TEAM123456",
+        "apple_key_id": "KEY7890ABC",
+        "apple_private_key": "-----BEGIN PRIVATE KEY-----\nNOTAKEY\n-----END PRIVATE KEY-----\n",
+    });
+    let (status, _, body) = admin_upsert_apple_provider(&bad, &store, &cache);
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("invalid Apple .p8"), "{body}");
+
+    // The same config with a real EC .p8 passes the key check.
+    let good = json!({
+        "apple_services_id": "com.pompeii.web",
+        "apple_team_id": "TEAM123456",
+        "apple_key_id": "KEY7890ABC",
+        "apple_private_key": apple_test_ec_key().private_pem,
+        "redirect_uri": "https://app.example.com/auth/callback/apple",
+    });
+    let (status, _, body) = admin_upsert_apple_provider(&good, &store, &cache);
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        !body.contains("invalid Apple .p8"),
+        "valid key wrongly rejected: {body}"
+    );
+
+    let invalid_redirect = json!({
+        "apple_services_id": "com.pompeii.web",
+        "apple_team_id": "TEAM123456",
+        "apple_key_id": "KEY7890ABC",
+        "apple_private_key": apple_test_ec_key().private_pem,
+        "redirect_uri": "http://localhost:5890/auth/v1/callback/apple",
+    });
+    let (status, _, body) = admin_upsert_apple_provider(&invalid_redirect, &store, &cache);
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("HTTPS redirect_uri"), "{body}");
+
+    let fragment_redirect = json!({
+        "apple_services_id": "com.pompeii.web",
+        "apple_team_id": "TEAM123456",
+        "apple_key_id": "KEY7890ABC",
+        "apple_private_key": apple_test_ec_key().private_pem,
+        "redirect_uri": "https://app.example.com/auth/callback/apple#fragment",
+    });
+    let (status, _, body) = admin_upsert_apple_provider(&fragment_redirect, &store, &cache);
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("no fragment"), "{body}");
+}
+
+#[test]
+fn admin_upsert_apple_provider_preserves_omitted_fields() {
+    let store = apple_encrypted_store("apple-update-key");
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+    let initial = json!({
+        "enabled": true,
+        "apple_services_id": "com.pompeii.web",
+        "apple_team_id": "TEAM123456",
+        "apple_key_id": "KEY7890ABC",
+        "apple_bundle_ids": "com.pompeii.app",
+        "apple_private_key": apple_test_ec_key().private_pem,
+        "redirect_uri": "https://app.example.com/auth/callback/apple",
+    });
+    let (status, _, body) = admin_upsert_apple_provider(&initial, &store, &cache);
+    assert_eq!(status, 200, "{body}");
+
+    let (status, _, body) = admin_upsert_apple_provider(&json!({"enabled": false}), &store, &cache);
+    assert_eq!(status, 200, "{body}");
+    let provider = oauth_provider_config(&store, &cache, "apple", Instant::now())
+        .unwrap()
+        .unwrap();
+    assert!(!provider.enabled);
+    assert_eq!(provider.apple_services_id, "com.pompeii.web");
+    assert_eq!(provider.apple_team_id, "TEAM123456");
+    assert_eq!(provider.apple_key_id, "KEY7890ABC");
+    assert_eq!(provider.apple_bundle_ids, "com.pompeii.app");
+    assert_eq!(
+        provider.apple_private_key,
+        apple_test_ec_key().private_pem.trim()
+    );
+}

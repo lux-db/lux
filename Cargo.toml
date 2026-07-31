@@ -45,6 +45,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+rsa = { version = "0.9", features = ["pem"] }
 
 [profile.release]
 opt-level = 3
