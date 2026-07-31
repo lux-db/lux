@@ -10,10 +10,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const ENVELOPE_MAGIC: &[u8] = b"LUXENC2";
+const SEALED_VALUE_PREFIX: &[u8] = b"luxsealed:";
 const STATE_MAGIC: &[u8] = b"LUXENCSTATE1";
 const NONCE_LEN: usize = 12;
 const DATA_KEY_LEN: usize = 32;
 const WRAPPED_DATA_KEY_LEN: usize = DATA_KEY_LEN + 16;
+
+#[derive(Serialize, Deserialize)]
+struct SealedValue {
+    table: String,
+    field: String,
+    pk: String,
+    envelope: String,
+}
 
 #[derive(Clone, Default)]
 pub struct EncryptionConfig {
@@ -302,11 +311,14 @@ impl EncryptionKeyring {
     }
 
     pub(crate) fn is_encrypted_value(raw: &[u8]) -> bool {
-        raw.starts_with(ENVELOPE_MAGIC)
+        raw.starts_with(ENVELOPE_MAGIC) || decode_sealed_value(raw).is_ok()
     }
 
     pub(crate) fn envelope_decryptable_by_any(envelope: &[u8], key_ids: &HashSet<String>) -> bool {
-        parse_envelope(envelope).is_ok_and(|parsed| {
+        let envelope = decode_sealed_value(envelope)
+            .map(|sealed| sealed.3)
+            .unwrap_or_else(|_| envelope.to_vec());
+        parse_envelope(&envelope).is_ok_and(|parsed| {
             parsed
                 .wraps
                 .iter()
@@ -321,8 +333,45 @@ impl EncryptionKeyring {
         pk: &str,
         envelope: &[u8],
     ) -> Result<Vec<u8>, String> {
+        if let Ok((sealed_table, sealed_field, sealed_pk, sealed_envelope)) =
+            decode_sealed_value(envelope)
+        {
+            let plaintext =
+                self.decrypt(&sealed_table, &sealed_field, &sealed_pk, &sealed_envelope)?;
+            return self.seal(&sealed_table, &sealed_field, &sealed_pk, &plaintext);
+        }
         let plaintext = self.decrypt(table, field, pk, envelope)?;
         self.encrypt(table, field, pk, &plaintext)
+    }
+
+    pub(crate) fn seal(
+        &self,
+        table: &str,
+        field: &str,
+        pk: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let sealed = SealedValue {
+            table: table.to_string(),
+            field: field.to_string(),
+            pk: pk.to_string(),
+            envelope: base64::engine::general_purpose::STANDARD
+                .encode(self.encrypt(table, field, pk, plaintext)?),
+        };
+        let json =
+            serde_json::to_vec(&sealed).map_err(|e| format!("ERR seal encode failed: {e}"))?;
+        let mut value = SEALED_VALUE_PREFIX.to_vec();
+        value.extend(
+            base64::engine::general_purpose::STANDARD
+                .encode(json)
+                .as_bytes(),
+        );
+        Ok(value)
+    }
+
+    pub(crate) fn unseal(&self, value: &[u8]) -> Result<Vec<u8>, String> {
+        let (table, field, pk, envelope) = decode_sealed_value(value)?;
+        self.decrypt(&table, &field, &pk, &envelope)
     }
 
     pub(crate) fn has_active_key(&self) -> bool {
@@ -603,6 +652,21 @@ impl EncryptionKeyring {
         }
         Ok(())
     }
+}
+
+fn decode_sealed_value(value: &[u8]) -> Result<(String, String, String, Vec<u8>), String> {
+    let encoded = value
+        .strip_prefix(SEALED_VALUE_PREFIX)
+        .ok_or_else(|| "ERR value is not sealed".to_string())?;
+    let json = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("ERR sealed value decode failed: {e}"))?;
+    let sealed: SealedValue =
+        serde_json::from_slice(&json).map_err(|e| format!("ERR sealed value invalid: {e}"))?;
+    let envelope = base64::engine::general_purpose::STANDARD
+        .decode(&sealed.envelope)
+        .map_err(|e| format!("ERR sealed envelope decode failed: {e}"))?;
+    Ok((sealed.table, sealed.field, sealed.pk, envelope))
 }
 
 /// The seal used to *seal* state: the env-sourced secret when present, otherwise
@@ -1159,6 +1223,29 @@ mod adversarial_tests {
         assert!(ring.retire("does-not-exist").is_err());
         // Retiring the old (now decrypt-only) key is allowed at this layer.
         assert!(ring.retire("k1").is_ok());
+    }
+
+    #[test]
+    fn sealed_values_rewrap_before_key_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let ring = EncryptionKeyring::open(&EncryptionConfig::default(), &data_dir).unwrap();
+        ring.init(Some("k1")).unwrap();
+        let sealed = ring
+            .seal("auth.providers", "apple_private_key", "apple", b"p8")
+            .unwrap();
+        assert!(EncryptionKeyring::is_encrypted_value(&sealed));
+
+        ring.rotate(Some("k2")).unwrap();
+        let rewrapped = ring
+            .reencrypt("ignored", "ignored", "ignored", &sealed)
+            .unwrap();
+        let remaining = ring.remaining_key_ids_without("k1");
+        assert!(EncryptionKeyring::envelope_decryptable_by_any(
+            &rewrapped, &remaining
+        ));
+        ring.retire("k1").unwrap();
+        assert_eq!(ring.unseal(&rewrapped).unwrap(), b"p8");
     }
 
     // ---- seal sourcing: env seal, file->env migration, rotation ----

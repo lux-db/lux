@@ -22,7 +22,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
-      - run: cd sdk && bun install && bun run build
+      - run: cd sdk && bun install && bun test && bun run build
 
       - run: cd sdk && npm publish --access public --provenance
         env:

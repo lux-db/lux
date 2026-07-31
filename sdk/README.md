@@ -295,6 +295,82 @@ const { data, error } = await lux.auth.signInWithOAuth({
 if (error) throw error;
 ```
 
+For Sign in with Apple on the web, configure the provider from trusted server
+code with a secret project key. `apple_private_key` is the contents of the
+`AuthKey_*.p8` file from Apple, not its path. Omit it on later updates to retain
+the stored key.
+
+```ts
+import { createClient } from "@luxdb/sdk";
+
+const admin = createClient(
+  "https://api.example.com/v1/my-project",
+  process.env.LUX_SECRET_KEY!
+);
+
+const { data: provider, error: providerError } = await admin.auth.upsertProvider({
+  provider: "apple",
+  apple_services_id: "com.example.web",
+  apple_team_id: "TEAMID1234",
+  apple_key_id: "KEYID12345",
+  apple_private_key: process.env.APPLE_PRIVATE_KEY,
+  apple_bundle_ids: "com.example.ios,com.example.macos",
+  redirect_uri: "https://api.example.com/v1/my-project/auth/v1/callback/apple",
+});
+
+if (providerError) throw providerError;
+console.log(provider.has_apple_private_key);
+```
+
+`apple_bundle_ids` is a comma-separated list of native app audiences accepted
+from Apple identity tokens. It can be configured by itself for native-only
+Sign in with Apple:
+
+```ts
+await admin.auth.upsertProvider({
+  provider: "apple",
+  apple_bundle_ids: "com.example.ios,com.example.macos",
+});
+```
+
+To support web and native sign-in together, send `apple_bundle_ids` alongside
+the web fields as shown in the first example. Apple upserts preserve omitted
+fields, including an omitted `apple_private_key`.
+
+For native Apple sign-in, request the one-time nonce before presenting Apple's
+authorization UI. Pass the SHA-256 hash of `nonce.data.nonce` to Apple, then
+exchange Apple's identity token together with the original nonce:
+
+```ts
+const nonce = await lux.auth.getAppleSignInNonce();
+if (nonce.error) throw nonce.error;
+
+const name = [
+  appleCredential.fullName?.givenName,
+  appleCredential.fullName?.middleName,
+  appleCredential.fullName?.familyName,
+].filter(Boolean).join(" ");
+
+const result = await lux.auth.signInWithApple({
+  idToken: appleCredential.identityToken,
+  nonce: nonce.data.nonce,
+  user: name ? { name } : undefined,
+});
+```
+
+Start Apple sign-in from browser code using the same callback handling as the
+other OAuth providers:
+
+```ts
+const { data, error } = await lux.auth.signInWithOAuth({
+  provider: "apple",
+  redirectTo: "https://app.example.com/auth/callback",
+  flow: "code",
+});
+
+if (error) throw error;
+```
+
 On your callback page:
 
 ```ts

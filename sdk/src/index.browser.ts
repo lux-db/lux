@@ -16,12 +16,15 @@ import type { LuxSchema } from './types';
 
 export type {
 	LuxAuthKey,
+	LuxAppleAuthProvider,
 	LuxAuthGrantRow,
 	LuxAuthIdentityRow,
 	LuxAuthChangeEvent,
 	LuxAuthOptions,
 	LuxAuthKeyRow,
 	LuxAuthProviderRow,
+	LuxAuthProvider,
+	LuxAuthProviderBase,
 	LuxAuthSession,
 	LuxAuthSessionRow,
 	LuxAuthSigningKeyRow,
@@ -33,11 +36,17 @@ export type {
 	LuxAuthUser,
 	LuxUser,
 	LuxOAuthProvider,
+	LuxClientSecretAuthProvider,
 	LuxOAuthUrl,
 	LuxSignInWithOAuthOptions,
 	LuxCreateApiKeyOptions,
 	LuxSignInOptions,
+	LuxSignInWithAppleOptions,
+	LuxAppleSignInNonce,
 	LuxSignUpOptions,
+	LuxUpsertAppleProviderOptions,
+	LuxUpsertClientSecretProviderOptions,
+	LuxUpsertProviderOptions,
 } from './auth';
 export { createProjectClient, LuxProjectClient };
 export { LuxProjectLiveSubscription } from './project';

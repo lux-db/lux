@@ -248,6 +248,57 @@ describe('LuxAuthClient session state', () => {
 		});
 	});
 
+	test('native Apple sign-in requests a nonce and stores the exchanged session', async () => {
+		const storage = memoryStorage();
+		const calls: Array<{ url: string; headers: Record<string, string>; body: unknown }> = [];
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({
+				url: String(input),
+				headers: init?.headers as Record<string, string>,
+				body: JSON.parse(String(init?.body)),
+			});
+			if (String(input).endsWith('/nonce')) {
+				return new Response(JSON.stringify({ nonce: 'server-nonce' }), { status: 200 });
+			}
+			return new Response(JSON.stringify(session({ access_token: 'apple-access' })), { status: 200 });
+		};
+		const auth = new LuxAuthClient({
+			httpUrl: 'https://example.com/project',
+			apiKey: 'lux_pub_test',
+			fetch: fetchImpl as typeof fetch,
+			persistSession: true,
+			autoRefreshToken: false,
+			storage,
+		});
+
+		const nonce = await auth.getAppleSignInNonce();
+		const signedIn = await auth.signInWithApple({
+			idToken: 'apple-identity-token',
+			nonce: nonce.data?.nonce ?? '',
+			user: { name: 'Taylor Example' },
+		});
+
+		expect(nonce.data?.nonce).toBe('server-nonce');
+		expect(signedIn.data?.session?.access_token).toBe('apple-access');
+		expect((await auth.getSession()).data?.session?.access_token).toBe('apple-access');
+		expect(calls).toEqual([
+			{
+				url: 'https://example.com/project/auth/v1/signin/apple/nonce',
+				headers: { Accept: 'application/json', 'Content-Type': 'application/json', apikey: 'lux_pub_test' },
+				body: {},
+			},
+			{
+				url: 'https://example.com/project/auth/v1/signin/apple',
+				headers: { Accept: 'application/json', 'Content-Type': 'application/json', apikey: 'lux_pub_test' },
+				body: {
+					id_token: 'apple-identity-token',
+					nonce: 'server-nonce',
+					user: { name: 'Taylor Example' },
+				},
+			},
+		]);
+	});
+
 	test('getUser uses the stored bearer token', async () => {
 		let authorization = '';
 		const fetchImpl = async (_input: RequestInfo | URL, init?: RequestInit) => {
@@ -535,6 +586,131 @@ describe('LuxAuthClient session state', () => {
 			'http://localhost:3957/v1/project/auth/v1/authorize?provider=github&redirect_to=http%3A%2F%2Flocalhost%3A5173%2Fcallback&flow=code',
 		);
 		expect(result.error).toBeNull();
+	});
+
+	test('signInWithOAuth accepts Apple web OAuth', async () => {
+		const auth = new LuxAuthClient({
+			httpUrl: 'https://api.example.com/v1/project',
+			persistSession: false,
+			autoRefreshToken: false,
+		});
+
+		const result = await auth.signInWithOAuth({
+			provider: 'apple',
+			redirectTo: 'https://app.example.com/auth/callback',
+			skipRedirect: true,
+			flow: 'code',
+		});
+
+		expect(result.data?.url).toBe(
+			'https://api.example.com/v1/project/auth/v1/authorize?provider=apple&redirect_to=https%3A%2F%2Fapp.example.com%2Fauth%2Fcallback&flow=code',
+		);
+		expect(result.error).toBeNull();
+	});
+
+	test('upsertProvider sends Apple web credentials without changing client-secret providers', async () => {
+		const calls: Array<{ url: string; body: unknown }> = [];
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const body = JSON.parse(String(init?.body));
+			calls.push({ url: String(input), body });
+			if (body.provider === 'apple') {
+				return new Response(JSON.stringify({
+					provider: {
+						provider: 'apple',
+						enabled: true,
+						redirect_uri: body.redirect_uri,
+						scopes: 'name email',
+						apple_team_id: body.apple_team_id,
+						apple_key_id: body.apple_key_id,
+						apple_services_id: body.apple_services_id,
+						apple_bundle_ids: body.apple_bundle_ids ?? '',
+						has_apple_private_key: true,
+					},
+				}), { status: 200 });
+			}
+			return new Response(JSON.stringify({
+				provider: {
+					provider: body.provider,
+					enabled: true,
+					client_id: body.client_id,
+					redirect_uri: body.redirect_uri,
+					scopes: 'openid email profile',
+					has_client_secret: true,
+				},
+			}), { status: 200 });
+		};
+		const auth = new LuxAuthClient({
+			httpUrl: 'https://api.example.com/v1/project',
+			apiKey: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+			persistSession: false,
+			autoRefreshToken: false,
+		});
+
+		const apple = await auth.upsertProvider({
+			provider: 'apple',
+			apple_team_id: 'TEAM123',
+			apple_key_id: 'KEY123',
+			apple_services_id: 'com.example.web',
+			apple_bundle_ids: 'com.example.ios,com.example.macos',
+			apple_private_key: '-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----',
+			redirect_uri: 'https://api.example.com/v1/project/auth/v1/callback/apple',
+		});
+		const nativeApple = await auth.upsertProvider({
+			provider: 'apple',
+			apple_bundle_ids: 'com.example.ios',
+		});
+		const google = await auth.upsertProvider({
+			provider: 'google',
+			client_id: 'google-client-id',
+			client_secret: 'google-client-secret',
+			redirect_uri: 'https://api.example.com/v1/project/auth/v1/callback/google',
+		});
+
+		expect(apple.data?.provider).toBe('apple');
+		if (apple.data?.provider === 'apple') {
+			expect(apple.data.has_apple_private_key).toBe(true);
+			expect(apple.data.apple_services_id).toBe('com.example.web');
+			expect(apple.data.apple_bundle_ids).toBe('com.example.ios,com.example.macos');
+		}
+		expect(nativeApple.data?.provider).toBe('apple');
+		if (nativeApple.data?.provider === 'apple') {
+			expect(nativeApple.data.apple_bundle_ids).toBe('com.example.ios');
+		}
+		expect(google.data?.provider).toBe('google');
+		if (google.data?.provider === 'google') {
+			expect(google.data.has_client_secret).toBe(true);
+		}
+		expect(calls).toEqual([
+			{
+				url: 'https://api.example.com/v1/project/auth/v1/admin/providers/apple',
+				body: {
+					provider: 'apple',
+					apple_team_id: 'TEAM123',
+					apple_key_id: 'KEY123',
+					apple_services_id: 'com.example.web',
+					apple_bundle_ids: 'com.example.ios,com.example.macos',
+					apple_private_key: '-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----',
+					redirect_uri: 'https://api.example.com/v1/project/auth/v1/callback/apple',
+				},
+			},
+			{
+				url: 'https://api.example.com/v1/project/auth/v1/admin/providers/apple',
+				body: {
+					provider: 'apple',
+					apple_bundle_ids: 'com.example.ios',
+				},
+			},
+			{
+				url: 'https://api.example.com/v1/project/auth/v1/admin/providers/google',
+				body: {
+					provider: 'google',
+					client_id: 'google-client-id',
+					client_secret: 'google-client-secret',
+					redirect_uri: 'https://api.example.com/v1/project/auth/v1/callback/google',
+				},
+			},
+		]);
 	});
 
 	test('consumeOAuthRedirect stores access, refresh, and loaded user from hash', async () => {

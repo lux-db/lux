@@ -560,7 +560,27 @@ POST /auth/v1/token
 GET  /auth/v1/user
 POST /auth/v1/logout
 GET  /auth/v1/authorize?provider=google&redirect_to=http://localhost:5173/callback
+POST /auth/v1/signin/apple
 ```
+
+Sign in with Apple supports native Apple identity tokens and web OAuth. Configure
+native Bundle IDs, web credentials, or both with the CLI:
+
+```bash
+# Native iOS/macOS
+lux auth provider apple --bundle-id com.example.app
+
+# Web (requires an active Lux encryption keyring for .p8 storage)
+lux auth provider apple \
+  --services-id com.example.web \
+  --team-id YOUR_TEAM_ID \
+  --key-id YOUR_KEY_ID \
+  --p8 /path/to/AuthKey.p8
+```
+
+Set up `LUX_ENCRYPTION_KEYS` before configuring Apple web sign-in. Lux refuses
+to persist an Apple `.p8` without an active encryption key. Remote provider
+configuration requires HTTPS; plain HTTP is accepted only for localhost.
 
 OAuth providers are configured through admin routes with a secret key:
 

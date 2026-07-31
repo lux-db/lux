@@ -94,6 +94,11 @@ export interface LuxAuthProviderRow {
 	client_secret?: string;
 	redirect_uri?: string;
 	scopes?: string;
+	apple_team_id?: string;
+	apple_key_id?: string;
+	apple_services_id?: string;
+	apple_bundle_ids?: string;
+	apple_private_key?: string;
 	created_at?: number | null;
 	updated_at?: number | null;
 }
@@ -182,6 +187,16 @@ export interface LuxSignInOptions {
 	password: string;
 }
 
+export interface LuxSignInWithAppleOptions {
+	idToken: string;
+	nonce: string;
+	user?: { name: string };
+}
+
+export interface LuxAppleSignInNonce {
+	nonce: string;
+}
+
 export interface LuxAdminCreateUserOptions {
 	id?: string;
 	email: string;
@@ -224,7 +239,7 @@ export interface LuxAuthAdminClient {
 	updateSettings(settings: LuxAuthSettingsUpdate): Promise<LuxResult<LuxAuthSettings>>;
 }
 
-export type LuxOAuthProvider = 'google' | 'github';
+export type LuxOAuthProvider = 'google' | 'github' | 'apple';
 
 export interface LuxSignInWithOAuthOptions {
 	provider: LuxOAuthProvider;
@@ -264,25 +279,68 @@ export interface LuxCreateApiKeyOptions {
 	name?: string;
 }
 
-export interface LuxAuthProvider {
-	provider: LuxOAuthProvider;
+export interface LuxAuthProviderBase {
 	enabled: boolean;
-	client_id: string;
 	redirect_uri: string;
 	scopes: string;
-	has_client_secret: boolean;
 	created_at?: number | null;
 	updated_at?: number | null;
 }
 
-export interface LuxUpsertProviderOptions {
-	provider: LuxOAuthProvider;
+export interface LuxClientSecretAuthProvider extends LuxAuthProviderBase {
+	provider: 'google' | 'github';
+	client_id: string;
+	has_client_secret: boolean;
+}
+
+export interface LuxAppleAuthProvider extends LuxAuthProviderBase {
+	provider: 'apple';
+	apple_team_id: string;
+	apple_key_id: string;
+	apple_services_id: string;
+	apple_bundle_ids: string;
+	has_apple_private_key: boolean;
+}
+
+export type LuxAuthProvider = LuxClientSecretAuthProvider | LuxAppleAuthProvider;
+
+export interface LuxUpsertClientSecretProviderOptions {
+	provider: 'google' | 'github';
 	client_id: string;
 	client_secret?: string;
 	redirect_uri: string;
 	scopes?: string;
 	enabled?: boolean;
 }
+
+interface LuxUpsertAppleProviderBase {
+	provider: 'apple';
+	/** Raw contents of Apple's AuthKey_*.p8 file. Omit it to retain the existing key. */
+	apple_private_key?: string;
+	scopes?: string;
+	enabled?: boolean;
+}
+
+export type LuxUpsertAppleProviderOptions = LuxUpsertAppleProviderBase & (
+	| {
+		apple_bundle_ids: string;
+		apple_team_id?: string;
+		apple_key_id?: string;
+		apple_services_id?: string;
+		redirect_uri?: string;
+	}
+	| {
+		apple_bundle_ids?: string;
+		apple_team_id: string;
+		apple_key_id: string;
+		apple_services_id: string;
+		redirect_uri: string;
+	}
+);
+
+export type LuxUpsertProviderOptions =
+	| LuxUpsertClientSecretProviderOptions
+	| LuxUpsertAppleProviderOptions;
 
 export interface LuxAuthSettings {
 	email_confirmation_required: boolean;
@@ -523,6 +581,37 @@ export class LuxAuthClient {
 			return ok({ session: this.currentSession!, user: this.currentSession!.user });
 		} catch (error) {
 			return err('LUX_AUTH_SIGNIN_ERROR', 'Failed to sign in', toLuxError(error));
+		}
+	}
+
+	async getAppleSignInNonce(): Promise<LuxResult<LuxAppleSignInNonce>> {
+		try {
+			const nonce = await this.requestRaw<LuxAppleSignInNonce>('/auth/v1/signin/apple/nonce', {
+				method: 'POST',
+				body: '{}',
+				apiKey: true,
+			});
+			return ok(nonce);
+		} catch (error) {
+			return err('LUX_AUTH_APPLE_NONCE_ERROR', 'Failed to create Apple sign-in nonce', toLuxError(error));
+		}
+	}
+
+	async signInWithApple(options: LuxSignInWithAppleOptions): Promise<LuxResult<LuxAuthSessionResult>> {
+		try {
+			const session = await this.requestRaw<LuxAuthSession>('/auth/v1/signin/apple', {
+				method: 'POST',
+				body: JSON.stringify({
+					id_token: options.idToken,
+					nonce: options.nonce,
+					user: options.user,
+				}),
+				apiKey: true,
+			});
+			await this.saveSession(normalizeSession(session), 'SIGNED_IN');
+			return ok({ session: this.currentSession!, user: this.currentSession!.user });
+		} catch (error) {
+			return err('LUX_AUTH_APPLE_SIGNIN_ERROR', 'Failed to sign in with Apple', toLuxError(error));
 		}
 	}
 

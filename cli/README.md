@@ -238,6 +238,27 @@ authenticated direct connection while migration state uses Cloud's dedicated
 management endpoints; it never sends generic `LUX` commands through the
 restricted Cloud console.
 
+## Auth providers
+
+Provider commands target the local `lux start` engine by default. For a remote
+self-hosted engine, pass `--url` and `--password`, or set `LUX_ENGINE_URL` and
+`LUX_ENGINE_PASSWORD`. Remote URLs must use HTTPS; HTTP is accepted only for
+localhost.
+
+```bash
+lux auth provider apple --bundle-id com.example.app
+lux auth provider apple \
+  --url https://db.example.com \
+  --services-id com.example.web \
+  --team-id TEAM_ID \
+  --key-id KEY_ID \
+  --p8 AuthKey_KEY_ID.p8
+lux auth provider list
+```
+
+The `.p8` file is sent directly to the engine's encrypted provider storage and
+is never written to CLI configuration or printed.
+
 ## Push configuration
 
 Push configuration has the same target rule as migrations: omitted means local;

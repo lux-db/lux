@@ -38,3 +38,15 @@ jobs:
       - run: cargo build --bin lux
       - run: cargo build --manifest-path cli/Cargo.toml
       - run: bash cli/tests/e2e-local.sh
+
+  sdk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun run build

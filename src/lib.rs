@@ -3104,6 +3104,22 @@ impl Runtime {
                 ));
             }
         }
+        // A loaded snapshot can carry an older auth schema. Upgrade it before
+        // replaying WAL entries that may already reference newer columns.
+        if runtime.config.auth.enabled {
+            if let Err(e) =
+                auth::bootstrap(&runtime.store, &runtime.schema_cache, &runtime.config.auth)
+            {
+                runtime
+                    .store
+                    .wal_suppress
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("auth snapshot migration failed: {e}"),
+                ));
+            }
+        }
         runtime
             .store
             .wal_suppress

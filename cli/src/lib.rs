@@ -245,6 +245,7 @@ enum AuthAction {
 struct EngineConn {
     #[arg(
         long,
+        env = "LUX_ENGINE_URL",
         value_name = "URL",
         help = "Engine HTTP base URL (default: local engine)"
     )]
@@ -252,6 +253,7 @@ struct EngineConn {
     #[arg(
         short = 'a',
         long,
+        env = "LUX_ENGINE_PASSWORD",
         help = "Operator password / secret key (default: local engine's)"
     )]
     password: Option<String>,
@@ -2216,6 +2218,20 @@ fn require_project_arg(project: Option<&str>) -> String {
 /// the local `lux start` engine; --url/--password reach any self-hosted engine.
 fn resolve_engine(conn: &EngineConn) -> (String, String) {
     if let Some(url) = &conn.url {
+        let parsed = reqwest::Url::parse(url).unwrap_or_else(|_| {
+            eprintln!("{}", "--url must be a valid HTTP or HTTPS URL".red());
+            std::process::exit(1);
+        });
+        let local_http = parsed.scheme() == "http"
+            && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+        if parsed.scheme() != "https" && !local_http {
+            eprintln!(
+                "{}",
+                "Remote provider configuration requires HTTPS; plain HTTP is allowed only for localhost."
+                    .red()
+            );
+            std::process::exit(1);
+        }
         let Some(password) = conn.password.clone() else {
             eprintln!("{}", "--password is required with --url".red());
             std::process::exit(1);
@@ -2231,6 +2247,53 @@ fn resolve_engine(conn: &EngineConn) -> (String, String) {
         };
         (state.lux_url(), state.password)
     }
+}
+
+struct AppleProviderPayload {
+    team_id: Option<String>,
+    key_id: Option<String>,
+    services_id: Option<String>,
+    bundle_ids: Vec<String>,
+    private_key: Option<String>,
+    scopes: Option<String>,
+    disable: bool,
+}
+
+fn apple_provider_payload(base: &str, config: AppleProviderPayload) -> serde_json::Value {
+    let configures_web = config.team_id.is_some()
+        || config.key_id.is_some()
+        || config.services_id.is_some()
+        || config.private_key.is_some();
+    let mut body = serde_json::Map::new();
+    body.insert("enabled".into(), serde_json::json!(!config.disable));
+    if configures_web {
+        body.insert(
+            "redirect_uri".into(),
+            serde_json::json!(format!("{base}/auth/v1/callback/apple")),
+        );
+    }
+    if let Some(scopes) = config.scopes {
+        body.insert("scopes".into(), serde_json::json!(scopes));
+    }
+    if let Some(team_id) = config.team_id {
+        body.insert("apple_team_id".into(), serde_json::json!(team_id));
+    }
+    if let Some(key_id) = config.key_id {
+        body.insert("apple_key_id".into(), serde_json::json!(key_id));
+    }
+    if let Some(services_id) = config.services_id {
+        body.insert("apple_services_id".into(), serde_json::json!(services_id));
+    }
+    if !config.bundle_ids.is_empty() {
+        body.insert(
+            "apple_bundle_ids".into(),
+            serde_json::json!(config.bundle_ids.join(",")),
+        );
+    }
+    if let Some(private_key) = config.private_key {
+        body.insert("apple_private_key".into(), serde_json::json!(private_key));
+    }
+    serde_json::Value::Object(body)
 }
 
 async fn handle_auth(action: AuthAction) {
@@ -2290,41 +2353,36 @@ async fn handle_auth_provider(action: AuthProviderAction) {
             conn,
         } => {
             let (base, password) = resolve_engine(&conn);
-            let mut body = serde_json::Map::new();
-            body.insert("enabled".into(), serde_json::json!(!disable));
-            body.insert(
-                "redirect_uri".into(),
-                serde_json::json!(format!("{base}/auth/v1/callback/apple")),
-            );
-            body.insert(
-                "scopes".into(),
-                serde_json::json!(scopes.unwrap_or_else(|| "name email".into())),
-            );
-            body.insert(
-                "apple_team_id".into(),
-                serde_json::json!(team_id.unwrap_or_default()),
-            );
-            body.insert(
-                "apple_key_id".into(),
-                serde_json::json!(key_id.unwrap_or_default()),
-            );
-            body.insert(
-                "apple_services_id".into(),
-                serde_json::json!(services_id.unwrap_or_default()),
-            );
-            body.insert(
-                "apple_bundle_ids".into(),
-                serde_json::json!(bundle_id.join(",")),
-            );
+            let configures_web =
+                team_id.is_some() || key_id.is_some() || services_id.is_some() || p8.is_some();
+            if configures_web && !base.starts_with("https://") {
+                eprintln!(
+                    "{}",
+                    "Apple web sign-in requires an HTTPS engine URL with a public domain. Pass --url or set LUX_ENGINE_URL."
+                        .red()
+                );
+                std::process::exit(1);
+            }
             // Omitting apple_private_key on update keeps the stored key.
-            if let Some(path) = p8 {
-                let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            let private_key = p8.map(|path| {
+                std::fs::read_to_string(&path).unwrap_or_else(|e| {
                     eprintln!("{} {}: {e}", "Failed to read .p8:".red(), path.display());
                     std::process::exit(1);
-                });
-                body.insert("apple_private_key".into(), serde_json::json!(contents));
-            }
-            put_provider(&base, &password, "apple", serde_json::Value::Object(body)).await;
+                })
+            });
+            let body = apple_provider_payload(
+                &base,
+                AppleProviderPayload {
+                    team_id,
+                    key_id,
+                    services_id,
+                    bundle_ids: bundle_id,
+                    private_key,
+                    scopes,
+                    disable,
+                },
+            );
+            put_provider(&base, &password, "apple", body).await;
         }
         AuthProviderAction::Google {
             client_id,
@@ -6754,6 +6812,105 @@ fn legacy_fnv1a_hash(content: &str) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parses_apple_provider_options() {
+        let cli = Cli::try_parse_from([
+            "lux",
+            "auth",
+            "provider",
+            "apple",
+            "--bundle-id",
+            "com.example.ios",
+            "--services-id",
+            "com.example.web",
+            "--team-id",
+            "TEAM123456",
+            "--key-id",
+            "KEY1234567",
+            "--p8",
+            "AuthKey.p8",
+            "--url",
+            "https://db.example.com",
+            "--password",
+            "operator-secret",
+        ])
+        .expect("Apple provider command parses");
+
+        let Commands::Auth {
+            action:
+                AuthAction::Provider {
+                    action:
+                        AuthProviderAction::Apple {
+                            team_id,
+                            key_id,
+                            services_id,
+                            bundle_id,
+                            p8,
+                            conn,
+                            ..
+                        },
+                },
+        } = cli.command
+        else {
+            panic!("expected Apple provider command");
+        };
+        assert_eq!(team_id.as_deref(), Some("TEAM123456"));
+        assert_eq!(key_id.as_deref(), Some("KEY1234567"));
+        assert_eq!(services_id.as_deref(), Some("com.example.web"));
+        assert_eq!(bundle_id, vec!["com.example.ios"]);
+        assert_eq!(p8, Some(PathBuf::from("AuthKey.p8")));
+        assert_eq!(conn.url.as_deref(), Some("https://db.example.com"));
+        assert_eq!(conn.password.as_deref(), Some("operator-secret"));
+    }
+
+    #[test]
+    fn builds_native_and_web_apple_provider_payloads() {
+        let native = apple_provider_payload(
+            "http://localhost:5890",
+            AppleProviderPayload {
+                team_id: None,
+                key_id: None,
+                services_id: None,
+                bundle_ids: vec!["com.example.ios".into(), "com.example.macos".into()],
+                private_key: None,
+                scopes: None,
+                disable: false,
+            },
+        );
+        assert_eq!(
+            native,
+            serde_json::json!({
+                "enabled": true,
+                "apple_bundle_ids": "com.example.ios,com.example.macos"
+            })
+        );
+
+        let web = apple_provider_payload(
+            "https://db.example.com",
+            AppleProviderPayload {
+                team_id: Some("TEAM123456".into()),
+                key_id: Some("KEY1234567".into()),
+                services_id: Some("com.example.web".into()),
+                bundle_ids: Vec::new(),
+                private_key: Some("private-key".into()),
+                scopes: Some("name email".into()),
+                disable: true,
+            },
+        );
+        assert_eq!(
+            web,
+            serde_json::json!({
+                "enabled": false,
+                "redirect_uri": "https://db.example.com/auth/v1/callback/apple",
+                "scopes": "name email",
+                "apple_team_id": "TEAM123456",
+                "apple_key_id": "KEY1234567",
+                "apple_services_id": "com.example.web",
+                "apple_private_key": "private-key"
+            })
+        );
+    }
 
     #[test]
     fn resp_array_strips_index_prefixes() {
