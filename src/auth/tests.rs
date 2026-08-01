@@ -1786,6 +1786,88 @@ fn authorization_code_flow_is_one_time_use() {
 }
 
 #[test]
+fn authorization_code_pkce_is_bound_and_failed_attempt_does_not_consume() {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (_, _, signup_body) = route_http(
+        "POST",
+        "/auth/v1/signup",
+        r#"{"email":"pkce@example.com","password":"password123"}"#,
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    let signup: Value = serde_json::from_str(&signup_body).unwrap();
+    let user_id = signup["user"]["id"].as_str().unwrap();
+    let settings = auth_settings(&store, &cache, Instant::now()).unwrap();
+    // RFC 7636 Appendix B's verifier/challenge pair.
+    let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    let code = create_flow_token(
+        &store,
+        &cache,
+        FlowTokenInsert {
+            settings: &settings,
+            kind: "oauth_code",
+            user_id,
+            email: "pkce@example.com",
+            redirect_to: "vigil://auth/callback",
+            metadata: json!({"code_challenge": challenge}),
+        },
+        Instant::now(),
+    )
+    .unwrap();
+
+    for body in [
+        format!(r#"{{"grant_type":"authorization_code","code":"{code}"}}"#),
+        format!(
+            r#"{{"grant_type":"authorization_code","code":"{code}","code_verifier":"{}"}}"#,
+            "x".repeat(43)
+        ),
+    ] {
+        let (status, _, _) = route_http("POST", "/auth/v1/token", &body, &[], &[], &store, &cache);
+        assert_eq!(status, 400);
+    }
+
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/token",
+        &format!(
+            r#"{{"grant_type":"authorization_code","code":"{code}","code_verifier":"{verifier}"}}"#
+        ),
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "correct verifier should redeem code: {body}");
+
+    let (status, _, _) = route_http(
+        "POST",
+        "/auth/v1/token",
+        &format!(
+            r#"{{"grant_type":"authorization_code","code":"{code}","code_verifier":"{verifier}"}}"#
+        ),
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 400, "successful redemption remains one-time");
+}
+
+#[test]
 fn flow_token_consume_has_single_winner_under_concurrency() {
     let config = Arc::new(crate::ServerConfig {
         auth: AuthConfig {
@@ -1828,7 +1910,11 @@ fn flow_token_consume_has_single_winner_under_concurrency() {
         let token = token.clone();
         handles.push(std::thread::spawn(move || {
             barrier.wait();
-            if consume_flow_token(&store, &cache, "recovery", &token, Instant::now()).is_ok() {
+            if consume_flow_token(&store, &cache, "recovery", &token, Instant::now(), |_| {
+                Ok(())
+            })
+            .is_ok()
+            {
                 successes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         }));
@@ -1924,6 +2010,60 @@ async fn oauth_provider_config_and_authorize_redirect_are_core_owned() {
         location.contains("scope=openid%20email%20profile"),
         "{location}"
     );
+
+    let (status, _, body) = route_http(
+        "PATCH",
+        "/auth/v1/admin/settings",
+        r#"{"redirect_allow_list":["vigil://auth/callback"]}"#,
+        &[],
+        &[("apikey".to_string(), "lux_sec_test".to_string())],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "allow custom redirect: {body}");
+
+    let response = route_http_response(
+        "GET",
+        "/auth/v1/authorize",
+        "",
+        &[
+            ("provider".to_string(), "google".to_string()),
+            (
+                "redirect_to".to_string(),
+                "vigil://auth/callback".to_string(),
+            ),
+            ("flow".to_string(), "code".to_string()),
+        ],
+        &[("host".to_string(), "localhost:17777".to_string())],
+        &store,
+        &cache,
+    )
+    .await;
+    assert_eq!(response.status, 400, "custom schemes must require PKCE");
+
+    let response = route_http_response(
+        "GET",
+        "/auth/v1/authorize",
+        "",
+        &[
+            ("provider".to_string(), "google".to_string()),
+            (
+                "redirect_to".to_string(),
+                "vigil://auth/callback".to_string(),
+            ),
+            ("flow".to_string(), "code".to_string()),
+            (
+                "code_challenge".to_string(),
+                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
+            ),
+            ("code_challenge_method".to_string(), "S256".to_string()),
+        ],
+        &[("host".to_string(), "localhost:17777".to_string())],
+        &store,
+        &cache,
+    )
+    .await;
+    assert_eq!(response.status, 302, "valid S256 PKCE should authorize");
 }
 
 #[test]

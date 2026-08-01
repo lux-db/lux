@@ -1173,7 +1173,9 @@ fn authorization_code_grant(
         Err(response) => return response,
     };
     let now = Instant::now();
-    let token = match consume_flow_token(store, cache, "oauth_code", code, now) {
+    let token = match consume_flow_token(store, cache, "oauth_code", code, now, |flow| {
+        verify_oauth_pkce(flow, parsed)
+    }) {
         Ok(token) => token,
         Err(response) => return response,
     };
@@ -1261,7 +1263,7 @@ fn verify_otp(
         _ => return error(400, "Bad Request", "unsupported verification type"),
     };
     let now = Instant::now();
-    let flow = match consume_flow_token(store, cache, expected_kind, token, now) {
+    let flow = match consume_flow_token(store, cache, expected_kind, token, now, |_| Ok(())) {
         Ok(flow) => flow,
         Err(response) => return response,
     };
@@ -2205,6 +2207,27 @@ fn oauth_authorize(
             return AuthHttpResponse::json(status, status_text, body);
         }
     };
+    let flow = get_param(params, "flow").unwrap_or("code");
+    if !matches!(flow, "code" | "implicit") {
+        let (status, status_text, body) = error(400, "Bad Request", "unsupported oauth flow");
+        return AuthHttpResponse::json(status, status_text, body);
+    }
+    let code_challenge = match oauth_pkce_challenge(params) {
+        Ok(challenge) => challenge,
+        Err(response) => {
+            let (status, status_text, body) = response;
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+    };
+    let is_custom_scheme = !redirect_to.starts_with('/') && url_origin(&redirect_to).is_none();
+    if flow == "code" && is_custom_scheme && code_challenge.is_none() {
+        let (status, status_text, body) = error(
+            400,
+            "Bad Request",
+            "custom-scheme oauth code flows require PKCE",
+        );
+        return AuthHttpResponse::json(status, status_text, body);
+    }
     let config = match oauth_provider_config(store, cache, &provider, Instant::now()) {
         Ok(Some(config)) if config.enabled => config,
         Ok(Some(_)) => {
@@ -2231,7 +2254,8 @@ fn oauth_authorize(
     let payload = json!({
         "provider": provider,
         "redirect_to": redirect_to,
-        "flow": get_param(params, "flow").unwrap_or("code"),
+        "flow": flow,
+        "code_challenge": code_challenge,
         "oidc_nonce": oidc_nonce,
         "created_at": unix_seconds(),
     });
@@ -2391,7 +2415,12 @@ async fn oauth_callback(
                     user_id: &subject.user_id,
                     email: &subject.email,
                     redirect_to: &redirect_to,
-                    metadata: json!({}),
+                    metadata: json!({
+                        "code_challenge": state_value
+                            .get("code_challenge")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    }),
                 },
                 now,
             ) {
@@ -4507,13 +4536,17 @@ fn validate_auth_email_settings(
     }
 }
 
-fn consume_flow_token(
+fn consume_flow_token<F>(
     store: &Store,
     cache: &SharedSchemaCache,
     kind: &str,
     token: &str,
     now: Instant,
-) -> Result<HashMap<String, String>, (u16, &'static str, String)> {
+    validate: F,
+) -> Result<HashMap<String, String>, (u16, &'static str, String)>
+where
+    F: FnOnce(&HashMap<String, String>) -> Result<(), (u16, &'static str, String)>,
+{
     let _guard = FLOW_TOKEN_CONSUME_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -4555,6 +4588,7 @@ fn consume_flow_token(
     if expires_at <= now_sec {
         return Err(error(400, "Bad Request", "invalid or expired token"));
     }
+    validate(&existing)?;
     let consumed_at = now_sec.to_string();
     let expires_at_s = expires_at.to_string();
     let rows = tables::table_update_where_returning_ttl(
@@ -5580,6 +5614,56 @@ fn hash_secret(secret: &str) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+fn oauth_pkce_challenge(
+    params: &[(String, String)],
+) -> Result<Option<String>, (u16, &'static str, String)> {
+    let Some(challenge) = get_param(params, "code_challenge") else {
+        return Ok(None);
+    };
+    if challenge.len() != 43
+        || !challenge
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(error(400, "Bad Request", "invalid PKCE code_challenge"));
+    }
+    if get_param(params, "code_challenge_method") != Some("S256") {
+        return Err(error(
+            400,
+            "Bad Request",
+            "PKCE code_challenge_method must be S256",
+        ));
+    }
+    Ok(Some(challenge.to_string()))
+}
+
+fn verify_oauth_pkce(
+    flow: &HashMap<String, String>,
+    request: &Value,
+) -> Result<(), (u16, &'static str, String)> {
+    let metadata = flow
+        .get("metadata")
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .unwrap_or_else(|| json!({}));
+    let Some(challenge) = metadata.get("code_challenge").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let verifier = required_string(request, "code_verifier")?;
+    if !(43..=128).contains(&verifier.len())
+        || !verifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+    {
+        return Err(error(400, "Bad Request", "invalid PKCE code_verifier"));
+    }
+    let digest = Sha256::digest(verifier.as_bytes());
+    let calculated = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    if !constant_time_eq(calculated.as_bytes(), challenge.as_bytes()) {
+        return Err(error(400, "Bad Request", "PKCE verification failed"));
+    }
+    Ok(())
 }
 
 fn random_token(bytes: usize) -> String {

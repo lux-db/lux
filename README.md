@@ -564,6 +564,12 @@ GET  /auth/v1/authorize?provider=google&redirect_to=http://localhost:5173/callba
 POST /auth/v1/signin/apple
 ```
 
+OAuth authorization-code clients can send an RFC 7636
+`code_challenge` with `code_challenge_method=S256`, then include the matching
+`code_verifier` in the token exchange. Lux binds and verifies the pair before
+consuming the one-time code. PKCE is required for custom-scheme callback URLs;
+browser HTTP(S) flows remain backward compatible.
+
 Lux supports Google, GitHub, and Apple OAuth. Configure a local or remote
 self-hosted engine with the CLI; managed Cloud projects use the **Auth** page in
 the Lux dashboard.
