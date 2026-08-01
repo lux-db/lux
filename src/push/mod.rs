@@ -1592,7 +1592,11 @@ mod tests {
 
     #[test]
     fn plaintext_push_secret_writes_are_rejected() {
-        let store = Store::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            ..ServerConfig::default()
+        }));
         let error = update_apns_credentials(
             &store,
             &cache(),
