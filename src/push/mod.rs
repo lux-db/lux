@@ -545,6 +545,30 @@ pub(crate) fn delete_device_by_id(
     Ok(removed > 0)
 }
 
+/// Delete a device by token only when it belongs to `subject_id`. This is the
+/// end-user cleanup path used during token rotation and logout, where the app
+/// always has the APNs token but may not have received or persisted the
+/// engine's internal device id yet.
+pub(crate) fn delete_device_by_token_for_subject(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    subject_id: &str,
+    token: &str,
+    now: Instant,
+) -> Result<bool, String> {
+    let removed = durable_table_delete_where(
+        store,
+        cache,
+        DEVICES_TABLE,
+        &["token", "=", token, "AND", "subject_id", "=", subject_id],
+        now,
+    )?;
+    if removed > 0 {
+        metrics().devices.fetch_sub(1, Ordering::Relaxed);
+    }
+    Ok(removed > 0)
+}
+
 /// Delete any device by its token (operator). Used for logout-time unregister,
 /// where the caller has the token but not the internal device id.
 pub(crate) fn delete_device_by_token(

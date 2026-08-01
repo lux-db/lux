@@ -523,7 +523,7 @@ fn delete_by_token_edge_cases() {
 }
 
 #[test]
-fn push_admin_routes_require_operator() {
+fn push_admin_routes_require_operator_and_token_cleanup_requires_auth() {
     let mock = MockApns::start(200);
     let dir = tempfile::tempdir().unwrap();
     let resp_port = free_port();
@@ -532,15 +532,18 @@ fn push_admin_routes_require_operator() {
     set_creds(http_port, &mock.url());
     let (token, _uid) = anon_login(http_port);
 
-    // A signed-in user (non-operator) must not delete-by-token or read stats.
-    let (s, _) = http(
+    // A signed-in user can reach the cleanup route, but a token it does not
+    // own is indistinguishable from a missing token. Admin stats remain
+    // operator-only.
+    let (s, deleted) = http(
         http_port,
         "DELETE",
         "/v1/push/devices",
         &json!({"token":"x"}).to_string(),
         Some(&token),
     );
-    assert!(s == 401 || s == 403, "user delete-by-token denied, got {s}");
+    assert_eq!(s, 200, "authenticated cleanup: {deleted}");
+    assert_eq!(deleted["deleted"], false);
     let (s, _) = http(http_port, "GET", "/v1/push/admin/stats", "", Some(&token));
     assert!(s == 401 || s == 403, "user stats read denied, got {s}");
 
@@ -834,6 +837,32 @@ fn push_devices_scoped_and_reserved_guarded() {
     assert_eq!(list_a["devices"].as_array().unwrap().len(), 1);
     let (_, list_b) = http(http_port, "GET", "/v1/push/devices", "", Some(&token_b));
     assert_eq!(list_b["devices"].as_array().unwrap().len(), 0);
+
+    // The stable token cleanup route is user-scoped: B cannot delete A's
+    // device, while A can remove it without knowing the internal device id.
+    let (s, deleted) = http(
+        http_port,
+        "DELETE",
+        "/v1/push/devices",
+        &json!({"token":"a-token"}).to_string(),
+        Some(&token_b),
+    );
+    assert_eq!(s, 200, "other-user cleanup: {deleted}");
+    assert_eq!(deleted["deleted"], false);
+    let (_, list_a) = http(http_port, "GET", "/v1/push/devices", "", Some(&token_a));
+    assert_eq!(list_a["devices"].as_array().unwrap().len(), 1);
+
+    let (s, deleted) = http(
+        http_port,
+        "DELETE",
+        "/v1/push/devices",
+        &json!({"token":"a-token"}).to_string(),
+        Some(&token_a),
+    );
+    assert_eq!(s, 200, "own-token cleanup: {deleted}");
+    assert_eq!(deleted["deleted"], true);
+    let (_, list_a) = http(http_port, "GET", "/v1/push/devices", "", Some(&token_a));
+    assert_eq!(list_a["devices"].as_array().unwrap().len(), 0);
 
     // Anonymous (no JWT) registration is rejected.
     let (s, _) = http(

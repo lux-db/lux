@@ -2690,7 +2690,7 @@ fn route_request_with_auth(
         ("POST", ["push", "devices"]) => push_register(body, store, cache, auth),
         ("GET", ["push", "devices"]) => push_list_devices(params, store, cache, auth),
         ("DELETE", ["push", "devices", id]) => push_delete_device(id, store, cache, auth),
-        ("DELETE", ["push", "devices"]) => push_delete_device_by_token(body, store, cache),
+        ("DELETE", ["push", "devices"]) => push_delete_device_by_token(body, store, cache, auth),
         ("POST", ["push", "send"]) => push_send(body, store, cache),
         ("POST", ["push", "credentials"]) => push_set_credentials(body, store, cache),
         ("GET", ["push", "config"]) => push_config(params, store, cache),
@@ -3088,7 +3088,6 @@ fn route_requires_project_access(method: &str, base: &[&str]) -> bool {
             | ("DELETE", ["push", "config", "apns"])
             | ("POST", ["push", "config", "vapid"])
             | ("DELETE", ["push", "config", "vapid"])
-            | ("DELETE", ["push", "devices"])
             | ("GET", ["push", "admin", "devices"])
             | ("GET", ["push", "admin", "outbox"])
             | ("GET", ["push", "admin", "stats"])
@@ -3463,12 +3462,15 @@ fn push_admin_outbox(store: &Arc<Store>, cache: &SharedSchemaCache) -> (u16, &'s
     }
 }
 
-/// `DELETE /v1/push/devices` (operator) — remove a device by its token. For
-/// logout-time unregister, where the client has the token but not the id.
+/// `DELETE /v1/push/devices` — remove a device by its token. A user session can
+/// only remove its own row; an operator or secret key can remove any matching
+/// row. This gives logout-time cleanup a stable handle even when registration
+/// raced before the client received the internal device id.
 fn push_delete_device_by_token(
     body: &str,
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
 ) -> (u16, &'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -3477,7 +3479,22 @@ fn push_delete_device_by_token(
     let Some(token) = parsed["token"].as_str().filter(|s| !s.is_empty()) else {
         return push_json_error(400, "Bad Request", "token is required");
     };
-    match crate::push::delete_device_by_token(store, cache, token, Instant::now()) {
+    let result = match auth {
+        HttpAuthContext::User(principal) => crate::push::delete_device_by_token_for_subject(
+            store,
+            cache,
+            &principal.user_id,
+            token,
+            Instant::now(),
+        ),
+        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+            crate::push::delete_device_by_token(store, cache, token, Instant::now())
+        }
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
+            return push_json_error(401, "Unauthorized", "authentication required")
+        }
+    };
+    match result {
         Ok(deleted) => ok(json!({ "deleted": deleted }).to_string()),
         Err(e) => push_json_error(400, "Bad Request", &e),
     }
@@ -5150,6 +5167,14 @@ mod tests {
                 base.join("/")
             );
         }
+    }
+
+    #[test]
+    fn user_push_cleanup_route_is_not_operator_only() {
+        assert!(
+            !route_requires_project_access("DELETE", &["push", "devices"]),
+            "a user JWT must reach the subject-scoped token cleanup handler"
+        );
     }
 
     #[test]
