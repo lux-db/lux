@@ -699,6 +699,11 @@ impl EmbeddedClient {
         &self,
         command: command::Command<'_>,
     ) -> Result<CommandOutput, LuxError> {
+        if self.runtime.cluster.is_some() {
+            let resp = self.execute_owned(command.to_owned_argv()).await?;
+            let value = parse_single_embedded_value(&resp)?;
+            return embedded_value_to_command_output(value);
+        }
         if let Some(output) = self.execute_command_fast_path(&command).await? {
             return Ok(output);
         }
@@ -728,6 +733,20 @@ impl EmbeddedClient {
         commands: &[Command<'_>],
         collect_outputs: bool,
     ) -> Result<Vec<CommandOutput>, LuxError> {
+        if self.runtime.cluster.is_some() {
+            let mut outputs = if collect_outputs {
+                Vec::with_capacity(commands.len())
+            } else {
+                Vec::new()
+            };
+            for command in commands {
+                let output = self.execute_command_output(command.clone()).await?;
+                if collect_outputs {
+                    outputs.push(output);
+                }
+            }
+            return Ok(outputs);
+        }
         if self.runtime.store.is_tiered() {
             let mut outputs = if collect_outputs {
                 Vec::with_capacity(commands.len())
@@ -1807,6 +1826,21 @@ impl EmbeddedClient {
             self.runtime.script_engine.clone(),
             self.runtime.schema_cache.clone(),
         );
+        if self.runtime.cluster.is_some() {
+            for args in &refs {
+                if self
+                    .runtime
+                    .execute_cluster_command(&executor, args, &mut session, &mut write_buf, now)
+                    .await
+                    .is_some()
+                {
+                    return Err(LuxError::Unsupported(
+                        "blocking command not supported in a Cluster pipeline".to_string(),
+                    ));
+                }
+            }
+            return Ok(write_buf.freeze());
+        }
         if let Some(action) = executor.execute_pipeline(&refs, &mut session, &mut write_buf, now) {
             let kind = match action {
                 CmdResult::BlockPop { .. } => "BLPOP/BRPOP",
@@ -1974,6 +2008,12 @@ impl EmbeddedClient {
         timeout: Duration,
         pop_left: bool,
     ) -> Result<Option<(String, bytes::Bytes)>, LuxError> {
+        if self.runtime.cluster.is_some() {
+            return Err(LuxError::Unsupported(
+                "blocking list operations require the Cluster blocking-command coordinator"
+                    .to_string(),
+            ));
+        }
         if keys.is_empty() {
             return Err(LuxError::InvalidCommand(
                 "blocking list pop requires at least one key".to_string(),
@@ -2041,6 +2081,19 @@ impl EmbeddedClient {
             self.runtime.script_engine.clone(),
             self.runtime.schema_cache.clone(),
         );
+        if self.runtime.cluster.is_some() {
+            if self
+                .runtime
+                .execute_cluster_command(&executor, &refs, &mut session, &mut write_buf, now)
+                .await
+                .is_some()
+            {
+                return Err(LuxError::Unsupported(
+                    "blocking command not supported in Cluster embedded execution".to_string(),
+                ));
+            }
+            return Ok(write_buf.freeze());
+        }
         self.runtime.store.add_total_commands(1);
         if let Some(action) = executor.execute_command(&refs, &mut session, &mut write_buf, now) {
             let kind = match action {
@@ -3082,7 +3135,11 @@ impl Runtime {
                     epoch: node.topology.current().manifest().epoch,
                 },
             );
-            background_tasks.spawn(node.clone().serve_foundation());
+            let peer_runtime = runtime.clone();
+            background_tasks.spawn(node.clone().serve(move |request| {
+                let runtime = peer_runtime.clone();
+                async move { runtime.execute_cluster_peer_request(request).await }
+            }));
             background_tasks.spawn(node.clone().probe_peers());
         }
 
@@ -3275,6 +3332,95 @@ impl Runtime {
         }
 
         Ok(runtime)
+    }
+
+    async fn execute_cluster_command(
+        &self,
+        executor: &CommandExecutor,
+        args: &[&[u8]],
+        session: &mut CommandSession,
+        write_buf: &mut BytesMut,
+        now: Instant,
+    ) -> Option<CmdResult> {
+        let Some(node) = &self.cluster else {
+            unreachable!("Cluster dispatch called for an ordinary runtime");
+        };
+
+        // Authentication and all connection-local state remain on the ingress
+        // connection. No unauthenticated argv is ever put on the peer network.
+        if !session.authenticated {
+            self.store.add_total_commands(1);
+            return executor.execute_command(args, session, write_buf, now);
+        }
+        if let Err(message) = cmd::validate_args(args) {
+            self.store.add_total_commands(1);
+            resp::write_error(write_buf, &message);
+            return None;
+        }
+
+        let target = match node.remote_target(args) {
+            Ok(target) => target,
+            Err(message) => {
+                self.store.add_total_commands(1);
+                resp::write_error(write_buf, &message);
+                return None;
+            }
+        };
+        let Some(target) = target else {
+            self.store.add_total_commands(1);
+            return executor.execute_command(args, session, write_buf, now);
+        };
+
+        // A future transaction slice forwards one complete, prevalidated
+        // same-slot transaction. Forwarding individual queued commands would
+        // silently destroy MULTI/EXEC atomicity, so fail closed today.
+        if session.in_multi {
+            self.store.add_total_commands(1);
+            resp::write_error(
+                write_buf,
+                "ERR Cluster cannot forward an individual command inside MULTI",
+            );
+            session.tx_error = true;
+            return None;
+        }
+
+        let argv = args.iter().map(|arg| arg.to_vec()).collect();
+        match node.execute_remote(target, argv).await {
+            Ok(response) => write_buf.extend_from_slice(&response),
+            Err(message) => resp::write_error(write_buf, &message),
+        }
+        None
+    }
+
+    async fn execute_cluster_peer_request(
+        &self,
+        request: cluster::PeerRequest,
+    ) -> cluster::PeerResponseBody {
+        let cluster::PeerRequestBody::Execute { argv, .. } = request.body else {
+            return cluster::PeerResponseBody::Error {
+                message: "peer request did not contain an executable command".to_string(),
+            };
+        };
+        let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mut session = CommandSession::new(false);
+        let mut response = BytesMut::with_capacity(4096);
+        let executor = CommandExecutor::new(
+            self.store.clone(),
+            self.broker.clone(),
+            self.script_engine.clone(),
+            self.schema_cache.clone(),
+        );
+        self.store.add_total_commands(1);
+        if executor
+            .execute_command(&refs, &mut session, &mut response, Instant::now())
+            .is_some()
+        {
+            return cluster::PeerResponseBody::Error {
+                message: "blocking or streaming command cannot execute on a Cluster peer"
+                    .to_string(),
+            };
+        }
+        cluster::PeerResponseBody::Ok(response.to_vec())
     }
 
     fn start_http_if_enabled(
@@ -4376,7 +4522,18 @@ async fn handle_connection(
 
             let mut deferred_action: Option<CmdResult> = None;
 
-            if commands.len() <= 1 {
+            if runtime.cluster.is_some() {
+                for command in &commands {
+                    let args = command.argv();
+                    if let Some(action) = runtime
+                        .execute_cluster_command(&executor, args, &mut session, &mut write_buf, now)
+                        .await
+                    {
+                        deferred_action = Some(action);
+                        break;
+                    }
+                }
+            } else if commands.len() <= 1 {
                 for command in &commands {
                     let args = command.argv();
                     store.add_total_commands(1);
