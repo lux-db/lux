@@ -1,5 +1,10 @@
 pub(crate) mod select;
 pub(crate) use select::*;
+mod distributed;
+pub(crate) use distributed::{
+    export_cluster_table_catalog, install_cluster_table_catalog, prepare_cluster_table_command,
+    validate_cluster_routed_table_command,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -4070,6 +4075,158 @@ mod tests {
             Ok(_) => panic!("expected table_select to fail"),
             Err(err) => err,
         }
+    }
+
+    #[test]
+    fn cluster_catalog_installs_once_and_enables_row_execution() {
+        let source = Store::new();
+        let source_cache = make_cache();
+        let target = Store::new();
+        let target_cache = make_cache();
+        let now = now();
+        table_create(
+            &source,
+            &source_cache,
+            "orders",
+            &["id UUID PRIMARY KEY,", "state STR NOT NULL"],
+            now,
+        )
+        .unwrap();
+
+        let encoded = export_cluster_table_catalog(&source, &source_cache, "orders", now).unwrap();
+        assert!(
+            install_cluster_table_catalog(&target, &target_cache, "orders", &encoded, now,)
+                .unwrap()
+        );
+        assert!(
+            !install_cluster_table_catalog(&target, &target_cache, "orders", &encoded, now,)
+                .unwrap()
+        );
+
+        let id = "019fa100-0000-7000-8000-000000000001";
+        table_insert_pk(
+            &target,
+            &target_cache,
+            "orders",
+            &[("id", id), ("state", "pending")],
+            None,
+            now,
+        )
+        .unwrap();
+        let row = table_get_by_pk_str(&target, &target_cache, "orders", id, None, true, now)
+            .unwrap()
+            .unwrap();
+        assert!(row.contains(&("state".to_string(), "pending".to_string())));
+    }
+
+    #[test]
+    fn cluster_catalog_rejects_constraints_that_need_global_coordination() {
+        let store = Store::new();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "users",
+            &["id UUID PRIMARY KEY,", "email STR UNIQUE"],
+            now,
+        )
+        .unwrap();
+        let error = export_cluster_table_catalog(&store, &cache, "users", now).unwrap_err();
+        assert!(error.contains("secondary UNIQUE"));
+    }
+
+    #[test]
+    fn cluster_insert_materializes_uuid_and_receiver_recomputes_route() {
+        let store = Store::new();
+        let cache = make_cache();
+        let now = now();
+        table_create(
+            &store,
+            &cache,
+            "events",
+            &["id UUID PRIMARY KEY,", "body STR NOT NULL"],
+            now,
+        )
+        .unwrap();
+        let original = [
+            b"TINSERT".as_slice(),
+            b"events".as_slice(),
+            b"body".as_slice(),
+            b"created".as_slice(),
+            b"RETURNING".as_slice(),
+            b"id".as_slice(),
+        ];
+        let prepared = prepare_cluster_table_command(&store, &cache, &original, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.argv[4], b"id");
+        assert_eq!(prepared.argv[5], prepared.primary_key);
+        assert_eq!(prepared.argv[6], b"RETURNING");
+
+        let catalog = export_cluster_table_catalog(&store, &cache, "events", now).unwrap();
+        let refs = prepared.argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert_eq!(
+            validate_cluster_routed_table_command(&catalog, &refs, &prepared.primary_key).unwrap(),
+            ("events".to_string(), false)
+        );
+        let error =
+            validate_cluster_routed_table_command(&catalog, &refs, b"tampered").unwrap_err();
+        assert!(error.contains("does not match argv"));
+    }
+
+    #[test]
+    fn cluster_catalog_replays_before_its_table_rows() {
+        let source = Store::new();
+        let source_cache = make_cache();
+        let now = now();
+        table_create(
+            &source,
+            &source_cache,
+            "orders",
+            &["id STR PRIMARY KEY,", "state STR NOT NULL"],
+            now,
+        )
+        .unwrap();
+        let catalog = export_cluster_table_catalog(&source, &source_cache, "orders", now).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..crate::ServerConfig::default()
+        });
+        let target = Store::new_with_config(config.clone());
+        let target_cache = make_cache();
+        install_cluster_table_catalog(&target, &target_cache, "orders", &catalog, now).unwrap();
+        table_insert_pk(
+            &target,
+            &target_cache,
+            "orders",
+            &[("id", "order-1"), ("state", "paid")],
+            None,
+            now,
+        )
+        .unwrap();
+        target.fsync_wal();
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&crate::pubsub::Broker::new());
+        let restored_cache = make_cache();
+        let row = table_get_by_pk_str(
+            &restored,
+            &restored_cache,
+            "orders",
+            "order-1",
+            None,
+            true,
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(row.contains(&("state".to_string(), "paid".to_string())));
     }
 
     // -------------------------------------------------------------------------

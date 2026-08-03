@@ -1,4 +1,4 @@
-use super::slot_for_key;
+use super::{slot_for_key, slot_for_table_row};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CommandRoute {
@@ -22,6 +22,24 @@ pub(crate) fn classify_command(argv: &[&[u8]]) -> CommandRoute {
 
     if local_command(command) {
         return CommandRoute::Local;
+    }
+    if table_row_command(command) {
+        let (Some(table), Some(primary_key)) = (argv.get(1), argv.get(2)) else {
+            // Preserve the ordinary command's exact arity response on the
+            // system node instead of inventing a router-level error.
+            return CommandRoute::System {
+                read_only: eq(command, b"TGET"),
+            };
+        };
+        if reserved_system_table(table) {
+            return CommandRoute::System {
+                read_only: eq(command, b"TGET"),
+            };
+        }
+        return CommandRoute::Slot {
+            slot: slot_for_table_row(table, primary_key),
+            read_only: eq(command, b"TGET"),
+        };
     }
     if system_command(command) {
         return CommandRoute::System {
@@ -162,17 +180,36 @@ fn system_command(command: &[u8]) -> bool {
         b"TDELETE",
         b"TDROP",
         b"TDROPINDEX",
-        b"TGET",
         b"TINDEX",
         b"TINSERT",
         b"TLIST",
         b"TSCHEMA",
         b"TSELECT",
-        b"TSET",
         b"TUPDATE",
         b"TUPSERT",
     ];
     COMMANDS.iter().any(|candidate| eq(command, candidate))
+}
+
+fn table_row_command(command: &[u8]) -> bool {
+    eq(command, b"TGET") || eq(command, b"TSET")
+}
+
+fn reserved_system_table(table: &[u8]) -> bool {
+    let Ok(table) = std::str::from_utf8(table) else {
+        return true;
+    };
+    table.starts_with("auth.") || table.starts_with("push.")
+}
+
+pub(crate) fn routed_table<'a>(argv: &'a [&'a [u8]]) -> Option<&'a str> {
+    let command = argv.first()?;
+    if !table_row_command(command) {
+        return None;
+    }
+    argv.get(2)?;
+    let table = std::str::from_utf8(argv.get(1)?).ok()?;
+    (!crate::auth::is_reserved_system_table(table)).then_some(table)
 }
 
 fn system_command_is_write(argv: &[&[u8]]) -> bool {
@@ -510,6 +547,29 @@ mod tests {
             classify(&[b"KEYS", b"*"]),
             CommandRoute::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn point_table_commands_route_by_table_and_primary_key() {
+        let slot = slot_for_table_row(b"orders", b"order-17");
+        assert_eq!(
+            classify(&[b"TGET", b"orders", b"order-17"]),
+            CommandRoute::Slot {
+                slot,
+                read_only: true,
+            }
+        );
+        assert_eq!(
+            classify(&[b"TSET", b"orders", b"order-17", b"state", b"paid"]),
+            CommandRoute::Slot {
+                slot,
+                read_only: false,
+            }
+        );
+        assert_eq!(
+            classify(&[b"TGET", b"auth.users", b"user-1"]),
+            CommandRoute::System { read_only: true }
+        );
     }
 
     #[test]
