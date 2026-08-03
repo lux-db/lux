@@ -71,6 +71,16 @@ async fn async_main() -> std::io::Result<()> {
     let managed_email = managed_auth_email_from_env();
 
     let encryption = encryption_config_from_env()?;
+    let cluster = std::env::var("LUX_CLUSTER_CONFIG")
+        .ok()
+        .map(lux::cluster::ClusterConfig::from_file)
+        .transpose()
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("failed to load LUX_CLUSTER_CONFIG: {error}"),
+            )
+        })?;
 
     // `site_url` and `issuer` default to the address this engine actually serves
     // HTTP on. They used to hardcode port 7379, which is not the RESP port, the
@@ -157,6 +167,7 @@ async fn async_main() -> std::io::Result<()> {
             managed_email,
         },
         encryption,
+        cluster,
         // The library is quiet by default; the binary maps severity-specific
         // callbacks back to the previous stdout/stderr behavior.
         on_info: Some(std::sync::Arc::new(print_info_event)),
@@ -363,6 +374,13 @@ fn print_info_event(event: lux::ServerInfoEvent) {
         }
         lux::ServerInfoEvent::HttpReady { addr } => {
             println!("lux http api ready on {addr}");
+        }
+        lux::ServerInfoEvent::ClusterPeerReady {
+            node_id,
+            addr,
+            epoch,
+        } => {
+            println!("lux cluster node {node_id} ready on {addr} (epoch {epoch})");
         }
     }
 }
