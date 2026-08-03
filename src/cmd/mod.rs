@@ -2053,6 +2053,25 @@ pub fn execute(
                 }
                 return CmdResult::Written;
             }
+            if cmd_eq(cmd, b"LXCATALOG") {
+                // Internal, replay-only: a Cluster slot owner's durable table
+                // schema context. Live peer installation calls the table layer
+                // directly and self-logs this resolved snapshot first.
+                if !store.wal_replaying() {
+                    resp::write_error(out, &format!("ERR unknown command '{}'", arg_str(cmd)));
+                    return CmdResult::Written;
+                }
+                if args.len() != 3 {
+                    return CmdResult::Written;
+                }
+                let table = arg_str(args[1]);
+                if let Err(error) =
+                    crate::tables::install_cluster_table_catalog(store, cache, table, args[2], now)
+                {
+                    resp::write_error(out, &error);
+                }
+                return CmdResult::Written;
+            }
             if cmd_eq(cmd, b"LASTSAVE") {
                 return server::cmd_lastsave(args, store, out, now);
             }

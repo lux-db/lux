@@ -1,10 +1,11 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use lux::cluster::{
-    certificate_fingerprint, slot_for_key, ClusterConfig, NodeDescriptor, SignedTopology,
-    SlotAssignment, TopologyManifest, CLUSTER_PROTOCOL_VERSION, CLUSTER_SLOT_COUNT,
+    certificate_fingerprint, slot_for_key, slot_for_table_row, ClusterConfig, NodeDescriptor,
+    SignedTopology, SlotAssignment, TopologyManifest, CLUSTER_PROTOCOL_VERSION, CLUSTER_SLOT_COUNT,
     CLUSTER_TOPOLOGY_SCHEMA_VERSION,
 };
+use lux::EmbeddedValue;
 use p256::ecdsa::SigningKey;
 use rand_core::OsRng;
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
@@ -42,6 +43,16 @@ fn key_for_range(start: u16, end: u16) -> String {
         .find(|key| {
             let slot = slot_for_key(key.as_bytes());
             slot >= start && slot <= end
+        })
+        .unwrap()
+}
+
+fn table_pk_for_range(table: &str, start: u16, end: u16) -> String {
+    (0u64..)
+        .map(|value| format!("order-{value}"))
+        .find(|primary_key| {
+            let logical = slot_for_table_row(table.as_bytes(), primary_key.as_bytes());
+            logical >= start && logical <= end
         })
         .unwrap()
 }
@@ -187,6 +198,66 @@ async fn embedded_clients_route_to_the_signed_owner_without_a_local_hop() {
     let mut actual = vec![0; expected.len()];
     resp.read_exact(&mut actual).await.unwrap();
     assert_eq!(actual, expected);
+
+    assert_eq!(
+        client_a
+            .execute_value(
+                "TCREATE",
+                &["orders", "id STR PRIMARY KEY,", "state STR NOT NULL"],
+            )
+            .await
+            .unwrap(),
+        EmbeddedValue::Simple("OK".to_string())
+    );
+    let order_id = table_pk_for_range("orders", 2048, CLUSTER_SLOT_COUNT - 1);
+    assert_eq!(
+        client_a
+            .execute_value("TGET", &["orders", &order_id])
+            .await
+            .unwrap(),
+        EmbeddedValue::Nil
+    );
+    assert_eq!(
+        client_a
+            .execute_value("TINSERT", &["orders", "id", &order_id, "state", "pending"],)
+            .await
+            .unwrap(),
+        EmbeddedValue::Int(0)
+    );
+    assert_eq!(
+        client_a
+            .execute_value("TGET", &["orders", &order_id, "state"])
+            .await
+            .unwrap(),
+        EmbeddedValue::Bulk(bytes::Bytes::from_static(b"pending"))
+    );
+    assert_eq!(
+        client_a
+            .execute_value("TSET", &["orders", &order_id, "state", "paid"])
+            .await
+            .unwrap(),
+        EmbeddedValue::Int(1)
+    );
+    assert_eq!(
+        client_a
+            .execute_value("TGET", &["orders", &order_id, "state"])
+            .await
+            .unwrap(),
+        EmbeddedValue::Bulk(bytes::Bytes::from_static(b"paid"))
+    );
+    let duplicate = client_a
+        .execute_value(
+            "TINSERT",
+            &["orders", "id", &order_id, "state", "duplicate"],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        duplicate
+            .to_string()
+            .contains("unique constraint violation"),
+        "{duplicate}"
+    );
 
     drop(client_a);
     drop(client_b);

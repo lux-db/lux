@@ -33,7 +33,16 @@ pub struct PeerRequest {
 pub enum PeerRequestBody {
     Probe,
     Status,
-    Execute { argv: Vec<Vec<u8>>, read_only: bool },
+    Execute {
+        argv: Vec<Vec<u8>>,
+        read_only: bool,
+        /// Authoritative table schema supplied only by the signed system node.
+        /// Slot owners durably install it before executing a table-row command.
+        catalog: Option<Vec<u8>>,
+        /// Logical table primary key used for the route. Receivers derive it
+        /// again from `argv` plus `catalog`; this field is never trusted alone.
+        table_primary_key: Option<Vec<u8>>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -91,6 +100,8 @@ mod tests {
             body: PeerRequestBody::Execute {
                 argv: vec![b"SET".to_vec(), vec![0, 255], b"value".to_vec()],
                 read_only: false,
+                catalog: None,
+                table_primary_key: None,
             },
         };
         let encoded = rmp_serde::to_vec_named(&request).unwrap();

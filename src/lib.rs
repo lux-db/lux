@@ -3358,17 +3358,77 @@ impl Runtime {
             return None;
         }
 
-        let target = match node.remote_target(args) {
-            Ok(target) => target,
-            Err(message) => {
+        let prepared =
+            match tables::prepare_cluster_table_command(&self.store, &self.schema_cache, args, now)
+            {
+                Ok(prepared) => prepared,
+                Err(message) => {
+                    self.store.add_total_commands(1);
+                    resp::write_error(write_buf, &message);
+                    return None;
+                }
+            };
+        let prepared_refs = prepared
+            .as_ref()
+            .map(|prepared| prepared.argv.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        let routed_args = prepared_refs.as_deref().unwrap_or(args);
+        let table_route = prepared
+            .as_ref()
+            .map(|prepared| {
+                (
+                    prepared.table.as_str(),
+                    prepared.primary_key.as_slice(),
+                    prepared.read_only,
+                )
+            })
+            .or_else(|| {
+                cluster::routed_table(routed_args).map(|table| {
+                    (
+                        table,
+                        routed_args[2],
+                        routed_args[0].eq_ignore_ascii_case(b"TGET"),
+                    )
+                })
+            });
+
+        let catalog = if let Some((table, _, _)) = table_route {
+            let topology = node.topology.current();
+            if topology.manifest().system_node_id != node.local_node_id {
                 self.store.add_total_commands(1);
-                resp::write_error(write_buf, &message);
+                resp::write_error(
+                    write_buf,
+                    "ERR Cluster table commands must enter through the system node",
+                );
                 return None;
+            }
+            match tables::export_cluster_table_catalog(&self.store, &self.schema_cache, table, now)
+            {
+                Ok(catalog) => Some(catalog),
+                Err(message) => {
+                    self.store.add_total_commands(1);
+                    resp::write_error(write_buf, &message);
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
+        let target = if let Some((table, primary_key, read_only)) = table_route {
+            node.remote_table_target(table.as_bytes(), primary_key, read_only)
+        } else {
+            match node.remote_target(routed_args) {
+                Ok(target) => target,
+                Err(message) => {
+                    self.store.add_total_commands(1);
+                    resp::write_error(write_buf, &message);
+                    return None;
+                }
             }
         };
         let Some(target) = target else {
             self.store.add_total_commands(1);
-            return executor.execute_command(args, session, write_buf, now);
+            return executor.execute_command(routed_args, session, write_buf, now);
         };
 
         // A future transaction slice forwards one complete, prevalidated
@@ -3384,8 +3444,12 @@ impl Runtime {
             return None;
         }
 
-        let argv = args.iter().map(|arg| arg.to_vec()).collect();
-        match node.execute_remote(target, argv).await {
+        let argv = routed_args.iter().map(|arg| arg.to_vec()).collect();
+        let table_primary_key = table_route.map(|(_, primary_key, _)| primary_key.to_vec());
+        match node
+            .execute_remote(target, argv, catalog, table_primary_key)
+            .await
+        {
             Ok(response) => write_buf.extend_from_slice(&response),
             Err(message) => resp::write_error(write_buf, &message),
         }
@@ -3396,12 +3460,42 @@ impl Runtime {
         &self,
         request: cluster::PeerRequest,
     ) -> cluster::PeerResponseBody {
-        let cluster::PeerRequestBody::Execute { argv, .. } = request.body else {
+        let cluster::PeerRequestBody::Execute {
+            argv,
+            catalog,
+            table_primary_key,
+            ..
+        } = request.body
+        else {
             return cluster::PeerResponseBody::Error {
                 message: "peer request did not contain an executable command".to_string(),
             };
         };
         let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        if table_primary_key.is_some() {
+            let Some(table) = refs
+                .get(1)
+                .and_then(|table| std::str::from_utf8(table).ok())
+            else {
+                return cluster::PeerResponseBody::Error {
+                    message: "Cluster table command has no valid table name".to_string(),
+                };
+            };
+            let Some(catalog) = catalog.as_deref() else {
+                return cluster::PeerResponseBody::Error {
+                    message: "Cluster table command did not include catalog context".to_string(),
+                };
+            };
+            if let Err(message) = tables::install_cluster_table_catalog(
+                &self.store,
+                &self.schema_cache,
+                table,
+                catalog,
+                Instant::now(),
+            ) {
+                return cluster::PeerResponseBody::Error { message };
+            }
+        }
         let mut session = CommandSession::new(false);
         let mut response = BytesMut::with_capacity(4096);
         let executor = CommandExecutor::new(

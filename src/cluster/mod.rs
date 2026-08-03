@@ -16,7 +16,7 @@ pub use protocol::{
     PeerRequest, PeerRequestBody, PeerResponse, PeerResponseBody, RequestId,
     CLUSTER_PROTOCOL_VERSION,
 };
-pub(crate) use routing::{classify_command, CommandRoute};
+pub(crate) use routing::{classify_command, routed_table, CommandRoute};
 pub use topology::{
     certificate_fingerprint, slot_for_key, slot_for_table_row, CompiledTopology, NodeDescriptor,
     SignedTopology, SlotAssignment, TopologyManifest, TopologyState, CLUSTER_SLOT_COUNT,
@@ -88,10 +88,28 @@ impl ClusterNode {
         }))
     }
 
+    pub(crate) fn remote_table_target(
+        &self,
+        table: &[u8],
+        primary_key: &[u8],
+        read_only: bool,
+    ) -> Option<RemoteTarget> {
+        let topology = self.topology.current();
+        let slot = slot_for_table_row(table, primary_key);
+        let target = &topology.owner_for_slot(slot).node_id;
+        (target != &self.local_node_id).then(|| RemoteTarget {
+            node_id: target.clone(),
+            slot: Some(slot),
+            read_only,
+        })
+    }
+
     pub(crate) async fn execute_remote(
         &self,
         target: RemoteTarget,
         argv: Vec<Vec<u8>>,
+        catalog: Option<Vec<u8>>,
+        table_primary_key: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, String> {
         let topology = self.topology.current();
         let request = PeerRequest {
@@ -107,6 +125,8 @@ impl ClusterNode {
             body: PeerRequestBody::Execute {
                 argv,
                 read_only: target.read_only,
+                catalog,
+                table_primary_key,
             },
         };
         let response = self
@@ -188,7 +208,13 @@ impl ClusterNode {
     }
 
     fn validate_peer_route(&self, request: &PeerRequest) -> Result<(), PeerResponseBody> {
-        let PeerRequestBody::Execute { argv, read_only } = &request.body else {
+        let PeerRequestBody::Execute {
+            argv,
+            read_only,
+            catalog,
+            table_primary_key,
+        } = &request.body
+        else {
             return Ok(());
         };
         let topology = self.topology.current();
@@ -198,6 +224,41 @@ impl ClusterNode {
             });
         }
         let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        if let Some(primary_key) = table_primary_key {
+            let Some(catalog) = catalog.as_deref() else {
+                return Err(PeerResponseBody::Error {
+                    message: "Cluster routed table command has no catalog".to_string(),
+                });
+            };
+            if request.source_node_id != topology.manifest().system_node_id {
+                return Err(PeerResponseBody::Error {
+                    message: "Cluster table routes must come from the signed system node"
+                        .to_string(),
+                });
+            }
+            let (table, expected_read_only) =
+                crate::tables::validate_cluster_routed_table_command(catalog, &refs, primary_key)
+                    .map_err(|message| PeerResponseBody::Error { message })?;
+            let slot = slot_for_table_row(table.as_bytes(), primary_key);
+            if request.slot != Some(slot) || expected_read_only != *read_only {
+                return Err(PeerResponseBody::Error {
+                    message: "Cluster peer table route metadata mismatch".to_string(),
+                });
+            }
+            let owner = topology.owner_for_slot(slot);
+            if owner.node_id != self.local_node_id {
+                return Err(PeerResponseBody::Moved {
+                    owner_node_id: owner.node_id.clone(),
+                    epoch: topology.manifest().epoch,
+                });
+            }
+            return Ok(());
+        }
+        if catalog.is_some() {
+            return Err(PeerResponseBody::Error {
+                message: "Cluster catalog context requires a verified table route".to_string(),
+            });
+        }
         match classify_command(&refs) {
             CommandRoute::System {
                 read_only: expected,
@@ -228,6 +289,12 @@ impl ClusterNode {
                     return Err(PeerResponseBody::Moved {
                         owner_node_id: owner.node_id.clone(),
                         epoch: topology.manifest().epoch,
+                    });
+                }
+                if routed_table(&refs).is_some() {
+                    return Err(PeerResponseBody::Error {
+                        message: "Cluster table command has no verified primary-key route"
+                            .to_string(),
                     });
                 }
             }
