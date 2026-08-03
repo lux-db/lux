@@ -22,6 +22,7 @@ mod http;
 mod jsonb;
 mod lua;
 mod migrations;
+pub mod cluster;
 mod pubsub;
 mod push;
 mod resp;
@@ -237,6 +238,9 @@ pub struct ServerConfig {
     pub auth: AuthConfig,
     /// Table column encryption key configuration.
     pub encryption: EncryptionConfig,
+    /// Optional Cluster multi-node routing configuration. `None` preserves the
+    /// exact ordinary single-node runtime path.
+    pub cluster: Option<cluster::ClusterConfig>,
     /// Enables the RESP listener. Use this instead of overloading `port = 0`.
     pub enable_resp: bool,
     /// Optional informational event sink. Library mode is silent when unset.
@@ -267,6 +271,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("eviction", &self.eviction)
             .field("auth", &self.auth)
             .field("encryption", &self.encryption)
+            .field("cluster", &self.cluster)
             .field("enable_resp", &self.enable_resp)
             .field("on_info", &self.on_info.as_ref().map(|_| "<callback>"))
             .field("on_warn", &self.on_warn.as_ref().map(|_| "<callback>"))
@@ -295,6 +300,7 @@ impl Default for ServerConfig {
             eviction: EvictionConfig::default(),
             auth: AuthConfig::default(),
             encryption: EncryptionConfig::default(),
+            cluster: None,
             enable_resp: true,
             on_info: None,
             on_warn: None,
@@ -318,6 +324,12 @@ pub enum ServerInfoEvent {
     WalReplayed { commands: usize },
     /// HTTP listener bound successfully.
     HttpReady { addr: std::net::SocketAddr },
+    /// Encrypted Cluster peer listener bound successfully.
+    ClusterPeerReady {
+        node_id: String,
+        addr: std::net::SocketAddr,
+        epoch: u64,
+    },
 }
 
 /// Warning runtime events emitted through `ServerConfig::on_warn`.
@@ -571,6 +583,7 @@ struct Runtime {
     shard_executor: ShardExecutor,
     schema_cache: SharedSchemaCache,
     script_engine: Arc<lua::ScriptEngine>,
+    cluster: Option<Arc<cluster::ClusterNode>>,
     config: Arc<ServerConfig>,
 }
 
@@ -3032,6 +3045,17 @@ impl Runtime {
         store.set_row_delta_broker(broker.clone());
         let shard_executor = ShardExecutor::new(store.clone(), broker.clone());
         let script_engine = Arc::new(lua::ScriptEngine::new());
+        let cluster = config
+            .cluster
+            .as_ref()
+            .map(cluster::ClusterNode::bind)
+            .transpose()
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Cluster startup failed: {error}"),
+                )
+            })?;
 
         let runtime = Arc::new(Self {
             store,
@@ -3039,8 +3063,28 @@ impl Runtime {
             shard_executor,
             schema_cache,
             script_engine,
+            cluster,
             config,
         });
+
+        if let Some(node) = &runtime.cluster {
+            let peer_addr = node.transport.local_addr().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    format!("Cluster peer listener failed: {error}"),
+                )
+            })?;
+            emit_info(
+                &runtime.config,
+                ServerInfoEvent::ClusterPeerReady {
+                    node_id: node.local_node_id.clone(),
+                    addr: peer_addr,
+                    epoch: node.topology.current().manifest().epoch,
+                },
+            );
+            background_tasks.spawn(node.clone().serve_foundation());
+            background_tasks.spawn(node.clone().probe_peers());
+        }
 
         if runtime.config.storage.mode == StorageMode::Tiered {
             emit_info(
