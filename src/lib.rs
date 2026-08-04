@@ -3358,6 +3358,25 @@ impl Runtime {
             return None;
         }
 
+        let table_scan = match tables::cluster_table_scan_table(args) {
+            Ok(table) => table,
+            Err(message) => {
+                self.store.add_total_commands(1);
+                resp::write_error(write_buf, &message);
+                return None;
+            }
+        };
+        if table_scan.is_some()
+            && node.topology.current().manifest().system_node_id == node.local_node_id
+        {
+            self.store.add_total_commands(1);
+            match self.execute_cluster_table_scan(args, now).await {
+                Ok(response) => write_buf.extend_from_slice(&response),
+                Err(message) => resp::write_error(write_buf, &message),
+            }
+            return None;
+        }
+
         let prepared =
             match tables::prepare_cluster_table_command(&self.store, &self.schema_cache, args, now)
             {
@@ -3460,18 +3479,63 @@ impl Runtime {
         &self,
         request: cluster::PeerRequest,
     ) -> cluster::PeerResponseBody {
-        let cluster::PeerRequestBody::Execute {
-            argv,
-            catalog,
-            table_primary_key,
-            ..
-        } = request.body
-        else {
-            return cluster::PeerResponseBody::Error {
-                message: "peer request did not contain an executable command".to_string(),
-            };
+        let (argv, catalog, table_primary_key, table_scan) = match request.body {
+            cluster::PeerRequestBody::Execute {
+                argv,
+                catalog,
+                table_primary_key,
+                ..
+            } => (argv, catalog, table_primary_key, false),
+            cluster::PeerRequestBody::TableScan { argv, catalog } => {
+                (argv, Some(catalog), None, true)
+            }
+            _ => {
+                return cluster::PeerResponseBody::Error {
+                    message: "peer request did not contain an executable command".to_string(),
+                };
+            }
         };
         let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        if table_scan {
+            let Some(catalog) = catalog.as_deref() else {
+                return cluster::PeerResponseBody::Error {
+                    message: "Cluster table scan did not include catalog context".to_string(),
+                };
+            };
+            let table = match tables::validate_cluster_table_scan(catalog, &refs) {
+                Ok(table) => table,
+                Err(message) => return cluster::PeerResponseBody::Error { message },
+            };
+            if let Err(message) = tables::install_cluster_table_catalog(
+                &self.store,
+                &self.schema_cache,
+                &table,
+                catalog,
+                Instant::now(),
+            ) {
+                return cluster::PeerResponseBody::Error { message };
+            }
+            return match tables::execute_cluster_table_scan(
+                &self.store,
+                &self.schema_cache,
+                &refs,
+                Instant::now(),
+            ) {
+                Ok(partial) => cluster::PeerResponseBody::TableScan(partial),
+                Err(message) => cluster::PeerResponseBody::Error { message },
+            };
+        }
+
+        match tables::cluster_table_scan_table(&refs) {
+            Ok(Some(_)) => {
+                return match self.execute_cluster_table_scan(&refs, Instant::now()).await {
+                    Ok(response) => cluster::PeerResponseBody::Ok(response),
+                    Err(message) => cluster::PeerResponseBody::Error { message },
+                };
+            }
+            Ok(None) => {}
+            Err(message) => return cluster::PeerResponseBody::Error { message },
+        }
         if let Some(primary_key) = table_primary_key.as_deref() {
             let Some(catalog) = catalog.as_deref() else {
                 return cluster::PeerResponseBody::Error {
@@ -3512,6 +3576,53 @@ impl Runtime {
             };
         }
         cluster::PeerResponseBody::Ok(response.to_vec())
+    }
+
+    async fn execute_cluster_table_scan(
+        &self,
+        args: &[&[u8]],
+        now: Instant,
+    ) -> Result<Vec<u8>, String> {
+        let node = self
+            .cluster
+            .as_ref()
+            .ok_or_else(|| "ERR Cluster is not enabled".to_string())?;
+        let table = tables::cluster_table_scan_table(args)?
+            .ok_or_else(|| "ERR command is not a Cluster table scan".to_string())?;
+        if node.topology.current().manifest().system_node_id != node.local_node_id {
+            return Err("ERR Cluster table scans must execute on the system node".to_string());
+        }
+        let catalog =
+            tables::export_cluster_table_catalog(&self.store, &self.schema_cache, &table, now)?;
+        let mut partials = node
+            .execute_table_scan_peers(args.iter().map(|arg| arg.to_vec()).collect(), catalog)
+            .await?;
+        partials.push(tables::execute_cluster_table_scan(
+            &self.store,
+            &self.schema_cache,
+            args,
+            now,
+        )?);
+
+        let merged = tables::merge_cluster_table_scans(args, partials)?;
+        let mut response = BytesMut::with_capacity(4096);
+        match merged {
+            tables::ClusterMergedTableScan::Count(count) => {
+                resp::write_integer(&mut response, count)
+            }
+            tables::ClusterMergedTableScan::Select(result) => {
+                let str_args = args[1..]
+                    .iter()
+                    .map(|arg| {
+                        std::str::from_utf8(arg)
+                            .map_err(|_| "ERR TSELECT argument is not valid UTF-8".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let plan = tables::parse_select(&str_args)?;
+                cmd::write_select_result(&mut response, &plan, result);
+            }
+        }
+        Ok(response.to_vec())
     }
 
     fn start_http_if_enabled(

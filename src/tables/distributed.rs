@@ -683,3 +683,208 @@ fn cluster_insert_fields_end(argv: &[&[u8]]) -> Result<usize, String> {
     }
     Ok(fields_end)
 }
+
+pub(crate) enum ClusterMergedTableScan {
+    Count(i64),
+    Select(SelectResult),
+}
+
+/// Identify a broad, read-only user-table command that must be scattered over
+/// every slot owner. Reserved auth/push tables intentionally stay on node 1.
+pub(crate) fn cluster_table_scan_table(argv: &[&[u8]]) -> Result<Option<String>, String> {
+    let Some(command) = argv.first() else {
+        return Ok(None);
+    };
+    let table = if command.eq_ignore_ascii_case(b"TCOUNT") {
+        if argv.len() != 2 {
+            return Err("ERR wrong number of arguments for 'tcount' command".to_string());
+        }
+        utf8_arg(argv[1], "table name")?.to_string()
+    } else if command.eq_ignore_ascii_case(b"TSELECT") {
+        let plan = parse_cluster_select(argv)?;
+        if !plan.joins.is_empty() {
+            return Err(
+                "ERR Cluster distributed JOIN is not supported; query one partition by primary key or denormalize the join"
+                    .to_string(),
+            );
+        }
+        plan.table
+    } else {
+        return Ok(None);
+    };
+    if crate::auth::is_reserved_system_table(&table) {
+        Ok(None)
+    } else {
+        Ok(Some(table))
+    }
+}
+
+/// Recompute a scatter command's table from its argv and prove that the signed
+/// system catalog names the same non-reserved table. Peers do this before any
+/// catalog installation or data access.
+pub(crate) fn validate_cluster_table_scan(
+    encoded_catalog: &[u8],
+    argv: &[&[u8]],
+) -> Result<String, String> {
+    let snapshot: ClusterTableCatalog = rmp_serde::from_slice(encoded_catalog)
+        .map_err(|error| format!("ERR invalid Cluster table catalog: {error}"))?;
+    let table = cluster_table_scan_table(argv)?
+        .ok_or_else(|| "ERR command is not a Cluster table scan".to_string())?;
+    if snapshot.schema_version != CLUSTER_TABLE_CATALOG_SCHEMA_VERSION
+        || snapshot.table != table
+        || crate::auth::is_reserved_system_table(&snapshot.table)
+    {
+        return Err("ERR Cluster table scan does not match its catalog".to_string());
+    }
+    Ok(table)
+}
+
+/// Run only the shard-local phase and return the peer protocol's structured
+/// result. The coordinator never parses or concatenates RESP frames.
+pub(crate) fn execute_cluster_table_scan(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    argv: &[&[u8]],
+    now: Instant,
+) -> Result<crate::cluster::TableScanPartial, String> {
+    let command = argv
+        .first()
+        .ok_or_else(|| "ERR empty Cluster table scan".to_string())?;
+    let partial = if command.eq_ignore_ascii_case(b"TCOUNT") {
+        let table = cluster_table_scan_table(argv)?
+            .ok_or_else(|| "ERR command is not a Cluster table scan".to_string())?;
+        crate::cluster::TableScanPartial::Count(table_count(store, cache, &table, now)?)
+    } else if command.eq_ignore_ascii_case(b"TSELECT") {
+        let plan = parse_cluster_select(argv)?;
+        crate::cluster::TableScanPartial::Rows(cluster_select_shard_rows(store, cache, &plan, now)?)
+    } else {
+        return Err("ERR command is not a Cluster table scan".to_string());
+    };
+    Ok(partial)
+}
+
+/// Decode every shard's structured result and apply the query's global
+/// semantics once. A missing, malformed, or mismatched shard fails the whole
+/// read instead of returning a plausible but incomplete answer.
+pub(crate) fn merge_cluster_table_scans(
+    argv: &[&[u8]],
+    partials: Vec<crate::cluster::TableScanPartial>,
+) -> Result<ClusterMergedTableScan, String> {
+    if partials.is_empty() {
+        return Err("TRYAGAIN Cluster table scan had no participating nodes".to_string());
+    }
+    if argv[0].eq_ignore_ascii_case(b"TCOUNT") {
+        let mut total = 0i64;
+        for partial in partials {
+            let crate::cluster::TableScanPartial::Count(count) = partial else {
+                return Err("ERR Cluster peer returned the wrong table scan result".to_string());
+            };
+            total = total
+                .checked_add(count)
+                .ok_or_else(|| "ERR Cluster table count overflow".to_string())?;
+        }
+        return Ok(ClusterMergedTableScan::Count(total));
+    }
+
+    let plan = parse_cluster_select(argv)?;
+    let mut rows = Vec::new();
+    for partial in partials {
+        let crate::cluster::TableScanPartial::Rows(mut shard_rows) = partial else {
+            return Err("ERR Cluster peer returned the wrong table scan result".to_string());
+        };
+        rows.append(&mut shard_rows);
+    }
+    Ok(ClusterMergedTableScan::Select(finish_cluster_select(
+        &plan, rows,
+    )?))
+}
+
+fn parse_cluster_select(argv: &[&[u8]]) -> Result<SelectPlan, String> {
+    if argv.len() < 4 {
+        return Err("ERR usage: TSELECT <cols> FROM <table> [...]".to_string());
+    }
+    let args = argv[1..]
+        .iter()
+        .map(|arg| utf8_arg(arg, "TSELECT argument"))
+        .collect::<Result<Vec<_>, _>>()?;
+    parse_select(&args)
+}
+
+fn utf8_arg<'a>(arg: &'a [u8], label: &str) -> Result<&'a str, String> {
+    std::str::from_utf8(arg).map_err(|_| format!("ERR {label} is not valid UTF-8"))
+}
+
+#[cfg(test)]
+mod distributed_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn cache() -> SharedSchemaCache {
+        Arc::new(parking_lot::RwLock::new(SchemaCache::new()))
+    }
+
+    #[test]
+    fn scan_catalog_is_bound_to_argv_and_distributed_joins_fail_closed() {
+        let store = Store::new();
+        let cache = cache();
+        let now = Instant::now();
+        table_create(
+            &store,
+            &cache,
+            "orders",
+            &["id STR PRIMARY KEY,", "amount INT"],
+            now,
+        )
+        .unwrap();
+        table_create(
+            &store,
+            &cache,
+            "customers",
+            &["id STR PRIMARY KEY,", "name STR"],
+            now,
+        )
+        .unwrap();
+        let catalog = export_cluster_table_catalog(&store, &cache, "orders", now).unwrap();
+
+        assert!(validate_cluster_table_scan(&catalog, &[b"TCOUNT", b"orders"]).is_ok());
+        assert!(
+            validate_cluster_table_scan(&catalog, &[b"TCOUNT", b"customers"])
+                .unwrap_err()
+                .contains("does not match")
+        );
+        let join = [
+            b"TSELECT".as_slice(),
+            b"*",
+            b"FROM",
+            b"orders",
+            b"o",
+            b"JOIN",
+            b"customers",
+            b"c",
+            b"ON",
+            b"o.id",
+            b"=",
+            b"c.id",
+        ];
+        assert!(cluster_table_scan_table(&join)
+            .unwrap_err()
+            .contains("distributed JOIN"));
+    }
+
+    #[test]
+    fn scan_merge_rejects_missing_or_wrong_partial_types() {
+        assert!(
+            merge_cluster_table_scans(&[b"TCOUNT", b"orders"], Vec::new())
+                .err()
+                .unwrap()
+                .contains("no participating nodes")
+        );
+        assert!(merge_cluster_table_scans(
+            &[b"TCOUNT", b"orders"],
+            vec![crate::cluster::TableScanPartial::Rows(Vec::new())],
+        )
+        .err()
+        .unwrap()
+        .contains("wrong table scan result"));
+    }
+}

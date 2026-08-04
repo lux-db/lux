@@ -43,6 +43,12 @@ pub enum PeerRequestBody {
         /// again from `argv` plus `catalog`; this field is never trusted alone.
         table_primary_key: Option<Vec<u8>>,
     },
+    /// Read-only user-table query broadcast by the signed system node. Every
+    /// peer returns a structured shard partial; only the system node merges it.
+    TableScan {
+        argv: Vec<Vec<u8>>,
+        catalog: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -54,8 +60,15 @@ pub struct PeerResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TableScanPartial {
+    Count(i64),
+    Rows(Vec<Vec<(String, String)>>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PeerResponseBody {
     Ok(Vec<u8>),
+    TableScan(TableScanPartial),
     Moved { owner_node_id: String, epoch: u64 },
     Fenced { epoch: u64 },
     CatalogStale { required_version: u64 },
@@ -127,5 +140,40 @@ mod tests {
             request.validate_envelope(100),
             Err("request deadline elapsed")
         );
+    }
+
+    #[test]
+    fn table_scan_wire_types_round_trip_without_resp_reencoding() {
+        let request = PeerRequest {
+            protocol_version: CLUSTER_PROTOCOL_VERSION,
+            cluster_id: "cluster-a".into(),
+            topology_epoch: 8,
+            source_node_id: "system".into(),
+            target_node_id: "data".into(),
+            request_id: RequestId([4; 16]),
+            deadline_unix_ms: 1_000,
+            slot: None,
+            catalog_version: 3,
+            body: PeerRequestBody::TableScan {
+                argv: vec![b"TCOUNT".to_vec(), b"orders".to_vec()],
+                catalog: vec![0, 1, 255],
+            },
+        };
+        let request: PeerRequest =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&request).unwrap()).unwrap();
+        assert!(matches!(request.body, PeerRequestBody::TableScan { .. }));
+
+        let response = PeerResponse {
+            protocol_version: CLUSTER_PROTOCOL_VERSION,
+            request_id: request.request_id,
+            topology_epoch: 8,
+            body: PeerResponseBody::TableScan(TableScanPartial::Rows(vec![vec![(
+                "id".to_string(),
+                "order-1".to_string(),
+            )]])),
+        };
+        let decoded: PeerResponse =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&response).unwrap()).unwrap();
+        assert_eq!(decoded, response);
     }
 }

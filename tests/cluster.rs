@@ -57,6 +57,46 @@ fn table_pk_for_range(table: &str, start: u16, end: u16) -> String {
         .unwrap()
 }
 
+fn table_pks_for_range(table: &str, start: u16, end: u16, count: usize) -> Vec<String> {
+    (0u64..)
+        .map(|value| format!("row-{value}"))
+        .filter(|primary_key| {
+            let slot = slot_for_table_row(table.as_bytes(), primary_key.as_bytes());
+            slot >= start && slot <= end
+        })
+        .take(count)
+        .collect()
+}
+
+fn table_rows(value: EmbeddedValue) -> Vec<std::collections::BTreeMap<String, String>> {
+    let EmbeddedValue::Array(rows) = value else {
+        panic!("expected table rows, got {value:?}");
+    };
+    rows.into_iter()
+        .map(|row| {
+            let EmbeddedValue::Array(fields) = row else {
+                panic!("expected table row, got {row:?}");
+            };
+            assert!(fields.len().is_multiple_of(2));
+            fields
+                .chunks_exact(2)
+                .map(|pair| {
+                    let key = match &pair[0] {
+                        EmbeddedValue::Bulk(value) => String::from_utf8(value.to_vec()).unwrap(),
+                        value => panic!("expected bulk field name, got {value:?}"),
+                    };
+                    let value = match &pair[1] {
+                        EmbeddedValue::Bulk(value) => String::from_utf8(value.to_vec()).unwrap(),
+                        EmbeddedValue::Int(value) => value.to_string(),
+                        value => panic!("expected scalar field value, got {value:?}"),
+                    };
+                    (key, value)
+                })
+                .collect()
+        })
+        .collect()
+}
+
 fn resp_command(parts: &[&str]) -> Vec<u8> {
     let mut bytes = format!("*{}\r\n", parts.len()).into_bytes();
     for part in parts {
@@ -339,6 +379,181 @@ async fn embedded_clients_route_to_the_signed_owner_without_a_local_hop() {
             .await
             .unwrap(),
         EmbeddedValue::Nil
+    );
+
+    client_a
+        .execute_value("TALTER", &["orders", "ADD", "amount", "INT", "NOT", "NULL"])
+        .await
+        .unwrap();
+    let mut order_ids = table_pks_for_range("orders", 0, 2047, 2);
+    order_ids.extend(table_pks_for_range(
+        "orders",
+        2048,
+        CLUSTER_SLOT_COUNT - 1,
+        2,
+    ));
+    for (id, state, amount) in [
+        (&order_ids[0], "open", "10"),
+        (&order_ids[1], "closed", "20"),
+        (&order_ids[2], "open", "30"),
+        (&order_ids[3], "closed", "40"),
+    ] {
+        client_a
+            .execute_value(
+                "TINSERT",
+                &["orders", "id", id, "state", state, "amount", amount],
+            )
+            .await
+            .unwrap();
+    }
+
+    // Enter through the non-system node to prove it forwards the coordinator
+    // command to node A before A fans the structured scan back out.
+    assert_eq!(
+        client_b.execute_value("TCOUNT", &["orders"]).await.unwrap(),
+        EmbeddedValue::Int(4)
+    );
+    let page = table_rows(
+        client_b
+            .execute_value(
+                "TSELECT",
+                &[
+                    "id,amount",
+                    "FROM",
+                    "orders",
+                    "WHERE",
+                    "amount",
+                    ">=",
+                    "10",
+                    "ORDER",
+                    "BY",
+                    "amount",
+                    "DESC",
+                    "LIMIT",
+                    "2",
+                    "OFFSET",
+                    "1",
+                ],
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        page.iter()
+            .map(|row| row.get("amount").unwrap().as_str())
+            .collect::<Vec<_>>(),
+        vec!["30", "20"]
+    );
+
+    let aggregate = table_rows(
+        client_a
+            .execute_value(
+                "TSELECT",
+                &[
+                    "COUNT(*) AS count,SUM(amount) AS total,AVG(amount) AS average,MIN(amount) AS minimum,MAX(amount) AS maximum",
+                    "FROM",
+                    "orders",
+                ],
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(aggregate[0].get("count").unwrap(), "4");
+    assert_eq!(aggregate[0].get("total").unwrap(), "100");
+    assert_eq!(aggregate[0].get("average").unwrap(), "25");
+    assert_eq!(aggregate[0].get("minimum").unwrap(), "10");
+    assert_eq!(aggregate[0].get("maximum").unwrap(), "40");
+
+    let grouped = table_rows(
+        client_a
+            .execute_value(
+                "TSELECT",
+                &[
+                    "state,COUNT(*) AS count",
+                    "FROM",
+                    "orders",
+                    "GROUP",
+                    "BY",
+                    "state",
+                    "ORDER",
+                    "BY",
+                    "state",
+                    "ASC",
+                ],
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(grouped.len(), 2);
+    assert!(grouped
+        .iter()
+        .all(|row| row.get("count") == Some(&"2".to_string())));
+
+    client_a
+        .execute_value(
+            "TCREATE",
+            &[
+                "documents",
+                "id STR PRIMARY KEY,",
+                "title STR NOT NULL,",
+                "embedding VECTOR(2)",
+            ],
+        )
+        .await
+        .unwrap();
+    let mut document_ids = table_pks_for_range("documents", 0, 2047, 2);
+    document_ids.extend(table_pks_for_range(
+        "documents",
+        2048,
+        CLUSTER_SLOT_COUNT - 1,
+        2,
+    ));
+    for (id, title, embedding) in [
+        (&document_ids[0], "best", "[1,0]"),
+        (&document_ids[1], "far", "[0,1]"),
+        (&document_ids[2], "second", "[0.99,0.01]"),
+        (&document_ids[3], "also-far", "[0.1,0.9]"),
+    ] {
+        client_a
+            .execute_value(
+                "TINSERT",
+                &[
+                    "documents",
+                    "id",
+                    id,
+                    "title",
+                    title,
+                    "embedding",
+                    embedding,
+                ],
+            )
+            .await
+            .unwrap();
+    }
+    let nearest = table_rows(
+        client_a
+            .execute_value(
+                "TSELECT",
+                &[
+                    "id,title,_similarity",
+                    "FROM",
+                    "documents",
+                    "NEAR",
+                    "embedding",
+                    "[1,0]",
+                    "K",
+                    "2",
+                ],
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        nearest
+            .iter()
+            .map(|row| row.get("title").unwrap().as_str())
+            .collect::<Vec<_>>(),
+        vec!["best", "second"]
     );
 
     drop(client_a);

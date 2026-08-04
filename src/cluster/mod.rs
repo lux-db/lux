@@ -13,7 +13,7 @@ pub(crate) mod transport;
 
 pub use config::ClusterConfig;
 pub use protocol::{
-    PeerRequest, PeerRequestBody, PeerResponse, PeerResponseBody, RequestId,
+    PeerRequest, PeerRequestBody, PeerResponse, PeerResponseBody, RequestId, TableScanPartial,
     CLUSTER_PROTOCOL_VERSION,
 };
 pub(crate) use routing::{classify_command, routed_table, CommandRoute};
@@ -144,6 +144,9 @@ impl ClusterNode {
             })?;
         match response.body {
             PeerResponseBody::Ok(bytes) => Ok(bytes),
+            PeerResponseBody::TableScan(_) => {
+                Err("ERR Cluster peer returned a table scan to a point command".to_string())
+            }
             PeerResponseBody::Moved {
                 owner_node_id,
                 epoch,
@@ -161,6 +164,81 @@ impl ClusterNode {
                 Err(format!("OUTCOMEUNKNOWN {message}"))
             }
         }
+    }
+
+    pub(crate) async fn execute_table_scan_peers(
+        &self,
+        argv: Vec<Vec<u8>>,
+        catalog: Vec<u8>,
+    ) -> Result<Vec<TableScanPartial>, String> {
+        let topology = self.topology.current();
+        if topology.manifest().system_node_id != self.local_node_id {
+            return Err("ERR Cluster table scans must enter through the system node".to_string());
+        }
+        let mut requests = tokio::task::JoinSet::new();
+        for peer in &topology.manifest().nodes {
+            if peer.node_id == self.local_node_id {
+                continue;
+            }
+            let target_node_id = peer.node_id.clone();
+            let transport = self.transport.clone();
+            let request = PeerRequest {
+                protocol_version: CLUSTER_PROTOCOL_VERSION,
+                cluster_id: topology.manifest().cluster_id.clone(),
+                topology_epoch: topology.manifest().epoch,
+                source_node_id: self.local_node_id.clone(),
+                target_node_id: target_node_id.clone(),
+                request_id: RequestId::random(),
+                deadline_unix_ms: transport::unix_time_ms() + 5_000,
+                slot: None,
+                catalog_version: topology.manifest().catalog_version,
+                body: PeerRequestBody::TableScan {
+                    argv: argv.clone(),
+                    catalog: catalog.clone(),
+                },
+            };
+            requests.spawn(async move {
+                let response =
+                    transport
+                        .request(&target_node_id, &request)
+                        .await
+                        .map_err(|error| {
+                            format!(
+                            "TRYAGAIN Cluster table scan failed on peer {target_node_id}: {error}"
+                        )
+                        })?;
+                match response.body {
+                    PeerResponseBody::TableScan(partial) => Ok(partial),
+                    PeerResponseBody::Ok(_) => Err(
+                        "ERR Cluster peer returned a command response to a table scan".to_string(),
+                    ),
+                    PeerResponseBody::Moved {
+                        owner_node_id,
+                        epoch,
+                    } => Err(format!(
+                        "MOVED Cluster topology epoch {epoch} routes this scan to {owner_node_id}"
+                    )),
+                    PeerResponseBody::Fenced { epoch } => Err(format!(
+                        "TRYAGAIN Cluster topology epoch {epoch} fenced the table scan"
+                    )),
+                    PeerResponseBody::CatalogStale { required_version } => Err(format!(
+                        "TRYAGAIN Cluster catalog version {required_version} is required"
+                    )),
+                    PeerResponseBody::Error { message } => Err(message),
+                    PeerResponseBody::OutcomeUnknown { message } => Err(format!(
+                        "TRYAGAIN read-only Cluster table scan had an unknown outcome: {message}"
+                    )),
+                }
+            });
+        }
+
+        let mut partials = Vec::with_capacity(requests.len());
+        while let Some(result) = requests.join_next().await {
+            let partial = result
+                .map_err(|error| format!("TRYAGAIN Cluster table scan task failed: {error}"))??;
+            partials.push(partial);
+        }
+        Ok(partials)
     }
 
     pub(crate) async fn serve<F, Fut>(self: Arc<Self>, execute: F)
@@ -191,10 +269,12 @@ impl ClusterNode {
                             }))
                             .unwrap_or_default(),
                         ),
-                        PeerRequestBody::Execute { .. } => match node.validate_peer_route(&request) {
-                            Ok(()) => execute(request.clone()).await,
-                            Err(body) => body,
-                        },
+                        PeerRequestBody::Execute { .. } | PeerRequestBody::TableScan { .. } => {
+                            match node.validate_peer_route(&request) {
+                                Ok(()) => execute(request.clone()).await,
+                                Err(body) => body,
+                            }
+                        }
                     };
                     PeerResponse {
                         protocol_version: CLUSTER_PROTOCOL_VERSION,
@@ -208,6 +288,27 @@ impl ClusterNode {
     }
 
     fn validate_peer_route(&self, request: &PeerRequest) -> Result<(), PeerResponseBody> {
+        let topology = self.topology.current();
+        if request.catalog_version != topology.manifest().catalog_version {
+            return Err(PeerResponseBody::CatalogStale {
+                required_version: topology.manifest().catalog_version,
+            });
+        }
+        if let PeerRequestBody::TableScan { argv, catalog } = &request.body {
+            if request.slot.is_some()
+                || request.source_node_id != topology.manifest().system_node_id
+            {
+                return Err(PeerResponseBody::Error {
+                    message:
+                        "Cluster table scans must come from the signed system node without a slot"
+                            .to_string(),
+                });
+            }
+            let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            crate::tables::validate_cluster_table_scan(catalog, &refs)
+                .map_err(|message| PeerResponseBody::Error { message })?;
+            return Ok(());
+        }
         let PeerRequestBody::Execute {
             argv,
             read_only,
@@ -217,12 +318,6 @@ impl ClusterNode {
         else {
             return Ok(());
         };
-        let topology = self.topology.current();
-        if request.catalog_version != topology.manifest().catalog_version {
-            return Err(PeerResponseBody::CatalogStale {
-                required_version: topology.manifest().catalog_version,
-            });
-        }
         let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
         if let Some(primary_key) = table_primary_key {
             let Some(catalog) = catalog.as_deref() else {

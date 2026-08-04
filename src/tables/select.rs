@@ -1378,6 +1378,94 @@ pub fn table_select(
         });
     }
 
+    Ok(finish_select_rows(
+        plan,
+        rows,
+        scan.order_satisfied,
+        scan.pagination_satisfied,
+    ))
+}
+
+/// Execute the shard-local portion of a distributed select. Filtering and
+/// vector candidate selection happen beside the data, while projection,
+/// aggregates, ordering, and pagination are deferred to the coordinator.
+pub(crate) fn cluster_select_shard_rows(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    plan: &SelectPlan,
+    now: Instant,
+) -> Result<Vec<Vec<(String, String)>>, String> {
+    if !plan.joins.is_empty() {
+        return Err(
+            "ERR Cluster distributed JOIN is not supported; query one partition by primary key or denormalize the join"
+                .to_string(),
+        );
+    }
+    let mut shard_plan = plan.clone();
+    shard_plan.projections.clear();
+    shard_plan.aggregates.clear();
+    shard_plan.group_by.clear();
+    shard_plan.having.clear();
+    shard_plan.limit = None;
+    shard_plan.offset = None;
+    match table_select(store, cache, &shard_plan, now)? {
+        SelectResult::Rows(rows) => Ok(rows),
+        SelectResult::Aggregate(_) => {
+            Err("ERR Cluster shard scan unexpectedly returned an aggregate".to_string())
+        }
+    }
+}
+
+/// Apply the semantics that must be global after all shard-local rows have
+/// reached the signed system node.
+pub(crate) fn finish_cluster_select(
+    plan: &SelectPlan,
+    mut rows: Vec<Vec<(String, String)>>,
+) -> Result<SelectResult, String> {
+    if !plan.joins.is_empty() {
+        return Err(
+            "ERR Cluster distributed JOIN is not supported; query one partition by primary key or denormalize the join"
+                .to_string(),
+        );
+    }
+
+    // Every owner returns its local top K. Their union is a superset of the
+    // global top K, so one coordinator sort produces the exact result without
+    // transferring rows that cannot possibly win.
+    if let Some(near) = &plan.near {
+        rows.sort_by(|left, right| {
+            let left = find_col(
+                left,
+                "_similarity",
+                plan.alias.as_deref().unwrap_or(&plan.table),
+            )
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(f32::NEG_INFINITY);
+            let right = find_col(
+                right,
+                "_similarity",
+                plan.alias.as_deref().unwrap_or(&plan.table),
+            )
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(f32::NEG_INFINITY);
+            right
+                .partial_cmp(&left)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows.truncate(near.k);
+    }
+
+    Ok(finish_select_rows(plan, rows, false, false))
+}
+
+fn finish_select_rows(
+    plan: &SelectPlan,
+    mut rows: Vec<Vec<(String, String)>>,
+    order_satisfied: bool,
+    pagination_satisfied: bool,
+) -> SelectResult {
+    let table_alias = plan.alias.as_deref().unwrap_or(&plan.table);
+
     // ---- Slow-path aggregates (needed rows already fetched) ----
     if !plan.aggregates.is_empty() {
         if !plan.group_by.is_empty() {
@@ -1406,17 +1494,17 @@ pub fn table_select(
             if let Some(lim) = plan.limit {
                 grouped.truncate(lim);
             }
-            return Ok(SelectResult::Rows(grouped));
+            return SelectResult::Rows(grouped);
         }
         let agg_row = compute_aggregates(&rows, &plan.aggregates);
         if !plan.having.is_empty() && !matches_all_having(&agg_row, &plan.having) {
-            return Ok(SelectResult::Rows(Vec::new()));
+            return SelectResult::Rows(Vec::new());
         }
-        return Ok(SelectResult::Aggregate(agg_row));
+        return SelectResult::Aggregate(agg_row);
     }
 
     // ---- ORDER BY ----
-    if !scan.order_satisfied {
+    if !order_satisfied {
         if let Some((ref col, ascending)) = plan.order_by {
             rows.sort_by(|a, b| {
                 let av = find_col(a, col, table_alias).unwrap_or("");
@@ -1436,7 +1524,7 @@ pub fn table_select(
     }
 
     // ---- OFFSET / LIMIT ----
-    let rows = if !scan.pagination_satisfied {
+    let rows = if !pagination_satisfied {
         if let Some(off) = plan.offset {
             rows.into_iter().skip(off).collect()
         } else {
@@ -1446,7 +1534,7 @@ pub fn table_select(
         rows
     };
     let mut rows = rows;
-    if !scan.pagination_satisfied {
+    if !pagination_satisfied {
         if let Some(lim) = plan.limit {
             rows.truncate(lim);
         }
@@ -1460,7 +1548,7 @@ pub fn table_select(
         project_columns(rows, &plan.projections, table_alias)
     };
 
-    Ok(SelectResult::Rows(rows))
+    SelectResult::Rows(rows)
 }
 
 fn validate_encrypted_condition(cond: &WhereClause, schema: &[FieldDef]) -> Result<(), String> {
