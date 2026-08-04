@@ -7044,7 +7044,11 @@ fn record_engine_contract_check(
                         "engine {} (management API {}) supports managed migrations{}",
                         version.version,
                         version.api_version,
-                        if cluster_required { " and cluster operations" } else { "" }
+                        if cluster_required {
+                            " and cluster operations"
+                        } else {
+                            ""
+                        }
                     )
                 } else {
                     format!("engine is missing capabilities: {}", missing.join(", "))
