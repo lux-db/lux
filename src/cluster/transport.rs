@@ -21,6 +21,12 @@ struct IdentityMaterial {
     private_key: PrivateKeyDer<'static>,
 }
 
+#[derive(Clone)]
+struct AuthenticatedPeer {
+    node_id: String,
+    certificate_sha256: String,
+}
+
 /// Persistent, multiplexed QUIC peer transport for a single Lux node.
 pub(crate) struct PeerTransport {
     local_node_id: String,
@@ -70,7 +76,7 @@ impl PeerTransport {
             certificates,
             private_key,
         });
-        let server_config = build_server_config(&current, &identity)?;
+        let server_config = build_server_config(&topology.trusted_nodes(), &identity)?;
         let endpoint = Endpoint::server(server_config, config.peer_bind_addr).map_err(|error| {
             ClusterError::Transport(format!("failed to bind QUIC endpoint: {error}"))
         })?;
@@ -89,6 +95,19 @@ impl PeerTransport {
         self.endpoint.local_addr().map_err(|error| {
             ClusterError::Transport(format!("QUIC endpoint has no address: {error}"))
         })
+    }
+
+    pub(crate) fn max_frame_bytes(&self) -> usize {
+        self.max_frame_bytes
+    }
+
+    /// Replace the verifier used for future handshakes with the union of the
+    /// committed and prepared identities. Existing connections are still
+    /// re-authorized against committed membership for every stream.
+    pub(crate) fn refresh_server_trust(&self) -> Result<(), ClusterError> {
+        let server_config = build_server_config(&self.topology.trusted_nodes(), &self.identity)?;
+        self.endpoint.set_server_config(Some(server_config));
+        Ok(())
     }
 
     pub(crate) async fn request(
@@ -222,7 +241,7 @@ impl PeerTransport {
                 let Ok(connection) = incoming.await else {
                     return;
                 };
-                let Ok(authenticated_source) = transport.authenticated_source(&connection) else {
+                let Ok(authenticated_peer) = transport.authenticated_source(&connection) else {
                     connection.close(1u32.into(), b"untrusted peer certificate");
                     return;
                 };
@@ -232,10 +251,10 @@ impl PeerTransport {
                     };
                     let transport = transport.clone();
                     let handler = handler.clone();
-                    let authenticated_source = authenticated_source.clone();
+                    let authenticated_peer = authenticated_peer.clone();
                     tokio::spawn(async move {
                         let _ = transport
-                            .handle_stream(send, receive, authenticated_source, handler)
+                            .handle_stream(send, receive, authenticated_peer, handler)
                             .await;
                     });
                 }
@@ -247,7 +266,7 @@ impl PeerTransport {
         &self,
         mut send: SendStream,
         mut receive: RecvStream,
-        authenticated_source: String,
+        authenticated_peer: AuthenticatedPeer,
         handler: F,
     ) -> Result<(), ClusterError>
     where
@@ -265,15 +284,22 @@ impl PeerTransport {
             Some(PeerResponseBody::Error {
                 message: "cluster id mismatch".to_string(),
             })
-        } else if request.source_node_id != authenticated_source {
+        } else if request.source_node_id != authenticated_peer.node_id {
             Some(PeerResponseBody::Error {
                 message: "source node id does not match the client certificate".to_string(),
+            })
+        } else if topology
+            .node(&authenticated_peer.node_id)
+            .is_none_or(|node| node.certificate_sha256 != authenticated_peer.certificate_sha256)
+        {
+            Some(PeerResponseBody::Error {
+                message: "client certificate is not committed in this topology epoch".to_string(),
             })
         } else if request.target_node_id != self.local_node_id {
             Some(PeerResponseBody::Error {
                 message: "request targeted another node".to_string(),
             })
-        } else if request.topology_epoch != topology.manifest().epoch {
+        } else if !request_epoch_is_accepted(&request, topology.manifest().epoch) {
             Some(match request.slot {
                 Some(slot) if slot < topology.manifest().slot_count => PeerResponseBody::Moved {
                     owner_node_id: topology.owner_for_slot(slot).node_id.clone(),
@@ -294,7 +320,7 @@ impl PeerTransport {
                 topology_epoch: topology.manifest().epoch,
                 body,
             },
-            None => handler(authenticated_source, request).await,
+            None => handler(authenticated_peer.node_id, request).await,
         };
         write_frame(&mut send, &response, self.max_frame_bytes).await?;
         send.finish().map_err(|error| {
@@ -303,22 +329,48 @@ impl PeerTransport {
         Ok(())
     }
 
-    fn authenticated_source(&self, connection: &Connection) -> Result<String, ClusterError> {
+    fn authenticated_source(
+        &self,
+        connection: &Connection,
+    ) -> Result<AuthenticatedPeer, ClusterError> {
         let certificate = peer_leaf_certificate(connection)?;
         let fingerprint = certificate_fingerprint(certificate.as_ref());
         self.topology
-            .current()
-            .manifest()
-            .nodes
+            .trusted_nodes()
             .iter()
             .find(|node| node.certificate_sha256 == fingerprint)
-            .map(|node| node.node_id.clone())
+            .map(|node| AuthenticatedPeer {
+                node_id: node.node_id.clone(),
+                certificate_sha256: fingerprint,
+            })
             .ok_or_else(|| {
                 ClusterError::Transport(
                     "client certificate is not in the signed topology".to_string(),
                 )
             })
     }
+}
+
+/// Ordinary work must match the receiver's committed topology exactly. The
+/// sole exception is ownership-transfer replay from the immediately previous
+/// epoch: a target may have committed after ACKing the source, while the source
+/// crashed before durably recording that ACK. The durable signed transfer route
+/// is still validated by `ClusterNode` before any payload is accepted.
+fn request_epoch_is_accepted(request: &PeerRequest, current_epoch: u64) -> bool {
+    if request.topology_epoch == current_epoch {
+        return true;
+    }
+    let transition_epoch = match &request.body {
+        super::PeerRequestBody::TransferChunk {
+            transition_epoch, ..
+        }
+        | super::PeerRequestBody::TransferFinish {
+            transition_epoch, ..
+        } => *transition_epoch,
+        _ => return false,
+    };
+    request.topology_epoch.checked_add(1) == Some(current_epoch)
+        && transition_epoch == current_epoch
 }
 
 impl Drop for PeerTransport {
@@ -328,11 +380,11 @@ impl Drop for PeerTransport {
 }
 
 fn build_server_config(
-    topology: &super::CompiledTopology,
+    trusted_nodes: &[super::NodeDescriptor],
     identity: &IdentityMaterial,
 ) -> Result<ServerConfig, ClusterError> {
     let mut roots = RootCertStore::empty();
-    for node in &topology.manifest().nodes {
+    for node in trusted_nodes {
         roots
             .add(CertificateDer::from(decode_certificate(node)?))
             .map_err(|error| {
@@ -528,6 +580,55 @@ mod tests {
     use rand_core::OsRng;
     use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
 
+    #[test]
+    fn only_transfer_recovery_accepts_the_immediately_previous_epoch() {
+        let base = PeerRequest {
+            protocol_version: CLUSTER_PROTOCOL_VERSION,
+            cluster_id: "cluster-a".into(),
+            topology_epoch: 6,
+            source_node_id: "node-a".into(),
+            target_node_id: "node-b".into(),
+            request_id: RequestId([1; 16]),
+            deadline_unix_ms: u64::MAX,
+            slot: None,
+            catalog_version: 1,
+            body: PeerRequestBody::Probe,
+        };
+        assert!(request_epoch_is_accepted(&base, 6));
+        assert!(!request_epoch_is_accepted(&base, 7));
+
+        let recovery = PeerRequest {
+            body: PeerRequestBody::TransferFinish {
+                transition_epoch: 7,
+                receipt: super::super::TransferReceipt {
+                    transfer_id: "transfer-a".into(),
+                    chunk_count: 1,
+                    rolling_digest: "digest".into(),
+                    total_items: 1,
+                    total_bytes: 10,
+                },
+            },
+            ..base.clone()
+        };
+        assert!(request_epoch_is_accepted(&recovery, 7));
+        assert!(!request_epoch_is_accepted(&recovery, 8));
+
+        let forged_transition = PeerRequest {
+            body: PeerRequestBody::TransferFinish {
+                transition_epoch: 8,
+                receipt: super::super::TransferReceipt {
+                    transfer_id: "transfer-a".into(),
+                    chunk_count: 1,
+                    rolling_digest: "digest".into(),
+                    total_items: 1,
+                    total_bytes: 10,
+                },
+            },
+            ..base
+        };
+        assert!(!request_epoch_is_accepted(&forged_transition, 7));
+    }
+
     fn reserve_udp_port() -> u16 {
         std::net::UdpSocket::bind("127.0.0.1:0")
             .unwrap()
@@ -704,6 +805,131 @@ mod tests {
                 epoch: 1,
             }
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn prepared_certificate_is_admitted_but_cannot_work_before_membership_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let port_a = reserve_udp_port();
+        let port_b = reserve_udp_port();
+        let (cert_a_path, key_a_path, cert_a) = identity("node-a.cluster.local", dir.path());
+        let (cert_b_path, key_b_path, cert_b) = identity("node-b.cluster.local", dir.path());
+        let signing_key = SigningKey::random(&mut OsRng);
+        let public_key = URL_SAFE_NO_PAD.encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let node_a = NodeDescriptor {
+            node_id: "node-a".into(),
+            peer_addr: format!("127.0.0.1:{port_a}"),
+            server_name: "node-a.cluster.local".into(),
+            certificate_der: URL_SAFE_NO_PAD.encode(&cert_a),
+            certificate_sha256: certificate_fingerprint(&cert_a),
+        };
+        let node_b = NodeDescriptor {
+            node_id: "node-b".into(),
+            peer_addr: format!("127.0.0.1:{port_b}"),
+            server_name: "node-b.cluster.local".into(),
+            certificate_der: URL_SAFE_NO_PAD.encode(&cert_b),
+            certificate_sha256: certificate_fingerprint(&cert_b),
+        };
+        let initial_manifest = TopologyManifest {
+            schema_version: CLUSTER_TOPOLOGY_SCHEMA_VERSION,
+            protocol_version: CLUSTER_PROTOCOL_VERSION,
+            cluster_id: "cluster-admission".into(),
+            epoch: 1,
+            system_node_id: "node-a".into(),
+            slot_count: CLUSTER_SLOT_COUNT,
+            catalog_version: 1,
+            nodes: vec![node_a.clone()],
+            assignments: vec![SlotAssignment {
+                start: 0,
+                end: CLUSTER_SLOT_COUNT - 1,
+                node_id: "node-a".into(),
+            }],
+        };
+        let initial = SignedTopology::sign(initial_manifest, &signing_key).unwrap();
+        let mut membership_manifest = initial.manifest.clone();
+        membership_manifest.epoch = 2;
+        membership_manifest.nodes.push(node_b);
+        let membership = SignedTopology::sign(membership_manifest, &signing_key).unwrap();
+
+        let state_a = Arc::new(TopologyState::in_memory(
+            initial.verify(&public_key).unwrap(),
+            public_key.clone(),
+        ));
+        let state_b = Arc::new(TopologyState::in_memory(
+            membership.verify(&public_key).unwrap(),
+            public_key.clone(),
+        ));
+        let topology_path = dir.path().join("membership.json");
+        std::fs::write(&topology_path, serde_json::to_vec(&membership).unwrap()).unwrap();
+        let transport_a = PeerTransport::bind(
+            &ClusterConfig {
+                local_node_id: "node-a".into(),
+                peer_bind_addr: format!("127.0.0.1:{port_a}").parse().unwrap(),
+                certificate_chain_path: cert_a_path,
+                private_key_path: key_a_path,
+                topology_path: topology_path.clone(),
+                topology_state_path: dir.path().join("node-a-state.json"),
+                controller_public_key: public_key.clone(),
+                max_frame_bytes: 1024 * 1024,
+            },
+            state_a.clone(),
+        )
+        .unwrap();
+        let transport_b = PeerTransport::bind(
+            &ClusterConfig {
+                local_node_id: "node-b".into(),
+                peer_bind_addr: format!("127.0.0.1:{port_b}").parse().unwrap(),
+                certificate_chain_path: cert_b_path,
+                private_key_path: key_b_path,
+                topology_path,
+                topology_state_path: dir.path().join("node-b-state.json"),
+                controller_public_key: public_key,
+                max_frame_bytes: 1024 * 1024,
+            },
+            state_b,
+        )
+        .unwrap();
+        let server = transport_a.clone();
+        let task = tokio::spawn(server.serve(|source, request| async move {
+            PeerResponse {
+                protocol_version: CLUSTER_PROTOCOL_VERSION,
+                request_id: request.request_id,
+                topology_epoch: request.topology_epoch,
+                body: PeerResponseBody::Ok(source.into_bytes()),
+            }
+        }));
+
+        state_a.prepare(membership).unwrap();
+        transport_a.refresh_server_trust().unwrap();
+        let request = PeerRequest {
+            protocol_version: CLUSTER_PROTOCOL_VERSION,
+            cluster_id: "cluster-admission".into(),
+            topology_epoch: 2,
+            source_node_id: "node-b".into(),
+            target_node_id: "node-a".into(),
+            request_id: RequestId([42; 16]),
+            deadline_unix_ms: unix_time_ms() + 5_000,
+            slot: Some(100),
+            catalog_version: 1,
+            body: PeerRequestBody::Probe,
+        };
+        let fenced = transport_b.request("node-a", &request).await.unwrap();
+        assert!(matches!(
+            fenced.body,
+            PeerResponseBody::Error { message }
+                if message.contains("not committed")
+        ));
+
+        state_a.commit(2).unwrap();
+        transport_a.refresh_server_trust().unwrap();
+        let admitted = transport_b.request("node-a", &request).await.unwrap();
+        assert_eq!(admitted.body, PeerResponseBody::Ok(b"node-b".to_vec()));
         task.abort();
     }
 }

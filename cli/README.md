@@ -103,6 +103,10 @@ lux start                  # engine + Studio; prints connection info + the Studi
 lux start --no-studio      # engine only
 lux start --fresh          # recreate from a clean data volume (drops local data)
 lux start --bind 0.0.0.0   # explicitly expose both services on every interface
+lux start --nodes 3        # safely grow this project into a 3-node local cluster
+lux cluster status         # inspect nodes, topology epoch, and transition state
+lux cluster resize 2       # move data online, then remove the extra node
+lux cluster consolidate    # return to the ordinary single-node fast path
 lux studio                 # open Lux Studio in your browser (starts it if needed)
 lux status                 # show local engine status
 lux env export local       # print the local profile when explicitly needed
@@ -121,6 +125,30 @@ user), mirroring production. Studio runs as a container
 (`ghcr.io/lux-db/studio`) and talks to the engine
 directly from your browser. With the default loopback binding, credentials
 never leave your machine.
+
+Local clustering is project configuration, not a separate kind of project.
+`local_nodes = 1` (the default) runs the original standalone engine with no
+topology or peer-routing overhead. A value above one enables Cluster. The CLI
+creates a project-private Docker network and signed node identities, admits new
+nodes before assigning them slots, transfers ownership while writes are fenced,
+commits targets before sources, and only then deletes stale copies. Extra-node
+management ports bind to loopback; the public `LUX_URL`, `LUX_DIRECT_URL`, and
+Studio URL never change. `lux cluster consolidate` moves every slot back to the
+system node and restarts it without Cluster, restoring the exact standalone
+fast path while preserving its data volume.
+
+The desired size is persisted in `lux/config.toml`, so later `lux start` calls
+reconcile the runtime instead of silently reverting it:
+
+```toml
+local_nodes = 3
+```
+
+Cluster controller keys, node certificates, and topology manifests live under
+the gitignored, owner-only `lux/.lux-cluster/` directory. `lux doctor` verifies
+those artifacts, every container, committed epoch agreement, and incomplete
+transition state. `lux stop --clear` removes all active and retired node data
+volumes; ordinary `lux stop` preserves them.
 
 Engine and Studio ports bind to `127.0.0.1` by default. Use `--bind <IP>` only
 when another device or development environment must reach them. Non-loopback

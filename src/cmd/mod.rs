@@ -1007,7 +1007,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: b"VCARD",
-        min_arity: 2,
+        min_arity: 1,
     },
     CommandSpec {
         name: b"PFADD",
@@ -1170,6 +1170,11 @@ fn command_spec(cmd: &[u8]) -> Option<&'static CommandSpec> {
 /// Number of registered RESP commands (for `COMMAND COUNT`).
 pub(crate) fn command_count() -> usize {
     COMMAND_SPECS.len()
+}
+
+#[cfg(test)]
+pub(crate) fn command_names() -> impl Iterator<Item = &'static [u8]> {
+    COMMAND_SPECS.iter().map(|spec| spec.name)
 }
 
 #[inline(always)]
@@ -2054,6 +2059,26 @@ pub fn execute(
                 }
                 return CmdResult::Written;
             }
+            if cmd_eq(cmd, b"LXMIGRATE") {
+                // Internal, replay-only: an ownership transfer's exact value
+                // plus absolute expiry deadline. Clients cannot invoke it.
+                if !store.wal_replaying() {
+                    resp::write_error(out, &format!("ERR unknown command '{}'", arg_str(cmd)));
+                    return CmdResult::Written;
+                }
+                if args.len() != 4 {
+                    return CmdResult::Written;
+                }
+                let Ok(deadline) = arg_str(args[2]).parse::<u64>() else {
+                    resp::write_error(out, "ERR invalid LXMIGRATE deadline");
+                    return CmdResult::Written;
+                };
+                let expires_unix_ms = (deadline != 0).then_some(deadline);
+                if let Err(error) = store.apply_cluster_restore(args[1], expires_unix_ms, args[3]) {
+                    resp::write_error(out, &error);
+                }
+                return CmdResult::Written;
+            }
             if cmd_eq(cmd, b"LXCATALOG") {
                 // Internal, replay-only: a Cluster slot owner's durable table
                 // schema context. Live peer installation calls the table layer
@@ -2336,6 +2361,9 @@ pub fn execute(
             if cmd_eq(cmd, b"TROWSET") {
                 return tables::cmd_trowset(args, store, cache, out, now);
             }
+            if cmd_eq(cmd, b"TROWDEL") {
+                return tables::cmd_trowdel(args, store, cache, out, now);
+            }
             if cmd_eq(cmd, b"TUPSERT") {
                 return tables::cmd_tupsert(args, store, cache, out, now);
             }
@@ -2613,6 +2641,7 @@ fn command_self_logs_wal(cmd: &[u8]) -> bool {
         c,
         b"TINSERT"
             | b"TROWSET"
+            | b"TROWDEL"
             | b"TUPSERT"
             | b"TUPDATE"
             | b"TDELETE"

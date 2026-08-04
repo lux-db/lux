@@ -3,6 +3,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use p256::ecdsa::signature::{Signer, Verifier};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use rustls::pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -34,6 +35,37 @@ pub struct SlotAssignment {
     /// Inclusive last slot.
     pub end: u16,
     pub node_id: String,
+}
+
+/// One contiguous ownership change derived from two signed topology epochs.
+/// Controllers never send an independent move list: every node recomputes this
+/// plan from the signed manifests so peer traffic cannot redirect data outside
+/// the controller-authorized slot map.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SlotMove {
+    pub start: u16,
+    pub end: u16,
+    pub source_node_id: String,
+    pub target_node_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopologyTransitionKind {
+    Membership,
+    Ownership,
+}
+
+/// Deterministic semantic diff between the committed and prepared epochs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TopologyTransitionPlan {
+    pub from_epoch: u64,
+    pub to_epoch: u64,
+    pub kind: TopologyTransitionKind,
+    pub added_node_ids: Vec<String>,
+    pub removed_node_ids: Vec<String>,
+    pub updated_node_ids: Vec<String>,
+    pub moves: Vec<SlotMove>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -195,6 +227,123 @@ impl CompiledTopology {
     pub fn owns_slot(&self, node_id: &str, slot: u16) -> bool {
         self.owner_for_slot(slot).node_id == node_id
     }
+
+    /// Validate and derive the only legal next transition. Membership and
+    /// ownership changes are intentionally separate epochs: a joining node is
+    /// admitted with zero slots before data moves to it, and a leaving node is
+    /// emptied before its certificate is removed from the trust set.
+    pub fn transition_to(
+        &self,
+        candidate: &CompiledTopology,
+    ) -> Result<TopologyTransitionPlan, ClusterError> {
+        let current = self.manifest();
+        let next = candidate.manifest();
+        if current.cluster_id != next.cluster_id {
+            return invalid("prepared topology belongs to another cluster");
+        }
+        if next.epoch != current.epoch.saturating_add(1) {
+            return invalid(format!(
+                "prepared epoch {} must immediately follow committed epoch {}",
+                next.epoch, current.epoch
+            ));
+        }
+        if current.system_node_id != next.system_node_id {
+            return invalid("system node changes require a separate data migration protocol");
+        }
+        if current.catalog_version != next.catalog_version {
+            return invalid("catalog and topology changes must use separate coordination paths");
+        }
+
+        let current_nodes = current
+            .nodes
+            .iter()
+            .map(|node| (node.node_id.as_str(), node))
+            .collect::<HashMap<_, _>>();
+        let next_nodes = next
+            .nodes
+            .iter()
+            .map(|node| (node.node_id.as_str(), node))
+            .collect::<HashMap<_, _>>();
+        let mut added_node_ids = next_nodes
+            .keys()
+            .filter(|node_id| !current_nodes.contains_key(**node_id))
+            .map(|node_id| (*node_id).to_string())
+            .collect::<Vec<_>>();
+        let mut removed_node_ids = current_nodes
+            .keys()
+            .filter(|node_id| !next_nodes.contains_key(**node_id))
+            .map(|node_id| (*node_id).to_string())
+            .collect::<Vec<_>>();
+        let mut updated_node_ids = current_nodes
+            .iter()
+            .filter_map(|(node_id, node)| {
+                next_nodes
+                    .get(node_id)
+                    .filter(|next_node| *next_node != node)
+                    .map(|_| (*node_id).to_string())
+            })
+            .collect::<Vec<_>>();
+        added_node_ids.sort();
+        removed_node_ids.sort();
+        updated_node_ids.sort();
+
+        let mut moves = Vec::<SlotMove>::new();
+        for slot in 0..CLUSTER_SLOT_COUNT {
+            let source = &self.owner_for_slot(slot).node_id;
+            let target = &candidate.owner_for_slot(slot).node_id;
+            if source == target {
+                continue;
+            }
+            if let Some(previous) = moves.last_mut() {
+                if previous.end.saturating_add(1) == slot
+                    && previous.source_node_id == *source
+                    && previous.target_node_id == *target
+                {
+                    previous.end = slot;
+                    continue;
+                }
+            }
+            moves.push(SlotMove {
+                start: slot,
+                end: slot,
+                source_node_id: source.clone(),
+                target_node_id: target.clone(),
+            });
+        }
+
+        let membership_changed = !added_node_ids.is_empty()
+            || !removed_node_ids.is_empty()
+            || !updated_node_ids.is_empty();
+        if membership_changed && !moves.is_empty() {
+            return invalid(
+                "node membership/certificate changes and slot ownership changes require separate epochs",
+            );
+        }
+        if !membership_changed && moves.is_empty() {
+            return invalid("prepared topology has no semantic change");
+        }
+        for node_id in &removed_node_ids {
+            if (0..CLUSTER_SLOT_COUNT).any(|slot| self.owns_slot(node_id, slot)) {
+                return invalid(format!(
+                    "node {node_id} must own zero slots before it can be removed"
+                ));
+            }
+        }
+
+        Ok(TopologyTransitionPlan {
+            from_epoch: current.epoch,
+            to_epoch: next.epoch,
+            kind: if membership_changed {
+                TopologyTransitionKind::Membership
+            } else {
+                TopologyTransitionKind::Ownership
+            },
+            added_node_ids,
+            removed_node_ids,
+            updated_node_ids,
+            moves,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -241,16 +390,15 @@ impl TopologyState {
             if durable.manifest().cluster_id != supplied.manifest().cluster_id {
                 return invalid("durable topology state belongs to another cluster");
             }
-            let current = match durable.manifest().epoch.cmp(&supplied.manifest().epoch) {
-                std::cmp::Ordering::Greater => durable,
-                std::cmp::Ordering::Less => supplied,
-                std::cmp::Ordering::Equal => {
-                    if durable.signed() != supplied.signed() {
-                        return invalid("same topology epoch has different signed contents");
-                    }
-                    durable
-                }
-            };
+            // Once durable state exists it is the commit authority. A newer
+            // config file may describe a prepared epoch, but restart must not
+            // silently cut ownership over without transfer-readiness gates.
+            if durable.manifest().epoch == supplied.manifest().epoch
+                && durable.signed() != supplied.signed()
+            {
+                return invalid("same topology epoch has different signed contents");
+            }
+            let current = durable;
             let pending = disk
                 .pending
                 .map(|pending| pending.verify(&controller_public_key))
@@ -260,8 +408,9 @@ impl TopologyState {
             }) {
                 return invalid("durable pending topology belongs to another cluster");
             }
-            let pending =
-                pending.filter(|pending| pending.manifest().epoch > current.manifest().epoch);
+            if let Some(pending) = &pending {
+                current.transition_to(pending)?;
+            }
             (current, pending)
         } else {
             (supplied, None)
@@ -285,50 +434,75 @@ impl TopologyState {
         self.inner.read().current.clone()
     }
 
+    pub fn pending(&self) -> Option<Arc<CompiledTopology>> {
+        self.inner.read().pending.clone()
+    }
+
+    /// Current plus prepared identities, de-duplicated by certificate pin.
+    /// QUIC admission uses this union while ordinary work remains fenced to the
+    /// committed epoch by the request envelope.
+    pub fn trusted_nodes(&self) -> Vec<NodeDescriptor> {
+        let inner = self.inner.read();
+        let mut seen = HashSet::new();
+        inner
+            .current
+            .manifest()
+            .nodes
+            .iter()
+            .chain(
+                inner
+                    .pending
+                    .iter()
+                    .flat_map(|pending| pending.manifest().nodes.iter()),
+            )
+            .filter(|node| seen.insert(node.certificate_sha256.clone()))
+            .cloned()
+            .collect()
+    }
+
+    pub fn transition_plan(&self) -> Result<Option<TopologyTransitionPlan>, ClusterError> {
+        let inner = self.inner.read();
+        inner
+            .pending
+            .as_ref()
+            .map(|pending| inner.current.transition_to(pending))
+            .transpose()
+    }
+
     pub fn prepare(&self, signed: SignedTopology) -> Result<u64, ClusterError> {
         let candidate = Arc::new(signed.verify(&self.controller_public_key)?);
         let mut inner = self.inner.write();
-        if candidate.manifest().cluster_id != inner.current.manifest().cluster_id {
-            return Err(ClusterError::InvalidTopology(
-                "prepared topology belongs to another cluster".to_string(),
-            ));
-        }
-        if candidate.manifest().epoch <= inner.current.manifest().epoch {
+        let plan = inner.current.transition_to(&candidate)?;
+        if let Some(pending) = &inner.pending {
+            if pending.signed() == candidate.signed() {
+                return Ok(candidate.manifest().epoch);
+            }
             return Err(ClusterError::InvalidTopology(format!(
-                "epoch {} does not advance committed epoch {}",
-                candidate.manifest().epoch,
-                inner.current.manifest().epoch
+                "topology epoch {} is already prepared; abort it before preparing another",
+                pending.manifest().epoch
             )));
-        }
-        if inner
-            .pending
-            .as_ref()
-            .is_some_and(|pending| candidate.manifest().epoch <= pending.manifest().epoch)
-        {
-            return Err(ClusterError::InvalidTopology(
-                "prepared epoch does not advance the existing pending topology".to_string(),
-            ));
         }
         let epoch = candidate.manifest().epoch;
         self.persist(&inner.current, Some(&candidate))?;
         inner.pending = Some(candidate);
+        debug_assert_eq!(plan.to_epoch, epoch);
         Ok(epoch)
     }
 
     pub fn commit(&self, epoch: u64) -> Result<Arc<CompiledTopology>, ClusterError> {
         let mut inner = self.inner.write();
-        let pending = inner
-            .pending
-            .take()
-            .ok_or_else(|| ClusterError::InvalidTopology("no topology is prepared".to_string()))?;
+        let pending =
+            inner.pending.as_ref().cloned().ok_or_else(|| {
+                ClusterError::InvalidTopology("no topology is prepared".to_string())
+            })?;
         if pending.manifest().epoch != epoch {
-            inner.pending = Some(pending);
             return Err(ClusterError::InvalidTopology(format!(
                 "prepared topology epoch does not match commit epoch {epoch}"
             )));
         }
         self.persist(&pending, None)?;
         inner.current = pending;
+        inner.pending = None;
         Ok(inner.current.clone())
     }
 
@@ -448,6 +622,15 @@ fn validate_manifest(manifest: &TopologyManifest) -> Result<(), ClusterError> {
             ))
         })?;
         let certificate = decode_certificate(node)?;
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(certificate.clone()))
+            .map_err(|error| {
+                ClusterError::InvalidTopology(format!(
+                    "node {} certificate is not a valid trust anchor: {error}",
+                    node.node_id
+                ))
+            })?;
         let actual = certificate_fingerprint(&certificate);
         if actual != node.certificate_sha256 {
             return invalid(format!(
@@ -586,6 +769,13 @@ fn hash_tag(key: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
     use rand_core::OsRng;
+    use rcgen::{CertificateParams, KeyPair};
+
+    fn test_certificate(server_name: &str) -> Vec<u8> {
+        let params = CertificateParams::new(vec![server_name.to_string()]).unwrap();
+        let key = KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().der().to_vec()
+    }
 
     fn node(node_id: &str, port: u16, certificate: &[u8]) -> NodeDescriptor {
         NodeDescriptor {
@@ -617,6 +807,7 @@ mod tests {
 
     #[test]
     fn signed_manifest_verifies_and_compiles_all_slots() {
+        let certificate = test_certificate("node-1.cluster.local");
         let signing_key = SigningKey::random(&mut OsRng);
         let public_key = URL_SAFE_NO_PAD.encode(
             signing_key
@@ -624,7 +815,7 @@ mod tests {
                 .to_encoded_point(false)
                 .as_bytes(),
         );
-        let signed = SignedTopology::sign(manifest(b"public-certificate"), &signing_key).unwrap();
+        let signed = SignedTopology::sign(manifest(&certificate), &signing_key).unwrap();
         let compiled = signed.verify(&public_key).unwrap();
         assert_eq!(compiled.owner_for_slot(0).node_id, "node-1");
         assert_eq!(
@@ -635,6 +826,7 @@ mod tests {
 
     #[test]
     fn signature_rejects_tampered_epoch() {
+        let certificate = test_certificate("node-1.cluster.local");
         let signing_key = SigningKey::random(&mut OsRng);
         let public_key = URL_SAFE_NO_PAD.encode(
             signing_key
@@ -642,8 +834,7 @@ mod tests {
                 .to_encoded_point(false)
                 .as_bytes(),
         );
-        let mut signed =
-            SignedTopology::sign(manifest(b"public-certificate"), &signing_key).unwrap();
+        let mut signed = SignedTopology::sign(manifest(&certificate), &signing_key).unwrap();
         signed.manifest.epoch = 2;
         assert!(matches!(
             signed.verify(&public_key),
@@ -653,6 +844,7 @@ mod tests {
 
     #[test]
     fn rejects_slot_gaps_and_fingerprint_mismatch() {
+        let certificate = test_certificate("node-1.cluster.local");
         let signing_key = SigningKey::random(&mut OsRng);
         let public_key = URL_SAFE_NO_PAD.encode(
             signing_key
@@ -660,7 +852,7 @@ mod tests {
                 .to_encoded_point(false)
                 .as_bytes(),
         );
-        let mut broken = manifest(b"public-certificate");
+        let mut broken = manifest(&certificate);
         broken.assignments[0].start = 1;
         let signed = SignedTopology::sign(broken, &signing_key).unwrap();
         assert!(matches!(
@@ -668,7 +860,7 @@ mod tests {
             Err(ClusterError::InvalidTopology(_))
         ));
 
-        let mut broken = manifest(b"public-certificate");
+        let mut broken = manifest(&certificate);
         broken.nodes[0].certificate_sha256 = "00".repeat(32);
         let signed = SignedTopology::sign(broken, &signing_key).unwrap();
         assert!(matches!(
@@ -686,9 +878,9 @@ mod tests {
                 .to_encoded_point(false)
                 .as_bytes(),
         );
-        let certificate = b"shared-public-certificate";
-        let mut broken = manifest(certificate);
-        broken.nodes.push(node("node-2", 7002, certificate));
+        let certificate = test_certificate("shared.cluster.local");
+        let mut broken = manifest(&certificate);
+        broken.nodes.push(node("node-2", 7002, &certificate));
         broken.assignments = vec![
             SlotAssignment {
                 start: 0,
@@ -726,6 +918,8 @@ mod tests {
 
     #[test]
     fn prepare_rejects_epoch_rollback_and_commit_is_exact() {
+        let certificate = test_certificate("node-1.cluster.local");
+        let node_two_certificate = test_certificate("node-2.cluster.local");
         let signing_key = SigningKey::random(&mut OsRng);
         let public_key = URL_SAFE_NO_PAD.encode(
             signing_key
@@ -733,26 +927,29 @@ mod tests {
                 .to_encoded_point(false)
                 .as_bytes(),
         );
-        let initial = SignedTopology::sign(manifest(b"public-certificate"), &signing_key)
+        let initial = SignedTopology::sign(manifest(&certificate), &signing_key)
             .unwrap()
             .verify(&public_key)
             .unwrap();
         let state = TopologyState::in_memory(initial, public_key.clone());
 
-        let mut next = manifest(b"public-certificate");
+        let mut next = manifest(&certificate);
         next.epoch = 2;
+        next.nodes.push(node("node-2", 7002, &node_two_certificate));
         state
             .prepare(SignedTopology::sign(next, &signing_key).unwrap())
             .unwrap();
         assert!(state.commit(3).is_err());
         assert_eq!(state.commit(2).unwrap().manifest().epoch, 2);
 
-        let rollback = SignedTopology::sign(manifest(b"public-certificate"), &signing_key).unwrap();
+        let rollback = SignedTopology::sign(manifest(&certificate), &signing_key).unwrap();
         assert!(state.prepare(rollback).is_err());
     }
 
     #[test]
     fn durable_state_survives_restart_and_rejects_rollback() {
+        let certificate = test_certificate("node-1.cluster.local");
+        let node_two_certificate = test_certificate("node-2.cluster.local");
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("topology-state.json");
         let signing_key = SigningKey::random(&mut OsRng);
@@ -762,16 +959,16 @@ mod tests {
                 .to_encoded_point(false)
                 .as_bytes(),
         );
-        let initial_signed =
-            SignedTopology::sign(manifest(b"public-certificate"), &signing_key).unwrap();
+        let initial_signed = SignedTopology::sign(manifest(&certificate), &signing_key).unwrap();
         let state = TopologyState::open(
             initial_signed.verify(&public_key).unwrap(),
             public_key.clone(),
             &path,
         )
         .unwrap();
-        let mut next = manifest(b"public-certificate");
+        let mut next = manifest(&certificate);
         next.epoch = 2;
+        next.nodes.push(node("node-2", 7002, &node_two_certificate));
         state
             .prepare(SignedTopology::sign(next, &signing_key).unwrap())
             .unwrap();
@@ -785,5 +982,148 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restarted.current().manifest().epoch, 2);
+    }
+
+    #[test]
+    fn transition_requires_membership_then_ownership_epochs() {
+        let certificate_one = test_certificate("node-1.cluster.local");
+        let certificate_two = test_certificate("node-2.cluster.local");
+        let signing_key = SigningKey::random(&mut OsRng);
+        let public_key = URL_SAFE_NO_PAD.encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let current = SignedTopology::sign(manifest(&certificate_one), &signing_key)
+            .unwrap()
+            .verify(&public_key)
+            .unwrap();
+
+        let mut membership = manifest(&certificate_one);
+        membership.epoch = 2;
+        membership
+            .nodes
+            .push(node("node-2", 7002, &certificate_two));
+        let membership = SignedTopology::sign(membership, &signing_key)
+            .unwrap()
+            .verify(&public_key)
+            .unwrap();
+        let admission = current.transition_to(&membership).unwrap();
+        assert_eq!(admission.kind, TopologyTransitionKind::Membership);
+        assert_eq!(admission.added_node_ids, ["node-2"]);
+        assert!(admission.moves.is_empty());
+
+        let mut ownership = membership.manifest().clone();
+        ownership.epoch = 3;
+        ownership.assignments = vec![
+            SlotAssignment {
+                start: 0,
+                end: 2047,
+                node_id: "node-1".to_string(),
+            },
+            SlotAssignment {
+                start: 2048,
+                end: CLUSTER_SLOT_COUNT - 1,
+                node_id: "node-2".to_string(),
+            },
+        ];
+        let ownership = SignedTopology::sign(ownership, &signing_key)
+            .unwrap()
+            .verify(&public_key)
+            .unwrap();
+        let rebalance = membership.transition_to(&ownership).unwrap();
+        assert_eq!(rebalance.kind, TopologyTransitionKind::Ownership);
+        assert_eq!(
+            rebalance.moves,
+            [SlotMove {
+                start: 2048,
+                end: CLUSTER_SLOT_COUNT - 1,
+                source_node_id: "node-1".to_string(),
+                target_node_id: "node-2".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn transition_rejects_combined_membership_and_slot_changes() {
+        let certificate_one = test_certificate("node-1.cluster.local");
+        let certificate_two = test_certificate("node-2.cluster.local");
+        let signing_key = SigningKey::random(&mut OsRng);
+        let public_key = URL_SAFE_NO_PAD.encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let current = SignedTopology::sign(manifest(&certificate_one), &signing_key)
+            .unwrap()
+            .verify(&public_key)
+            .unwrap();
+        let mut unsafe_next = manifest(&certificate_one);
+        unsafe_next.epoch = 2;
+        unsafe_next
+            .nodes
+            .push(node("node-2", 7002, &certificate_two));
+        unsafe_next.assignments = vec![
+            SlotAssignment {
+                start: 0,
+                end: 2047,
+                node_id: "node-1".to_string(),
+            },
+            SlotAssignment {
+                start: 2048,
+                end: CLUSTER_SLOT_COUNT - 1,
+                node_id: "node-2".to_string(),
+            },
+        ];
+        let unsafe_next = SignedTopology::sign(unsafe_next, &signing_key)
+            .unwrap()
+            .verify(&public_key)
+            .unwrap();
+        assert!(matches!(
+            current.transition_to(&unsafe_next),
+            Err(ClusterError::InvalidTopology(message))
+                if message.contains("separate epochs")
+        ));
+    }
+
+    #[test]
+    fn prepare_is_idempotent_but_never_replaces_pending_epoch() {
+        let certificate_one = test_certificate("node-1.cluster.local");
+        let certificate_two = test_certificate("node-2.cluster.local");
+        let certificate_three = test_certificate("node-3.cluster.local");
+        let signing_key = SigningKey::random(&mut OsRng);
+        let public_key = URL_SAFE_NO_PAD.encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let current = SignedTopology::sign(manifest(&certificate_one), &signing_key)
+            .unwrap()
+            .verify(&public_key)
+            .unwrap();
+        let state = TopologyState::in_memory(current, public_key);
+        let mut next = manifest(&certificate_one);
+        next.epoch = 2;
+        next.nodes.push(node("node-2", 7002, &certificate_two));
+        let signed = SignedTopology::sign(next, &signing_key).unwrap();
+        assert_eq!(state.prepare(signed.clone()).unwrap(), 2);
+        assert_eq!(state.prepare(signed).unwrap(), 2);
+
+        let mut conflicting = manifest(&certificate_one);
+        conflicting.epoch = 2;
+        conflicting
+            .nodes
+            .push(node("node-3", 7003, &certificate_three));
+        let error = state
+            .prepare(SignedTopology::sign(conflicting, &signing_key).unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("already prepared"));
+        assert_eq!(
+            state.pending().unwrap().manifest().nodes[1].node_id,
+            "node-2"
+        );
     }
 }

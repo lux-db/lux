@@ -1117,6 +1117,16 @@ pub fn table_select(
     plan: &SelectPlan,
     now: Instant,
 ) -> Result<SelectResult, String> {
+    table_select_with_pk_filter(store, cache, plan, now, None)
+}
+
+fn table_select_with_pk_filter(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    plan: &SelectPlan,
+    now: Instant,
+    pk_filter: Option<&(dyn Fn(&str) -> bool + Sync)>,
+) -> Result<SelectResult, String> {
     let schema = load_schema(store, cache, &plan.table, now)?;
     let table_alias = plan.alias.as_deref().unwrap_or(&plan.table);
 
@@ -1165,6 +1175,7 @@ pub fn table_select(
         && plan.joins.is_empty()
         && plan.group_by.is_empty()
         && plan.having.is_empty()
+        && pk_filter.is_none()
     {
         if let Some(agg_row) = try_fast_aggregate(
             store,
@@ -1202,7 +1213,11 @@ pub fn table_select(
     // Apply LIMIT early only when safe to do so:
     // - no joins (join changes the row count unpredictably)
     // - no ORDER BY (ordering requires all rows before truncating)
-    let early_limit = if plan.joins.is_empty() && plan.order_by.is_none() && plan.near.is_none() {
+    let early_limit = if pk_filter.is_none()
+        && plan.joins.is_empty()
+        && plan.order_by.is_none()
+        && plan.near.is_none()
+    {
         plan.limit.map(|l| l + plan.offset.unwrap_or(0))
     } else {
         None
@@ -1215,15 +1230,21 @@ pub fn table_select(
         TableScanPlan {
             conditions: &conditions,
             order_by: plan.order_by.as_ref(),
-            limit: plan.limit,
-            offset: plan.offset,
+            limit: pk_filter.is_none().then_some(plan.limit).flatten(),
+            offset: pk_filter.is_none().then_some(plan.offset).flatten(),
             allow_order_pushdown: plan.joins.is_empty(),
             early_limit,
         },
         now,
     );
+    if let Some(pk_filter) = pk_filter {
+        scan.row_ids.retain(|primary_key| pk_filter(primary_key));
+        scan.pagination_satisfied = false;
+    }
 
-    let near_candidate_pks = if plan.near.is_some() && !conditions.is_empty() {
+    let near_candidate_pks = if plan.near.is_some()
+        && (!conditions.is_empty() || pk_filter.is_some())
+    {
         let mut candidates = HashSet::new();
         for pk_str in &scan.row_ids {
             // Candidate pre-filter for NEAR: decode fully so WHERE evaluation is
@@ -1394,6 +1415,7 @@ pub(crate) fn cluster_select_shard_rows(
     cache: &SharedSchemaCache,
     plan: &SelectPlan,
     now: Instant,
+    owns_primary_key: &(dyn Fn(&str) -> bool + Sync),
 ) -> Result<Vec<Vec<(String, String)>>, String> {
     if !plan.joins.is_empty() {
         return Err(
@@ -1408,7 +1430,7 @@ pub(crate) fn cluster_select_shard_rows(
     shard_plan.having.clear();
     shard_plan.limit = None;
     shard_plan.offset = None;
-    match table_select(store, cache, &shard_plan, now)? {
+    match table_select_with_pk_filter(store, cache, &shard_plan, now, Some(owns_primary_key))? {
         SelectResult::Rows(rows) => Ok(rows),
         SelectResult::Aggregate(_) => {
             Err("ERR Cluster shard scan unexpectedly returned an aggregate".to_string())

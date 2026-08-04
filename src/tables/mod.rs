@@ -2,9 +2,11 @@ pub(crate) mod select;
 pub(crate) use select::*;
 mod distributed;
 pub(crate) use distributed::{
-    cluster_table_scan_table, execute_cluster_table_scan, export_cluster_table_catalog,
+    cluster_table_scan_table, execute_cluster_table_scan, export_all_cluster_table_catalogs,
+    export_cluster_table_catalog, export_cluster_transfer_data, import_cluster_transfer_row,
     install_cluster_table_catalog, merge_cluster_table_scans, prepare_cluster_table_command,
-    validate_cluster_routed_table_command, validate_cluster_table_scan, ClusterMergedTableScan,
+    remove_cluster_transfer_row, validate_cluster_routed_table_command,
+    validate_cluster_table_scan, validate_cluster_transfer_catalogs, ClusterMergedTableScan,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -667,7 +669,36 @@ pub(crate) fn table_apply_wal_row(
                 }
             }
         }
+        for path_index in &load_path_indexes(store, cache, table, now) {
+            let Some((root, rest)) = path_index.path.split_once('.') else {
+                continue;
+            };
+            if schema
+                .iter()
+                .any(|field| field.name == root && field.encrypted)
+            {
+                continue;
+            }
+            if let Some(scalar) = old_map
+                .get(root)
+                .and_then(|value| extract_json_scalar(value, rest))
+            {
+                remove_from_index(
+                    store,
+                    table,
+                    &synthetic_path_fielddef(path_index),
+                    &scalar,
+                    pk_str,
+                    now,
+                );
+            }
+        }
     }
+
+    // TROWSET is an exact durable row image, not a patch. Removing the old hash
+    // prevents fields absent from the transferred/replayed image surviving an
+    // idempotent replacement.
+    store.del(&[rk.as_bytes()]);
 
     let mut raw_map: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
     for (field, value) in raw_pairs {
@@ -3102,7 +3133,6 @@ fn table_delete_inner(
         ));
     }
     let schema = load_schema(store, cache, table, now)?;
-    let rk = row_key_for_pk(table, pk_str);
 
     // Read the row even if its TTL has lapsed: the sweep/purge path must clean
     // the indexes of an expired-but-not-yet-removed row.
@@ -3245,51 +3275,7 @@ fn table_delete_inner(
         }
     }
 
-    for field in &schema {
-        if let Some(val) = row_map.get(&field.name) {
-            remove_from_index(store, table, field, val, pk_str, now);
-            if field.unique {
-                remove_unique_entries(store, table, field, val, now);
-            }
-        }
-        // A VECTOR column stores its embedding in a side key with its own ANN
-        // index; deleting the row must remove it too, or vector search keeps
-        // returning the deleted row (and the entry leaks).
-        if matches!(field.field_type, FieldType::Vector(_)) {
-            let vkey = table_vector_key(table, &field.name, pk_str);
-            store.del(&[vkey.as_bytes()]);
-        }
-    }
-
-    // Remove declared JSON path index entries for this row.
-    for pi in &load_path_indexes(store, cache, table, now) {
-        if let Some((root, rest)) = pi.path.split_once('.') {
-            if schema.iter().any(|f| f.name == root && f.encrypted) {
-                continue;
-            }
-            if let Some(raw) = row_map.get(root) {
-                if let Some(scalar) = extract_json_scalar(raw, rest) {
-                    remove_from_index(
-                        store,
-                        table,
-                        &synthetic_path_fielddef(pi),
-                        &scalar,
-                        pk_str,
-                        now,
-                    );
-                }
-            }
-        }
-    }
-
-    let ikey = ids_key(table);
-    let _ = store.zrem(ikey.as_bytes(), &[pk_str.as_bytes()], now);
-
-    // Drop any TTL bookkeeping for this row (hidden field is removed with the
-    // hash below; this clears the `_t:_ttl` deadline member).
-    clear_row_ttl(store, table, pk_str, now);
-
-    store.del(&[rk.as_bytes()]);
+    remove_local_row_image(store, cache, table, pk_str, &schema, &row_map, now);
 
     // WAL: log the resolved per-row delete (keyed by the actual PK) only at the
     // top level. Cascaded child deletes (depth > 0) are NOT logged: replaying the
@@ -3315,6 +3301,87 @@ fn table_delete_inner(
         store.emit_row_delta(table, pk_str);
     }
 
+    Ok(())
+}
+
+/// Remove only this node's physical row image and derived indexes. This is
+/// intentionally separate from user-facing TDELETE: ownership cleanup must not
+/// execute foreign-key actions because the logical row still exists on its new
+/// owner.
+fn remove_local_row_image(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    schema: &[FieldDef],
+    row_map: &std::collections::HashMap<String, String>,
+    now: Instant,
+) {
+    for field in schema {
+        if let Some(value) = row_map.get(&field.name) {
+            remove_from_index(store, table, field, value, pk_str, now);
+            if field.unique {
+                remove_unique_entries(store, table, field, value, now);
+            }
+        }
+        // VECTOR values live in side keys with their own ANN index.
+        if matches!(field.field_type, FieldType::Vector(_)) {
+            let vector_key = table_vector_key(table, &field.name, pk_str);
+            store.del(&[vector_key.as_bytes()]);
+        }
+    }
+
+    for path_index in &load_path_indexes(store, cache, table, now) {
+        let Some((root, rest)) = path_index.path.split_once('.') else {
+            continue;
+        };
+        if schema
+            .iter()
+            .any(|field| field.name == root && field.encrypted)
+        {
+            continue;
+        }
+        if let Some(scalar) = row_map
+            .get(root)
+            .and_then(|value| extract_json_scalar(value, rest))
+        {
+            remove_from_index(
+                store,
+                table,
+                &synthetic_path_fielddef(path_index),
+                &scalar,
+                pk_str,
+                now,
+            );
+        }
+    }
+
+    let ids = ids_key(table);
+    let _ = store.zrem(ids.as_bytes(), &[pk_str.as_bytes()], now);
+    clear_row_ttl(store, table, pk_str, now);
+    let row_key = row_key_for_pk(table, pk_str);
+    store.del(&[row_key.as_bytes()]);
+}
+
+/// Apply the physical effect recorded by internal TROWDEL. Missing rows are a
+/// successful replay: a crash can occur after deletion but before transition
+/// bookkeeping is finalized.
+pub(crate) fn table_apply_wal_row_delete(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    now: Instant,
+) -> Result<(), String> {
+    let schema = load_schema(store, cache, table, now)?;
+    let row_map = get_row_including_expired(store, table, &schema, pk_str, now)
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    remove_local_row_image(store, cache, table, pk_str, &schema, &row_map, now);
+    if store.wants_row_deltas() {
+        store.emit_row_delta(table, pk_str);
+    }
     Ok(())
 }
 

@@ -46,12 +46,18 @@ pub(crate) fn classify_command(argv: &[&[u8]]) -> CommandRoute {
             read_only: !system_command_is_write(argv),
         };
     }
+    if global_scan_command(command) {
+        return CommandRoute::System { read_only: true };
+    }
     if unsupported_distributed_command(command) {
         return unsupported(command, "requires a distributed coordinator");
     }
 
     let keys = match route_keys(argv) {
         Ok(Some(keys)) => keys,
+        Ok(None) if crate::cmd::is_known_command(command) => {
+            return unsupported(command, "has no declared Cluster routing domain")
+        }
         Ok(None) => return CommandRoute::Local,
         Err(message) => return CommandRoute::Unsupported(message),
     };
@@ -195,6 +201,17 @@ fn table_row_command(command: &[u8]) -> bool {
     eq(command, b"TGET") || eq(command, b"TSET")
 }
 
+fn global_scan_command(command: &[u8]) -> bool {
+    [
+        b"KEYS".as_slice(),
+        b"TSMRANGE".as_slice(),
+        b"VCARD".as_slice(),
+        b"VSEARCH".as_slice(),
+    ]
+    .iter()
+    .any(|candidate| eq(command, candidate))
+}
+
 fn reserved_system_table(table: &[u8]) -> bool {
     let Ok(table) = std::str::from_utf8(table) else {
         return true;
@@ -254,7 +271,6 @@ fn unsupported_distributed_command(command: &[u8]) -> bool {
         b"FLUSHALL",
         b"FLUSHDB",
         b"FUNCTION",
-        b"KEYS",
         b"KSUB",
         b"KUNSUB",
         b"LASTSAVE",
@@ -276,11 +292,8 @@ fn unsupported_distributed_command(command: &[u8]) -> bool {
         b"SUBSCRIBE",
         b"SUNSUBSCRIBE",
         b"SWAPDB",
-        b"TSMRANGE",
         b"UNSUBSCRIBE",
         b"UNWATCH",
-        b"VCARD",
-        b"VSEARCH",
         b"WAIT",
         b"WAITAOF",
         b"WATCH",
@@ -364,6 +377,7 @@ fn single_key_at_one(command: &[u8]) -> bool {
         b"PEXPIREAT",
         b"PEXPIRETIME",
         b"PFADD",
+        b"PSETEX",
         b"PTTL",
         b"RESTORE",
         b"RPOP",
@@ -543,8 +557,12 @@ mod tests {
             classify(&[b"LUX", b"VERSION"]),
             CommandRoute::System { read_only: true }
         );
-        assert!(matches!(
+        assert_eq!(
             classify(&[b"KEYS", b"*"]),
+            CommandRoute::System { read_only: true }
+        );
+        assert!(matches!(
+            classify(&[b"DBSIZE"]),
             CommandRoute::Unsupported(_)
         ));
     }
@@ -589,5 +607,28 @@ mod tests {
             classify(&[b"ZUNIONSTORE", b"dst", b"not-a-number"]),
             CommandRoute::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn every_registered_command_has_an_explicit_or_fail_closed_domain() {
+        for command in crate::cmd::command_names() {
+            let route = classify(&[
+                command,
+                b"{audit}:key-a",
+                b"{audit}:key-b",
+                b"1",
+                b"{audit}:key-c",
+                b"2",
+            ]);
+            if local_command(command) {
+                assert_eq!(route, CommandRoute::Local, "local {command:?}");
+            } else {
+                assert!(
+                    !matches!(route, CommandRoute::Local),
+                    "registered command {command:?} silently fell through to one node"
+                );
+            }
+        }
+        assert_eq!(classify(&[b"NOT-A-LUX-COMMAND"]), CommandRoute::Local);
     }
 }

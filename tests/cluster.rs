@@ -19,6 +19,32 @@ fn reserve_udp_port() -> u16 {
         .port()
 }
 
+fn reserve_tcp_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+async fn post_engine_json(
+    client: &reqwest::Client,
+    port: u16,
+    path: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    let response = client
+        .post(format!("http://127.0.0.1:{port}{path}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert!(status.is_success(), "{path} returned {status}: {text}");
+    serde_json::from_str(&text).unwrap()
+}
+
 fn identity(
     server_name: &str,
     dir: &std::path::Path,
@@ -38,8 +64,12 @@ fn identity(
 }
 
 fn key_for_range(start: u16, end: u16) -> String {
+    key_for_range_with_prefix("cluster:key", start, end)
+}
+
+fn key_for_range_with_prefix(prefix: &str, start: u16, end: u16) -> String {
     (0u64..)
-        .map(|value| format!("cluster:key:{value}"))
+        .map(|value| format!("{prefix}:{value}"))
         .find(|key| {
             let slot = slot_for_key(key.as_bytes());
             slot >= start && slot <= end
@@ -215,6 +245,14 @@ async fn embedded_clients_route_to_the_signed_owner_without_a_local_hop() {
         client_b.get(&key_b).await.unwrap().as_deref(),
         Some(b"owned-by-b".as_slice())
     );
+    let mut remote_events = client_a.ksubscribe(&key_b);
+    client_a.set(&key_b, b"remote-event").await.unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), remote_events.recv())
+        .await
+        .expect("remote owner mutation did not wake the ingress subscriber")
+        .unwrap();
+    assert_eq!(event.channel, key_b);
+    assert_eq!(event.payload.as_ref(), b"set");
 
     client_b.set(&key_a, b"owned-by-a").await.unwrap();
     assert_eq!(
@@ -228,13 +266,66 @@ async fn embedded_clients_route_to_the_signed_owner_without_a_local_hop() {
         .unwrap_err();
     assert!(cross_slot.to_string().contains("CROSSSLOT"));
 
+    let vector_a = key_for_range_with_prefix("vector", 0, 2047);
+    let vector_b = key_for_range_with_prefix("vector", 2048, CLUSTER_SLOT_COUNT - 1);
+    client_a
+        .execute_value("VSET", &[&vector_a, "2", "1", "0"])
+        .await
+        .unwrap();
+    client_a
+        .execute_value("VSET", &[&vector_b, "2", "0.9", "0.1"])
+        .await
+        .unwrap();
+    assert_eq!(
+        client_b.execute_value("VCARD", &[]).await.unwrap(),
+        EmbeddedValue::Int(2)
+    );
+    let search = client_b
+        .execute_value("VSEARCH", &["2", "1", "0", "K", "2"])
+        .await
+        .unwrap();
+    let EmbeddedValue::Array(search) = search else {
+        panic!("expected VSEARCH array");
+    };
+    assert_eq!(search.len(), 2);
+    let EmbeddedValue::Array(best) = &search[0] else {
+        panic!("expected VSEARCH hit");
+    };
+    assert_eq!(best[0], EmbeddedValue::Bulk(vector_a.clone().into()));
+
+    let series_a = key_for_range_with_prefix("series", 0, 2047);
+    let series_b = key_for_range_with_prefix("series", 2048, CLUSTER_SLOT_COUNT - 1);
+    for (key, timestamp, value) in [(&series_a, "1000", "1"), (&series_b, "2000", "2")] {
+        client_a
+            .execute_value("TSADD", &[key, timestamp, value, "LABELS", "site", "west"])
+            .await
+            .unwrap();
+    }
+    let series = client_b
+        .execute_value("TSMRANGE", &["-", "+", "FILTER", "site=west"])
+        .await
+        .unwrap();
+    let EmbeddedValue::Array(series) = series else {
+        panic!("expected TSMRANGE array");
+    };
+    assert_eq!(series.len(), 2);
+
+    let keys = client_b
+        .execute_value("KEYS", &["cluster:key:*"])
+        .await
+        .unwrap();
+    let EmbeddedValue::Array(keys) = keys else {
+        panic!("expected KEYS array");
+    };
+    assert_eq!(keys.len(), 2);
+
     let mut resp = tokio::net::TcpStream::connect(node_a.local_addr().unwrap())
         .await
         .unwrap();
     resp.write_all(&resp_command(&["GET", &key_b]))
         .await
         .unwrap();
-    let expected = b"$10\r\nowned-by-b\r\n";
+    let expected = b"$12\r\nremote-event\r\n";
     let mut actual = vec![0; expected.len()];
     resp.read_exact(&mut actual).await.unwrap();
     assert_eq!(actual, expected);
@@ -365,7 +456,9 @@ async fn embedded_clients_route_to_the_signed_owner_without_a_local_hop() {
         )
         .await
         .unwrap_err();
-    assert!(broad_update.to_string().contains("must use WHERE id"));
+    assert!(broad_update
+        .to_string()
+        .contains("must include WHERE id = <value> as an AND condition"));
     client_a
         .execute_value(
             "TDELETE",
@@ -554,6 +647,505 @@ async fn embedded_clients_route_to_the_signed_owner_without_a_local_hop() {
             .map(|row| row.get("title").unwrap().as_str())
             .collect::<Vec<_>>(),
         vec!["best", "second"]
+    );
+
+    drop(client_a);
+    drop(client_b);
+    node_a.shutdown_and_wait().await.unwrap();
+    node_b.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn online_resize_and_consolidation_move_kv_and_table_rows_without_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer_port_a = reserve_udp_port();
+    let peer_port_b = reserve_udp_port();
+    let http_port_a = reserve_tcp_port();
+    let http_port_b = reserve_tcp_port();
+    let (cert_a_path, key_a_path, cert_a) = identity("resize-a.cluster.local", dir.path());
+    let (cert_b_path, key_b_path, cert_b) = identity("resize-b.cluster.local", dir.path());
+    let signing_key = SigningKey::random(&mut OsRng);
+    let controller_public_key = URL_SAFE_NO_PAD.encode(
+        signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes(),
+    );
+    let encryption = lux::EncryptionConfig {
+        active_key_id: Some("cluster-test-key".to_string()),
+        keys: vec![lux::EncryptionKeyConfig {
+            id: "cluster-test-key".to_string(),
+            secret: b"shared-cluster-test-encryption-key".to_vec(),
+            decrypt_only: false,
+        }],
+        ..Default::default()
+    };
+    let nodes = vec![
+        NodeDescriptor {
+            node_id: "node-a".into(),
+            peer_addr: format!("127.0.0.1:{peer_port_a}"),
+            server_name: "resize-a.cluster.local".into(),
+            certificate_der: URL_SAFE_NO_PAD.encode(&cert_a),
+            certificate_sha256: certificate_fingerprint(&cert_a),
+        },
+        NodeDescriptor {
+            node_id: "node-b".into(),
+            peer_addr: format!("127.0.0.1:{peer_port_b}"),
+            server_name: "resize-b.cluster.local".into(),
+            certificate_der: URL_SAFE_NO_PAD.encode(&cert_b),
+            certificate_sha256: certificate_fingerprint(&cert_b),
+        },
+    ];
+    let initial = SignedTopology::sign(
+        TopologyManifest {
+            schema_version: CLUSTER_TOPOLOGY_SCHEMA_VERSION,
+            protocol_version: CLUSTER_PROTOCOL_VERSION,
+            cluster_id: "resize-test".into(),
+            epoch: 1,
+            system_node_id: "node-a".into(),
+            slot_count: CLUSTER_SLOT_COUNT,
+            catalog_version: 1,
+            nodes: nodes.clone(),
+            assignments: vec![SlotAssignment {
+                start: 0,
+                end: CLUSTER_SLOT_COUNT - 1,
+                node_id: "node-a".into(),
+            }],
+        },
+        &signing_key,
+    )
+    .unwrap();
+    let topology_path = dir.path().join("resize-topology.json");
+    std::fs::write(&topology_path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+    let cluster = |node_id: &str,
+                   peer_port: u16,
+                   certificate_chain_path: std::path::PathBuf,
+                   private_key_path: std::path::PathBuf| ClusterConfig {
+        local_node_id: node_id.to_string(),
+        peer_bind_addr: format!("127.0.0.1:{peer_port}").parse().unwrap(),
+        certificate_chain_path,
+        private_key_path,
+        topology_path: topology_path.clone(),
+        topology_state_path: dir.path().join(format!("{node_id}-resize-state.json")),
+        controller_public_key: controller_public_key.clone(),
+        max_frame_bytes: 1024 * 1024,
+    };
+    let node_a = lux::run_with_config(lux::ServerConfig {
+        enable_resp: false,
+        http_port: http_port_a,
+        shards: 4,
+        data_dir: dir.path().join("resize-a-data").display().to_string(),
+        encryption: encryption.clone(),
+        cluster: Some(cluster("node-a", peer_port_a, cert_a_path, key_a_path)),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let node_b = lux::run_with_config(lux::ServerConfig {
+        enable_resp: false,
+        http_port: http_port_b,
+        shards: 4,
+        data_dir: dir.path().join("resize-b-data").display().to_string(),
+        encryption,
+        cluster: Some(cluster("node-b", peer_port_b, cert_b_path, key_b_path)),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let client_a = node_a.client();
+    let client_b = node_b.client();
+    let moved_key = key_for_range(2048, CLUSTER_SLOT_COUNT - 1);
+    let retained_key = key_for_range(0, 2047);
+    client_a.set(&moved_key, b"move-me").await.unwrap();
+    client_a.set(&retained_key, b"stay-here").await.unwrap();
+    client_a
+        .execute_value(
+            "TCREATE",
+            &[
+                "resize_rows",
+                "id STR PRIMARY KEY,",
+                "state STR NOT NULL,",
+                "secret STR ENCRYPTED",
+            ],
+        )
+        .await
+        .unwrap();
+    let moved_row = table_pk_for_range("resize_rows", 2048, CLUSTER_SLOT_COUNT - 1);
+    let retained_row = table_pk_for_range("resize_rows", 0, 2047);
+    for (id, state) in [(&moved_row, "moved"), (&retained_row, "retained")] {
+        client_a
+            .execute_value("TINSERT", &["resize_rows", "id", id, "state", state])
+            .await
+            .unwrap();
+    }
+
+    let http = reqwest::Client::new();
+    post_engine_json(
+        &http,
+        http_port_a,
+        "/v1/cluster/catalogs/sync",
+        serde_json::json!({}),
+    )
+    .await;
+    let mut split_manifest = initial.manifest.clone();
+    split_manifest.epoch = 2;
+    split_manifest.assignments = vec![
+        SlotAssignment {
+            start: 0,
+            end: 2047,
+            node_id: "node-a".into(),
+        },
+        SlotAssignment {
+            start: 2048,
+            end: CLUSTER_SLOT_COUNT - 1,
+            node_id: "node-b".into(),
+        },
+    ];
+    let split = SignedTopology::sign(split_manifest, &signing_key).unwrap();
+    let split_json = serde_json::to_value(&split).unwrap();
+    post_engine_json(
+        &http,
+        http_port_b,
+        "/v1/cluster/topology/prepare",
+        split_json.clone(),
+    )
+    .await;
+    post_engine_json(
+        &http,
+        http_port_a,
+        "/v1/cluster/topology/prepare",
+        split_json,
+    )
+    .await;
+    let fenced = client_a.get(&moved_key).await.unwrap_err();
+    assert!(fenced.to_string().contains("fenced slot"), "{fenced}");
+    assert_eq!(
+        client_a.get(&retained_key).await.unwrap().as_deref(),
+        Some(b"stay-here".as_slice())
+    );
+    let source_transfer = post_engine_json(
+        &http,
+        http_port_a,
+        "/v1/cluster/transfers/run",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(source_transfer["ready_to_commit"], true);
+    post_engine_json(
+        &http,
+        http_port_b,
+        "/v1/cluster/topology/commit",
+        serde_json::json!({ "epoch": 2 }),
+    )
+    .await;
+    // The target has cut over but the source is still on the previous epoch.
+    // Replaying the transfer recovers the same receipt instead of being fenced.
+    let recovered = post_engine_json(
+        &http,
+        http_port_a,
+        "/v1/cluster/transfers/run",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(recovered["ready_to_commit"], true);
+    post_engine_json(
+        &http,
+        http_port_a,
+        "/v1/cluster/topology/commit",
+        serde_json::json!({ "epoch": 2 }),
+    )
+    .await;
+
+    assert_eq!(
+        client_a.get(&moved_key).await.unwrap().as_deref(),
+        Some(b"move-me".as_slice())
+    );
+    let http_moved: serde_json::Value = http
+        .get(format!("http://127.0.0.1:{http_port_a}/v1/kv/{moved_key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(http_moved["result"], "move-me");
+    let http_keys: serde_json::Value = http
+        .get(format!("http://127.0.0.1:{http_port_a}/v1/keys"))
+        .query(&[("pattern", "cluster:key:*")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut http_keys = http_keys["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    http_keys.sort();
+    let mut expected_keys = vec![moved_key.clone(), retained_key.clone()];
+    expected_keys.sort();
+    assert_eq!(http_keys, expected_keys);
+    assert_eq!(
+        client_b.get(&retained_key).await.unwrap().as_deref(),
+        Some(b"stay-here".as_slice())
+    );
+    assert_eq!(
+        client_a
+            .execute_value("TGET", &["resize_rows", &moved_row, "state"])
+            .await
+            .unwrap(),
+        EmbeddedValue::Bulk(bytes::Bytes::from_static(b"moved"))
+    );
+    assert_eq!(
+        client_a
+            .execute_value("TCOUNT", &["resize_rows"])
+            .await
+            .unwrap(),
+        EmbeddedValue::Int(2)
+    );
+
+    // The PostgREST-style table surface uses the same distributed path. The
+    // new row hashes to B even though every request enters through A.
+    let http_row = table_pks_for_range("resize_rows", 2048, CLUSTER_SLOT_COUNT - 1, 2)
+        .into_iter()
+        .find(|id| id != &moved_row)
+        .unwrap();
+    let inserted = http
+        .post(format!(
+            "http://127.0.0.1:{http_port_a}/v1/tables/resize_rows"
+        ))
+        .json(&serde_json::json!({
+            "id": http_row,
+            "state": "http-created",
+            "secret": "must-not-leak",
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = inserted.status();
+    let inserted: serde_json::Value = inserted.json().await.unwrap();
+    assert!(status.is_success(), "HTTP insert failed: {inserted}");
+    assert_eq!(inserted["result"]["id"], http_row);
+    // Bare auth-disabled HTTP is an anonymous surface; ENCRYPTED values are
+    // materialized as null rather than returned in plaintext.
+    assert_eq!(inserted["result"]["secret"], serde_json::Value::Null);
+
+    let fetched: serde_json::Value = http
+        .get(format!(
+            "http://127.0.0.1:{http_port_a}/v1/tables/resize_rows/{http_row}"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fetched["result"]["state"], "http-created");
+    assert_eq!(fetched["result"]["secret"], serde_json::Value::Null);
+
+    let updated = http
+        .patch(format!(
+            "http://127.0.0.1:{http_port_a}/v1/tables/resize_rows/{http_row}"
+        ))
+        .json(&serde_json::json!({ "state": "http-updated" }))
+        .send()
+        .await
+        .unwrap();
+    let status = updated.status();
+    let updated: serde_json::Value = updated.json().await.unwrap();
+    assert!(status.is_success(), "HTTP update failed: {updated}");
+    assert_eq!(updated["result"][0]["state"], "http-updated");
+
+    let broad = http
+        .patch(format!(
+            "http://127.0.0.1:{http_port_a}/v1/tables/resize_rows"
+        ))
+        .query(&[("where", "state = http-updated")])
+        .json(&serde_json::json!({ "state": "must-not-run" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(broad.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(broad
+        .text()
+        .await
+        .unwrap()
+        .contains("must include WHERE id"));
+
+    let count: serde_json::Value = http
+        .get(format!(
+            "http://127.0.0.1:{http_port_a}/v1/tables/resize_rows/count"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(count["result"], 3);
+
+    let deleted = http
+        .delete(format!(
+            "http://127.0.0.1:{http_port_a}/v1/tables/resize_rows"
+        ))
+        .query(&[("where", format!("id = {http_row}"))])
+        .send()
+        .await
+        .unwrap();
+    let status = deleted.status();
+    let deleted: serde_json::Value = deleted.json().await.unwrap();
+    assert!(status.is_success(), "HTTP delete failed: {deleted}");
+    assert_eq!(deleted["result"][0]["id"], http_row);
+    assert_eq!(
+        client_a
+            .execute_value("TGET", &["resize_rows", &http_row])
+            .await
+            .unwrap(),
+        EmbeddedValue::Nil
+    );
+    for port in [http_port_b, http_port_a] {
+        let finalized = post_engine_json(
+            &http,
+            port,
+            "/v1/cluster/transfers/finalize",
+            serde_json::json!({ "epoch": 2 }),
+        )
+        .await;
+        assert_eq!(finalized["finalized"], true);
+    }
+
+    let mut consolidated_manifest = initial.manifest.clone();
+    consolidated_manifest.epoch = 3;
+    let consolidated = SignedTopology::sign(consolidated_manifest.clone(), &signing_key).unwrap();
+    let consolidated_json = serde_json::to_value(&consolidated).unwrap();
+    post_engine_json(
+        &http,
+        http_port_a,
+        "/v1/cluster/topology/prepare",
+        consolidated_json.clone(),
+    )
+    .await;
+    post_engine_json(
+        &http,
+        http_port_b,
+        "/v1/cluster/topology/prepare",
+        consolidated_json,
+    )
+    .await;
+    post_engine_json(
+        &http,
+        http_port_b,
+        "/v1/cluster/transfers/run",
+        serde_json::json!({}),
+    )
+    .await;
+    post_engine_json(
+        &http,
+        http_port_a,
+        "/v1/cluster/topology/commit",
+        serde_json::json!({ "epoch": 3 }),
+    )
+    .await;
+    post_engine_json(
+        &http,
+        http_port_b,
+        "/v1/cluster/topology/commit",
+        serde_json::json!({ "epoch": 3 }),
+    )
+    .await;
+    assert_eq!(
+        client_b.get(&moved_key).await.unwrap().as_deref(),
+        Some(b"move-me".as_slice())
+    );
+    assert_eq!(
+        client_a
+            .execute_value("TCOUNT", &["resize_rows"])
+            .await
+            .unwrap(),
+        EmbeddedValue::Int(2)
+    );
+    for port in [http_port_a, http_port_b] {
+        let finalized = post_engine_json(
+            &http,
+            port,
+            "/v1/cluster/transfers/finalize",
+            serde_json::json!({ "epoch": 3 }),
+        )
+        .await;
+        assert_eq!(finalized["finalized"], true);
+    }
+
+    let legacy_snapshot = http
+        .get(format!("http://127.0.0.1:{http_port_a}/v1/snapshot"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy_snapshot.status(), reqwest::StatusCode::CONFLICT);
+    let mut descriptors = Vec::new();
+    for port in [http_port_a, http_port_b] {
+        let response = http
+            .get(format!("http://127.0.0.1:{port}/v1/cluster/backup/part"))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let encoded = response
+            .headers()
+            .get("x-lux-cluster-part")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let descriptor: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap();
+        assert!(!response.bytes().await.unwrap().is_empty());
+        descriptors.push(descriptor);
+    }
+    assert_eq!(descriptors[0]["cluster_id"], "resize-test");
+    assert_eq!(descriptors[0]["topology_epoch"], 3);
+    assert_eq!(
+        descriptors[0]["topology_sha256"],
+        descriptors[1]["topology_sha256"]
+    );
+    assert_ne!(descriptors[0]["node_id"], descriptors[1]["node_id"]);
+
+    consolidated_manifest.epoch = 4;
+    consolidated_manifest.nodes = vec![nodes[0].clone()];
+    let remove_b = SignedTopology::sign(consolidated_manifest, &signing_key).unwrap();
+    let remove_json = serde_json::to_value(&remove_b).unwrap();
+    post_engine_json(
+        &http,
+        http_port_a,
+        "/v1/cluster/topology/prepare",
+        remove_json.clone(),
+    )
+    .await;
+    post_engine_json(
+        &http,
+        http_port_b,
+        "/v1/cluster/topology/prepare",
+        remove_json,
+    )
+    .await;
+    post_engine_json(
+        &http,
+        http_port_b,
+        "/v1/cluster/topology/commit",
+        serde_json::json!({ "epoch": 4 }),
+    )
+    .await;
+    post_engine_json(
+        &http,
+        http_port_a,
+        "/v1/cluster/topology/commit",
+        serde_json::json!({ "epoch": 4 }),
+    )
+    .await;
+    assert_eq!(
+        client_a.get(&moved_key).await.unwrap().as_deref(),
+        Some(b"move-me".as_slice())
     );
 
     drop(client_a);

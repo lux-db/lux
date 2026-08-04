@@ -17,6 +17,166 @@ struct ClusterTableCatalog {
 
 const CLUSTER_TABLE_CATALOG_SCHEMA_VERSION: u16 = 1;
 
+pub(crate) fn export_all_cluster_table_catalogs(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    now: Instant,
+) -> Result<Vec<crate::cluster::TransferCatalogProof>, String> {
+    let mut tables = table_list(store, now);
+    tables.sort();
+    tables
+        .into_iter()
+        .filter(|table| !crate::auth::is_reserved_system_table(table))
+        .map(|table| {
+            Ok(crate::cluster::TransferCatalogProof {
+                catalog: export_cluster_table_catalog(store, cache, &table, now)?,
+                table,
+            })
+        })
+        .collect()
+}
+
+/// Export canonical catalogs and exact raw row images for the logical slots in
+/// one ownership-transfer route. Raw encrypted cells remain ciphertext and are
+/// carried only inside the mutually authenticated peer channel.
+pub(crate) fn export_cluster_transfer_data(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    owns_primary_key: &(dyn Fn(&str, &str) -> bool + Sync),
+    now: Instant,
+) -> Result<
+    (
+        Vec<crate::cluster::TransferCatalogProof>,
+        Vec<crate::cluster::TransferItem>,
+    ),
+    String,
+> {
+    let mut tables = table_list(store, now);
+    tables.sort();
+    let mut catalogs = Vec::new();
+    let mut rows = Vec::new();
+    for table in tables {
+        if crate::auth::is_reserved_system_table(&table) {
+            continue;
+        }
+        let mut table_rows = Vec::new();
+        for primary_key in get_all_row_ids(store, &table, now) {
+            if !owns_primary_key(&table, &primary_key) {
+                continue;
+            }
+            let row_key = row_key_for_pk(&table, &primary_key);
+            let mut raw_fields = store.hgetall(row_key.as_bytes(), now)?;
+            if raw_fields.is_empty() || row_map_expired(&raw_fields) {
+                continue;
+            }
+            raw_fields.sort_by(|left, right| left.0.cmp(&right.0));
+            table_rows.push(crate::cluster::TransferItem::TableRow {
+                table: table.clone(),
+                primary_key,
+                raw_fields: raw_fields
+                    .into_iter()
+                    .map(|(field, value)| (field.into_bytes(), value.to_vec()))
+                    .collect(),
+            });
+        }
+        if table_rows.is_empty() {
+            continue;
+        }
+        catalogs.push(crate::cluster::TransferCatalogProof {
+            table: table.clone(),
+            catalog: export_cluster_table_catalog(store, cache, &table, now)?,
+        });
+        rows.append(&mut table_rows);
+    }
+    Ok((catalogs, rows))
+}
+
+/// Prove that every catalog referenced by a source bundle is already installed
+/// from the signed system node. A data owner can move its rows, but it cannot
+/// use a transfer to author or rewrite schema on the target.
+pub(crate) fn validate_cluster_transfer_catalogs(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    catalogs: &[crate::cluster::TransferCatalogProof],
+    now: Instant,
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut validated = std::collections::HashSet::new();
+    for proof in catalogs {
+        if !validated.insert(proof.table.clone()) {
+            return Err("ERR duplicate Cluster transfer catalog proof".to_string());
+        }
+        if crate::auth::is_reserved_system_table(&proof.table) {
+            return Err("ERR reserved system table cannot be transferred".to_string());
+        }
+        let installed =
+            export_cluster_table_catalog(store, cache, &proof.table, now).map_err(|_| {
+                format!(
+                    "ERR Cluster catalog '{}' must be synced from the system node before transfer",
+                    proof.table
+                )
+            })?;
+        if installed != proof.catalog {
+            return Err(format!(
+                "ERR Cluster catalog '{}' does not match the system-node version",
+                proof.table
+            ));
+        }
+    }
+    Ok(validated)
+}
+
+pub(crate) fn import_cluster_transfer_row(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    primary_key: &str,
+    raw_fields: &[(Vec<u8>, Vec<u8>)],
+    now: Instant,
+) -> Result<(), String> {
+    if raw_fields.is_empty() {
+        return Err("ERR Cluster transfer row has no fields".to_string());
+    }
+    if !raw_fields.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+        return Err("ERR Cluster transfer row fields are not canonical".to_string());
+    }
+    let mut command = Vec::<Vec<u8>>::with_capacity(raw_fields.len() * 2 + 3);
+    command.push(b"TROWSET".to_vec());
+    command.push(table.as_bytes().to_vec());
+    command.push(primary_key.as_bytes().to_vec());
+    for (field, value) in raw_fields {
+        command.push(field.clone());
+        command.push(value.clone());
+    }
+    let command_refs = command.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    store
+        .wal_log_command(&command_refs)
+        .map_err(|error| format!("ERR WAL append failed: {error}"))?;
+    let pair_refs = raw_fields
+        .iter()
+        .map(|(field, value)| (field.as_slice(), value.as_slice()))
+        .collect::<Vec<_>>();
+    table_apply_wal_row(store, cache, table, primary_key, &pair_refs, now)
+}
+
+/// Durably remove a stale physical row from a source node after cluster-wide
+/// ownership commit. This bypasses logical FK actions because the row was
+/// moved, not deleted from the user's database.
+pub(crate) fn remove_cluster_transfer_row(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    primary_key: &str,
+    now: Instant,
+) -> Result<(), String> {
+    if crate::auth::is_reserved_system_table(table) {
+        return Err("ERR reserved system table cannot be transfer-cleaned".to_string());
+    }
+    store
+        .wal_log_command(&[b"TROWDEL", table.as_bytes(), primary_key.as_bytes()])
+        .map_err(|error| format!("ERR WAL append failed: {error}"))?;
+    table_apply_wal_row_delete(store, cache, table, primary_key, now)
+}
+
 /// Export one user table's authoritative catalog record for a Cluster slot
 /// owner. Reserved engine tables never leave the system node.
 pub(crate) fn export_cluster_table_catalog(
@@ -501,9 +661,6 @@ fn exact_update_primary_key(argv: &[&[u8]], primary_key: &FieldDef) -> Result<Ve
         .is_none_or(|arg| !arg.eq_ignore_ascii_case(b"SET"))
         || where_pos < 5
         || !(where_pos - 3).is_multiple_of(2)
-        || end != where_pos + 4
-        || argv[where_pos + 1] != primary_key.name.as_bytes()
-        || argv[where_pos + 2] != b"="
     {
         return Err(format!(
             "ERR Cluster update must use WHERE {} = <value>",
@@ -516,7 +673,7 @@ fn exact_update_primary_key(argv: &[&[u8]], primary_key: &FieldDef) -> Result<Ve
     {
         return Err("ERR Cluster cannot change a row primary key in place".to_string());
     }
-    Ok(argv[where_pos + 3].to_vec())
+    exact_primary_key_from_where(&argv[where_pos + 1..end], primary_key, "update")
 }
 
 fn exact_delete_primary_key(argv: &[&[u8]], primary_key: &FieldDef) -> Result<Vec<u8>, String> {
@@ -530,16 +687,46 @@ fn exact_delete_primary_key(argv: &[&[u8]], primary_key: &FieldDef) -> Result<Ve
     if argv
         .get(1)
         .is_none_or(|arg| !arg.eq_ignore_ascii_case(b"FROM"))
-        || end != where_pos + 4
-        || argv[where_pos + 1] != primary_key.name.as_bytes()
-        || argv[where_pos + 2] != b"="
     {
         return Err(format!(
             "ERR Cluster delete must use WHERE {} = <value>",
             primary_key.name
         ));
     }
-    Ok(argv[where_pos + 3].to_vec())
+    exact_primary_key_from_where(&argv[where_pos + 1..end], primary_key, "delete")
+}
+
+/// Prove that an arbitrary AND predicate narrows to at most one shard. Extra
+/// conditions (notably HTTP RLS USING filters) are evaluated atomically by the
+/// owner. A primary-key equality nested inside an OR group does not qualify.
+fn exact_primary_key_from_where(
+    argv: &[&[u8]],
+    primary_key: &FieldDef,
+    operation: &str,
+) -> Result<Vec<u8>, String> {
+    let args = argv
+        .iter()
+        .map(|arg| {
+            std::str::from_utf8(arg)
+                .map_err(|_| format!("ERR Cluster {operation} WHERE is not valid UTF-8"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let conditions = parse_where_conditions(&args)?;
+    let value = conditions
+        .iter()
+        .find(|condition| {
+            condition.field == primary_key.name
+                && condition.op == CmpOp::Eq
+                && condition.or_clauses.is_empty()
+        })
+        .map(|condition| condition.value.as_bytes().to_vec())
+        .ok_or_else(|| {
+            format!(
+                "ERR Cluster {operation} must include WHERE {} = <value> as an AND condition",
+                primary_key.name
+            )
+        })?;
+    Ok(value)
 }
 
 fn cluster_upsert_fields_end<'a>(
@@ -746,6 +933,8 @@ pub(crate) fn execute_cluster_table_scan(
     cache: &SharedSchemaCache,
     argv: &[&[u8]],
     now: Instant,
+    decrypt_authorized: bool,
+    owns_primary_key: &(dyn Fn(&str, &str) -> bool + Sync),
 ) -> Result<crate::cluster::TableScanPartial, String> {
     let command = argv
         .first()
@@ -753,10 +942,28 @@ pub(crate) fn execute_cluster_table_scan(
     let partial = if command.eq_ignore_ascii_case(b"TCOUNT") {
         let table = cluster_table_scan_table(argv)?
             .ok_or_else(|| "ERR command is not a Cluster table scan".to_string())?;
-        crate::cluster::TableScanPartial::Count(table_count(store, cache, &table, now)?)
+        let _ = load_schema(store, cache, &table, now)?;
+        let count = get_all_row_ids(store, &table, now)
+            .into_iter()
+            .filter(|primary_key| owns_primary_key(&table, primary_key))
+            .filter(|primary_key| {
+                let row_key = row_key_for_pk(&table, primary_key);
+                store
+                    .hgetall(row_key.as_bytes(), now)
+                    .is_ok_and(|row| !row.is_empty() && !row_map_expired(&row))
+            })
+            .count() as i64;
+        crate::cluster::TableScanPartial::Count(count)
     } else if command.eq_ignore_ascii_case(b"TSELECT") {
-        let plan = parse_cluster_select(argv)?;
-        crate::cluster::TableScanPartial::Rows(cluster_select_shard_rows(store, cache, &plan, now)?)
+        let mut plan = parse_cluster_select(argv)?;
+        plan.decrypt_authorized = decrypt_authorized;
+        crate::cluster::TableScanPartial::Rows(cluster_select_shard_rows(
+            store,
+            cache,
+            &plan,
+            now,
+            &|primary_key| owns_primary_key(&plan.table, primary_key),
+        )?)
     } else {
         return Err("ERR command is not a Cluster table scan".to_string());
     };
@@ -886,5 +1093,81 @@ mod distributed_tests {
         .err()
         .unwrap()
         .contains("wrong table scan result"));
+    }
+
+    #[test]
+    fn point_mutation_routing_accepts_rls_and_but_not_or_only_primary_key() {
+        let store = Store::new();
+        let cache = cache();
+        let now = Instant::now();
+        table_create(
+            &store,
+            &cache,
+            "orders",
+            &["id STR PRIMARY KEY,", "owner STR,", "status STR"],
+            now,
+        )
+        .unwrap();
+
+        let update = [
+            b"TUPDATE".as_slice(),
+            b"orders",
+            b"SET",
+            b"status",
+            b"paid",
+            b"WHERE",
+            b"id",
+            b"=",
+            b"order-1",
+            b"AND",
+            b"owner",
+            b"=",
+            b"user-1",
+            b"RETURNING",
+            b"*",
+        ];
+        let prepared = prepare_cluster_table_command(&store, &cache, &update, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.primary_key, b"order-1");
+
+        let delete = [
+            b"TDELETE".as_slice(),
+            b"FROM",
+            b"orders",
+            b"WHERE",
+            b"owner",
+            b"=",
+            b"user-1",
+            b"AND",
+            b"id",
+            b"=",
+            b"order-1",
+            b"RETURNING",
+            b"*",
+        ];
+        let prepared = prepare_cluster_table_command(&store, &cache, &delete, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.primary_key, b"order-1");
+
+        let or_only = [
+            b"TDELETE".as_slice(),
+            b"FROM",
+            b"orders",
+            b"WHERE",
+            b"owner",
+            b"=",
+            b"user-1",
+            b"OR",
+            b"id",
+            b"=",
+            b"order-1",
+        ];
+        let error = match prepare_cluster_table_command(&store, &cache, &or_only, now) {
+            Ok(_) => panic!("OR-only primary-key predicate must not be routable"),
+            Err(error) => error,
+        };
+        assert!(error.contains("as an AND condition"));
     }
 }

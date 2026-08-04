@@ -65,6 +65,8 @@ pub async fn start_http_server(
     broker: Broker,
     cache: SharedSchemaCache,
     script_engine: Arc<lua::ScriptEngine>,
+    cluster: Option<Arc<crate::cluster::ClusterNode>>,
+    routed_client: Option<Arc<crate::EmbeddedClient>>,
 ) -> std::io::Result<()> {
     let addr: std::net::SocketAddr = format!("{}:{}", config.bind_host, config.http_port)
         .parse()
@@ -96,6 +98,8 @@ pub async fn start_http_server(
         let broker = broker.clone();
         let cache = cache.clone();
         let script_engine = script_engine.clone();
+        let cluster = cluster.clone();
+        let routed_client = routed_client.clone();
 
         tokio::spawn(async move {
             let mut stream = socket;
@@ -105,6 +109,8 @@ pub async fn start_http_server(
                 &broker,
                 &cache,
                 &script_engine,
+                cluster.as_ref(),
+                routed_client.as_deref(),
                 max_rows,
                 max_body,
             )
@@ -121,12 +127,15 @@ fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpL
     socket.listen(1024)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     socket: &mut tokio::net::TcpStream,
     store: &Arc<Store>,
     broker: &Broker,
     cache: &SharedSchemaCache,
     script_engine: &Arc<lua::ScriptEngine>,
+    cluster: Option<&Arc<crate::cluster::ClusterNode>>,
+    routed_client: Option<&crate::EmbeddedClient>,
     max_rows: Option<usize>,
     max_body: usize,
 ) -> std::io::Result<bool> {
@@ -298,6 +307,160 @@ async fn handle_request(
         }
     }
 
+    if let Some(client) = routed_client {
+        if let Some(response) = route_cluster_http_table(
+            &method,
+            &path,
+            &params,
+            &body,
+            client,
+            store,
+            cache,
+            &auth_context,
+            max_rows,
+        )
+        .await
+        {
+            return send_json(socket, response.0, response.1, &response.2).await;
+        }
+        if let Some(response) =
+            route_cluster_http_command(&method, &path, &params, &body, client).await
+        {
+            return send_json(socket, response.0, response.1, &response.2).await;
+        }
+    }
+
+    if method == "POST"
+        && matches!(
+            path.as_str(),
+            "/v1/cluster/catalogs/sync" | "/cluster/catalogs/sync"
+        )
+    {
+        if let Err((status, status_text, body)) = require_project_access(store, &auth_context) {
+            return send_json(socket, status, status_text, &body).await;
+        }
+        let Some(node) = cluster else {
+            return send_json(
+                socket,
+                409,
+                "Conflict",
+                r#"{"error":"Cluster is not enabled for this engine"}"#,
+            )
+            .await;
+        };
+        return match node.sync_table_catalogs(store, cache).await {
+            Ok(installed) => {
+                send_json(
+                    socket,
+                    200,
+                    "OK",
+                    &json!({ "synced": true, "peer_catalogs_installed": installed }).to_string(),
+                )
+                .await
+            }
+            Err(error) => {
+                send_json(
+                    socket,
+                    409,
+                    "Conflict",
+                    &json!({ "error": error.to_string() }).to_string(),
+                )
+                .await
+            }
+        };
+    }
+
+    if method == "POST"
+        && matches!(
+            path.as_str(),
+            "/v1/cluster/transfers/run" | "/cluster/transfers/run"
+        )
+    {
+        if let Err((status, status_text, body)) = require_project_access(store, &auth_context) {
+            return send_json(socket, status, status_text, &body).await;
+        }
+        let Some(node) = cluster else {
+            return send_json(
+                socket,
+                409,
+                "Conflict",
+                r#"{"error":"Cluster is not enabled for this engine"}"#,
+            )
+            .await;
+        };
+        return match node.run_prepared_transfers(store, cache).await {
+            Ok(transfer) => {
+                send_json(
+                    socket,
+                    200,
+                    "OK",
+                    &json!({
+                        "transferred": true,
+                        "ready_to_commit": transfer.ready_to_commit(),
+                        "transfer": transfer,
+                    })
+                    .to_string(),
+                )
+                .await
+            }
+            Err(error) => {
+                send_json(
+                    socket,
+                    409,
+                    "Conflict",
+                    &json!({ "error": error.to_string() }).to_string(),
+                )
+                .await
+            }
+        };
+    }
+
+    if method == "POST"
+        && matches!(
+            path.as_str(),
+            "/v1/cluster/transfers/finalize" | "/cluster/transfers/finalize"
+        )
+    {
+        if let Err((status, status_text, body)) = require_project_access(store, &auth_context) {
+            return send_json(socket, status, status_text, &body).await;
+        }
+        let Some(node) = cluster else {
+            return send_json(
+                socket,
+                409,
+                "Conflict",
+                r#"{"error":"Cluster is not enabled for this engine"}"#,
+            )
+            .await;
+        };
+        let epoch = match cluster_transition_epoch(&body) {
+            Ok(epoch) => epoch,
+            Err((status, status_text, body)) => {
+                return send_json(socket, status, status_text, &body).await
+            }
+        };
+        return match node.finalize_topology(epoch, store, cache) {
+            Ok(finalized) => {
+                send_json(
+                    socket,
+                    200,
+                    "OK",
+                    &json!({ "finalized": finalized, "epoch": epoch }).to_string(),
+                )
+                .await
+            }
+            Err(error) => {
+                send_json(
+                    socket,
+                    409,
+                    "Conflict",
+                    &json!({ "error": error.to_string() }).to_string(),
+                )
+                .await
+            }
+        };
+    }
+
     if method == "GET" && path == "/live" {
         return handle_live_upgrade(
             socket,
@@ -319,11 +482,80 @@ async fn handle_request(
     // straight from the buffer to avoid the lossy String conversion. Operator-
     // only. On success the process exits so the container restart reloads from
     // the restored dump via the standard startup path.
-    if method == "POST" && matches!(segments.as_slice(), ["v1", "restore"] | ["restore"]) {
+    if method == "POST"
+        && matches!(
+            segments.as_slice(),
+            ["v1", "restore"]
+                | ["restore"]
+                | ["v1", "cluster", "restore", "part"]
+                | ["cluster", "restore", "part"]
+        )
+    {
         let password_set = !store.config().password.is_empty();
         if password_set && !matches!(auth_context, HttpAuthContext::Operator) {
             let body = r#"{"error":"restore requires operator credentials"}"#;
             return send_json(socket, 403, "Forbidden", body).await;
+        }
+        let cluster_part = matches!(
+            segments.as_slice(),
+            ["v1", "cluster", "restore", "part"] | ["cluster", "restore", "part"]
+        );
+        if cluster.is_some() && !cluster_part {
+            return send_json(
+                socket,
+                409,
+                "Conflict",
+                r#"{"error":"clustered engines require a topology-bound restore part"}"#,
+            )
+            .await;
+        }
+        if cluster_part {
+            let Some(node) = cluster else {
+                return send_json(
+                    socket,
+                    409,
+                    "Conflict",
+                    r#"{"error":"Cluster is not enabled for this engine"}"#,
+                )
+                .await;
+            };
+            let Some(encoded) = headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("x-lux-cluster-part"))
+                .map(|(_, value)| value)
+            else {
+                return send_json(
+                    socket,
+                    400,
+                    "Bad Request",
+                    r#"{"error":"X-Lux-Cluster-Part descriptor is required"}"#,
+                )
+                .await;
+            };
+            let descriptor = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .ok()
+                .and_then(|bytes| {
+                    serde_json::from_slice::<crate::cluster::BackupPartDescriptor>(&bytes).ok()
+                });
+            let Some(descriptor) = descriptor else {
+                return send_json(
+                    socket,
+                    400,
+                    "Bad Request",
+                    r#"{"error":"invalid X-Lux-Cluster-Part descriptor"}"#,
+                )
+                .await;
+            };
+            if let Err(error) = node.validate_restore_part(&descriptor) {
+                return send_json(
+                    socket,
+                    409,
+                    "Conflict",
+                    &json!({ "error": error.to_string() }).to_string(),
+                )
+                .await;
+            }
         }
         let end = (header_end + content_length).min(data.len());
         let dump = &data[header_end..end];
@@ -355,7 +587,50 @@ async fn handle_request(
                     let body = r#"{"error":"snapshot requires operator credentials"}"#;
                     return send_json(socket, 403, "Forbidden", body).await;
                 }
-                return stream_snapshot(socket, store).await;
+                if cluster.is_some() {
+                    return send_json(
+                        socket,
+                        409,
+                        "Conflict",
+                        r#"{"error":"clustered engines require one topology-bound backup part per node"}"#,
+                    )
+                    .await;
+                }
+                return stream_snapshot(socket, store, None).await;
+            }
+            ["v1", "cluster", "backup", "part"] | ["cluster", "backup", "part"] => {
+                let password_set = !store.config().password.is_empty();
+                if password_set && !matches!(auth_context, HttpAuthContext::Operator) {
+                    return send_json(
+                        socket,
+                        403,
+                        "Forbidden",
+                        r#"{"error":"backup part requires operator credentials"}"#,
+                    )
+                    .await;
+                }
+                let Some(node) = cluster else {
+                    return send_json(
+                        socket,
+                        409,
+                        "Conflict",
+                        r#"{"error":"Cluster is not enabled for this engine"}"#,
+                    )
+                    .await;
+                };
+                let descriptor = match node.backup_part_descriptor() {
+                    Ok(descriptor) => descriptor,
+                    Err(error) => {
+                        return send_json(
+                            socket,
+                            409,
+                            "Conflict",
+                            &json!({ "error": error.to_string() }).to_string(),
+                        )
+                        .await
+                    }
+                };
+                return stream_snapshot(socket, store, Some(&descriptor)).await;
             }
             ["v1", "tables", table] => {
                 let filter = match enforce_table_read(store, cache, &auth_context, table) {
@@ -471,6 +746,7 @@ async fn handle_request(
         broker,
         cache,
         script_engine,
+        cluster,
     };
     let (status, status_text, result) =
         route_request_with_auth(&method, &path, &body, &params, deps, &auth_context);
@@ -488,6 +764,7 @@ async fn handle_request(
 async fn stream_snapshot(
     socket: &mut tokio::net::TcpStream,
     store: &Arc<Store>,
+    descriptor: Option<&crate::cluster::BackupPartDescriptor>,
 ) -> std::io::Result<bool> {
     let store = store.clone();
     let path =
@@ -522,16 +799,635 @@ async fn stream_snapshot(
         }
     };
     let len = file.metadata().await?.len();
-    let header = format!(
+    let filename = descriptor
+        .map(|descriptor| format!("lux-{}.dat", descriptor.node_id))
+        .unwrap_or_else(|| "lux.dat".to_string());
+    let mut header = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/octet-stream\r\n\
-         Content-Disposition: attachment; filename=\"lux.dat\"\r\n\
+         Content-Disposition: attachment; filename=\"{filename}\"\r\n\
          Access-Control-Allow-Origin: *\r\n\
-         Content-Length: {len}\r\n\r\n"
+         Content-Length: {len}\r\n"
     );
+    if let Some(descriptor) = descriptor {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(descriptor).map_err(std::io::Error::other)?);
+        header.push_str("X-Lux-Cluster-Part: ");
+        header.push_str(&encoded);
+        header.push_str("\r\n");
+    }
+    header.push_str("\r\n");
     socket.write_all(header.as_bytes()).await?;
     tokio::io::copy(&mut file, socket).await?;
     Ok(true)
+}
+
+fn embedded_scalar_text(value: crate::EmbeddedValue) -> Result<String, String> {
+    match value {
+        crate::EmbeddedValue::Bulk(value) => Ok(String::from_utf8_lossy(&value).into_owned()),
+        crate::EmbeddedValue::Simple(value) => Ok(value),
+        crate::EmbeddedValue::Int(value) => Ok(value.to_string()),
+        crate::EmbeddedValue::Nil => Ok(String::new()),
+        other => Err(format!(
+            "ERR distributed table response contained a non-scalar value: {other:?}"
+        )),
+    }
+}
+
+fn embedded_table_rows(value: crate::EmbeddedValue) -> Result<Vec<Vec<(String, String)>>, String> {
+    let crate::EmbeddedValue::Array(rows) = value else {
+        return Err("ERR distributed table response was not an array".to_string());
+    };
+    rows.into_iter()
+        .map(|row| {
+            let crate::EmbeddedValue::Array(fields) = row else {
+                return Err("ERR distributed table row was not an array".to_string());
+            };
+            if !fields.len().is_multiple_of(2) {
+                return Err(
+                    "ERR distributed table row had an invalid field/value shape".to_string()
+                );
+            }
+            let mut fields = fields.into_iter();
+            let mut decoded = Vec::with_capacity(fields.len() / 2);
+            while let Some(field) = fields.next() {
+                let value = fields
+                    .next()
+                    .ok_or_else(|| "ERR distributed table row was truncated".to_string())?;
+                decoded.push((embedded_scalar_text(field)?, embedded_scalar_text(value)?));
+            }
+            Ok(decoded)
+        })
+        .collect()
+}
+
+async fn execute_cluster_table_rows(
+    client: &crate::EmbeddedClient,
+    argv: &[String],
+    decrypt_authorized: bool,
+    scan: bool,
+) -> Result<Vec<Vec<(String, String)>>, String> {
+    let refs = argv.iter().map(String::as_bytes).collect::<Vec<_>>();
+    let value = if scan {
+        client
+            .execute_table_scan_bytes_value(&refs, decrypt_authorized)
+            .await
+    } else {
+        client.execute_bytes_value(&refs).await
+    }
+    .map_err(|error| error.to_string())?;
+    embedded_table_rows(value)
+}
+
+fn table_http_error(error: impl ToString) -> (u16, &'static str, String) {
+    let error = error.to_string();
+    let status = if error.starts_with("TRYAGAIN") || error.starts_with("MOVED") {
+        503
+    } else if error.starts_with("OUTCOMEUNKNOWN") {
+        502
+    } else {
+        400
+    };
+    let status_text = match status {
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Bad Request",
+    };
+    (status, status_text, json!({ "error": error }).to_string())
+}
+
+/// Distributed PostgREST-style table data routes. Authorization and RLS are
+/// evaluated once on the signed system node; the resulting query or exact-PK
+/// mutation is then executed through the same Cluster path as RESP.
+#[allow(clippy::too_many_arguments)]
+async fn route_cluster_http_table(
+    method: &str,
+    path: &str,
+    params: &[(String, String)],
+    body: &str,
+    client: &crate::EmbeddedClient,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+    max_rows: Option<usize>,
+) -> Option<(u16, &'static str, String)> {
+    let segments = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let base = if segments.first() == Some(&"v1") {
+        &segments[1..]
+    } else {
+        &segments[..]
+    };
+
+    let table = match base {
+        ["tables", table] | ["tables", table, _] => *table,
+        _ => return None,
+    };
+    if let Some(error) = crate::auth::reserved_table_access_error(table) {
+        return Some((403, "Forbidden", json!({ "error": error }).to_string()));
+    }
+
+    match (method, base) {
+        ("GET", ["tables", table]) => {
+            let filter = match enforce_table_read(store, cache, auth, table) {
+                Ok(filter) => filter,
+                Err(response) => return Some(response),
+            };
+            let combined = combine_where(
+                get_param(params, "where").unwrap_or(""),
+                filter.as_deref().unwrap_or(""),
+            );
+            let scoped = params_with_where(params, &combined);
+            let (parsed, plan) = match parse_http_table_query(&scoped, table, max_rows) {
+                Ok(parsed) => parsed,
+                Err(error) => return Some(table_http_error(error)),
+            };
+            let mut argv = vec!["TSELECT".to_string()];
+            argv.extend(parsed.tokens);
+            let rows =
+                match execute_cluster_table_rows(client, &argv, decrypt_authorized(auth), true)
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(error) => return Some(table_http_error(error)),
+                };
+            let result = if !plan.aggregates.is_empty() && plan.group_by.is_empty() {
+                crate::tables::SelectResult::Aggregate(rows.into_iter().next().unwrap_or_default())
+            } else {
+                crate::tables::SelectResult::Rows(rows)
+            };
+            let materialize_missing =
+                plan.projections.is_empty() && plan.alias.is_none() && plan.joins.is_empty();
+            Some(ok(select_result_to_json(
+                result,
+                &render_columns(store, cache, table, Instant::now()),
+                materialize_missing,
+            )))
+        }
+        ("GET", ["tables", table, "count"]) => {
+            let filter = match enforce_table_read(store, cache, auth, table) {
+                Ok(filter) => filter,
+                Err(response) => return Some(response),
+            };
+            let mut argv = vec![
+                "TSELECT".to_string(),
+                "COUNT(*)".to_string(),
+                "FROM".to_string(),
+                (*table).to_string(),
+            ];
+            if let Some(filter) = filter.filter(|value| !value.trim().is_empty()) {
+                let where_tokens = match parse_http_where_tokens(&filter) {
+                    Ok(tokens) => tokens,
+                    Err(error) => return Some(table_http_error(error)),
+                };
+                argv.push("WHERE".to_string());
+                argv.extend(where_tokens);
+            }
+            let rows = match execute_cluster_table_rows(client, &argv, false, true).await {
+                Ok(rows) => rows,
+                Err(error) => return Some(table_http_error(error)),
+            };
+            let count = rows
+                .first()
+                .and_then(|row| {
+                    row.iter()
+                        .find(|(field, _)| field.eq_ignore_ascii_case("COUNT(*)"))
+                })
+                .and_then(|(_, value)| value.parse::<i64>().ok())
+                .unwrap_or(0);
+            Some(ok(json!({ "result": count }).to_string()))
+        }
+        ("GET", ["tables", table, id]) if *id != "schema" && *id != "count" => {
+            let filter = match enforce_table_read(store, cache, auth, table) {
+                Ok(filter) => filter,
+                Err(response) => return Some(response),
+            };
+            let Some(primary_key) = live_table_pk_field(store, cache, table) else {
+                return Some(table_http_error(format!(
+                    "ERR table '{table}' has no primary key"
+                )));
+            };
+            let mut argv = vec![
+                "TSELECT".to_string(),
+                "*".to_string(),
+                "FROM".to_string(),
+                (*table).to_string(),
+                "WHERE".to_string(),
+                primary_key,
+                "=".to_string(),
+                (*id).to_string(),
+            ];
+            if let Some(filter) = filter.filter(|value| !value.trim().is_empty()) {
+                let where_tokens = match parse_http_where_tokens(&filter) {
+                    Ok(tokens) => tokens,
+                    Err(error) => return Some(table_http_error(error)),
+                };
+                argv.push("AND".to_string());
+                argv.extend(where_tokens);
+            }
+            let rows =
+                match execute_cluster_table_rows(client, &argv, decrypt_authorized(auth), true)
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(error) => return Some(table_http_error(error)),
+                };
+            let body = rows
+                .first()
+                .map(|row| {
+                    row_to_json_object(row, &render_columns(store, cache, table, Instant::now()))
+                })
+                .unwrap_or_else(|| r#"{"error":"row not found"}"#.to_string());
+            Some(ok(body))
+        }
+        ("POST", ["tables", table]) => {
+            let parsed: Value = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(_) => return Some(table_http_error("invalid json")),
+            };
+            if parsed.is_array() {
+                return Some((
+                    409,
+                    "Conflict",
+                    json!({
+                        "error": "Cluster bulk table inserts are not atomic yet; insert one row per request"
+                    })
+                    .to_string(),
+                ));
+            }
+            let Some(object) = parsed.as_object() else {
+                return Some(table_http_error("expected json object"));
+            };
+            if let Err(response) = enforce_table_insert(store, cache, auth, table, object) {
+                return Some(response);
+            }
+            let conflict = get_param(params, "on_conflict");
+            let upsert = conflict.is_some() || get_param(params, "upsert") == Some("true");
+            let mut argv = vec![
+                if upsert { "TUPSERT" } else { "TINSERT" }.to_string(),
+                (*table).to_string(),
+            ];
+            for (field, value) in json_obj_to_pairs(object) {
+                argv.push(field);
+                argv.push(value);
+            }
+            if let Some(conflict) = conflict {
+                argv.extend([
+                    "ON".to_string(),
+                    "CONFLICT".to_string(),
+                    conflict.to_string(),
+                ]);
+            }
+            if let Some(ttl) = get_param(params, "ttl") {
+                argv.extend(["TTL".to_string(), ttl.to_string()]);
+            }
+            argv.extend(["RETURNING".to_string(), "*".to_string()]);
+            let mut rows = match execute_cluster_table_rows(client, &argv, true, false).await {
+                Ok(rows) => rows,
+                Err(error) => return Some(table_http_error(error)),
+            };
+            let columns = render_columns(store, cache, table, Instant::now());
+            if !decrypt_authorized(auth) {
+                redact_encrypted_returning_rows(&mut rows, &columns);
+            }
+            let body = rows
+                .first()
+                .map(|row| row_to_json_object(row, &columns))
+                .unwrap_or_else(|| "{}".to_string());
+            Some(ok(body))
+        }
+        ("PATCH", ["tables", table]) | ("PATCH", ["tables", table, _]) => {
+            let mut point_where = None;
+            if let ["tables", _, id] = base {
+                let Some(primary_key) = live_table_pk_field(store, cache, table) else {
+                    return Some(table_http_error(format!(
+                        "ERR table '{table}' has no primary key"
+                    )));
+                };
+                point_where = Some(format!("{primary_key} = {id}"));
+            }
+            let where_clause = point_where
+                .as_deref()
+                .or_else(|| get_param(params, "where"));
+            let Some(where_clause) = where_clause else {
+                return Some(table_http_error("where parameter required for updates"));
+            };
+            let filter = match enforce_table_write_where(store, cache, auth, table) {
+                Ok(filter) => filter,
+                Err(response) => return Some(response),
+            };
+            let effective_where = combine_where(where_clause, filter.as_deref().unwrap_or(""));
+            let parsed: Value = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(_) => return Some(table_http_error("invalid json")),
+            };
+            let Some(object) = parsed.as_object() else {
+                return Some(table_http_error("expected json object"));
+            };
+            let fields = json_obj_to_pairs(object);
+            let field_refs = fields
+                .iter()
+                .map(|(field, value)| (field.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            if let Err(response) =
+                enforce_table_update_check(store, cache, auth, table, &field_refs)
+            {
+                return Some(response);
+            }
+            let where_tokens = match parse_http_where_tokens(&effective_where) {
+                Ok(tokens) => tokens,
+                Err(error) => return Some(table_http_error(error)),
+            };
+            let mut argv = vec![
+                "TUPDATE".to_string(),
+                (*table).to_string(),
+                "SET".to_string(),
+            ];
+            for (field, value) in fields {
+                argv.push(field);
+                argv.push(value);
+            }
+            argv.push("WHERE".to_string());
+            argv.extend(where_tokens);
+            if let Some(ttl) = get_param(params, "ttl") {
+                argv.extend(["TTL".to_string(), ttl.to_string()]);
+            }
+            argv.extend(["RETURNING".to_string(), "*".to_string()]);
+            let mut rows = match execute_cluster_table_rows(client, &argv, true, false).await {
+                Ok(rows) => rows,
+                Err(error) => return Some(table_http_error(error)),
+            };
+            let columns = render_columns(store, cache, table, Instant::now());
+            if !decrypt_authorized(auth) {
+                redact_encrypted_returning_rows(&mut rows, &columns);
+            }
+            Some(ok(rows_to_json_array(&rows, &columns)))
+        }
+        ("DELETE", ["tables", table]) if get_param(params, "drop") != Some("true") => {
+            let Some(where_clause) = get_param(params, "where") else {
+                return Some(table_http_error(
+                    "where parameter required for delete (use drop=true to drop table)",
+                ));
+            };
+            let filter = match enforce_table_write_where(store, cache, auth, table) {
+                Ok(filter) => filter,
+                Err(response) => return Some(response),
+            };
+            let effective_where = combine_where(where_clause, filter.as_deref().unwrap_or(""));
+            let where_tokens = match parse_http_where_tokens(&effective_where) {
+                Ok(tokens) => tokens,
+                Err(error) => return Some(table_http_error(error)),
+            };
+            let mut argv = vec![
+                "TDELETE".to_string(),
+                "FROM".to_string(),
+                (*table).to_string(),
+                "WHERE".to_string(),
+            ];
+            argv.extend(where_tokens);
+            argv.extend(["RETURNING".to_string(), "*".to_string()]);
+            let mut rows = match execute_cluster_table_rows(client, &argv, true, false).await {
+                Ok(rows) => rows,
+                Err(error) => return Some(table_http_error(error)),
+            };
+            let columns = render_columns(store, cache, table, Instant::now());
+            if !decrypt_authorized(auth) {
+                redact_encrypted_returning_rows(&mut rows, &columns);
+            }
+            Some(ok(rows_to_json_array(&rows, &columns)))
+        }
+        _ => None,
+    }
+}
+
+/// Route command-shaped HTTP surfaces through the same authenticated embedded
+/// Cluster path as RESP. Without this, an HTTP request would execute directly
+/// against whichever node accepted the socket and silently read or write the
+/// wrong shard.
+async fn route_cluster_http_command(
+    method: &str,
+    path: &str,
+    params: &[(String, String)],
+    body: &str,
+    client: &crate::EmbeddedClient,
+) -> Option<(u16, &'static str, String)> {
+    let segments = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let base = if segments.first() == Some(&"v1") {
+        &segments[1..]
+    } else {
+        &segments[..]
+    };
+
+    let bad_request = |message: &str| (400, "Bad Request", json!({ "error": message }).to_string());
+    let argv = match (method, base) {
+        ("POST", ["exec"]) => {
+            let parsed: Value = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(_) => return Some(bad_request("invalid json")),
+            };
+            let command = match parsed.get("command") {
+                Some(Value::Array(values)) => values
+                    .iter()
+                    .map(|value| value.as_str().unwrap_or("").to_string())
+                    .collect::<Vec<_>>(),
+                Some(Value::String(command)) => command
+                    .split_whitespace()
+                    .map(ToString::to_string)
+                    .collect(),
+                _ => return Some(bad_request("missing command")),
+            };
+            if command.is_empty() {
+                return Some(bad_request("empty command"));
+            }
+            if let Some(error) = reserved_auth_table_exec_read_error(&command) {
+                return Some((403, "Forbidden", json!({ "error": error }).to_string()));
+            }
+            command
+        }
+        ("GET", ["kv", key]) | ("GET", ["get", key]) => {
+            vec!["GET".into(), (*key).into()]
+        }
+        ("PUT", ["kv", key]) | ("POST", ["set", key]) => {
+            let parsed: Value = serde_json::from_str(body).unwrap_or_default();
+            let value = parsed.get("value").and_then(Value::as_str).unwrap_or("");
+            let mut command = vec!["SET".into(), (*key).into(), value.into()];
+            if let Some(seconds) = parsed.get("ex").and_then(Value::as_u64) {
+                command.extend(["EX".into(), seconds.to_string()]);
+            }
+            command
+        }
+        ("DELETE", ["kv", key]) | ("POST", ["del", key]) => {
+            vec!["DEL".into(), (*key).into()]
+        }
+        ("POST", ["kv", key, "incr"]) | ("POST", ["incr", key]) => {
+            vec!["INCR".into(), (*key).into()]
+        }
+        ("POST", ["kv", key, "decr"]) | ("POST", ["decr", key]) => {
+            vec!["DECR".into(), (*key).into()]
+        }
+        ("GET", ["kv", key, "hash"]) | ("GET", ["hgetall", key]) => {
+            vec!["HGETALL".into(), (*key).into()]
+        }
+        ("GET", ["kv", key, "list"]) => vec![
+            "LRANGE".into(),
+            (*key).into(),
+            get_param(params, "start").unwrap_or("0").into(),
+            get_param(params, "stop").unwrap_or("-1").into(),
+        ],
+        ("GET", ["kv", key, "set"]) => vec!["SMEMBERS".into(), (*key).into()],
+        ("GET", ["kv", key, "zset"]) => vec![
+            "ZRANGEBYSCORE".into(),
+            (*key).into(),
+            get_param(params, "min").unwrap_or("-inf").into(),
+            get_param(params, "max").unwrap_or("+inf").into(),
+            "WITHSCORES".into(),
+        ],
+        ("GET", ["keys"]) => vec![
+            "KEYS".into(),
+            get_param(params, "pattern").unwrap_or("*").into(),
+        ],
+        ("GET", ["keys", pattern]) => vec!["KEYS".into(), (*pattern).into()],
+        ("GET", ["dbsize"]) => vec!["DBSIZE".into()],
+        ("GET", ["ping"]) => vec!["PING".into()],
+        ("GET", ["ts"]) => {
+            let filter = get_param(params, "filter").unwrap_or("");
+            if filter.is_empty() {
+                return Some(bad_request("filter parameter required"));
+            }
+            let mut command = vec![
+                "TSMRANGE".into(),
+                "-".into(),
+                "+".into(),
+                "FILTER".into(),
+                filter.into(),
+            ];
+            if let (Some(aggregation), Some(bucket)) =
+                (get_param(params, "agg"), get_param(params, "bucket"))
+            {
+                command.extend(["AGGREGATION".into(), aggregation.into(), bucket.into()]);
+            }
+            command
+        }
+        ("GET", ["ts", key]) => {
+            let mut command = vec![
+                "TSRANGE".into(),
+                (*key).into(),
+                get_param(params, "from").unwrap_or("-").into(),
+                get_param(params, "to").unwrap_or("+").into(),
+            ];
+            if let (Some(aggregation), Some(bucket)) =
+                (get_param(params, "agg"), get_param(params, "bucket"))
+            {
+                command.extend(["AGGREGATION".into(), aggregation.into(), bucket.into()]);
+            }
+            if let Some(count) = get_param(params, "count") {
+                command.extend(["COUNT".into(), count.into()]);
+            }
+            command
+        }
+        ("POST", ["ts", key]) => {
+            let parsed: Value = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(_) => return Some(bad_request("invalid json")),
+            };
+            let value = match parsed.get("value") {
+                Some(Value::Number(value)) => value.to_string(),
+                Some(Value::String(value)) => value.clone(),
+                _ => return Some(bad_request("missing value")),
+            };
+            let mut command = vec![
+                "TSADD".into(),
+                (*key).into(),
+                parsed
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .unwrap_or("*")
+                    .into(),
+                value,
+            ];
+            if let Some(retention) = parsed.get("retention").and_then(Value::as_u64) {
+                command.extend(["RETENTION".into(), retention.to_string()]);
+            }
+            if let Some(labels) = parsed.get("labels").and_then(Value::as_object) {
+                command.push("LABELS".into());
+                for (name, value) in labels {
+                    command.push(name.clone());
+                    command.push(value.as_str().unwrap_or("").into());
+                }
+            }
+            command
+        }
+        ("GET", ["ts", key, "info"]) => vec!["TSINFO".into(), (*key).into()],
+        ("GET", ["ts", key, "latest"]) => vec!["TSGET".into(), (*key).into()],
+        ("POST", ["vectors", key]) if *key != "search" => {
+            let parsed: Value = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(_) => return Some(bad_request("invalid json")),
+            };
+            let Some(vector) = parsed.get("vector").and_then(Value::as_array) else {
+                return Some(bad_request("missing vector array"));
+            };
+            let mut command = vec!["VSET".into(), (*key).into(), vector.len().to_string()];
+            command.extend(
+                vector
+                    .iter()
+                    .map(|value| value.as_f64().unwrap_or(0.0).to_string()),
+            );
+            if let Some(metadata) = parsed.get("metadata") {
+                command.extend(["META".into(), metadata.to_string()]);
+            }
+            command
+        }
+        ("POST", ["vectors", "search"]) => {
+            let parsed: Value = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(_) => return Some(bad_request("invalid json")),
+            };
+            let Some(vector) = parsed.get("vector").and_then(Value::as_array) else {
+                return Some(bad_request("missing vector array"));
+            };
+            let mut command = vec!["VSEARCH".into(), vector.len().to_string()];
+            command.extend(
+                vector
+                    .iter()
+                    .map(|value| value.as_f64().unwrap_or(0.0).to_string()),
+            );
+            command.extend([
+                "K".into(),
+                parsed
+                    .get("k")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(10)
+                    .to_string(),
+            ]);
+            if let (Some(field), Some(value)) = (
+                parsed.get("filter").and_then(Value::as_str),
+                parsed.get("filter_value").and_then(Value::as_str),
+            ) {
+                command.extend(["FILTER".into(), field.into(), value.into()]);
+            }
+            command.push("META".into());
+            command
+        }
+        ("GET", ["vectors", key]) => vec!["VGET".into(), (*key).into()],
+        ("DELETE", ["vectors", key]) => vec!["DEL".into(), (*key).into()],
+        ("GET", ["vectors"]) => vec!["VCARD".into()],
+        _ => return None,
+    };
+
+    let refs = argv.iter().map(String::as_bytes).collect::<Vec<_>>();
+    let body = match client.execute_bytes(&refs).await {
+        Ok(response) => resp_to_json(&response),
+        Err(error) => json!({ "error": error.to_string() }).to_string(),
+    };
+    Some((200, "OK", body))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2349,6 +3245,9 @@ struct HttpTableQueryParams {
     has_where: bool,
     where_tokens: Vec<String>,
     offset: usize,
+    /// Exact TSELECT arguments after the command name. Keeping the parsed argv
+    /// avoids rebuilding a subtly different query for distributed execution.
+    tokens: Vec<String>,
 }
 
 fn parse_http_where_tokens(where_clause: &str) -> Result<Vec<String>, String> {
@@ -2626,6 +3525,7 @@ fn parse_http_table_query(
             has_where,
             where_tokens,
             offset,
+            tokens,
         },
         plan,
     ))
@@ -2636,6 +3536,7 @@ struct RouteDeps<'a> {
     broker: &'a Broker,
     cache: &'a SharedSchemaCache,
     script_engine: &'a Arc<lua::ScriptEngine>,
+    cluster: Option<&'a Arc<crate::cluster::ClusterNode>>,
 }
 
 fn route_request_with_auth(
@@ -2651,6 +3552,7 @@ fn route_request_with_auth(
         broker,
         cache,
         script_engine,
+        cluster,
     } = deps;
     let path = path.trim_start_matches('/');
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -2682,6 +3584,10 @@ fn route_request_with_auth(
         ("POST", ["migrations", "repair"]) => {
             migration_repair(body, store, broker, cache, script_engine)
         }
+        ("GET", ["cluster", "status"]) => cluster_status(cluster),
+        ("POST", ["cluster", "topology", "prepare"]) => cluster_prepare(cluster, body),
+        ("POST", ["cluster", "topology", "commit"]) => cluster_commit(cluster, body),
+        ("POST", ["cluster", "topology", "abort"]) => cluster_abort(cluster, body),
 
         // ── exec (escape hatch) ──
         ("POST", ["exec"]) => ok(handle_exec(body, store, broker, cache, script_engine)),
@@ -3061,6 +3967,13 @@ fn route_requires_project_access(method: &str, base: &[&str]) -> bool {
             | ("POST", ["migrations", "plan"])
             | ("POST", ["migrations", "apply"])
             | ("POST", ["migrations", "repair"])
+            | ("GET", ["cluster", "status"])
+            | ("POST", ["cluster", "topology", "prepare"])
+            | ("POST", ["cluster", "topology", "commit"])
+            | ("POST", ["cluster", "topology", "abort"])
+            | ("POST", ["cluster", "catalogs", "sync"])
+            | ("POST", ["cluster", "transfers", "run"])
+            | ("POST", ["cluster", "transfers", "finalize"])
             | ("GET", ["dbsize"])
             | ("GET", ["keys"])
             | ("GET", ["keys", _])
@@ -3114,6 +4027,115 @@ fn engine_root() -> (u16, &'static str, String) {
         "capabilities": crate::migrations::CAPABILITIES
     })
     .to_string())
+}
+
+fn cluster_status(
+    cluster: Option<&Arc<crate::cluster::ClusterNode>>,
+) -> (u16, &'static str, String) {
+    let Some(node) = cluster else {
+        return push_json_error(409, "Conflict", "Cluster is not enabled for this engine");
+    };
+    let current = node.topology.current();
+    let pending = node.topology.pending();
+    let transition = match node.topology.transition_plan() {
+        Ok(transition) => transition,
+        Err(error) => {
+            return push_json_error(
+                500,
+                "Internal Server Error",
+                &format!("durable Cluster topology state is invalid: {error}"),
+            )
+        }
+    };
+    ok(json!({
+        "enabled": true,
+        "topology_schema_version": crate::cluster::CLUSTER_TOPOLOGY_SCHEMA_VERSION,
+        "peer_protocol_version": crate::cluster::CLUSTER_PROTOCOL_VERSION,
+        "local_node_id": node.local_node_id,
+        "current": current.manifest(),
+        "pending": pending.as_ref().map(|topology| topology.manifest()),
+        "transition": transition,
+        "transfer": node.transitions.status(),
+    })
+    .to_string())
+}
+
+fn cluster_prepare(
+    cluster: Option<&Arc<crate::cluster::ClusterNode>>,
+    body: &str,
+) -> (u16, &'static str, String) {
+    let Some(node) = cluster else {
+        return push_json_error(409, "Conflict", "Cluster is not enabled for this engine");
+    };
+    let signed = match serde_json::from_str::<crate::cluster::SignedTopology>(body) {
+        Ok(signed) => signed,
+        Err(error) => {
+            return push_json_error(
+                400,
+                "Bad Request",
+                &format!("invalid signed topology: {error}"),
+            )
+        }
+    };
+    match node.prepare_topology(signed) {
+        Ok(transition) => ok(json!({
+            "prepared": true,
+            "transition": transition,
+        })
+        .to_string()),
+        Err(error) => push_json_error(409, "Conflict", &error.to_string()),
+    }
+}
+
+fn cluster_transition_epoch(body: &str) -> Result<u64, (u16, &'static str, String)> {
+    let parsed: Value = serde_json::from_str(body)
+        .map_err(|error| push_json_error(400, "Bad Request", &format!("invalid json: {error}")))?;
+    parsed
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| push_json_error(400, "Bad Request", "epoch is required"))
+}
+
+fn cluster_commit(
+    cluster: Option<&Arc<crate::cluster::ClusterNode>>,
+    body: &str,
+) -> (u16, &'static str, String) {
+    let Some(node) = cluster else {
+        return push_json_error(409, "Conflict", "Cluster is not enabled for this engine");
+    };
+    let epoch = match cluster_transition_epoch(body) {
+        Ok(epoch) => epoch,
+        Err(response) => return response,
+    };
+    match node.commit_topology(epoch) {
+        Ok(topology) => ok(json!({
+            "committed": true,
+            "current": topology.manifest(),
+        })
+        .to_string()),
+        Err(error) => push_json_error(409, "Conflict", &error.to_string()),
+    }
+}
+
+fn cluster_abort(
+    cluster: Option<&Arc<crate::cluster::ClusterNode>>,
+    body: &str,
+) -> (u16, &'static str, String) {
+    let Some(node) = cluster else {
+        return push_json_error(409, "Conflict", "Cluster is not enabled for this engine");
+    };
+    let epoch = match cluster_transition_epoch(body) {
+        Ok(epoch) => epoch,
+        Err(response) => return response,
+    };
+    match node.abort_topology(epoch) {
+        Ok(aborted) => ok(json!({
+            "aborted": aborted,
+            "epoch": epoch,
+        })
+        .to_string()),
+        Err(error) => push_json_error(409, "Conflict", &error.to_string()),
+    }
 }
 
 fn migration_list(
@@ -4452,6 +5474,7 @@ fn reserved_auth_table_exec_read_error(command: &[String]) -> Option<String> {
 #[derive(Default)]
 struct RenderCols {
     fields: Vec<String>,
+    encrypted: std::collections::HashSet<String>,
     json: std::collections::HashSet<String>,
     number: std::collections::HashSet<String>,
     bool_: std::collections::HashSet<String>,
@@ -4468,6 +5491,9 @@ fn render_columns(
     if let Ok(fields) = crate::tables::load_schema(store, cache, table, now) {
         for f in fields {
             cols.fields.push(f.name.clone());
+            if f.encrypted {
+                cols.encrypted.insert(f.name.clone());
+            }
             match f.field_type {
                 crate::tables::FieldType::Json | crate::tables::FieldType::Array => {
                     cols.json.insert(f.name);
@@ -4489,6 +5515,12 @@ fn render_columns(
         }
     }
     cols
+}
+
+fn redact_encrypted_returning_rows(rows: &mut [Vec<(String, String)>], cols: &RenderCols) {
+    for row in rows {
+        row.retain(|(field, _)| !cols.encrypted.contains(field));
+    }
 }
 
 /// Append `"key":value` to a JSON object with schema-correct encoding: VECTOR as

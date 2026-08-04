@@ -620,6 +620,17 @@ fn read_dump_value(
 /// embedded TTL (ms) WITHOUT loading it, so RESTORE can apply the value under a
 /// caller-chosen key and TTL.
 pub(crate) fn decode_dump_blob_value(store: &Store, blob: &[u8]) -> io::Result<(DumpValue, i64)> {
+    let (_, value, ttl_ms) = decode_dump_blob_parts(store, blob)?;
+    Ok((value, ttl_ms))
+}
+
+/// Strictly decode the one entry carried by an internal DUMP blob. Transfer
+/// receivers use the embedded key to prove the payload cannot install data in
+/// a slot other than the one validated from its envelope.
+pub(crate) fn decode_dump_blob_parts(
+    store: &Store,
+    blob: &[u8],
+) -> io::Result<(String, DumpValue, i64)> {
     let mut cursor = io::Cursor::new(blob);
     let mut header = [0u8; 4];
     cursor.read_exact(&mut header)?;
@@ -638,7 +649,13 @@ pub(crate) fn decode_dump_blob_value(store: &Store, blob: &[u8]) -> io::Result<(
     let key = read_string(&mut cursor)?;
     let ttl_ms = read_i64(&mut cursor)?;
     let value = read_dump_value(store, &mut cursor, type_buf[0], &key, stream_groups)?;
-    Ok((value, ttl_ms))
+    if cursor.position() != blob.len() as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DUMP payload must contain exactly one entry",
+        ));
+    }
+    Ok((key, value, ttl_ms))
 }
 
 /// Encode a single key/value into the on-disk snapshot format (header + one

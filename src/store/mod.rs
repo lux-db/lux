@@ -13,6 +13,7 @@ mod sorted_sets;
 mod streams;
 mod timeseries;
 mod vectors;
+pub(crate) use vectors::ClusterVectorSearch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId {
@@ -564,6 +565,7 @@ pub(crate) fn fx_hash(bytes: &[u8]) -> u64 {
 
 pub(crate) type ShardKey = Vec<u8>;
 pub(crate) type ShardData = HashMap<ShardKey, Entry, FxBuildHasher>;
+pub(crate) type ClusterDumpBlob = (Vec<u8>, Vec<u8>, Option<u64>);
 
 #[inline(always)]
 fn key_str(key: &[u8]) -> &str {
@@ -3845,6 +3847,116 @@ impl Store {
         entries
     }
 
+    /// Export a point-in-time set of same-key DUMP blobs under the global
+    /// write barrier. Cluster fences and drains the moving logical slots first;
+    /// the barrier then prevents eviction/expiry from moving a selected value
+    /// between memory and tiered disk while its payload is captured.
+    pub(crate) fn export_dump_blobs_matching(
+        &self,
+        now: Instant,
+        include: impl Fn(&[u8]) -> bool,
+    ) -> Result<Vec<ClusterDumpBlob>, String> {
+        let captured_unix_ms = epoch_ms().max(0) as u64;
+        let entries = self.with_write_barrier(|shards| {
+            let mut selected = BTreeMap::<String, DumpEntry>::new();
+            // Load cold entries first; a hot copy, if one exists, is newer and
+            // intentionally overwrites it below.
+            for entry in self.dump_disk_entries(now) {
+                if include(entry.key.as_bytes()) {
+                    selected.insert(entry.key.clone(), entry);
+                }
+            }
+            for shard in shards {
+                for (key, entry) in shard.data.iter() {
+                    if entry.is_expired_at(now) || !include(key) {
+                        continue;
+                    }
+                    let key = std::str::from_utf8(key).map_err(|_| {
+                        "ERR Cluster transfer requires UTF-8 keys (matching Lux snapshot format)"
+                            .to_string()
+                    })?;
+                    let ttl_ms = entry
+                        .expires_at
+                        .map(|expires_at| expires_at.duration_since(now).as_millis() as i64)
+                        .unwrap_or(0);
+                    selected.insert(
+                        key.to_string(),
+                        DumpEntry {
+                            key: key.to_string(),
+                            value: store_value_to_dump_value(&entry.value),
+                            ttl_ms,
+                        },
+                    );
+                }
+            }
+            Ok::<Vec<DumpEntry>, String>(selected.into_values().collect())
+        })?;
+        entries
+            .into_iter()
+            .map(|entry| {
+                let key = entry.key.as_bytes().to_vec();
+                let expires_unix_ms = (entry.ttl_ms > 0)
+                    .then(|| captured_unix_ms.saturating_add(entry.ttl_ms as u64));
+                let blob = crate::snapshot::encode_dump_blob(self, &entry)
+                    .map_err(|error| format!("ERR Cluster transfer encode failed: {error}"))?;
+                Ok((key, blob, expires_unix_ms))
+            })
+            .collect()
+    }
+
+    /// Validate, WAL-log, and atomically replace one same-key transfer value.
+    /// The blob is decoded before WAL append so a malformed peer payload can
+    /// never poison crash recovery.
+    pub(crate) fn import_cluster_dump_blob(
+        &self,
+        key: &[u8],
+        blob: &[u8],
+        expires_unix_ms: Option<u64>,
+    ) -> Result<(), String> {
+        let (embedded_key, _, _) = crate::snapshot::decode_dump_blob_parts(self, blob)
+            .map_err(|error| format!("ERR invalid Cluster key payload: {error}"))?;
+        if embedded_key.as_bytes() != key {
+            return Err("ERR Cluster key payload does not match its routed key".to_string());
+        }
+        let deadline = expires_unix_ms.unwrap_or(0).to_string();
+        self.wal_log_command(&[b"LXMIGRATE", key, deadline.as_bytes(), blob])
+            .map_err(|error| format!("ERR WAL append failed: {error}"))?;
+        self.apply_cluster_restore(key, expires_unix_ms, blob)
+    }
+
+    /// Replay the exact value with its original wall-clock deadline. This is
+    /// separate from LXRESTORE, whose legacy blob TTL is relative to replay.
+    pub(crate) fn apply_cluster_restore(
+        &self,
+        key: &[u8],
+        expires_unix_ms: Option<u64>,
+        blob: &[u8],
+    ) -> Result<(), String> {
+        let (embedded_key, _, _) = crate::snapshot::decode_dump_blob_parts(self, blob)
+            .map_err(|error| format!("ERR invalid Cluster key payload: {error}"))?;
+        if embedded_key.as_bytes() != key {
+            return Err("ERR Cluster key payload does not match its routed key".to_string());
+        }
+        let deadline = expires_unix_ms.unwrap_or(0);
+        let deadline = i64::try_from(deadline)
+            .map_err(|_| "ERR Cluster key deadline is out of range".to_string())?;
+        self.restore_key(key, deadline, blob, true, true, Instant::now())
+            .map_err(|error| format!("ERR Cluster key import failed: {error}"))
+    }
+
+    /// Durably remove a stale source copy after every node has committed an
+    /// ownership transition. Repeating this after a crash is safe: DEL is
+    /// idempotent and is appended before the in-memory/disk mutation.
+    pub(crate) fn remove_cluster_key(&self, key: &[u8]) -> Result<(), String> {
+        if key.starts_with(b"_t:") {
+            return Err("ERR Cluster cannot remove reserved table storage as a key".to_string());
+        }
+        self.wal_log_command(&[b"DEL", key])
+            .map_err(|error| format!("ERR WAL append failed: {error}"))?;
+        self.del(&[key]);
+        Ok(())
+    }
+
     pub fn load_entry(&self, key: String, value: DumpValue, ttl: Option<Duration>) {
         let idx = self.shard_index(key.as_bytes());
         let mut shard = self.shards[idx].write();
@@ -5710,6 +5822,27 @@ mod tests {
         assert!(store.get(b"key1", n).is_some());
         std::thread::sleep(Duration::from_millis(5));
         assert!(store.get(b"key1", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn cluster_transfer_uses_the_original_absolute_ttl_deadline() {
+        let source = Store::new();
+        source.set(
+            b"expiring",
+            b"value",
+            Some(Duration::from_millis(15)),
+            Instant::now(),
+        );
+        let exported = source
+            .export_dump_blobs_matching(Instant::now(), |key| key == b"expiring")
+            .unwrap();
+        let (key, blob, deadline) = &exported[0];
+        assert!(deadline.is_some());
+        std::thread::sleep(Duration::from_millis(25));
+
+        let target = Store::new();
+        target.apply_cluster_restore(key, *deadline, blob).unwrap();
+        assert!(target.get(key, Instant::now()).is_none());
     }
 
     #[test]

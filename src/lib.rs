@@ -695,6 +695,28 @@ impl EmbeddedClient {
         parse_single_embedded_value(&resp)
     }
 
+    /// Execute a distributed table scan while preserving the HTTP ingress's
+    /// encrypted-column authorization decision across every shard. This is
+    /// intentionally crate-private: public RESP callers use the ordinary
+    /// operator-authorized command path.
+    pub(crate) async fn execute_table_scan_bytes_value(
+        &self,
+        argv: &[&[u8]],
+        decrypt_authorized: bool,
+    ) -> Result<EmbeddedValue, LuxError> {
+        if self.runtime.cluster.is_none() {
+            return Err(LuxError::Unsupported(
+                "distributed table scan requires Cluster".to_string(),
+            ));
+        }
+        let response = self
+            .runtime
+            .execute_cluster_table_scan(argv, Instant::now(), decrypt_authorized)
+            .await
+            .map_err(LuxError::Command)?;
+        parse_single_embedded_value(&response)
+    }
+
     pub(crate) async fn execute_command_output(
         &self,
         command: command::Command<'_>,
@@ -3120,29 +3142,6 @@ impl Runtime {
             config,
         });
 
-        if let Some(node) = &runtime.cluster {
-            let peer_addr = node.transport.local_addr().map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::AddrNotAvailable,
-                    format!("Cluster peer listener failed: {error}"),
-                )
-            })?;
-            emit_info(
-                &runtime.config,
-                ServerInfoEvent::ClusterPeerReady {
-                    node_id: node.local_node_id.clone(),
-                    addr: peer_addr,
-                    epoch: node.topology.current().manifest().epoch,
-                },
-            );
-            let peer_runtime = runtime.clone();
-            background_tasks.spawn(node.clone().serve(move |request| {
-                let runtime = peer_runtime.clone();
-                async move { runtime.execute_cluster_peer_request(request).await }
-            }));
-            background_tasks.spawn(node.clone().probe_peers());
-        }
-
         if runtime.config.storage.mode == StorageMode::Tiered {
             emit_info(
                 &runtime.config,
@@ -3266,6 +3265,32 @@ impl Runtime {
             eprintln!("push scope migration skipped: {e}");
         }
 
+        // Do not admit peer work until snapshots, WAL, auth upgrades, and
+        // one-time data migrations are complete. Binding early reserves the
+        // port, but serving early would expose an empty/partially replayed node.
+        if let Some(node) = &runtime.cluster {
+            let peer_addr = node.transport.local_addr().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    format!("Cluster peer listener failed: {error}"),
+                )
+            })?;
+            emit_info(
+                &runtime.config,
+                ServerInfoEvent::ClusterPeerReady {
+                    node_id: node.local_node_id.clone(),
+                    addr: peer_addr,
+                    epoch: node.topology.current().manifest().epoch,
+                },
+            );
+            let peer_runtime = runtime.clone();
+            background_tasks.spawn(node.clone().serve(move |request| {
+                let runtime = peer_runtime.clone();
+                async move { runtime.execute_cluster_peer_request(request).await }
+            }));
+            background_tasks.spawn(node.clone().probe_peers());
+        }
+
         background_tasks.spawn(snapshot::background_save_loop(runtime.store.clone()));
 
         {
@@ -3366,11 +3391,29 @@ impl Runtime {
                 return None;
             }
         };
+        let global_scan = match cluster::global_scan_spec(args) {
+            Ok(scan) => scan,
+            Err(message) => {
+                self.store.add_total_commands(1);
+                resp::write_error(write_buf, &message);
+                return None;
+            }
+        };
+        if global_scan.is_some()
+            && node.topology.current().manifest().system_node_id == node.local_node_id
+        {
+            self.store.add_total_commands(1);
+            match self.execute_cluster_global_scan(args, now).await {
+                Ok(response) => write_buf.extend_from_slice(&response),
+                Err(message) => resp::write_error(write_buf, &message),
+            }
+            return None;
+        }
         if table_scan.is_some()
             && node.topology.current().manifest().system_node_id == node.local_node_id
         {
             self.store.add_total_commands(1);
-            match self.execute_cluster_table_scan(args, now).await {
+            match self.execute_cluster_table_scan(args, now, true).await {
                 Ok(response) => write_buf.extend_from_slice(&response),
                 Err(message) => resp::write_error(write_buf, &message),
             }
@@ -3445,7 +3488,32 @@ impl Runtime {
                 }
             }
         };
+        let local_slot = table_route
+            .map(|(table, primary_key, _)| {
+                cluster::slot_for_table_row(table.as_bytes(), primary_key)
+            })
+            .or_else(|| match cluster::classify_command(routed_args) {
+                cluster::CommandRoute::Slot { slot, .. } => Some(slot),
+                _ => None,
+            });
         let Some(target) = target else {
+            let _permit = if let Some(slot) = local_slot {
+                match node.transitions.enter_slot(slot) {
+                    Ok(permit) => Some(permit),
+                    Err(epoch) => {
+                        self.store.add_total_commands(1);
+                        resp::write_error(
+                            write_buf,
+                            &format!(
+                                "TRYAGAIN Cluster topology epoch {epoch} fenced slot {slot} for ownership transfer"
+                            ),
+                        );
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
             self.store.add_total_commands(1);
             return executor.execute_command(routed_args, session, write_buf, now);
         };
@@ -3469,7 +3537,13 @@ impl Runtime {
             .execute_remote(target, argv, catalog, table_primary_key)
             .await
         {
-            Ok(response) => write_buf.extend_from_slice(&response),
+            Ok(response) => {
+                // The owner emits to its local broker; mirror the successful
+                // logical mutation at the ingress so HTTP/live and embedded
+                // subscribers connected there observe remote-slot changes.
+                fire_key_events(&self.broker, routed_args);
+                write_buf.extend_from_slice(&response);
+            }
             Err(message) => resp::write_error(write_buf, &message),
         }
         None
@@ -3479,15 +3553,86 @@ impl Runtime {
         &self,
         request: cluster::PeerRequest,
     ) -> cluster::PeerResponseBody {
+        let request_slot = request.slot;
+        let source_node_id = request.source_node_id.clone();
+        let target_node_id = request.target_node_id.clone();
         let (argv, catalog, table_primary_key, table_scan) = match request.body {
+            cluster::PeerRequestBody::CatalogInstall { table, catalog } => {
+                return match tables::install_cluster_table_catalog(
+                    &self.store,
+                    &self.schema_cache,
+                    &table,
+                    &catalog,
+                    Instant::now(),
+                ) {
+                    Ok(installed) => cluster::PeerResponseBody::Ok(
+                        serde_json::to_vec(&serde_json::json!({
+                            "table": table,
+                            "installed": installed,
+                        }))
+                        .unwrap_or_default(),
+                    ),
+                    Err(message) => cluster::PeerResponseBody::Error { message },
+                };
+            }
+            cluster::PeerRequestBody::TransferChunk {
+                transition_epoch,
+                transfer_id,
+                sequence,
+                catalogs,
+                items,
+            } => {
+                return self.apply_cluster_transfer_chunk(
+                    transition_epoch,
+                    &transfer_id,
+                    sequence,
+                    &source_node_id,
+                    &target_node_id,
+                    &catalogs,
+                    &items,
+                );
+            }
+            cluster::PeerRequestBody::TransferFinish {
+                transition_epoch,
+                receipt,
+            } => {
+                let node = self
+                    .cluster
+                    .as_ref()
+                    .expect("Cluster transfer requires a Cluster runtime");
+                if let Err(error) = node.transitions.validate_route(
+                    transition_epoch,
+                    &receipt.transfer_id,
+                    &source_node_id,
+                    &target_node_id,
+                ) {
+                    return cluster::PeerResponseBody::Error {
+                        message: error.to_string(),
+                    };
+                }
+                return match node.transitions.finish_inbound(&receipt) {
+                    Ok(receipt) => cluster::PeerResponseBody::TransferComplete { receipt },
+                    Err(error) => cluster::PeerResponseBody::Error {
+                        message: error.to_string(),
+                    },
+                };
+            }
             cluster::PeerRequestBody::Execute {
                 argv,
                 catalog,
                 table_primary_key,
                 ..
-            } => (argv, catalog, table_primary_key, false),
-            cluster::PeerRequestBody::TableScan { argv, catalog } => {
-                (argv, Some(catalog), None, true)
+            } => (argv, catalog, table_primary_key, None),
+            cluster::PeerRequestBody::TableScan {
+                argv,
+                catalog,
+                decrypt_authorized,
+            } => (argv, Some(catalog), None, Some(decrypt_authorized)),
+            cluster::PeerRequestBody::GlobalScan { argv } => {
+                return match self.execute_cluster_global_scan_shard(&argv, Instant::now()) {
+                    Ok(partial) => cluster::PeerResponseBody::GlobalScan(partial),
+                    Err(message) => cluster::PeerResponseBody::Error { message },
+                };
             }
             _ => {
                 return cluster::PeerResponseBody::Error {
@@ -3496,7 +3641,7 @@ impl Runtime {
             }
         };
         let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        if table_scan {
+        if let Some(decrypt_authorized) = table_scan {
             let Some(catalog) = catalog.as_deref() else {
                 return cluster::PeerResponseBody::Error {
                     message: "Cluster table scan did not include catalog context".to_string(),
@@ -3515,20 +3660,49 @@ impl Runtime {
             ) {
                 return cluster::PeerResponseBody::Error { message };
             }
+            let node = self
+                .cluster
+                .as_ref()
+                .expect("Cluster table scan requires a Cluster runtime");
+            let topology = node.topology.current();
             return match tables::execute_cluster_table_scan(
                 &self.store,
                 &self.schema_cache,
                 &refs,
                 Instant::now(),
+                decrypt_authorized,
+                &|table, primary_key| {
+                    topology.owns_slot(
+                        &node.local_node_id,
+                        cluster::slot_for_table_row(table.as_bytes(), primary_key.as_bytes()),
+                    )
+                },
             ) {
                 Ok(partial) => cluster::PeerResponseBody::TableScan(partial),
                 Err(message) => cluster::PeerResponseBody::Error { message },
             };
         }
 
+        match cluster::global_scan_spec(&refs) {
+            Ok(Some(_)) => {
+                return match self
+                    .execute_cluster_global_scan(&refs, Instant::now())
+                    .await
+                {
+                    Ok(response) => cluster::PeerResponseBody::Ok(response),
+                    Err(message) => cluster::PeerResponseBody::Error { message },
+                };
+            }
+            Ok(None) => {}
+            Err(message) => return cluster::PeerResponseBody::Error { message },
+        }
+
         match tables::cluster_table_scan_table(&refs) {
             Ok(Some(_)) => {
-                return match self.execute_cluster_table_scan(&refs, Instant::now()).await {
+                return match self
+                    .execute_cluster_table_scan(&refs, Instant::now(), true)
+                    .await
+                {
                     Ok(response) => cluster::PeerResponseBody::Ok(response),
                     Err(message) => cluster::PeerResponseBody::Error { message },
                 };
@@ -3557,6 +3731,18 @@ impl Runtime {
                 return cluster::PeerResponseBody::Error { message };
             }
         }
+        let _permit = if let Some(slot) = request_slot {
+            let node = self
+                .cluster
+                .as_ref()
+                .expect("Cluster peer requests require a Cluster runtime");
+            match node.transitions.enter_slot(slot) {
+                Ok(permit) => Some(permit),
+                Err(epoch) => return cluster::PeerResponseBody::Fenced { epoch },
+            }
+        } else {
+            None
+        };
         let mut session = CommandSession::new(false);
         let mut response = BytesMut::with_capacity(4096);
         let executor = CommandExecutor::new(
@@ -3578,10 +3764,163 @@ impl Runtime {
         cluster::PeerResponseBody::Ok(response.to_vec())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn apply_cluster_transfer_chunk(
+        &self,
+        transition_epoch: u64,
+        transfer_id: &str,
+        sequence: u64,
+        source_node_id: &str,
+        target_node_id: &str,
+        catalogs: &[cluster::TransferCatalogProof],
+        items: &[cluster::TransferItem],
+    ) -> cluster::PeerResponseBody {
+        let node = self
+            .cluster
+            .as_ref()
+            .expect("Cluster transfer requires a Cluster runtime");
+        let route = match node.transitions.validate_route(
+            transition_epoch,
+            transfer_id,
+            source_node_id,
+            target_node_id,
+        ) {
+            Ok(route) => route,
+            Err(error) => {
+                return cluster::PeerResponseBody::Error {
+                    message: error.to_string(),
+                }
+            }
+        };
+        if !catalogs
+            .windows(2)
+            .all(|pair| pair[0].table < pair[1].table)
+        {
+            return cluster::PeerResponseBody::Error {
+                message: "Cluster transfer catalogs are not canonical".to_string(),
+            };
+        }
+        let now = Instant::now();
+        let validated_catalogs = match tables::validate_cluster_transfer_catalogs(
+            &self.store,
+            &self.schema_cache,
+            catalogs,
+            now,
+        ) {
+            Ok(catalogs) => catalogs,
+            Err(message) => return cluster::PeerResponseBody::Error { message },
+        };
+        let in_route = |slot: u16| {
+            route
+                .moves
+                .iter()
+                .any(|movement| slot >= movement.start && slot <= movement.end)
+        };
+        let mut identities = std::collections::HashSet::new();
+        for item in items {
+            let (identity, slot) = match item {
+                cluster::TransferItem::Key { key, dump, .. } => {
+                    if key.starts_with(b"_t:") || dump.is_empty() {
+                        return cluster::PeerResponseBody::Error {
+                            message: "invalid Cluster transfer key item".to_string(),
+                        };
+                    }
+                    (key.clone(), cluster::slot_for_key(key))
+                }
+                cluster::TransferItem::TableRow {
+                    table,
+                    primary_key,
+                    raw_fields,
+                } => {
+                    if !validated_catalogs.contains(table) || raw_fields.is_empty() {
+                        return cluster::PeerResponseBody::Error {
+                            message: format!(
+                                "Cluster transfer row '{}' has no validated catalog or fields",
+                                table
+                            ),
+                        };
+                    }
+                    let mut identity = table.as_bytes().to_vec();
+                    identity.push(0);
+                    identity.extend_from_slice(primary_key.as_bytes());
+                    (
+                        identity,
+                        cluster::slot_for_table_row(table.as_bytes(), primary_key.as_bytes()),
+                    )
+                }
+            };
+            if !identities.insert(identity) {
+                return cluster::PeerResponseBody::Error {
+                    message: "Cluster transfer chunk contains a duplicate item".to_string(),
+                };
+            }
+            if !in_route(slot) {
+                return cluster::PeerResponseBody::Error {
+                    message: format!(
+                        "Cluster transfer item slot {slot} is outside its signed move"
+                    ),
+                };
+            }
+        }
+        let (digest, byte_count) = match cluster::transfer_payload_digest(catalogs, items) {
+            Ok(result) => result,
+            Err(error) => {
+                return cluster::PeerResponseBody::Error {
+                    message: error.to_string(),
+                }
+            }
+        };
+        let applied = node.transitions.apply_inbound_chunk(
+            transfer_id,
+            sequence,
+            &digest,
+            items.len() as u64,
+            byte_count,
+            || {
+                for item in items {
+                    match item {
+                        cluster::TransferItem::Key {
+                            key,
+                            dump,
+                            expires_unix_ms,
+                        } => self
+                            .store
+                            .import_cluster_dump_blob(key, dump, *expires_unix_ms)
+                            .map_err(cluster::ClusterError::Protocol)?,
+                        cluster::TransferItem::TableRow {
+                            table,
+                            primary_key,
+                            raw_fields,
+                        } => tables::import_cluster_transfer_row(
+                            &self.store,
+                            &self.schema_cache,
+                            table,
+                            primary_key,
+                            raw_fields,
+                            now,
+                        )
+                        .map_err(cluster::ClusterError::Protocol)?,
+                    }
+                }
+                Ok(())
+            },
+        );
+        match applied {
+            Ok((disposition, receipt)) => cluster::PeerResponseBody::TransferAck {
+                receipt,
+                replayed: disposition == cluster::ChunkDisposition::Replay,
+            },
+            Err(error) => cluster::PeerResponseBody::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
     async fn execute_cluster_table_scan(
         &self,
         args: &[&[u8]],
         now: Instant,
+        decrypt_authorized: bool,
     ) -> Result<Vec<u8>, String> {
         let node = self
             .cluster
@@ -3595,13 +3934,25 @@ impl Runtime {
         let catalog =
             tables::export_cluster_table_catalog(&self.store, &self.schema_cache, &table, now)?;
         let mut partials = node
-            .execute_table_scan_peers(args.iter().map(|arg| arg.to_vec()).collect(), catalog)
+            .execute_table_scan_peers(
+                args.iter().map(|arg| arg.to_vec()).collect(),
+                catalog,
+                decrypt_authorized,
+            )
             .await?;
+        let topology = node.topology.current();
         partials.push(tables::execute_cluster_table_scan(
             &self.store,
             &self.schema_cache,
             args,
             now,
+            decrypt_authorized,
+            &|table, primary_key| {
+                topology.owns_slot(
+                    &node.local_node_id,
+                    cluster::slot_for_table_row(table.as_bytes(), primary_key.as_bytes()),
+                )
+            },
         )?);
 
         let merged = tables::merge_cluster_table_scans(args, partials)?;
@@ -3625,6 +3976,216 @@ impl Runtime {
         Ok(response.to_vec())
     }
 
+    fn execute_cluster_global_scan_shard(
+        &self,
+        argv: &[Vec<u8>],
+        now: Instant,
+    ) -> Result<cluster::GlobalScanPartial, String> {
+        let node = self
+            .cluster
+            .as_ref()
+            .ok_or_else(|| "ERR Cluster is not enabled".to_string())?;
+        let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let spec = cluster::global_scan_spec(&refs)?
+            .ok_or_else(|| "ERR command is not a supported Cluster global scan".to_string())?;
+        let topology = node.topology.current();
+        let owns_raw_key = |key: &str| {
+            topology.owns_slot(&node.local_node_id, cluster::slot_for_key(key.as_bytes()))
+        };
+        let owns_table_row = |table: &str, primary_key: &str| {
+            topology.owns_slot(
+                &node.local_node_id,
+                cluster::slot_for_table_row(table.as_bytes(), primary_key.as_bytes()),
+            )
+        };
+        match spec {
+            cluster::GlobalScanSpec::Keys { pattern } => {
+                let mut keys = self
+                    .store
+                    .keys(&pattern, now)
+                    .into_iter()
+                    .filter(|key| !key.starts_with("_t:") && owns_raw_key(key))
+                    .collect::<Vec<_>>();
+                keys.sort();
+                keys.dedup();
+                Ok(cluster::GlobalScanPartial::Keys(keys))
+            }
+            cluster::GlobalScanSpec::VectorCardinality => Ok(cluster::GlobalScanPartial::Count(
+                self.store
+                    .cluster_vcard(&owns_raw_key, &owns_table_row, now) as u64,
+            )),
+            cluster::GlobalScanSpec::VectorSearch {
+                query,
+                k,
+                filter_key,
+                filter_value,
+                ..
+            } => Ok(cluster::GlobalScanPartial::Vectors(
+                self.store
+                    .cluster_vsearch(store::ClusterVectorSearch {
+                        query: &query,
+                        k,
+                        filter_key: filter_key.as_deref(),
+                        filter_value: filter_value.as_deref(),
+                        owns_raw_key: &owns_raw_key,
+                        owns_table_row: &owns_table_row,
+                        now,
+                    })
+                    .into_iter()
+                    .map(|(key, score, metadata)| cluster::VectorSearchHit {
+                        key,
+                        score: score.to_string(),
+                        metadata,
+                    })
+                    .collect(),
+            )),
+            cluster::GlobalScanSpec::TimeSeriesRange {
+                from,
+                to,
+                filters,
+                aggregation,
+            } => {
+                let aggregation = aggregation
+                    .as_ref()
+                    .map(|(function, bucket)| (function.as_str(), *bucket));
+                Ok(cluster::GlobalScanPartial::TimeSeries(
+                    self.store
+                        .tsmrange(from, to, &filters, aggregation, now)
+                        .into_iter()
+                        .filter(|(key, _, _)| owns_raw_key(key))
+                        .map(|(key, labels, samples)| cluster::TimeSeriesResult {
+                            key,
+                            labels,
+                            samples: samples
+                                .into_iter()
+                                .map(|(timestamp, value)| (timestamp, value.to_string()))
+                                .collect(),
+                        })
+                        .collect(),
+                ))
+            }
+        }
+    }
+
+    async fn execute_cluster_global_scan(
+        &self,
+        argv: &[&[u8]],
+        now: Instant,
+    ) -> Result<Vec<u8>, String> {
+        let node = self
+            .cluster
+            .as_ref()
+            .ok_or_else(|| "ERR Cluster is not enabled".to_string())?;
+        if node.topology.current().manifest().system_node_id != node.local_node_id {
+            return Err("ERR Cluster global scans must execute on the system node".to_string());
+        }
+        let spec = cluster::global_scan_spec(argv)?
+            .ok_or_else(|| "ERR command is not a supported Cluster global scan".to_string())?;
+        let owned = argv.iter().map(|arg| arg.to_vec()).collect::<Vec<_>>();
+        let mut partials = node.execute_global_scan_peers(owned.clone()).await?;
+        partials.push(self.execute_cluster_global_scan_shard(&owned, now)?);
+        let mut response = BytesMut::with_capacity(4096);
+        match spec {
+            cluster::GlobalScanSpec::Keys { .. } => {
+                let mut keys = Vec::new();
+                for partial in partials {
+                    let cluster::GlobalScanPartial::Keys(mut shard_keys) = partial else {
+                        return Err("ERR Cluster peer returned the wrong KEYS partial".to_string());
+                    };
+                    keys.append(&mut shard_keys);
+                }
+                keys.sort();
+                keys.dedup();
+                resp::write_bulk_array(&mut response, &keys);
+            }
+            cluster::GlobalScanSpec::VectorCardinality => {
+                let mut count = 0u64;
+                for partial in partials {
+                    let cluster::GlobalScanPartial::Count(shard_count) = partial else {
+                        return Err("ERR Cluster peer returned the wrong VCARD partial".to_string());
+                    };
+                    count = count
+                        .checked_add(shard_count)
+                        .ok_or_else(|| "ERR Cluster vector count overflow".to_string())?;
+                }
+                let count = i64::try_from(count)
+                    .map_err(|_| "ERR Cluster vector count overflow".to_string())?;
+                resp::write_integer(&mut response, count);
+            }
+            cluster::GlobalScanSpec::VectorSearch {
+                k, include_meta, ..
+            } => {
+                let mut hits = Vec::new();
+                for partial in partials {
+                    let cluster::GlobalScanPartial::Vectors(mut shard_hits) = partial else {
+                        return Err(
+                            "ERR Cluster peer returned the wrong VSEARCH partial".to_string()
+                        );
+                    };
+                    hits.append(&mut shard_hits);
+                }
+                hits.sort_by(|left, right| {
+                    let left_score = left.score.parse::<f32>().unwrap_or(f32::NEG_INFINITY);
+                    let right_score = right.score.parse::<f32>().unwrap_or(f32::NEG_INFINITY);
+                    right_score
+                        .partial_cmp(&left_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| left.key.cmp(&right.key))
+                });
+                let mut seen = std::collections::HashSet::new();
+                hits.retain(|hit| seen.insert(hit.key.clone()));
+                hits.truncate(k);
+                resp::write_array_header(&mut response, hits.len());
+                for hit in hits {
+                    resp::write_array_header(&mut response, if include_meta { 3 } else { 2 });
+                    resp::write_bulk(&mut response, &hit.key);
+                    resp::write_bulk(&mut response, &hit.score);
+                    if include_meta {
+                        match hit.metadata {
+                            Some(metadata) => resp::write_bulk(&mut response, &metadata),
+                            None => resp::write_null(&mut response),
+                        }
+                    }
+                }
+            }
+            cluster::GlobalScanSpec::TimeSeriesRange { .. } => {
+                let mut series = Vec::new();
+                for partial in partials {
+                    let cluster::GlobalScanPartial::TimeSeries(mut shard_series) = partial else {
+                        return Err(
+                            "ERR Cluster peer returned the wrong TSMRANGE partial".to_string()
+                        );
+                    };
+                    series.append(&mut shard_series);
+                }
+                series.sort_by(|left, right| left.key.cmp(&right.key));
+                if series.windows(2).any(|pair| pair[0].key == pair[1].key) {
+                    return Err(
+                        "TRYAGAIN Cluster TSMRANGE observed duplicate ownership".to_string()
+                    );
+                }
+                resp::write_array_header(&mut response, series.len());
+                for series in series {
+                    resp::write_array_header(&mut response, 3);
+                    resp::write_bulk(&mut response, &series.key);
+                    resp::write_array_header(&mut response, series.labels.len());
+                    for (key, value) in series.labels {
+                        resp::write_array_header(&mut response, 2);
+                        resp::write_bulk(&mut response, &key);
+                        resp::write_bulk(&mut response, &value);
+                    }
+                    resp::write_array_header(&mut response, series.samples.len());
+                    for (timestamp, value) in series.samples {
+                        resp::write_array_header(&mut response, 2);
+                        resp::write_integer(&mut response, timestamp);
+                        resp::write_bulk(&mut response, &value);
+                    }
+                }
+            }
+        }
+        Ok(response.to_vec())
+    }
+
     fn start_http_if_enabled(
         self: &Arc<Self>,
         background_tasks: &mut JoinSet<()>,
@@ -3636,6 +4197,11 @@ impl Runtime {
         let http_broker = self.broker.clone();
         let http_cache = self.schema_cache.clone();
         let http_script_engine = self.script_engine.clone();
+        let http_cluster = self.cluster.clone();
+        let http_routed_client = self
+            .cluster
+            .as_ref()
+            .map(|_| Arc::new(EmbeddedClient::new(self.clone())));
         let http_port = self.config.http_port;
         let bind_host = self.config.bind_host.clone();
         let max_rows = self.config.max_rows;
@@ -3661,6 +4227,8 @@ impl Runtime {
                 http_broker,
                 http_cache,
                 http_script_engine,
+                http_cluster,
+                http_routed_client,
             )
             .await
             {

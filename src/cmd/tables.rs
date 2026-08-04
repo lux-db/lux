@@ -284,6 +284,33 @@ pub fn cmd_trowset(
     CmdResult::Written
 }
 
+pub fn cmd_trowdel(
+    args: &[&[u8]],
+    store: &Store,
+    cache: &SharedSchemaCache,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    if !store
+        .wal_suppress
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        resp::write_error(out, "ERR TROWDEL is internal to WAL replay");
+        return CmdResult::Written;
+    }
+    if args.len() != 3 {
+        resp::write_error(out, "ERR usage: TROWDEL <table> <pk>");
+        return CmdResult::Written;
+    }
+    let table = arg_str(args[1]);
+    let pk = arg_str(args[2]);
+    match tables::table_apply_wal_row_delete(store, cache, table, pk, now) {
+        Ok(()) => resp::write_ok(out),
+        Err(error) => resp::write_error(out, &error),
+    }
+    CmdResult::Written
+}
+
 pub fn cmd_tupsert(
     args: &[&[u8]],
     store: &Store,

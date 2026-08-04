@@ -1,5 +1,15 @@
 use super::*;
 
+pub(crate) struct ClusterVectorSearch<'a> {
+    pub(crate) query: &'a [f32],
+    pub(crate) k: usize,
+    pub(crate) filter_key: Option<&'a str>,
+    pub(crate) filter_value: Option<&'a str>,
+    pub(crate) owns_raw_key: &'a (dyn Fn(&str) -> bool + Sync),
+    pub(crate) owns_table_row: &'a (dyn Fn(&str, &str) -> bool + Sync),
+    pub(crate) now: Instant,
+}
+
 impl Store {
     #[allow(clippy::too_many_arguments)]
     pub fn vset(
@@ -332,6 +342,102 @@ impl Store {
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(k);
         results
+    }
+
+    /// Exact ownership-filtered vector scan used by the Cluster shard phase.
+    /// ANN top-k cannot be filtered after the fact: stale transfer copies could
+    /// occupy the candidate budget and hide a valid owned result. Scanning the
+    /// local shard image makes the global merge correct during cutover too.
+    pub(crate) fn cluster_vsearch(
+        &self,
+        search: ClusterVectorSearch<'_>,
+    ) -> Vec<(String, f32, Option<String>)> {
+        let ClusterVectorSearch {
+            query,
+            k,
+            filter_key,
+            filter_value,
+            owns_raw_key,
+            owns_table_row,
+            now,
+        } = search;
+        let query_norm = vector_norm(query);
+        if query_norm == 0.0 {
+            return Vec::new();
+        }
+        let has_filter = filter_key.is_some() && filter_value.is_some();
+        let mut results = Vec::new();
+        for shard_lock in self.shards.iter() {
+            let shard = shard_lock.read();
+            for (key, entry) in &shard.data {
+                if entry.is_expired_at(now) {
+                    continue;
+                }
+                let StoreValue::Vector(vector) = &entry.value else {
+                    continue;
+                };
+                if vector.dims as usize != query.len() {
+                    continue;
+                }
+                let key = key_string(key);
+                let owned = parse_table_vector_key(&key)
+                    .map(|(table, _, primary_key)| owns_table_row(table, primary_key))
+                    .unwrap_or_else(|| owns_raw_key(&key));
+                if !owned {
+                    continue;
+                }
+                if has_filter {
+                    let Some(metadata) = &vector.metadata else {
+                        continue;
+                    };
+                    if !metadata_field_matches(metadata, filter_key.unwrap(), filter_value.unwrap())
+                    {
+                        continue;
+                    }
+                }
+                results.push((
+                    key,
+                    cosine_similarity(query, query_norm, &vector.data),
+                    vector.metadata.clone(),
+                ));
+            }
+        }
+        results.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        results.truncate(k);
+        results
+    }
+
+    pub(crate) fn cluster_vcard(
+        &self,
+        owns_raw_key: &(dyn Fn(&str) -> bool + Sync),
+        owns_table_row: &(dyn Fn(&str, &str) -> bool + Sync),
+        now: Instant,
+    ) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .read()
+                    .data
+                    .iter()
+                    .filter(|(_, entry)| {
+                        !entry.is_expired_at(now) && matches!(entry.value, StoreValue::Vector(_))
+                    })
+                    .filter(|(key, _)| {
+                        let key = key_string(key);
+                        parse_table_vector_key(&key)
+                            .map(|(table, _, primary_key)| owns_table_row(table, primary_key))
+                            .unwrap_or_else(|| owns_raw_key(&key))
+                    })
+                    .count()
+            })
+            .sum()
     }
 
     pub fn vcard(&self, _now: Instant) -> usize {

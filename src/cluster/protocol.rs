@@ -48,7 +48,94 @@ pub enum PeerRequestBody {
     TableScan {
         argv: Vec<Vec<u8>>,
         catalog: Vec<u8>,
+        /// Authorization is decided at the public ingress before the query is
+        /// broadcast. Missing metadata fails closed so an older or malformed
+        /// sender can never expose ENCRYPTED columns on a peer.
+        #[serde(default)]
+        decrypt_authorized: bool,
     },
+    /// Ownership-filtered shard phase for global read commands. Only the
+    /// signed system node may broadcast these requests; peers return typed
+    /// partials so RESP framing is never concatenated or trusted as data.
+    GlobalScan {
+        argv: Vec<Vec<u8>>,
+    },
+    /// Install authoritative table metadata from the signed system node before
+    /// any ownership transfer can stage rows on a newly admitted node.
+    CatalogInstall {
+        table: String,
+        catalog: Vec<u8>,
+    },
+    /// One ordered, idempotent ownership-transfer chunk. The receiver derives
+    /// every item's logical slot and verifies the signed pending move before
+    /// applying any data.
+    TransferChunk {
+        transition_epoch: u64,
+        transfer_id: String,
+        sequence: u64,
+        catalogs: Vec<TransferCatalogProof>,
+        items: Vec<TransferItem>,
+    },
+    TransferFinish {
+        transition_epoch: u64,
+        receipt: TransferReceipt,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VectorSearchHit {
+    pub key: String,
+    pub score: String,
+    pub metadata: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TimeSeriesResult {
+    pub key: String,
+    pub labels: Vec<(String, String)>,
+    /// Values stay in Lux's canonical textual representation so the wire type
+    /// remains deterministic and free of NaN equality ambiguities.
+    pub samples: Vec<(i64, String)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum GlobalScanPartial {
+    Keys(Vec<String>),
+    Count(u64),
+    Vectors(Vec<VectorSearchHit>),
+    TimeSeries(Vec<TimeSeriesResult>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TransferCatalogProof {
+    pub table: String,
+    pub catalog: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TransferItem {
+    Key {
+        key: Vec<u8>,
+        dump: Vec<u8>,
+        /// Absolute Unix-millisecond deadline. None means persistent. Keeping
+        /// this outside the snapshot blob prevents delayed transfer retries or
+        /// WAL replay from extending a relative TTL.
+        expires_unix_ms: Option<u64>,
+    },
+    TableRow {
+        table: String,
+        primary_key: String,
+        raw_fields: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TransferReceipt {
+    pub transfer_id: String,
+    pub chunk_count: u64,
+    pub rolling_digest: String,
+    pub total_items: u64,
+    pub total_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -69,11 +156,30 @@ pub enum TableScanPartial {
 pub enum PeerResponseBody {
     Ok(Vec<u8>),
     TableScan(TableScanPartial),
-    Moved { owner_node_id: String, epoch: u64 },
-    Fenced { epoch: u64 },
-    CatalogStale { required_version: u64 },
-    Error { message: String },
-    OutcomeUnknown { message: String },
+    GlobalScan(GlobalScanPartial),
+    Moved {
+        owner_node_id: String,
+        epoch: u64,
+    },
+    Fenced {
+        epoch: u64,
+    },
+    CatalogStale {
+        required_version: u64,
+    },
+    Error {
+        message: String,
+    },
+    OutcomeUnknown {
+        message: String,
+    },
+    TransferAck {
+        receipt: TransferReceipt,
+        replayed: bool,
+    },
+    TransferComplete {
+        receipt: TransferReceipt,
+    },
 }
 
 impl PeerRequest {
@@ -157,6 +263,7 @@ mod tests {
             body: PeerRequestBody::TableScan {
                 argv: vec![b"TCOUNT".to_vec(), b"orders".to_vec()],
                 catalog: vec![0, 1, 255],
+                decrypt_authorized: false,
             },
         };
         let request: PeerRequest =

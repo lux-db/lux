@@ -14,6 +14,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod local_cluster;
+use local_cluster::*;
+
 const DEFAULT_API_URL: &str = "https://api.luxdb.dev";
 
 #[derive(Parser)]
@@ -53,11 +56,23 @@ enum Commands {
             help = "Host address for local engine and Studio ports (default 127.0.0.1)"
         )]
         bind: Option<IpAddr>,
+        #[arg(
+            long,
+            value_name = "COUNT",
+            value_parser = clap::value_parser!(u16).range(1..=16),
+            help = "Run a local Cluster cluster with this many nodes (1-16)"
+        )]
+        nodes: Option<u16>,
     },
     /// Stop the local Lux engine.
     Stop {
         #[arg(long, help = "Also delete the local data volume (fresh DB next start)")]
         clear: bool,
+    },
+    /// Inspect or resize the local Cluster cluster.
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
     },
     /// Open Lux Studio (local web UI) against the running local engine.
     Studio {
@@ -234,6 +249,22 @@ enum Commands {
         #[arg(long, help = "Print to stdout instead of writing a file")]
         stdout: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ClusterAction {
+    /// Show local node health, slot ownership, and any active transition.
+    Status {
+        #[arg(short = 'o', long, help = "Output format (json)")]
+        output: Option<String>,
+    },
+    /// Safely redistribute the local project across COUNT nodes.
+    Resize {
+        #[arg(value_name = "COUNT", value_parser = clap::value_parser!(u16).range(1..=16))]
+        nodes: u16,
+    },
+    /// Move all data back to the system node and restore the single-node fast path.
+    Consolidate,
 }
 
 #[derive(Subcommand)]
@@ -691,6 +722,9 @@ struct LocalConfig {
     /// Pin the local engine to a specific version (e.g. "0.23.0") instead of
     /// tracking `:latest`. Maps to the `ghcr.io/lux-db/lux:<version>` image.
     engine_version: Option<String>,
+    /// Desired local runtime size. One preserves the ordinary standalone fast
+    /// path; values above one enable Cluster and are reconciled by `lux start`.
+    local_nodes: Option<u16>,
 }
 
 const ENV_PROFILE_DIR: &str = "lux/.env-profiles";
@@ -779,6 +813,10 @@ struct LocalState {
     studio_port: u16,
     #[serde(default)]
     studio_container: String,
+    #[serde(default)]
+    cluster: Option<LocalClusterState>,
+    #[serde(default)]
+    retired_cluster_volumes: Vec<String>,
 }
 
 fn local_state_path() -> PathBuf {
@@ -980,6 +1018,8 @@ fn ensure_local_state() -> LocalState {
         studio_port: DEFAULT_STUDIO_PORT,
         studio_container: format!("lux-{slug}-studio"),
         bind_host: default_bind_host(),
+        cluster: None,
+        retired_cluster_volumes: Vec::new(),
     };
     // secret_key == password: the operator credential and the SDK secret key are
     // the same value locally (see LocalState doc comment).
@@ -1471,6 +1511,21 @@ fn active_profile_label() -> String {
 
 fn local_status_value(state: &LocalState) -> serde_json::Value {
     let running = docker_container_state(&state.container).as_deref() == Some("running");
+    let cluster = state
+        .cluster
+        .as_ref()
+        .map(|cluster| {
+            serde_json::json!({
+                "enabled": true,
+                "cluster_id": cluster.cluster_id,
+                "epoch": cluster.epoch,
+                "nodes": cluster.nodes.len(),
+                "running_nodes": cluster.nodes.iter().filter(|node| {
+                    docker_container_state(&node.container).as_deref() == Some("running")
+                }).count(),
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!({ "enabled": false, "nodes": 1 }));
     serde_json::json!({
         "target": { "kind": "local", "name": "local" },
         "status": if running { "running" } else { "stopped" },
@@ -1482,6 +1537,7 @@ fn local_status_value(state: &LocalState) -> serde_json::Value {
         "data_volume": state.volume,
         "encryption": "enabled",
         "active_env_profile": active_profile_label(),
+        "cluster": cluster,
     })
 }
 
@@ -1508,6 +1564,22 @@ fn print_local_status(state: &LocalState, json_output: bool) {
     println!("{} {}", "App env:".bold(), active_profile_label());
     println!("{} {}", "Data volume:".bold(), state.volume);
     println!("{} {}", "Encryption:".bold(), "enabled".green());
+    if let Some(cluster) = &state.cluster {
+        let running_nodes = cluster
+            .nodes
+            .iter()
+            .filter(|node| docker_container_state(&node.container).as_deref() == Some("running"))
+            .count();
+        println!(
+            "{} {} nodes ({} running), epoch {}",
+            "Cluster:".bold(),
+            cluster.nodes.len(),
+            running_nodes,
+            cluster.epoch
+        );
+    } else {
+        println!("{} standalone fast path", "Cluster:".bold());
+    }
     if !running {
         println!("\nRun {} to boot it.", "lux start".cyan());
     }
@@ -1529,6 +1601,16 @@ fn print_connection_block(state: &LocalState) {
     );
     println!("  {}  {}", "Data volume      ".dimmed(), state.volume);
     println!("  {}  {}", "Encryption       ".dimmed(), "enabled".green());
+    if let Some(cluster) = &state.cluster {
+        println!(
+            "  {}  {} nodes · epoch {}",
+            "Cluster          ".dimmed(),
+            cluster.nodes.len(),
+            cluster.epoch
+        );
+    } else {
+        println!("  {}  standalone fast path", "Cluster          ".dimmed());
+    }
     println!();
     println!(
         "  Local credentials are stored in {}. Use {} to activate them.",
@@ -2221,6 +2303,7 @@ fn load_local_config() -> Option<LocalConfig> {
         local_http_port: port("local_http_port"),
         local_resp_port: port("local_resp_port"),
         engine_version: string("engine_version"),
+        local_nodes: port("local_nodes"),
     })
 }
 
@@ -2248,6 +2331,12 @@ fn save_local_config(config: &LocalConfig) {
         Some(port) => doc["local_resp_port"] = toml_edit::value(i64::from(port)),
         None => {
             doc.remove("local_resp_port");
+        }
+    }
+    match config.local_nodes {
+        Some(nodes) => doc["local_nodes"] = toml_edit::value(i64::from(nodes)),
+        None => {
+            doc.remove("local_nodes");
         }
     }
     match config
@@ -3183,8 +3272,23 @@ fn update_local_engine(check: bool) -> Result<(), String> {
         }
         return Ok(());
     }
-    let was_running = docker_container_state(&state.container).as_deref() == Some("running");
-    let existed = docker_container_state(&state.container).is_some();
+    let runtime_containers = state
+        .cluster
+        .as_ref()
+        .map(|cluster| {
+            cluster
+                .nodes
+                .iter()
+                .map(|node| node.container.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![state.container.clone()]);
+    let was_running = runtime_containers
+        .iter()
+        .any(|container| docker_container_state(container).as_deref() == Some("running"));
+    let existed = runtime_containers
+        .iter()
+        .any(|container| docker_container_state(container).is_some());
     let before = docker_container_digest(&state.container).ok();
     pull_image(&state.image)?;
     let after = docker_image_digest(&state.image)?;
@@ -3193,10 +3297,27 @@ fn update_local_engine(check: bool) -> Result<(), String> {
         return Ok(());
     }
     if existed {
-        docker_output(&["rm", "-f", &state.container])?;
+        for container in &runtime_containers {
+            if docker_container_state(container).is_some() {
+                docker_output(&["rm", "-f", container])?;
+            }
+        }
     }
     if was_running {
-        run_local_engine_container(&state)?;
+        if let Some(cluster) = &state.cluster {
+            ensure_local_cluster_network(cluster)?;
+            for node in &cluster.nodes {
+                run_local_cluster_node(&state, cluster, node)?;
+                if !wait_for_local_cluster_node_tcp(&state, node) {
+                    return Err(format!(
+                        "updated {} did not become ready; inspect `docker logs {}`",
+                        node.node_id, node.container
+                    ));
+                }
+            }
+        } else {
+            run_local_engine_container(&state)?;
+        }
         if !wait_for_local_ready(&state) {
             return Err(format!(
                 "updated engine did not become ready; inspect `docker logs {}`",
@@ -3398,6 +3519,7 @@ pub async fn run() {
                 "lux/.lux-local.json",
                 "lux/.env-profiles/",
                 "lux/.backups/",
+                "lux/.lux-cluster/",
             ]);
 
             println!("{}", "Initialized Lux project.".green());
@@ -3413,12 +3535,29 @@ pub async fn run() {
             resp_port: resp_port_flag,
             http_port: http_port_flag,
             bind,
+            nodes,
         } => {
             if let Err(e) = docker_preflight() {
                 eprintln!("{} {e}", "Error:".red());
                 std::process::exit(1);
             }
 
+            if let Some(nodes) = nodes {
+                validate_local_node_count(nodes).unwrap_or_else(|error| {
+                    eprintln!("{} {error}", "Error:".red());
+                    std::process::exit(1);
+                });
+                let mut config = load_local_config().unwrap_or_default();
+                config.local_nodes = Some(nodes);
+                save_local_config(&config);
+            }
+            let desired_nodes = load_local_config()
+                .and_then(|config| config.local_nodes)
+                .unwrap_or(1);
+            validate_local_node_count(desired_nodes).unwrap_or_else(|error| {
+                eprintln!("{} {error}", "Error:".red());
+                std::process::exit(1);
+            });
             let mut state = ensure_local_state();
             let bind_changed = bind.is_some_and(|host| host != state.bind_host);
             if let Some(bind_host) = bind.filter(|host| *host != state.bind_host) {
@@ -3437,13 +3576,45 @@ pub async fn run() {
                 "lux/.lux-local.json",
                 "lux/.env-profiles/",
                 "lux/.backups/",
+                "lux/.lux-cluster/",
             ]);
+
+            if fresh {
+                if let Some(cluster) = state.cluster.take() {
+                    for node in cluster.nodes.iter().chain(cluster.retired_nodes.iter()) {
+                        if docker_container_state(&node.container).is_some() {
+                            let _ = docker_output(&["rm", "-f", &node.container]);
+                        }
+                        if docker_volume_exists(&node.volume) {
+                            let _ = docker_output(&["volume", "rm", &node.volume]);
+                        }
+                    }
+                    let _ = docker_output(&["network", "rm", &cluster.network]);
+                }
+                for volume in state.retired_cluster_volumes.drain(..) {
+                    if docker_volume_exists(&volume) {
+                        let _ = docker_output(&["volume", "rm", &volume]);
+                    }
+                }
+                save_local_state(&state);
+            }
 
             // Already running? Just reprint the connection block.
             let engine_running =
                 docker_container_state(&state.container).as_deref() == Some("running");
             let bindings_match = engine_running && engine_bindings_match(&state);
             if engine_running && !fresh && bindings_match {
+                let reconcile = if desired_nodes == 1 && state.cluster.is_some() {
+                    consolidate_local_cluster(&mut state).await
+                } else if desired_nodes > 1 {
+                    resize_local_cluster(&mut state, desired_nodes).await
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = reconcile {
+                    eprintln!("{} {error}", "Cluster resize failed:".red());
+                    std::process::exit(1);
+                }
                 println!("{}", "Local Lux engine already running.".green());
                 refresh_local_profile(&state).unwrap_or_else(|e| {
                     eprintln!("{} {e}", "Failed to refresh local env profile:".red());
@@ -3537,8 +3708,31 @@ pub async fn run() {
             // Starting uses the locally installed image. Existing projects
             // update only through `lux update engine`; Docker pulls here only
             // when the image has never been installed.
-            if let Err(e) = run_local_engine_container(&state) {
+            let start_result = if desired_nodes > 1 {
+                if state.cluster.is_none() {
+                    initialize_local_cluster(&mut state).await
+                } else {
+                    start_persisted_local_cluster(&state).await
+                }
+            } else if state.cluster.is_some() {
+                start_persisted_local_cluster(&state).await
+            } else {
+                run_local_engine_container(&state)
+            };
+            if let Err(e) = start_result {
                 eprintln!("{} Failed to start container: {e}", "Error:".red());
+                std::process::exit(1);
+            }
+
+            let reconcile = if desired_nodes == 1 && state.cluster.is_some() {
+                consolidate_local_cluster(&mut state).await
+            } else if desired_nodes > 1 {
+                resize_local_cluster(&mut state, desired_nodes).await
+            } else {
+                Ok(())
+            };
+            if let Err(error) = reconcile {
+                eprintln!("{} {error}", "Cluster resize failed:".red());
                 std::process::exit(1);
             }
 
@@ -3631,9 +3825,27 @@ pub async fn run() {
                 );
                 std::process::exit(1);
             });
-            if docker_container_state(&state.container).is_some() {
-                let _ = docker_output(&["rm", "-f", &state.container]);
-                println!("{} Stopped local Lux engine.", "Done.".green());
+            let mut stopped = false;
+            let mut containers = vec![state.container.clone()];
+            if let Some(cluster) = &state.cluster {
+                containers.extend(
+                    cluster
+                        .nodes
+                        .iter()
+                        .chain(cluster.retired_nodes.iter())
+                        .map(|node| node.container.clone()),
+                );
+            }
+            containers.sort();
+            containers.dedup();
+            for container in containers {
+                if docker_container_state(&container).is_some() {
+                    let _ = docker_output(&["rm", "-f", &container]);
+                    stopped = true;
+                }
+            }
+            if stopped {
+                println!("{} Stopped local Lux engine runtime.", "Done.".green());
             } else {
                 println!("{}", "Local Lux engine is not running.".yellow());
             }
@@ -3644,9 +3856,171 @@ pub async fn run() {
                 let _ = docker_output(&["rm", "-f", &state.studio_container]);
                 println!("{} Stopped Lux Studio.", "Done.".green());
             }
-            if clear && docker_volume_exists(&state.volume) {
-                let _ = docker_output(&["volume", "rm", &state.volume]);
-                println!("{} Cleared data volume {}.", "Done.".green(), state.volume);
+            if clear {
+                let mut volumes = vec![state.volume.clone()];
+                volumes.extend(state.retired_cluster_volumes.iter().cloned());
+                if let Some(cluster) = &state.cluster {
+                    volumes.extend(
+                        cluster
+                            .nodes
+                            .iter()
+                            .chain(cluster.retired_nodes.iter())
+                            .map(|node| node.volume.clone()),
+                    );
+                    let _ = docker_output(&["network", "rm", &cluster.network]);
+                }
+                volumes.sort();
+                volumes.dedup();
+                for volume in volumes {
+                    if docker_volume_exists(&volume) {
+                        let _ = docker_output(&["volume", "rm", &volume]);
+                        println!("{} Cleared data volume {}.", "Done.".green(), volume);
+                    }
+                }
+            }
+        }
+
+        Commands::Cluster { action } => {
+            if let Err(error) = docker_preflight() {
+                eprintln!("{} {error}", "Error:".red());
+                std::process::exit(1);
+            }
+            let mut state = load_local_state().unwrap_or_else(|| {
+                eprintln!(
+                    "{} No local runtime exists. Start one with {}.",
+                    "Error:".red(),
+                    "lux start".cyan()
+                );
+                std::process::exit(1);
+            });
+            match action {
+                ClusterAction::Status { output } => {
+                    let json_output = output.as_deref() == Some("json");
+                    if output.is_some() && !json_output {
+                        eprintln!(
+                            "{} Supported cluster status output is `json`.",
+                            "Error:".red()
+                        );
+                        std::process::exit(1);
+                    }
+                    let Some(cluster) = &state.cluster else {
+                        if json_output {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "enabled": false,
+                                    "nodes": 1,
+                                    "status": if docker_container_state(&state.container).as_deref() == Some("running") { "running" } else { "stopped" }
+                                }))
+                                .unwrap()
+                            );
+                        } else {
+                            println!("{} standalone (1 node)", "Local cluster:".bold());
+                            println!(
+                                "{}",
+                                "Cluster is disabled; the direct single-node fast path is active."
+                                    .dimmed()
+                            );
+                        }
+                        return;
+                    };
+                    let mut statuses = Vec::new();
+                    for node in &cluster.nodes {
+                        let container = docker_container_state(&node.container)
+                            .unwrap_or_else(|| "missing".to_string());
+                        let engine = if container == "running" {
+                            local_cluster_status(&state, node).await.ok().map(|status| {
+                                serde_json::json!({
+                                    "local_node_id": status["local_node_id"],
+                                    "epoch": status["current"]["epoch"],
+                                    "pending_epoch": status["pending"]["epoch"],
+                                    "transition": status["transition"],
+                                    "transfer": status["transfer"],
+                                })
+                            })
+                        } else {
+                            None
+                        };
+                        statuses.push(serde_json::json!({
+                            "node_id": node.node_id,
+                            "container": node.container,
+                            "container_status": container,
+                            "management_url": local_cluster_node_url(&state, node),
+                            "engine": engine,
+                        }));
+                    }
+                    let value = serde_json::json!({
+                        "enabled": true,
+                        "cluster_id": cluster.cluster_id,
+                        "epoch": cluster.epoch,
+                        "assignments": load_local_topology(cluster).ok().map(|topology| topology.manifest.assignments),
+                        "pending_resize": cluster.pending_resize.as_ref().map(|resize| serde_json::json!({
+                            "desired_nodes": resize.desired_nodes,
+                            "direction": resize.direction,
+                        })),
+                        "nodes": statuses,
+                    });
+                    if json_output {
+                        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+                    } else {
+                        println!(
+                            "{} {} nodes · epoch {}",
+                            "Local cluster:".bold(),
+                            cluster.nodes.len(),
+                            cluster.epoch
+                        );
+                        for status in value["nodes"].as_array().unwrap() {
+                            let engine_epoch = status["engine"]["epoch"]
+                                .as_u64()
+                                .map(|epoch| format!("epoch {epoch}"))
+                                .unwrap_or_else(|| "engine unavailable".to_string());
+                            println!(
+                                "  {}  {:<8}  {}",
+                                status["node_id"].as_str().unwrap_or("unknown").bold(),
+                                status["container_status"].as_str().unwrap_or("unknown"),
+                                engine_epoch.dimmed()
+                            );
+                        }
+                    }
+                }
+                ClusterAction::Resize { nodes } => {
+                    if docker_container_state(&state.container).as_deref() != Some("running") {
+                        eprintln!(
+                            "{} Start the local runtime before resizing it.",
+                            "Error:".red()
+                        );
+                        std::process::exit(1);
+                    }
+                    let result = if nodes == 1 {
+                        consolidate_local_cluster(&mut state).await
+                    } else {
+                        resize_local_cluster(&mut state, nodes).await
+                    };
+                    if let Err(error) = result {
+                        eprintln!("{} {error}", "Cluster resize failed:".red());
+                        std::process::exit(1);
+                    }
+                    let mut config = load_local_config().unwrap_or_default();
+                    config.local_nodes = Some(nodes);
+                    save_local_config(&config);
+                    println!(
+                        "{} Local runtime now uses {nodes} node(s).",
+                        "Done.".green()
+                    );
+                }
+                ClusterAction::Consolidate => {
+                    if let Err(error) = consolidate_local_cluster(&mut state).await {
+                        eprintln!("{} {error}", "Cluster consolidation failed:".red());
+                        std::process::exit(1);
+                    }
+                    let mut config = load_local_config().unwrap_or_default();
+                    config.local_nodes = Some(1);
+                    save_local_config(&config);
+                    println!(
+                        "{} All data is on the standalone system node.",
+                        "Done.".green()
+                    );
+                }
             }
         }
 
@@ -3723,6 +4097,7 @@ pub async fn run() {
                 local_http_port: existing.local_http_port,
                 local_resp_port: existing.local_resp_port,
                 engine_version: existing.engine_version,
+                local_nodes: existing.local_nodes,
             });
             println!("{} Linked to project '{}'", "Done.".green(), inst.name);
             println!("{} {}", "ID:".bold(), inst.id);
@@ -6264,6 +6639,7 @@ async fn doctor_local(fix: bool, checks: &mut Vec<DoctorCheck>) {
         "lux/.lux-local.json",
         "lux/.env-profiles/",
         "lux/.backups/",
+        "lux/.lux-cluster/",
     ];
     let gitignore_path = Path::new(".gitignore");
     let existing = std::fs::read_to_string(gitignore_path).unwrap_or_default();
@@ -6343,6 +6719,112 @@ async fn doctor_local(fix: bool, checks: &mut Vec<DoctorCheck>) {
         },
         false,
     );
+
+    if let Some(cluster) = &state.cluster {
+        let artifacts = std::iter::once(cluster.controller_private_key_file.as_str())
+            .chain(std::iter::once(cluster.topology_file.as_str()))
+            .chain(cluster.nodes.iter().flat_map(|node| {
+                [
+                    node.certificate_file.as_str(),
+                    node.private_key_file.as_str(),
+                    node.config_file.as_str(),
+                ]
+            }))
+            .map(|file| local_cluster_dir().join(file))
+            .collect::<Vec<_>>();
+        let missing = artifacts
+            .iter()
+            .filter(|path| !path.is_file())
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        add_doctor_check(
+            checks,
+            "local",
+            "cluster identity",
+            if missing.is_empty() { "pass" } else { "fail" },
+            if missing.is_empty() {
+                format!(
+                    "signed cluster {} has {} node identities",
+                    cluster.cluster_id,
+                    cluster.nodes.len()
+                )
+            } else {
+                format!("missing cluster artifacts: {}", missing.join(", "))
+            },
+            false,
+        );
+
+        let mut unhealthy = Vec::new();
+        let mut transitioning = cluster
+            .pending_resize
+            .as_ref()
+            .map(|resize| {
+                vec![format!(
+                    "controller resize {} to {} nodes",
+                    resize.direction, resize.desired_nodes
+                )]
+            })
+            .unwrap_or_default();
+        for node in &cluster.nodes {
+            if docker_container_state(&node.container).as_deref() != Some("running") {
+                unhealthy.push(format!("{} container is not running", node.node_id));
+                continue;
+            }
+            match local_cluster_status(&state, node).await {
+                Ok(status) => {
+                    let node_cluster = status["current"]["cluster_id"].as_str();
+                    let epoch = status["current"]["epoch"].as_u64();
+                    if node_cluster != Some(cluster.cluster_id.as_str())
+                        || epoch != Some(cluster.epoch)
+                    {
+                        unhealthy.push(format!(
+                            "{} reports cluster {:?} epoch {:?}, expected {} epoch {}",
+                            node.node_id, node_cluster, epoch, cluster.cluster_id, cluster.epoch
+                        ));
+                    }
+                    if !status["pending"].is_null() || !status["transfer"].is_null() {
+                        transitioning.push(node.node_id.clone());
+                    }
+                }
+                Err(error) => unhealthy.push(error),
+            }
+        }
+        add_doctor_check(
+            checks,
+            "local",
+            "cluster convergence",
+            if unhealthy.is_empty() { "pass" } else { "fail" },
+            if unhealthy.is_empty() {
+                format!(
+                    "all {} nodes agree on committed epoch {}",
+                    cluster.nodes.len(),
+                    cluster.epoch
+                )
+            } else {
+                unhealthy.join("; ")
+            },
+            false,
+        );
+        add_doctor_check(
+            checks,
+            "local",
+            "cluster transition",
+            if transitioning.is_empty() {
+                "pass"
+            } else {
+                "warn"
+            },
+            if transitioning.is_empty() {
+                "no topology transition is pending".to_string()
+            } else {
+                format!(
+                    "transition state remains: {}; rerun the interrupted resize",
+                    transitioning.join(", ")
+                )
+            },
+            false,
+        );
+    }
 
     let mut profile_fixed = false;
     let profile_ok = load_profile_index().is_ok_and(|index| {
@@ -7255,6 +7737,63 @@ mod tests {
     }
 
     #[test]
+    fn local_cluster_commands_parse_and_bound_node_counts() {
+        let cli = Cli::try_parse_from(["lux", "start", "--nodes", "3"]).unwrap();
+        let Commands::Start { nodes, .. } = cli.command else {
+            panic!("expected start command");
+        };
+        assert_eq!(nodes, Some(3));
+
+        let cli = Cli::try_parse_from(["lux", "cluster", "resize", "4"]).unwrap();
+        let Commands::Cluster {
+            action: ClusterAction::Resize { nodes },
+        } = cli.command
+        else {
+            panic!("expected cluster resize command");
+        };
+        assert_eq!(nodes, 4);
+        assert!(Cli::try_parse_from(["lux", "start", "--nodes", "0"]).is_err());
+        assert!(Cli::try_parse_from(["lux", "cluster", "resize", "17"]).is_err());
+    }
+
+    #[test]
+    fn balanced_cluster_assignments_cover_every_slot_once() {
+        let nodes = (1..=3)
+            .map(|ordinal| LocalClusterNode {
+                node_id: format!("node-{ordinal}"),
+                container: format!("node-{ordinal}"),
+                volume: format!("volume-{ordinal}"),
+                http_port: 5900 + ordinal,
+                server_name: format!("node-{ordinal}.cluster.local"),
+                certificate_der: String::new(),
+                certificate_file: String::new(),
+                private_key_file: String::new(),
+                config_file: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let assignments = balanced_slot_assignments(&nodes);
+        assert_eq!(assignments.first().unwrap().start, 0);
+        assert_eq!(assignments.last().unwrap().end, CLUSTER_SLOT_COUNT - 1);
+        for pair in assignments.windows(2) {
+            assert_eq!(pair[0].end + 1, pair[1].start);
+        }
+        for slot in 0..CLUSTER_SLOT_COUNT {
+            assert_eq!(
+                assignments
+                    .iter()
+                    .filter(|assignment| slot >= assignment.start && slot <= assignment.end)
+                    .count(),
+                1
+            );
+        }
+        let two = balanced_slot_assignments(&nodes[..2]);
+        let targets = ownership_target_nodes(&two, &assignments);
+        assert!(targets.contains("node-2"));
+        assert!(targets.contains("node-3"));
+        assert!(!targets.contains("node-1"));
+    }
+
+    #[test]
     fn parses_tls_connection_urls() {
         let target = parse_connection_url("luxs://:secret@db.example.com:6380");
 
@@ -7479,6 +8018,8 @@ mod tests {
             bind_host: default_bind_host(),
             studio_port: DEFAULT_STUDIO_PORT,
             studio_container: "lux-sample-abc123-studio".to_string(),
+            cluster: None,
+            retired_cluster_volumes: Vec::new(),
         }
     }
 
