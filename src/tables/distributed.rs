@@ -160,16 +160,21 @@ pub(crate) fn install_cluster_table_catalog(
     {
         return Ok(false);
     }
-    if !current_schema.is_empty() {
-        return Err(format!(
-            "TRYAGAIN Cluster catalog reconciliation for table '{}' is not complete",
-            snapshot.table
-        ));
-    }
-
     store
         .wal_log_command(&[b"LXCATALOG", snapshot.table.as_bytes(), encoded])
         .map_err(|error| format!("ERR WAL append failed: {error}"))?;
+
+    if !current_schema.is_empty() {
+        reconcile_cluster_table_catalog(
+            store,
+            cache,
+            &snapshot,
+            &current_schema,
+            &current_paths,
+            now,
+        )?;
+        return Ok(true);
+    }
 
     let schema_refs = snapshot
         .schema
@@ -208,6 +213,123 @@ pub(crate) fn install_cluster_table_catalog(
     );
     cache.write().remove(&snapshot.table);
     Ok(true)
+}
+
+fn reconcile_cluster_table_catalog(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    snapshot: &ClusterTableCatalog,
+    current_schema: &[(String, Vec<u8>)],
+    current_paths: &[(String, Vec<u8>)],
+    now: Instant,
+) -> Result<(), String> {
+    let target_fields = snapshot
+        .schema
+        .iter()
+        .filter(|(name, _)| name.as_bytes() != HIDDEN_DEFAULT_TTL_FIELD)
+        .map(|(name, encoded)| {
+            let encoded = std::str::from_utf8(encoded)
+                .map_err(|_| format!("ERR Cluster field '{}' is not UTF-8", name))?;
+            Ok((
+                name.clone(),
+                (encoded.to_string(), decode_field_def(name, encoded)),
+            ))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+    let current_fields = current_schema
+        .iter()
+        .filter(|(name, _)| name.as_bytes() != HIDDEN_DEFAULT_TTL_FIELD)
+        .map(|(name, encoded)| {
+            let encoded = std::str::from_utf8(encoded)
+                .map_err(|_| format!("ERR local Cluster field '{}' is not UTF-8", name))?;
+            Ok((name.clone(), encoded.to_string()))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+
+    for (name, encoded) in &current_fields {
+        if let Some((target_encoded, _)) = target_fields.get(name) {
+            if encoded != target_encoded {
+                return Err(format!(
+                    "ERR Cluster cannot reconcile an in-place type or constraint change for '{}.{}'",
+                    snapshot.table, name
+                ));
+            }
+        }
+    }
+
+    let current_path_map = current_paths
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let target_path_map = snapshot
+        .path_indexes
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    // Rebuild every declared path index when a catalog changes. This is more
+    // work than a metadata-only comparison, but makes replay idempotent after a
+    // crash in the middle of an index backfill.
+    for path in current_path_map.keys() {
+        table_drop_path_index(store, cache, &snapshot.table, path, now)?;
+    }
+
+    for name in current_fields.keys() {
+        if !target_fields.contains_key(name) {
+            if name == &snapshot.primary_key {
+                return Err("ERR Cluster cannot remove a table primary key".to_string());
+            }
+            table_drop_column(store, cache, &snapshot.table, name, now)?;
+        }
+    }
+    for (name, (_, field)) in &target_fields {
+        if !current_fields.contains_key(name) {
+            table_add_column_def(store, cache, &snapshot.table, field.clone(), now)?;
+        }
+        if let Some(default) = &field.default_value {
+            for primary_key in get_all_row_ids(store, &snapshot.table, now) {
+                let row_key = row_key_for_pk(&snapshot.table, &primary_key);
+                if store
+                    .hget(row_key.as_bytes(), field.name.as_bytes(), now)
+                    .is_some()
+                {
+                    continue;
+                }
+                let encoded =
+                    encode_stored_value(store, &snapshot.table, field, &primary_key, default)?;
+                store.hset(
+                    row_key.as_bytes(),
+                    &[(field.name.as_bytes(), encoded.as_slice())],
+                    now,
+                )?;
+                add_to_index(store, &snapshot.table, field, default, &primary_key, now);
+            }
+        }
+    }
+
+    let schema_key = schema_key(&snapshot.table);
+    match snapshot
+        .schema
+        .iter()
+        .find(|(name, _)| name.as_bytes() == HIDDEN_DEFAULT_TTL_FIELD)
+    {
+        Some((_, value)) => {
+            store.hset(
+                schema_key.as_bytes(),
+                &[(HIDDEN_DEFAULT_TTL_FIELD, value.as_slice())],
+                now,
+            )?;
+        }
+        None => {
+            let _ = store.hdel(schema_key.as_bytes(), &[HIDDEN_DEFAULT_TTL_FIELD], now);
+        }
+    }
+    for (path, encoded_type) in &target_path_map {
+        let encoded_type = std::str::from_utf8(encoded_type)
+            .map_err(|_| format!("ERR Cluster path index '{}' is not UTF-8", path))?;
+        table_create_path_index(store, cache, &snapshot.table, path, encoded_type, now)?;
+    }
+    cache.write().remove(&snapshot.table);
+    Ok(())
 }
 
 fn validate_cluster_table_schema(table: &str, fields: &[FieldDef]) -> Result<(), String> {
@@ -255,45 +377,87 @@ pub(crate) struct PreparedClusterTableCommand {
     pub(crate) read_only: bool,
 }
 
-/// Resolve coordinator-owned values before routing an insert. In particular,
-/// UUID primary keys must be generated exactly once on the system node; letting
-/// a retrying slot owner generate identity would make outcomes unknowable.
+/// Prepare a mutation whose target can be proven from one primary key. Generated
+/// identity is resolved exactly once on the system node; broad predicates and
+/// secondary conflict targets fail closed instead of accidentally touching only
+/// one partition.
 pub(crate) fn prepare_cluster_table_command(
     store: &Store,
     cache: &SharedSchemaCache,
     argv: &[&[u8]],
     now: Instant,
 ) -> Result<Option<PreparedClusterTableCommand>, String> {
-    if !argv
-        .first()
-        .is_some_and(|command| command.eq_ignore_ascii_case(b"TINSERT"))
+    let Some(command) = argv.first() else {
+        return Ok(None);
+    };
+    let table_index = if command.eq_ignore_ascii_case(b"TDELETE") {
+        2
+    } else if command.eq_ignore_ascii_case(b"TINSERT")
+        || command.eq_ignore_ascii_case(b"TUPSERT")
+        || command.eq_ignore_ascii_case(b"TUPDATE")
     {
+        1
+    } else {
         return Ok(None);
-    }
-    if argv.len() < 2 {
+    };
+    let Some(raw_table) = argv.get(table_index) else {
         return Ok(None);
-    }
-    let table = std::str::from_utf8(argv[1])
+    };
+    let table = std::str::from_utf8(raw_table)
         .map_err(|_| "ERR table name is not valid UTF-8".to_string())?;
     if crate::auth::is_reserved_system_table(table) {
         return Ok(None);
     }
-    let fields_end = cluster_insert_fields_end(argv)?;
     let schema = load_schema(store, cache, table, now)?;
     validate_cluster_table_schema(table, &schema)?;
     let primary_key = schema
         .iter()
         .find(|field| field.primary_key)
         .expect("Cluster schema validation requires a primary key");
+    let mut owned = argv.iter().map(|value| value.to_vec()).collect::<Vec<_>>();
+    let primary_key_value = if command.eq_ignore_ascii_case(b"TINSERT") {
+        let fields_end = cluster_insert_fields_end(argv)?;
+        materialize_insert_primary_key(&mut owned, argv, fields_end, table, primary_key)?
+    } else if command.eq_ignore_ascii_case(b"TUPSERT") {
+        let (fields_end, conflict) = cluster_upsert_fields_end(argv)?;
+        if conflict.is_some_and(|conflict| conflict != primary_key.name.as_bytes()) {
+            return Err(format!(
+                "ERR Cluster upsert conflict target must be primary key '{}'",
+                primary_key.name
+            ));
+        }
+        materialize_insert_primary_key(&mut owned, argv, fields_end, table, primary_key)?
+    } else if command.eq_ignore_ascii_case(b"TUPDATE") {
+        exact_update_primary_key(argv, primary_key)?
+    } else {
+        exact_delete_primary_key(argv, primary_key)?
+    };
+    let primary_key_str = std::str::from_utf8(&primary_key_value)
+        .map_err(|_| "ERR Cluster primary key is not valid UTF-8".to_string())?;
+    validate_value(primary_key, primary_key_str)?;
+
+    Ok(Some(PreparedClusterTableCommand {
+        table: table.to_string(),
+        primary_key: primary_key_value,
+        argv: owned,
+        read_only: false,
+    }))
+}
+
+fn materialize_insert_primary_key(
+    owned: &mut Vec<Vec<u8>>,
+    argv: &[&[u8]],
+    fields_end: usize,
+    table: &str,
+    primary_key: &FieldDef,
+) -> Result<Vec<u8>, String> {
     let mut value = None;
     for pair in argv[2..fields_end].chunks_exact(2) {
         if pair[0] == primary_key.name.as_bytes() {
             value = Some(pair[1].to_vec());
         }
     }
-
-    let mut owned = argv.iter().map(|value| value.to_vec()).collect::<Vec<_>>();
-    let primary_key_value = match value {
+    Ok(match value {
         Some(value) => value,
         None if primary_key.field_type == FieldType::Uuid => {
             let value = generate_uuid_v7().into_bytes();
@@ -321,17 +485,100 @@ pub(crate) fn prepare_cluster_table_command(
                 primary_key.name
             ));
         }
-    };
-    let primary_key_str = std::str::from_utf8(&primary_key_value)
-        .map_err(|_| "ERR Cluster primary key is not valid UTF-8".to_string())?;
-    validate_value(primary_key, primary_key_str)?;
+    })
+}
 
-    Ok(Some(PreparedClusterTableCommand {
-        table: table.to_string(),
-        primary_key: primary_key_value,
-        argv: owned,
-        read_only: false,
-    }))
+fn exact_update_primary_key(argv: &[&[u8]], primary_key: &FieldDef) -> Result<Vec<u8>, String> {
+    let end = cluster_write_body_end(argv);
+    let where_pos = argv[..end]
+        .iter()
+        .position(|arg| arg.eq_ignore_ascii_case(b"WHERE"))
+        .ok_or_else(|| {
+            "ERR Cluster update requires an exact primary-key WHERE clause".to_string()
+        })?;
+    if argv
+        .get(2)
+        .is_none_or(|arg| !arg.eq_ignore_ascii_case(b"SET"))
+        || where_pos < 5
+        || !(where_pos - 3).is_multiple_of(2)
+        || end != where_pos + 4
+        || argv[where_pos + 1] != primary_key.name.as_bytes()
+        || argv[where_pos + 2] != b"="
+    {
+        return Err(format!(
+            "ERR Cluster update must use WHERE {} = <value>",
+            primary_key.name
+        ));
+    }
+    if argv[3..where_pos]
+        .chunks_exact(2)
+        .any(|pair| pair[0] == primary_key.name.as_bytes())
+    {
+        return Err("ERR Cluster cannot change a row primary key in place".to_string());
+    }
+    Ok(argv[where_pos + 3].to_vec())
+}
+
+fn exact_delete_primary_key(argv: &[&[u8]], primary_key: &FieldDef) -> Result<Vec<u8>, String> {
+    let end = cluster_returning_start(argv);
+    let where_pos = argv[..end]
+        .iter()
+        .position(|arg| arg.eq_ignore_ascii_case(b"WHERE"))
+        .ok_or_else(|| {
+            "ERR Cluster delete requires an exact primary-key WHERE clause".to_string()
+        })?;
+    if argv
+        .get(1)
+        .is_none_or(|arg| !arg.eq_ignore_ascii_case(b"FROM"))
+        || end != where_pos + 4
+        || argv[where_pos + 1] != primary_key.name.as_bytes()
+        || argv[where_pos + 2] != b"="
+    {
+        return Err(format!(
+            "ERR Cluster delete must use WHERE {} = <value>",
+            primary_key.name
+        ));
+    }
+    Ok(argv[where_pos + 3].to_vec())
+}
+
+fn cluster_upsert_fields_end<'a>(
+    argv: &'a [&'a [u8]],
+) -> Result<(usize, Option<&'a [u8]>), String> {
+    let end = cluster_write_body_end(argv);
+    let on = argv[..end].windows(2).position(|pair| {
+        pair[0].eq_ignore_ascii_case(b"ON") && pair[1].eq_ignore_ascii_case(b"CONFLICT")
+    });
+    let (fields_end, conflict) = match on {
+        Some(position) if position + 3 == end => (position, Some(argv[position + 2])),
+        Some(_) => return Err("ERR invalid ON CONFLICT clause".to_string()),
+        None => (end, None),
+    };
+    if fields_end < 2 || !(fields_end - 2).is_multiple_of(2) {
+        return Err("ERR wrong number of arguments for 'tupsert' command".to_string());
+    }
+    Ok((fields_end, conflict))
+}
+
+fn cluster_returning_start(argv: &[&[u8]]) -> usize {
+    argv.iter()
+        .position(|arg| arg.eq_ignore_ascii_case(b"RETURNING"))
+        .unwrap_or(argv.len())
+}
+
+fn cluster_write_body_end(argv: &[&[u8]]) -> usize {
+    let returning = cluster_returning_start(argv);
+    if returning >= 2
+        && argv[returning - 2].eq_ignore_ascii_case(b"TTL")
+        && std::str::from_utf8(argv[returning - 1])
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some()
+    {
+        returning - 2
+    } else {
+        returning
+    }
 }
 
 /// Independently derive a peer command's logical table-row route from the
@@ -344,8 +591,12 @@ pub(crate) fn validate_cluster_routed_table_command(
 ) -> Result<(String, bool), String> {
     let snapshot: ClusterTableCatalog = rmp_serde::from_slice(encoded_catalog)
         .map_err(|error| format!("ERR invalid Cluster table catalog: {error}"))?;
+    let command = argv
+        .first()
+        .ok_or_else(|| "ERR empty Cluster table command".to_string())?;
+    let table_index = usize::from(command.eq_ignore_ascii_case(b"TDELETE")) + 1;
     if snapshot.schema_version != CLUSTER_TABLE_CATALOG_SCHEMA_VERSION
-        || argv.get(1).copied() != Some(snapshot.table.as_bytes())
+        || argv.get(table_index).copied() != Some(snapshot.table.as_bytes())
         || crate::auth::is_reserved_system_table(&snapshot.table)
     {
         return Err("ERR Cluster table route does not match its catalog".to_string());
@@ -366,35 +617,46 @@ pub(crate) fn validate_cluster_routed_table_command(
     if pk_field.name != snapshot.primary_key {
         return Err("ERR Cluster primary key metadata does not match the catalog".to_string());
     }
-    let command = argv
-        .first()
-        .ok_or_else(|| "ERR empty Cluster table command".to_string())?;
-    let (actual_primary_key, read_only) =
-        if command.eq_ignore_ascii_case(b"TGET") || command.eq_ignore_ascii_case(b"TSET") {
-            (
-                argv.get(2)
-                    .copied()
-                    .ok_or_else(|| "ERR Cluster point command has no primary key".to_string())?,
-                command.eq_ignore_ascii_case(b"TGET"),
-            )
-        } else if command.eq_ignore_ascii_case(b"TINSERT") {
-            let fields_end = cluster_insert_fields_end(argv)?;
-            let mut value = None;
-            for pair in argv[2..fields_end].chunks_exact(2) {
-                if pair[0] == pk_field.name.as_bytes() {
-                    value = Some(pair[1]);
-                }
-            }
-            (
-                value.ok_or_else(|| {
-                    "ERR Cluster routed insert has no materialized primary key".to_string()
-                })?,
-                false,
-            )
+    let (actual_primary_key, read_only) = if command.eq_ignore_ascii_case(b"TGET")
+        || command.eq_ignore_ascii_case(b"TSET")
+    {
+        (
+            argv.get(2)
+                .copied()
+                .ok_or_else(|| "ERR Cluster point command has no primary key".to_string())?
+                .to_vec(),
+            command.eq_ignore_ascii_case(b"TGET"),
+        )
+    } else if command.eq_ignore_ascii_case(b"TINSERT") || command.eq_ignore_ascii_case(b"TUPSERT") {
+        let fields_end = if command.eq_ignore_ascii_case(b"TINSERT") {
+            cluster_insert_fields_end(argv)?
         } else {
-            return Err("ERR command is not a routed Cluster table operation".to_string());
+            let (fields_end, conflict) = cluster_upsert_fields_end(argv)?;
+            if conflict.is_some_and(|conflict| conflict != pk_field.name.as_bytes()) {
+                return Err("ERR Cluster upsert conflict target is not the primary key".to_string());
+            }
+            fields_end
         };
-    if actual_primary_key != claimed_primary_key {
+        let mut value = None;
+        for pair in argv[2..fields_end].chunks_exact(2) {
+            if pair[0] == pk_field.name.as_bytes() {
+                value = Some(pair[1].to_vec());
+            }
+        }
+        (
+            value.ok_or_else(|| {
+                "ERR Cluster routed insert has no materialized primary key".to_string()
+            })?,
+            false,
+        )
+    } else if command.eq_ignore_ascii_case(b"TUPDATE") {
+        (exact_update_primary_key(argv, &pk_field)?, false)
+    } else if command.eq_ignore_ascii_case(b"TDELETE") {
+        (exact_delete_primary_key(argv, &pk_field)?, false)
+    } else {
+        return Err("ERR command is not a routed Cluster table operation".to_string());
+    };
+    if actual_primary_key.as_slice() != claimed_primary_key {
         return Err("ERR Cluster routed primary key does not match argv".to_string());
     }
     Ok((snapshot.table, read_only))

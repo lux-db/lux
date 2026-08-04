@@ -3472,24 +3472,21 @@ impl Runtime {
             };
         };
         let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        if table_primary_key.is_some() {
-            let Some(table) = refs
-                .get(1)
-                .and_then(|table| std::str::from_utf8(table).ok())
-            else {
-                return cluster::PeerResponseBody::Error {
-                    message: "Cluster table command has no valid table name".to_string(),
-                };
-            };
+        if let Some(primary_key) = table_primary_key.as_deref() {
             let Some(catalog) = catalog.as_deref() else {
                 return cluster::PeerResponseBody::Error {
                     message: "Cluster table command did not include catalog context".to_string(),
                 };
             };
+            let table =
+                match tables::validate_cluster_routed_table_command(catalog, &refs, primary_key) {
+                    Ok((table, _)) => table,
+                    Err(message) => return cluster::PeerResponseBody::Error { message },
+                };
             if let Err(message) = tables::install_cluster_table_catalog(
                 &self.store,
                 &self.schema_cache,
-                table,
+                &table,
                 catalog,
                 Instant::now(),
             ) {

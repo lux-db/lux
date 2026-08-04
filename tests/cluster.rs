@@ -245,6 +245,33 @@ async fn embedded_clients_route_to_the_signed_owner_without_a_local_hop() {
             .unwrap(),
         EmbeddedValue::Bulk(bytes::Bytes::from_static(b"paid"))
     );
+    client_a
+        .execute_value(
+            "TALTER",
+            &[
+                "orders", "ADD", "priority", "INT", "DEFAULT", "7", "NOT", "NULL",
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client_a
+            .execute_value("TGET", &["orders", &order_id, "priority"])
+            .await
+            .unwrap(),
+        EmbeddedValue::Bulk(bytes::Bytes::from_static(b"7"))
+    );
+    client_a
+        .execute_value("TALTER", &["orders", "DROP", "priority"])
+        .await
+        .unwrap();
+    assert_eq!(
+        client_a
+            .execute_value("TGET", &["orders", &order_id, "priority"])
+            .await
+            .unwrap(),
+        EmbeddedValue::Nil
+    );
     let duplicate = client_a
         .execute_value(
             "TINSERT",
@@ -257,6 +284,61 @@ async fn embedded_clients_route_to_the_signed_owner_without_a_local_hop() {
             .to_string()
             .contains("unique constraint violation"),
         "{duplicate}"
+    );
+    assert_eq!(
+        client_a
+            .execute_value(
+                "TUPDATE",
+                &["orders", "SET", "state", "shipped", "WHERE", "id", "=", &order_id,],
+            )
+            .await
+            .unwrap(),
+        EmbeddedValue::Int(1)
+    );
+    client_a
+        .execute_value(
+            "TUPSERT",
+            &["orders", "id", &order_id, "state", "delivered"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client_a
+            .execute_value("TGET", &["orders", &order_id, "state"])
+            .await
+            .unwrap(),
+        EmbeddedValue::Bulk(bytes::Bytes::from_static(b"delivered"))
+    );
+    let broad_update = client_a
+        .execute_value(
+            "TUPDATE",
+            &[
+                "orders",
+                "SET",
+                "state",
+                "bad",
+                "WHERE",
+                "state",
+                "=",
+                "delivered",
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert!(broad_update.to_string().contains("must use WHERE id"));
+    client_a
+        .execute_value(
+            "TDELETE",
+            &["FROM", "orders", "WHERE", "id", "=", &order_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client_a
+            .execute_value("TGET", &["orders", &order_id])
+            .await
+            .unwrap(),
+        EmbeddedValue::Nil
     );
 
     drop(client_a);

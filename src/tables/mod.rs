@@ -3882,8 +3882,18 @@ pub fn table_add_column(
     field_spec: &str,
     now: Instant,
 ) -> Result<(), String> {
-    let schema = load_schema(store, cache, table, now)?;
     let new_field = parse_field_def(field_spec)?;
+    table_add_column_def(store, cache, table, new_field, now)
+}
+
+fn table_add_column_def(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    new_field: FieldDef,
+    now: Instant,
+) -> Result<(), String> {
+    let schema = load_schema(store, cache, table, now)?;
     ensure_encryption_ready(store, std::slice::from_ref(&new_field))?;
 
     if schema.iter().any(|f| f.name == new_field.name) {
@@ -4210,6 +4220,24 @@ mod tests {
             now,
         )
         .unwrap();
+        table_add_column(
+            &source,
+            &source_cache,
+            "orders",
+            "priority INT DEFAULT 7 NOT NULL",
+            now,
+        )
+        .unwrap();
+        let updated_catalog =
+            export_cluster_table_catalog(&source, &source_cache, "orders", now).unwrap();
+        assert!(install_cluster_table_catalog(
+            &target,
+            &target_cache,
+            "orders",
+            &updated_catalog,
+            now,
+        )
+        .unwrap());
         target.fsync_wal();
 
         let restored = Store::new_with_config(config);
@@ -4227,6 +4255,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(row.contains(&("state".to_string(), "paid".to_string())));
+        assert!(row.contains(&("priority".to_string(), "7".to_string())));
     }
 
     // -------------------------------------------------------------------------
