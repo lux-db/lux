@@ -41,6 +41,8 @@ pub(crate) const CAPABILITIES: &[&str] = &[
     "cluster.topology.v1",
     "cluster.transfer.v1",
     "cluster.backup.parts.v1",
+    "cluster.backup.barrier.v1",
+    "cluster.restore.staged.v1",
     "cluster.global-scans.v1",
     "cluster.http.tables.v1",
     "engine.auth.users",

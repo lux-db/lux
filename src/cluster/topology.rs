@@ -14,6 +14,12 @@ use std::sync::Arc;
 
 pub const CLUSTER_TOPOLOGY_SCHEMA_VERSION: u16 = 1;
 pub const CLUSTER_SLOT_COUNT: u16 = 4096;
+/// Redis clients hash keys across 16,384 discovery slots. Lux owns a smaller
+/// internal slot space and projects each owner range four times in
+/// `CLUSTER SLOTS`, preserving standard client routing without multiplying the
+/// controller's transition state.
+pub(crate) const CLUSTER_CLIENT_SLOT_COUNT: u16 = 16_384;
+pub const CLUSTER_MAX_NODES: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeDescriptor {
@@ -21,6 +27,12 @@ pub struct NodeDescriptor {
     /// DNS name or IP plus port. DNS is resolved for each new connection so a
     /// Kubernetes Service can move without changing the signed topology.
     pub peer_addr: String,
+    /// Public RESP endpoint used only by cluster-aware clients. Ordinary
+    /// clients keep using the project's stable endpoint and are forwarded by
+    /// the ingress node. Keeping this endpoint in the signed topology prevents
+    /// discovery from redirecting clients outside the controller-authorized
+    /// node set.
+    pub client_addr: String,
     pub server_name: String,
     /// Public DER certificate, base64url encoded. The signed manifest is the trust root.
     pub certificate_der: String,
@@ -147,6 +159,7 @@ fn canonical_manifest_bytes(manifest: &TopologyManifest) -> Result<Vec<u8>, Clus
     for node in &manifest.nodes {
         push_string(&mut bytes, &node.node_id)?;
         push_string(&mut bytes, &node.peer_addr)?;
+        push_string(&mut bytes, &node.client_addr)?;
         push_string(&mut bytes, &node.server_name)?;
         push_string(&mut bytes, &node.certificate_der)?;
         push_string(&mut bytes, &node.certificate_sha256)?;
@@ -589,12 +602,15 @@ fn validate_manifest(manifest: &TopologyManifest) -> Result<(), ClusterError> {
     if manifest.slot_count != CLUSTER_SLOT_COUNT {
         return invalid(format!("slot_count must be {CLUSTER_SLOT_COUNT}"));
     }
-    if manifest.nodes.is_empty() || manifest.nodes.len() > 8 {
-        return invalid("topology must contain 1 to 8 nodes");
+    if manifest.nodes.is_empty() || manifest.nodes.len() > CLUSTER_MAX_NODES {
+        return invalid(format!(
+            "topology must contain 1 to {CLUSTER_MAX_NODES} nodes"
+        ));
     }
 
     let mut node_ids = HashSet::new();
     let mut addresses = HashSet::new();
+    let mut client_addresses = HashSet::new();
     let mut certificate_fingerprints = HashSet::new();
     for node in &manifest.nodes {
         if node.node_id.trim().is_empty() || node.node_id.len() > 128 {
@@ -609,6 +625,15 @@ fn validate_manifest(manifest: &TopologyManifest) -> Result<(), ClusterError> {
         if peer_port(&node.peer_addr).is_none() {
             return invalid(format!(
                 "node {} peer_addr must be a DNS name or IP with a non-zero port",
+                node.node_id
+            ));
+        }
+        if !client_addresses.insert(node.client_addr.as_str()) {
+            return invalid(format!("duplicate client address {}", node.client_addr));
+        }
+        if endpoint_host_port(&node.client_addr).is_none() {
+            return invalid(format!(
+                "node {} client_addr must be a DNS name or IP with a non-zero port",
                 node.node_id
             ));
         }
@@ -701,15 +726,19 @@ pub(crate) fn decode_certificate(node: &NodeDescriptor) -> Result<Vec<u8>, Clust
 }
 
 pub(crate) fn peer_port(endpoint: &str) -> Option<u16> {
+    endpoint_host_port(endpoint).map(|(_, port)| port)
+}
+
+pub(crate) fn endpoint_host_port(endpoint: &str) -> Option<(String, u16)> {
     if let Ok(address) = endpoint.parse::<SocketAddr>() {
-        return (address.port() != 0).then_some(address.port());
+        return (address.port() != 0).then(|| (address.ip().to_string(), address.port()));
     }
     let (host, port) = endpoint.rsplit_once(':')?;
     if host.is_empty() || host.contains(char::is_whitespace) {
         return None;
     }
     let port = port.parse::<u16>().ok()?;
-    (port != 0).then_some(port)
+    (port != 0).then(|| (host.to_string(), port))
 }
 
 pub fn certificate_fingerprint(certificate_der: &[u8]) -> String {
@@ -724,7 +753,7 @@ pub fn certificate_fingerprint(certificate_der: &[u8]) -> String {
 
 #[inline]
 pub fn slot_for_key(key: &[u8]) -> u16 {
-    (fnv1a64(hash_tag(key)) % CLUSTER_SLOT_COUNT as u64) as u16
+    redis_crc16(hash_tag(key)) % CLUSTER_SLOT_COUNT
 }
 
 #[inline]
@@ -741,8 +770,19 @@ const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
 #[inline]
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    fnv1a64_continue(FNV_OFFSET, bytes)
+fn redis_crc16(bytes: &[u8]) -> u16 {
+    let mut crc = 0_u16;
+    for &byte in bytes {
+        crc ^= u16::from(byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
 }
 
 #[inline]
@@ -781,6 +821,7 @@ mod tests {
         NodeDescriptor {
             node_id: node_id.to_string(),
             peer_addr: format!("127.0.0.1:{port}"),
+            client_addr: format!("127.0.0.1:{}", port + 10_000),
             server_name: format!("{node_id}.cluster.local"),
             certificate_der: URL_SAFE_NO_PAD.encode(certificate),
             certificate_sha256: certificate_fingerprint(certificate),
@@ -822,6 +863,118 @@ mod tests {
             compiled.owner_for_slot(CLUSTER_SLOT_COUNT - 1).node_id,
             "node-1"
         );
+    }
+
+    #[test]
+    fn accepts_the_cloud_and_cli_maximum_of_sixteen_nodes() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let public_key = URL_SAFE_NO_PAD.encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let mut nodes = Vec::new();
+        let mut assignments = Vec::new();
+        for ordinal in 1..=CLUSTER_MAX_NODES {
+            let node_id = format!("node-{ordinal}");
+            let certificate = test_certificate(&format!("{node_id}.cluster.local"));
+            nodes.push(node(&node_id, 7000 + ordinal as u16, &certificate));
+            assignments.push(SlotAssignment {
+                start: ((ordinal - 1) * 256) as u16,
+                end: (ordinal * 256 - 1) as u16,
+                node_id,
+            });
+        }
+        let signed = SignedTopology::sign(
+            TopologyManifest {
+                schema_version: CLUSTER_TOPOLOGY_SCHEMA_VERSION,
+                protocol_version: CLUSTER_PROTOCOL_VERSION,
+                cluster_id: "cluster-sixteen".to_string(),
+                epoch: 1,
+                system_node_id: "node-1".to_string(),
+                slot_count: CLUSTER_SLOT_COUNT,
+                catalog_version: 1,
+                nodes,
+                assignments,
+            },
+            &signing_key,
+        )
+        .unwrap();
+        let compiled = signed.verify(&public_key).unwrap();
+        assert_eq!(compiled.manifest().nodes.len(), CLUSTER_MAX_NODES);
+        assert_eq!(
+            compiled.owner_for_slot(CLUSTER_SLOT_COUNT - 1).node_id,
+            "node-16"
+        );
+    }
+
+    #[test]
+    fn cloud_signature_vector_verifies_byte_for_byte() {
+        let manifest = TopologyManifest {
+            schema_version: 1,
+            protocol_version: 1,
+            cluster_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            epoch: 42,
+            system_node_id: "node-1".to_string(),
+            slot_count: 4096,
+            catalog_version: 1,
+            nodes: vec![
+                NodeDescriptor {
+                    node_id: "node-1".to_string(),
+                    peer_addr: "node-1.cluster.local:7001".to_string(),
+                    client_addr: "node-1.example.test:6380".to_string(),
+                    server_name: "node-1.cluster.local".to_string(),
+                    certificate_der: "AQIDBA".to_string(),
+                    certificate_sha256:
+                        "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a"
+                            .to_string(),
+                },
+                NodeDescriptor {
+                    node_id: "node-2".to_string(),
+                    peer_addr: "node-2.cluster.local:7001".to_string(),
+                    client_addr: "node-2.example.test:6380".to_string(),
+                    server_name: "node-2.cluster.local".to_string(),
+                    certificate_der: "BQYHCA".to_string(),
+                    certificate_sha256:
+                        "55e5509f8052998294266ee5b50cb592938191fb5d67f73cac2e60b0276b1bdd"
+                            .to_string(),
+                },
+            ],
+            assignments: vec![
+                SlotAssignment {
+                    start: 0,
+                    end: 2047,
+                    node_id: "node-1".to_string(),
+                },
+                SlotAssignment {
+                    start: 2048,
+                    end: 4095,
+                    node_id: "node-2".to_string(),
+                },
+            ],
+        };
+        let payload = manifest.signing_payload().unwrap();
+        assert_eq!(payload.len(), 467);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&payload)),
+            "f9d4d7924c120175f7bcf90fedb3db21fcc561e16f0173aec3d6c23fe03a2541"
+        );
+
+        let public_key = URL_SAFE_NO_PAD
+            .decode(
+                "BGsX0fLhLEJH-Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU",
+            )
+            .unwrap();
+        let signature = URL_SAFE_NO_PAD
+            .decode(
+                "X_20WCj2rsBD3_59V_W8rWRZIzDIzOoozpF4uLVen9wPT6uvp1hRmvVzG2Sl0E2eC_mZEfP7ujRrRL3pnsQlMQ",
+            )
+            .unwrap();
+        VerifyingKey::from_sec1_bytes(&public_key)
+            .unwrap()
+            .verify(&payload, &Signature::from_slice(&signature).unwrap())
+            .unwrap();
     }
 
     #[test]
@@ -902,6 +1055,11 @@ mod tests {
 
     #[test]
     fn hash_tags_co_locate_and_table_name_participates() {
+        // CRC16/XMODEM is the Redis Cluster reference algorithm. Lux uses its
+        // lower 12 bits internally, while discovery projects those owners over
+        // all 14 client-visible bits.
+        assert_eq!(redis_crc16(b"123456789"), 0x31c3);
+        assert_eq!(slot_for_key(b"123456789"), 451);
         assert_eq!(
             slot_for_key(b"cart:{user-1}"),
             slot_for_key(b"orders:{user-1}")

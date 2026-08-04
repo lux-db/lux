@@ -60,7 +60,7 @@ enum Commands {
             long,
             value_name = "COUNT",
             value_parser = clap::value_parser!(u16).range(1..=16),
-            help = "Run a local Cluster cluster with this many nodes (1-16)"
+            help = "Run a local cluster with this many nodes (1-16)"
         )]
         nodes: Option<u16>,
     },
@@ -69,7 +69,7 @@ enum Commands {
         #[arg(long, help = "Also delete the local data volume (fresh DB next start)")]
         clear: bool,
     },
-    /// Inspect or resize the local Cluster cluster.
+    /// Inspect or resize local cluster capacity.
     Cluster {
         #[command(subcommand)]
         action: ClusterAction,
@@ -690,6 +690,11 @@ fn local_engine_env(state: &LocalState) -> Vec<String> {
         "LUX_PORT=6379".to_string(),
         "LUX_HTTP_PORT=5890".to_string(),
         "LUX_BIND_HOST=0.0.0.0".to_string(),
+        format!(
+            "LUX_ADVERTISE_RESP_ADDR={}:{}",
+            state.connection_host(),
+            state.resp_port
+        ),
         "LUX_DATA_DIR=/data".to_string(),
         // Tiered (WAL) storage so local-dev data survives a crash/restart;
         // memory mode only persists on periodic snapshots.
@@ -991,6 +996,41 @@ fn ensure_local_state() -> LocalState {
         }
         if state.studio_port == 0 {
             state.studio_port = DEFAULT_STUDIO_PORT;
+            dirty = true;
+        }
+        if state
+            .cluster
+            .as_ref()
+            .is_some_and(|cluster| cluster.nodes.iter().any(|node| node.resp_port == 0))
+        {
+            let mut used = state
+                .cluster
+                .as_ref()
+                .into_iter()
+                .flat_map(|cluster| cluster.nodes.iter())
+                .filter_map(|node| (node.resp_port != 0).then_some(node.resp_port))
+                .collect::<HashSet<_>>();
+            let mut next = state.resp_port.saturating_add(10);
+            if let Some(cluster) = &mut state.cluster {
+                for node in &mut cluster.nodes {
+                    if node.resp_port != 0 {
+                        continue;
+                    }
+                    if node.node_id == "node-1" {
+                        node.resp_port = state.resp_port;
+                        used.insert(node.resp_port);
+                        continue;
+                    }
+                    while used.contains(&next)
+                        || !port_is_free(IpAddr::V4(Ipv4Addr::LOCALHOST), next)
+                    {
+                        next = next.saturating_add(1);
+                    }
+                    node.resp_port = next;
+                    used.insert(next);
+                    next = next.saturating_add(1);
+                }
+            }
             dirty = true;
         }
         if dirty {
@@ -2173,6 +2213,15 @@ struct Instance {
     engine_update_phase: Option<String>,
     #[serde(default)]
     engine_update_error: Option<String>,
+    #[serde(default)]
+    cluster: Option<InstanceCluster>,
+}
+
+#[derive(Deserialize, Debug)]
+struct InstanceCluster {
+    phase: String,
+    nodes: u16,
+    desired_nodes: u16,
 }
 
 #[derive(Deserialize)]
@@ -6539,6 +6588,17 @@ struct EngineManagementVersion {
     capabilities: Vec<String>,
 }
 
+const CLUSTER_MANAGEMENT_CAPABILITIES: &[&str] = &[
+    "engine.cluster",
+    "cluster.topology.v1",
+    "cluster.transfer.v1",
+    "cluster.backup.parts.v1",
+    "cluster.backup.barrier.v1",
+    "cluster.restore.staged.v1",
+    "cluster.global-scans.v1",
+    "cluster.http.tables.v1",
+];
+
 #[derive(Serialize)]
 struct DoctorCheck {
     target: String,
@@ -6859,7 +6919,7 @@ async fn doctor_local(fix: bool, checks: &mut Vec<DoctorCheck>) {
         }
     };
     let mut target = MigrateTarget::Direct(Box::new(conn));
-    doctor_engine_contract("local", &mut target, checks).await;
+    doctor_engine_contract("local", &mut target, checks, state.cluster.is_some()).await;
     doctor_migrations("local", &mut target, Path::new("lux/migrations"), checks).await;
 }
 
@@ -6911,7 +6971,10 @@ async fn doctor_cloud(
     let engine_contract = try_get_instance_credentials(&client, &api_url, &token, &instance.id)
         .await
         .and_then(|credentials| direct_engine_contract(&credentials.resp));
-    record_engine_contract_check(&target_name, engine_contract, checks);
+    let cluster_required = instance.cluster.as_ref().is_some_and(|cluster| {
+        cluster.nodes > 1 || cluster.desired_nodes > 1 || cluster.phase != "standalone"
+    });
+    record_engine_contract_check(&target_name, engine_contract, checks, cluster_required);
 
     // Migration operations keep using Cloud's dedicated management endpoints.
     let mut target = MigrateTarget::Cloud {
@@ -6933,12 +6996,13 @@ async fn doctor_engine_contract(
     target_name: &str,
     target: &mut MigrateTarget,
     checks: &mut Vec<DoctorCheck>,
+    cluster_required: bool,
 ) {
     let version = target
         .exec("LUX VERSION")
         .await
         .and_then(|raw| decode_json::<EngineManagementVersion>(&raw, "engine version"));
-    record_engine_contract_check(target_name, version, checks);
+    record_engine_contract_check(target_name, version, checks, cluster_required);
 }
 
 fn direct_engine_contract(url: &str) -> Result<EngineManagementVersion, String> {
@@ -6952,10 +7016,14 @@ fn record_engine_contract_check(
     target_name: &str,
     version: Result<EngineManagementVersion, String>,
     checks: &mut Vec<DoctorCheck>,
+    cluster_required: bool,
 ) {
     match version {
         Ok(version) => {
-            let required = ["migrations.plan", "migrations.apply", "migrations.repair"];
+            let mut required = vec!["migrations.plan", "migrations.apply", "migrations.repair"];
+            if cluster_required {
+                required.extend_from_slice(CLUSTER_MANAGEMENT_CAPABILITIES);
+            }
             let missing: Vec<&str> = required
                 .iter()
                 .filter(|capability| {
@@ -6973,8 +7041,10 @@ fn record_engine_contract_check(
                 if missing.is_empty() { "pass" } else { "fail" },
                 if missing.is_empty() {
                     format!(
-                        "engine {} (management API {}) supports managed migrations",
-                        version.version, version.api_version
+                        "engine {} (management API {}) supports managed migrations{}",
+                        version.version,
+                        version.api_version,
+                        if cluster_required { " and cluster operations" } else { "" }
                     )
                 } else {
                     format!("engine is missing capabilities: {}", missing.join(", "))
@@ -7763,6 +7833,7 @@ mod tests {
                 node_id: format!("node-{ordinal}"),
                 container: format!("node-{ordinal}"),
                 volume: format!("volume-{ordinal}"),
+                resp_port: 6400 + ordinal,
                 http_port: 5900 + ordinal,
                 server_name: format!("node-{ordinal}.cluster.local"),
                 certificate_der: String::new(),
@@ -8411,7 +8482,7 @@ mod tests {
         server.join().unwrap();
 
         let mut checks = Vec::new();
-        record_engine_contract_check("cloud:test", Ok(version), &mut checks);
+        record_engine_contract_check("cloud:test", Ok(version), &mut checks, false);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].target, "cloud:test");
         assert_eq!(checks[0].check, "engine management API");
@@ -8430,11 +8501,32 @@ mod tests {
                 capabilities: vec!["migrations.plan".to_string()],
             }),
             &mut checks,
+            false,
         );
 
         assert_eq!(checks[0].status, "fail");
         assert!(checks[0].detail.contains("migrations.apply"));
         assert!(checks[0].detail.contains("migrations.repair"));
+    }
+
+    #[test]
+    fn doctor_requires_the_complete_cluster_contract_only_for_clustered_projects() {
+        let version = EngineManagementVersion {
+            version: "0.37.0".to_string(),
+            api_version: "1".to_string(),
+            capabilities: vec![
+                "migrations.plan".to_string(),
+                "migrations.apply".to_string(),
+                "migrations.repair".to_string(),
+                "engine.cluster".to_string(),
+            ],
+        };
+        let mut checks = Vec::new();
+        record_engine_contract_check("cloud:test", Ok(version), &mut checks, true);
+
+        assert_eq!(checks[0].status, "fail");
+        assert!(checks[0].detail.contains("cluster.topology.v1"));
+        assert!(checks[0].detail.contains("cluster.restore.staged.v1"));
     }
 
     #[test]

@@ -37,7 +37,10 @@ const INVENTORY: &[CommandInventory] = &[
     supported("BZPOPMIN"),
     supported("BZMPOP"),
     partial("CLIENT", "compatibility gap"),
-    excluded("CLUSTER", "cluster mode is out of scope"),
+    partial(
+        "CLUSTER",
+        "CLUSTER SLOTS exposes direct owner discovery; other subcommands are unsupported",
+    ),
     partial("COMMAND", "compatibility gap"),
     partial("CONFIG", "compatibility gap"),
     supported("COPY"),

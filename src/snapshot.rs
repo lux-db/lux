@@ -1,7 +1,9 @@
 use crate::store::{DumpValue, Store};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, BufRead, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -139,6 +141,36 @@ fn save_entries(store: &Store, entries: &[crate::store::DumpEntry]) -> io::Resul
     Ok(entries.len())
 }
 
+pub(crate) fn snapshot_cluster_part_from_locked_shards(
+    store: &Store,
+    shards: &[parking_lot::RwLockWriteGuard<'_, crate::store::Shard>],
+    backup_id: &str,
+) -> io::Result<PathBuf> {
+    let now = Instant::now();
+    let entries = store.dump_all_from_locked_shards(shards, now);
+    save_entries(store, &entries)?;
+    store.truncate_wal();
+
+    let live = PathBuf::from(snapshot_path(store));
+    let part = PathBuf::from(format!("{}.cluster-backup-{backup_id}", live.display()));
+    match fs::remove_file(&part) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::hard_link(&live, &part)?;
+    sync_parent(&part)?;
+    Ok(part)
+}
+
+pub(crate) fn remove_cluster_backup_part(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_parent(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn save_and_truncate_wal_consistent(store: &Store) -> io::Result<usize> {
     store.with_write_barrier(|shards| {
         let now = Instant::now();
@@ -166,16 +198,7 @@ pub fn snapshot_for_backup(store: &Store) -> io::Result<String> {
 /// the process so the standard startup load reconstructs state from the dump.
 /// Used by `POST /v1/restore`.
 pub fn restore_to_disk(store: &Store, dump: &[u8]) -> io::Result<()> {
-    let header_ok = dump.len() >= 4
-        && [HEADER, HEADER_V2, HEADER_V1]
-            .iter()
-            .any(|h| &dump[..4] == *h);
-    if !header_ok {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "restore payload is not a lux snapshot",
-        ));
-    }
+    validate_restore_payload(dump)?;
 
     let path = snapshot_path(store);
     if let Some(parent) = Path::new(&path).parent() {
@@ -197,6 +220,355 @@ pub fn restore_to_disk(store: &Store, dump: &[u8]) -> io::Result<()> {
     // overlaps data_dir must never take lux.dat down with it.
     let storage_dir = store.config().storage.dir.clone();
     purge_lux_storage_shards(Path::new(&storage_dir))?;
+    Ok(())
+}
+
+/// Durably stage one topology-bound restore part without changing live data.
+/// The restore id is the Cloud operation UUID, making retries idempotent across
+/// process restarts and control-plane lease handoffs.
+pub(crate) fn stage_cluster_restore(
+    store: &Store,
+    restore_id: &str,
+    dump: &[u8],
+) -> io::Result<bool> {
+    validate_restore_id(restore_id)?;
+    validate_restore_payload(dump)?;
+    let paths = cluster_restore_paths(store, restore_id);
+    let digest = restore_digest(dump);
+    if paths.committed.exists() {
+        if read_restore_receipt(&paths.committed)? != digest {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "restore id is already committed with different contents",
+            ));
+        }
+        return Ok(false);
+    }
+    let intent_exists = validate_restore_intent(&paths.intent, dump.len() as u64, &digest)?;
+    if let Some(parent) = paths.staged.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let intent = format!("{}\n{}\n", dump.len(), digest);
+    let already_staged = paths.staged.exists();
+    if already_staged {
+        verify_restore_file(&paths.staged, dump.len() as u64, &digest)?;
+    } else {
+        write_create_atomic(&paths.staged, dump)?;
+    }
+    if !intent_exists {
+        write_create_atomic(&paths.intent, intent.as_bytes())?;
+    }
+    sync_parent(&paths.staged)?;
+    Ok(!already_staged)
+}
+
+/// Create a same-filesystem upload file for the HTTP streaming path. The caller
+/// must either pass it to [`stage_cluster_restore_file`] or remove it.
+pub(crate) fn create_cluster_restore_upload(
+    store: &Store,
+    restore_id: &str,
+) -> io::Result<(PathBuf, fs::File)> {
+    validate_restore_id(restore_id)?;
+    let paths = cluster_restore_paths(store, restore_id);
+    if let Some(parent) = paths.staged.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    for _ in 0..16 {
+        let nonce = RESTORE_UPLOAD_NONCE.fetch_add(1, Ordering::Relaxed);
+        let path = paths
+            .staged
+            .with_extension(format!("upload-{}-{nonce}", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique restore upload file",
+    ))
+}
+
+/// Atomically adopt a fully streamed and fsynced restore part. Size and digest
+/// are independently verified before it can become the durable staged file.
+pub(crate) fn stage_cluster_restore_file(
+    store: &Store,
+    restore_id: &str,
+    upload_path: &Path,
+    size: u64,
+    digest: &str,
+) -> io::Result<bool> {
+    validate_restore_id(restore_id)?;
+    validate_restore_digest(digest)?;
+    validate_restore_file_header(upload_path)?;
+    verify_restore_file(upload_path, size, digest)?;
+    let paths = cluster_restore_paths(store, restore_id);
+    if paths.committed.exists() {
+        if read_restore_receipt(&paths.committed)? != digest {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "restore id is already committed with different contents",
+            ));
+        }
+        return Ok(false);
+    }
+    let intent_exists = validate_restore_intent(&paths.intent, size, digest)?;
+    let already_staged = paths.staged.exists();
+    if already_staged {
+        verify_restore_file(&paths.staged, size, digest)?;
+    } else {
+        fs::rename(upload_path, &paths.staged)?;
+        sync_parent(&paths.staged)?;
+    }
+    if !intent_exists {
+        write_create_atomic(&paths.intent, format!("{size}\n{digest}\n").as_bytes())?;
+    }
+    sync_parent(&paths.staged)?;
+    Ok(!already_staged)
+}
+
+/// Atomically install a previously staged part, then purge only Lux-owned WAL
+/// and cold-data shards. A durable receipt closes the rename/receipt crash
+/// window, so a retry can prove the same restore already committed.
+pub(crate) fn commit_cluster_restore(store: &Store, restore_id: &str) -> io::Result<bool> {
+    validate_restore_id(restore_id)?;
+    let paths = cluster_restore_paths(store, restore_id);
+    if paths.committed.exists() {
+        return Ok(false);
+    }
+    let (size, digest) = read_restore_intent(&paths.intent)?;
+    let snapshot = PathBuf::from(snapshot_path(store));
+    if paths.staged.exists() {
+        verify_restore_file(&paths.staged, size, &digest)?;
+        fs::rename(&paths.staged, &snapshot)?;
+        sync_parent(&snapshot)?;
+    } else {
+        // Recovery after a crash between the atomic snapshot rename and receipt.
+        verify_restore_file(&snapshot, size, &digest)?;
+    }
+    purge_lux_storage_shards(Path::new(&store.config().storage.dir))?;
+    write_create_atomic(&paths.committed, digest.as_bytes())?;
+    let _ = fs::remove_file(&paths.intent);
+    sync_parent(&snapshot)?;
+    Ok(true)
+}
+
+/// Remove an uncommitted staged part. Never removes a committed receipt or the
+/// live snapshot, so an abort cannot roll back a node that already committed.
+pub(crate) fn abort_cluster_restore(store: &Store, restore_id: &str) -> io::Result<bool> {
+    validate_restore_id(restore_id)?;
+    let paths = cluster_restore_paths(store, restore_id);
+    if paths.committed.exists() {
+        return Ok(false);
+    }
+    let mut removed = false;
+    for path in [&paths.staged, &paths.intent] {
+        match fs::remove_file(path) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if removed {
+        sync_parent(&paths.staged)?;
+    }
+    Ok(removed)
+}
+
+struct ClusterRestorePaths {
+    staged: PathBuf,
+    intent: PathBuf,
+    committed: PathBuf,
+}
+
+static RESTORE_UPLOAD_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn cluster_restore_paths(store: &Store, restore_id: &str) -> ClusterRestorePaths {
+    let snapshot = snapshot_path(store);
+    ClusterRestorePaths {
+        staged: PathBuf::from(format!("{snapshot}.cluster-restore-{restore_id}.staged")),
+        intent: PathBuf::from(format!("{snapshot}.cluster-restore-{restore_id}.intent")),
+        committed: PathBuf::from(format!("{snapshot}.cluster-restore-{restore_id}.committed")),
+    }
+}
+
+fn validate_restore_payload(dump: &[u8]) -> io::Result<()> {
+    let header_ok = dump.len() >= 4
+        && [HEADER, HEADER_V2, HEADER_V1]
+            .iter()
+            .any(|header| &dump[..4] == *header);
+    if header_ok {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "restore payload is not a lux snapshot",
+        ))
+    }
+}
+
+fn validate_restore_file_header(path: &Path) -> io::Result<()> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; 4];
+    file.read_exact(&mut header)?;
+    validate_restore_payload(&header)
+}
+
+fn validate_restore_id(restore_id: &str) -> io::Result<()> {
+    let bytes = restore_id.as_bytes();
+    let valid = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "restore id must be a UUID",
+        ))
+    }
+}
+
+fn restore_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn verify_restore_file(path: &Path, size: u64, digest: &str) -> io::Result<()> {
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() != size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staged restore size does not match its intent",
+        ));
+    }
+    let mut reader = io::BufReader::new(file);
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    let actual: String = hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if actual == digest {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staged restore digest does not match its intent",
+        ))
+    }
+}
+
+fn read_restore_intent(path: &Path) -> io::Result<(u64, String)> {
+    let value = fs::read_to_string(path)?;
+    let mut lines = value.lines();
+    let size = lines
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "restore intent is invalid"))?;
+    let digest = lines.next().unwrap_or_default().to_string();
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "restore intent digest is invalid",
+        ));
+    }
+    Ok((size, digest))
+}
+
+fn validate_restore_intent(path: &Path, size: u64, digest: &str) -> io::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let (existing_size, existing_digest) = read_restore_intent(path)?;
+    if existing_size != size || existing_digest != digest {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "restore id is already staged with different contents",
+        ));
+    }
+    Ok(true)
+}
+
+fn validate_restore_digest(digest: &str) -> io::Result<()> {
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "restore digest is invalid",
+    ))
+}
+
+fn read_restore_receipt(path: &Path) -> io::Result<String> {
+    let digest = fs::read_to_string(path)?.trim().to_string();
+    validate_restore_digest(&digest).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "restore receipt digest is invalid",
+        )
+    })?;
+    Ok(digest)
+}
+
+fn write_create_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    match fs::hard_link(&tmp, path) {
+        Ok(()) => {
+            fs::remove_file(&tmp)?;
+            sync_parent(path)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            fs::remove_file(&tmp)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&tmp);
+            Err(error)
+        }
+    }
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -1382,6 +1754,68 @@ mod tests {
         assert!(!storage_dir.join("shard_1").exists(), "shard_1 purged");
         assert!(storage_dir.join("keep.txt").exists(), "unrelated file kept");
         assert!(storage_dir.exists(), "storage dir itself kept");
+    }
+
+    #[test]
+    fn staged_cluster_restore_is_durable_idempotent_and_commit_only() {
+        let (store, dir, _g) = store_in_temp_dir();
+        let restore_id = "11111111-1111-4111-8111-111111111111";
+        let old = [HEADER.as_slice(), b"old"].concat();
+        let next = [HEADER.as_slice(), b"next"].concat();
+        fs::write(dir.join("lux.dat"), &old).unwrap();
+        let storage_dir = PathBuf::from(&store.config().storage.dir);
+        fs::create_dir_all(storage_dir.join("shard_0")).unwrap();
+
+        assert!(stage_cluster_restore(&store, restore_id, &next).unwrap());
+        assert!(!stage_cluster_restore(&store, restore_id, &next).unwrap());
+        assert_eq!(fs::read(dir.join("lux.dat")).unwrap(), old);
+        assert!(storage_dir.join("shard_0").exists());
+
+        assert!(commit_cluster_restore(&store, restore_id).unwrap());
+        assert!(!commit_cluster_restore(&store, restore_id).unwrap());
+        let conflict = stage_cluster_restore(
+            &store,
+            restore_id,
+            &[HEADER.as_slice(), b"different"].concat(),
+        )
+        .expect_err("one committed restore id cannot name different data");
+        assert_eq!(conflict.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(dir.join("lux.dat")).unwrap(), next);
+        assert!(!storage_dir.join("shard_0").exists());
+        assert!(!abort_cluster_restore(&store, restore_id).unwrap());
+    }
+
+    #[test]
+    fn staged_cluster_restore_rejects_conflicts_and_aborts_cleanly() {
+        let (store, dir, _g) = store_in_temp_dir();
+        let restore_id = "22222222-2222-4222-8222-222222222222";
+        let first = [HEADER.as_slice(), b"first"].concat();
+        let second = [HEADER.as_slice(), b"second"].concat();
+
+        stage_cluster_restore(&store, restore_id, &first).unwrap();
+        let conflict = stage_cluster_restore(&store, restore_id, &second)
+            .expect_err("one restore id cannot name different data");
+        assert_eq!(conflict.kind(), io::ErrorKind::AlreadyExists);
+        assert!(abort_cluster_restore(&store, restore_id).unwrap());
+        assert!(!abort_cluster_restore(&store, restore_id).unwrap());
+        assert!(commit_cluster_restore(&store, restore_id).is_err());
+        assert!(!dir.join("lux.dat").exists());
+    }
+
+    #[test]
+    fn staged_cluster_restore_recovers_the_rename_receipt_crash_window() {
+        let (store, dir, _g) = store_in_temp_dir();
+        let restore_id = "33333333-3333-4333-8333-333333333333";
+        let next = [HEADER.as_slice(), b"recovered"].concat();
+        stage_cluster_restore(&store, restore_id, &next).unwrap();
+        let paths = cluster_restore_paths(&store, restore_id);
+
+        // Simulate a crash after the atomic data rename but before the durable
+        // committed receipt and shard cleanup.
+        fs::rename(&paths.staged, dir.join("lux.dat")).unwrap();
+        assert!(commit_cluster_restore(&store, restore_id).unwrap());
+        assert_eq!(fs::read(dir.join("lux.dat")).unwrap(), next);
+        assert!(paths.committed.exists());
     }
 
     // Fuzz: arbitrary bytes fed to the binary snapshot loader must never panic

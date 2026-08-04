@@ -4,6 +4,7 @@
 //! enabled, a signed topology maps a fixed slot space to ordinary Lux runtimes;
 //! the data engine and persistence formats remain the same on every node.
 
+mod backup;
 mod config;
 mod protocol;
 mod routing;
@@ -21,10 +22,12 @@ pub use protocol::{
 };
 pub(crate) use routing::{classify_command, routed_table, CommandRoute};
 pub(crate) use scatter::{global_scan_spec, GlobalScanSpec};
+pub(crate) use topology::endpoint_host_port;
+pub(crate) use topology::CLUSTER_CLIENT_SLOT_COUNT;
 pub use topology::{
     certificate_fingerprint, slot_for_key, slot_for_table_row, CompiledTopology, NodeDescriptor,
     SignedTopology, SlotAssignment, SlotMove, TopologyManifest, TopologyState,
-    TopologyTransitionKind, TopologyTransitionPlan, CLUSTER_SLOT_COUNT,
+    TopologyTransitionKind, TopologyTransitionPlan, CLUSTER_MAX_NODES, CLUSTER_SLOT_COUNT,
     CLUSTER_TOPOLOGY_SCHEMA_VERSION,
 };
 pub(crate) use transition::{transfer_payload_digest, ChunkDisposition};
@@ -80,6 +83,20 @@ pub(crate) struct ClusterNode {
     pub(crate) topology: Arc<TopologyState>,
     pub(crate) transitions: Arc<transition::TransitionState>,
     pub(crate) transport: Arc<transport::PeerTransport>,
+    backup_control: Arc<std::sync::Mutex<()>>,
+    backup_prepare: Arc<std::sync::Mutex<()>>,
+    backups: Arc<backup::BackupCoordinator>,
+}
+
+pub(crate) enum BackupControlError {
+    Forbidden,
+    Cluster(ClusterError),
+}
+
+impl From<ClusterError> for BackupControlError {
+    fn from(error: ClusterError) -> Self {
+        Self::Cluster(error)
+    }
 }
 
 impl ClusterNode {
@@ -112,6 +129,9 @@ impl ClusterNode {
             topology,
             transitions,
             transport,
+            backup_control: Arc::new(std::sync::Mutex::new(())),
+            backup_prepare: Arc::new(std::sync::Mutex::new(())),
+            backups: Arc::new(backup::BackupCoordinator::default()),
         }))
     }
 
@@ -119,6 +139,10 @@ impl ClusterNode {
         &self,
         signed: SignedTopology,
     ) -> Result<TopologyTransitionPlan, ClusterError> {
+        let _backup_control = self
+            .backup_control
+            .lock()
+            .map_err(|_| ClusterError::Protocol("backup control lock is poisoned".to_string()))?;
         let epoch = self.topology.prepare(signed)?;
         let plan = self.topology.transition_plan()?.ok_or_else(|| {
             ClusterError::InvalidTopology("prepared topology has no transition plan".to_string())
@@ -133,6 +157,107 @@ impl ClusterNode {
             return Err(error);
         }
         Ok(plan)
+    }
+
+    pub(crate) fn prepare_backup(
+        self: &Arc<Self>,
+        store: Arc<crate::store::Store>,
+        cache: crate::tables::SharedSchemaCache,
+        backup_id: &str,
+        credential: &str,
+    ) -> Result<BackupPartDescriptor, BackupControlError> {
+        let _prepare = self.backup_prepare.lock().map_err(|_| {
+            ClusterError::Protocol("backup preparation lock is poisoned".to_string())
+        })?;
+        self.backups.expire_old_session()?;
+        match self.backups.access(backup_id, credential)? {
+            backup::SessionAccess::Authorized => {}
+            backup::SessionAccess::Forbidden => return Err(BackupControlError::Forbidden),
+            backup::SessionAccess::Conflict => {
+                return Err(
+                    ClusterError::Protocol("another cluster backup is active".to_string()).into(),
+                );
+            }
+            backup::SessionAccess::Missing => {
+                let allowed = match crate::auth::resolve_credential(
+                    credential,
+                    "",
+                    crate::auth::Surface::Http,
+                    &store,
+                    &cache,
+                ) {
+                    Ok(crate::auth::Credential::Operator | crate::auth::Credential::Secret) => true,
+                    Ok(crate::auth::Credential::Anonymous) => {
+                        store.config().password.is_empty()
+                            && !crate::auth::project_keys_configured(&store, &cache)
+                    }
+                    _ => false,
+                };
+                if !allowed {
+                    return Err(BackupControlError::Forbidden);
+                }
+            }
+        }
+        self.backups
+            .prepare(self.clone(), store, backup_id, credential)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn capture_backup(
+        &self,
+        backup_id: &str,
+        credential: &str,
+    ) -> Result<(), BackupControlError> {
+        self.authorize_backup(backup_id, credential)?;
+        self.backups
+            .capture(backup_id)
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn release_backup(
+        &self,
+        backup_id: &str,
+        credential: &str,
+    ) -> Result<bool, BackupControlError> {
+        self.authorize_backup(backup_id, credential)?;
+        self.backups.release(backup_id).map_err(Into::into)
+    }
+
+    pub(crate) fn finish_backup(
+        &self,
+        backup_id: &str,
+        credential: &str,
+    ) -> Result<bool, BackupControlError> {
+        self.authorize_backup(backup_id, credential)?;
+        self.backups.finish(backup_id).map_err(Into::into)
+    }
+
+    pub(crate) fn backup_part(
+        &self,
+        backup_id: &str,
+        credential: &str,
+    ) -> Result<(BackupPartDescriptor, std::path::PathBuf), BackupControlError> {
+        self.authorize_backup(backup_id, credential)?;
+        self.backups.part(backup_id).map_err(Into::into)
+    }
+
+    fn authorize_backup(
+        &self,
+        backup_id: &str,
+        credential: &str,
+    ) -> Result<(), BackupControlError> {
+        match self.backups.access(backup_id, credential)? {
+            backup::SessionAccess::Authorized => Ok(()),
+            backup::SessionAccess::Forbidden => Err(BackupControlError::Forbidden),
+            backup::SessionAccess::Missing => Err(ClusterError::Protocol(
+                "cluster backup session was not prepared".to_string(),
+            )
+            .into()),
+            backup::SessionAccess::Conflict => {
+                Err(ClusterError::Protocol("another cluster backup is active".to_string()).into())
+            }
+        }
     }
 
     pub(crate) fn commit_topology(

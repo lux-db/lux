@@ -35,6 +35,20 @@ with ALPN `lux-cluster/1`; requests bind the authenticated certificate to their
 claimed source node and carry cluster, epoch, target, deadline, slot, catalog,
 and request identity. Mutations never use 0-RTT.
 
+## Client discovery
+
+The signed descriptor for each node also carries its externally reachable RESP
+address. `CLUSTER SLOTS` projects Lux's 4,096 internal owners across Redis's
+16,384 client slots, and key ownership uses Redis CRC16 plus hash tags. Standard
+Redis Cluster clients can therefore discover every owner and send keyed traffic
+directly without Lux-specific routing code.
+
+The stable RESP endpoint remains a compatibility ingress and forwards keyed
+commands to their signed owner. HTTP clients also remain on the stable endpoint.
+Commands that have no safe distributed semantics fail explicitly instead of
+silently executing on one node. See `README.md` for the currently supported
+Redis Cluster compatibility surface.
+
 ## Node config
 
 `LUX_CLUSTER_CONFIG` names one JSON file. Paths are relative to that file:
@@ -52,10 +66,12 @@ and request identity. Mutations never use 0-RTT.
 }
 ```
 
-The peer address in the manifest may be an IP or DNS name plus port. DNS is
+Peer and client addresses in the manifest may be IP or DNS names plus ports. DNS is
 resolved for each new connection, allowing a Kubernetes Service to move without
 changing ownership. Certificate identity remains pinned independently of DNS.
 
-This module is not yet a user-facing cluster release. The routing, transfer,
-query, backup, CLI, and Cloud orchestration slices land behind the same disabled
-configuration boundary before the capability is advertised.
+Cluster remains completely disabled unless `LUX_CLUSTER_CONFIG` is present.
+When enabled, the management capability contract advertises topology,
+transfers, distributed scans and tables, backup barriers and parts, and staged
+restore. The OSS CLI and Lux Cloud require that complete contract before they
+allow a project to use multiple nodes.

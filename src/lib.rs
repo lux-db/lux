@@ -205,6 +205,9 @@ pub struct ServerConfig {
     pub bind_host: String,
     /// RESP port. When `enable_resp` is true, `0` asks the OS for any free port.
     pub port: u16,
+    /// Public RESP endpoint returned by `CLUSTER SLOTS` in standalone mode.
+    /// Cluster topologies carry one signed endpoint per node instead.
+    pub advertised_resp_addr: Option<String>,
     /// HTTP API port. `0` disables the HTTP API.
     pub http_port: u16,
     /// Optional row cap for HTTP table responses.
@@ -256,6 +259,7 @@ impl std::fmt::Debug for ServerConfig {
         f.debug_struct("ServerConfig")
             .field("bind_host", &self.bind_host)
             .field("port", &self.port)
+            .field("advertised_resp_addr", &self.advertised_resp_addr)
             .field("http_port", &self.http_port)
             .field("max_rows", &self.max_rows)
             .field("max_body", &self.max_body)
@@ -285,6 +289,7 @@ impl Default for ServerConfig {
         Self {
             bind_host: "127.0.0.1".to_string(),
             port: 6379,
+            advertised_resp_addr: None,
             http_port: 0,
             max_rows: None,
             max_body: 64 * 1024 * 1024,
@@ -3377,6 +3382,11 @@ impl Runtime {
             self.store.add_total_commands(1);
             return executor.execute_command(args, session, write_buf, now);
         }
+        if cmd_eq_fast(args[0], b"CLUSTER") {
+            self.store.add_total_commands(1);
+            write_cluster_slots(node, args, write_buf);
+            return None;
+        }
         if let Err(message) = cmd::validate_args(args) {
             self.store.add_total_commands(1);
             resp::write_error(write_buf, &message);
@@ -4240,6 +4250,36 @@ impl Runtime {
             }
         });
         Some(startup_rx)
+    }
+}
+
+fn write_cluster_slots(node: &cluster::ClusterNode, args: &[&[u8]], out: &mut BytesMut) {
+    if args.len() != 2 || !cmd_eq_fast(args[1], b"SLOTS") {
+        resp::write_error(out, "ERR only CLUSTER SLOTS is supported");
+        return;
+    }
+    let topology = node.topology.current();
+    let repetitions = cluster::CLUSTER_CLIENT_SLOT_COUNT / cluster::CLUSTER_SLOT_COUNT;
+    resp::write_array_header(
+        out,
+        topology.manifest().assignments.len() * usize::from(repetitions),
+    );
+    for repetition in 0..repetitions {
+        let offset = repetition * cluster::CLUSTER_SLOT_COUNT;
+        for assignment in &topology.manifest().assignments {
+            let owner = topology
+                .node(&assignment.node_id)
+                .expect("validated slot owner is a topology node");
+            let (host, port) = cluster::endpoint_host_port(&owner.client_addr)
+                .expect("validated topology client endpoint");
+            resp::write_array_header(out, 3);
+            resp::write_integer(out, i64::from(offset + assignment.start));
+            resp::write_integer(out, i64::from(offset + assignment.end));
+            resp::write_array_header(out, 3);
+            resp::write_bulk(out, &host);
+            resp::write_integer(out, i64::from(port));
+            resp::write_bulk(out, &owner.node_id);
+        }
     }
 }
 

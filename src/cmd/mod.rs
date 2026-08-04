@@ -382,6 +382,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 2,
     },
     CommandSpec {
+        name: b"CLUSTER",
+        min_arity: 2,
+    },
+    CommandSpec {
         name: b"SELECT",
         min_arity: 2,
     },
@@ -1740,6 +1744,9 @@ pub fn execute(
             }
         }
         b'C' => {
+            if cmd_eq(cmd, b"CLUSTER") {
+                return server::cmd_cluster(args, store, out, now);
+            }
             if cmd_eq(cmd, b"CONFIG") {
                 return server::cmd_config(args, store, out, now);
             }
@@ -5017,6 +5024,18 @@ mod tests {
         let store = Store::new();
         let out = exec_str(&store, &[b"NOTACMD"]);
         assert!(out.contains("ERR unknown command"));
+    }
+
+    #[test]
+    fn standalone_cluster_slots_advertises_the_fast_path_endpoint() {
+        let reply = exec_str(
+            &Store::new_with_config(Arc::new(ServerConfig::default())),
+            &[b"CLUSTER", b"SLOTS"],
+        );
+        assert_eq!(
+            reply,
+            "*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n$9\r\n127.0.0.1\r\n:6379\r\n$10\r\nstandalone\r\n"
+        );
     }
 
     #[test]

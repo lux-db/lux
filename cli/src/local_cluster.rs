@@ -13,6 +13,7 @@ pub(super) const CLUSTER_SLOT_COUNT: u16 = 4096;
 pub(super) struct NodeDescriptor {
     pub(super) node_id: String,
     pub(super) peer_addr: String,
+    pub(super) client_addr: String,
     pub(super) server_name: String,
     pub(super) certificate_der: String,
     pub(super) certificate_sha256: String,
@@ -69,6 +70,7 @@ pub(super) fn topology_signing_payload(manifest: &TopologyManifest) -> Result<Ve
     for node in &manifest.nodes {
         topology_push_string(&mut bytes, &node.node_id)?;
         topology_push_string(&mut bytes, &node.peer_addr)?;
+        topology_push_string(&mut bytes, &node.client_addr)?;
         topology_push_string(&mut bytes, &node.server_name)?;
         topology_push_string(&mut bytes, &node.certificate_der)?;
         topology_push_string(&mut bytes, &node.certificate_sha256)?;
@@ -104,6 +106,8 @@ pub(super) struct LocalClusterNode {
     pub(super) node_id: String,
     pub(super) container: String,
     pub(super) volume: String,
+    #[serde(default)]
+    pub(super) resp_port: u16,
     pub(super) http_port: u16,
     pub(super) server_name: String,
     pub(super) certificate_der: String,
@@ -157,6 +161,7 @@ pub(super) fn validate_local_node_count(nodes: u16) -> Result<(), String> {
 pub(super) fn create_local_cluster_node(
     state: &LocalState,
     ordinal: u16,
+    resp_port: u16,
     http_port: u16,
 ) -> Result<LocalClusterNode, String> {
     let node_id = format!("node-{ordinal}");
@@ -186,6 +191,7 @@ pub(super) fn create_local_cluster_node(
         } else {
             format!("{}-node-{ordinal}", state.volume)
         },
+        resp_port,
         http_port,
         server_name,
         certificate_der: URL_SAFE_NO_PAD.encode(certificate_der),
@@ -213,6 +219,7 @@ pub(super) fn local_node_descriptor(node: &LocalClusterNode) -> Result<NodeDescr
     Ok(NodeDescriptor {
         node_id: node.node_id.clone(),
         peer_addr: format!("{}:{LOCAL_CLUSTER_PEER_PORT}", node.container),
+        client_addr: format!("127.0.0.1:{}", node.resp_port),
         server_name: node.server_name.clone(),
         certificate_der: node.certificate_der.clone(),
         certificate_sha256: certificate_fingerprint(&certificate_der),
@@ -351,6 +358,8 @@ pub(super) fn run_local_cluster_node(
     } else {
         args.extend([
             "-p".into(),
+            docker_port_map(IpAddr::V4(Ipv4Addr::LOCALHOST), node.resp_port, 6379),
+            "-p".into(),
             docker_port_map(IpAddr::V4(Ipv4Addr::LOCALHOST), node.http_port, 5890),
         ]);
     }
@@ -487,6 +496,15 @@ pub(super) fn reserve_local_node_http_port(state: &LocalState, used: &mut HashSe
     port
 }
 
+pub(super) fn reserve_local_node_resp_port(state: &LocalState, used: &mut HashSet<u16>) -> u16 {
+    let mut port = state.resp_port.saturating_add(10);
+    while used.contains(&port) || !port_is_free(IpAddr::V4(Ipv4Addr::LOCALHOST), port) {
+        port = port.saturating_add(1);
+    }
+    used.insert(port);
+    port
+}
+
 pub(super) async fn initialize_local_cluster(state: &mut LocalState) -> Result<(), String> {
     if state.cluster.is_some() {
         return Ok(());
@@ -504,7 +522,7 @@ pub(super) async fn initialize_local_cluster(state: &mut LocalState) -> Result<(
             .to_encoded_point(false)
             .as_bytes(),
     );
-    let system = create_local_cluster_node(state, 1, state.http_port)?;
+    let system = create_local_cluster_node(state, 1, state.resp_port, state.http_port)?;
     let cluster = LocalClusterState {
         cluster_id: format!("local-{}-{}", project_slug(), random_hex(8)),
         network: format!("{}-cluster", state.container),
@@ -699,10 +717,15 @@ pub(super) async fn resize_local_cluster(
             .iter()
             .map(|node| node.http_port)
             .collect::<HashSet<_>>();
+        let mut used_resp = all_nodes
+            .iter()
+            .map(|node| node.resp_port)
+            .collect::<HashSet<_>>();
         let mut ordinal = next_local_node_ordinal(&cluster);
         while all_nodes.len() < desired as usize {
             let port = reserve_local_node_http_port(state, &mut used);
-            all_nodes.push(create_local_cluster_node(state, ordinal, port)?);
+            let resp_port = reserve_local_node_resp_port(state, &mut used_resp);
+            all_nodes.push(create_local_cluster_node(state, ordinal, resp_port, port)?);
             ordinal = ordinal.saturating_add(1);
         }
 

@@ -138,6 +138,165 @@ fn resp_command(parts: &[&str]) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn cluster_backup_control_requires_the_preparing_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer_port = reserve_udp_port();
+    let http_port = reserve_tcp_port();
+    let (cert_path, key_path, certificate) = identity("node-a.cluster.local", dir.path());
+    let signing_key = SigningKey::random(&mut OsRng);
+    let controller_public_key = URL_SAFE_NO_PAD.encode(
+        signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes(),
+    );
+    let topology = SignedTopology::sign(
+        TopologyManifest {
+            schema_version: CLUSTER_TOPOLOGY_SCHEMA_VERSION,
+            protocol_version: CLUSTER_PROTOCOL_VERSION,
+            cluster_id: "backup-auth-test".into(),
+            epoch: 1,
+            system_node_id: "node-a".into(),
+            slot_count: CLUSTER_SLOT_COUNT,
+            catalog_version: 1,
+            nodes: vec![NodeDescriptor {
+                node_id: "node-a".into(),
+                peer_addr: format!("127.0.0.1:{peer_port}"),
+                client_addr: "127.0.0.1:16379".into(),
+                server_name: "node-a.cluster.local".into(),
+                certificate_der: URL_SAFE_NO_PAD.encode(&certificate),
+                certificate_sha256: certificate_fingerprint(&certificate),
+            }],
+            assignments: vec![SlotAssignment {
+                start: 0,
+                end: CLUSTER_SLOT_COUNT - 1,
+                node_id: "node-a".into(),
+            }],
+        },
+        &signing_key,
+    )
+    .unwrap();
+    let topology_path = dir.path().join("topology.json");
+    std::fs::write(&topology_path, serde_json::to_vec(&topology).unwrap()).unwrap();
+    let _server = lux::run_with_config(lux::ServerConfig {
+        enable_resp: false,
+        http_port,
+        shards: 4,
+        auth: lux::AuthConfig {
+            enabled: true,
+            initial_secret_key: Some("lux_sec_backup_control".into()),
+            ..Default::default()
+        },
+        data_dir: dir.path().join("data").display().to_string(),
+        cluster: Some(ClusterConfig {
+            local_node_id: "node-a".into(),
+            peer_bind_addr: format!("127.0.0.1:{peer_port}").parse().unwrap(),
+            certificate_chain_path: cert_path,
+            private_key_path: key_path,
+            topology_path,
+            topology_state_path: dir.path().join("topology-state.json"),
+            controller_public_key,
+            max_frame_bytes: 1024 * 1024,
+        }),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let client = reqwest::Client::new();
+    let backup_id = "11111111-1111-4111-8111-111111111111";
+    let endpoint =
+        |action: &str| format!("http://127.0.0.1:{http_port}/v1/cluster/backup/{action}");
+    let unauthorized = client
+        .post(endpoint("prepare"))
+        .header("X-Lux-Backup-Id", backup_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let prepared = client
+        .post(endpoint("prepare"))
+        .bearer_auth("lux_sec_backup_control")
+        .header("X-Lux-Backup-Id", backup_id)
+        .send()
+        .await
+        .unwrap();
+    let prepared_status = prepared.status();
+    let prepared_body = prepared.text().await.unwrap();
+    assert!(
+        prepared_status.is_success(),
+        "backup prepare returned {prepared_status}: {prepared_body}"
+    );
+
+    let prepared_again = client
+        .post(endpoint("prepare"))
+        .bearer_auth("lux_sec_backup_control")
+        .header("X-Lux-Backup-Id", backup_id)
+        .send()
+        .await
+        .unwrap();
+    assert!(prepared_again.status().is_success());
+
+    let wrong_session_credential = client
+        .post(endpoint("capture"))
+        .bearer_auth("wrong-password")
+        .header("X-Lux-Backup-Id", backup_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        wrong_session_credential.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    for action in ["capture", "release"] {
+        let response = client
+            .post(endpoint(action))
+            .bearer_auth("lux_sec_backup_control")
+            .header("X-Lux-Backup-Id", backup_id)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "backup {action} returned {}",
+            response.status()
+        );
+    }
+
+    let wrong_part_credential = client
+        .get(endpoint("part"))
+        .bearer_auth("wrong-password")
+        .header("X-Lux-Backup-Id", backup_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        wrong_part_credential.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    let part = client
+        .get(endpoint("part"))
+        .bearer_auth("lux_sec_backup_control")
+        .header("X-Lux-Backup-Id", backup_id)
+        .send()
+        .await
+        .unwrap();
+    assert!(part.status().is_success());
+
+    let finished = client
+        .post(endpoint("finish"))
+        .bearer_auth("lux_sec_backup_control")
+        .header("X-Lux-Backup-Id", backup_id)
+        .send()
+        .await
+        .unwrap();
+    assert!(finished.status().is_success());
+}
+
+#[tokio::test]
 async fn embedded_clients_route_to_the_signed_owner_without_a_local_hop() {
     let dir = tempfile::tempdir().unwrap();
     let port_a = reserve_udp_port();
@@ -164,6 +323,7 @@ async fn embedded_clients_route_to_the_signed_owner_without_a_local_hop() {
                 NodeDescriptor {
                     node_id: "node-a".into(),
                     peer_addr: format!("127.0.0.1:{port_a}"),
+                    client_addr: "127.0.0.1:16379".into(),
                     server_name: "node-a.cluster.local".into(),
                     certificate_der: URL_SAFE_NO_PAD.encode(&cert_a),
                     certificate_sha256: certificate_fingerprint(&cert_a),
@@ -171,6 +331,7 @@ async fn embedded_clients_route_to_the_signed_owner_without_a_local_hop() {
                 NodeDescriptor {
                     node_id: "node-b".into(),
                     peer_addr: format!("127.0.0.1:{port_b}"),
+                    client_addr: "127.0.0.1:16380".into(),
                     server_name: "node-b.cluster.local".into(),
                     certificate_der: URL_SAFE_NO_PAD.encode(&cert_b),
                     certificate_sha256: certificate_fingerprint(&cert_b),
@@ -239,6 +400,32 @@ async fn embedded_clients_route_to_the_signed_owner_without_a_local_hop() {
     let key_b = key_for_range(2048, CLUSTER_SLOT_COUNT - 1);
     let client_a = node_a.client();
     let client_b = node_b.client();
+
+    let slots = client_a.execute_value("CLUSTER", &["SLOTS"]).await.unwrap();
+    let mut expected_slots = Vec::new();
+    for offset in [0_i64, 4096, 8192, 12288] {
+        expected_slots.extend([
+            EmbeddedValue::Array(vec![
+                EmbeddedValue::Int(offset),
+                EmbeddedValue::Int(offset + 2047),
+                EmbeddedValue::Array(vec![
+                    EmbeddedValue::Bulk("127.0.0.1".into()),
+                    EmbeddedValue::Int(16379),
+                    EmbeddedValue::Bulk("node-a".into()),
+                ]),
+            ]),
+            EmbeddedValue::Array(vec![
+                EmbeddedValue::Int(offset + 2048),
+                EmbeddedValue::Int(offset + 4095),
+                EmbeddedValue::Array(vec![
+                    EmbeddedValue::Bulk("127.0.0.1".into()),
+                    EmbeddedValue::Int(16380),
+                    EmbeddedValue::Bulk("node-b".into()),
+                ]),
+            ]),
+        ]);
+    }
+    assert_eq!(slots, EmbeddedValue::Array(expected_slots));
 
     client_a.set(&key_b, b"owned-by-b").await.unwrap();
     assert_eq!(
@@ -684,6 +871,7 @@ async fn online_resize_and_consolidation_move_kv_and_table_rows_without_duplicat
         NodeDescriptor {
             node_id: "node-a".into(),
             peer_addr: format!("127.0.0.1:{peer_port_a}"),
+            client_addr: "127.0.0.1:16379".into(),
             server_name: "resize-a.cluster.local".into(),
             certificate_der: URL_SAFE_NO_PAD.encode(&cert_a),
             certificate_sha256: certificate_fingerprint(&cert_a),
@@ -691,6 +879,7 @@ async fn online_resize_and_consolidation_move_kv_and_table_rows_without_duplicat
         NodeDescriptor {
             node_id: "node-b".into(),
             peer_addr: format!("127.0.0.1:{peer_port_b}"),
+            client_addr: "127.0.0.1:16380".into(),
             server_name: "resize-b.cluster.local".into(),
             certificate_der: URL_SAFE_NO_PAD.encode(&cert_b),
             certificate_sha256: certificate_fingerprint(&cert_b),
@@ -1084,10 +1273,27 @@ async fn online_resize_and_consolidation_move_kv_and_table_rows_without_duplicat
         .await
         .unwrap();
     assert_eq!(legacy_snapshot.status(), reqwest::StatusCode::CONFLICT);
+    let backup_id = "33333333-3333-4333-8333-333333333333";
+    for action in ["prepare", "capture", "release"] {
+        let request = |port| {
+            http.post(format!(
+                "http://127.0.0.1:{port}/v1/cluster/backup/{action}"
+            ))
+            .header("X-Lux-Backup-Id", backup_id)
+            .send()
+        };
+        let (response_a, response_b) = tokio::join!(request(http_port_a), request(http_port_b));
+        for response in [response_a.unwrap(), response_b.unwrap()] {
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert!(status.is_success(), "backup {action} failed: {body}");
+        }
+    }
     let mut descriptors = Vec::new();
     for port in [http_port_a, http_port_b] {
         let response = http
             .get(format!("http://127.0.0.1:{port}/v1/cluster/backup/part"))
+            .header("X-Lux-Backup-Id", backup_id)
             .send()
             .await
             .unwrap();
@@ -1097,10 +1303,57 @@ async fn online_resize_and_consolidation_move_kv_and_table_rows_without_duplicat
             .get("x-lux-cluster-part")
             .unwrap()
             .to_str()
-            .unwrap();
+            .unwrap()
+            .to_string();
         let descriptor: serde_json::Value =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap();
-        assert!(!response.bytes().await.unwrap().is_empty());
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&encoded).unwrap()).unwrap();
+        let part = response.bytes().await.unwrap();
+        assert!(!part.is_empty());
+        let restore_id = "44444444-4444-4444-8444-444444444444";
+        let staged = http
+            .post(format!("http://127.0.0.1:{port}/v1/cluster/restore/stage"))
+            .header("X-Lux-Cluster-Part", &encoded)
+            .header("X-Lux-Restore-Id", restore_id)
+            .body(part.clone())
+            .send()
+            .await
+            .unwrap();
+        assert!(staged.status().is_success());
+        assert_eq!(
+            staged.json::<serde_json::Value>().await.unwrap()["created"],
+            true
+        );
+        let staged_again = http
+            .post(format!("http://127.0.0.1:{port}/v1/cluster/restore/stage"))
+            .header("X-Lux-Cluster-Part", &encoded)
+            .header("X-Lux-Restore-Id", restore_id)
+            .body(part)
+            .send()
+            .await
+            .unwrap();
+        assert!(staged_again.status().is_success());
+        assert_eq!(
+            staged_again.json::<serde_json::Value>().await.unwrap()["created"],
+            false
+        );
+        let aborted = http
+            .post(format!("http://127.0.0.1:{port}/v1/cluster/restore/abort"))
+            .header("X-Lux-Restore-Id", restore_id)
+            .send()
+            .await
+            .unwrap();
+        assert!(aborted.status().is_success());
+        assert_eq!(
+            aborted.json::<serde_json::Value>().await.unwrap()["aborted"],
+            true
+        );
+        let finished = http
+            .post(format!("http://127.0.0.1:{port}/v1/cluster/backup/finish"))
+            .header("X-Lux-Backup-Id", backup_id)
+            .send()
+            .await
+            .unwrap();
+        assert!(finished.status().is_success());
         descriptors.push(descriptor);
     }
     assert_eq!(descriptors[0]["cluster_id"], "resize-test");

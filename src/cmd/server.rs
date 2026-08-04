@@ -259,6 +259,49 @@ pub fn cmd_client(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Ins
     CmdResult::Written
 }
 
+/// Return the ordinary one-node slot map. Multi-node runtimes intercept this
+/// command and emit their signed owner map before reaching command dispatch.
+/// This keeps cluster-aware clients usable after a project consolidates back
+/// onto the standalone fast path.
+pub fn cmd_cluster(args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    if args.len() != 2 || !cmd_eq(args[1], b"SLOTS") {
+        resp::write_error(out, "ERR only CLUSTER SLOTS is supported");
+        return CmdResult::Written;
+    }
+    let endpoint = store
+        .config()
+        .advertised_resp_addr
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| {
+            let host = store.config().bind_host.as_str();
+            (!matches!(host, "0.0.0.0" | "::")).then(|| format!("{host}:{}", store.config().port))
+        });
+    let Some(endpoint) = endpoint else {
+        resp::write_error(
+            out,
+            "ERR CLUSTER SLOTS requires LUX_ADVERTISE_RESP_ADDR on a wildcard listener",
+        );
+        return CmdResult::Written;
+    };
+    let Some((host, port)) = crate::cluster::endpoint_host_port(&endpoint) else {
+        resp::write_error(out, "ERR advertised RESP endpoint is invalid");
+        return CmdResult::Written;
+    };
+    resp::write_array_header(out, 1);
+    resp::write_array_header(out, 3);
+    resp::write_integer(out, 0);
+    resp::write_integer(
+        out,
+        i64::from(crate::cluster::CLUSTER_CLIENT_SLOT_COUNT - 1),
+    );
+    resp::write_array_header(out, 3);
+    resp::write_bulk(out, &host);
+    resp::write_integer(out, i64::from(port));
+    resp::write_bulk(out, "standalone");
+    CmdResult::Written
+}
+
 pub fn cmd_select(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
     // Lux is single-database. SELECT 0 is a no-op OK; any other index is an
     // honest out-of-range error instead of a silent fake OK.

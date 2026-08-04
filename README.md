@@ -649,6 +649,7 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LUX_PORT` | `6379` | RESP (Redis-compatible) TCP port |
+| `LUX_ADVERTISE_RESP_ADDR` | listener address | Public `host:port` returned by `CLUSTER SLOTS`; required when the listener binds a wildcard address |
 | `LUX_HTTP_PORT` | (disabled) | HTTP API port (set to enable; `lux start` defaults it to `5890`) |
 | `LUX_PASSWORD` | (none) | Operator/break-glass AUTH (RESP and HTTP). Project keys also gate the engine |
 | `LUX_DATA_DIR` | `.` | Snapshot directory |
@@ -811,7 +812,7 @@ After 1.0, Lux follows semantic versioning for documented public APIs.
 
 **Sorting:** `SORT` `SORT_RO`
 
-**Server:** `PING` `ECHO` `QUIT` `HELLO` `INFO` `TIME` `SAVE` `BGSAVE` `LASTSAVE` `AUTH` `CONFIG` `CLIENT` `SELECT` `COMMAND` `OBJECT` `MEMORY`
+**Server:** `PING` `ECHO` `QUIT` `HELLO` `INFO` `TIME` `SAVE` `BGSAVE` `LASTSAVE` `AUTH` `CONFIG` `CLIENT` `CLUSTER SLOTS` `SELECT` `COMMAND` `OBJECT` `MEMORY`
 
 ## Known Differences from Redis
 
@@ -819,7 +820,7 @@ Lux is Redis-compatible but not identical. Key differences:
 
 - **No AOF persistence** -- Lux uses snapshots + a write-ahead log (WAL) with CRC32 checksums instead of Redis AOF. The WAL is fsync'd every 1 second (matching Redis `appendfsync everysec`). Maximum data loss on power failure is 1 second of writes
 - **No RESP3 protocol** -- RESP2 only
-- **Cluster routing is Lux-native, not Redis Cluster** -- Cluster uses a signed 4,096-slot topology, encrypted peer links, and one stable system-node endpoint. Single-key commands, typed table operations, `KEYS`, `VSEARCH`, `VCARD`, and `TSMRANGE` are distributed; unsafe global commands fail closed instead of returning partial results. It does not expose Redis Cluster's `CLUSTER` command or require Redis clients to follow `MOVED` redirects
+- **Cluster routing is Lux-native, with standard owner discovery** -- Cluster uses a signed 4,096-slot topology, encrypted peer links, and one stable fallback endpoint. `CLUSTER SLOTS` lets cluster-aware RESP clients address each signed owner directly; a request sent to the stable or a stale endpoint is still forwarded, so clients do not need `MOVED` handling for correctness. Single-key commands, typed table operations, `KEYS`, `VSEARCH`, `VCARD`, and `TSMRANGE` are distributed; unsafe global commands fail closed instead of returning partial results. Other Redis Cluster control commands are unsupported
 - **MULTI/EXEC** -- supported with WATCH-based optimistic locking. Commands in a transaction execute sequentially, each acquiring its own shard lock, so another client could observe intermediate state mid-EXEC. Redis avoids this via single-threading. Standard client libraries (Redlock, BullMQ, Sidekiq) rely on WATCH for correctness, not EXEC isolation. Full shard-locking isolation may be added in a future release if there's demand
 - **Pipeline ordering** -- per-client command order is preserved. Consecutive same-shard commands are batched for performance
 

@@ -98,6 +98,7 @@ async fn async_main() -> std::io::Result<()> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(6379),
+        advertised_resp_addr: std::env::var("LUX_ADVERTISE_RESP_ADDR").ok(),
         http_port: std::env::var("LUX_HTTP_PORT")
             .ok()
             .and_then(|s| s.parse().ok())

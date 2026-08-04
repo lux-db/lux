@@ -132,8 +132,10 @@ topology or peer-routing overhead. A value above one enables Cluster. The CLI
 creates a project-private Docker network and signed node identities, admits new
 nodes before assigning them slots, transfers ownership while writes are fenced,
 commits targets before sources, and only then deletes stale copies. Extra-node
-management ports bind to loopback; the public `LUX_URL`, `LUX_DIRECT_URL`, and
-Studio URL never change. `lux cluster consolidate` moves every slot back to the
+management and RESP ports bind to loopback; the stable `LUX_URL`,
+`LUX_DIRECT_URL`, and Studio URL never change. Cluster-aware RESP clients use
+`CLUSTER SLOTS` to reach each local owner directly, while ordinary clients keep
+using the stable endpoint. `lux cluster consolidate` moves every slot back to the
 system node and restarts it without Cluster, restoring the exact standalone
 fast path while preserving its data volume.
 

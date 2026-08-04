@@ -673,6 +673,7 @@ mod tests {
             NodeDescriptor {
                 node_id: "node-a".into(),
                 peer_addr: format!("127.0.0.1:{port_a}"),
+                client_addr: "127.0.0.1:16379".into(),
                 server_name: "node-a.cluster.local".into(),
                 certificate_der: URL_SAFE_NO_PAD.encode(&cert_a),
                 certificate_sha256: certificate_fingerprint(&cert_a),
@@ -680,6 +681,7 @@ mod tests {
             NodeDescriptor {
                 node_id: "node-b".into(),
                 peer_addr: format!("127.0.0.1:{port_b}"),
+                client_addr: "127.0.0.1:16380".into(),
                 server_name: "node-b.cluster.local".into(),
                 certificate_der: URL_SAFE_NO_PAD.encode(&cert_b),
                 certificate_sha256: certificate_fingerprint(&cert_b),
@@ -825,6 +827,7 @@ mod tests {
         let node_a = NodeDescriptor {
             node_id: "node-a".into(),
             peer_addr: format!("127.0.0.1:{port_a}"),
+            client_addr: "127.0.0.1:16379".into(),
             server_name: "node-a.cluster.local".into(),
             certificate_der: URL_SAFE_NO_PAD.encode(&cert_a),
             certificate_sha256: certificate_fingerprint(&cert_a),
@@ -832,6 +835,7 @@ mod tests {
         let node_b = NodeDescriptor {
             node_id: "node-b".into(),
             peer_addr: format!("127.0.0.1:{port_b}"),
+            client_addr: "127.0.0.1:16380".into(),
             server_name: "node-b.cluster.local".into(),
             certificate_der: URL_SAFE_NO_PAD.encode(&cert_b),
             certificate_sha256: certificate_fingerprint(&cert_b),

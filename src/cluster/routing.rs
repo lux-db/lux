@@ -169,8 +169,8 @@ fn counted_keys<'a>(
 
 fn local_command(command: &[u8]) -> bool {
     const COMMANDS: &[&[u8]] = &[
-        b"AUTH", b"CLIENT", b"COMMAND", b"CONFIG", b"ECHO", b"HELLO", b"INFO", b"LATENCY", b"PING",
-        b"QUIT", b"RESET", b"SELECT", b"TIME",
+        b"AUTH", b"CLIENT", b"CLUSTER", b"COMMAND", b"CONFIG", b"ECHO", b"HELLO", b"INFO",
+        b"LATENCY", b"PING", b"QUIT", b"RESET", b"SELECT", b"TIME",
     ];
     COMMANDS.iter().any(|candidate| eq(command, candidate))
 }

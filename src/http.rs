@@ -2,6 +2,7 @@ use base64::Engine;
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,6 +20,7 @@ use crate::tables::SharedSchemaCache;
 use crate::{CommandExecutor, CommandSession, LuxError};
 
 const WEBSOCKET_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const MAX_CLUSTER_RESTORE_PART_BYTES: usize = 16 * 1024 * 1024 * 1024;
 
 enum HttpAuthContext {
     Anonymous,
@@ -172,6 +174,33 @@ async fn handle_request(
         .and_then(|(_, v)| v.trim().parse().ok())
         .unwrap_or(0);
 
+    // Cluster restore parts can be much larger than the ordinary JSON body
+    // budget. Stream this privileged endpoint to a same-filesystem file before
+    // the generic request path allocates the body in memory.
+    let (header_method, header_full_path, header_headers, _) = parse_http_request(&header_str);
+    let header_path = header_full_path
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(&header_full_path);
+    if header_method == "POST"
+        && matches!(
+            header_path,
+            "/v1/cluster/restore/stage" | "/cluster/restore/stage"
+        )
+    {
+        let initial_end = (header_end + content_length).min(data.len());
+        return stream_cluster_restore_stage(
+            socket,
+            store,
+            cache,
+            cluster,
+            &header_headers,
+            content_length,
+            &data[header_end..initial_end],
+        )
+        .await;
+    }
+
     if content_length > max_body {
         let body = r#"{"error":"request body too large"}"#;
         return send_json(socket, 413, "Payload Too Large", body).await;
@@ -222,6 +251,22 @@ async fn handle_request(
         .map(|(_, v)| v.as_str())
         .and_then(|auth| auth.strip_prefix("Bearer "))
         .unwrap_or("");
+    let apikey_header = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("apikey"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let presented = if !apikey_header.is_empty() {
+        apikey_header
+    } else {
+        bearer
+    };
+    if is_cluster_backup_control(&method, &path) {
+        return handle_cluster_backup_control(
+            socket, store, cache, cluster, &headers, &path, presented,
+        )
+        .await;
+    }
     // Browsers cannot set headers on a WebSocket handshake, so `/live` also takes
     // the key as a query param. `apikey` is the name the SDK sends (and the
     // Supabase-compatible one); `token` is accepted as the original alias. Only
@@ -244,11 +289,6 @@ async fn handle_request(
     // The project credential: `apikey` header, then the /live query param, then
     // the bearer. The bearer is overloaded -- it can be the operator password, a
     // project key, or an end-user JWT -- so the resolver sorts it out.
-    let apikey_header = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("apikey"))
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("");
     let presented = if !apikey_header.is_empty() {
         apikey_header
     } else if !query_token.is_empty() {
@@ -478,6 +518,94 @@ async fn handle_request(
     // the full response string in memory first.
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
+    if method == "POST"
+        && matches!(
+            segments.as_slice(),
+            ["v1", "cluster", "restore", "commit"]
+                | ["cluster", "restore", "commit"]
+                | ["v1", "cluster", "restore", "abort"]
+                | ["cluster", "restore", "abort"]
+        )
+    {
+        if let Err((status, status_text, body)) = require_project_access(store, &auth_context) {
+            return send_json(socket, status, status_text, &body).await;
+        }
+        if cluster.is_none() {
+            return send_json(
+                socket,
+                409,
+                "Conflict",
+                r#"{"error":"Cluster is not enabled for this engine"}"#,
+            )
+            .await;
+        }
+        let Some(restore_id) = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-lux-restore-id"))
+            .map(|(_, value)| value.as_str())
+        else {
+            return send_json(
+                socket,
+                400,
+                "Bad Request",
+                r#"{"error":"X-Lux-Restore-Id is required"}"#,
+            )
+            .await;
+        };
+        let commit = matches!(
+            segments.as_slice(),
+            ["v1", "cluster", "restore", "commit"] | ["cluster", "restore", "commit"]
+        );
+        if !commit {
+            return match crate::snapshot::abort_cluster_restore(store, restore_id) {
+                Ok(aborted) => {
+                    send_json(
+                        socket,
+                        200,
+                        "OK",
+                        &json!({ "aborted": aborted, "restore_id": restore_id }).to_string(),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    send_json(
+                        socket,
+                        409,
+                        "Conflict",
+                        &json!({ "error": error.to_string() }).to_string(),
+                    )
+                    .await
+                }
+            };
+        }
+        match crate::snapshot::commit_cluster_restore(store, restore_id) {
+            Ok(committed) => {
+                let response = send_json(
+                    socket,
+                    200,
+                    "OK",
+                    &json!({ "committed": committed, "restore_id": restore_id }).to_string(),
+                )
+                .await;
+                if committed && response.is_ok() {
+                    let _ = socket.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    std::process::exit(0);
+                }
+                return response;
+            }
+            Err(error) => {
+                return send_json(
+                    socket,
+                    409,
+                    "Conflict",
+                    &json!({ "error": error.to_string() }).to_string(),
+                )
+                .await
+            }
+        }
+    }
+
     // Full-instance restore. The raw request body is a lux.dat dump; read it
     // straight from the buffer to avoid the lossy String conversion. Operator-
     // only. On success the process exits so the container restart reloads from
@@ -489,16 +617,19 @@ async fn handle_request(
                 | ["restore"]
                 | ["v1", "cluster", "restore", "part"]
                 | ["cluster", "restore", "part"]
+                | ["v1", "cluster", "restore", "stage"]
+                | ["cluster", "restore", "stage"]
         )
     {
-        let password_set = !store.config().password.is_empty();
-        if password_set && !matches!(auth_context, HttpAuthContext::Operator) {
-            let body = r#"{"error":"restore requires operator credentials"}"#;
-            return send_json(socket, 403, "Forbidden", body).await;
+        if let Err((status, status_text, body)) = require_project_access(store, &auth_context) {
+            return send_json(socket, status, status_text, &body).await;
         }
         let cluster_part = matches!(
             segments.as_slice(),
-            ["v1", "cluster", "restore", "part"] | ["cluster", "restore", "part"]
+            ["v1", "cluster", "restore", "part"]
+                | ["cluster", "restore", "part"]
+                | ["v1", "cluster", "restore", "stage"]
+                | ["cluster", "restore", "stage"]
         );
         if cluster.is_some() && !cluster_part {
             return send_json(
@@ -559,6 +690,46 @@ async fn handle_request(
         }
         let end = (header_end + content_length).min(data.len());
         let dump = &data[header_end..end];
+        let staged = matches!(
+            segments.as_slice(),
+            ["v1", "cluster", "restore", "stage"] | ["cluster", "restore", "stage"]
+        );
+        if staged {
+            let Some(restore_id) = headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("x-lux-restore-id"))
+                .map(|(_, value)| value.as_str())
+            else {
+                return send_json(
+                    socket,
+                    400,
+                    "Bad Request",
+                    r#"{"error":"X-Lux-Restore-Id is required"}"#,
+                )
+                .await;
+            };
+            return match crate::snapshot::stage_cluster_restore(store, restore_id, dump) {
+                Ok(created) => {
+                    send_json(
+                        socket,
+                        200,
+                        "OK",
+                        &json!({ "staged": true, "created": created, "restore_id": restore_id })
+                            .to_string(),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    send_json(
+                        socket,
+                        409,
+                        "Conflict",
+                        &json!({ "error": error.to_string() }).to_string(),
+                    )
+                    .await
+                }
+            };
+        }
         match crate::snapshot::restore_to_disk(store, dump) {
             Ok(()) => {
                 let _ = send_json(socket, 200, "OK", r#"{"restored":true}"#).await;
@@ -581,11 +752,10 @@ async fn handle_request(
             ["v1", "snapshot"] | ["snapshot"] => {
                 // Full-instance backup. Streams a consistent dump out over HTTP
                 // so the control plane never needs a shell in the container.
-                // Operator-only when a password is set (it exposes all data).
-                let password_set = !store.config().password.is_empty();
-                if password_set && !matches!(auth_context, HttpAuthContext::Operator) {
-                    let body = r#"{"error":"snapshot requires operator credentials"}"#;
-                    return send_json(socket, 403, "Forbidden", body).await;
+                if let Err((status, status_text, body)) =
+                    require_project_access(store, &auth_context)
+                {
+                    return send_json(socket, status, status_text, &body).await;
                 }
                 if cluster.is_some() {
                     return send_json(
@@ -599,15 +769,10 @@ async fn handle_request(
                 return stream_snapshot(socket, store, None).await;
             }
             ["v1", "cluster", "backup", "part"] | ["cluster", "backup", "part"] => {
-                let password_set = !store.config().password.is_empty();
-                if password_set && !matches!(auth_context, HttpAuthContext::Operator) {
-                    return send_json(
-                        socket,
-                        403,
-                        "Forbidden",
-                        r#"{"error":"backup part requires operator credentials"}"#,
-                    )
-                    .await;
+                if let Err((status, status_text, body)) =
+                    require_project_access(store, &auth_context)
+                {
+                    return send_json(socket, status, status_text, &body).await;
                 }
                 let Some(node) = cluster else {
                     return send_json(
@@ -618,19 +783,33 @@ async fn handle_request(
                     )
                     .await;
                 };
-                let descriptor = match node.backup_part_descriptor() {
-                    Ok(descriptor) => descriptor,
+                let Some(backup_id) = headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("x-lux-backup-id"))
+                    .map(|(_, value)| value.as_str())
+                else {
+                    return send_json(
+                        socket,
+                        400,
+                        "Bad Request",
+                        r#"{"error":"X-Lux-Backup-Id is required"}"#,
+                    )
+                    .await;
+                };
+                let (descriptor, path) = match node.backup_part(backup_id, presented) {
+                    Ok(part) => part,
                     Err(error) => {
+                        let (status, status_text, message) = backup_control_error(error);
                         return send_json(
                             socket,
-                            409,
-                            "Conflict",
-                            &json!({ "error": error.to_string() }).to_string(),
+                            status,
+                            status_text,
+                            &json!({ "error": message }).to_string(),
                         )
-                        .await
+                        .await;
                     }
                 };
-                return stream_snapshot(socket, store, Some(&descriptor)).await;
+                return stream_snapshot_file(socket, &path, Some(&descriptor)).await;
             }
             ["v1", "tables", table] => {
                 let filter = match enforce_table_read(store, cache, &auth_context, table) {
@@ -754,6 +933,314 @@ async fn handle_request(
     send_json(socket, status, status_text, &result).await
 }
 
+async fn stream_cluster_restore_stage(
+    socket: &mut tokio::net::TcpStream,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    cluster: Option<&Arc<crate::cluster::ClusterNode>>,
+    headers: &[(String, String)],
+    content_length: usize,
+    initial: &[u8],
+) -> std::io::Result<bool> {
+    if !(4..=MAX_CLUSTER_RESTORE_PART_BYTES).contains(&content_length) {
+        return send_json(
+            socket,
+            413,
+            "Payload Too Large",
+            r#"{"error":"cluster restore part size is invalid"}"#,
+        )
+        .await;
+    }
+    let bearer = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value.as_str())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let apikey = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("apikey"))
+        .map(|(_, value)| value.as_str())
+        .unwrap_or("");
+    let presented = if apikey.is_empty() { bearer } else { apikey };
+    let auth = match crate::auth::resolve_credential(
+        presented,
+        "",
+        crate::auth::Surface::Http,
+        store,
+        cache,
+    ) {
+        Ok(crate::auth::Credential::Operator) => HttpAuthContext::Operator,
+        Ok(crate::auth::Credential::Secret) => HttpAuthContext::Secret,
+        Ok(crate::auth::Credential::Publishable) => HttpAuthContext::Publishable,
+        Ok(crate::auth::Credential::User(principal)) => HttpAuthContext::User(principal),
+        Ok(crate::auth::Credential::Anonymous) => HttpAuthContext::Anonymous,
+        Err(_) => {
+            return send_json(socket, 401, "Unauthorized", r#"{"error":"unauthorized"}"#).await
+        }
+    };
+    if let Err((status, status_text, body)) = require_project_access(store, &auth) {
+        return send_json(socket, status, status_text, &body).await;
+    }
+    let Some(node) = cluster else {
+        return send_json(
+            socket,
+            409,
+            "Conflict",
+            r#"{"error":"Cluster is not enabled for this engine"}"#,
+        )
+        .await;
+    };
+    let Some(restore_id) = header_value(headers, "x-lux-restore-id") else {
+        return send_json(
+            socket,
+            400,
+            "Bad Request",
+            r#"{"error":"X-Lux-Restore-Id is required"}"#,
+        )
+        .await;
+    };
+    let Some(encoded) = header_value(headers, "x-lux-cluster-part") else {
+        return send_json(
+            socket,
+            400,
+            "Bad Request",
+            r#"{"error":"X-Lux-Cluster-Part descriptor is required"}"#,
+        )
+        .await;
+    };
+    let descriptor = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| {
+            serde_json::from_slice::<crate::cluster::BackupPartDescriptor>(&bytes).ok()
+        });
+    let Some(descriptor) = descriptor else {
+        return send_json(
+            socket,
+            400,
+            "Bad Request",
+            r#"{"error":"invalid X-Lux-Cluster-Part descriptor"}"#,
+        )
+        .await;
+    };
+    if node.validate_restore_part(&descriptor).is_err() {
+        return send_json(
+            socket,
+            409,
+            "Conflict",
+            r#"{"error":"backup part descriptor does not match this node"}"#,
+        )
+        .await;
+    }
+
+    let (upload_path, upload) =
+        match crate::snapshot::create_cluster_restore_upload(store, restore_id) {
+            Ok(value) => value,
+            Err(_) => {
+                return send_json(
+                    socket,
+                    409,
+                    "Conflict",
+                    r#"{"error":"cluster restore upload could not be created"}"#,
+                )
+                .await
+            }
+        };
+    let mut upload = tokio::fs::File::from_std(upload);
+    let mut hash = Sha256::new();
+    let mut written = 0usize;
+    let result = async {
+        upload.write_all(initial).await?;
+        hash.update(initial);
+        written += initial.len();
+        let mut buffer = vec![0u8; 1024 * 1024];
+        while written < content_length {
+            let wanted = (content_length - written).min(buffer.len());
+            let read = socket.read(&mut buffer[..wanted]).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "cluster restore upload ended early",
+                ));
+            }
+            upload.write_all(&buffer[..read]).await?;
+            hash.update(&buffer[..read]);
+            written += read;
+        }
+        upload.flush().await?;
+        upload.sync_all().await?;
+        Ok::<_, std::io::Error>(())
+    }
+    .await;
+    drop(upload);
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&upload_path).await;
+        return send_json(
+            socket,
+            400,
+            "Bad Request",
+            r#"{"error":"cluster restore upload was incomplete"}"#,
+        )
+        .await;
+    }
+    let digest = format!("{:x}", hash.finalize());
+    let store = store.clone();
+    let restore_id = restore_id.to_string();
+    let staged_path = upload_path.clone();
+    let staged = tokio::task::spawn_blocking(move || {
+        crate::snapshot::stage_cluster_restore_file(
+            &store,
+            &restore_id,
+            &staged_path,
+            written as u64,
+            &digest,
+        )
+    })
+    .await;
+    let _ = tokio::fs::remove_file(&upload_path).await;
+    match staged {
+        Ok(Ok(created)) => {
+            send_json(
+                socket,
+                200,
+                "OK",
+                &json!({ "staged": true, "created": created }).to_string(),
+            )
+            .await
+        }
+        _ => {
+            send_json(
+                socket,
+                409,
+                "Conflict",
+                r#"{"error":"cluster restore part could not be staged"}"#,
+            )
+            .await
+        }
+    }
+}
+
+fn is_cluster_backup_control(method: &str, path: &str) -> bool {
+    method == "POST"
+        && matches!(
+            path,
+            "/v1/cluster/backup/prepare"
+                | "/cluster/backup/prepare"
+                | "/v1/cluster/backup/capture"
+                | "/cluster/backup/capture"
+                | "/v1/cluster/backup/release"
+                | "/cluster/backup/release"
+                | "/v1/cluster/backup/finish"
+                | "/cluster/backup/finish"
+        )
+}
+
+async fn handle_cluster_backup_control(
+    socket: &mut tokio::net::TcpStream,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    cluster: Option<&Arc<crate::cluster::ClusterNode>>,
+    headers: &[(String, String)],
+    path: &str,
+    credential: &str,
+) -> std::io::Result<bool> {
+    let Some(node) = cluster else {
+        return send_json(
+            socket,
+            409,
+            "Conflict",
+            r#"{"error":"Cluster is not enabled for this engine"}"#,
+        )
+        .await;
+    };
+    let Some(backup_id) = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-lux-backup-id"))
+        .map(|(_, value)| value.clone())
+    else {
+        return send_json(
+            socket,
+            400,
+            "Bad Request",
+            r#"{"error":"X-Lux-Backup-Id is required"}"#,
+        )
+        .await;
+    };
+    let action = path.rsplit('/').next().unwrap_or_default();
+    let credential = credential.to_string();
+    let result = match action {
+        "prepare" => {
+            let node = (*node).clone();
+            let store = store.clone();
+            let cache = cache.clone();
+            let id = backup_id.clone();
+            tokio::task::spawn_blocking(move || node.prepare_backup(store, cache, &id, &credential))
+                .await
+                .map_err(|error| (500, "Internal Server Error", error.to_string()))
+                .and_then(|result| result.map_err(backup_control_error))
+                .map(|descriptor| {
+                    json!({
+                        "prepared": true,
+                        "backup_id": backup_id,
+                        "descriptor": descriptor,
+                    })
+                })
+        }
+        "capture" => {
+            let node = (*node).clone();
+            let id = backup_id.clone();
+            tokio::task::spawn_blocking(move || node.capture_backup(&id, &credential))
+                .await
+                .map_err(|error| (500, "Internal Server Error", error.to_string()))
+                .and_then(|result| result.map_err(backup_control_error))
+                .map(|()| json!({ "captured": true, "backup_id": backup_id }))
+        }
+        "release" => {
+            let node = (*node).clone();
+            let id = backup_id.clone();
+            tokio::task::spawn_blocking(move || node.release_backup(&id, &credential))
+                .await
+                .map_err(|error| (500, "Internal Server Error", error.to_string()))
+                .and_then(|result| result.map_err(backup_control_error))
+                .map(|released| json!({ "released": released, "backup_id": backup_id }))
+        }
+        "finish" => {
+            let node = (*node).clone();
+            let id = backup_id.clone();
+            tokio::task::spawn_blocking(move || node.finish_backup(&id, &credential))
+                .await
+                .map_err(|error| (500, "Internal Server Error", error.to_string()))
+                .and_then(|result| result.map_err(backup_control_error))
+                .map(|finished| json!({ "finished": finished, "backup_id": backup_id }))
+        }
+        _ => unreachable!(),
+    };
+    match result {
+        Ok(body) => send_json(socket, 200, "OK", &body.to_string()).await,
+        Err((status, status_text, error)) => {
+            send_json(
+                socket,
+                status,
+                status_text,
+                &json!({ "error": error }).to_string(),
+            )
+            .await
+        }
+    }
+}
+
+fn backup_control_error(error: crate::cluster::BackupControlError) -> (u16, &'static str, String) {
+    match error {
+        crate::cluster::BackupControlError::Forbidden => (
+            403,
+            "Forbidden",
+            "backup requires a secret or operator credential".to_string(),
+        ),
+        crate::cluster::BackupControlError::Cluster(error) => (409, "Conflict", error.to_string()),
+    }
+}
+
 /// Stream a table query response using chunked transfer encoding.
 /// Writes rows directly to the socket as they come out of table_select,
 /// without ever building the full JSON string in memory.
@@ -788,7 +1275,15 @@ async fn stream_snapshot(
             }
         };
 
-    let mut file = match tokio::fs::File::open(&path).await {
+    stream_snapshot_file(socket, std::path::Path::new(&path), descriptor).await
+}
+
+async fn stream_snapshot_file(
+    socket: &mut tokio::net::TcpStream,
+    path: &std::path::Path,
+    descriptor: Option<&crate::cluster::BackupPartDescriptor>,
+) -> std::io::Result<bool> {
+    let mut file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
         Err(e) => {
             let body = format!(
