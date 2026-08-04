@@ -2,8 +2,9 @@ pub(crate) mod select;
 pub(crate) use select::*;
 mod distributed;
 pub(crate) use distributed::{
-    export_cluster_table_catalog, install_cluster_table_catalog, prepare_cluster_table_command,
-    validate_cluster_routed_table_command,
+    cluster_table_scan_table, execute_cluster_table_scan, export_cluster_table_catalog,
+    install_cluster_table_catalog, merge_cluster_table_scans, prepare_cluster_table_command,
+    validate_cluster_routed_table_command, validate_cluster_table_scan, ClusterMergedTableScan,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -399,7 +400,7 @@ pub enum JoinType {
 }
 
 /// The full query plan produced by the TSELECT parser
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SelectPlan {
     // FROM
     pub table: String,

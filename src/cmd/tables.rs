@@ -711,10 +711,22 @@ pub fn cmd_tselect(
         }
     };
     match tables::table_select(store, cache, &plan, now) {
-        Ok(SelectResult::Rows(rows)) => {
+        Ok(result) => write_select_result(out, &plan, result),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub(crate) fn write_select_result(
+    out: &mut BytesMut,
+    plan: &tables::SelectPlan,
+    result: SelectResult,
+) {
+    match result {
+        SelectResult::Rows(rows) => {
             resp::write_array_header(out, rows.len());
             for mut row in rows {
-                crate::auth::redact_auth_select_row(&plan, &mut row);
+                crate::auth::redact_auth_select_row(plan, &mut row);
                 resp::write_array_header(out, row.len() * 2);
                 for (k, v) in row {
                     resp::write_bulk(out, &k);
@@ -722,7 +734,7 @@ pub fn cmd_tselect(
                 }
             }
         }
-        Ok(SelectResult::Aggregate(row)) => {
+        SelectResult::Aggregate(row) => {
             // Single aggregate result row
             resp::write_array_header(out, 1);
             resp::write_array_header(out, row.len() * 2);
@@ -731,9 +743,7 @@ pub fn cmd_tselect(
                 resp::write_bulk(out, &v);
             }
         }
-        Err(e) => resp::write_error(out, &e),
     }
-    CmdResult::Written
 }
 
 pub fn cmd_tlist(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {

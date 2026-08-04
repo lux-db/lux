@@ -14,6 +14,7 @@ mod sorted_sets;
 mod streams;
 mod strings;
 mod tables;
+pub(crate) use tables::write_select_result;
 mod timeseries;
 mod vectors;
 
