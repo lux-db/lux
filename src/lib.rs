@@ -6,6 +6,7 @@
 //! pipeline.
 
 mod auth;
+pub mod cluster;
 mod cmd;
 mod command;
 mod disk;

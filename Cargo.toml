@@ -23,6 +23,7 @@ fuzzing = []
 tokio = { version = "1", features = ["full"] }
 rayon = "1"
 bytes = "1"
+arc-swap = "1"
 base64 = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 parking_lot = "0.12"
@@ -42,9 +43,11 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+rcgen = "0.13"
 rsa = { version = "0.9", features = ["pem"] }
 
 [profile.release]
