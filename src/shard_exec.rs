@@ -100,6 +100,18 @@ impl ShardExecutor {
         out: &mut BytesMut,
         now: Instant,
     ) -> Result<(), ShardExecutionError> {
+        self.store.with_persistence_mutation(|| {
+            self.execute_write_batch_inner(shard_idx, commands, out, now)
+        })
+    }
+
+    fn execute_write_batch_inner<'argv, 'data>(
+        &self,
+        shard_idx: usize,
+        commands: &[ShardPipelineCommand<'argv, 'data>],
+        out: &mut BytesMut,
+        now: Instant,
+    ) -> Result<(), ShardExecutionError> {
         let eviction_enabled = crate::eviction::eviction_enabled(&self.store);
         let tiered = self.store.is_tiered();
         let wal_enabled = self.store.wal_enabled();
@@ -178,6 +190,19 @@ impl ShardExecutor {
     }
 
     fn execute_argv_write_batch<A: ArgvSlice>(
+        &self,
+        shard_idx: usize,
+        commands: &[A],
+        access: &[PipelineAccess],
+        out: &mut BytesMut,
+        now: Instant,
+    ) -> Result<(), ShardExecutionError> {
+        self.store.with_persistence_mutation(|| {
+            self.execute_argv_write_batch_inner(shard_idx, commands, access, out, now)
+        })
+    }
+
+    fn execute_argv_write_batch_inner<A: ArgvSlice>(
         &self,
         shard_idx: usize,
         commands: &[A],

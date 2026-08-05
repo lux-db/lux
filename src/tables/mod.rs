@@ -619,16 +619,14 @@ fn schema_has_encrypted_fields(schema: &[FieldDef]) -> bool {
     schema.iter().any(|field| field.encrypted)
 }
 
-fn log_raw_row_wal(store: &Store, table: &str, pk: &str, now: Instant) {
+fn log_raw_row_wal(store: &Store, table: &str, pk: &str, now: Instant) -> Result<(), String> {
     if !store.wal_enabled() {
-        return;
+        return Ok(());
     }
     let rk = row_key_for_pk(table, pk);
-    let Ok(row) = store.hgetall(rk.as_bytes(), now) else {
-        return;
-    };
+    let row = store.hgetall(rk.as_bytes(), now)?;
     if row.is_empty() {
-        return;
+        return Ok(());
     }
     let mut a: Vec<Vec<u8>> = Vec::with_capacity(row.len() * 2 + 3);
     a.push(b"TROWSET".to_vec());
@@ -639,7 +637,9 @@ fn log_raw_row_wal(store: &Store, table: &str, pk: &str, now: Instant) {
         a.push(value.to_vec());
     }
     let refs: Vec<&[u8]> = a.iter().map(|v| v.as_slice()).collect();
-    let _ = store.wal_log_command(&refs);
+    store
+        .wal_log_command_for_key(table.as_bytes(), &refs)
+        .map_err(|error| format!("ERR WAL append failed: {error}"))
 }
 
 pub(crate) fn table_apply_wal_row(
@@ -2112,6 +2112,16 @@ pub fn table_create(
     col_args: &[&str],
     now: Instant,
 ) -> Result<(), String> {
+    store.with_persistence_mutation(|| table_create_inner(store, cache, table, col_args, now))
+}
+
+fn table_create_inner(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    col_args: &[&str],
+    now: Instant,
+) -> Result<(), String> {
     if !is_valid_table_name(table) {
         return Err("ERR invalid table name".to_string());
     }
@@ -2188,7 +2198,9 @@ pub fn table_create(
         for c in orig_col_args {
             a.push(c.as_bytes());
         }
-        let _ = store.wal_log_command(&a);
+        store
+            .wal_log_command_for_key(table.as_bytes(), &a)
+            .map_err(|error| format!("ERR WAL append failed: {error}"))?;
     }
 
     Ok(())
@@ -2461,6 +2473,19 @@ pub fn table_upsert_returning_ttl(
 
 /// Core insert: returns the primary-key string of the new row.
 fn table_insert_pk(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    ttl: Option<TtlOp>,
+    now: Instant,
+) -> Result<String, String> {
+    store.with_persistence_mutation(|| {
+        table_insert_pk_inner(store, cache, table, field_values, ttl, now)
+    })
+}
+
+fn table_insert_pk_inner(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -2816,7 +2841,7 @@ fn table_insert_pk(
     // WAL: log the RESOLVED insert (explicit PK + the resolved column values that
     // were actually stored) so crash replay reproduces this exact row.
     if store.wal_enabled() && schema_has_encrypted_fields(&schema) {
-        log_raw_row_wal(store, table, &pk_str, now);
+        log_raw_row_wal(store, table, &pk_str, now)?;
     } else if store.wal_enabled() {
         let mut a: Vec<Vec<u8>> = Vec::with_capacity(provided.len() * 2 + 6);
         a.push(b"TINSERT".to_vec());
@@ -2839,7 +2864,9 @@ fn table_insert_pk(
             a.push(val);
         }
         let refs: Vec<&[u8]> = a.iter().map(|v| v.as_slice()).collect();
-        let _ = store.wal_log_command(&refs);
+        store
+            .wal_log_command_for_key(table.as_bytes(), &refs)
+            .map_err(|error| format!("ERR WAL append failed: {error}"))?;
     }
 
     // Reactive live queries: hint that this pk changed so watching queries
@@ -2935,6 +2962,20 @@ pub fn table_update(
 
 /// Update a row identified by its raw PK string - works for any PK type (INT, UUID, STR).
 fn table_update_by_pk_str(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    field_values: &[(&str, &str)],
+    ttl: Option<TtlOp>,
+    now: Instant,
+) -> Result<(), String> {
+    store.with_persistence_mutation(|| {
+        table_update_by_pk_str_inner(store, cache, table, pk_str, field_values, ttl, now)
+    })
+}
+
+fn table_update_by_pk_str_inner(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -3059,7 +3100,7 @@ fn table_update_by_pk_str(
     // row.) The TTL op is logged as a trailing `TTL <secs>` clause so replay
     // preserves the row's deadline instead of resetting it.
     if store.wal_enabled() && schema_has_encrypted_fields(&schema) {
-        log_raw_row_wal(store, table, pk_str, now);
+        log_raw_row_wal(store, table, pk_str, now)?;
     } else if store.wal_enabled() {
         let pkcol = pk_column_name(&schema);
         let mut a: Vec<Vec<u8>> = Vec::with_capacity(field_values.len() * 2 + 9);
@@ -3079,7 +3120,9 @@ fn table_update_by_pk_str(
             a.push(val);
         }
         let refs: Vec<&[u8]> = a.iter().map(|v| v.as_slice()).collect();
-        let _ = store.wal_log_command(&refs);
+        store
+            .wal_log_command_for_key(table.as_bytes(), &refs)
+            .map_err(|error| format!("ERR WAL append failed: {error}"))?;
     }
 
     // Reactive live queries: hint that this pk changed.
@@ -3104,6 +3147,19 @@ pub fn table_delete(
 const CASCADE_DEPTH_LIMIT: usize = 16;
 
 fn table_delete_inner(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    now: Instant,
+    depth: usize,
+) -> Result<(), String> {
+    store.with_persistence_mutation(|| {
+        table_delete_inner_exclusive(store, cache, table, pk_str, now, depth)
+    })
+}
+
+fn table_delete_inner_exclusive(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -3322,7 +3378,9 @@ fn table_delete_inner(
             b"=",
             pk_str.as_bytes(),
         ];
-        let _ = store.wal_log_command(&a);
+        store
+            .wal_log_command_for_key(table.as_bytes(), &a)
+            .map_err(|error| format!("ERR WAL append failed: {error}"))?;
     }
 
     // Reactive live queries: hint that this pk changed. Cascaded child deletes
@@ -3633,6 +3691,15 @@ pub fn table_drop(
     table: &str,
     now: Instant,
 ) -> Result<(), String> {
+    store.with_persistence_mutation(|| table_drop_inner(store, cache, table, now))
+}
+
+fn table_drop_inner(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    now: Instant,
+) -> Result<(), String> {
     if crate::auth::is_reserved_auth_table(table) {
         return Err(format!("ERR table '{}' is managed by Lux Auth", table));
     }
@@ -3721,7 +3788,9 @@ pub fn table_drop(
     // TDROP bypasses execute_with_wal).
     if store.wal_enabled() {
         let a: Vec<&[u8]> = vec![b"TDROP", table.as_bytes()];
-        let _ = store.wal_log_command(&a);
+        store
+            .wal_log_command_for_key(table.as_bytes(), &a)
+            .map_err(|error| format!("ERR WAL append failed: {error}"))?;
     }
 
     Ok(())

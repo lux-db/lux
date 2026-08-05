@@ -326,7 +326,8 @@ fn final_fence_waits_for_admitted_writers_and_rejects_new_ones() {
     target.seal(&receipt).unwrap();
     source.mark_topology_committed(4).unwrap();
     target.mark_target_applied(&receipt).unwrap();
-    target.mark_target_ready(&receipt).unwrap();
+    let proof = crate::cluster::TargetReadyProof::for_test(receipt.transfer_id);
+    target.mark_target_ready(&receipt, &proof).unwrap();
     target.mark_topology_committed(4).unwrap();
     let activated_snapshot = source.snapshot();
 

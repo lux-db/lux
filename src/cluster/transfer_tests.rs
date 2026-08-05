@@ -125,7 +125,8 @@ fn chained_chunks_are_ordered_idempotent_and_durable() {
     source.seal(&final_receipt).unwrap();
     target.mark_target_applied(&final_receipt).unwrap();
     assert!(target.mark_topology_committed(4).is_err());
-    target.mark_target_ready(&final_receipt).unwrap();
+    let proof = TargetReadyProof::for_test(final_receipt.transfer_id);
+    target.mark_target_ready(&final_receipt, &proof).unwrap();
     target.mark_topology_committed(4).unwrap();
     source.mark_topology_committed(4).unwrap();
     assert!(matches!(
@@ -572,8 +573,9 @@ fn state_transitions_are_idempotent_but_late_progress_fails_closed() {
     target.mark_target_applied(&receipt).unwrap();
     target.mark_target_applied(&receipt).unwrap();
     assert!(target.mark_topology_committed(4).is_err());
-    target.mark_target_ready(&receipt).unwrap();
-    target.mark_target_ready(&receipt).unwrap();
+    let proof = TargetReadyProof::for_test(receipt.transfer_id);
+    target.mark_target_ready(&receipt, &proof).unwrap();
+    target.mark_target_ready(&receipt, &proof).unwrap();
     target.mark_topology_committed(4).unwrap();
     source.finalize().unwrap();
     assert!(target.finalize().is_err());

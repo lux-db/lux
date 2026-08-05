@@ -6,7 +6,7 @@ use super::transfer::{
 use super::transfer_stage::{
     stage_header, validate_stage_contents, TransferStageReader, STAGE_HEADER_BYTES,
 };
-use super::ClusterError;
+use super::{ClusterError, TargetReadyProof};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -115,6 +115,26 @@ impl TransferJournal {
             TransferPhase::Sealed | TransferPhase::Applied
         ) {
             return transfer_invalid("target stage can be applied only before activation");
+        }
+        self.reconcile_stage(&snapshot)?;
+        TransferStageReader::open(&self.stage_path, &snapshot)
+    }
+
+    pub(crate) fn open_target_checkpoint_reader(
+        &self,
+        proof: &TargetReadyProof,
+    ) -> Result<TransferStageReader, ClusterError> {
+        let snapshot = self.inner.lock().snapshot.clone();
+        require_role(&snapshot, TransferRole::Target)?;
+        proof.validate_transfer(snapshot.descriptor.transfer_id)?;
+        if !matches!(
+            snapshot.phase,
+            TransferPhase::Sealed
+                | TransferPhase::Applied
+                | TransferPhase::Ready
+                | TransferPhase::Activated
+        ) {
+            return transfer_invalid("target checkpoint cannot replay in this phase");
         }
         self.reconcile_stage(&snapshot)?;
         TransferStageReader::open(&self.stage_path, &snapshot)
@@ -451,25 +471,47 @@ impl TransferJournal {
         Ok(())
     }
 
-    /// Record that canonical data is applied, row-local table metadata has been
-    /// rebuilt, and the target has a durable recovery point ordered before any
-    /// writes it may serve. Callers must complete all three before presenting
-    /// this transition; topology activation rejects the earlier `Applied` phase.
-    #[cfg(test)]
-    pub(crate) fn mark_target_ready(&self, expected: &TransferReceipt) -> Result<(), ClusterError> {
+    pub(crate) fn mark_target_applied_from_checkpoint(
+        &self,
+        expected: &TransferReceipt,
+        proof: &TargetReadyProof,
+    ) -> Result<(), ClusterError> {
         self.mutate(|snapshot| {
             require_role(snapshot, TransferRole::Target)?;
+            proof.validate_transfer(snapshot.descriptor.transfer_id)?;
+            validate_receipt_identity(snapshot, expected)?;
+            if receipt(snapshot) != *expected {
+                return transfer_invalid("checkpoint receipt does not match durable progress");
+            }
+            match snapshot.phase {
+                TransferPhase::Sealed => snapshot.phase = TransferPhase::Applied,
+                TransferPhase::Applied | TransferPhase::Ready | TransferPhase::Activated => {}
+                _ => return transfer_invalid("target checkpoint replay is invalid in this phase"),
+            }
+            Ok(())
+        })
+    }
+
+    /// Accept readiness only from an opaque proof created after the exact WAL
+    /// cutover and target marker are durable. Topology activation continues to
+    /// reject the earlier `Applied` phase.
+    pub(crate) fn mark_target_ready(
+        &self,
+        expected: &TransferReceipt,
+        proof: &TargetReadyProof,
+    ) -> Result<(), ClusterError> {
+        self.mutate(|snapshot| {
+            require_role(snapshot, TransferRole::Target)?;
+            proof.validate_transfer(snapshot.descriptor.transfer_id)?;
             validate_receipt_identity(snapshot, expected)?;
             if receipt(snapshot) != *expected {
                 return transfer_invalid("ready target receipt does not match durable progress");
             }
-            if snapshot.phase == TransferPhase::Ready {
-                return Ok(());
+            match snapshot.phase {
+                TransferPhase::Applied => snapshot.phase = TransferPhase::Ready,
+                TransferPhase::Ready | TransferPhase::Activated => {}
+                _ => return transfer_invalid("target cannot become ready before data is applied"),
             }
-            if snapshot.phase != TransferPhase::Applied {
-                return transfer_invalid("target cannot become ready before data is applied");
-            }
-            snapshot.phase = TransferPhase::Ready;
             Ok(())
         })
     }

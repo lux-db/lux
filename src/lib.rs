@@ -687,7 +687,7 @@ impl EmbeddedClient {
         &self,
         command: command::Command<'_>,
     ) -> Result<CommandOutput, LuxError> {
-        if let Some(output) = self.execute_command_fast_path(&command).await? {
+        if let Some(output) = self.execute_command_fast_path(&command)? {
             return Ok(output);
         }
         let resp = self.execute_owned(command.to_owned_argv()).await?;
@@ -813,35 +813,40 @@ impl EmbeddedClient {
             let emit_key_events = self.runtime.broker.has_key_subs();
             let mut write_argvs = Vec::new();
             if has_write {
-                if emit_key_events {
-                    write_argvs.reserve(batch.len());
-                }
-                for command in batch {
-                    if command_is_fast_path_write(command) {
-                        ensure_write_allowed(&self.runtime.store)?;
-                        if emit_key_events {
-                            let argv = command.to_owned_argv();
-                            let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                            self.runtime
-                                .store
-                                .wal_log_command(&refs)
-                                .map_err(wal_lux_error)?;
-                            write_argvs.push(argv);
-                        } else {
-                            wal_log_native_command(&self.runtime.store, command)?;
+                self.runtime.store.with_persistence_mutation(|| {
+                    if emit_key_events {
+                        write_argvs.reserve(batch.len());
+                    }
+                    for command in batch {
+                        if command_is_fast_path_write(command) {
+                            ensure_write_allowed(&self.runtime.store)?;
+                            if emit_key_events {
+                                let argv = command.to_owned_argv();
+                                let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                                self.runtime
+                                    .store
+                                    .wal_log_command(&refs)
+                                    .map_err(wal_lux_error)?;
+                                write_argvs.push(argv);
+                            } else {
+                                wal_log_native_command(&self.runtime.store, command)?;
+                            }
                         }
                     }
-                }
 
-                let mut shard = self.runtime.store.lock_write_shard(shard_idx);
-                shard.version += 1;
-                for command in batch {
-                    if collect_outputs {
-                        outputs.push(self.execute_native_write_on_shard(command, &mut shard, now)?);
-                    } else {
-                        self.execute_native_write_on_shard_discard(command, &mut shard, now)?;
+                    let mut shard = self.runtime.store.lock_write_shard(shard_idx);
+                    shard.version += 1;
+                    for command in batch {
+                        if collect_outputs {
+                            outputs.push(
+                                self.execute_native_write_on_shard(command, &mut shard, now)?,
+                            );
+                        } else {
+                            self.execute_native_write_on_shard_discard(command, &mut shard, now)?;
+                        }
                     }
-                }
+                    Ok::<_, LuxError>(())
+                })?;
             } else if collect_outputs {
                 let shard = self.runtime.store.lock_read_shard(shard_idx);
                 for command in batch {
@@ -868,6 +873,16 @@ impl EmbeddedClient {
     }
 
     fn execute_mset_pipeline_batch(
+        &self,
+        commands: &[Command<'_>],
+        now: Instant,
+    ) -> Result<(), LuxError> {
+        self.runtime
+            .store
+            .with_persistence_mutation(|| self.execute_mset_pipeline_batch_inner(commands, now))
+    }
+
+    fn execute_mset_pipeline_batch_inner(
         &self,
         commands: &[Command<'_>],
         now: Instant,
@@ -1090,7 +1105,7 @@ impl EmbeddedClient {
                     .lpush_on_shard(shard, key, values, now)
                     .map_err(LuxError::Command)?;
                 self.runtime.store.remove_from_disk(key);
-                self.drain_list_waiters_on_shard(key, shard, now);
+                self.drain_list_waiters_on_shard(key, shard, now)?;
                 Ok(CommandOutput::Int(n))
             }
             Command::RPush { key, values } => {
@@ -1100,7 +1115,7 @@ impl EmbeddedClient {
                     .rpush_on_shard(shard, key, values, now)
                     .map_err(LuxError::Command)?;
                 self.runtime.store.remove_from_disk(key);
-                self.drain_list_waiters_on_shard(key, shard, now);
+                self.drain_list_waiters_on_shard(key, shard, now)?;
                 Ok(CommandOutput::Int(n))
             }
             Command::LPop { key } => {
@@ -1251,7 +1266,7 @@ impl EmbeddedClient {
             .map(|_| ())
     }
 
-    async fn execute_command_fast_path(
+    fn execute_command_fast_path(
         &self,
         command: &Command<'_>,
     ) -> Result<Option<CommandOutput>, LuxError> {
@@ -1261,6 +1276,19 @@ impl EmbeddedClient {
             return Ok(None);
         }
 
+        if command_is_fast_path_write(command) {
+            return self
+                .runtime
+                .store
+                .with_persistence_mutation(|| self.execute_command_fast_path_inner(command));
+        }
+        self.execute_command_fast_path_inner(command)
+    }
+
+    fn execute_command_fast_path_inner(
+        &self,
+        command: &Command<'_>,
+    ) -> Result<Option<CommandOutput>, LuxError> {
         let now = Instant::now();
         if command_is_fast_path_write(command) {
             ensure_write_allowed(&self.runtime.store)?;
@@ -1423,7 +1451,7 @@ impl EmbeddedClient {
                     .store
                     .lpush(key, values, now)
                     .map_err(LuxError::Command)?;
-                self.drain_list_waiters(key, now);
+                self.drain_list_waiters(key, now)?;
                 CommandOutput::Int(n)
             }
             Command::RPush { key, values } => {
@@ -1432,7 +1460,7 @@ impl EmbeddedClient {
                     .store
                     .rpush(key, values, now)
                     .map_err(LuxError::Command)?;
-                self.drain_list_waiters(key, now);
+                self.drain_list_waiters(key, now)?;
                 CommandOutput::Int(n)
             }
             Command::LPop { key } => optional_bulk_output(self.runtime.store.lpop(key, now)),
@@ -1743,31 +1771,36 @@ impl EmbeddedClient {
         Ok(Some(output))
     }
 
-    fn drain_list_waiters(&self, key: &[u8], now: Instant) {
+    fn drain_list_waiters(&self, key: &[u8], now: Instant) -> Result<(), LuxError> {
         if !self.runtime.broker.has_list_waiters("") {
-            return;
+            return Ok(());
         }
         let key_s = std::str::from_utf8(key).unwrap_or("");
         if self.runtime.broker.has_list_waiters(key_s) {
             let shard_idx = self.runtime.store.shard_for_key(key);
             let mut shard = self.runtime.store.lock_write_shard(shard_idx);
-            self.drain_list_waiters_on_shard(key, &mut shard, now);
+            self.drain_list_waiters_on_shard(key, &mut shard, now)?;
         }
+        Ok(())
     }
 
-    fn drain_list_waiters_on_shard(&self, key: &[u8], shard: &mut store::Shard, now: Instant) {
+    fn drain_list_waiters_on_shard(
+        &self,
+        key: &[u8],
+        shard: &mut store::Shard,
+        now: Instant,
+    ) -> Result<(), LuxError> {
         if !self.runtime.broker.has_list_waiters("") {
-            return;
+            return Ok(());
         }
         let key_s = std::str::from_utf8(key).unwrap_or("");
         if self.runtime.broker.has_list_waiters(key_s) {
-            self.runtime.broker.drain_list_waiters(
-                key_s,
-                &mut shard.data,
-                &self.runtime.store,
-                now,
-            );
+            self.runtime
+                .broker
+                .drain_list_waiters(key_s, &mut shard.data, &self.runtime.store, now)
+                .map_err(wal_lux_error)?;
         }
+        Ok(())
     }
 
     /// Executes a raw Redis command pipeline and returns raw RESP bytes for all replies.
@@ -2007,14 +2040,7 @@ impl EmbeddedClient {
             ));
         };
 
-        wait_for_blocking_pop(
-            &self.runtime.store,
-            &self.runtime.broker,
-            &owned_keys,
-            timeout,
-            pop_left,
-        )
-        .await
+        wait_for_blocking_pop(&self.runtime.broker, &owned_keys, timeout, pop_left).await
     }
 
     async fn execute_owned(&self, argv: Vec<Vec<u8>>) -> Result<bytes::Bytes, LuxError> {
@@ -2720,7 +2746,6 @@ fn parse_blocking_pop_value(buf: &[u8]) -> Result<Option<(String, bytes::Bytes)>
 }
 
 async fn wait_for_blocking_pop(
-    store: &Store,
     broker: &Broker,
     keys: &[String],
     timeout: Duration,
@@ -2745,10 +2770,6 @@ async fn wait_for_blocking_pop(
         val = rx.recv() => val,
         _ = tokio::time::sleep(timeout) => None,
     };
-
-    if let Some((key, _)) = &result {
-        wal_log_blocked_pop(store, key.as_bytes(), pop_left);
-    }
 
     broker.remove_list_waiters_by_id(keys, waiter_id);
     Ok(result)
@@ -4364,8 +4385,7 @@ async fn handle_connection(
                         timeout,
                         pop_left,
                     } => {
-                        handle_block_pop(&mut socket, &store, &broker, &keys, timeout, pop_left)
-                            .await?;
+                        handle_block_pop(&mut socket, &broker, &keys, timeout, pop_left).await?;
                     }
                     CmdResult::BlockMove {
                         src,
@@ -4439,23 +4459,8 @@ async fn handle_connection(
     }
 }
 
-/// Log the pop that satisfied a blocked BLPOP/BRPOP/BLMOVE. The element was
-/// already removed from `key` in memory by the pushing side's drain, and the
-/// push that satisfied us was WAL-logged before we woke, so appending the
-/// matching pop here keeps WAL replay from resurrecting the element (ENG-1317).
-/// Runs in the woken task with no shard locks held, so there is no
-/// memory->WAL lock nesting.
-fn wal_log_blocked_pop(store: &Store, key: &[u8], pop_left: bool) {
-    if !store.wal_enabled() {
-        return;
-    }
-    let pop: &[u8] = if pop_left { b"LPOP" } else { b"RPOP" };
-    let _ = store.wal_log_command(&[pop, key]);
-}
-
 async fn handle_block_pop(
     socket: &mut tokio::net::TcpStream,
-    store: &Arc<Store>,
     broker: &Broker,
     keys: &[String],
     timeout: std::time::Duration,
@@ -4484,7 +4489,6 @@ async fn handle_block_pop(
 
     match result {
         Some((key, val)) => {
-            wal_log_blocked_pop(store, key.as_bytes(), pop_left);
             resp::write_array_header(&mut write_buf, 2);
             resp::write_bulk(&mut write_buf, &key);
             resp::write_bulk_raw(&mut write_buf, &val);
@@ -4531,28 +4535,29 @@ async fn handle_block_move(
 
     match result {
         Some((_key, val)) => {
-            let now = Instant::now();
-            let vals: &[&[u8]] = &[val.as_ref()];
-            if dst_left {
-                let _ = store.lpush(dst.as_bytes(), vals, now);
-            } else {
-                let _ = store.rpush(dst.as_bytes(), vals, now);
+            let moved = store.with_persistence_mutation(|| -> Result<(), String> {
+                let now = Instant::now();
+                let vals: &[&[u8]] = &[val.as_ref()];
+                if dst_left {
+                    store.lpush(dst.as_bytes(), vals, now)?;
+                } else {
+                    store.rpush(dst.as_bytes(), vals, now)?;
+                }
+                // The source pop was persisted by the pushing task before it
+                // removed the element. Persist the destination half before the
+                // blocked move can be acknowledged.
+                if store.wal_enabled() {
+                    let push: &[u8] = if dst_left { b"LPUSH" } else { b"RPUSH" };
+                    store
+                        .wal_log_command(&[push, dst.as_bytes(), val.as_ref()])
+                        .map_err(|error| format!("ERR WAL append failed: {error}"))?;
+                }
+                Ok(())
+            });
+            match moved {
+                Ok(()) => resp::write_bulk_raw(&mut write_buf, &val),
+                Err(error) => resp::write_error(&mut write_buf, &error),
             }
-            // Log both effects of the completed move: the src pop (done in the
-            // pushing side's drain) and the dst push (done just above). Neither
-            // went through the WAL yet; the satisfying push to src was logged
-            // before we woke, so replay order is push(src), pop(src), push(dst)
-            // -> element ends up only in dst (ENG-1317). Batched so a same-shard
-            // move is one atomic frame; a cross-shard move splits per shard.
-            if store.wal_enabled() {
-                let pop: &[u8] = if src_left { b"LPOP" } else { b"RPOP" };
-                let push: &[u8] = if dst_left { b"LPUSH" } else { b"RPUSH" };
-                let pop_cmd: [&[u8]; 2] = [pop, src.as_bytes()];
-                let push_cmd: [&[u8]; 3] = [push, dst.as_bytes(), val.as_ref()];
-                let batch: [&[&[u8]]; 2] = [&pop_cmd, &push_cmd];
-                let _ = store.wal_log_command_batch(&batch);
-            }
-            resp::write_bulk_raw(&mut write_buf, &val);
         }
         None => {
             resp::write_null(&mut write_buf);
@@ -4680,15 +4685,17 @@ fn handle_eval(
         script.to_string()
     };
 
-    let _guard = store.script_write_guard();
-    match lua::eval(&actual_script, keys, argv, store, broker, now) {
-        Ok(result) => {
-            out.extend_from_slice(&result);
+    let _script = store.script_write_guard();
+    store.with_persistence_mutation(|| {
+        match lua::eval(&actual_script, keys, argv, store, broker, now) {
+            Ok(result) => {
+                out.extend_from_slice(&result);
+            }
+            Err(e) => {
+                resp::write_error(out, &e);
+            }
         }
-        Err(e) => {
-            resp::write_error(out, &e);
-        }
-    }
+    });
 }
 
 async fn handle_block_lmpop(
@@ -4705,16 +4712,21 @@ async fn handle_block_lmpop(
 
     loop {
         let now = Instant::now();
-        match store.lmpop(&key_refs, pop_left, count, now) {
-            Ok(Some((key, items))) => {
-                // Popped straight from the store outside the WAL; log the
-                // compensating LPOP/RPOP keyed on the popped key so replay stays
-                // correct (ENG-1316/1317). No shard locks held here.
+        let popped = store.with_persistence_mutation(|| {
+            let popped = store.lmpop(&key_refs, pop_left, count, now)?;
+            if let Some((key, items)) = &popped {
                 if store.wal_enabled() {
                     let pop: &[u8] = if pop_left { b"LPOP" } else { b"RPOP" };
                     let n = items.len().to_string();
-                    let _ = store.wal_log_command(&[pop, &key, n.as_bytes()]);
+                    store
+                        .wal_log_command(&[pop, key, n.as_bytes()])
+                        .map_err(|error| format!("ERR WAL append failed: {error}"))?;
                 }
+            }
+            Ok::<_, String>(popped)
+        });
+        match popped {
+            Ok(Some((key, items))) => {
                 resp::write_array_header(&mut write_buf, 2);
                 resp::write_bulk_raw(&mut write_buf, &key);
                 resp::write_array_header(&mut write_buf, items.len());
@@ -4756,19 +4768,25 @@ async fn handle_block_zmpop(
 
     loop {
         let now = Instant::now();
-        match store.zmpop(&key_refs, pop_min, count, now) {
-            Ok(Some((key, items))) => {
-                // Popped straight from the store outside the WAL; self-log the
-                // removal as a keyed ZREM so replay stays correct (ENG-1316/1317).
+        let popped = store.with_persistence_mutation(|| {
+            let popped = store.zmpop(&key_refs, pop_min, count, now)?;
+            if let Some((key, items)) = &popped {
                 if store.wal_enabled() {
                     let mut zrem: Vec<&[u8]> = Vec::with_capacity(items.len() + 2);
                     zrem.push(b"ZREM");
-                    zrem.push(&key);
-                    for (m, _) in &items {
-                        zrem.push(m.as_bytes());
+                    zrem.push(key);
+                    for (member, _) in items {
+                        zrem.push(member.as_bytes());
                     }
-                    let _ = store.wal_log_command(&zrem);
+                    store
+                        .wal_log_command(&zrem)
+                        .map_err(|error| format!("ERR WAL append failed: {error}"))?;
                 }
+            }
+            Ok::<_, String>(popped)
+        });
+        match popped {
+            Ok(Some((key, items))) => {
                 resp::write_array_header(&mut write_buf, 2);
                 resp::write_bulk_raw(&mut write_buf, &key);
                 resp::write_array_header(&mut write_buf, items.len());
@@ -4813,22 +4831,24 @@ async fn handle_block_zpop(
     loop {
         let now = Instant::now();
         for key in keys {
-            let result = if pop_min {
-                store.zpopmin(key.as_bytes(), 1, now)
-            } else {
-                store.zpopmax(key.as_bytes(), 1, now)
-            };
-            if let Ok(items) = result {
-                if !items.is_empty() {
-                    let (member, score) = &items[0];
-                    // BZPOPMIN/BZPOPMAX pop straight from the store here, outside
-                    // the WAL; log the removal of the exact member so replay
-                    // doesn't resurrect it (ENG-1317). Keyed on `key` -> correct
-                    // shard; no shard locks held at this point.
+            let result = store.with_persistence_mutation(|| {
+                let items = if pop_min {
+                    store.zpopmin(key.as_bytes(), 1, now)
+                } else {
+                    store.zpopmax(key.as_bytes(), 1, now)
+                }?;
+                if let Some((member, _)) = items.first() {
                     if store.wal_enabled() {
-                        let _ =
-                            store.wal_log_command(&[b"ZREM", key.as_bytes(), member.as_bytes()]);
+                        store
+                            .wal_log_command(&[b"ZREM", key.as_bytes(), member.as_bytes()])
+                            .map_err(|error| format!("ERR WAL append failed: {error}"))?;
                     }
+                }
+                Ok::<_, String>(items)
+            });
+            match result {
+                Ok(items) if !items.is_empty() => {
+                    let (member, score) = &items[0];
                     resp::write_array_header(&mut write_buf, 3);
                     resp::write_bulk(&mut write_buf, key);
                     resp::write_bulk(&mut write_buf, member);
@@ -4838,6 +4858,11 @@ async fn handle_block_zpop(
                         format!("{}", score)
                     };
                     resp::write_bulk(&mut write_buf, &score_str);
+                    return socket.write_all(&write_buf).await;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    resp::write_error(&mut write_buf, &error);
                     return socket.write_all(&write_buf).await;
                 }
             }

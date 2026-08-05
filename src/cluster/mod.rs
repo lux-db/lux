@@ -9,6 +9,7 @@ mod signature;
 mod topology;
 mod topology_state;
 mod transfer;
+mod transfer_checkpoint;
 mod transfer_coordinator;
 mod transfer_dirty;
 mod transfer_journal;
@@ -49,6 +50,7 @@ pub use transfer::{
     TransferJournalSnapshot, TransferPhase, TransferReceipt, TransferRole,
     MAX_TRANSFER_CHUNK_BYTES,
 };
+pub use transfer_checkpoint::{TargetCheckpoint, TargetReadyProof};
 pub use transfer_coordinator::{apply_target_store_transfer, SourceStoreTransfer};
 pub use transfer_journal::TransferJournal;
 pub use transfer_runtime::{

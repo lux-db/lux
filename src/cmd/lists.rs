@@ -122,13 +122,16 @@ fn push_list(
                     return CmdResult::Written;
                 }
             }
-            resp::write_integer(out, n);
             let key_s = arg_str(args[1]);
             if broker.has_list_waiters(key_s) {
                 let shard_idx = store.shard_for_key(args[1]);
                 let mut shard = store.lock_write_shard(shard_idx);
-                broker.drain_list_waiters(key_s, &mut shard.data, store, now);
+                if let Err(error) = broker.drain_list_waiters(key_s, &mut shard.data, store, now) {
+                    resp::write_error(out, &format!("ERR WAL append failed: {error}"));
+                    return CmdResult::Written;
+                }
             }
+            resp::write_integer(out, n);
         }
         Err(e) => resp::write_error(out, &e),
     }

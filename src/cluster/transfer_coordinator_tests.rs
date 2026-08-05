@@ -261,7 +261,8 @@ fn fuzzy_snapshot_plus_dirty_round_converges_target_to_source() {
 
     source.mark_topology_committed(descriptor.to_epoch).unwrap();
     assert!(target.mark_topology_committed(descriptor.to_epoch).is_err());
-    target.mark_target_ready(&receipt).unwrap();
+    let proof = crate::cluster::TargetReadyProof::for_test(receipt.transfer_id);
+    target.mark_target_ready(&receipt, &proof).unwrap();
     target.mark_topology_committed(descriptor.to_epoch).unwrap();
     target_store.set(b"account:a", b"post-activation", None, Instant::now());
     assert!(

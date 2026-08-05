@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 mod cluster_transfer;
 mod hashes;
+mod persistence;
 mod sorted_sets;
 mod streams;
 mod timeseries;
@@ -541,6 +542,10 @@ pub struct Store {
     /// Serializes Lua script execution for this runtime without blocking other
     /// embedded Lux instances in the same process.
     script_gate: RwLock<()>,
+    /// Quiescent boundary shared by WAL-backed mutations, snapshots, and
+    /// ownership cutovers. Normal writers remain concurrent; point-in-time
+    /// persistence closes admission and waits for in-flight writers.
+    persistence_barrier: persistence::Barrier,
     pub(crate) vector_indexes: RwLock<HashMap<u32, crate::hnsw::HnswIndex, FxBuildHasher>>,
     pub(crate) table_vector_indexes:
         RwLock<HashMap<(u32, String), crate::hnsw::HnswIndex, FxBuildHasher>>,
@@ -766,6 +771,7 @@ impl Store {
             shards: shards.into_boxed_slice(),
             metrics: StoreMetrics::new(),
             script_gate: RwLock::new(()),
+            persistence_barrier: persistence::Barrier::new(),
             vector_indexes: RwLock::new(HashMap::with_hasher(FxBuildHasher)),
             table_vector_indexes: RwLock::new(HashMap::with_hasher(FxBuildHasher)),
             disk_shards,
@@ -850,6 +856,11 @@ impl Store {
     }
 
     pub(crate) fn enc_rewrap_all(&self) -> Result<usize, String> {
+        self.with_persistence_cutover(|| self.enc_rewrap_all_exclusive())
+            .map_err(|error| format!("ERR rewrap persistence cutover failed: {error}"))?
+    }
+
+    fn enc_rewrap_all_exclusive(&self) -> Result<usize, String> {
         let mut count = 0usize;
         for idx in 0..self.shards.len() {
             let mut shard = self.shards[idx].write();
@@ -994,6 +1005,11 @@ impl Store {
     }
 
     pub(crate) fn enc_retire_key(&self, key_id: &str) -> Result<(), String> {
+        self.with_persistence_cutover(|| self.enc_retire_key_exclusive(key_id))
+            .map_err(|error| format!("ERR retire persistence cutover failed: {error}"))?
+    }
+
+    fn enc_retire_key_exclusive(&self, key_id: &str) -> Result<(), String> {
         let remaining = self.encryption().remaining_key_ids_without(key_id);
         if remaining.is_empty() {
             return Err("ERR ENC cannot retire the last key".to_string());
@@ -1230,6 +1246,20 @@ impl Store {
 
     pub(crate) fn script_write_guard(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
         self.script_gate.write()
+    }
+
+    #[inline]
+    pub(crate) fn with_persistence_mutation<R>(&self, operation: impl FnOnce() -> R) -> R {
+        self.persistence_barrier.with_mutation(operation)
+    }
+
+    pub(crate) fn with_persistence_cutover<R>(
+        &self,
+        operation: impl FnOnce() -> R,
+    ) -> Result<R, &'static str> {
+        self.persistence_barrier
+            .with_cutover(operation)
+            .map_err(|_| "cannot begin a persistence cutover from inside a mutation")
     }
 
     pub fn shard_count(&self) -> usize {
@@ -1491,7 +1521,9 @@ impl Store {
     }
 
     /// Append a command to the per-shard WAL. Uses the key (args[1]) to
-    /// determine which shard's WAL to write to. Suppressed during WAL replay
+    /// determine which shard's WAL to write to. Commands whose grammar does
+    /// not put their persistence key in args[1] must use
+    /// [`Self::wal_log_command_for_key`] instead. Suppressed during WAL replay
     /// and snapshot loading to prevent re-logging replayed commands.
     ///
     /// Global commands (FLUSHDB, FLUSHALL) are written to ALL WAL shards
@@ -1521,18 +1553,49 @@ impl Store {
                     }
                 }
             } else if args.len() >= 2 {
-                let idx = self.disk_shard_index(args[1]);
-                let mut wal = ws[idx].lock();
-                if let Err(e) = wal.append_command(args) {
-                    self.record_wal_append_error();
-                    self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
-                        error: e.to_string(),
-                    });
-                    return Err(e);
-                }
+                return self.wal_log_command_for_key(args[1], args);
             }
         }
         Ok(())
+    }
+
+    /// Append `args` to the WAL lane selected by `key`, independently of the
+    /// command's wire grammar. Table commands use this because `TDELETE FROM`
+    /// has `FROM`, not the table name, in args[1]. Keeping every operation for
+    /// one table on its table-selected lane is also required for ordered replay.
+    pub(crate) fn wal_log_command_for_key(
+        &self,
+        key: &[u8],
+        args: &[&[u8]],
+    ) -> std::io::Result<()> {
+        if self.wal_suppress.load(Ordering::Relaxed) || args.is_empty() {
+            return Ok(());
+        }
+        let Some(wal_shards) = &self.wal_shards else {
+            return Ok(());
+        };
+        let index = self.disk_shard_index(key);
+        let mut wal = wal_shards[index].lock();
+        if let Err(error) = wal.append_command(args) {
+            self.record_wal_append_error();
+            self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
+                error: error.to_string(),
+            });
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wal_commands_for_key(&self, key: &[u8]) -> Vec<Vec<Vec<u8>>> {
+        let Some(wal_shards) = &self.wal_shards else {
+            return Vec::new();
+        };
+        wal_shards[self.disk_shard_index(key)]
+            .lock()
+            .replay()
+            .expect("test WAL must be readable")
+            .commands
     }
 
     pub(crate) fn wal_log_command_batch<'a>(
@@ -1630,6 +1693,154 @@ impl Store {
         }
         self.wal_suppress
             .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Flush every WAL shard and capture one exact cutover boundary per shard.
+    ///
+    /// Callers must exclude concurrent WAL-backed mutations while collecting
+    /// the set; otherwise the individual offsets would not describe one logical
+    /// cutover. Ownership checkpoints do this behind the persistence barrier.
+    pub(crate) fn durable_wal_boundaries(&self) -> std::io::Result<Vec<crate::disk::WalBoundary>> {
+        let Some(wal_shards) = &self.wal_shards else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "durable ownership checkpoints require tiered WAL storage",
+            ));
+        };
+        wal_shards
+            .iter()
+            .map(|wal| wal.lock().durable_boundary())
+            .collect()
+    }
+
+    /// Rebuild one crash cutover in three ordered phases: every WAL prefix,
+    /// the caller's durable checkpoint, then every WAL suffix.
+    ///
+    /// All boundaries are validated before replay mutates the Store. A replaced
+    /// generation, an offset inside a frame, or any checksummed corruption
+    /// fails closed. This path is intentionally stricter than legacy best-effort
+    /// replay because ownership activation promises zero lost committed writes.
+    pub(crate) fn replay_wal_at_boundaries(
+        &self,
+        broker: &crate::pubsub::Broker,
+        boundaries: &[crate::disk::WalBoundary],
+        cutover: impl FnOnce() -> Result<(), crate::cluster::ClusterError>,
+    ) -> Result<usize, crate::cluster::ClusterError> {
+        let Some(wal_shards) = &self.wal_shards else {
+            return Err(crate::cluster::ClusterError::InvalidTransfer(
+                "durable ownership recovery requires tiered WAL storage".to_owned(),
+            ));
+        };
+        if boundaries.len() != wal_shards.len() {
+            return Err(crate::cluster::ClusterError::InvalidTransfer(
+                "ownership checkpoint WAL shard count does not match this Store".to_owned(),
+            ));
+        }
+        for (wal, boundary) in wal_shards.iter().zip(boundaries.iter().copied()) {
+            wal.lock().validate_boundary(boundary)?;
+        }
+
+        let was_suppressed = self
+            .wal_suppress
+            .swap(true, std::sync::atomic::Ordering::Relaxed);
+        let result = (|| {
+            let schema_cache =
+                std::sync::Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+            let mut total = 0_usize;
+            for (wal, boundary) in wal_shards.iter().zip(boundaries.iter().copied()) {
+                let replay = wal.lock().replay_before(boundary)?;
+                total = total
+                    .checked_add(self.execute_strict_wal_replay(broker, &schema_cache, replay)?)
+                    .ok_or_else(|| {
+                        crate::cluster::ClusterError::InvalidTransfer(
+                            "ownership WAL replay count is exhausted".to_owned(),
+                        )
+                    })?;
+            }
+            cutover()?;
+            for (wal, boundary) in wal_shards.iter().zip(boundaries.iter().copied()) {
+                let replay = wal.lock().replay_after(boundary)?;
+                total = total
+                    .checked_add(self.execute_strict_wal_replay(broker, &schema_cache, replay)?)
+                    .ok_or_else(|| {
+                        crate::cluster::ClusterError::InvalidTransfer(
+                            "ownership WAL replay count is exhausted".to_owned(),
+                        )
+                    })?;
+            }
+            Ok(total)
+        })();
+        self.wal_suppress
+            .store(was_suppressed, std::sync::atomic::Ordering::Relaxed);
+        result
+    }
+
+    pub(crate) fn replay_wal_strict(
+        &self,
+        broker: &crate::pubsub::Broker,
+    ) -> Result<usize, crate::cluster::ClusterError> {
+        let Some(wal_shards) = &self.wal_shards else {
+            return Err(crate::cluster::ClusterError::InvalidTransfer(
+                "durable ownership recovery requires tiered WAL storage".to_owned(),
+            ));
+        };
+        let was_suppressed = self
+            .wal_suppress
+            .swap(true, std::sync::atomic::Ordering::Relaxed);
+        let result = (|| {
+            let schema_cache =
+                std::sync::Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+            let mut total = 0_usize;
+            for wal in wal_shards.iter() {
+                total = total
+                    .checked_add(self.execute_strict_wal_replay(
+                        broker,
+                        &schema_cache,
+                        wal.lock().replay()?,
+                    )?)
+                    .ok_or_else(|| {
+                        crate::cluster::ClusterError::InvalidTransfer(
+                            "ownership WAL replay count is exhausted".to_owned(),
+                        )
+                    })?;
+            }
+            Ok(total)
+        })();
+        self.wal_suppress
+            .store(was_suppressed, std::sync::atomic::Ordering::Relaxed);
+        result
+    }
+
+    fn execute_strict_wal_replay(
+        &self,
+        broker: &crate::pubsub::Broker,
+        schema_cache: &crate::tables::SharedSchemaCache,
+        replay: crate::disk::WalReplay,
+    ) -> Result<usize, crate::cluster::ClusterError> {
+        if !replay.corrupted_frames.is_empty() {
+            return Err(crate::cluster::ClusterError::InvalidTransfer(
+                "ownership checkpoint WAL contains a corrupted frame".to_owned(),
+            ));
+        }
+        let count = replay.commands.len();
+        for command in replay.commands {
+            let refs = command.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let mut output = bytes::BytesMut::new();
+            crate::cmd::execute(
+                self,
+                schema_cache,
+                broker,
+                &refs,
+                &mut output,
+                Instant::now(),
+            );
+            if output.starts_with(b"-") {
+                return Err(crate::cluster::ClusterError::InvalidTransfer(
+                    "ownership checkpoint WAL command failed during replay".to_owned(),
+                ));
+            }
+        }
+        Ok(count)
     }
 
     pub fn truncate_wal(&self) {
@@ -5702,6 +5913,58 @@ mod tests {
 
     fn now() -> Instant {
         Instant::now()
+    }
+
+    #[test]
+    fn explicit_wal_key_routes_commands_with_nonstandard_grammar() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage_dir = directory.path().join("storage");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            shards: 4,
+            data_dir: directory.path().to_string_lossy().into_owned(),
+            storage: crate::StorageConfig {
+                mode: crate::StorageMode::Tiered,
+                dir: storage_dir.to_string_lossy().into_owned(),
+            },
+            ..Default::default()
+        });
+        let store = Store::new_with_config(config);
+        let misleading_lane = store.disk_shard_index(b"FROM");
+        let table = (0..128)
+            .map(|index| format!("table_{index}"))
+            .find(|table| store.disk_shard_index(table.as_bytes()) != misleading_lane)
+            .expect("one test table must map away from the FROM lane");
+        let table_lane = store.disk_shard_index(table.as_bytes());
+        let args: [&[u8]; 7] = [
+            b"TDELETE",
+            b"FROM",
+            table.as_bytes(),
+            b"WHERE",
+            b"id",
+            b"=",
+            b"row-1",
+        ];
+
+        store
+            .wal_log_command_for_key(table.as_bytes(), &args)
+            .unwrap();
+
+        let wal_shards = store.wal_shards.as_ref().unwrap();
+        for (index, wal) in wal_shards.iter().enumerate() {
+            let commands = wal.lock().replay().unwrap().commands;
+            if index == table_lane {
+                assert_eq!(
+                    commands,
+                    vec![args.iter().map(|arg| arg.to_vec()).collect::<Vec<_>>()]
+                );
+            } else {
+                assert!(
+                    commands.is_empty(),
+                    "unexpected command in WAL lane {index}"
+                );
+            }
+        }
     }
 
     #[test]

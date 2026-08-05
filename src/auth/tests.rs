@@ -155,6 +155,43 @@ fn add_column_if_missing_survives_wal_replay() {
 }
 
 #[test]
+fn durable_table_insert_writes_one_resolved_wal_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(crate::ServerConfig {
+        storage: crate::StorageConfig {
+            mode: crate::StorageMode::Tiered,
+            dir: dir.path().to_string_lossy().to_string(),
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    create_table_if_missing(
+        &store,
+        &cache,
+        "widgets",
+        &["id STR PRIMARY KEY,", "name STR"],
+        now,
+    )
+    .unwrap();
+    let before = store.wal_commands_for_key(b"widgets").len();
+
+    durable_table_insert(
+        &store,
+        &cache,
+        "widgets",
+        &[("id", "w1"), ("name", "bolt")],
+        now,
+    )
+    .unwrap();
+
+    let commands = store.wal_commands_for_key(b"widgets");
+    assert_eq!(commands.len(), before + 1);
+    assert_eq!(commands.last().unwrap()[0], b"TINSERT");
+}
+
+#[test]
 fn read_grant_enforced_end_to_end() {
     let store = Store::new();
     let cache = Arc::new(RwLock::new(SchemaCache::new()));

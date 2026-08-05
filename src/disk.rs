@@ -6,9 +6,12 @@
 //! On read miss, entries are transparently promoted back to memory.
 
 use crate::store::{DumpEntry, DumpValue, StreamGroupDump};
+use rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -16,6 +19,7 @@ use std::time::{Duration, Instant};
 // Magic bytes written at the start of WAL and data files to identify the
 // checksummed format (v2). Files without this magic are treated as legacy.
 const WAL_MAGIC: &[u8; 4] = b"LXW1";
+const WAL_GENERATION_MAGIC: &[u8; 4] = b"LXWG";
 const DATA_MAGIC: &[u8; 4] = b"LXD1";
 
 /// CRC32 (ISO 3309 / ITU-T V.42) computed with a lookup table.
@@ -92,6 +96,20 @@ pub struct Wal {
     file: File,
     /// True if this WAL file starts with WAL_MAGIC (v2 checksummed format).
     has_checksums: bool,
+    generation_path: PathBuf,
+    generation: [u8; 16],
+}
+
+/// Stable identity and byte boundary for one WAL generation.
+///
+/// A byte offset alone is unsafe after snapshot truncation because the new WAL
+/// can grow past the old offset. The random generation makes that history
+/// replacement explicit and lets ownership recovery fail closed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WalBoundary {
+    pub(crate) generation: [u8; 16],
+    pub(crate) offset: u64,
 }
 
 /// Checksum details for one corrupted WAL frame skipped during replay.
@@ -114,6 +132,8 @@ impl Wal {
         let shard_dir = dir.join(format!("shard_{shard_id}"));
         fs::create_dir_all(&shard_dir)?;
         let path = shard_dir.join("wal.lux");
+        let generation_path = shard_dir.join("wal.gen");
+        let generation = load_or_create_wal_generation(&generation_path)?;
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -142,6 +162,8 @@ impl Wal {
         Ok(Wal {
             file,
             has_checksums,
+            generation_path,
+            generation,
         })
     }
 
@@ -207,43 +229,133 @@ impl Wal {
         self.file.sync_all()
     }
 
+    /// Flush this generation and return an exact frame boundary suitable for a
+    /// crash-recovery cutover. The caller must prevent concurrent appends while
+    /// coordinating boundaries across shards.
+    pub(crate) fn durable_boundary(&mut self) -> io::Result<WalBoundary> {
+        self.file.sync_all()?;
+        let offset = self.file.seek(SeekFrom::End(0))?;
+        Ok(WalBoundary {
+            generation: self.generation,
+            offset,
+        })
+    }
+
+    pub(crate) fn validate_boundary(&mut self, boundary: WalBoundary) -> io::Result<()> {
+        if boundary.generation != self.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL boundary belongs to another generation",
+            ));
+        }
+        let start = self.data_start();
+        let end = self.file.seek(SeekFrom::End(0))?;
+        if boundary.offset < start || boundary.offset > end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL boundary is outside the current generation",
+            ));
+        }
+        // Parsing the prefix also proves that the byte offset lands exactly
+        // between complete frames rather than inside attacker-controlled bytes.
+        let replay = self.replay_range(start, boundary.offset, false)?;
+        if !replay.corrupted_frames.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL boundary prefix contains a corrupted frame",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replay_before(&mut self, boundary: WalBoundary) -> io::Result<WalReplay> {
+        self.validate_boundary(boundary)?;
+        self.replay_range(self.data_start(), boundary.offset, false)
+    }
+
+    pub(crate) fn replay_after(&mut self, boundary: WalBoundary) -> io::Result<WalReplay> {
+        self.validate_boundary(boundary)?;
+        let end = self.file.seek(SeekFrom::End(0))?;
+        // A crash can leave an incomplete final frame in the suffix. Preserve
+        // the existing WAL contract by ignoring only that terminal partial.
+        self.replay_range(boundary.offset, end, true)
+    }
+
     /// Read all commands from the WAL for replay. Partial/corrupt frames
     /// (from a crash mid-write) are safely skipped. Checksummed frames (v2)
     /// are validated; frames with bad checksums are rejected and counted.
     pub fn replay(&mut self) -> io::Result<WalReplay> {
         let file_len = self.file.seek(SeekFrom::End(0))?;
-        if file_len == 0 {
+        let start = self.data_start();
+        if file_len <= start {
             return Ok(WalReplay {
                 commands: Vec::new(),
                 corrupted_frames: Vec::new(),
             });
         }
 
-        // Skip past magic header if present.
+        self.replay_range(start, file_len, true)
+    }
+
+    fn data_start(&self) -> u64 {
         if self.has_checksums {
-            self.file.seek(SeekFrom::Start(4))?;
+            WAL_MAGIC.len() as u64
         } else {
-            self.file.seek(SeekFrom::Start(0))?;
+            0
         }
+    }
+
+    fn replay_range(
+        &mut self,
+        start: u64,
+        end: u64,
+        allow_partial_tail: bool,
+    ) -> io::Result<WalReplay> {
+        let file_len = self.file.seek(SeekFrom::End(0))?;
+        if start > end || end > file_len || start < self.data_start() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL replay range is invalid",
+            ));
+        }
+
+        self.file.seek(SeekFrom::Start(start))?;
 
         let mut commands = Vec::new();
         let mut corrupted_frames = Vec::new();
 
-        loop {
+        while self.file.stream_position()? < end {
+            let frame_start = self.file.stream_position()?;
+            if end.saturating_sub(frame_start) < 4 {
+                if allow_partial_tail && end == file_len {
+                    break;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WAL boundary ends inside a frame header",
+                ));
+            }
             let frame_len = match read_u32(&mut self.file) {
                 Ok(l) => l as usize,
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(_) => break,
+                Err(e) if allow_partial_tail && e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
             };
             let payload_start = self.file.stream_position()?;
-            if payload_start + frame_len as u64 > file_len {
-                break;
+            if payload_start.saturating_add(frame_len as u64) > end {
+                if allow_partial_tail && end == file_len {
+                    break;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WAL boundary ends inside a frame",
+                ));
             }
 
             let mut buf = vec![0u8; frame_len];
             match self.file.read_exact(&mut buf) {
                 Ok(()) => {}
-                Err(_) => break, // partial frame at end (crash mid-write)
+                Err(_error) if allow_partial_tail && end == file_len => break,
+                Err(e) => return Err(e),
             }
 
             let payload = if self.has_checksums {
@@ -294,14 +406,85 @@ impl Wal {
     }
 
     pub fn truncate(&mut self) -> io::Result<()> {
+        let next_generation = random_wal_generation()?;
+        write_wal_generation_atomic(&self.generation_path, next_generation)?;
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         // Re-write magic so new appends are checksummed.
         self.file.write_all(WAL_MAGIC)?;
         self.file.flush()?;
         self.has_checksums = true;
+        self.generation = next_generation;
         Ok(())
     }
+}
+
+fn random_wal_generation() -> io::Result<[u8; 16]> {
+    let mut generation = [0_u8; 16];
+    OsRng
+        .try_fill_bytes(&mut generation)
+        .map_err(|error| io::Error::other(format!("failed to generate WAL identity: {error}")))?;
+    Ok(generation)
+}
+
+fn load_or_create_wal_generation(path: &Path) -> io::Result<[u8; 16]> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            if bytes.len() != WAL_GENERATION_MAGIC.len() + 16
+                || &bytes[..WAL_GENERATION_MAGIC.len()] != WAL_GENERATION_MAGIC
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WAL generation file is invalid",
+                ));
+            }
+            bytes[WAL_GENERATION_MAGIC.len()..]
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid WAL generation"))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let generation = random_wal_generation()?;
+            write_wal_generation_atomic(path, generation)?;
+            Ok(generation)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn write_wal_generation_atomic(path: &Path, generation: [u8; 16]) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "WAL generation has no parent")
+    })?;
+    fs::create_dir_all(parent)?;
+    let mut nonce = [0_u8; 16];
+    OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|error| io::Error::other(format!("failed to stage WAL identity: {error}")))?;
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        nonce
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ));
+    let result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(WAL_GENERATION_MAGIC)?;
+        file.write_all(&generation)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// In-memory metadata for a cold entry on disk. The actual data lives in the
@@ -1220,6 +1403,54 @@ mod tests {
             assert_eq!(commands[0][1], b"key1");
             assert_eq!(commands[1][1], b"key2");
         }
+    }
+
+    #[test]
+    fn wal_boundary_splits_pre_and_post_cutover_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let boundary = {
+            let mut wal = Wal::open(dir.path(), 0).unwrap();
+            wal.append_command(&[b"SET", b"key", b"before"]).unwrap();
+            let boundary = wal.durable_boundary().unwrap();
+            wal.append_command(&[b"SET", b"key", b"after"]).unwrap();
+            boundary
+        };
+
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        assert_eq!(
+            wal.replay_before(boundary).unwrap().commands,
+            vec![vec![b"SET".to_vec(), b"key".to_vec(), b"before".to_vec()]]
+        );
+        assert_eq!(
+            wal.replay_after(boundary).unwrap().commands,
+            vec![vec![b"SET".to_vec(), b"key".to_vec(), b"after".to_vec()]]
+        );
+
+        let mut inside_frame = boundary;
+        inside_frame.offset -= 1;
+        assert!(wal.validate_boundary(inside_frame).is_err());
+    }
+
+    #[test]
+    fn wal_truncation_invalidates_prior_generation_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        wal.append_command(&[b"SET", b"key", b"before"]).unwrap();
+        let old = wal.durable_boundary().unwrap();
+        wal.truncate().unwrap();
+        wal.append_command(&[b"SET", b"key", b"after"]).unwrap();
+        let new = wal.durable_boundary().unwrap();
+
+        assert_ne!(old.generation, new.generation);
+        assert!(wal.validate_boundary(old).is_err());
+        drop(wal);
+
+        let mut reopened = Wal::open(dir.path(), 0).unwrap();
+        assert_eq!(
+            reopened.durable_boundary().unwrap().generation,
+            new.generation
+        );
+        assert_eq!(reopened.replay_before(new).unwrap().commands.len(), 1);
     }
 
     #[test]

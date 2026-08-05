@@ -212,25 +212,34 @@ impl Broker {
         shard_data: &mut crate::store::ShardData,
         store: &crate::store::Store,
         now: std::time::Instant,
-    ) {
+    ) -> std::io::Result<()> {
         let mut waiters = self.list_waiters.lock();
         let queue = match waiters.get_mut(key) {
             Some(q) => q,
-            None => return,
+            None => return Ok(()),
         };
 
         while !queue.is_empty() {
             let entry = match shard_data.get_mut(key.as_bytes()) {
                 Some(e) if !e.is_expired_at(now) => e,
-                _ => return,
+                _ => return Ok(()),
             };
             let list = match &mut entry.value {
                 crate::store::StoreValue::List(l) if !l.is_empty() => l,
-                _ => return,
+                _ => return Ok(()),
             };
 
             let req = queue.pop_front().unwrap();
             self.list_waiter_count.fetch_sub(1, Ordering::Relaxed);
+            // The push that made this element available is already in the WAL.
+            // Append the matching pop before changing memory, under the pushing
+            // command's persistence lease, so snapshots cannot split the pair.
+            let pop: &[u8] = if req.pop_left { b"LPOP" } else { b"RPOP" };
+            if let Err(error) = store.wal_log_command(&[pop, key.as_bytes()]) {
+                queue.push_front(req);
+                self.list_waiter_count.fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
             let val = if req.pop_left {
                 list.pop_front()
             } else {
@@ -247,6 +256,7 @@ impl Broker {
         if queue.is_empty() {
             waiters.remove(key);
         }
+        Ok(())
     }
 
     pub fn remove_list_waiters_by_id(&self, keys: &[String], id: u64) {

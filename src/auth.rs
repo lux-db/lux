@@ -2750,6 +2750,18 @@ pub(crate) fn add_column_if_missing(
     field_spec: &str,
     now: Instant,
 ) -> Result<(), String> {
+    store.with_persistence_mutation(|| {
+        add_column_if_missing_inner(store, cache, table, field_spec, now)
+    })
+}
+
+fn add_column_if_missing_inner(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_spec: &str,
+    now: Instant,
+) -> Result<(), String> {
     let mut tokens = field_spec.split_whitespace();
     let Some(column) = tokens.next() else {
         return Err("ERR empty column spec".to_string());
@@ -2779,13 +2791,9 @@ pub(crate) fn durable_table_insert(
     field_values: &[(&str, &str)],
     now: Instant,
 ) -> Result<i64, String> {
-    let mut args: Vec<Vec<u8>> = vec![b"TINSERT".to_vec(), table.as_bytes().to_vec()];
-    for (field, value) in field_values {
-        args.push(field.as_bytes().to_vec());
-        args.push(value.as_bytes().to_vec());
-    }
-    log_command(store, &args)?;
-    tables::table_insert(store, cache, table, field_values, now)
+    // The table leaf records the resolved row (including generated defaults and
+    // primary key). Raw-logging here as well duplicates the insert during replay.
+    store.with_persistence_mutation(|| tables::table_insert(store, cache, table, field_values, now))
 }
 
 pub(crate) fn durable_table_update_where(
@@ -2796,21 +2804,11 @@ pub(crate) fn durable_table_update_where(
     where_args: &[&str],
     now: Instant,
 ) -> Result<i64, String> {
-    let mut args: Vec<Vec<u8>> = vec![
-        b"TUPDATE".to_vec(),
-        table.as_bytes().to_vec(),
-        b"SET".to_vec(),
-    ];
-    for (field, value) in field_values {
-        args.push(field.as_bytes().to_vec());
-        args.push(value.as_bytes().to_vec());
-    }
-    args.push(b"WHERE".to_vec());
-    for arg in where_args {
-        args.push(arg.as_bytes().to_vec());
-    }
-    log_command(store, &args)?;
-    tables::table_update_where(store, cache, table, field_values, where_args, now)
+    // Each matched row is WAL-logged by the table leaf with its resolved PK.
+    // Keeping the outer lease makes a multi-row auth update one snapshot unit.
+    store.with_persistence_mutation(|| {
+        tables::table_update_where(store, cache, table, field_values, where_args, now)
+    })
 }
 
 pub(crate) fn durable_table_delete_where(
@@ -2820,17 +2818,10 @@ pub(crate) fn durable_table_delete_where(
     where_args: &[&str],
     now: Instant,
 ) -> Result<i64, String> {
-    let mut args: Vec<Vec<u8>> = vec![
-        b"TDELETE".to_vec(),
-        b"FROM".to_vec(),
-        table.as_bytes().to_vec(),
-    ];
-    args.push(b"WHERE".to_vec());
-    for arg in where_args {
-        args.push(arg.as_bytes().to_vec());
-    }
-    log_command(store, &args)?;
-    tables::table_delete_where(store, cache, table, where_args, now)
+    // Each matched row is WAL-logged by the table leaf with its resolved PK.
+    store.with_persistence_mutation(|| {
+        tables::table_delete_where(store, cache, table, where_args, now)
+    })
 }
 
 fn log_command(store: &Store, args: &[Vec<u8>]) -> Result<(), String> {

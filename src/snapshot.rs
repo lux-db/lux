@@ -140,13 +140,17 @@ fn save_entries(store: &Store, entries: &[crate::store::DumpEntry]) -> io::Resul
 }
 
 pub(crate) fn save_and_truncate_wal_consistent(store: &Store) -> io::Result<usize> {
-    store.with_write_barrier(|shards| {
-        let now = Instant::now();
-        let entries = store.dump_all_from_locked_shards(shards, now);
-        let saved = save_entries(store, &entries)?;
-        store.truncate_wal();
-        Ok(saved)
-    })
+    store
+        .with_persistence_cutover(|| {
+            store.with_write_barrier(|shards| {
+                let now = Instant::now();
+                let entries = store.dump_all_from_locked_shards(shards, now);
+                let saved = save_entries(store, &entries)?;
+                store.truncate_wal();
+                Ok(saved)
+            })
+        })
+        .map_err(io::Error::other)?
 }
 
 /// Produce a consistent on-disk snapshot for an out-of-band backup and return
@@ -166,6 +170,12 @@ pub fn snapshot_for_backup(store: &Store) -> io::Result<String> {
 /// the process so the standard startup load reconstructs state from the dump.
 /// Used by `POST /v1/restore`.
 pub fn restore_to_disk(store: &Store, dump: &[u8]) -> io::Result<()> {
+    store
+        .with_persistence_cutover(|| restore_to_disk_exclusive(store, dump))
+        .map_err(io::Error::other)?
+}
+
+fn restore_to_disk_exclusive(store: &Store, dump: &[u8]) -> io::Result<()> {
     let header_ok = dump.len() >= 4
         && [HEADER, HEADER_V2, HEADER_V1]
             .iter()
@@ -1335,6 +1345,93 @@ mod tests {
             }
         }
         (store, dir.clone(), Cleanup(dir))
+    }
+
+    fn tiered_store_in_temp_dir() -> (
+        Arc<Store>,
+        Arc<crate::ServerConfig>,
+        std::path::PathBuf,
+        impl Drop,
+    ) {
+        let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("lux_cutover_test_{}_{}", std::process::id(), id));
+        let storage_dir = dir.join("storage");
+        fs::create_dir_all(&storage_dir).unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            shards: 4,
+            data_dir: dir.to_string_lossy().into_owned(),
+            storage: crate::StorageConfig {
+                mode: crate::StorageMode::Tiered,
+                dir: storage_dir.to_string_lossy().into_owned(),
+            },
+            ..Default::default()
+        });
+        let store = Arc::new(Store::new_with_config(config.clone()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        (store, config, dir.clone(), Cleanup(dir))
+    }
+
+    #[test]
+    fn snapshot_waits_between_wal_append_and_memory_commit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (store, config, _dir, _cleanup) = tiered_store_in_temp_dir();
+        let (logged_tx, logged_rx) = mpsc::channel();
+        let (commit_tx, commit_rx) = mpsc::channel();
+        let writer = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                store.with_persistence_mutation(|| {
+                    store
+                        .wal_log_command(&[b"SET", b"during-cutover", b"durable"])
+                        .unwrap();
+                    logged_tx.send(()).unwrap();
+                    commit_rx.recv().unwrap();
+                    store.set(b"during-cutover", b"durable", None, Instant::now());
+                });
+            })
+        };
+        logged_rx.recv().unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (saved_tx, saved_rx) = mpsc::channel();
+        let snapshot = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let saved = save_and_truncate_wal_consistent(&store);
+                saved_tx.send(saved).unwrap();
+            })
+        };
+        started_rx.recv().unwrap();
+        assert!(
+            saved_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "snapshot crossed an in-flight WAL-backed mutation"
+        );
+
+        commit_tx.send(()).unwrap();
+        writer.join().unwrap();
+        saved_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        snapshot.join().unwrap();
+        drop(store);
+
+        let restarted = Store::new_with_config(config);
+        load(&restarted).unwrap();
+        restarted.replay_wal(&crate::pubsub::Broker::new());
+        assert_eq!(
+            restarted.get(b"during-cutover", Instant::now()).as_deref(),
+            Some(b"durable".as_slice())
+        );
     }
 
     // Every snapshot header version we have ever written must be restorable. The

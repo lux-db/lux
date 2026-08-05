@@ -2555,6 +2555,23 @@ pub fn execute_with_wal(
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
+    let is_write = !args.is_empty() && crate::eviction::is_write_command(args[0]);
+    if is_write && !command_runs_persistence_cutover(args) {
+        return store.with_persistence_mutation(|| {
+            execute_with_wal_inner(store, cache, broker, args, out, now)
+        });
+    }
+    execute_with_wal_inner(store, cache, broker, args, out, now)
+}
+
+fn execute_with_wal_inner(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    broker: &Broker,
+    args: &[&[u8]],
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
     if !args.is_empty() && crate::eviction::is_write_command(args[0]) {
         if let Some(err) = crate::auth::reserved_table_mutation_error(args, store) {
             resp::write_error(out, &err);
@@ -2576,6 +2593,19 @@ pub fn execute_with_wal(
         }
     }
     execute(store, cache, broker, args, out, now)
+}
+
+fn command_runs_persistence_cutover(args: &[&[u8]]) -> bool {
+    let Some(command) = args.first() else {
+        return false;
+    };
+    if cmd_eq(command, b"SAVE") || cmd_eq(command, b"BGSAVE") {
+        return true;
+    }
+    cmd_eq(command, b"ENC")
+        && args.get(1).is_some_and(|subcommand| {
+            cmd_eq(subcommand, b"REWRAP") || cmd_eq(subcommand, b"RETIRE")
+        })
 }
 
 /// Table writes that append their own resolved command to the WAL from the table
