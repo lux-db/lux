@@ -720,7 +720,7 @@ fn host_is_loopback(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-fn decode_certificate(node: &NodeDescriptor) -> Result<Vec<u8>, ClusterError> {
+pub(super) fn decode_certificate(node: &NodeDescriptor) -> Result<Vec<u8>, ClusterError> {
     if node.peer_certificate_der.len() > MAX_CERTIFICATE_BASE64_BYTES {
         return invalid(format!(
             "node {} peer certificate is too large",

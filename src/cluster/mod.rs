@@ -1,3 +1,4 @@
+mod control;
 mod durable_state;
 mod execution;
 mod execution_state;
@@ -7,7 +8,12 @@ mod serving_state;
 mod signature;
 mod topology;
 mod topology_state;
+mod transport;
 
+pub use control::{
+    ControlRejectCode, ControlRequest, ControlRequestBody, ControlRequestId, ControlResponse,
+    ControlResponseBody, MAX_CONTROL_DEADLINE_MS,
+};
 pub use execution::{
     CompiledExecution, ExecutionApiKey, ExecutionApiKeyKind, ExecutionAuth, ExecutionField,
     ExecutionGrant, ExecutionGrantScope, ExecutionJwtKey, ExecutionManifest, ExecutionPathIndex,
@@ -27,14 +33,18 @@ pub use topology::{
     CLUSTER_SLOT_COUNT, CLUSTER_TOPOLOGY_SCHEMA_VERSION,
 };
 pub use topology_state::{TopologySnapshot, TopologyState};
+pub use transport::{AuthenticatedControlRequest, PeerControlConfig, PeerControlTransport};
 
 pub const CLUSTER_PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Debug)]
 pub enum ClusterError {
+    InvalidConfig(String),
     InvalidTopology(String),
     InvalidExecution(String),
+    Protocol(String),
     Signature(String),
+    Transport(String),
     Io(std::io::Error),
     Json(serde_json::Error),
 }
@@ -42,13 +52,16 @@ pub enum ClusterError {
 impl std::fmt::Display for ClusterError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidConfig(message) => write!(formatter, "invalid cluster config: {message}"),
             Self::InvalidTopology(message) => {
                 write!(formatter, "invalid cluster topology: {message}")
             }
             Self::InvalidExecution(message) => {
                 write!(formatter, "invalid cluster execution metadata: {message}")
             }
+            Self::Protocol(message) => write!(formatter, "cluster protocol error: {message}"),
             Self::Signature(message) => write!(formatter, "cluster signature error: {message}"),
+            Self::Transport(message) => write!(formatter, "cluster transport error: {message}"),
             Self::Io(error) => write!(formatter, "cluster I/O error: {error}"),
             Self::Json(error) => write!(formatter, "cluster JSON error: {error}"),
         }
@@ -60,7 +73,12 @@ impl std::error::Error for ClusterError {
         match self {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
-            Self::InvalidTopology(_) | Self::InvalidExecution(_) | Self::Signature(_) => None,
+            Self::InvalidConfig(_)
+            | Self::InvalidTopology(_)
+            | Self::InvalidExecution(_)
+            | Self::Protocol(_)
+            | Self::Signature(_)
+            | Self::Transport(_) => None,
         }
     }
 }
