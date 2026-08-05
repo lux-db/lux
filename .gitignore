@@ -1,5 +1,6 @@
 /target
 /cli/target
+/bench/cluster/target
 .cache/
 config.toml
 *.dat

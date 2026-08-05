@@ -39,6 +39,20 @@ jobs:
       - run: cargo build --manifest-path cli/Cargo.toml
       - run: bash cli/tests/e2e-local.sh
 
+  cluster-bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --manifest-path bench/cluster/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path bench/cluster/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path bench/cluster/Cargo.toml --all-targets
+      - run: cargo build --bin lux
+      - name: Prove out-of-process Engine orchestration
+        env:
+          LUX_BENCH_ENGINE_BIN: ${{ github.workspace }}/target/debug/lux
+        run: cargo test --manifest-path bench/cluster/Cargo.toml --test local_process -- --ignored
+
   sdk:
     runs-on: ubuntu-latest
     defaults:
