@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+mod cluster_transfer;
 mod hashes;
 mod sorted_sets;
 mod streams;
@@ -3846,10 +3847,15 @@ impl Store {
     }
 
     pub fn load_entry(&self, key: String, value: DumpValue, ttl: Option<Duration>) {
-        let idx = self.shard_index(key.as_bytes());
+        self.load_entry_bytes(key.into_bytes(), value, ttl);
+    }
+
+    pub(crate) fn load_entry_bytes(&self, key: Vec<u8>, value: DumpValue, ttl: Option<Duration>) {
+        let idx = self.shard_index(&key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let key_bytes_owned = key.as_bytes().to_vec();
+        let key_name = key_string(&key);
+        let key_bytes_owned = key.clone();
         let store_value = match value {
             DumpValue::Str(s) => StoreValue::Str(Bytes::from(s)),
             DumpValue::List(l) => StoreValue::List(l.into_iter().map(Bytes::from).collect()),
@@ -3938,35 +3944,12 @@ impl Store {
                     groups,
                 })
             }
-            DumpValue::Vector(data, metadata, encrypted) => {
-                let dims = data.len() as u32;
-                let index_data = data.clone();
-                let key_clone = key.clone();
-                let sv = StoreValue::Vector(VectorData {
-                    dims,
-                    data,
-                    metadata,
-                    encrypted,
-                });
-                let expires_at = ttl.map(|d| Instant::now() + d);
-                let mem = estimate_entry_memory(&key, &sv);
-                let old = shard.data.insert(
-                    key_bytes_owned,
-                    Entry {
-                        value: sv,
-                        expires_at,
-                        lru_clock: self.lru_clock(),
-                    },
-                );
-                if old.is_none() {
-                    self.key_added();
-                }
-                shard.used_memory += mem;
-                self.mem_add(mem);
-                drop(shard);
-                self.insert_vector_indexes(key_clone, dims, index_data);
-                return;
-            }
+            DumpValue::Vector(data, metadata, encrypted) => StoreValue::Vector(VectorData {
+                dims: data.len() as u32,
+                data,
+                metadata,
+                encrypted,
+            }),
             DumpValue::HyperLogLog(regs, cached) => StoreValue::HyperLogLog(regs, cached),
             DumpValue::TimeSeries(samples, retention, labels) => {
                 StoreValue::TimeSeries(TimeSeriesData {
@@ -3975,6 +3958,10 @@ impl Store {
                     labels,
                 })
             }
+        };
+        let new_vector = match &store_value {
+            StoreValue::Vector(vector) => Some((vector.dims, vector.data.clone())),
+            _ => None,
         };
         let expires_at = ttl.map(|d| Instant::now() + d);
         let mem = estimate_entry_memory(&key, &store_value);
@@ -3986,11 +3973,34 @@ impl Store {
                 lru_clock: self.lru_clock(),
             },
         );
-        if old.is_none() {
+        let old_vector = old.as_ref().and_then(|entry| match &entry.value {
+            StoreValue::Vector(vector) => Some(vector.dims),
+            _ => None,
+        });
+        if let Some(old) = &old {
+            let old_mem = estimate_entry_memory(&key, &old.value);
+            if mem >= old_mem {
+                let added = mem - old_mem;
+                shard.used_memory = shard.used_memory.saturating_add(added);
+                self.mem_add(added);
+            } else {
+                let removed = old_mem - mem;
+                shard.used_memory = shard.used_memory.saturating_sub(removed);
+                self.mem_sub(removed);
+            }
+        } else {
+            shard.used_memory = shard.used_memory.saturating_add(mem);
+            self.mem_add(mem);
             self.key_added();
         }
-        shard.used_memory += mem;
-        self.mem_add(mem);
+        drop(shard);
+        if let Some(dims) = old_vector {
+            self.remove_vector_indexes(&key_name, dims);
+        }
+        if let Some((dims, data)) = new_vector {
+            self.insert_vector_indexes(key_name, dims, data);
+        }
+        self.remove_from_disk(&key);
     }
 
     pub fn getdel(&self, key: &[u8], now: Instant) -> Option<Bytes> {
@@ -5604,7 +5614,7 @@ pub type StreamGroupDump = (
     Vec<StreamPendingDump>,
 );
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum DumpValue {
     Str(Vec<u8>),
     List(Vec<Vec<u8>>),

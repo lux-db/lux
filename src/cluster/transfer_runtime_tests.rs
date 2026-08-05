@@ -277,7 +277,7 @@ fn final_fence_waits_for_admitted_writers_and_rejects_new_ones() {
     let retry = runtime
         .fence_and_drain(transfer_id, Duration::from_secs(2))
         .unwrap();
-    assert!(Arc::ptr_eq(&final_batch, &retry));
+    assert!(Arc::ptr_eq(&final_batch.keys, &retry.keys));
     assert_eq!(runtime.dirty_stats(transfer_id).unwrap().keys, 1);
 
     let directory = tempfile::tempdir().unwrap();
@@ -325,6 +325,8 @@ fn final_fence_waits_for_admitted_writers_and_rejects_new_ones() {
     source.seal(&receipt).unwrap();
     target.seal(&receipt).unwrap();
     source.mark_topology_committed(4).unwrap();
+    target.mark_target_applied(&receipt).unwrap();
+    target.mark_target_ready(&receipt).unwrap();
     target.mark_topology_committed(4).unwrap();
     let activated_snapshot = source.snapshot();
 

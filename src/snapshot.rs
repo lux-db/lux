@@ -228,20 +228,7 @@ fn save_binary(
 ) -> io::Result<()> {
     w.write_all(HEADER)?;
     for entry in entries {
-        let type_byte: u8 = match &entry.value {
-            DumpValue::Str(_) => b'S',
-            DumpValue::List(_) => b'L',
-            // 'h' carries a per-field TTL section; 'H' stays backward-compatible.
-            DumpValue::Hash(_, e) if !e.is_empty() => b'h',
-            DumpValue::Hash(_, _) => b'H',
-            DumpValue::Set(_) => b'T',
-            DumpValue::SortedSet(_) => b'Z',
-            DumpValue::Stream(..) => b'X',
-            DumpValue::Vector(_, _, true) => b'W',
-            DumpValue::Vector(_, _, false) => b'V',
-            DumpValue::HyperLogLog(..) => b'P',
-            DumpValue::TimeSeries(..) => b'I',
-        };
+        let type_byte = dump_value_type(&entry.value);
         w.write_all(&[type_byte])?;
         write_bytes(w, entry.key.as_bytes())?;
         // `entry.ttl_ms` is relative remaining-ms (computed at dump time, a few ms
@@ -253,115 +240,135 @@ fn save_binary(
             -1
         };
         write_i64(w, ttl)?;
+        write_dump_value(w, store, entry.key.as_bytes(), &entry.value)?;
+    }
+    Ok(())
+}
 
-        match &entry.value {
-            DumpValue::Str(v) => {
-                write_bytes(w, v)?;
+pub(crate) fn dump_value_type(value: &DumpValue) -> u8 {
+    match value {
+        DumpValue::Str(_) => b'S',
+        DumpValue::List(_) => b'L',
+        // 'h' carries a per-field TTL section; 'H' stays backward-compatible.
+        DumpValue::Hash(_, expiries) if !expiries.is_empty() => b'h',
+        DumpValue::Hash(_, _) => b'H',
+        DumpValue::Set(_) => b'T',
+        DumpValue::SortedSet(_) => b'Z',
+        DumpValue::Stream(..) => b'X',
+        DumpValue::Vector(_, _, true) => b'W',
+        DumpValue::Vector(_, _, false) => b'V',
+        DumpValue::HyperLogLog(..) => b'P',
+        DumpValue::TimeSeries(..) => b'I',
+    }
+}
+
+pub(crate) fn write_dump_value(
+    w: &mut impl Write,
+    store: &Store,
+    key: &[u8],
+    value: &DumpValue,
+) -> io::Result<()> {
+    match value {
+        DumpValue::Str(value) => {
+            write_bytes(w, value)?;
+        }
+        DumpValue::List(items) => {
+            write_u32(w, items.len() as u32)?;
+            for item in items {
+                write_bytes(w, item)?;
             }
-            DumpValue::List(items) => {
-                write_u32(w, items.len() as u32)?;
-                for item in items {
-                    write_bytes(w, item)?;
+        }
+        DumpValue::Hash(pairs, expiries) => {
+            write_u32(w, pairs.len() as u32)?;
+            for (field, value) in pairs {
+                write_bytes(w, field.as_bytes())?;
+                write_bytes(w, value)?;
+            }
+            if !expiries.is_empty() {
+                write_u32(w, expiries.len() as u32)?;
+                for (field, deadline_ms) in expiries {
+                    write_bytes(w, field.as_bytes())?;
+                    write_i64(w, *deadline_ms)?;
                 }
             }
-            DumpValue::Hash(pairs, expiries) => {
-                write_u32(w, pairs.len() as u32)?;
-                for (k, v) in pairs {
-                    write_bytes(w, k.as_bytes())?;
-                    write_bytes(w, v)?;
-                }
-                // The per-field TTL section is present only under the 'h' type byte.
-                if !expiries.is_empty() {
-                    write_u32(w, expiries.len() as u32)?;
-                    for (f, ms) in expiries {
-                        write_bytes(w, f.as_bytes())?;
-                        write_i64(w, *ms)?;
-                    }
+        }
+        DumpValue::Set(members) => {
+            write_u32(w, members.len() as u32)?;
+            for member in members {
+                write_bytes(w, member.as_bytes())?;
+            }
+        }
+        DumpValue::SortedSet(members) => {
+            write_u32(w, members.len() as u32)?;
+            for (member, score) in members {
+                write_bytes(w, member.as_bytes())?;
+                write_f64(w, *score)?;
+            }
+        }
+        DumpValue::Stream(entries, last_id, groups) => {
+            write_bytes(w, last_id.as_bytes())?;
+            write_u32(w, entries.len() as u32)?;
+            for (id, fields) in entries {
+                write_bytes(w, id.as_bytes())?;
+                write_u32(w, fields.len() as u32)?;
+                for (field, value) in fields {
+                    write_bytes(w, field.as_bytes())?;
+                    write_bytes(w, value)?;
                 }
             }
-            DumpValue::Set(members) => {
-                write_u32(w, members.len() as u32)?;
-                for m in members {
-                    write_bytes(w, m.as_bytes())?;
-                }
-            }
-            DumpValue::SortedSet(members) => {
-                write_u32(w, members.len() as u32)?;
-                for (m, score) in members {
-                    write_bytes(w, m.as_bytes())?;
-                    write_f64(w, *score)?;
-                }
-            }
-            DumpValue::Stream(stream_entries, last_id, groups) => {
-                write_bytes(w, last_id.as_bytes())?;
-                write_u32(w, stream_entries.len() as u32)?;
-                for (id, fields) in stream_entries {
-                    write_bytes(w, id.as_bytes())?;
-                    write_u32(w, fields.len() as u32)?;
-                    for (k, v) in fields {
-                        write_bytes(w, k.as_bytes())?;
-                        write_bytes(w, v)?;
-                    }
-                }
-                write_u32(w, groups.len() as u32)?;
-                for (name, last_delivered_id, consumers, pending) in groups {
-                    write_bytes(w, name.as_bytes())?;
-                    write_bytes(w, last_delivered_id.as_bytes())?;
-                    write_u32(w, consumers.len() as u32)?;
-                    for (consumer, pending_ids) in consumers {
-                        write_bytes(w, consumer.as_bytes())?;
-                        write_u32(w, pending_ids.len() as u32)?;
-                        for id in pending_ids {
-                            write_bytes(w, id.as_bytes())?;
-                        }
-                    }
-                    write_u32(w, pending.len() as u32)?;
-                    for (id, consumer, delivery_count) in pending {
+            write_u32(w, groups.len() as u32)?;
+            for (name, last_delivered_id, consumers, pending) in groups {
+                write_bytes(w, name.as_bytes())?;
+                write_bytes(w, last_delivered_id.as_bytes())?;
+                write_u32(w, consumers.len() as u32)?;
+                for (consumer, pending_ids) in consumers {
+                    write_bytes(w, consumer.as_bytes())?;
+                    write_u32(w, pending_ids.len() as u32)?;
+                    for id in pending_ids {
                         write_bytes(w, id.as_bytes())?;
-                        write_bytes(w, consumer.as_bytes())?;
-                        write_u32(w, (*delivery_count).min(u32::MAX as u64) as u32)?;
                     }
+                }
+                write_u32(w, pending.len() as u32)?;
+                for (id, consumer, delivery_count) in pending {
+                    write_bytes(w, id.as_bytes())?;
+                    write_bytes(w, consumer.as_bytes())?;
+                    write_u32(w, (*delivery_count).min(u32::MAX as u64) as u32)?;
                 }
             }
-            DumpValue::Vector(data, metadata, encrypted) => {
-                if *encrypted {
-                    // Seal the f32 payload; the 'W' type byte marks it encrypted.
-                    let sealed = store
-                        .encrypt_vector(entry.key.as_bytes(), data)
-                        .map_err(io::Error::other)?;
-                    write_bytes(w, &sealed)?;
-                } else {
-                    write_u32(w, data.len() as u32)?;
-                    for f in data {
-                        w.write_all(&f.to_le_bytes())?;
-                    }
-                }
-                match metadata {
-                    Some(m) => {
-                        w.write_all(&[1u8])?;
-                        write_bytes(w, m.as_bytes())?;
-                    }
-                    None => {
-                        w.write_all(&[0u8])?;
-                    }
+        }
+        DumpValue::Vector(data, metadata, encrypted) => {
+            if *encrypted {
+                let sealed = store.encrypt_vector(key, data).map_err(io::Error::other)?;
+                write_bytes(w, &sealed)?;
+            } else {
+                write_u32(w, data.len() as u32)?;
+                for value in data {
+                    w.write_all(&value.to_le_bytes())?;
                 }
             }
-            DumpValue::HyperLogLog(regs, _) => {
-                write_u32(w, regs.len() as u32)?;
-                w.write_all(regs)?;
+            match metadata {
+                Some(metadata) => {
+                    w.write_all(&[1])?;
+                    write_bytes(w, metadata.as_bytes())?;
+                }
+                None => w.write_all(&[0])?,
             }
-            DumpValue::TimeSeries(samples, retention, labels) => {
-                write_u32(w, samples.len() as u32)?;
-                for (ts, val) in samples {
-                    write_i64(w, *ts)?;
-                    write_f64(w, *val)?;
-                }
-                write_i64(w, *retention as i64)?;
-                write_u32(w, labels.len() as u32)?;
-                for (k, v) in labels {
-                    write_bytes(w, k.as_bytes())?;
-                    write_bytes(w, v.as_bytes())?;
-                }
+        }
+        DumpValue::HyperLogLog(registers, _) => {
+            write_u32(w, registers.len() as u32)?;
+            w.write_all(registers)?;
+        }
+        DumpValue::TimeSeries(samples, retention, labels) => {
+            write_u32(w, samples.len() as u32)?;
+            for (timestamp, value) in samples {
+                write_i64(w, *timestamp)?;
+                write_f64(w, *value)?;
+            }
+            write_i64(w, *retention as i64)?;
+            write_u32(w, labels.len() as u32)?;
+            for (key, value) in labels {
+                write_bytes(w, key.as_bytes())?;
+                write_bytes(w, value.as_bytes())?;
             }
         }
     }
@@ -428,7 +435,7 @@ pub(crate) fn load_binary(
             (Some(Duration::from_millis(ttl_ms as u64)), false)
         };
 
-        let value = read_dump_value(store, r, type_buf[0], &key, stream_groups)?;
+        let value = read_dump_value(store, r, type_buf[0], key.as_bytes(), stream_groups)?;
 
         // The value bytes were read above to advance the stream; only store the
         // entry if its absolute deadline hasn't already passed during downtime.
@@ -440,11 +447,11 @@ pub(crate) fn load_binary(
     Ok(count)
 }
 
-fn read_dump_value(
+pub(crate) fn read_dump_value(
     store: &Store,
     r: &mut impl Read,
     type_byte: u8,
-    key: &str,
+    key: &[u8],
     stream_groups: bool,
 ) -> io::Result<DumpValue> {
     Ok(match type_byte {
@@ -574,7 +581,7 @@ fn read_dump_value(
                 None
             };
             let data = store
-                .decrypt_vector(key.as_bytes(), &sealed)
+                .decrypt_vector(key, &sealed)
                 .map_err(io::Error::other)?;
             DumpValue::Vector(data, metadata, true)
         }
@@ -637,7 +644,13 @@ pub(crate) fn decode_dump_blob_value(store: &Store, blob: &[u8]) -> io::Result<(
     cursor.read_exact(&mut type_buf)?;
     let key = read_string(&mut cursor)?;
     let ttl_ms = read_i64(&mut cursor)?;
-    let value = read_dump_value(store, &mut cursor, type_buf[0], &key, stream_groups)?;
+    let value = read_dump_value(
+        store,
+        &mut cursor,
+        type_buf[0],
+        key.as_bytes(),
+        stream_groups,
+    )?;
     Ok((value, ttl_ms))
 }
 

@@ -123,15 +123,18 @@ fn chained_chunks_are_ordered_idempotent_and_durable() {
     source.mark_source_fenced(&final_receipt).unwrap();
     target.seal(&final_receipt).unwrap();
     source.seal(&final_receipt).unwrap();
+    target.mark_target_applied(&final_receipt).unwrap();
+    assert!(target.mark_topology_committed(4).is_err());
+    target.mark_target_ready(&final_receipt).unwrap();
     target.mark_topology_committed(4).unwrap();
     source.mark_topology_committed(4).unwrap();
     assert!(matches!(
         target.abort(),
         Err(ClusterError::InvalidTransfer(_))
     ));
-    target.finalize().unwrap();
+    assert!(target.finalize().is_err());
     source.finalize().unwrap();
-    assert!(!target.stage_path.exists());
+    assert!(target.stage_path.exists());
 
     drop(source);
     drop(target);
@@ -142,8 +145,8 @@ fn chained_chunks_are_ordered_idempotent_and_durable() {
         MAX_STAGED_BYTES,
     )
     .unwrap();
-    assert_eq!(reopened.snapshot().phase, TransferPhase::Finalized);
-    assert!(!reopened.stage_path.exists());
+    assert_eq!(reopened.snapshot().phase, TransferPhase::Activated);
+    assert!(reopened.stage_path.exists());
 }
 
 #[test]
@@ -565,9 +568,15 @@ fn state_transitions_are_idempotent_but_late_progress_fails_closed() {
     target.seal(&receipt).unwrap();
     source.mark_topology_committed(4).unwrap();
     source.mark_topology_committed(4).unwrap();
+    assert!(target.mark_topology_committed(4).is_err());
+    target.mark_target_applied(&receipt).unwrap();
+    target.mark_target_applied(&receipt).unwrap();
+    assert!(target.mark_topology_committed(4).is_err());
+    target.mark_target_ready(&receipt).unwrap();
+    target.mark_target_ready(&receipt).unwrap();
     target.mark_topology_committed(4).unwrap();
     source.finalize().unwrap();
-    target.finalize().unwrap();
+    assert!(target.finalize().is_err());
     source.seal(&receipt).unwrap();
     source.mark_topology_committed(4).unwrap();
     source.record_source_receipt(&chunk, &receipt).unwrap();

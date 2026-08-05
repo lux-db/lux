@@ -3,7 +3,9 @@ use super::transfer::{
     ChunkDisposition, TransferChunk, TransferDescriptor, TransferId, TransferJournalSnapshot,
     TransferPhase, TransferReceipt, TransferRole, TRANSFER_SCHEMA_VERSION,
 };
-use super::transfer_stage::{stage_header, validate_stage_contents, STAGE_HEADER_BYTES};
+use super::transfer_stage::{
+    stage_header, validate_stage_contents, TransferStageReader, STAGE_HEADER_BYTES,
+};
 use super::ClusterError;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -103,6 +105,19 @@ impl TransferJournal {
     #[must_use]
     pub fn snapshot(&self) -> TransferJournalSnapshot {
         self.inner.lock().snapshot.clone()
+    }
+
+    pub(crate) fn open_target_reader(&self) -> Result<TransferStageReader, ClusterError> {
+        let snapshot = self.inner.lock().snapshot.clone();
+        require_role(&snapshot, TransferRole::Target)?;
+        if !matches!(
+            snapshot.phase,
+            TransferPhase::Sealed | TransferPhase::Applied
+        ) {
+            return transfer_invalid("target stage can be applied only before activation");
+        }
+        self.reconcile_stage(&snapshot)?;
+        TransferStageReader::open(&self.stage_path, &snapshot)
     }
 
     #[must_use]
@@ -352,7 +367,11 @@ impl TransferJournal {
             }
             if matches!(
                 snapshot.phase,
-                TransferPhase::Sealed | TransferPhase::Activated | TransferPhase::Finalized
+                TransferPhase::Sealed
+                    | TransferPhase::Applied
+                    | TransferPhase::Ready
+                    | TransferPhase::Activated
+                    | TransferPhase::Finalized
             ) {
                 return Ok(());
             }
@@ -379,10 +398,77 @@ impl TransferJournal {
             ) {
                 return Ok(());
             }
-            if snapshot.phase != TransferPhase::Sealed {
-                return transfer_invalid("topology cannot activate an unsealed transfer");
+            let ready = match snapshot.role {
+                TransferRole::Source => snapshot.phase == TransferPhase::Sealed,
+                TransferRole::Target => snapshot.phase == TransferPhase::Ready,
+            };
+            if !ready {
+                return transfer_invalid(
+                    "topology cannot activate before source seal and target apply",
+                );
             }
             snapshot.phase = TransferPhase::Activated;
+            Ok(())
+        })
+    }
+
+    pub fn mark_target_applied(&self, expected: &TransferReceipt) -> Result<(), ClusterError> {
+        self.mutate(|snapshot| {
+            require_role(snapshot, TransferRole::Target)?;
+            validate_receipt_identity(snapshot, expected)?;
+            if receipt(snapshot) != *expected {
+                return transfer_invalid("applied target receipt does not match durable progress");
+            }
+            if snapshot.phase == TransferPhase::Applied {
+                return Ok(());
+            }
+            if snapshot.phase != TransferPhase::Sealed {
+                return transfer_invalid("target data can be applied only after sealing");
+            }
+            snapshot.phase = TransferPhase::Applied;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn prepare_target_apply(
+        &self,
+        descriptor: &TransferDescriptor,
+        expected: &TransferReceipt,
+    ) -> Result<(), ClusterError> {
+        let snapshot = &self.inner.lock().snapshot;
+        require_role(snapshot, TransferRole::Target)?;
+        descriptor.validate()?;
+        validate_receipt_identity(snapshot, expected)?;
+        if snapshot.descriptor != *descriptor || receipt(snapshot) != *expected {
+            return transfer_invalid("target apply does not match durable staged progress");
+        }
+        if !matches!(
+            snapshot.phase,
+            TransferPhase::Sealed | TransferPhase::Applied
+        ) {
+            return transfer_invalid("target data can be applied only before activation");
+        }
+        Ok(())
+    }
+
+    /// Record that canonical data is applied, row-local table metadata has been
+    /// rebuilt, and the target has a durable recovery point ordered before any
+    /// writes it may serve. Callers must complete all three before presenting
+    /// this transition; topology activation rejects the earlier `Applied` phase.
+    pub fn mark_target_ready(&self, expected: &TransferReceipt) -> Result<(), ClusterError> {
+        self.mutate(|snapshot| {
+            require_role(snapshot, TransferRole::Target)?;
+            validate_receipt_identity(snapshot, expected)?;
+            if receipt(snapshot) != *expected {
+                return transfer_invalid("ready target receipt does not match durable progress");
+            }
+            if snapshot.phase == TransferPhase::Ready {
+                return Ok(());
+            }
+            if snapshot.phase != TransferPhase::Applied {
+                return transfer_invalid("target cannot become ready before data is applied");
+            }
+            snapshot.phase = TransferPhase::Ready;
             Ok(())
         })
     }
@@ -394,6 +480,11 @@ impl TransferJournal {
             }
             if snapshot.phase != TransferPhase::Activated {
                 return transfer_invalid("transfer cannot finalize before activation");
+            }
+            if snapshot.role == TransferRole::Target {
+                return transfer_invalid(
+                    "target transfer cannot finalize before a durable Store checkpoint",
+                );
             }
             snapshot.phase = TransferPhase::Finalized;
             Ok(())
@@ -564,8 +655,18 @@ fn validate_disk_state(
         return transfer_invalid("durable journal does not match the requested transfer");
     }
     descriptor.validate()?;
-    if role == TransferRole::Target && state.snapshot.phase == TransferPhase::Fenced {
-        return transfer_invalid("target journal cannot contain a source fence");
+    if (role == TransferRole::Target
+        && matches!(
+            state.snapshot.phase,
+            TransferPhase::Fenced | TransferPhase::Finalized
+        ))
+        || (role == TransferRole::Source
+            && matches!(
+                state.snapshot.phase,
+                TransferPhase::Applied | TransferPhase::Ready
+            ))
+    {
+        return transfer_invalid("journal contains a phase reserved for the opposite role");
     }
     match state.snapshot.phase {
         TransferPhase::Prepared if state.snapshot.attempt != 0 => {
@@ -574,6 +675,8 @@ fn validate_disk_state(
         TransferPhase::Copying
         | TransferPhase::Fenced
         | TransferPhase::Sealed
+        | TransferPhase::Applied
+        | TransferPhase::Ready
         | TransferPhase::Activated
         | TransferPhase::Finalized
             if state.snapshot.attempt == 0 =>

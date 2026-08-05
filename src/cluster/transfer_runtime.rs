@@ -172,7 +172,10 @@ impl TransferRuntime {
             TransferPhase::Copying => PHASE_COPYING,
             TransferPhase::Fenced | TransferPhase::Sealed => PHASE_FENCED,
             TransferPhase::Activated | TransferPhase::Finalized => PHASE_REDIRECTING,
-            TransferPhase::Prepared | TransferPhase::Aborted => {
+            TransferPhase::Prepared
+            | TransferPhase::Applied
+            | TransferPhase::Ready
+            | TransferPhase::Aborted => {
                 return transfer_invalid("source journal has no recoverable transfer")
             }
         };
@@ -338,14 +341,17 @@ impl TransferRuntime {
         &self,
         transfer_id: TransferId,
         timeout: Duration,
-    ) -> Result<Arc<[TransferDataKey]>, ClusterError> {
+    ) -> Result<TransferFinalBatch, ClusterError> {
         if timeout.is_zero() || timeout > MAX_TRANSFER_FENCE_WAIT {
             return transfer_invalid(
                 "source fence wait must be between 1 nanosecond and 30 seconds",
             );
         }
         let _guard = self.mutation.lock();
-        self.find(transfer_id)?.fence_and_drain(timeout)
+        Ok(TransferFinalBatch {
+            transfer_id,
+            keys: self.find(transfer_id)?.fence_and_drain(timeout)?,
+        })
     }
 
     /// Confirm that the final target receipt and source fence are durable.
@@ -478,6 +484,52 @@ impl TransferRuntime {
 
     fn find(&self, transfer_id: TransferId) -> Result<Arc<ActiveTransfer>, ClusterError> {
         find_in_routes(&self.published.load(), transfer_id)
+    }
+}
+
+/// The retained final dirty set produced only after a source transfer stops
+/// admitting writes and every previously admitted mutation has completed.
+/// Its fields are intentionally private so transfer orchestration cannot forge
+/// a final batch or accidentally use one from another ownership transition.
+#[derive(Clone, Debug)]
+pub struct TransferFinalBatch {
+    transfer_id: TransferId,
+    keys: Arc<[TransferDataKey]>,
+}
+
+impl TransferFinalBatch {
+    #[must_use]
+    pub fn transfer_id(&self) -> TransferId {
+        self.transfer_id
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    #[must_use]
+    pub fn keys(&self) -> &[TransferDataKey] {
+        &self.keys
+    }
+}
+
+impl AsRef<[TransferDataKey]> for TransferFinalBatch {
+    fn as_ref(&self) -> &[TransferDataKey] {
+        self.keys()
+    }
+}
+
+impl std::ops::Deref for TransferFinalBatch {
+    type Target = [TransferDataKey];
+
+    fn deref(&self) -> &Self::Target {
+        self.keys()
     }
 }
 

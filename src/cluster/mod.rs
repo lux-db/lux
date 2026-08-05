@@ -9,10 +9,13 @@ mod signature;
 mod topology;
 mod topology_state;
 mod transfer;
+mod transfer_coordinator;
 mod transfer_dirty;
 mod transfer_journal;
+pub(crate) mod transfer_record;
 mod transfer_runtime;
 mod transfer_stage;
+mod transfer_stream;
 mod transport;
 
 pub use control::{
@@ -43,10 +46,11 @@ pub use transfer::{
     TransferJournalSnapshot, TransferPhase, TransferReceipt, TransferRole,
     MAX_TRANSFER_CHUNK_BYTES,
 };
+pub use transfer_coordinator::{apply_target_store_transfer, SourceStoreTransfer};
 pub use transfer_journal::TransferJournal;
 pub use transfer_runtime::{
-    DirtyStats, TransferDataKey, TransferFence, TransferRuntime, TransferRuntimeConfig,
-    TransferWriteAdmission, TransferWriteGuard,
+    DirtyStats, TransferDataKey, TransferFence, TransferFinalBatch, TransferRuntime,
+    TransferRuntimeConfig, TransferWriteAdmission, TransferWriteGuard,
 };
 pub use transport::{AuthenticatedControlRequest, PeerControlConfig, PeerControlTransport};
 

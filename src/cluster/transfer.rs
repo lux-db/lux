@@ -123,7 +123,7 @@ impl TransferDescriptor {
             .any(|range| slot >= range.start && slot <= range.end)
     }
 
-    pub(super) fn expected_id(&self) -> Result<TransferId, ClusterError> {
+    pub(crate) fn expected_id(&self) -> Result<TransferId, ClusterError> {
         let mut canonical = Vec::with_capacity(256);
         canonical.extend_from_slice(b"LUX-OWNERSHIP-TRANSFER\0");
         canonical.extend_from_slice(&self.schema_version.to_be_bytes());
@@ -158,6 +158,8 @@ pub enum TransferPhase {
     Copying,
     Fenced,
     Sealed,
+    Applied,
+    Ready,
     Activated,
     Finalized,
     Aborted,
