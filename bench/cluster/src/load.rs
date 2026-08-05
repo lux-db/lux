@@ -102,7 +102,7 @@ pub struct RouteCounterSnapshot {
     pub schema_version: u32,
     pub owner_id: String,
     pub topology_epoch: u64,
-    pub catalog_version: u64,
+    pub execution_version: u64,
     pub counters: EngineRouteCounters,
 }
 
@@ -713,8 +713,8 @@ fn route_delta(
         if before.topology_epoch != after.topology_epoch {
             bail!("owner {owner_id} topology changed during stable measurement");
         }
-        if before.catalog_version != after.catalog_version {
-            bail!("owner {owner_id} catalog changed during stable measurement");
+        if before.execution_version != after.execution_version {
+            bail!("owner {owner_id} execution metadata changed during stable measurement");
         }
         evidence.owner_local_operations += checked_delta(
             owner_id,
@@ -1262,14 +1262,14 @@ mod tests {
         owner_id: &str,
         owner_local_operations: u64,
         topology_epoch: u64,
-        catalog_version: u64,
+        execution_version: u64,
         point_peer_bytes: u64,
     ) -> RouteCounterSnapshot {
         RouteCounterSnapshot {
             schema_version: ROUTE_SNAPSHOT_SCHEMA_VERSION,
             owner_id: owner_id.into(),
             topology_epoch,
-            catalog_version,
+            execution_version,
             counters: EngineRouteCounters {
                 owner_local_operations,
                 compatibility_forwards: 0,
