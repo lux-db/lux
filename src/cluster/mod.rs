@@ -1,15 +1,30 @@
+mod durable_state;
+mod execution;
+mod execution_state;
+mod execution_wire;
 mod metrics;
+mod serving_state;
+mod signature;
 mod topology;
 mod topology_state;
 
+pub use execution::{
+    CompiledExecution, ExecutionApiKey, ExecutionApiKeyKind, ExecutionAuth, ExecutionField,
+    ExecutionGrant, ExecutionGrantScope, ExecutionJwtKey, ExecutionManifest, ExecutionPathIndex,
+    ExecutionPrincipalBlock, ExecutionPrincipalBlockKind, ExecutionSessionRevocation,
+    ExecutionTable, SignedExecution, CLUSTER_EXECUTION_SCHEMA_VERSION,
+};
+pub use execution_state::{ExecutionSnapshot, ExecutionState};
 pub use metrics::{
     RouteCounterSnapshot, RouteCounterValues, RouteCounters, ROUTE_SNAPSHOT_SCHEMA_VERSION,
 };
+pub use serving_state::{ServingSnapshot, ServingState};
+pub use signature::encode_controller_public_key;
 pub use topology::{
-    certificate_fingerprint, encode_controller_public_key, slot_for_key, slot_for_table_row,
-    CompiledTopology, NodeDescriptor, RedisSlotRange, SignedTopology, SlotAssignment, SlotMove,
-    TopologyManifest, TopologyTransitionKind, TopologyTransitionPlan, CLUSTER_CLIENT_SLOT_COUNT,
-    CLUSTER_MAX_NODES, CLUSTER_SLOT_COUNT, CLUSTER_TOPOLOGY_SCHEMA_VERSION,
+    certificate_fingerprint, slot_for_key, slot_for_table_row, CompiledTopology, NodeDescriptor,
+    RedisSlotRange, SignedTopology, SlotAssignment, SlotMove, TopologyManifest,
+    TopologyTransitionKind, TopologyTransitionPlan, CLUSTER_CLIENT_SLOT_COUNT, CLUSTER_MAX_NODES,
+    CLUSTER_SLOT_COUNT, CLUSTER_TOPOLOGY_SCHEMA_VERSION,
 };
 pub use topology_state::{TopologySnapshot, TopologyState};
 
@@ -18,6 +33,7 @@ pub const CLUSTER_PROTOCOL_VERSION: u16 = 1;
 #[derive(Debug)]
 pub enum ClusterError {
     InvalidTopology(String),
+    InvalidExecution(String),
     Signature(String),
     Io(std::io::Error),
     Json(serde_json::Error),
@@ -28,6 +44,9 @@ impl std::fmt::Display for ClusterError {
         match self {
             Self::InvalidTopology(message) => {
                 write!(formatter, "invalid cluster topology: {message}")
+            }
+            Self::InvalidExecution(message) => {
+                write!(formatter, "invalid cluster execution metadata: {message}")
             }
             Self::Signature(message) => write!(formatter, "cluster signature error: {message}"),
             Self::Io(error) => write!(formatter, "cluster I/O error: {error}"),
@@ -41,7 +60,7 @@ impl std::error::Error for ClusterError {
         match self {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
-            Self::InvalidTopology(_) | Self::Signature(_) => None,
+            Self::InvalidTopology(_) | Self::InvalidExecution(_) | Self::Signature(_) => None,
         }
     }
 }

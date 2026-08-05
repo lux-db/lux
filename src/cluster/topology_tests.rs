@@ -1,6 +1,6 @@
 use super::*;
-use crate::cluster::TopologyState;
-use p256::ecdsa::SigningKey;
+use crate::cluster::{encode_controller_public_key, TopologyState};
+use p256::ecdsa::{Signature, SigningKey};
 use proptest::prelude::*;
 use rand_core::OsRng;
 use rcgen::{CertificateParams, KeyPair};
@@ -124,6 +124,25 @@ fn signature_encoding_is_canonical_and_rejects_malleability() {
     assert!(matches!(
         topology.verify(&public_key),
         Err(ClusterError::Signature(_))
+    ));
+}
+
+#[test]
+fn untrusted_topology_is_bounded_before_signature_work() {
+    let key = SigningKey::random(&mut OsRng);
+    let public_key = encode_controller_public_key(key.verifying_key());
+    let mut topology = signed(1, &key);
+    topology.manifest.assignments = vec![
+        SlotAssignment {
+            start: 0,
+            end: 0,
+            node_id: "node-1".to_owned(),
+        };
+        usize::from(CLUSTER_SLOT_COUNT) + 1
+    ];
+    assert!(matches!(
+        topology.verify(&public_key),
+        Err(ClusterError::InvalidTopology(_))
     ));
 }
 

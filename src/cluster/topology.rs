@@ -1,8 +1,8 @@
+use super::signature::{sign_payload, verify_payload};
 use super::{ClusterError, CLUSTER_PROTOCOL_VERSION};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use p256::ecdsa::signature::{Signer, Verifier};
-use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use p256::ecdsa::SigningKey;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{client::WebPkiServerVerifier, server::WebPkiClientVerifier};
@@ -16,8 +16,6 @@ pub const CLUSTER_TOPOLOGY_SCHEMA_VERSION: u16 = 1;
 pub const CLUSTER_SLOT_COUNT: u16 = 4096;
 pub const CLUSTER_CLIENT_SLOT_COUNT: u16 = 16_384;
 pub const CLUSTER_MAX_NODES: usize = 16;
-const MAX_ENCODED_CONTROLLER_KEY_BYTES: usize = 128;
-const MAX_ENCODED_SIGNATURE_BYTES: usize = 128;
 const MAX_PEER_ENDPOINT_BYTES: usize = 512;
 const MAX_CLIENT_ENDPOINT_BYTES: usize = 2048;
 const MAX_CERTIFICATE_DER_BYTES: usize = 64 * 1024;
@@ -103,60 +101,25 @@ impl SignedTopology {
     ) -> Result<Self, ClusterError> {
         validate_manifest(&manifest)?;
         let payload = canonical_manifest_bytes(&manifest)?;
-        let signature: Signature = signing_key.sign(&payload);
-        let signature = signature.normalize_s().unwrap_or(signature);
         Ok(Self {
             manifest,
-            signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            signature: sign_payload(&payload, signing_key),
         })
     }
 
     pub fn verify(&self, controller_public_key: &str) -> Result<CompiledTopology, ClusterError> {
-        if controller_public_key.len() > MAX_ENCODED_CONTROLLER_KEY_BYTES {
-            return Err(ClusterError::Signature(
-                "encoded controller public key is too large".to_owned(),
-            ));
-        }
-        if self.signature.len() > MAX_ENCODED_SIGNATURE_BYTES {
-            return Err(ClusterError::Signature(
-                "encoded topology signature is too large".to_owned(),
-            ));
-        }
-        let key_bytes = URL_SAFE_NO_PAD
-            .decode(controller_public_key)
-            .map_err(|error| {
-                ClusterError::Signature(format!("public key is not base64url: {error}"))
-            })?;
-        let verifying_key = VerifyingKey::from_sec1_bytes(&key_bytes).map_err(|error| {
-            ClusterError::Signature(format!("public key is not P-256 SEC1: {error}"))
-        })?;
-        let signature_bytes = URL_SAFE_NO_PAD.decode(&self.signature).map_err(|error| {
-            ClusterError::Signature(format!("signature is not base64url: {error}"))
-        })?;
-        let signature = Signature::from_slice(&signature_bytes)
-            .map_err(|error| ClusterError::Signature(format!("signature is not P-256: {error}")))?;
-        if signature.normalize_s().is_some() {
-            return Err(ClusterError::Signature(
-                "signature is not in canonical low-S form".to_owned(),
-            ));
-        }
+        validate_manifest_bounds(&self.manifest)?;
         let payload = canonical_manifest_bytes(&self.manifest)?;
-        verifying_key
-            .verify(&payload, &signature)
-            .map_err(|_| ClusterError::Signature("manifest signature did not verify".to_owned()))?;
+        verify_payload(&payload, &self.signature, controller_public_key)?;
         CompiledTopology::compile(self.clone())
     }
 }
 
 impl TopologyManifest {
     pub fn signing_payload(&self) -> Result<Vec<u8>, ClusterError> {
+        validate_manifest(self)?;
         canonical_manifest_bytes(self)
     }
-}
-
-#[must_use]
-pub fn encode_controller_public_key(verifying_key: &VerifyingKey) -> String {
-    URL_SAFE_NO_PAD.encode(verifying_key.to_encoded_point(false).as_bytes())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -450,6 +413,7 @@ fn push_len(bytes: &mut Vec<u8>, length: usize) -> Result<(), ClusterError> {
 }
 
 fn validate_manifest(manifest: &TopologyManifest) -> Result<(), ClusterError> {
+    validate_manifest_bounds(manifest)?;
     if manifest.schema_version != CLUSTER_TOPOLOGY_SCHEMA_VERSION {
         return invalid(format!(
             "unsupported topology schema {}",
@@ -620,6 +584,42 @@ fn validate_manifest(manifest: &TopologyManifest) -> Result<(), ClusterError> {
             "slot assignments must end at slot {}",
             CLUSTER_SLOT_COUNT - 1
         ));
+    }
+    Ok(())
+}
+
+fn validate_manifest_bounds(manifest: &TopologyManifest) -> Result<(), ClusterError> {
+    if manifest.nodes.is_empty() || manifest.nodes.len() > CLUSTER_MAX_NODES {
+        return invalid(format!(
+            "topology must contain 1 to {CLUSTER_MAX_NODES} nodes"
+        ));
+    }
+    if manifest.assignments.is_empty()
+        || manifest.assignments.len() > usize::from(CLUSTER_SLOT_COUNT)
+    {
+        return invalid(format!(
+            "topology must contain 1 to {CLUSTER_SLOT_COUNT} slot assignments"
+        ));
+    }
+    if manifest.cluster_id.len() > 128 || manifest.control_node_id.len() > 128 {
+        return invalid("topology identifier exceeds the size limit");
+    }
+    for node in &manifest.nodes {
+        if node.node_id.len() > 128
+            || node.peer_addr.len() > MAX_PEER_ENDPOINT_BYTES
+            || node.peer_server_name.len() > 253
+            || node.client_resp_url.len() > MAX_CLIENT_ENDPOINT_BYTES
+            || node.client_http_url.len() > MAX_CLIENT_ENDPOINT_BYTES
+            || node.peer_certificate_der.len() > MAX_CERTIFICATE_BASE64_BYTES
+            || node.peer_certificate_sha256.len() > 64
+        {
+            return invalid("topology node metadata exceeds a size limit");
+        }
+    }
+    for assignment in &manifest.assignments {
+        if assignment.node_id.len() > 128 {
+            return invalid("slot-assignment owner exceeds the size limit");
+        }
     }
     Ok(())
 }

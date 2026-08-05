@@ -1390,7 +1390,7 @@ pub fn parse_column_list(args: &[&str]) -> Result<Vec<FieldDef>, String> {
 
 /// Encode a FieldDef into a compact string for storage in the KV schema hash.
 /// Format: type[|flag[|flag...]][|ref:table:col:on_delete]
-fn encode_field_def(def: &FieldDef) -> String {
+pub(crate) fn encode_field_def(def: &FieldDef) -> String {
     let type_str = match &def.field_type {
         FieldType::Str => "str".to_string(),
         FieldType::Int => "int".to_string(),
@@ -1439,9 +1439,9 @@ fn encode_field_def(def: &FieldDef) -> String {
     parts.join("|")
 }
 
-fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
-    let parts: Vec<&str> = encoded.split('|').collect();
-    let type_str = parts[0];
+pub(crate) fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
+    let parts = split_field_definition(encoded);
+    let type_str = parts[0].as_str();
 
     let field_type = match type_str {
         "str" => FieldType::Str,
@@ -1457,7 +1457,7 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
             .map(FieldType::Vector)
             .unwrap_or(FieldType::Vector(0)),
         // Legacy ref format from old colon-based schema
-        "ref" => FieldType::Ref(parts.get(1).unwrap_or(&"").to_string()),
+        "ref" => FieldType::Ref(parts.get(1).cloned().unwrap_or_default()),
         _ => FieldType::Str,
     };
 
@@ -1471,7 +1471,7 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
     let mut searchable = false;
 
     for flag in &parts[1..] {
-        match *flag {
+        match flag.as_str() {
             "pk" => {
                 primary_key = true;
                 unique = true;
@@ -1520,6 +1520,26 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
         encrypted,
         searchable,
     }
+}
+
+fn split_field_definition(encoded: &str) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    let mut escaped = false;
+    for character in encoded.chars() {
+        if character == '|' && !escaped {
+            parts.push(String::new());
+        } else {
+            parts
+                .last_mut()
+                .expect("field definition always has one part")
+                .push(character);
+        }
+        escaped = character == '\\' && !escaped;
+        if character != '\\' {
+            escaped = false;
+        }
+    }
+    parts
 }
 
 pub(crate) fn load_schema(
@@ -5694,6 +5714,15 @@ mod tests {
             assert_eq!(decoded.nullable, original.nullable);
             assert_eq!(decoded.references, original.references);
         }
+    }
+
+    #[test]
+    fn field_definition_roundtrip_preserves_escaped_defaults() {
+        let original = parse_field_def(r"label STR DEFAULT a|b\\c").unwrap();
+        let encoded = encode_field_def(&original);
+        let decoded = decode_field_def(&original.name, &encoded);
+        assert_eq!(decoded.default_value, original.default_value);
+        assert_eq!(encode_field_def(&decoded), encoded);
     }
 
     // -------------------------------------------------------------------------

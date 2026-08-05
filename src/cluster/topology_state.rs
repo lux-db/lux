@@ -1,14 +1,13 @@
+use super::durable_state::{read_bounded, write_json_atomic};
 use super::topology::{CompiledTopology, NodeDescriptor, SignedTopology, TopologyTransitionPlan};
 use super::ClusterError;
 use arc_swap::ArcSwap;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
-use rand_core::{OsRng as SystemRandom, RngCore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+const MAX_DURABLE_TOPOLOGY_STATE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// One immutable, internally consistent view of committed and prepared topology.
 ///
@@ -66,7 +65,10 @@ impl TopologyState {
     ) -> Result<Self, ClusterError> {
         let state_path = state_path.as_ref().to_path_buf();
         let (current, pending) = if state_path.exists() {
-            let bytes = std::fs::read(&state_path)?;
+            let bytes = read_bounded(&state_path, MAX_DURABLE_TOPOLOGY_STATE_BYTES)?;
+            if bytes.len() as u64 > MAX_DURABLE_TOPOLOGY_STATE_BYTES {
+                return invalid("durable topology state exceeds the size limit");
+            }
             let disk: TopologyDiskState = serde_json::from_slice(&bytes).map_err(|error| {
                 ClusterError::InvalidTopology(format!(
                     "failed to read durable topology state {}: {error}",
@@ -220,43 +222,17 @@ impl TopologyState {
         let Some(path) = &self.state_path else {
             return Ok(());
         };
-        if let Some(parent) = state_parent(path) {
-            std::fs::create_dir_all(parent)?;
-        }
         let disk = TopologyDiskState {
             current: current.signed().clone(),
             pending: pending.map(|candidate| candidate.signed().clone()),
         };
-        let bytes = serde_json::to_vec_pretty(&disk)?;
-        let mut nonce = [0_u8; 16];
-        SystemRandom.try_fill_bytes(&mut nonce).map_err(|error| {
-            std::io::Error::other(format!("failed to create topology state nonce: {error}"))
-        })?;
-        let nonce = URL_SAFE_NO_PAD.encode(nonce);
-        let temporary = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
-        let result = (|| -> Result<(), ClusterError> {
-            let mut file = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, path)?;
-            if let Some(parent) = state_parent(path) {
-                std::fs::File::open(parent)?.sync_all()?;
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        result
+        write_json_atomic(
+            path,
+            &disk,
+            "topology",
+            MAX_DURABLE_TOPOLOGY_STATE_BYTES as usize,
+        )
     }
-}
-
-fn state_parent(path: &Path) -> Option<&Path> {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
 }
 
 #[derive(Serialize, Deserialize)]
