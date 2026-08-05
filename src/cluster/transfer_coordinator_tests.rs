@@ -1,4 +1,5 @@
 use super::*;
+use crate::cluster::test_support::{compiled_execution, execution_table};
 use crate::cluster::transfer_record::{table_row_key, table_vector_key, TransferRecordWriter};
 use crate::cluster::transfer_stream::TransferChunkWriter;
 use crate::cluster::{
@@ -10,6 +11,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
+
+fn execution() -> CompiledExecution {
+    compiled_execution(
+        "cluster-a",
+        vec![execution_table(
+            "accounts",
+            Some("id"),
+            &[
+                ("embedding", "vector:2"),
+                ("id", "str|pk|unique|notnull"),
+                ("name", "str"),
+            ],
+            &[],
+        )],
+    )
+}
 
 fn descriptor() -> TransferDescriptor {
     let mut descriptor = TransferDescriptor {
@@ -33,6 +50,7 @@ fn descriptor() -> TransferDescriptor {
 #[test]
 fn fuzzy_snapshot_plus_dirty_round_converges_target_to_source() {
     let descriptor = descriptor();
+    let execution = execution();
     let source_store = Store::new();
     let target_store = Store::new();
     let now = Instant::now();
@@ -40,9 +58,28 @@ fn fuzzy_snapshot_plus_dirty_round_converges_target_to_source() {
     source_store.set(b"account:deleted", b"old", None, now);
     source_store.load_entry_bytes(
         table_row_key("accounts", b"user-1").unwrap(),
-        DumpValue::Hash(vec![("name".to_owned(), b"Old".to_vec())], Vec::new()),
+        DumpValue::Hash(
+            vec![
+                ("embedding".to_owned(), b"[0.1,0.2]".to_vec()),
+                ("id".to_owned(), b"user-1".to_vec()),
+                ("name".to_owned(), b"Old".to_vec()),
+            ],
+            Vec::new(),
+        ),
         None,
     );
+    source_store
+        .zadd(
+            b"_t:accounts:ids",
+            &[(b"user-1", 11.0)],
+            false,
+            false,
+            false,
+            false,
+            false,
+            now,
+        )
+        .unwrap();
     source_store.load_entry_bytes(
         table_vector_key("accounts", "embedding", b"user-1").unwrap(),
         DumpValue::Vector(vec![0.1, 0.2], None, false),
@@ -51,9 +88,28 @@ fn fuzzy_snapshot_plus_dirty_round_converges_target_to_source() {
     target_store.set(b"target-only", b"stale", None, now);
     target_store.load_entry_bytes(
         table_row_key("accounts", b"stale-user").unwrap(),
-        DumpValue::Hash(vec![("name".to_owned(), b"Stale".to_vec())], Vec::new()),
+        DumpValue::Hash(
+            vec![
+                ("embedding".to_owned(), b"[0.0,0.0]".to_vec()),
+                ("id".to_owned(), b"stale-user".to_vec()),
+                ("name".to_owned(), b"Stale".to_vec()),
+            ],
+            Vec::new(),
+        ),
         None,
     );
+    target_store
+        .zadd(
+            b"_t:accounts:ids",
+            &[(b"stale-user", 99.0)],
+            false,
+            false,
+            false,
+            false,
+            false,
+            now,
+        )
+        .unwrap();
     target_store.load_entry_bytes(
         table_vector_key("accounts", "embedding", b"stale-user").unwrap(),
         DumpValue::Vector(vec![0.0, 0.0], None, false),
@@ -84,7 +140,8 @@ fn fuzzy_snapshot_plus_dirty_round_converges_target_to_source() {
         let (_, receipt) = target.append_target_chunk(chunk)?;
         Ok(receipt)
     });
-    let mut records = TransferRecordWriter::new(chunks, &source_store, &descriptor).unwrap();
+    let mut records =
+        TransferRecordWriter::new(chunks, &source_store, &descriptor, &execution).unwrap();
     assert_eq!(
         write_initial_store_records(&source_store, &descriptor, &mut records).unwrap(),
         3
@@ -96,7 +153,14 @@ fn fuzzy_snapshot_plus_dirty_round_converges_target_to_source() {
     source_store.del(&[b"account:deleted"]);
     source_store.load_entry_bytes(
         table_row_key("accounts", b"user-1").unwrap(),
-        DumpValue::Hash(vec![("name".to_owned(), b"New".to_vec())], Vec::new()),
+        DumpValue::Hash(
+            vec![
+                ("embedding".to_owned(), b"[0.8,0.9]".to_vec()),
+                ("id".to_owned(), b"user-1".to_vec()),
+                ("name".to_owned(), b"New".to_vec()),
+            ],
+            Vec::new(),
+        ),
         None,
     );
     source_store.load_entry_bytes(
@@ -123,19 +187,26 @@ fn fuzzy_snapshot_plus_dirty_round_converges_target_to_source() {
 
     let mut wrong_receipt = receipt.clone();
     wrong_receipt.next_sequence += 1;
-    assert!(
-        apply_target_store_transfer(&target_store, &descriptor, &target, &wrong_receipt).is_err()
-    );
+    assert!(apply_target_store_transfer(
+        &target_store,
+        &descriptor,
+        &execution,
+        &target,
+        &wrong_receipt,
+    )
+    .is_err());
     assert_eq!(
         target_store.get(b"target-only", Instant::now()).unwrap(),
         b"stale"[..]
     );
     assert_eq!(
-        apply_target_store_transfer(&target_store, &descriptor, &target, &receipt).unwrap(),
+        apply_target_store_transfer(&target_store, &descriptor, &execution, &target, &receipt,)
+            .unwrap(),
         7
     );
     assert_eq!(
-        apply_target_store_transfer(&target_store, &descriptor, &target, &receipt).unwrap(),
+        apply_target_store_transfer(&target_store, &descriptor, &execution, &target, &receipt,)
+            .unwrap(),
         7
     );
     assert_eq!(
@@ -193,7 +264,10 @@ fn fuzzy_snapshot_plus_dirty_round_converges_target_to_source() {
     target.mark_target_ready(&receipt).unwrap();
     target.mark_topology_committed(descriptor.to_epoch).unwrap();
     target_store.set(b"account:a", b"post-activation", None, Instant::now());
-    assert!(apply_target_store_transfer(&target_store, &descriptor, &target, &receipt).is_err());
+    assert!(
+        apply_target_store_transfer(&target_store, &descriptor, &execution, &target, &receipt,)
+            .is_err()
+    );
     assert_eq!(
         target.snapshot().phase,
         super::super::TransferPhase::Activated
@@ -207,6 +281,7 @@ fn fuzzy_snapshot_plus_dirty_round_converges_target_to_source() {
 #[test]
 fn concurrent_admitted_writes_converge_through_the_final_fence() {
     let descriptor = descriptor();
+    let execution = execution();
     let source_store = Arc::new(Store::new());
     let target_store = Store::new();
     for index in 0..100 {
@@ -275,11 +350,12 @@ fn concurrent_admitted_writes_converge_through_the_final_fence() {
         }
     });
 
-    let mut transfer = SourceStoreTransfer::begin(&source_store, &source, &descriptor, |chunk| {
-        let (_, receipt) = target.append_target_chunk(chunk)?;
-        Ok(receipt)
-    })
-    .unwrap();
+    let mut transfer =
+        SourceStoreTransfer::begin(&source_store, &source, &descriptor, &execution, |chunk| {
+            let (_, receipt) = target.append_target_chunk(chunk)?;
+            Ok(receipt)
+        })
+        .unwrap();
     started.wait();
     transfer.write_initial().unwrap();
     for round in 1..=3 {
@@ -298,7 +374,7 @@ fn concurrent_admitted_writes_converge_through_the_final_fence() {
     writer.join().unwrap();
     assert!(committed.load(Ordering::Relaxed) > 0);
 
-    apply_target_store_transfer(&target_store, &descriptor, &target, &receipt).unwrap();
+    apply_target_store_transfer(&target_store, &descriptor, &execution, &target, &receipt).unwrap();
     for index in 0..100 {
         let key = format!("key:{index}");
         assert_eq!(
@@ -312,6 +388,7 @@ fn concurrent_admitted_writes_converge_through_the_final_fence() {
 #[test]
 fn high_level_source_stream_requires_fresh_acknowledged_attempt_and_strict_rounds() {
     let descriptor = descriptor();
+    let execution = execution();
     let store = Store::new();
     let runtime = TransferRuntime::new(
         "node-a",
@@ -339,7 +416,7 @@ fn high_level_source_stream_requires_fresh_acknowledged_attempt_and_strict_round
     .unwrap();
     source.begin_source_attempt().unwrap();
     assert!(
-        SourceStoreTransfer::begin(&store, &source, &descriptor, |_| {
+        SourceStoreTransfer::begin(&store, &source, &descriptor, &execution, |_| {
             Err(ClusterError::Transport("must not send".to_owned()))
         })
         .is_err()
@@ -347,18 +424,19 @@ fn high_level_source_stream_requires_fresh_acknowledged_attempt_and_strict_round
 
     let start = target.accept_target_attempt(1).unwrap();
     source.record_target_start(&start).unwrap();
-    let mut transfer = SourceStoreTransfer::begin(&store, &source, &descriptor, |chunk| {
-        let (_, receipt) = target.append_target_chunk(chunk)?;
-        Ok(receipt)
-    })
-    .unwrap();
+    let mut transfer =
+        SourceStoreTransfer::begin(&store, &source, &descriptor, &execution, |chunk| {
+            let (_, receipt) = target.append_target_chunk(chunk)?;
+            Ok(receipt)
+        })
+        .unwrap();
     assert!(transfer.write_dirty_round(1, &[]).is_err());
     assert_eq!(transfer.write_initial().unwrap(), 0);
     assert_eq!(transfer.write_dirty_round(1, &[]).unwrap(), 0);
     assert!(transfer.write_dirty_round(1, &[]).is_err());
     assert_eq!(transfer.write_dirty_round(2, &[]).unwrap(), 0);
     assert!(
-        SourceStoreTransfer::begin(&store, &source, &descriptor, |_| {
+        SourceStoreTransfer::begin(&store, &source, &descriptor, &execution, |_| {
             Err(ClusterError::Transport("must not send".to_owned()))
         })
         .is_err()

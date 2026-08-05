@@ -1,11 +1,11 @@
-use super::{ClusterError, TransferDataKey, TransferDescriptor};
+use super::{ClusterError, CompiledExecution, TransferDataKey, TransferDescriptor};
 use crate::snapshot::{dump_value_type, read_dump_value, write_dump_value};
 use crate::store::{DumpValue, Store};
 use std::collections::HashSet;
 use std::io::{Read, Write};
 
 const RECORD_MAGIC: &[u8; 4] = b"LXRD";
-const RECORD_SCHEMA_VERSION: u16 = 1;
+const RECORD_SCHEMA_VERSION: u16 = 2;
 const RECORD_END: u8 = 0;
 const RECORD_DELETE_KV: u8 = 1;
 const RECORD_UPSERT_KV: u8 = 2;
@@ -33,6 +33,7 @@ pub(crate) enum TransferRecord {
     UpsertTableRow {
         table: String,
         primary_key: Vec<u8>,
+        order_score: f64,
         value: DumpValue,
         expires_at_ms: Option<i64>,
         vectors: Vec<TableVectorRecord>,
@@ -58,14 +59,16 @@ impl TransferRecord {
             Self::UpsertTableRow {
                 table,
                 primary_key,
+                order_score,
                 value,
                 expires_at_ms,
                 vectors,
             } => {
                 validate_expiry(*expires_at_ms)?;
-                if !matches!(value, DumpValue::Hash(_, _)) {
-                    return invalid("table-row transfer value must be a hash");
+                if !order_score.is_finite() {
+                    return invalid("table-row order score must be finite");
                 }
+                validate_table_hash(value)?;
                 if std::str::from_utf8(primary_key).is_err() {
                     return invalid("table-row primary key must be UTF-8");
                 }
@@ -97,6 +100,7 @@ pub(crate) struct TransferRecordWriter<'a, W> {
     inner: W,
     store: &'a Store,
     descriptor: &'a TransferDescriptor,
+    execution: &'a CompiledExecution,
     records: u64,
     finished: bool,
 }
@@ -106,15 +110,20 @@ impl<'a, W: Write> TransferRecordWriter<'a, W> {
         mut inner: W,
         store: &'a Store,
         descriptor: &'a TransferDescriptor,
+        execution: &'a CompiledExecution,
     ) -> Result<Self, ClusterError> {
         descriptor.validate()?;
+        validate_execution(descriptor, execution)?;
         inner.write_all(RECORD_MAGIC)?;
         inner.write_all(&RECORD_SCHEMA_VERSION.to_be_bytes())?;
         inner.write_all(&descriptor.transfer_id.0)?;
+        inner.write_all(&execution.manifest().version.to_be_bytes())?;
+        inner.write_all(execution.digest().as_bytes())?;
         Ok(Self {
             inner,
             store,
             descriptor,
+            execution,
             records: 0,
             finished: false,
         })
@@ -125,6 +134,7 @@ impl<'a, W: Write> TransferRecordWriter<'a, W> {
             return invalid("transfer record stream is already finished");
         }
         record.validate()?;
+        validate_record_execution(record, self.execution)?;
         let identity = record.identity()?;
         if !self.descriptor.contains_slot(identity.slot()) {
             return invalid("transfer record is outside the ownership movement");
@@ -153,6 +163,7 @@ impl<'a, W: Write> TransferRecordWriter<'a, W> {
             TransferRecord::UpsertTableRow {
                 table,
                 primary_key,
+                order_score,
                 value,
                 expires_at_ms,
                 vectors,
@@ -160,6 +171,7 @@ impl<'a, W: Write> TransferRecordWriter<'a, W> {
                 self.inner.write_all(&[RECORD_UPSERT_TABLE_ROW])?;
                 write_name(&mut self.inner, table)?;
                 write_bytes(&mut self.inner, primary_key)?;
+                self.inner.write_all(&order_score.to_bits().to_be_bytes())?;
                 write_expiry(&mut self.inner, *expires_at_ms)?;
                 let row_key = table_row_key(table, primary_key)?;
                 self.inner.write_all(&[dump_value_type(value)])?;
@@ -206,6 +218,7 @@ pub(crate) struct TransferRecordReader<'a, R> {
     inner: R,
     store: &'a Store,
     descriptor: &'a TransferDescriptor,
+    execution: &'a CompiledExecution,
     records: u64,
     finished: bool,
 }
@@ -215,8 +228,10 @@ impl<'a, R: Read> TransferRecordReader<'a, R> {
         mut inner: R,
         store: &'a Store,
         descriptor: &'a TransferDescriptor,
+        execution: &'a CompiledExecution,
     ) -> Result<Self, ClusterError> {
         descriptor.validate()?;
+        validate_execution(descriptor, execution)?;
         let mut magic = [0_u8; 4];
         inner.read_exact(&mut magic)?;
         if &magic != RECORD_MAGIC {
@@ -231,10 +246,20 @@ impl<'a, R: Read> TransferRecordReader<'a, R> {
         if transfer_id != descriptor.transfer_id.0 {
             return invalid("transfer record stream belongs to another transfer");
         }
+        let execution_version = read_u64(&mut inner)?;
+        if execution_version != execution.manifest().version {
+            return invalid("transfer record stream uses another execution version");
+        }
+        let mut execution_digest = [0_u8; 64];
+        inner.read_exact(&mut execution_digest)?;
+        if execution_digest != execution.digest().as_bytes() {
+            return invalid("transfer record stream uses another execution digest");
+        }
         Ok(Self {
             inner,
             store,
             descriptor,
+            execution,
             records: 0,
             finished: false,
         })
@@ -290,6 +315,7 @@ impl<'a, R: Read> TransferRecordReader<'a, R> {
             RECORD_UPSERT_TABLE_ROW => {
                 let table = read_name(&mut self.inner)?;
                 let primary_key = read_bytes(&mut self.inner, MAX_RECORD_KEY_BYTES)?;
+                let order_score = f64::from_bits(read_u64(&mut self.inner)?);
                 let expires_at_ms = read_expiry(&mut self.inner)?;
                 let row_key = table_row_key(&table, &primary_key)?;
                 let value_type = read_u8(&mut self.inner)?;
@@ -321,6 +347,7 @@ impl<'a, R: Read> TransferRecordReader<'a, R> {
                 TransferRecord::UpsertTableRow {
                     table,
                     primary_key,
+                    order_score,
                     value,
                     expires_at_ms,
                     vectors,
@@ -329,6 +356,7 @@ impl<'a, R: Read> TransferRecordReader<'a, R> {
             _ => return invalid("transfer record stream contains an unknown record kind"),
         };
         record.validate()?;
+        validate_record_execution(&record, self.execution)?;
         if !self.descriptor.contains_slot(record.identity()?.slot()) {
             return invalid("transfer record is outside the ownership movement");
         }
@@ -338,6 +366,63 @@ impl<'a, R: Read> TransferRecordReader<'a, R> {
             .ok_or_else(|| ClusterError::InvalidTransfer("record count is exhausted".to_owned()))?;
         Ok(Some(record))
     }
+}
+
+fn validate_execution(
+    descriptor: &TransferDescriptor,
+    execution: &CompiledExecution,
+) -> Result<(), ClusterError> {
+    if execution.manifest().cluster_id != descriptor.cluster_id {
+        return invalid("transfer execution metadata belongs to another cluster");
+    }
+    if execution.digest().len() != 64 || !execution.digest().is_ascii() {
+        return invalid("transfer execution digest is not canonical");
+    }
+    Ok(())
+}
+
+fn validate_record_execution(
+    record: &TransferRecord,
+    execution: &CompiledExecution,
+) -> Result<(), ClusterError> {
+    let (table, vectors) = match record {
+        TransferRecord::Delete(TransferDataKey::TableRow { table, .. }) => (table.as_str(), None),
+        TransferRecord::UpsertTableRow { table, vectors, .. } => {
+            (table.as_str(), Some(vectors.as_slice()))
+        }
+        TransferRecord::Delete(TransferDataKey::Kv(_)) | TransferRecord::UpsertKv { .. } => {
+            return Ok(());
+        }
+    };
+    let table = execution.table(table).ok_or_else(|| {
+        ClusterError::InvalidTransfer(
+            "table row is absent from signed execution metadata".to_owned(),
+        )
+    })?;
+    if let Some(vectors) = vectors {
+        for vector in vectors {
+            let field = table
+                .fields
+                .iter()
+                .find(|field| field.name == vector.field)
+                .ok_or_else(|| {
+                    ClusterError::InvalidTransfer(
+                        "table vector field is absent from signed execution metadata".to_owned(),
+                    )
+                })?;
+            let definition = crate::tables::decode_field_def(&field.name, &field.definition);
+            let crate::tables::FieldType::Vector(dimensions) = definition.field_type else {
+                return invalid("table vector sidecar belongs to a non-vector field");
+            };
+            let DumpValue::Vector(values, _, _) = &vector.value else {
+                return invalid("table vector sidecar must contain a vector");
+            };
+            if values.len() != dimensions {
+                return invalid("table vector sidecar dimensions do not match signed metadata");
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn table_row_key(table: &str, primary_key: &[u8]) -> Result<Vec<u8>, ClusterError> {
@@ -372,6 +457,25 @@ fn validate_field(field: &str) -> Result<(), ClusterError> {
 fn validate_expiry(expires_at_ms: Option<i64>) -> Result<(), ClusterError> {
     if expires_at_ms.is_some_and(|deadline| deadline <= 0) {
         return invalid("transfer expiry deadline must be positive");
+    }
+    Ok(())
+}
+
+fn validate_table_hash(value: &DumpValue) -> Result<(), ClusterError> {
+    let DumpValue::Hash(pairs, expiries) = value else {
+        return invalid("table-row transfer value must be a hash");
+    };
+    let mut fields = HashSet::with_capacity(pairs.len());
+    for (field, _) in pairs {
+        if !fields.insert(field.as_str()) {
+            return invalid("table-row transfer value contains duplicate fields");
+        }
+    }
+    let mut expiring = HashSet::with_capacity(expiries.len());
+    for (field, deadline) in expiries {
+        if *deadline <= 0 || !fields.contains(field.as_str()) || !expiring.insert(field.as_str()) {
+            return invalid("table-row field expiry is invalid");
+        }
     }
     Ok(())
 }

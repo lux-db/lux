@@ -1,8 +1,8 @@
 use super::transfer_record::{TransferRecordReader, TransferRecordWriter};
 use super::transfer_stream::TransferChunkWriter;
 use super::{
-    ClusterError, TransferChunk, TransferDataKey, TransferDescriptor, TransferFinalBatch,
-    TransferJournal, TransferReceipt, TransferRuntime,
+    ClusterError, CompiledExecution, TransferChunk, TransferDataKey, TransferDescriptor,
+    TransferFinalBatch, TransferJournal, TransferReceipt, TransferRuntime,
 };
 use crate::store::Store;
 use std::io::{Read, Write};
@@ -26,6 +26,7 @@ where
         store: &'a Store,
         source: &'a TransferJournal,
         descriptor: &'a TransferDescriptor,
+        execution: &'a CompiledExecution,
         send_chunk: SendChunk,
     ) -> Result<Self, ClusterError> {
         descriptor.validate()?;
@@ -47,7 +48,7 @@ where
             store,
             source,
             descriptor,
-            records: TransferRecordWriter::new(chunks, store, descriptor)?,
+            records: TransferRecordWriter::new(chunks, store, descriptor, execution)?,
             initial_written: false,
             last_round: 0,
             failed: false,
@@ -176,12 +177,13 @@ pub(crate) fn write_dirty_store_records<W: Write>(
 pub(crate) fn apply_target_store_records<R: Read>(
     store: &Store,
     descriptor: &TransferDescriptor,
+    execution: &CompiledExecution,
     reader: R,
 ) -> Result<u64, ClusterError> {
-    let mut records = TransferRecordReader::new(reader, store, descriptor)?;
+    let mut records = TransferRecordReader::new(reader, store, descriptor, execution)?;
     let mut applied = 0_u64;
     while let Some(record) = records.next_record()? {
-        store.apply_transfer_record(record)?;
+        store.apply_transfer_record(record, execution)?;
         applied = applied.checked_add(1).ok_or_else(|| {
             ClusterError::InvalidTransfer("applied record count is exhausted".to_owned())
         })?;
@@ -192,20 +194,22 @@ pub(crate) fn apply_target_store_records<R: Read>(
 pub(crate) fn apply_sealed_target_store(
     store: &Store,
     descriptor: &TransferDescriptor,
+    execution: &CompiledExecution,
     target: &TransferJournal,
 ) -> Result<u64, ClusterError> {
-    apply_target_store_records(store, descriptor, target.open_target_reader()?)
+    apply_target_store_records(store, descriptor, execution, target.open_target_reader()?)
 }
 
 pub fn apply_target_store_transfer(
     store: &Store,
     descriptor: &TransferDescriptor,
+    execution: &CompiledExecution,
     target: &TransferJournal,
     receipt: &super::TransferReceipt,
 ) -> Result<u64, ClusterError> {
     target.prepare_target_apply(descriptor, receipt)?;
-    store.clear_transfer_ranges(descriptor)?;
-    let applied = apply_sealed_target_store(store, descriptor, target)?;
+    store.clear_transfer_ranges(descriptor, execution)?;
+    let applied = apply_sealed_target_store(store, descriptor, execution, target)?;
     target.mark_target_applied(receipt)?;
     Ok(applied)
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::cluster::test_support::compiled_execution;
 use crate::cluster::transfer_record::{TransferRecord, TransferRecordReader, TransferRecordWriter};
 use crate::cluster::{
     SlotRange, TransferDescriptor, TransferId, TransferRole, CLUSTER_PROTOCOL_VERSION,
@@ -47,6 +48,7 @@ fn records_stream_across_chunks_rounds_and_a_lost_receipt() {
     let start = target.accept_target_attempt(1).unwrap();
     source.record_target_start(&start).unwrap();
     let store = Store::new();
+    let execution = compiled_execution("cluster-a", Vec::new());
     let mut lose_first_receipt = true;
     let chunks = TransferChunkWriter::new(&source, 0, |chunk| {
         let (_, receipt) = target.append_target_chunk(chunk)?;
@@ -56,7 +58,7 @@ fn records_stream_across_chunks_rounds_and_a_lost_receipt() {
         }
         Ok(receipt)
     });
-    let mut records = TransferRecordWriter::new(chunks, &store, &descriptor).unwrap();
+    let mut records = TransferRecordWriter::new(chunks, &store, &descriptor, &execution).unwrap();
     let small = TransferRecord::UpsertKv {
         key: b"small".to_vec(),
         value: DumpValue::Str(b"value".to_vec()),
@@ -84,7 +86,7 @@ fn records_stream_across_chunks_rounds_and_a_lost_receipt() {
     target.seal(&receipt).unwrap();
 
     let stage = target.open_target_reader().unwrap();
-    let mut reader = TransferRecordReader::new(stage, &store, &descriptor).unwrap();
+    let mut reader = TransferRecordReader::new(stage, &store, &descriptor, &execution).unwrap();
     assert_eq!(reader.next_record().unwrap(), Some(small));
     assert_eq!(reader.next_record().unwrap(), Some(large));
     assert_eq!(reader.next_record().unwrap(), Some(deleted));

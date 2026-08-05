@@ -18,6 +18,9 @@ mod transfer_stage;
 mod transfer_stream;
 mod transport;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use control::{
     ControlRejectCode, ControlRequest, ControlRequestBody, ControlRequestId, ControlResponse,
     ControlResponseBody, MAX_CONTROL_DEADLINE_MS,

@@ -455,7 +455,8 @@ impl TransferJournal {
     /// rebuilt, and the target has a durable recovery point ordered before any
     /// writes it may serve. Callers must complete all three before presenting
     /// this transition; topology activation rejects the earlier `Applied` phase.
-    pub fn mark_target_ready(&self, expected: &TransferReceipt) -> Result<(), ClusterError> {
+    #[cfg(test)]
+    pub(crate) fn mark_target_ready(&self, expected: &TransferReceipt) -> Result<(), ClusterError> {
         self.mutate(|snapshot| {
             require_role(snapshot, TransferRole::Target)?;
             validate_receipt_identity(snapshot, expected)?;

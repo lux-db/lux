@@ -1,4 +1,5 @@
 use super::*;
+use crate::cluster::test_support::{compiled_execution, execution_table};
 use crate::cluster::{SlotRange, TransferId, CLUSTER_PROTOCOL_VERSION, CLUSTER_SLOT_COUNT};
 
 fn descriptor() -> TransferDescriptor {
@@ -18,6 +19,30 @@ fn descriptor() -> TransferDescriptor {
     };
     descriptor.transfer_id = descriptor.expected_id().unwrap();
     descriptor
+}
+
+fn execution() -> CompiledExecution {
+    compiled_execution(
+        "cluster-a",
+        vec![
+            execution_table(
+                "accounts",
+                Some("id"),
+                &[
+                    ("embedding", "vector:2"),
+                    ("id", "str|pk|unique|notnull"),
+                    ("name", "str"),
+                ],
+                &[],
+            ),
+            execution_table(
+                "sessions",
+                Some("id"),
+                &[("id", "str|pk|unique|notnull")],
+                &[],
+            ),
+        ],
+    )
 }
 
 fn values() -> Vec<DumpValue> {
@@ -53,6 +78,7 @@ fn values() -> Vec<DumpValue> {
 fn record_stream_round_trips_every_store_value_and_table_sidecars() {
     let descriptor = descriptor();
     let store = Store::new();
+    let execution = execution();
     let mut records = values()
         .into_iter()
         .enumerate()
@@ -68,6 +94,7 @@ fn record_stream_round_trips_every_store_value_and_table_sidecars() {
     records.push(TransferRecord::UpsertTableRow {
         table: "accounts".to_owned(),
         primary_key: b"user-1".to_vec(),
+        order_score: 7.0,
         value: DumpValue::Hash(vec![("name".to_owned(), b"Matty".to_vec())], Vec::new()),
         expires_at_ms: None,
         vectors: vec![TableVectorRecord {
@@ -80,13 +107,15 @@ fn record_stream_round_trips_every_store_value_and_table_sidecars() {
         TransferDataKey::table_row("sessions", b"expired".to_vec()).unwrap(),
     ));
 
-    let mut writer = TransferRecordWriter::new(Vec::new(), &store, &descriptor).unwrap();
+    let mut writer =
+        TransferRecordWriter::new(Vec::new(), &store, &descriptor, &execution).unwrap();
     for record in &records {
         writer.write_record(record).unwrap();
     }
     let encoded = writer.finish().unwrap();
 
-    let mut reader = TransferRecordReader::new(encoded.as_slice(), &store, &descriptor).unwrap();
+    let mut reader =
+        TransferRecordReader::new(encoded.as_slice(), &store, &descriptor, &execution).unwrap();
     let mut decoded = Vec::new();
     while let Some(record) = reader.next_record().unwrap() {
         decoded.push(record);
@@ -99,24 +128,28 @@ fn record_stream_round_trips_every_store_value_and_table_sidecars() {
 fn stream_identity_completion_and_bounds_fail_closed() {
     let descriptor = descriptor();
     let store = Store::new();
+    let execution = execution();
     let record = TransferRecord::UpsertKv {
         key: b"key".to_vec(),
         value: DumpValue::Str(b"value".to_vec()),
         expires_at_ms: None,
     };
-    let mut writer = TransferRecordWriter::new(Vec::new(), &store, &descriptor).unwrap();
+    let mut writer =
+        TransferRecordWriter::new(Vec::new(), &store, &descriptor, &execution).unwrap();
     writer.write_record(&record).unwrap();
     let encoded = writer.finish().unwrap();
 
     let mut truncated = encoded.clone();
     truncated.truncate(truncated.len() - 9);
-    let mut reader = TransferRecordReader::new(truncated.as_slice(), &store, &descriptor).unwrap();
+    let mut reader =
+        TransferRecordReader::new(truncated.as_slice(), &store, &descriptor, &execution).unwrap();
     assert_eq!(reader.next_record().unwrap(), Some(record.clone()));
     assert!(reader.next_record().is_err());
 
     let mut trailing = encoded.clone();
     trailing.push(1);
-    let mut reader = TransferRecordReader::new(trailing.as_slice(), &store, &descriptor).unwrap();
+    let mut reader =
+        TransferRecordReader::new(trailing.as_slice(), &store, &descriptor, &execution).unwrap();
     assert!(reader.next_record().unwrap().is_some());
     assert!(reader.next_record().is_err());
 
@@ -124,18 +157,26 @@ fn stream_identity_completion_and_bounds_fail_closed() {
     other.to_epoch += 1;
     other.from_epoch += 1;
     other.transfer_id = other.expected_id().unwrap();
-    assert!(TransferRecordReader::new(encoded.as_slice(), &store, &other).is_err());
+    assert!(TransferRecordReader::new(encoded.as_slice(), &store, &other, &execution).is_err());
+    let other_execution = compiled_execution("cluster-a", Vec::new());
+    assert!(
+        TransferRecordReader::new(encoded.as_slice(), &store, &descriptor, &other_execution,)
+            .is_err()
+    );
 }
 
 #[test]
 fn invalid_table_shapes_and_records_outside_the_move_are_rejected() {
     let store = Store::new();
     let descriptor = descriptor();
-    let mut writer = TransferRecordWriter::new(Vec::new(), &store, &descriptor).unwrap();
+    let execution = execution();
+    let mut writer =
+        TransferRecordWriter::new(Vec::new(), &store, &descriptor, &execution).unwrap();
     assert!(writer
         .write_record(&TransferRecord::UpsertTableRow {
             table: "accounts".to_owned(),
             primary_key: b"user-1".to_vec(),
+            order_score: 1.0,
             value: DumpValue::Str(b"not-a-row".to_vec()),
             expires_at_ms: None,
             vectors: Vec::new(),
@@ -145,6 +186,7 @@ fn invalid_table_shapes_and_records_outside_the_move_are_rejected() {
         .write_record(&TransferRecord::UpsertTableRow {
             table: "accounts".to_owned(),
             primary_key: b"user-1".to_vec(),
+            order_score: 1.0,
             value: DumpValue::Hash(Vec::new(), Vec::new()),
             expires_at_ms: None,
             vectors: vec![
@@ -161,6 +203,16 @@ fn invalid_table_shapes_and_records_outside_the_move_are_rejected() {
             ],
         })
         .is_err());
+    assert!(writer
+        .write_record(&TransferRecord::UpsertTableRow {
+            table: "accounts".to_owned(),
+            primary_key: b"user-1".to_vec(),
+            order_score: f64::NAN,
+            value: DumpValue::Hash(Vec::new(), Vec::new()),
+            expires_at_ms: None,
+            vectors: Vec::new(),
+        })
+        .is_err());
 
     let mut narrow = descriptor;
     narrow.ranges = vec![SlotRange { start: 0, end: 0 }];
@@ -169,7 +221,7 @@ fn invalid_table_shapes_and_records_outside_the_move_are_rejected() {
         .map(|index| format!("outside-{index}").into_bytes())
         .find(|key| TransferDataKey::kv(key.clone()).unwrap().slot() != 0)
         .unwrap();
-    let mut writer = TransferRecordWriter::new(Vec::new(), &store, &narrow).unwrap();
+    let mut writer = TransferRecordWriter::new(Vec::new(), &store, &narrow, &execution).unwrap();
     assert!(writer
         .write_record(&TransferRecord::Delete(TransferDataKey::kv(key).unwrap()))
         .is_err());
