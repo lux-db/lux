@@ -8,6 +8,11 @@ mod serving_state;
 mod signature;
 mod topology;
 mod topology_state;
+mod transfer;
+mod transfer_dirty;
+mod transfer_journal;
+mod transfer_runtime;
+mod transfer_stage;
 mod transport;
 
 pub use control::{
@@ -33,6 +38,16 @@ pub use topology::{
     CLUSTER_SLOT_COUNT, CLUSTER_TOPOLOGY_SCHEMA_VERSION,
 };
 pub use topology_state::{TopologySnapshot, TopologyState};
+pub use transfer::{
+    ChunkDisposition, SlotRange, TransferChunk, TransferDescriptor, TransferId,
+    TransferJournalSnapshot, TransferPhase, TransferReceipt, TransferRole,
+    MAX_TRANSFER_CHUNK_BYTES,
+};
+pub use transfer_journal::TransferJournal;
+pub use transfer_runtime::{
+    DirtyStats, TransferDataKey, TransferFence, TransferRuntime, TransferRuntimeConfig,
+    TransferWriteAdmission, TransferWriteGuard,
+};
 pub use transport::{AuthenticatedControlRequest, PeerControlConfig, PeerControlTransport};
 
 pub const CLUSTER_PROTOCOL_VERSION: u16 = 1;
@@ -42,6 +57,7 @@ pub enum ClusterError {
     InvalidConfig(String),
     InvalidTopology(String),
     InvalidExecution(String),
+    InvalidTransfer(String),
     Protocol(String),
     Signature(String),
     Transport(String),
@@ -58,6 +74,9 @@ impl std::fmt::Display for ClusterError {
             }
             Self::InvalidExecution(message) => {
                 write!(formatter, "invalid cluster execution metadata: {message}")
+            }
+            Self::InvalidTransfer(message) => {
+                write!(formatter, "invalid cluster ownership transfer: {message}")
             }
             Self::Protocol(message) => write!(formatter, "cluster protocol error: {message}"),
             Self::Signature(message) => write!(formatter, "cluster signature error: {message}"),
@@ -76,6 +95,7 @@ impl std::error::Error for ClusterError {
             Self::InvalidConfig(_)
             | Self::InvalidTopology(_)
             | Self::InvalidExecution(_)
+            | Self::InvalidTransfer(_)
             | Self::Protocol(_)
             | Self::Signature(_)
             | Self::Transport(_) => None,
