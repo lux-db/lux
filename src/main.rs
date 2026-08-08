@@ -506,9 +506,7 @@ fn print_error_event(event: lux::ServerErrorEvent) {
             eprintln!("compaction error (shard {shard}): {error}");
         }
         lux::ServerErrorEvent::WalAppendFailed { error } => {
-            eprintln!(
-                "CRITICAL: WAL append failed, in-memory mutation will not survive crash: {error}"
-            );
+            eprintln!("CRITICAL: WAL append failed, mutation was rejected: {error}");
         }
         lux::ServerErrorEvent::SnapshotDiskDumpFailed { error } => {
             eprintln!(
@@ -516,7 +514,9 @@ fn print_error_event(event: lux::ServerErrorEvent) {
             );
         }
         lux::ServerErrorEvent::WalFsyncFailed { error } => {
-            eprintln!("CRITICAL: WAL fsync failed, up to 1s of writes may not be durable: {error}");
+            eprintln!(
+                "CRITICAL: WAL fsync failed; durability is degraded until synchronization succeeds: {error}"
+            );
         }
         lux::ServerErrorEvent::HttpServerFailed { error } => {
             eprintln!("http server error: {error}");

@@ -14,6 +14,7 @@ pub(crate) enum CommandOutput {
     Nil,
     Int(i64),
     Simple(&'static str),
+    SimpleOwned(String),
     Bulk(Bytes),
     Array(Vec<CommandOutput>),
 }

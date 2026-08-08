@@ -2,7 +2,7 @@ use bytes::BytesMut;
 use std::time::Instant;
 
 use crate::resp;
-use crate::store::{epoch_ms, HExpireCond, HFieldTtl, HGetexTtl, Store, StoreValue};
+use crate::store::{epoch_ms, HExpireCond, HFieldTtl, HGetexTtl, JournalPlan, Store, StoreValue};
 
 use super::{arg_str, cmd_eq, parse_i64, parse_u64, CmdResult};
 
@@ -35,34 +35,37 @@ pub fn cmd_hset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         return CmdResult::Written;
     }
     let pairs: Vec<(&[u8], &[u8])> = args[2..end].chunks(2).map(|c| (c[0], c[1])).collect();
-    let fields: Vec<&[u8]> = pairs.iter().map(|(field, _)| *field).collect();
-    let should_self_log = encrypted || store.hash_fields_need_encryption(args[1], &fields, now);
-    let result = if should_self_log {
-        store
-            .hset_kv(args[1], &pairs, encrypted, now)
-            .map(|(added, stored_pairs)| (added, Some(stored_pairs)))
-    } else {
-        store.hset(args[1], &pairs, now).map(|added| (added, None))
+    // Always journal the resolved bytes. Whether an existing field must remain
+    // encrypted is state-dependent, so deciding between raw and resolved WAL
+    // paths before acquiring the key gate would race another HSET.
+    let route: [&[u8]; 2] = [b"HSET", args[1]];
+    let result = match store.commit_prepared(
+        &route,
+        || {
+            let stored_pairs = store.prepare_hset_kv(args[1], &pairs, encrypted, now)?;
+            let mut command = Vec::with_capacity(3 + stored_pairs.len() * 2);
+            command.push(b"ENC".to_vec());
+            command.push(b"RAWHSET".to_vec());
+            command.push(args[1].to_vec());
+            for (field, value) in &stored_pairs {
+                command.push(field.clone());
+                command.push(value.clone());
+            }
+            Ok(JournalPlan::command(command, stored_pairs))
+        },
+        |stored_pairs| {
+            let refs: Vec<(&[u8], &[u8])> = stored_pairs
+                .iter()
+                .map(|(field, value)| (field.as_slice(), value.as_slice()))
+                .collect();
+            store.hset(args[1], &refs, now)
+        },
+    ) {
+        Ok(result) => result,
+        Err(error) => Err(format!("ERR WAL append failed: {error}")),
     };
     match result {
-        Ok((n, stored_pairs)) => {
-            if should_self_log && store.wal_enabled() {
-                if let Some(stored_pairs) = stored_pairs {
-                    let mut owned: Vec<Vec<u8>> = Vec::with_capacity(3 + stored_pairs.len() * 2);
-                    owned.push(b"ENC".to_vec());
-                    owned.push(b"RAWHSET".to_vec());
-                    owned.push(args[1].to_vec());
-                    for (field, value) in stored_pairs {
-                        owned.push(field);
-                        owned.push(value);
-                    }
-                    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-                    if let Err(e) = store.wal_log_command(&refs) {
-                        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-                        return CmdResult::Written;
-                    }
-                }
-            }
+        Ok(n) => {
             if is_hmset {
                 resp::write_ok(out);
             } else {
@@ -581,31 +584,31 @@ fn cmd_hexpire_generic(
         ExpireUnit::SecondsAt => ttl.saturating_mul(1000),
         ExpireUnit::MillisAt => ttl,
     };
+    // Journal the resolved absolute deadline before mutating any field TTL.
+    let dl = deadline_ms.to_string();
+    let nf = fields.len().to_string();
+    let mut journal_args: Vec<Vec<u8>> =
+        vec![b"HPEXPIREAT".to_vec(), args[1].to_vec(), dl.into_bytes()];
+    match cond {
+        HExpireCond::None => {}
+        HExpireCond::Nx => journal_args.push(b"NX".to_vec()),
+        HExpireCond::Xx => journal_args.push(b"XX".to_vec()),
+        HExpireCond::Gt => journal_args.push(b"GT".to_vec()),
+        HExpireCond::Lt => journal_args.push(b"LT".to_vec()),
+    }
+    journal_args.push(b"FIELDS".to_vec());
+    journal_args.push(nf.into_bytes());
+    journal_args.extend(fields.iter().map(|field| field.to_vec()));
+    let refs: Vec<&[u8]> = journal_args.iter().map(Vec::as_slice).collect();
+    let _commit = match store.begin_journaled(&refs) {
+        Ok(commit) => commit,
+        Err(e) => {
+            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+            return CmdResult::Written;
+        }
+    };
     match store.hexpire_fields(args[1], &fields, deadline_ms, cond, now) {
         Ok(results) => {
-            // Self-log a resolved HPEXPIREAT (absolute deadline) so a relative
-            // TTL doesn't re-anchor to replay time. Keyed on the hash key.
-            if store.wal_enabled() {
-                let dl = deadline_ms.to_string();
-                let nf = fields.len().to_string();
-                let mut owned: Vec<Vec<u8>> =
-                    vec![b"HPEXPIREAT".to_vec(), args[1].to_vec(), dl.into_bytes()];
-                match cond {
-                    HExpireCond::None => {}
-                    HExpireCond::Nx => owned.push(b"NX".to_vec()),
-                    HExpireCond::Xx => owned.push(b"XX".to_vec()),
-                    HExpireCond::Gt => owned.push(b"GT".to_vec()),
-                    HExpireCond::Lt => owned.push(b"LT".to_vec()),
-                }
-                owned.push(b"FIELDS".to_vec());
-                owned.push(nf.into_bytes());
-                owned.extend(fields.iter().map(|f| f.to_vec()));
-                let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-                if let Err(e) = store.wal_log_command(&refs) {
-                    resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-                    return CmdResult::Written;
-                }
-            }
             resp::write_array_header(out, results.len());
             for r in results {
                 resp::write_integer(out, r);
@@ -778,44 +781,44 @@ pub fn cmd_hgetex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
     let Some(fields) = parse_fields_clause(args, i, out) else {
         return CmdResult::Written;
     };
+    let journal_args: Option<Vec<Vec<u8>>> = match ttl {
+        HGetexTtl::Keep => None,
+        HGetexTtl::Persist => {
+            let mut command = vec![
+                b"HPERSIST".to_vec(),
+                args[1].to_vec(),
+                b"FIELDS".to_vec(),
+                fields.len().to_string().into_bytes(),
+            ];
+            command.extend(fields.iter().map(|field| field.to_vec()));
+            Some(command)
+        }
+        HGetexTtl::SetMs(ms) => {
+            let mut command = vec![
+                b"HPEXPIREAT".to_vec(),
+                args[1].to_vec(),
+                ms.to_string().into_bytes(),
+                b"FIELDS".to_vec(),
+                fields.len().to_string().into_bytes(),
+            ];
+            command.extend(fields.iter().map(|field| field.to_vec()));
+            Some(command)
+        }
+    };
+    let _commit = if let Some(journal_args) = &journal_args {
+        let refs: Vec<&[u8]> = journal_args.iter().map(Vec::as_slice).collect();
+        match store.begin_journaled(&refs) {
+            Ok(commit) => Some(commit),
+            Err(e) => {
+                resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                return CmdResult::Written;
+            }
+        }
+    } else {
+        None
+    };
     match store.hgetex_fields(args[1], &fields, ttl, now) {
         Ok(values) => {
-            // A TTL mutation must be logged (keyed on the hash key) as a resolved
-            // absolute effect, so replay is deterministic. A plain read is not.
-            if store.wal_enabled() {
-                let nf = fields.len().to_string();
-                let logged: Option<Vec<Vec<u8>>> = match ttl {
-                    HGetexTtl::Keep => None,
-                    HGetexTtl::Persist => {
-                        let mut o = vec![
-                            b"HPERSIST".to_vec(),
-                            args[1].to_vec(),
-                            b"FIELDS".to_vec(),
-                            nf.into_bytes(),
-                        ];
-                        o.extend(fields.iter().map(|f| f.to_vec()));
-                        Some(o)
-                    }
-                    HGetexTtl::SetMs(ms) => {
-                        let mut o = vec![
-                            b"HPEXPIREAT".to_vec(),
-                            args[1].to_vec(),
-                            ms.to_string().into_bytes(),
-                            b"FIELDS".to_vec(),
-                            nf.into_bytes(),
-                        ];
-                        o.extend(fields.iter().map(|f| f.to_vec()));
-                        Some(o)
-                    }
-                };
-                if let Some(owned) = logged {
-                    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-                    if let Err(e) = store.wal_log_command(&refs) {
-                        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-                        return CmdResult::Written;
-                    }
-                }
-            }
             resp::write_array_header(out, values.len());
             for v in &values {
                 resp::write_optional_bulk_raw(out, v);

@@ -82,6 +82,15 @@ pub fn cmd_enc(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
         }
         return CmdResult::Written;
     }
+    let raw_replay_command = cmd_eq(args[1], b"RAWSET")
+        || cmd_eq(args[1], b"RAWHSET")
+        || cmd_eq(args[1], b"RAWLPUSH")
+        || cmd_eq(args[1], b"RAWRPUSH")
+        || cmd_eq(args[1], b"RAWVSET");
+    if raw_replay_command && !store.wal_replaying() {
+        resp::write_error(out, "ERR unknown ENC subcommand");
+        return CmdResult::Written;
+    }
     if cmd_eq(args[1], b"RAWSET") {
         return cmd_rawset(args, store, out, now);
     }
@@ -243,8 +252,8 @@ fn cmd_rawvset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
             metadata = Some(String::from_utf8_lossy(args[i + 1]).to_string());
             i += 2;
         } else if cmd_eq(args[i], b"EX") && i + 1 < args.len() {
-            if let Ok(s) = parse_u64(args[i + 1]) {
-                ttl = Some(Duration::from_secs(s));
+            if let Ok(seconds) = parse_u64(args[i + 1]) {
+                ttl = Some(Duration::from_secs(seconds));
             }
             i += 2;
         } else if cmd_eq(args[i], b"PXAT") && i + 1 < args.len() {

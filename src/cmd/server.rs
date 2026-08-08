@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::pubsub::Broker;
 use crate::resp;
-use crate::store::{epoch_ms, Store};
+use crate::store::{JournalPlan, Store};
 
 use super::{arg_str, cmd_eq, is_restricted, CmdResult};
 
@@ -397,18 +397,42 @@ pub fn cmd_restore(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
             return CmdResult::Written;
         }
     }
-    match store.restore_key(args[1], ttl_ms, args[3], replace, absttl, now) {
-        Ok(()) => {
-            if ttl_ms > 0 && !absttl && store.wal_enabled() {
-                let deadline = epoch_ms().saturating_add(ttl_ms);
-                if let Err(e) = super::wal_log_resolved_ttl_command(store, args, deadline) {
-                    resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-                    return CmdResult::Written;
-                }
+    let durable_ttl_ms = if ttl_ms <= 0 || absttl {
+        ttl_ms
+    } else {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        now_ms.saturating_add(ttl_ms)
+    };
+    let route: [&[u8]; 2] = [b"RESTORE", args[1]];
+    let result: std::io::Result<Result<(), String>> = store.commit_prepared(
+        &route,
+        || {
+            let prepared =
+                store.prepare_restore_key(args[1], ttl_ms, args[3], replace, absttl, now)?;
+            let mut command = vec![
+                b"RESTORE".to_vec(),
+                args[1].to_vec(),
+                durable_ttl_ms.to_string().into_bytes(),
+                args[3].to_vec(),
+            ];
+            if replace {
+                command.push(b"REPLACE".to_vec());
             }
-            resp::write_ok(out)
-        }
-        Err(e) => resp::write_error(out, &e),
+            command.push(b"ABSTTL".to_vec());
+            Ok(JournalPlan::command(command, prepared))
+        },
+        |prepared| {
+            store.apply_prepared_restore(args[1], prepared);
+            Ok::<(), String>(())
+        },
+    );
+    match result {
+        Ok(Ok(())) => resp::write_ok(out),
+        Ok(Err(error)) => resp::write_error(out, &error),
+        Err(error) => resp::write_error(out, &format!("ERR WAL append failed: {error}")),
     }
     CmdResult::Written
 }

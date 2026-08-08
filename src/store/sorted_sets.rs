@@ -576,6 +576,43 @@ impl Store {
         }
     }
 
+    pub(crate) fn preview_zpop(
+        &self,
+        key: &[u8],
+        count: usize,
+        min: bool,
+        now: Instant,
+    ) -> Result<Vec<(String, f64)>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard
+            .data
+            .get(key)
+            .filter(|entry| !entry.is_expired_at(now))
+        {
+            Some(entry) => match &entry.value {
+                StoreValue::SortedSet(tree, _) => {
+                    if min {
+                        Ok(tree
+                            .keys()
+                            .take(count)
+                            .map(|(score, member)| (member.clone(), score.0))
+                            .collect())
+                    } else {
+                        Ok(tree
+                            .keys()
+                            .rev()
+                            .take(count)
+                            .map(|(score, member)| (member.clone(), score.0))
+                            .collect())
+                    }
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub fn zpopmax(
         &self,
         key: &[u8],
@@ -732,17 +769,37 @@ impl Store {
     }
 
     /// Delete `dst` and store `result` as a sorted set; returns the member count.
-    fn write_computed_zset(&self, dst: &[u8], result: HashMap<String, f64>) -> Result<i64, String> {
+    fn write_computed_zset(
+        &self,
+        prepare: JournalPrepareGuard<'_>,
+        dst: &[u8],
+        result: HashMap<String, f64>,
+    ) -> Result<i64, String> {
         let count = result.len() as i64;
-        self.del(&[dst]);
-        let wal = self.wal_enabled();
-
-        if result.is_empty() {
-            // Self-log the clear so replay drops any prior dst on dst's own shard.
-            if wal {
-                self.wal_log_command(&[b"DEL", dst])
-                    .map_err(|e| format!("ERR WAL append failed: {e}"))?;
+        let entries: Vec<(String, f64)> = result.into_iter().collect();
+        let score_strs: Vec<String> = entries.iter().map(|(_, score)| score.to_string()).collect();
+        let del: [&[u8]; 2] = [b"DEL", dst];
+        let mut zadd: Vec<&[u8]> = Vec::with_capacity(entries.len() * 2 + 2);
+        if !entries.is_empty() {
+            zadd.push(b"ZADD");
+            zadd.push(dst);
+            for ((member, _), score) in entries.iter().zip(&score_strs) {
+                zadd.push(score.as_bytes());
+                zadd.push(member.as_bytes());
             }
+        }
+        let mut commands: Vec<&[&[u8]]> = vec![&del];
+        if !zadd.is_empty() {
+            commands.push(&zadd);
+        }
+
+        // Journal the resolved replacement before touching the destination.
+        // Recovery never needs to re-read the source keys.
+        let _commit = prepare
+            .commit_batch(&commands)
+            .map_err(|e| format!("ERR WAL append failed: {e}"))?;
+        self.del(&[dst]);
+        if entries.is_empty() {
             return Ok(count);
         }
 
@@ -752,25 +809,10 @@ impl Store {
         let mut tree = BTreeMap::new();
         let mut scores = HashMap::new();
         let mut mem = key_str(dst).len() + 64;
-        // Captured for the self-logged ZADD below (only when WAL is on).
-        let mut members: Vec<String> = if wal {
-            Vec::with_capacity(result.len())
-        } else {
-            Vec::new()
-        };
-        let mut score_strs: Vec<String> = if wal {
-            Vec::with_capacity(result.len())
-        } else {
-            Vec::new()
-        };
-        for (member, score) in result {
+        for (member, score) in &entries {
             mem += member.len() + 48;
-            tree.insert((OrderedFloat(score), member.clone()), ());
-            if wal {
-                score_strs.push(score.to_string());
-                members.push(member.clone());
-            }
-            scores.insert(member, score);
+            tree.insert((OrderedFloat(*score), member.clone()), ());
+            scores.insert(member.clone(), *score);
         }
         let old = shard.data.insert(
             key_bytes(dst),
@@ -785,26 +827,6 @@ impl Store {
         }
         shard.used_memory += mem;
         self.mem_add(mem);
-        drop(shard);
-
-        // Self-log the resolved effect keyed on dst (DEL + ZADD). The raw *STORE
-        // command reads source keys that may live on other WAL shards, so per-
-        // shard replay could apply it before the sources are restored. Logging
-        // DEL+ZADD to dst's own shard makes replay independent of source order.
-        // (The raw command is skipped in execute_with_wal via command_self_logs_wal.)
-        if wal {
-            self.wal_log_command(&[b"DEL", dst])
-                .map_err(|e| format!("ERR WAL append failed: {e}"))?;
-            let mut zadd: Vec<&[u8]> = Vec::with_capacity(members.len() * 2 + 2);
-            zadd.push(b"ZADD");
-            zadd.push(dst);
-            for (s, m) in score_strs.iter().zip(members.iter()) {
-                zadd.push(s.as_bytes());
-                zadd.push(m.as_bytes());
-            }
-            self.wal_log_command(&zadd)
-                .map_err(|e| format!("ERR WAL append failed: {e}"))?;
-        }
         Ok(count)
     }
 
@@ -828,45 +850,25 @@ impl Store {
         aggregate: &str,
         now: Instant,
     ) -> Result<i64, String> {
+        let route: [&[u8]; 2] = [b"ZUNIONSTORE", dst];
+        let prepare = self
+            .prepare_journaled(&route)
+            .map_err(|e| format!("ERR WAL append failed: {e}"))?;
         let result = self.zunion_compute(keys, weights, aggregate, now)?;
-        self.write_computed_zset(dst, result)
-    }
-
-    /// ZMPOP/BZMPOP core: pop up to `count` MIN- or MAX-scored members from the
-    /// first non-empty sorted set among `keys`. Returns the popped key and the
-    /// (member, score) pairs, or None when every key is missing/empty. WRONGTYPE
-    /// propagates from the first non-zset key scanned.
-    #[allow(clippy::type_complexity)]
-    pub fn zmpop(
-        &self,
-        keys: &[&[u8]],
-        pop_min: bool,
-        count: usize,
-        now: Instant,
-    ) -> Result<Option<(Vec<u8>, Vec<(String, f64)>)>, String> {
-        for key in keys {
-            self.try_promote(key, now);
-            let popped = if pop_min {
-                self.zpopmin(key, count, now)
-            } else {
-                self.zpopmax(key, count, now)
-            };
-            match popped {
-                Ok(items) if !items.is_empty() => return Ok(Some((key.to_vec(), items))),
-                Ok(_) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(None)
+        self.write_computed_zset(prepare, dst, result)
     }
 
     /// ZRANGESTORE: store already-resolved (member, score) pairs into `dst` as a
-    /// sorted set, replacing any prior value. Reuses `write_computed_zset`, which
-    /// self-logs a keyed DEL+ZADD so a sharded WAL replays it on dst's own shard
-    /// (the raw command reads a src key that may live on another shard).
-    pub fn zrangestore(&self, dst: &[u8], pairs: Vec<(String, f64)>) -> Result<i64, String> {
+    /// sorted set, replacing any prior value. The journal records DEL + ZADD so
+    /// recovery does not need to re-read a mutable source key.
+    pub(crate) fn zrangestore(
+        &self,
+        prepare: JournalPrepareGuard<'_>,
+        dst: &[u8],
+        pairs: Vec<(String, f64)>,
+    ) -> Result<i64, String> {
         let map: HashMap<String, f64> = pairs.into_iter().collect();
-        self.write_computed_zset(dst, map)
+        self.write_computed_zset(prepare, dst, map)
     }
 
     pub fn zinterstore(
@@ -877,13 +879,21 @@ impl Store {
         aggregate: &str,
         now: Instant,
     ) -> Result<i64, String> {
+        let route: [&[u8]; 2] = [b"ZINTERSTORE", dst];
+        let prepare = self
+            .prepare_journaled(&route)
+            .map_err(|e| format!("ERR WAL append failed: {e}"))?;
         let result = self.zinter_compute(keys, weights, aggregate, now)?;
-        self.write_computed_zset(dst, result)
+        self.write_computed_zset(prepare, dst, result)
     }
 
     pub fn zdiffstore(&self, dst: &[u8], keys: &[&[u8]], now: Instant) -> Result<i64, String> {
+        let route: [&[u8]; 2] = [b"ZDIFFSTORE", dst];
+        let prepare = self
+            .prepare_journaled(&route)
+            .map_err(|e| format!("ERR WAL append failed: {e}"))?;
         let result = self.zdiff_compute(keys, now)?;
-        self.write_computed_zset(dst, result)
+        self.write_computed_zset(prepare, dst, result)
     }
 
     /// Direct-return union (sorted). WITHSCORES is applied at the command layer.

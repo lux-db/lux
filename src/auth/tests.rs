@@ -8,6 +8,7 @@ use rsa::RsaPrivateKey;
 
 use super::*;
 use crate::tables::SchemaCache;
+use crate::{DurabilityConfig, DurabilityPolicy, ServerConfig};
 
 fn principal(uid: &str) -> AuthPrincipal {
     AuthPrincipal {
@@ -895,6 +896,46 @@ fn bootstrap_creates_auth_tables_idempotently() {
         store.get(AUTH_SCHEMA_VERSION_KEY, now).unwrap(),
         AUTH_SCHEMA_VERSION
     );
+}
+
+#[test]
+fn oauth_state_crosses_the_journal_boundary_on_create_and_consume() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ServerConfig {
+        data_dir: dir.path().to_string_lossy().to_string(),
+        durability: DurabilityConfig {
+            policy: DurabilityPolicy::AlwaysSync,
+            ..DurabilityConfig::default()
+        },
+        ..ServerConfig::default()
+    });
+    let key = b"_auth:oauth_state:test";
+    let payload = br#"{"provider":"google"}"#;
+    let store = Store::new_with_config(config.clone());
+
+    store.inject_journal_failures(1);
+    let error = persist_oauth_state(&store, key, payload).unwrap_err();
+    assert!(error.contains("WAL append failed"), "{error}");
+    assert!(store.get(key, Instant::now()).is_none());
+
+    persist_oauth_state(&store, key, payload).unwrap();
+    store.inject_journal_failures(1);
+    let error = take_oauth_state(&store, key, Instant::now()).unwrap_err();
+    assert!(error.contains("WAL append failed"), "{error}");
+    assert_eq!(store.get(key, Instant::now()).unwrap(), payload.as_slice());
+
+    assert_eq!(
+        take_oauth_state(&store, key, Instant::now()).unwrap(),
+        Some(bytes::Bytes::from_static(payload))
+    );
+    assert!(take_oauth_state(&store, key, Instant::now())
+        .unwrap()
+        .is_none());
+    drop(store);
+
+    let restored = Store::new_with_config(config);
+    restored.replay_wal(&crate::pubsub::Broker::new());
+    assert!(restored.get(key, Instant::now()).is_none());
 }
 
 #[test]

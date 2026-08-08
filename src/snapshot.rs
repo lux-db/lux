@@ -181,7 +181,7 @@ pub fn snapshot_for_backup(store: &Store) -> io::Result<String> {
 }
 
 /// Lay a restored snapshot down on disk: write `dump` as lux.dat and remove the
-/// per-shard WAL + tiered data dirs so a restart reloads purely from the dump,
+/// mutation journal + tiered data dirs so a restart reloads purely from the dump,
 /// with no stale WAL replaying post-snapshot writes over it. The caller restarts
 /// the process so the standard startup load reconstructs state from the dump.
 /// Used by `POST /v1/restore`.
@@ -210,19 +210,22 @@ pub fn restore_to_disk(store: &Store, dump: &[u8]) -> io::Result<()> {
     }
     fs::rename(&tmp, &path)?;
 
-    // Drop the Lux-owned per-shard dirs (WAL and, for tiered layout, cold data)
-    // so startup loads only lux.dat. Memory and tiered layouts use different
-    // journal roots, so resolve the effective path from the active config.
-    // Remove only `shard_*` dirs we own, never the parent directory.
+    // Drop both legacy shard journals and the authoritative global journal so
+    // startup cannot replay post-backup writes over the restored snapshot. Cold
+    // tiered shards are purged separately when they live elsewhere.
     let journal_dir = store.config().journal_dir();
-    purge_lux_storage_shards(&journal_dir)?;
+    purge_lux_state_dirs(&journal_dir)?;
+    let storage_dir = Path::new(&store.config().storage.dir);
+    if storage_dir != journal_dir {
+        purge_lux_state_dirs(storage_dir)?;
+    }
     Ok(())
 }
 
-/// Remove only the `shard_*` directories Lux owns under `storage_dir`, leaving the
-/// directory itself and any unrelated contents intact. Missing dir is not an error.
-fn purge_lux_storage_shards(storage_dir: &Path) -> io::Result<()> {
-    let entries = match fs::read_dir(storage_dir) {
+/// Remove only Lux-owned persistence directories, leaving the root and any
+/// unrelated contents intact. Missing roots are not an error.
+fn purge_lux_state_dirs(root: &Path) -> io::Result<()> {
+    let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
@@ -233,7 +236,7 @@ fn purge_lux_storage_shards(storage_dir: &Path) -> io::Result<()> {
         let Some(name) = file_name.to_str() else {
             continue;
         };
-        if name.starts_with("shard_") && entry.file_type()?.is_dir() {
+        if (name.starts_with("shard_") || name == "global") && entry.file_type()?.is_dir() {
             fs::remove_dir_all(entry.path())?;
         }
     }
@@ -387,27 +390,58 @@ fn save_binary(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn load(store: &Store) -> io::Result<usize> {
+    load_with_mode(store, false)
+}
+
+pub(crate) fn load_for_recovery(store: &Store) -> io::Result<usize> {
+    load_with_mode(store, true)
+}
+
+fn load_with_mode(store: &Store, preserve_expired: bool) -> io::Result<usize> {
     let path_str = snapshot_path(store);
     let path = Path::new(&path_str);
     if !path.exists() {
         return Ok(0);
     }
     let file = fs::File::open(path)?;
-    load_from_reader(store, file)
+    load_from_reader(store, file, preserve_expired)
 }
 
-fn load_from_reader(store: &Store, mut file: fs::File) -> io::Result<usize> {
+fn load_from_reader(
+    store: &Store,
+    mut file: fs::File,
+    preserve_expired: bool,
+) -> io::Result<usize> {
     let mut header = [0u8; 4];
     let n = file.read(&mut header)?;
     if n == 4 && &header == HEADER {
         // V3: absolute-deadline TTLs, stream groups present.
-        load_binary(store, &mut io::BufReader::new(file), true, true)
+        load_binary(
+            store,
+            &mut io::BufReader::new(file),
+            true,
+            true,
+            preserve_expired,
+        )
     } else if n == 4 && &header == HEADER_V2 {
         // V2: relative remaining-ms TTLs (legacy; rebased to now on load).
-        load_binary(store, &mut io::BufReader::new(file), true, false)
+        load_binary(
+            store,
+            &mut io::BufReader::new(file),
+            true,
+            false,
+            preserve_expired,
+        )
     } else if n == 4 && &header == HEADER_V1 {
-        load_binary(store, &mut io::BufReader::new(file), false, false)
+        load_binary(
+            store,
+            &mut io::BufReader::new(file),
+            false,
+            false,
+            preserve_expired,
+        )
     } else {
         file.seek(SeekFrom::Start(0))?;
         load_legacy(store, file)
@@ -419,6 +453,7 @@ pub(crate) fn load_binary(
     r: &mut impl Read,
     stream_groups: bool,
     absolute_ttl: bool,
+    preserve_expired: bool,
 ) -> io::Result<usize> {
     let mut count = 0;
     loop {
@@ -451,7 +486,10 @@ pub(crate) fn load_binary(
 
         // The value bytes were read above to advance the stream; only store the
         // entry if its absolute deadline hasn't already passed during downtime.
-        if !expired {
+        if expired && preserve_expired {
+            store.stage_expired_recovery_entry(key, value);
+            count += 1;
+        } else if !expired {
             store.load_entry(key, value, ttl);
             count += 1;
         }
@@ -661,9 +699,8 @@ pub(crate) fn decode_dump_blob_value(store: &Store, blob: &[u8]) -> io::Result<(
 }
 
 /// Encode a single key/value into the on-disk snapshot format (header + one
-/// entry). Used to self-log COPY to the WAL as a keyed `LXRESTORE dst <blob>`
-/// so replay reconstructs the destination from its own WAL shard, rather than
-/// re-reading a source key whose shard may not have replayed yet.
+/// entry). Used to record COPY as a resolved `LXRESTORE dst <blob>` so replay
+/// reconstructs the exact destination without re-reading a mutable source key.
 pub(crate) fn encode_dump_blob(
     store: &Store,
     entry: &crate::store::DumpEntry,
@@ -680,11 +717,11 @@ pub(crate) fn decode_dump_blob(store: &Store, blob: &[u8]) -> io::Result<usize> 
     let mut header = [0u8; 4];
     cursor.read_exact(&mut header)?;
     if &header == HEADER {
-        load_binary(store, &mut cursor, true, true)
+        load_binary(store, &mut cursor, true, true, false)
     } else if &header == HEADER_V2 {
-        load_binary(store, &mut cursor, true, false)
+        load_binary(store, &mut cursor, true, false, false)
     } else if &header == HEADER_V1 {
-        load_binary(store, &mut cursor, false, false)
+        load_binary(store, &mut cursor, false, false, false)
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -881,7 +918,7 @@ fn load_from_path(store: &Store, path: &str) -> io::Result<usize> {
         return Ok(0);
     }
     let file = fs::File::open(p)?;
-    load_from_reader(store, file)
+    load_from_reader(store, file, false)
 }
 
 #[cfg(test)]
@@ -984,6 +1021,51 @@ mod tests {
         assert_eq!(load_from_path(&store2, &path).unwrap(), 2);
         assert_eq!(store2.get(b"hello", Instant::now()).unwrap(), &b"world"[..]);
         assert_eq!(store2.get(b"num", Instant::now()).unwrap(), &b"42"[..]);
+    }
+
+    #[test]
+    fn snapshot_waits_for_in_flight_journal_commit_before_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let store = Arc::new(Store::new_with_config(config.clone()));
+        let command: [&[u8]; 3] = [b"SET", b"snapshot-race", b"durable"];
+        let prepared = store.prepare_journaled(&command).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let snapshot_store = store.clone();
+        let snapshot_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(save_and_truncate_wal_consistent(&snapshot_store))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "snapshot crossed an in-flight journal mutation"
+        );
+
+        let commit = prepared.commit(&command).unwrap();
+        store.set(b"snapshot-race", b"durable", None, Instant::now());
+        drop(commit);
+        done_rx.recv().unwrap().unwrap();
+        snapshot_thread.join().unwrap();
+
+        let recovered = Store::new_with_config(config);
+        assert_eq!(load(&recovered).unwrap(), 1);
+        recovered.replay_wal(&crate::pubsub::Broker::new());
+        assert_eq!(
+            recovered.get(b"snapshot-race", Instant::now()).unwrap(),
+            &b"durable"[..]
+        );
     }
 
     #[test]
@@ -1285,8 +1367,14 @@ mod tests {
         huge_count.extend_from_slice(&(-1i64).to_le_bytes()); // ttl: none
         huge_count.extend_from_slice(&u32::MAX.to_le_bytes()); // list count: huge
         let store = Store::new();
-        let err = load_binary(&store, &mut Cursor::new(huge_count.as_slice()), true, true)
-            .expect_err("huge list count must be rejected");
+        let err = load_binary(
+            &store,
+            &mut Cursor::new(huge_count.as_slice()),
+            true,
+            true,
+            false,
+        )
+        .expect_err("huge list count must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
         let mut huge_bytes = Vec::new();
@@ -1296,8 +1384,14 @@ mod tests {
         huge_bytes.extend_from_slice(&(-1i64).to_le_bytes());
         huge_bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // str byte len: huge
         let store = Store::new();
-        let err = load_binary(&store, &mut Cursor::new(huge_bytes.as_slice()), true, true)
-            .expect_err("huge byte string length must be rejected");
+        let err = load_binary(
+            &store,
+            &mut Cursor::new(huge_bytes.as_slice()),
+            true,
+            true,
+            false,
+        )
+        .expect_err("huge byte string length must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -1312,7 +1406,13 @@ mod tests {
             0x00, 0x00, 0x00, 0xf5, 0xff, 0x02, 0x00, 0xff, 0xff, 0xff,
         ];
         let store = Store::new();
-        let result = load_binary(&store, &mut std::io::Cursor::new(&data[..]), true, true);
+        let result = load_binary(
+            &store,
+            &mut std::io::Cursor::new(&data[..]),
+            true,
+            true,
+            false,
+        );
         assert!(
             result.is_err(),
             "truncated huge-count hash must error, not OOM"
@@ -1365,7 +1465,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    // Restore must drop only the shard_* dirs Lux owns, never sibling files: a
+    // Restore must drop only Lux-owned persistence dirs, never sibling files: a
     // misconfigured storage.dir overlapping data_dir must not take lux.dat down.
     #[test]
     fn restore_purges_only_owned_shard_dirs() {
@@ -1375,6 +1475,9 @@ mod tests {
         fs::create_dir_all(storage_dir.join("shard_1")).unwrap();
         fs::write(storage_dir.join("shard_0").join("wal.log"), b"x").unwrap();
         fs::write(storage_dir.join("keep.txt"), b"keep").unwrap();
+        let journal_dir = store.config().journal_dir();
+        fs::create_dir_all(journal_dir.join("global")).unwrap();
+        fs::write(journal_dir.join("global/wal.lux"), b"stale").unwrap();
 
         let mut dump = HEADER.to_vec();
         dump.extend_from_slice(b"body");
@@ -1382,6 +1485,10 @@ mod tests {
 
         assert!(!storage_dir.join("shard_0").exists(), "shard_0 purged");
         assert!(!storage_dir.join("shard_1").exists(), "shard_1 purged");
+        assert!(
+            !journal_dir.join("global").exists(),
+            "global journal purged"
+        );
         assert!(storage_dir.join("keep.txt").exists(), "unrelated file kept");
         assert!(storage_dir.exists(), "storage dir itself kept");
     }
@@ -1415,9 +1522,21 @@ mod tests {
             data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)
         ) {
             let store = Store::new();
-            let _ = load_binary(&store, &mut std::io::Cursor::new(&data), true, true);
+            let _ = load_binary(
+                &store,
+                &mut std::io::Cursor::new(&data),
+                true,
+                true,
+                false,
+            );
             let store2 = Store::new();
-            let _ = load_binary(&store2, &mut std::io::Cursor::new(&data), false, false);
+            let _ = load_binary(
+                &store2,
+                &mut std::io::Cursor::new(&data),
+                false,
+                false,
+                false,
+            );
         }
     }
 }

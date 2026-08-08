@@ -53,42 +53,23 @@ fn xadd_id_arg_index(args: &[&[u8]]) -> Option<usize> {
     (i < args.len()).then_some(i)
 }
 
-fn log_resolved_xadd(store: &Store, args: &[&[u8]], id: StreamId, out: &mut BytesMut) -> bool {
-    if !store.wal_enabled() {
-        return true;
-    }
-    let Some(id_idx) = xadd_id_arg_index(args) else {
-        return true;
-    };
+fn resolved_xadd_args(args: &[&[u8]], id: StreamId) -> Option<Vec<Vec<u8>>> {
+    let id_idx = xadd_id_arg_index(args)?;
     let mut owned: Vec<Vec<u8>> = args.iter().map(|arg| arg.to_vec()).collect();
     owned[id_idx] = id.to_string().into_bytes();
-    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-    match store.wal_log_command(&refs) {
-        Ok(()) => true,
-        Err(e) => {
-            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-            false
-        }
-    }
+    Some(owned)
 }
 
 /// Self-log an encrypted XADD as a normal XADD carrying the resolved id and the
 /// sealed ciphertext values (the ENCRYPTED flag is dropped). On replay the
 /// envelope bytes are stored verbatim (no ENCRYPTED flag => no re-encryption),
 /// and reads decrypt them via the envelope magic prefix.
-fn log_encrypted_xadd(
-    store: &Store,
+fn resolved_encrypted_xadd_args(
     args: &[&[u8]],
     id: StreamId,
     fields: &[(String, Bytes)],
-    out: &mut BytesMut,
-) -> bool {
-    if !store.wal_enabled() {
-        return true;
-    }
-    let Some(id_idx) = xadd_id_arg_index(args) else {
-        return true;
-    };
+) -> Option<Vec<Vec<u8>>> {
+    let id_idx = xadd_id_arg_index(args)?;
     let mut owned: Vec<Vec<u8>> = vec![b"XADD".to_vec(), args[1].to_vec()];
     // Preserve trimming options (MAXLEN/MINID/NOMKSTREAM) that sit before the id.
     owned.extend(args[2..id_idx].iter().map(|a| a.to_vec()));
@@ -97,14 +78,7 @@ fn log_encrypted_xadd(
         owned.push(name.as_bytes().to_vec());
         owned.push(val.to_vec());
     }
-    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-    match store.wal_log_command(&refs) {
-        Ok(()) => true,
-        Err(e) => {
-            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-            false
-        }
-    }
+    Some(owned)
 }
 
 pub fn cmd_xadd(
@@ -165,16 +139,41 @@ pub fn cmd_xadd(
         fields.push((arg_str(args[i]).to_string(), value));
         i += 2;
     }
-    match store.xadd(args[1], id_input, fields.clone(), maxlen, now) {
+    let route: [&[u8]; 2] = [b"XADD", args[1]];
+    let prepare = match store.prepare_journaled(&route) {
+        Ok(prepare) => prepare,
+        Err(e) => {
+            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+            return CmdResult::Written;
+        }
+    };
+    let id = match store.preview_xadd_id(args[1], id_input, now) {
+        Ok(id) => id,
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
+    };
+    let journal_args = if encrypted {
+        resolved_encrypted_xadd_args(args, id, &fields)
+    } else {
+        resolved_xadd_args(args, id)
+    };
+    let Some(journal_args) = journal_args else {
+        resp::write_error(out, "ERR invalid XADD journal plan");
+        return CmdResult::Written;
+    };
+    let refs: Vec<&[u8]> = journal_args.iter().map(Vec::as_slice).collect();
+    let _commit = match prepare.commit(&refs) {
+        Ok(commit) => commit,
+        Err(e) => {
+            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+            return CmdResult::Written;
+        }
+    };
+    let resolved_id = id.to_string();
+    match store.xadd(args[1], &resolved_id, fields, maxlen, now) {
         Ok(id) => {
-            let logged = if encrypted {
-                log_encrypted_xadd(store, args, id, &fields, out)
-            } else {
-                log_resolved_xadd(store, args, id, out)
-            };
-            if !logged {
-                return CmdResult::Written;
-            }
             resp::write_bulk(out, &id.to_string());
             _broker.wake_stream_waiters(arg_str(args[1]));
         }

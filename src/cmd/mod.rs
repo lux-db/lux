@@ -17,6 +17,9 @@ mod tables;
 mod timeseries;
 mod vectors;
 
+pub(crate) use lists::journaled_lmpop;
+pub(crate) use sorted_sets::journaled_zmpop;
+
 use bytes::{Bytes, BytesMut};
 use std::time::Instant;
 
@@ -112,6 +115,10 @@ fn cmd_eq(input: &[u8], expected: &[u8]) -> bool {
         }
     }
     true
+}
+
+pub(crate) fn is_reserved_internal_argument(arg: &[u8]) -> bool {
+    arg.starts_with(b"_t:") || arg.starts_with(b"_auth:")
 }
 
 #[inline(always)]
@@ -1282,9 +1289,6 @@ pub(crate) fn pipeline_access(cmd: &[u8]) -> PipelineAccess {
             if cmd_eq(cmd, b"PTTL") {
                 return PipelineAccess::Read;
             }
-            if cmd_eq(cmd, b"PERSIST") {
-                return PipelineAccess::Write;
-            }
         }
         b'R' => {
             if cmd_eq(cmd, b"RPOP") || cmd_eq(cmd, b"RPUSH") {
@@ -1350,10 +1354,6 @@ pub(crate) fn pipeline_access_for_args(args: &[&[u8]]) -> PipelineAccess {
     if args.len() == 2 && cmd_eq(cmd, b"GET") {
         return PipelineAccess::Read;
     }
-    if args.len() == 3 && cmd_eq(cmd, b"SET") {
-        return PipelineAccess::Write;
-    }
-
     if cmd[0].eq_ignore_ascii_case(&b'Z') {
         if cmd_eq(cmd, b"ZCARD") {
             return if args.len() == 2 {
@@ -1399,19 +1399,15 @@ pub(crate) fn pipeline_access_for_args(args: &[&[u8]]) -> PipelineAccess {
 fn pipeline_fast_path_arity(args: &[&[u8]]) -> bool {
     let cmd = args[0];
     match cmd[0].to_ascii_uppercase() {
-        b'A' => cmd_eq(cmd, b"APPEND") && args.len() == 3,
-        b'D' => {
-            (cmd_eq(cmd, b"DECR") && args.len() == 2) || (cmd_eq(cmd, b"DECRBY") && args.len() == 3)
-        }
-        b'E' => {
-            (cmd_eq(cmd, b"EXISTS") && args.len() == 2)
-                || (cmd_eq(cmd, b"EXPIRE") && args.len() == 3)
-        }
+        // String mutations are state-dependent when the existing value is
+        // encrypted. Keep them on the resolved command path so plaintext never
+        // leaks into the journal and typed/raw pipelines preserve semantics.
+        b'A' | b'D' | b'I' => false,
+        b'E' => cmd_eq(cmd, b"EXISTS") && args.len() == 2,
         b'G' => {
             (cmd_eq(cmd, b"GET") && args.len() == 2)
                 || (cmd_eq(cmd, b"GEODIST") && (args.len() == 4 || args.len() == 5))
                 || (cmd_eq(cmd, b"GEOPOS") && args.len() >= 3)
-                || (cmd_eq(cmd, b"GETSET") && args.len() == 3)
                 || (cmd_eq(cmd, b"GEOADD") && args.len() >= 5)
         }
         b'H' => {
@@ -1420,26 +1416,24 @@ fn pipeline_fast_path_arity(args: &[&[u8]]) -> bool {
                 || (cmd_eq(cmd, b"HMGET") && args.len() >= 3)
                 || (cmd_eq(cmd, b"HEXISTS") && args.len() == 3)
                 || (cmd_eq(cmd, b"HGETALL") && args.len() == 2)
-                || (cmd_eq(cmd, b"HSET") && args.len() >= 4)
                 || (cmd_eq(cmd, b"HINCRBY") && args.len() == 4)
                 || (cmd_eq(cmd, b"HDEL") && args.len() >= 3)
-        }
-        b'I' => {
-            (cmd_eq(cmd, b"INCR") && args.len() == 2) || (cmd_eq(cmd, b"INCRBY") && args.len() == 3)
         }
         b'L' => {
             (cmd_eq(cmd, b"LLEN") && args.len() == 2)
                 || (cmd_eq(cmd, b"LINDEX") && args.len() == 3)
                 || (cmd_eq(cmd, b"LRANGE") && args.len() == 4)
-                || (cmd_eq(cmd, b"LPUSH") && args.len() >= 3)
+                || (cmd_eq(cmd, b"LPUSH")
+                    && args.len() >= 3
+                    && !args.last().is_some_and(|arg| cmd_eq(arg, b"ENCRYPTED")))
                 || (cmd_eq(cmd, b"LPOP") && args.len() == 2)
         }
-        b'P' => {
-            (cmd_eq(cmd, b"PTTL") && args.len() == 2)
-                || (cmd_eq(cmd, b"PERSIST") && args.len() == 2)
-        }
+        b'P' => cmd_eq(cmd, b"PTTL") && args.len() == 2,
         b'R' => {
-            (cmd_eq(cmd, b"RPOP") && args.len() == 2) || (cmd_eq(cmd, b"RPUSH") && args.len() >= 3)
+            (cmd_eq(cmd, b"RPOP") && args.len() == 2)
+                || (cmd_eq(cmd, b"RPUSH")
+                    && args.len() >= 3
+                    && !args.last().is_some_and(|arg| cmd_eq(arg, b"ENCRYPTED")))
         }
         b'S' => {
             (cmd_eq(cmd, b"STRLEN") && args.len() == 2)
@@ -1447,18 +1441,11 @@ fn pipeline_fast_path_arity(args: &[&[u8]]) -> bool {
                 || (cmd_eq(cmd, b"SMEMBERS") && args.len() == 2)
                 || (cmd_eq(cmd, b"SISMEMBER") && args.len() == 3)
                 || (cmd_eq(cmd, b"SRANDMEMBER") && args.len() == 2)
-                || (cmd_eq(cmd, b"SET") && set_pipeline_fast_path_arity(args))
-                || (cmd_eq(cmd, b"SETNX") && args.len() == 3)
                 || (cmd_eq(cmd, b"SADD") && args.len() >= 3)
                 || (cmd_eq(cmd, b"SREM") && args.len() >= 3)
-                || (cmd_eq(cmd, b"SPOP") && args.len() == 2)
         }
         b'T' => (cmd_eq(cmd, b"TTL") || cmd_eq(cmd, b"TYPE")) && args.len() == 2,
-        b'X' => {
-            (cmd_eq(cmd, b"XLEN") && args.len() == 2)
-                || (cmd_eq(cmd, b"XRANGE")
-                    && (args.len() == 4 || (args.len() == 6 && cmd_eq(args[4], b"COUNT"))))
-        }
+        b'X' => cmd_eq(cmd, b"XLEN") && args.len() == 2,
         b'Z' => {
             (cmd_eq(cmd, b"ZCARD") && args.len() == 2)
                 || (cmd_eq(cmd, b"ZSCORE") && args.len() == 3)
@@ -1471,18 +1458,6 @@ fn pipeline_fast_path_arity(args: &[&[u8]]) -> bool {
         }
         _ => false,
     }
-}
-
-fn set_pipeline_fast_path_arity(args: &[&[u8]]) -> bool {
-    if args.len() == 3 {
-        return true;
-    }
-    if args.len() < 4 {
-        return false;
-    }
-    args[3..]
-        .iter()
-        .all(|arg| cmd_eq(arg, b"NX") || cmd_eq(arg, b"XX"))
 }
 
 #[inline(always)]
@@ -1644,17 +1619,13 @@ pub fn execute(
         return server::cmd_auth(args, store, cache, out, now);
     }
 
-    // Reserve the internal table-storage namespace ("_t:") from direct command
-    // access. Table + Lux Auth data lives under `_t:<table>:...` keys; the table
-    // API and internal ops reach them through the store directly, never through
-    // command dispatch, so rejecting `_t:` args here closes the raw-KV bypass of
-    // the reserved-table guard without touching tables/auth. (KEYS/SCAN take a
-    // pattern and are filtered in their handlers instead.) Tradeoff: user values
-    // cannot start with the 3-char reserved prefix `_t:`.
-    if !cmd_eq(cmd, b"KEYS") && !cmd_eq(cmd, b"SCAN") {
+    // Reserve internal table/auth storage from direct commands. Recovery is the
+    // only command-dispatch caller allowed to apply resolved journal entries in
+    // these namespaces. KEYS/SCAN take patterns and filter their results below.
+    if !store.wal_replaying() && !cmd_eq(cmd, b"KEYS") && !cmd_eq(cmd, b"SCAN") {
         for arg in &args[1..] {
-            if arg.starts_with(b"_t:") {
-                resp::write_error(out, "ERR '_t:' is a reserved internal namespace");
+            if is_reserved_internal_argument(arg) {
+                resp::write_error(out, "ERR reserved internal namespace");
                 return CmdResult::Written;
             }
         }
@@ -1676,7 +1647,7 @@ pub fn execute(
 
     if crate::eviction::is_write_command(cmd) {
         if let Err(e) = crate::eviction::evict_if_needed(store) {
-            resp::write_error(out, e);
+            resp::write_error(out, &e);
             return CmdResult::Written;
         }
     }
@@ -2033,8 +2004,79 @@ pub fn execute(
             if cmd_eq(cmd, b"LMPOP") {
                 return lists::cmd_lmpop(args, store, out, now);
             }
+            if cmd_eq(cmd, b"LXGROUPREAD") {
+                // Internal replay-only representation of the exact consumer-
+                // group delivery acknowledged by XREADGROUP.
+                if !store.wal_replaying() {
+                    resp::write_error(out, &format!("ERR unknown command '{}'", arg_str(cmd)));
+                    return CmdResult::Written;
+                }
+                if args.len() < 5 {
+                    resp::write_error(out, "ERR invalid LXGROUPREAD journal entry");
+                    return CmdResult::Written;
+                }
+                let Some(last_delivered_id) = crate::store::StreamId::parse(arg_str(args[3]))
+                else {
+                    resp::write_error(out, "ERR invalid LXGROUPREAD stream ID");
+                    return CmdResult::Written;
+                };
+                let pending_ids: Vec<crate::store::StreamId> = args[5..]
+                    .iter()
+                    .filter_map(|arg| crate::store::StreamId::parse(arg_str(arg)))
+                    .collect();
+                if pending_ids.len() != args.len() - 5 {
+                    resp::write_error(out, "ERR invalid LXGROUPREAD pending ID");
+                    return CmdResult::Written;
+                }
+                let consumer = (!args[4].is_empty()).then(|| arg_str(args[4]));
+                if let Err(error) = store.apply_lxgroupread(
+                    args[1],
+                    arg_str(args[2]),
+                    consumer,
+                    last_delivered_id,
+                    &pending_ids,
+                    now,
+                ) {
+                    resp::write_error(out, &error);
+                }
+                return CmdResult::Written;
+            }
+            if cmd_eq(cmd, b"LXGROUPCLAIM") {
+                // Internal replay-only representation of exact XCLAIM/
+                // XAUTOCLAIM ownership and delivery-count effects.
+                if !store.wal_replaying() {
+                    resp::write_error(out, &format!("ERR unknown command '{}'", arg_str(cmd)));
+                    return CmdResult::Written;
+                }
+                if args.len() < 6 || !(args.len() - 4).is_multiple_of(2) {
+                    resp::write_error(out, "ERR invalid LXGROUPCLAIM journal entry");
+                    return CmdResult::Written;
+                }
+                let mut claims = Vec::with_capacity((args.len() - 4) / 2);
+                for pair in args[4..].chunks(2) {
+                    let Some(id) = crate::store::StreamId::parse(arg_str(pair[0])) else {
+                        resp::write_error(out, "ERR invalid LXGROUPCLAIM stream ID");
+                        return CmdResult::Written;
+                    };
+                    let Ok(delivery_count) = parse_u64(pair[1]) else {
+                        resp::write_error(out, "ERR invalid LXGROUPCLAIM delivery count");
+                        return CmdResult::Written;
+                    };
+                    claims.push((id, delivery_count));
+                }
+                if let Err(error) = store.apply_lxgroupclaim(
+                    args[1],
+                    arg_str(args[2]),
+                    arg_str(args[3]),
+                    &claims,
+                    now,
+                ) {
+                    resp::write_error(out, &error);
+                }
+                return CmdResult::Written;
+            }
             if cmd_eq(cmd, b"LXRESTORE") {
-                // Internal, replay-only: COPY's self-logged effect. Reject if a
+                // Internal, replay-only: COPY's resolved journal effect. Reject if a
                 // client sends it during normal operation.
                 if !store.wal_replaying() {
                     resp::write_error(out, &format!("ERR unknown command '{}'", arg_str(cmd)));
@@ -2555,119 +2597,28 @@ pub fn execute_with_wal(
             resp::write_error(out, &err);
             return CmdResult::Written;
         }
-        // Table data/schema writes log their own RESOLVED command from the table
-        // layer (for crash determinism + so HTTP table writes, which never reach
-        // this function, are durable). Raw-logging them here too would apply the
-        // row twice on replay, so skip them.
-        if !command_self_logs_wal_args(args, store, now) && !command_has_relative_ttl(args) {
-            if let Err(e) = store.wal_log_command(args) {
-                resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-                return CmdResult::Written;
-            }
+        // State-dependent commands resolve and commit their recovery form in the
+        // owning command/table layer. Recording raw argv here as well would
+        // duplicate the mutation during replay.
+        if !command_owns_journal_boundary_args(args) {
+            return match store
+                .commit_journaled(args, || execute(store, cache, broker, args, out, now))
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                    CmdResult::Written
+                }
+            };
         }
     }
     execute(store, cache, broker, args, out, now)
 }
 
-/// Append an absolute replay command after a relative-TTL mutation succeeds.
-pub(crate) fn wal_log_resolved_ttl_command(
-    store: &Store,
-    args: &[&[u8]],
-    deadline_ms: i64,
-) -> std::io::Result<()> {
-    let deadline = deadline_ms.to_string().into_bytes();
-    let mut owned: Vec<Vec<u8>> = Vec::with_capacity(args.len() + 1);
-    if cmd_eq(args[0], b"SETEX") || cmd_eq(args[0], b"PSETEX") {
-        owned.extend([
-            b"SET".to_vec(),
-            args[1].to_vec(),
-            args[3].to_vec(),
-            b"PXAT".to_vec(),
-            deadline,
-        ]);
-    } else if cmd_eq(args[0], b"EXPIRE") || cmd_eq(args[0], b"PEXPIRE") {
-        owned.extend([b"PEXPIREAT".to_vec(), args[1].to_vec(), deadline]);
-    } else if cmd_eq(args[0], b"RESTORE") {
-        owned.extend(args.iter().map(|arg| arg.to_vec()));
-        owned[2] = deadline;
-        if !owned
-            .get(4..)
-            .unwrap_or_default()
-            .iter()
-            .any(|arg| cmd_eq(arg, b"ABSTTL"))
-        {
-            owned.push(b"ABSTTL".to_vec());
-        }
-    } else {
-        owned.extend(args.iter().map(|arg| arg.to_vec()));
-        if let Some(ttl_index) = relative_ttl_option_index(args) {
-            owned[ttl_index] = b"PXAT".to_vec();
-            owned[ttl_index + 1] = deadline;
-        }
-    }
-    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-    store.wal_log_command(&refs)
-}
-
-pub(crate) fn command_has_relative_ttl(args: &[&[u8]]) -> bool {
-    if args.is_empty() {
-        return false;
-    }
-    if cmd_eq(args[0], b"SETEX")
-        || cmd_eq(args[0], b"PSETEX")
-        || cmd_eq(args[0], b"EXPIRE")
-        || cmd_eq(args[0], b"PEXPIRE")
-    {
-        return true;
-    }
-    if cmd_eq(args[0], b"RESTORE") {
-        return parse_i64(args.get(2).copied().unwrap_or_default()).is_ok_and(|ttl| ttl > 0)
-            && !args
-                .get(4..)
-                .unwrap_or_default()
-                .iter()
-                .any(|arg| cmd_eq(arg, b"ABSTTL"));
-    }
-    relative_ttl_option_index(args).is_some()
-}
-
-/// Returns the position of a relative TTL option, skipping data arguments that
-/// may happen to contain option-like bytes.
-fn relative_ttl_option_index(args: &[&[u8]]) -> Option<usize> {
-    if args.is_empty() {
-        return None;
-    }
-    let mut i = if cmd_eq(args[0], b"SET") {
-        3
-    } else if cmd_eq(args[0], b"GETEX") {
-        2
-    } else if cmd_eq(args[0], b"VSET") {
-        let dims = parse_u64(args.get(2)?).ok()? as usize;
-        3usize.checked_add(dims)?
-    } else {
-        return None;
-    };
-    while i < args.len() {
-        if cmd_eq(args[i], b"EX") || cmd_eq(args[i], b"PX") {
-            return args.get(i + 1).map(|_| i);
-        }
-        if cmd_eq(args[i], b"EXAT")
-            || cmd_eq(args[i], b"PXAT")
-            || cmd_eq(args[i], b"IFEQ")
-            || (cmd_eq(args[0], b"VSET") && cmd_eq(args[i], b"META"))
-        {
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    None
-}
-
-/// Table writes that append their own resolved command to the WAL from the table
-/// layer; `execute_with_wal` must not also raw-log them.
-fn command_self_logs_wal(cmd: &[u8]) -> bool {
-    let mut up = [0u8; 8];
+/// Writes whose owning command layer resolves and commits the durable form;
+/// `execute_with_wal` must not also record their raw client arguments.
+fn command_owns_journal_boundary(cmd: &[u8]) -> bool {
+    let mut up = [0u8; 12];
     if cmd.len() > up.len() {
         return false;
     }
@@ -2690,59 +2641,67 @@ fn command_self_logs_wal(cmd: &[u8]) -> bool {
             | b"TSMADD"
             | b"ZMPOP"
             | b"LMPOP"
+            | b"SPOP"
             | b"HEXPIRE"
             | b"HPEXPIRE"
             | b"HEXPIREAT"
             | b"HPEXPIREAT"
+            | b"SETEX"
+            | b"PSETEX"
+            | b"GETEX"
+            | b"EXPIRE"
+            | b"PEXPIRE"
+            | b"EXPIREAT"
+            | b"PEXPIREAT"
+            | b"PERSIST"
+            | b"RESTORE"
+            | b"XREADGROUP"
+            | b"XCLAIM"
+            | b"XAUTOCLAIM"
+            | b"EVAL"
+            | b"EVALSHA"
             | b"LUX"
     )
 }
 
-fn command_self_logs_wal_args(args: &[&[u8]], store: &Store, now: Instant) -> bool {
+fn command_owns_journal_boundary_args(args: &[&[u8]]) -> bool {
     if args.is_empty() {
         return false;
     }
     let cmd = args[0];
-    if command_self_logs_wal(cmd) {
+    if command_owns_journal_boundary(cmd) {
         return true;
     }
-    // Commands whose key isn't at args[1] and/or that read/write across WAL
-    // shards self-log their resolved single-key effects to the correct shard(s),
-    // so they must not be raw-logged here (which would replay out of order).
+    // Commands whose durable effect cannot be derived from raw argv record their
+    // own resolved effects, so the generic boundary must not record them twice.
     if cmd_eq(cmd, b"ZUNIONSTORE") || cmd_eq(cmd, b"ZINTERSTORE") || cmd_eq(cmd, b"ZDIFFSTORE") {
         return true;
     }
-    // ZRANGESTORE writes dst but reads a src key that may live on another WAL
-    // shard; it self-logs the resolved DEL+ZADD keyed on dst.
+    // ZRANGESTORE records the resolved DEL+ZADD instead of re-reading its source.
     if cmd_eq(cmd, b"ZRANGESTORE") {
         return true;
     }
     if cmd_eq(cmd, b"SUNIONSTORE") || cmd_eq(cmd, b"SINTERSTORE") || cmd_eq(cmd, b"SDIFFSTORE") {
         return true;
     }
-    // Movers write two keys on different WAL shards. They self-log the resolved
-    // per-key effects (pop on src, push on dst) so each replays in its own
-    // shard's order instead of the raw command landing wholesale in src's shard.
+    // Movers atomically record their resolved source and destination effects.
     if cmd_eq(cmd, b"LMOVE") || cmd_eq(cmd, b"RPOPLPUSH") || cmd_eq(cmd, b"SMOVE") {
         return true;
     }
-    // COPY writes only dst but shards on src and re-reads src at replay; it
-    // self-logs the resolved dst value as a keyed LXRESTORE instead.
+    // COPY records the resolved destination as LXRESTORE instead of re-reading src.
     if cmd_eq(cmd, b"COPY") {
         return true;
     }
-    // MSET/MSETNX write many keys; the raw command shards on the first key only.
-    // They self-log a keyed SET per pair so each lands in its own WAL shard.
+    // MSET/MSETNX record resolved keyed SET effects as one journaled batch.
     if cmd_eq(cmd, b"MSET") || cmd_eq(cmd, b"MSETNX") {
         return true;
     }
     if cmd_eq(cmd, b"SET") && args.len() >= 3 {
-        return args[3..].iter().any(|arg| cmd_eq(arg, b"ENCRYPTED"))
-            || store.kv_string_is_encrypted(args[1], now);
+        return true;
     }
     if (cmd_eq(cmd, b"LPUSH") || cmd_eq(cmd, b"RPUSH")) && args.len() >= 4 {
-        // Encrypted pushes self-log ENC RAWLPUSH/RAWRPUSH with the resolved
-        // ciphertext; plaintext pushes take the normal WAL path.
+        // Encrypted pushes commit ENC RAWLPUSH/RAWRPUSH with resolved
+        // ciphertext; plaintext pushes take the generic boundary.
         return args.last().is_some_and(|arg| cmd_eq(arg, b"ENCRYPTED"));
     }
     if (cmd_eq(cmd, b"HSET") || cmd_eq(cmd, b"HMSET")) && args.len() >= 4 {
@@ -2753,13 +2712,13 @@ fn command_self_logs_wal_args(args: &[&[u8]], store: &Store, now: Instant) -> bo
             args.len()
         };
         if end > 2 && (end - 2).is_multiple_of(2) {
-            let fields: Vec<&[u8]> = args[2..end].chunks(2).map(|chunk| chunk[0]).collect();
-            return encrypted || store.hash_fields_need_encryption(args[1], &fields, now);
+            return true;
         }
     }
     if cmd_eq(cmd, b"VSET") {
-        // Encrypted VSET self-logs ENC RAWVSET with the sealed payload.
-        return args.iter().any(|arg| cmd_eq(arg, b"ENCRYPTED"));
+        // VSET records an absolute TTL; encrypted variants additionally replace
+        // plaintext vector components with an ENC RAWVSET sealed payload.
+        return true;
     }
     false
 }
@@ -2783,6 +2742,14 @@ pub(crate) fn execute_on_shard(
     let cmd = args[0];
     let key = args[1];
     let ks = key;
+
+    // A same-shard pipeline containing any write executes under the shard write
+    // lock. Route its read members through the same decryption-aware adapter as
+    // an all-read batch instead of duplicating raw-value shortcuts here.
+    if pipeline_access_for_args(args) == PipelineAccess::Read {
+        execute_on_shard_read(&shard.data, store, args, out, now);
+        return;
+    }
 
     if cmd_eq(cmd, b"SET") && args.len() >= 3 {
         let mut ttl = None;
@@ -2950,10 +2917,14 @@ pub(crate) fn execute_on_shard(
             out,
         );
     } else if cmd_eq(cmd, b"LPOP") && args.len() == 2 {
-        let value = store.lpop_on_shard(shard, key, now);
+        let value = store
+            .lpop_on_shard(shard, key, now)
+            .map(|raw| store.decrypt_list_element(raw.clone()).unwrap_or(raw));
         resp::write_optional_bulk_raw(out, &value);
     } else if cmd_eq(cmd, b"RPOP") && args.len() == 2 {
-        let value = store.rpop_on_shard(shard, key, now);
+        let value = store
+            .rpop_on_shard(shard, key, now)
+            .map(|raw| store.decrypt_list_element(raw.clone()).unwrap_or(raw));
         resp::write_optional_bulk_raw(out, &value);
     } else if cmd_eq(cmd, b"SADD") && args.len() >= 3 {
         shard_sadd_fast(
@@ -3134,6 +3105,7 @@ pub(crate) fn execute_on_shard(
 #[allow(dead_code)]
 pub(crate) fn execute_on_shard_read(
     data: &ShardData,
+    store: &Store,
     args: &[&[u8]],
     out: &mut BytesMut,
     now: Instant,
@@ -3206,14 +3178,16 @@ pub(crate) fn execute_on_shard_read(
     }
 
     if cmd_eq(cmd, b"GET") {
-        Store::get_and_write(data, key, now, out);
+        store.get_kv_and_write_from_shard(data, key, now, out);
     } else if cmd_eq(cmd, b"EXISTS") {
         resp::write_integer(out, i64::from(Store::exists_on_shard(data, key, now)));
     } else if cmd_eq(cmd, b"STRLEN") {
         match data.get(ks) {
-            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Str(s) => resp::write_integer(out, s.len() as i64),
-                StoreValue::StrBuf(s) => resp::write_integer(out, s.len() as i64),
+            Some(entry) if !entry.is_expired_at(now) => match entry.value.string_to_bytes() {
+                Some(value) => match store.decrypt_kv_string_value(key, value) {
+                    Ok(value) => resp::write_integer(out, value.len() as i64),
+                    Err(error) => resp::write_error(out, &error),
+                },
                 _ => resp::write_integer(out, 0),
             },
             _ => resp::write_integer(out, 0),
@@ -3239,7 +3213,11 @@ pub(crate) fn execute_on_shard_read(
                         } else {
                             index as usize
                         };
-                        resp::write_optional_bulk_raw(out, &list.get(i).cloned());
+                        let value = list
+                            .get(i)
+                            .cloned()
+                            .map(|raw| store.decrypt_list_element(raw.clone()).unwrap_or(raw));
+                        resp::write_optional_bulk_raw(out, &value);
                     }
                     _ => resp::write_null(out),
                 },
@@ -3282,7 +3260,10 @@ pub(crate) fn execute_on_shard_read(
                         resp::write_array_header(out, e - s);
                         for idx in s..e {
                             if let Some(value) = list.get(idx) {
-                                resp::write_bulk_raw(out, value);
+                                let value = store
+                                    .decrypt_list_element(value.clone())
+                                    .unwrap_or_else(|_| value.clone());
+                                resp::write_bulk_raw(out, &value);
                             }
                         }
                     }
@@ -3339,7 +3320,12 @@ pub(crate) fn execute_on_shard_read(
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => {
                     match map.get_live(arg_str(args[2]), crate::store::epoch_ms()) {
-                        Some(value) => resp::write_bulk_raw(out, value),
+                        Some(value) => {
+                            match store.decrypt_hash_field_value(key, args[2], value.clone()) {
+                                Ok(value) => resp::write_bulk_raw(out, &value),
+                                Err(error) => resp::write_error(out, &error),
+                            }
+                        }
                         None => resp::write_null(out),
                     }
                 }
@@ -3354,10 +3340,13 @@ pub(crate) fn execute_on_shard_read(
                 StoreValue::Hash(map) => {
                     let now_ms = crate::store::epoch_ms();
                     for field in &args[2..] {
-                        resp::write_optional_bulk_raw(
-                            out,
-                            &map.get_live(arg_str(field), now_ms).cloned(),
-                        );
+                        let value =
+                            map.get_live(arg_str(field), now_ms)
+                                .cloned()
+                                .and_then(|value| {
+                                    store.decrypt_hash_field_value(key, field, value).ok()
+                                });
+                        resp::write_optional_bulk_raw(out, &value);
                     }
                 }
                 _ => {
@@ -3395,11 +3384,23 @@ pub(crate) fn execute_on_shard_read(
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => {
                     let now_ms = crate::store::epoch_ms();
-                    let live: Vec<(&String, &bytes::Bytes)> = map.live_iter(now_ms).collect();
-                    resp::write_array_header(out, live.len() * 2);
-                    for (field, value) in live {
-                        resp::write_bulk(out, field);
-                        resp::write_bulk_raw(out, value);
+                    let live = map
+                        .live_iter(now_ms)
+                        .map(|(field, value)| {
+                            store
+                                .decrypt_hash_field_value(key, field.as_bytes(), value.clone())
+                                .map(|value| (field, value))
+                        })
+                        .collect::<Result<Vec<_>, _>>();
+                    match live {
+                        Ok(live) => {
+                            resp::write_array_header(out, live.len() * 2);
+                            for (field, value) in live {
+                                resp::write_bulk(out, field);
+                                resp::write_bulk_raw(out, &value);
+                            }
+                        }
+                        Err(error) => resp::write_error(out, &error),
                     }
                 }
                 _ => resp::write_error(
@@ -4071,7 +4072,7 @@ mod tests {
     use crate::store::Store;
     use crate::{ServerConfig, StorageConfig, StorageMode};
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn exec(store: &Store, args: &[&[u8]]) -> BytesMut {
         let broker = Broker::new();
@@ -4133,6 +4134,344 @@ mod tests {
             }
         }
         bytes
+    }
+
+    fn journal_test_store(dir: &std::path::Path) -> Store {
+        Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir.to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.to_string_lossy().to_string(),
+            },
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::EverySecond,
+                ..Default::default()
+            },
+            ..ServerConfig::default()
+        }))
+    }
+
+    #[test]
+    fn journal_failure_prevents_generic_and_resolved_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = journal_test_store(dir.path());
+
+        store.inject_journal_failures(1);
+        let reply =
+            String::from_utf8_lossy(&exec_wal(&store, &[b"SET", b"key", b"value"])).to_string();
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert!(store.get(b"key", Instant::now()).is_none());
+
+        exec_wal(&store, &[b"TCREATE", b"items", b"name STR"]);
+        store.inject_journal_failures(1);
+        let reply = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[b"TINSERT", b"items", b"name", b"rejected"],
+        ))
+        .to_string();
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert_eq!(exec_str(&store, &[b"TCOUNT", b"items"]), ":0\r\n");
+
+        // A rejected generated-id insert must not consume its sequence value.
+        assert_eq!(
+            exec_str(&store, &[b"TINSERT", b"items", b"name", b"accepted"]),
+            ":1\r\n"
+        );
+
+        store.inject_journal_failures(1);
+        let reply = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[b"XADD", b"events", b"*", b"kind", b"rejected"],
+        ))
+        .to_string();
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert_eq!(exec_str(&store, &[b"XLEN", b"events"]), ":0\r\n");
+
+        store.inject_journal_failures(1);
+        let reply = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[b"PSETEX", b"expiring", b"1000", b"rejected"],
+        ))
+        .to_string();
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert!(store.get(b"expiring", Instant::now()).is_none());
+
+        exec_wal(&store, &[b"SET", b"persistent", b"value"]);
+        store.inject_journal_failures(1);
+        let reply =
+            String::from_utf8_lossy(&exec_wal(&store, &[b"PEXPIRE", b"persistent", b"1000"]))
+                .to_string();
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert_eq!(store.pttl(b"persistent", Instant::now()), -1);
+
+        exec_wal(&store, &[b"SET", b"getex", b"value"]);
+        store.inject_journal_failures(1);
+        let reply =
+            String::from_utf8_lossy(&exec_wal(&store, &[b"GETEX", b"getex", b"PX", b"1000"]))
+                .to_string();
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert_eq!(store.pttl(b"getex", Instant::now()), -1);
+
+        exec_wal(&store, &[b"PSETEX", b"persist", b"1000", b"value"]);
+        store.inject_journal_failures(1);
+        let reply =
+            String::from_utf8_lossy(&exec_wal(&store, &[b"PERSIST", b"persist"])).to_string();
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert!(store.pttl(b"persist", Instant::now()) >= 0);
+
+        store.inject_journal_failures(1);
+        let reply = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[b"VSET", b"vector", b"2", b"1.0", b"2.0", b"PX", b"1000"],
+        ))
+        .to_string();
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert!(store.vget(b"vector", Instant::now()).is_none());
+
+        exec_wal(&store, &[b"SET", b"dump-source", b"value"]);
+        let dump = store
+            .dump_key(b"dump-source", Instant::now())
+            .unwrap()
+            .unwrap();
+        store.inject_journal_failures(1);
+        let reply =
+            String::from_utf8_lossy(&exec_wal(&store, &[b"RESTORE", b"restored", b"0", &dump]))
+                .to_string();
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert!(store.get(b"restored", Instant::now()).is_none());
+
+        exec_wal(&store, &[b"SADD", b"set-source", b"member"]);
+        store.inject_journal_failures(1);
+        let reply =
+            String::from_utf8_lossy(&exec_wal(&store, &[b"SPOP", b"set-source"])).to_string();
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert_eq!(store.scard(b"set-source", Instant::now()).unwrap(), 1);
+
+        store.inject_journal_failures(1);
+        let reply = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[b"SUNIONSTORE", b"set-destination", b"set-source"],
+        ))
+        .to_string();
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert_eq!(store.scard(b"set-destination", Instant::now()).unwrap(), 0);
+
+        exec_wal(&store, &[b"ZADD", b"zset-source", b"1", b"member"]);
+        store.inject_journal_failures(1);
+        let reply = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[b"ZUNIONSTORE", b"zset-destination", b"1", b"zset-source"],
+        ))
+        .to_string();
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert_eq!(store.zcard(b"zset-destination", Instant::now()).unwrap(), 0);
+
+        store.inject_journal_failures(1);
+        let reply = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[b"COPY", b"dump-source", b"copy-destination"],
+        ))
+        .to_string();
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert!(store.get(b"copy-destination", Instant::now()).is_none());
+
+        exec_wal(&store, &[b"XADD", b"stream", b"1-0", b"field", b"value"]);
+        exec_wal(&store, &[b"XGROUP", b"CREATE", b"stream", b"group", b"0-0"]);
+        store.inject_journal_failures(1);
+        let reply = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"group",
+                b"consumer",
+                b"STREAMS",
+                b"stream",
+                b">",
+            ],
+        ))
+        .to_string();
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert_eq!(
+            exec_str(&store, &[b"XPENDING", b"stream", b"group"]),
+            "*4\r\n:0\r\n$-1\r\n$-1\r\n*-1\r\n"
+        );
+    }
+
+    #[test]
+    fn consumer_group_delivery_and_claims_replay_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = journal_test_store(dir.path());
+        exec_wal(&store, &[b"XADD", b"stream", b"1-0", b"field", b"one"]);
+        exec_wal(&store, &[b"XADD", b"stream", b"2-0", b"field", b"two"]);
+        exec_wal(&store, &[b"XGROUP", b"CREATE", b"stream", b"group", b"0-0"]);
+        exec_wal(
+            &store,
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"group",
+                b"first",
+                b"STREAMS",
+                b"stream",
+                b">",
+            ],
+        );
+        exec_wal(
+            &store,
+            &[b"XCLAIM", b"stream", b"group", b"second", b"0", b"1-0"],
+        );
+        exec_wal(
+            &store,
+            &[
+                b"XAUTOCLAIM",
+                b"stream",
+                b"group",
+                b"third",
+                b"0",
+                b"2-0",
+                b"COUNT",
+                b"10",
+            ],
+        );
+        store.fsync_wal();
+        drop(store);
+
+        let restored = journal_test_store(dir.path());
+        restored.replay_wal(&Broker::new());
+        let pending = exec_str(
+            &restored,
+            &[b"XPENDING", b"stream", b"group", b"-", b"+", b"10"],
+        );
+        assert!(pending.contains("second"), "{pending}");
+        assert!(pending.contains("third"), "{pending}");
+        assert_eq!(pending.matches(":2\r\n").count(), 2, "{pending}");
+    }
+
+    #[test]
+    fn relative_deadlines_replay_as_absolute_and_do_not_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = journal_test_store(dir.path());
+
+        exec_wal(&store, &[b"PSETEX", b"psetex", b"80", b"value"]);
+        exec_wal(&store, &[b"SET", b"expire", b"value"]);
+        exec_wal(&store, &[b"PEXPIRE", b"expire", b"80"]);
+        exec_wal(&store, &[b"SET", b"getex", b"value"]);
+        exec_wal(&store, &[b"GETEX", b"getex", b"PX", b"80"]);
+        exec_wal(
+            &store,
+            &[b"VSET", b"vector", b"2", b"1.0", b"2.0", b"PX", b"80"],
+        );
+        exec_wal(&store, &[b"SET", b"keep", b"first", b"PX", b"80"]);
+        exec_wal(&store, &[b"SET", b"keep", b"second", b"KEEPTTL"]);
+        exec_wal(&store, &[b"PSETEX", b"wal-preserved", b"80", b"base"]);
+        exec_wal(&store, &[b"APPEND", b"wal-preserved", b"-suffix"]);
+
+        exec_wal(&store, &[b"SET", b"dump-source", b"restored-value"]);
+        let dump = store
+            .dump_key(b"dump-source", Instant::now())
+            .unwrap()
+            .unwrap();
+        exec_wal(&store, &[b"RESTORE", b"restored", b"80", &dump]);
+        store.fsync_wal();
+
+        let mut wal = crate::disk::Wal::open_named(dir.path(), "global").unwrap();
+        let replay = wal.replay().unwrap();
+        assert!(replay.commands.iter().all(|command| {
+            !matches!(
+                command.first().map(Vec::as_slice),
+                Some(b"PSETEX" | b"SETEX" | b"PEXPIRE" | b"EXPIRE" | b"GETEX")
+            )
+        }));
+        assert!(replay.commands.iter().any(|command| {
+            command.first().is_some_and(|arg| arg == b"VSET")
+                && command.iter().any(|arg| arg == b"PXAT")
+        }));
+        assert!(replay.commands.iter().any(|command| {
+            command.first().is_some_and(|arg| arg == b"RESTORE")
+                && command.iter().any(|arg| arg == b"ABSTTL")
+        }));
+
+        std::thread::sleep(Duration::from_millis(140));
+        let restored = journal_test_store(dir.path());
+        restored.replay_wal(&Broker::new());
+        for key in [
+            b"psetex".as_slice(),
+            b"expire".as_slice(),
+            b"getex".as_slice(),
+            b"vector".as_slice(),
+            b"keep".as_slice(),
+            b"wal-preserved".as_slice(),
+            b"restored".as_slice(),
+        ] {
+            assert!(
+                restored.get(key, Instant::now()).is_none(),
+                "expired key resurrected after replay: {}",
+                String::from_utf8_lossy(key)
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_does_not_resurrect_expired_snapshot_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = journal_test_store(dir.path());
+        for key in [b"preserved".as_slice(), b"revived", b"retimed"] {
+            exec_wal(&store, &[b"PSETEX", key, b"80", b"old"]);
+        }
+        crate::snapshot::save_and_truncate_wal_consistent(&store).unwrap();
+
+        // These all execute while the snapshot values are still live. APPEND
+        // preserves the original deadline, SET intentionally clears it, and
+        // PEXPIRE intentionally installs a later absolute deadline.
+        exec_wal(&store, &[b"APPEND", b"preserved", b"-suffix"]);
+        exec_wal(&store, &[b"SET", b"revived", b"new"]);
+        exec_wal(&store, &[b"PEXPIRE", b"retimed", b"5000"]);
+        store.fsync_wal();
+        std::thread::sleep(Duration::from_millis(140));
+
+        let restored = journal_test_store(dir.path());
+        restored.begin_recovery();
+        crate::snapshot::load_for_recovery(&restored).unwrap();
+        restored.replay_wal(&Broker::new());
+        restored.finish_recovery();
+
+        assert!(restored.get(b"preserved", Instant::now()).is_none());
+        assert_eq!(
+            restored.get(b"revived", Instant::now()).unwrap(),
+            b"new".as_slice()
+        );
+        assert_eq!(
+            restored.get(b"retimed", Instant::now()).unwrap(),
+            b"old".as_slice()
+        );
+        assert!(restored.pttl(b"retimed", Instant::now()) > 0);
+    }
+
+    #[test]
+    fn table_leaf_records_one_resolved_row_image_per_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = journal_test_store(dir.path());
+        exec_wal(&store, &[b"TCREATE", b"items", b"name STR"]);
+        exec_wal(&store, &[b"TINSERT", b"items", b"name", b"one"]);
+        exec_wal(&store, &[b"TSET", b"items", b"1", b"name", b"two"]);
+        store.fsync_wal();
+
+        let mut wal = crate::disk::Wal::open_named(dir.path(), "global").unwrap();
+        let replay = wal.replay().unwrap();
+        let row_images = replay
+            .commands
+            .iter()
+            .filter(|command| {
+                command
+                    .first()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(b"TROWSET"))
+            })
+            .count();
+        assert_eq!(
+            row_images, 2,
+            "insert and update must each appear exactly once"
+        );
     }
 
     #[test]
@@ -4430,9 +4769,9 @@ mod tests {
         ))
         .contains(":1"));
         store.fsync_wal();
-        // The point-write self-logs a resolved, replayable TUPDATE (no double log).
+        // The point-write records the complete resolved row image once.
         let wal = read_wal_bytes(dir.path());
-        assert!(wal.windows(b"TUPDATE".len()).any(|w| w == b"TUPDATE"));
+        assert!(wal.windows(b"TROWSET".len()).any(|w| w == b"TROWSET"));
 
         let restored = Store::new_with_config(config);
         restored.replay_wal(&Broker::new());
@@ -4495,8 +4834,8 @@ mod tests {
 
     #[test]
     fn tset_is_a_write_command() {
-        // Gates the reserved-table guard, the WAL self-log suppression, and the
-        // central .live() key-event fire -- all keyed off is_write_command.
+        // Gates the reserved-table guard, journal ownership, and central .live()
+        // key-event fire -- all keyed off is_write_command.
         assert!(crate::eviction::is_write_command(b"TSET"));
         assert!(!crate::eviction::is_write_command(b"TGET"));
     }
@@ -4626,7 +4965,7 @@ mod tests {
         let wal = read_wal_bytes(dir.path());
         assert!(
             wal.windows(b"RAWVSET".len()).any(|w| w == b"RAWVSET"),
-            "encrypted VSET must self-log ENC RAWVSET"
+            "encrypted VSET must journal ENC RAWVSET"
         );
         assert!(
             !wal.windows(b"2.5".len()).any(|w| w == b"2.5"),
@@ -5369,11 +5708,11 @@ mod tests {
         );
         assert_eq!(
             pipeline_access_for_args(&[b"SET" as &[u8], b"k", b"v"]),
-            PipelineAccess::Write
+            PipelineAccess::General
         );
         assert_eq!(
             pipeline_access_for_args(&[b"SET" as &[u8], b"k", b"v", b"NX"]),
-            PipelineAccess::Write
+            PipelineAccess::General
         );
         assert_eq!(
             pipeline_access_for_args(&[b"SET" as &[u8], b"k", b"v", b"BAD"]),
@@ -5392,8 +5731,16 @@ mod tests {
             PipelineAccess::General
         );
         assert_eq!(
+            pipeline_access_for_args(&[b"HSET" as &[u8], b"h", b"f", b"v"]),
+            PipelineAccess::General
+        );
+        assert_eq!(
+            pipeline_access_for_args(&[b"LPUSH" as &[u8], b"l", b"v", b"ENCRYPTED"]),
+            PipelineAccess::General
+        );
+        assert_eq!(
             pipeline_access_for_args(&[b"SPOP" as &[u8], b"k"]),
-            PipelineAccess::Write
+            PipelineAccess::General
         );
         assert_eq!(
             pipeline_access_for_args(&[b"SPOP" as &[u8], b"k", b"2"]),

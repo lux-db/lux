@@ -2,11 +2,12 @@ use bytes::BytesMut;
 use std::time::{Duration, Instant};
 
 use crate::resp;
-use crate::store::{Store, StoreValue};
+use crate::store::{JournalPlan, Store, StoreValue};
 
 use super::{arg_str, cmd_eq, format_float, parse_i64, parse_u64, CmdResult};
 
 const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
+type SortedSetPopResult = Option<(Vec<u8>, Vec<(String, f64)>)>;
 
 fn parse_i64_arg(arg: &[u8], out: &mut BytesMut) -> Option<i64> {
     match parse_i64(arg) {
@@ -1210,50 +1211,11 @@ pub fn cmd_zmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
             return CmdResult::Written;
         }
     }
-    // Pop from the first key that yields members.
-    for key in &keys {
-        store.try_promote(key, now);
-        let popped = if is_min {
-            store.zpopmin(key, count, now)
-        } else {
-            store.zpopmax(key, count, now)
-        };
-        match popped {
-            Ok(items) if !items.is_empty() => {
-                // Self-log the effect as a keyed ZREM: the raw ZMPOP would be WAL-
-                // sharded on its numkeys arg (not the key), landing in the wrong
-                // shard and replaying out of order. ZREM is keyed on the actual
-                // key, so it shards and replays deterministically.
-                if store.wal_enabled() {
-                    let member_bytes: Vec<&[u8]> =
-                        items.iter().map(|(m, _)| m.as_bytes()).collect();
-                    let mut zrem: Vec<&[u8]> = Vec::with_capacity(member_bytes.len() + 2);
-                    zrem.push(b"ZREM");
-                    zrem.push(key);
-                    zrem.extend_from_slice(&member_bytes);
-                    if let Err(e) = store.wal_log_command(&zrem) {
-                        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-                        return CmdResult::Written;
-                    }
-                }
-                resp::write_array_header(out, 2);
-                resp::write_bulk(out, arg_str(key));
-                resp::write_array_header(out, items.len());
-                for (member, score) in &items {
-                    resp::write_array_header(out, 2);
-                    resp::write_bulk(out, member);
-                    resp::write_bulk(out, &format_float(*score));
-                }
-                return CmdResult::Written;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                resp::write_error(out, &e);
-                return CmdResult::Written;
-            }
-        }
+    match journaled_zmpop(store, &keys, is_min, count, now) {
+        Ok(Some((key, items))) => write_zmpop_reply(out, &key, &items),
+        Ok(None) => resp::write_null_array(out),
+        Err(error) => resp::write_error(out, &error),
     }
-    resp::write_null_array(out);
     CmdResult::Written
 }
 
@@ -1449,31 +1411,19 @@ pub fn cmd_bzpopmin(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
     let timeout_secs: f64 = arg_str(args[args.len() - 1]).parse().unwrap_or(0.0);
     let keys: Vec<&[u8]> = args[1..args.len() - 1].to_vec();
 
-    for key in &keys {
-        let result = if is_min {
-            store.zpopmin(key, 1, now)
-        } else {
-            store.zpopmax(key, 1, now)
-        };
-        if let Ok(items) = result {
-            if !items.is_empty() {
-                let (member, score) = &items[0];
-                // Immediately-satisfiable BZPOPMIN/BZPOPMAX pops here without going
-                // through the blocked path, so it must self-log the removal (it
-                // isn't a write command, so execute_with_wal never logs it). Keyed
-                // ZREM replays deterministically on `key`'s shard.
-                if store.wal_enabled() {
-                    if let Err(e) = store.wal_log_command(&[b"ZREM", key, member.as_bytes()]) {
-                        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-                        return CmdResult::Written;
-                    }
-                }
-                resp::write_array_header(out, 3);
-                resp::write_bulk_raw(out, key);
-                resp::write_bulk(out, member);
-                resp::write_bulk(out, &format_float(*score));
-                return CmdResult::Written;
-            }
+    match journaled_zmpop(store, &keys, is_min, 1, now) {
+        Ok(Some((key, items))) => {
+            let (member, score) = &items[0];
+            resp::write_array_header(out, 3);
+            resp::write_bulk_raw(out, &key);
+            resp::write_bulk(out, member);
+            resp::write_bulk(out, &format_float(*score));
+            return CmdResult::Written;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            resp::write_error(out, &error);
+            return CmdResult::Written;
         }
     }
 
@@ -1502,22 +1452,50 @@ fn write_zmpop_reply(out: &mut BytesMut, key: &[u8], items: &[(String, f64)]) {
     }
 }
 
-/// Self-log a ZMPOP/BZMPOP pop as a keyed ZREM so a sharded WAL replays it on the
-/// popped key's shard (the raw command shards on its numkeys arg).
-fn wal_log_zmpop(store: &Store, key: &[u8], items: &[(String, f64)], out: &mut BytesMut) -> bool {
-    if !store.wal_enabled() {
-        return true;
-    }
-    let members: Vec<&[u8]> = items.iter().map(|(m, _)| m.as_bytes()).collect();
-    let mut zrem: Vec<&[u8]> = Vec::with_capacity(members.len() + 2);
-    zrem.push(b"ZREM");
-    zrem.push(key);
-    zrem.extend_from_slice(&members);
-    if let Err(e) = store.wal_log_command(&zrem) {
-        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-        return false;
-    }
-    true
+pub(crate) fn journaled_zmpop(
+    store: &Store,
+    keys: &[&[u8]],
+    pop_min: bool,
+    count: usize,
+    now: Instant,
+) -> Result<SortedSetPopResult, String> {
+    let route: [&[u8]; 1] = [b"ZMPOP"];
+    store
+        .commit_prepared(
+            &route,
+            || {
+                let mut expected = None;
+                for key in keys {
+                    store.try_promote(key, now);
+                    let items = store.preview_zpop(key, count, pop_min, now)?;
+                    if !items.is_empty() {
+                        expected = Some((key.to_vec(), items));
+                        break;
+                    }
+                }
+                let Some((key, items)) = &expected else {
+                    return Ok(JournalPlan::no_op(None));
+                };
+                let mut command = vec![b"ZREM".to_vec(), key.clone()];
+                command.extend(items.iter().map(|(member, _)| member.as_bytes().to_vec()));
+                Ok(JournalPlan::command(command, expected))
+            },
+            |expected| {
+                let Some((key, expected_items)) = expected else {
+                    return Ok(None);
+                };
+                let actual_items = if pop_min {
+                    store.zpopmin(&key, count, now)?
+                } else {
+                    store.zpopmax(&key, count, now)?
+                };
+                if actual_items != expected_items {
+                    return Err("ERR sorted-set pop changed while committing".to_string());
+                }
+                Ok(Some((key, actual_items)))
+            },
+        )
+        .map_err(|error| format!("ERR WAL append failed: {error}"))?
 }
 
 pub fn cmd_bzmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
@@ -1565,12 +1543,9 @@ pub fn cmd_bzmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
             return CmdResult::Written;
         }
     }
-    // Immediately satisfiable -> behave like ZMPOP and self-log the effect.
-    match store.zmpop(&keys, pop_min, count, now) {
+    // Immediately satisfiable -> behave like ZMPOP through the same journal boundary.
+    match journaled_zmpop(store, &keys, pop_min, count, now) {
         Ok(Some((key, items))) => {
-            if !wal_log_zmpop(store, &key, &items, out) {
-                return CmdResult::Written;
-            }
             write_zmpop_reply(out, &key, &items);
             return CmdResult::Written;
         }
@@ -1651,6 +1626,13 @@ pub fn cmd_zrangestore(
         );
         return CmdResult::Written;
     }
+    let prepare = match store.prepare_journaled(args) {
+        Ok(prepare) => prepare,
+        Err(error) => {
+            resp::write_error(out, &format!("ERR WAL append failed: {error}"));
+            return CmdResult::Written;
+        }
+    };
     let pairs: Result<Vec<(String, f64)>, String> = if byscore {
         let (min, min_ex) = match parse_score_bound(arg_str(args[3]), false) {
             Ok(bound) => bound,
@@ -1705,7 +1687,7 @@ pub fn cmd_zrangestore(
         store.zrange(src, start, stop, reverse, true, now)
     };
     match pairs {
-        Ok(pairs) => match store.zrangestore(dst, pairs) {
+        Ok(pairs) => match store.zrangestore(prepare, dst, pairs) {
             Ok(n) => resp::write_integer(out, n),
             Err(e) => resp::write_error(out, &e),
         },

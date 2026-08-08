@@ -2,7 +2,7 @@ use bytes::{Bytes, BytesMut};
 use std::time::{Duration, Instant};
 
 use crate::resp;
-use crate::store::{epoch_ms, Entry, SetOptions, Store, StoreValue};
+use crate::store::{Entry, JournalPlan, SetOptions, Store, StoreValue};
 
 use super::{arg_str, cmd_eq, parse_i64, parse_u64, CmdResult};
 
@@ -47,6 +47,18 @@ fn parse_positive_ttl(arg: &[u8], command: &str, out: &mut BytesMut) -> Option<u
     }
 }
 
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn deadline_ms(ttl: Duration) -> u64 {
+    let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+    epoch_ms().saturating_add(ttl_ms)
+}
+
 fn reject_encrypted_string_mutation(
     store: &Store,
     key: &[u8],
@@ -75,13 +87,13 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
         return CmdResult::Written;
     }
     let mut ttl = None;
+    let mut explicit_deadline_ms = None;
     let mut keep_ttl = false;
     let mut nx = false;
     let mut xx = false;
     let mut get = false;
     let mut ifeq = None;
     let mut encrypted = false;
-    let mut relative_ttl = false;
     let mut i = 3;
     while i < args.len() {
         if cmd_eq(args[i], b"EX") {
@@ -94,7 +106,7 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
                 None => return CmdResult::Written,
             };
             ttl = Some(Duration::from_secs(secs));
-            relative_ttl = true;
+            explicit_deadline_ms = ttl.map(deadline_ms);
             keep_ttl = false;
             i += 2;
         } else if cmd_eq(args[i], b"EXAT") {
@@ -104,11 +116,9 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
             }
             match parse_u64(args[i + 1]) {
                 Ok(expiry_secs) => {
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    ttl = Some(Duration::from_secs(expiry_secs.saturating_sub(now_secs)));
+                    let deadline = expiry_secs.saturating_mul(1000);
+                    ttl = Some(Duration::from_millis(deadline.saturating_sub(epoch_ms())));
+                    explicit_deadline_ms = Some(deadline);
                     keep_ttl = false;
                 }
                 Err(_) => {
@@ -127,7 +137,7 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
                 None => return CmdResult::Written,
             };
             ttl = Some(Duration::from_millis(ms));
-            relative_ttl = true;
+            explicit_deadline_ms = ttl.map(deadline_ms);
             keep_ttl = false;
             i += 2;
         } else if cmd_eq(args[i], b"PXAT") {
@@ -137,11 +147,8 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
             }
             match parse_u64(args[i + 1]) {
                 Ok(expiry_ms) => {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    ttl = Some(Duration::from_millis(expiry_ms.saturating_sub(now_ms)));
+                    ttl = Some(Duration::from_millis(expiry_ms.saturating_sub(epoch_ms())));
+                    explicit_deadline_ms = Some(expiry_ms);
                     keep_ttl = false;
                 }
                 Err(_) => {
@@ -172,6 +179,7 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
                 return CmdResult::Written;
             }
             keep_ttl = true;
+            explicit_deadline_ms = None;
             i += 1;
         } else if cmd_eq(args[i], b"ENCRYPTED") {
             encrypted = true;
@@ -194,59 +202,47 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
         get,
         encrypted,
     };
-    let should_self_log = encrypted || store.kv_string_is_encrypted(args[1], now);
-    match store.set_conditional(args[1], args[2], options, now) {
-        Ok((set, old)) => {
-            if set && should_self_log && store.wal_enabled() {
-                if let Some(raw) = store.get_raw_string(args[1], now) {
-                    // Self-log the resolved ciphertext plus the original SET
-                    // options (minus ENCRYPTED), incl. EX/PX/EXAT/PXAT, which
-                    // ENC RAWSET replays faithfully so expiry survives a restart.
-                    let mut owned: Vec<Vec<u8>> = Vec::with_capacity(args.len());
-                    owned.push(b"ENC".to_vec());
-                    owned.push(b"RAWSET".to_vec());
-                    owned.push(args[1].to_vec());
-                    owned.push(raw.to_vec());
-                    let ttl_index = relative_ttl
-                        .then(|| super::relative_ttl_option_index(args))
-                        .flatten();
-                    for (index, arg) in args.iter().enumerate().skip(3) {
-                        if cmd_eq(arg, b"ENCRYPTED") {
-                            continue;
-                        }
-                        if Some(index) == ttl_index {
-                            owned.push(b"PXAT".to_vec());
-                            owned.push(
-                                epoch_ms()
-                                    .saturating_add(
-                                        ttl.unwrap_or_default().as_millis().min(i64::MAX as u128)
-                                            as i64,
-                                    )
-                                    .to_string()
-                                    .into_bytes(),
-                            );
-                        } else if ttl_index == Some(index - 1) {
-                            // The relative TTL's duration is replaced above.
-                            continue;
-                        } else {
-                            owned.push(arg.to_vec());
-                        }
-                    }
-                    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-                    if let Err(e) = store.wal_log_command(&refs) {
-                        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-                        return CmdResult::Written;
-                    }
+    let route: [&[u8]; 2] = [b"SET", args[1]];
+    let result = match store.commit_prepared(
+        &route,
+        || {
+            let prepared = store.prepare_conditional_set(args[1], args[2], options, now)?;
+            if prepared.should_set() {
+                let mut command = Vec::with_capacity(6);
+                if prepared
+                    .stored_value()
+                    .is_some_and(crate::encryption::EncryptionKeyring::is_encrypted_value)
+                {
+                    command.push(b"ENC".to_vec());
+                    command.push(b"RAWSET".to_vec());
+                } else {
+                    command.push(b"SET".to_vec());
                 }
-            } else if set && relative_ttl && store.wal_enabled() {
-                let deadline = epoch_ms().saturating_add(
-                    ttl.unwrap_or_default().as_millis().min(i64::MAX as u128) as i64,
+                command.push(args[1].to_vec());
+                command.push(
+                    prepared
+                        .stored_value()
+                        .expect("prepared SET has a stored value")
+                        .to_vec(),
                 );
-                if let Err(e) = super::wal_log_resolved_ttl_command(store, args, deadline) {
-                    resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-                    return CmdResult::Written;
+                if let Some(expires_in) = prepared.expires_in(now) {
+                    let deadline_ms =
+                        explicit_deadline_ms.unwrap_or_else(|| deadline_ms(expires_in));
+                    command.push(b"PXAT".to_vec());
+                    command.push(deadline_ms.to_string().into_bytes());
                 }
+                Ok(JournalPlan::command(command, prepared))
+            } else {
+                Ok(JournalPlan::no_op(prepared))
             }
+        },
+        |prepared| Ok(store.apply_conditional_set(args[1], prepared)),
+    ) {
+        Ok(result) => result,
+        Err(error) => Err(format!("ERR WAL append failed: {error}")),
+    };
+    match result {
+        Ok((set, old)) => {
             if get {
                 resp::write_optional_bulk_raw(out, &old);
             } else if set {
@@ -292,20 +288,13 @@ pub fn cmd_setex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
             resp::write_error(out, "ERR invalid expire time in 'setex' command")
         }
         Ok(secs) => {
-            store.set(
-                args[1],
-                args[3],
-                Some(Duration::from_secs(secs as u64)),
-                now,
-            );
-            if store.wal_enabled() {
-                let deadline = epoch_ms().saturating_add(secs.saturating_mul(1000));
-                if let Err(e) = super::wal_log_resolved_ttl_command(store, args, deadline) {
-                    resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-                    return CmdResult::Written;
-                }
+            let ttl = Duration::from_secs(secs as u64);
+            let deadline = deadline_ms(ttl).to_string().into_bytes();
+            let command: [&[u8]; 5] = [b"SET", args[1], args[3], b"PXAT", &deadline];
+            match store.commit_journaled(&command, || store.set(args[1], args[3], Some(ttl), now)) {
+                Ok(()) => resp::write_ok(out),
+                Err(error) => resp::write_error(out, &format!("ERR WAL append failed: {error}")),
             }
-            resp::write_ok(out);
         }
         Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
     }
@@ -324,15 +313,13 @@ pub fn cmd_psetex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         Some(ms) => ms,
         None => return CmdResult::Written,
     };
-    store.set(args[1], args[3], Some(Duration::from_millis(ms)), now);
-    if store.wal_enabled() {
-        let deadline = epoch_ms().saturating_add(ms.min(i64::MAX as u64) as i64);
-        if let Err(e) = super::wal_log_resolved_ttl_command(store, args, deadline) {
-            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-            return CmdResult::Written;
-        }
+    let ttl = Duration::from_millis(ms);
+    let deadline = deadline_ms(ttl).to_string().into_bytes();
+    let command: [&[u8]; 5] = [b"SET", args[1], args[3], b"PXAT", &deadline];
+    match store.commit_journaled(&command, || store.set(args[1], args[3], Some(ttl), now)) {
+        Ok(()) => resp::write_ok(out),
+        Err(error) => resp::write_error(out, &format!("ERR WAL append failed: {error}")),
     }
-    resp::write_ok(out);
     CmdResult::Written
 }
 
@@ -394,9 +381,9 @@ pub fn cmd_getex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         return CmdResult::Written;
     }
     let mut ttl = None;
+    let mut expires_at_ms = None;
     let mut persist = false;
     let mut option_seen = false;
-    let mut relative_ttl = false;
     let mut i = 2;
     while i < args.len() {
         if cmd_eq(args[i], b"EX") && i + 1 < args.len() {
@@ -409,7 +396,7 @@ pub fn cmd_getex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
                 None => return CmdResult::Written,
             };
             ttl = Some(Duration::from_secs(secs));
-            relative_ttl = true;
+            expires_at_ms = ttl.map(deadline_ms);
             option_seen = true;
             i += 2;
         } else if cmd_eq(args[i], b"PX") && i + 1 < args.len() {
@@ -422,7 +409,7 @@ pub fn cmd_getex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
                 None => return CmdResult::Written,
             };
             ttl = Some(Duration::from_millis(ms));
-            relative_ttl = true;
+            expires_at_ms = ttl.map(deadline_ms);
             option_seen = true;
             i += 2;
         } else if cmd_eq(args[i], b"EXAT") && i + 1 < args.len() {
@@ -434,11 +421,9 @@ pub fn cmd_getex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
                 Some(ts) => ts,
                 None => return CmdResult::Written,
             };
-            let now_ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            ttl = Some(Duration::from_secs(ts.saturating_sub(now_ts)));
+            let expiry_ms = ts.saturating_mul(1000);
+            ttl = Some(Duration::from_millis(expiry_ms.saturating_sub(epoch_ms())));
+            expires_at_ms = Some(expiry_ms);
             option_seen = true;
             i += 2;
         } else if cmd_eq(args[i], b"PXAT") && i + 1 < args.len() {
@@ -450,11 +435,8 @@ pub fn cmd_getex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
                 Some(ts) => ts,
                 None => return CmdResult::Written,
             };
-            let now_ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            ttl = Some(Duration::from_millis(ts.saturating_sub(now_ts)));
+            ttl = Some(Duration::from_millis(ts.saturating_sub(epoch_ms())));
+            expires_at_ms = Some(ts);
             option_seen = true;
             i += 2;
         } else if cmd_eq(args[i], b"PERSIST") {
@@ -470,15 +452,43 @@ pub fn cmd_getex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
             return CmdResult::Written;
         }
     }
-    let value = store.getex(args[1], ttl, persist, now);
-    if value.is_some() && relative_ttl && store.wal_enabled() {
-        let deadline = epoch_ms()
-            .saturating_add(ttl.unwrap_or_default().as_millis().min(i64::MAX as u128) as i64);
-        if let Err(e) = super::wal_log_resolved_ttl_command(store, args, deadline) {
-            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-            return CmdResult::Written;
-        }
-    }
+    let value = if !option_seen {
+        store.getex(args[1], None, false, now)
+    } else {
+        let route: [&[u8]; 2] = [b"GETEX", args[1]];
+        let prepare = match store.prepare_journaled(&route) {
+            Ok(prepare) => prepare,
+            Err(error) => {
+                resp::write_error(out, &format!("ERR WAL append failed: {error}"));
+                return CmdResult::Written;
+            }
+        };
+        let commit = if persist {
+            if store.pttl(args[1], now) >= 0 {
+                let command: [&[u8]; 2] = [b"PERSIST", args[1]];
+                prepare.commit(&command)
+            } else {
+                prepare.commit_batch(&[])
+            }
+        } else if store.exists(&[args[1]], now) == 1 {
+            let deadline = expires_at_ms
+                .expect("GETEX expiry option has a deadline")
+                .to_string()
+                .into_bytes();
+            let command: [&[u8]; 3] = [b"PEXPIREAT", args[1], &deadline];
+            prepare.commit(&command)
+        } else {
+            prepare.commit_batch(&[])
+        };
+        let _commit = match commit {
+            Ok(commit) => commit,
+            Err(error) => {
+                resp::write_error(out, &format!("ERR WAL append failed: {error}"));
+                return CmdResult::Written;
+            }
+        };
+        store.getex(args[1], ttl, persist, now)
+    };
     match value
         .map(|value| store.decrypt_kv_string_value(args[1], value))
         .transpose()
@@ -598,28 +608,32 @@ pub fn cmd_mset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'mset' command");
         return CmdResult::Written;
     }
-    let mut i = 1;
-    while i < args.len() {
-        if reject_encrypted_string_mutation(store, args[i], now, out) {
+    let prepare = match store.prepare_journaled(args) {
+        Ok(prepare) => prepare,
+        Err(error) => {
+            resp::write_error(out, &format!("ERR WAL append failed: {error}"));
             return CmdResult::Written;
         }
-        store.set(args[i], args[i + 1], None, now);
-        i += 2;
+    };
+    for pair in args[1..].chunks(2) {
+        if reject_encrypted_string_mutation(store, pair[0], now, out) {
+            return CmdResult::Written;
+        }
     }
-    // Self-log each pair as a keyed SET so every key lands in its own WAL shard.
-    // The raw MSET would shard on the first key only, replaying the rest out of
-    // order vs their own shards' writes. Batched: atomic when all keys share a
-    // shard, correctly split when they don't.
-    if store.wal_enabled() {
-        let sets: Vec<[&[u8]; 3]> = args[1..]
-            .chunks(2)
-            .map(|c| [b"SET".as_slice(), c[0], c[1]])
-            .collect();
-        let refs: Vec<&[&[u8]]> = sets.iter().map(|s| s.as_slice()).collect();
-        if let Err(e) = store.wal_log_command_batch(&refs) {
+    let sets: Vec<[&[u8]; 3]> = args[1..]
+        .chunks(2)
+        .map(|pair| [b"SET".as_slice(), pair[0], pair[1]])
+        .collect();
+    let refs: Vec<&[&[u8]]> = sets.iter().map(|set| set.as_slice()).collect();
+    let _commit = match prepare.commit_batch(&refs) {
+        Ok(commit) => commit,
+        Err(e) => {
             resp::write_error(out, &format!("ERR WAL append failed: {e}"));
             return CmdResult::Written;
         }
+    };
+    for pair in args[1..].chunks(2) {
+        store.set(pair[0], pair[1], None, now);
     }
     resp::write_ok(out);
     CmdResult::Written
@@ -631,27 +645,39 @@ pub fn cmd_msetnx(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         return CmdResult::Written;
     }
     let pairs: Vec<(&[u8], &[u8])> = args[1..].chunks(2).map(|c| (c[0], c[1])).collect();
-    if pairs
-        .iter()
-        .any(|(key, _)| store.kv_string_is_encrypted(key, now))
-    {
-        resp::write_error(out, ENCRYPTED_MUTATION_ERR);
-        return CmdResult::Written;
-    }
-    let set = store.msetnx(&pairs, now);
-    // Self-log each applied pair as a keyed SET (same cross-shard reasoning as
-    // MSET). The NX check already passed at runtime; replay just sets the values.
-    if set && store.wal_enabled() {
-        let sets: Vec<[&[u8]; 3]> = pairs
-            .iter()
-            .map(|(k, v)| [b"SET".as_slice(), *k, *v])
-            .collect();
-        let refs: Vec<&[&[u8]]> = sets.iter().map(|s| s.as_slice()).collect();
-        if let Err(e) = store.wal_log_command_batch(&refs) {
-            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+    let result = store.commit_prepared(
+        args,
+        || -> Result<JournalPlan<bool>, String> {
+            if pairs
+                .iter()
+                .any(|(key, _)| store.kv_string_is_encrypted(key, now))
+            {
+                return Err(ENCRYPTED_MUTATION_ERR.to_string());
+            }
+            let should_set = store.msetnx_would_set(&pairs, now);
+            if should_set {
+                let commands = pairs
+                    .iter()
+                    .map(|(key, value)| vec![b"SET".to_vec(), key.to_vec(), value.to_vec()])
+                    .collect();
+                Ok(JournalPlan::batch(commands, true))
+            } else {
+                Ok(JournalPlan::no_op(false))
+            }
+        },
+        |should_set| -> Result<bool, String> { Ok(should_set && store.msetnx(&pairs, now)) },
+    );
+    let set = match result {
+        Ok(Ok(set)) => set,
+        Ok(Err(error)) => {
+            resp::write_error(out, &error);
             return CmdResult::Written;
         }
-    }
+        Err(error) => {
+            resp::write_error(out, &format!("ERR WAL append failed: {error}"));
+            return CmdResult::Written;
+        }
+    };
     resp::write_integer(out, if set { 1 } else { 0 });
     CmdResult::Written
 }

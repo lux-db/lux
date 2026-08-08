@@ -2677,6 +2677,7 @@ fn pair_refs<K: AsRef<[u8]>, V: AsRef<[u8]>>(pairs: &[(K, V)]) -> Vec<(&[u8], &[
 fn ok(value: CommandOutput) -> Result<(), LuxError> {
     match value {
         CommandOutput::Simple(s) if s.eq_ignore_ascii_case("OK") => Ok(()),
+        CommandOutput::SimpleOwned(s) if s.eq_ignore_ascii_case("OK") => Ok(()),
         CommandOutput::Bulk(bytes) if bytes.eq_ignore_ascii_case(b"OK") => Ok(()),
         other => Err(protocol(format!("expected OK, got {other:?}"))),
     }
@@ -2685,6 +2686,7 @@ fn ok(value: CommandOutput) -> Result<(), LuxError> {
 fn simple_string(value: CommandOutput) -> Result<String, LuxError> {
     match value {
         CommandOutput::Simple(s) => Ok(s.to_string()),
+        CommandOutput::SimpleOwned(s) => Ok(s),
         CommandOutput::Bulk(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
         other => Err(protocol(format!("expected string, got {other:?}"))),
     }
@@ -2715,6 +2717,7 @@ fn optional_bulk(value: CommandOutput) -> Result<Option<Bytes>, LuxError> {
         CommandOutput::Nil => Ok(None),
         CommandOutput::Bulk(bytes) => Ok(Some(bytes)),
         CommandOutput::Simple(s) => Ok(Some(Bytes::from(s))),
+        CommandOutput::SimpleOwned(s) => Ok(Some(Bytes::from(s))),
         other => Err(protocol(format!("expected bulk string, got {other:?}"))),
     }
 }
@@ -2820,6 +2823,7 @@ fn command_output_to_embedded_value(value: CommandOutput) -> Result<EmbeddedValu
         CommandOutput::Nil => EmbeddedValue::Nil,
         CommandOutput::Int(n) => EmbeddedValue::Int(n),
         CommandOutput::Simple(s) => EmbeddedValue::Simple(s.to_string()),
+        CommandOutput::SimpleOwned(s) => EmbeddedValue::Simple(s),
         CommandOutput::Bulk(bytes) => EmbeddedValue::Bulk(bytes),
         CommandOutput::Array(values) => EmbeddedValue::Array(
             values

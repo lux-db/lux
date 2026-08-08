@@ -2,12 +2,19 @@ use bytes::BytesMut;
 use std::time::{Duration, Instant};
 
 use crate::resp;
-use crate::store::{epoch_ms, Store};
+use crate::store::Store;
 
 use super::{arg_str, cmd_eq, parse_u64, CmdResult};
 
 fn parse_f32(arg: &[u8]) -> Result<f32, ()> {
     arg_str(arg).parse::<f32>().map_err(|_| ())
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
@@ -40,9 +47,8 @@ pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     let mut i = 3 + dims;
     let mut metadata = None;
     let mut ttl = None;
+    let mut expires_at_ms = None;
     let mut encrypted = false;
-    let mut relative_ttl = false;
-    let mut absolute_deadline = None;
     while i < args.len() {
         if cmd_eq(args[i], b"ENCRYPTED") {
             encrypted = true;
@@ -62,7 +68,10 @@ pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
             match parse_u64(args[i + 1]) {
                 Ok(s) => {
                     ttl = Some(Duration::from_secs(s));
-                    relative_ttl = true;
+                    expires_at_ms = ttl.map(|duration| {
+                        epoch_ms()
+                            .saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+                    });
                 }
                 Err(_) => {
                     resp::write_error(out, "ERR value is not an integer or out of range");
@@ -78,7 +87,7 @@ pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
             match parse_u64(args[i + 1]) {
                 Ok(ms) => {
                     ttl = Some(Duration::from_millis(ms));
-                    relative_ttl = true;
+                    expires_at_ms = Some(epoch_ms().saturating_add(ms));
                 }
                 Err(_) => {
                     resp::write_error(out, "ERR value is not an integer or out of range");
@@ -93,10 +102,8 @@ pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
             }
             match parse_u64(args[i + 1]) {
                 Ok(deadline) => {
-                    absolute_deadline = Some(deadline);
-                    ttl = Some(Duration::from_millis(
-                        deadline.saturating_sub(epoch_ms().max(0) as u64),
-                    ))
+                    ttl = Some(Duration::from_millis(deadline.saturating_sub(epoch_ms())));
+                    expires_at_ms = Some(deadline);
                 }
                 Err(_) => {
                     resp::write_error(out, "ERR value is not an integer or out of range");
@@ -109,8 +116,8 @@ pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
             return CmdResult::Written;
         }
     }
-    // Encrypted vectors keep plaintext in RAM but self-log the sealed payload as
-    // ENC RAWVSET so the WAL carries no plaintext f32 (mirrors SET ... ENCRYPTED).
+    // Encrypted vectors keep plaintext in RAM but journal the sealed payload as
+    // ENC RAWVSET so the journal carries no plaintext f32.
     let sealed = if encrypted {
         match store.encrypt_vector(key, &data) {
             Ok(c) => Some(c),
@@ -122,43 +129,33 @@ pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     } else {
         None
     };
-    store.vset(key, data, metadata.clone(), ttl, encrypted, now);
-    if let Some(ct) = sealed {
-        if store.wal_enabled() {
-            let mut owned: Vec<Vec<u8>> =
-                vec![b"ENC".to_vec(), b"RAWVSET".to_vec(), key.to_vec(), ct];
-            if let Some(m) = &metadata {
-                owned.push(b"META".to_vec());
-                owned.push(m.as_bytes().to_vec());
-            }
-            if let Some(deadline) = absolute_deadline {
-                owned.push(b"PXAT".to_vec());
-                owned.push(deadline.to_string().into_bytes());
-            } else if relative_ttl {
-                owned.push(b"PXAT".to_vec());
-                owned.push(
-                    epoch_ms()
-                        .saturating_add(
-                            ttl.unwrap_or_default().as_millis().min(i64::MAX as u128) as i64
-                        )
-                        .to_string()
-                        .into_bytes(),
-                );
-            }
-            let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-            if let Err(e) = store.wal_log_command(&refs) {
-                resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-                return CmdResult::Written;
-            }
-        }
-    } else if relative_ttl && store.wal_enabled() {
-        let deadline = epoch_ms()
-            .saturating_add(ttl.unwrap_or_default().as_millis().min(i64::MAX as u128) as i64);
-        if let Err(e) = super::wal_log_resolved_ttl_command(store, args, deadline) {
+    let mut journal_args = if let Some(ct) = sealed {
+        vec![b"ENC".to_vec(), b"RAWVSET".to_vec(), key.to_vec(), ct]
+    } else {
+        let mut command = Vec::with_capacity(3 + dims + 4);
+        command.push(b"VSET".to_vec());
+        command.push(key.to_vec());
+        command.push(args[2].to_vec());
+        command.extend(args[3..3 + dims].iter().map(|arg| arg.to_vec()));
+        command
+    };
+    if let Some(m) = &metadata {
+        journal_args.push(b"META".to_vec());
+        journal_args.push(m.as_bytes().to_vec());
+    }
+    if let Some(deadline) = expires_at_ms {
+        journal_args.push(b"PXAT".to_vec());
+        journal_args.push(deadline.to_string().into_bytes());
+    }
+    let refs: Vec<&[u8]> = journal_args.iter().map(Vec::as_slice).collect();
+    let _commit = match store.begin_journaled(&refs) {
+        Ok(commit) => commit,
+        Err(e) => {
             resp::write_error(out, &format!("ERR WAL append failed: {e}"));
             return CmdResult::Written;
         }
-    }
+    };
+    store.vset(key, data, metadata, ttl, encrypted, now);
     resp::write_ok(out);
     CmdResult::Written
 }

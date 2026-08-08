@@ -136,12 +136,6 @@ fn crash_recovery_all_types() {
     assert!(resp.contains("42.5"), "timeseries recovery: {resp}");
 }
 
-// AUDIT PROBE: XADD with a `*` server-generated ID must keep the SAME id across a
-// WAL-only recovery. execute_with_wal logs the RAW command (literal `*`), so replay
-// regenerates a new time-based id and the entry's identity changes.
-//
-// QUARANTINED repro for row TTL WAL replay drift (un-ignore when fixing). Run with:
-//   cargo test --release --test crash_recovery -- --ignored xadd_star_id_stable_after_wal_replay
 #[test]
 fn xadd_star_id_stable_after_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
@@ -660,9 +654,6 @@ fn zmpop_persists_across_wal_replay() {
     );
 }
 
-// AUDIT PROBE: SPOP removes a RANDOM member. The raw command is WAL-logged, so
-// replay re-runs SPOP and may remove a DIFFERENT member than the client saw,
-// leaving the recovered set inconsistent with the acknowledged result.
 #[test]
 fn spop_deterministic_after_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
@@ -771,7 +762,7 @@ fn crash_after_snapshot_before_wal_truncate() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: Crash during MULTI/EXEC -- partial transaction should not corrupt
+// Test: Crash during MULTI/EXEC -- a recovered prefix must remain valid
 // ---------------------------------------------------------------------------
 #[test]
 fn crash_during_multi_exec() {
@@ -782,8 +773,9 @@ fn crash_during_multi_exec() {
     send(&mut c, &["SET", "before_tx", "safe"]);
 
     // Start a MULTI but kill before EXEC completes all commands.
-    // Since each command in MULTI is individually WAL'd on EXEC,
-    // a crash mid-EXEC means some commands are in WAL and some aren't.
+    // Each command in MULTI crosses its own durability boundary during EXEC.
+    // Lux documents sequential, non-isolated transaction execution, so a crash
+    // before the EXEC response can recover a completed prefix.
     send(&mut c, &["MULTI"]);
     send(&mut c, &["SET", "tx_key1", "tx_val1"]);
     send(&mut c, &["SET", "tx_key2", "tx_val2"]);
@@ -1126,10 +1118,8 @@ fn row_ttl_survives_restart() {
 }
 
 // Row TTL recovered purely from WAL replay (no snapshot since the write). The
-// WAL stores the relative command, so replay REFRESHES the deadline -- exactly
-// like KV EXPIRE/SETEX. The guarantee here is: the row survives recovery and its
-// TTL is still active (it expires again). Absolute deadline preservation is a
-// snapshot-only guarantee, covered by `row_ttl_survives_restart`.
+// journal stores the resolved absolute deadline, so recovery preserves the
+// original expiry schedule instead of granting the row a fresh lifetime.
 #[test]
 fn row_ttl_active_after_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
@@ -1156,7 +1146,7 @@ fn row_ttl_active_after_wal_replay() {
     srv.restart();
     let mut c = srv.conn();
 
-    // Both rows survive recovery (gone's TTL was refreshed by replay).
+    // Restart completes before either original deadline has elapsed.
     let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
     assert!(
         resp.contains("keep"),
@@ -1167,7 +1157,7 @@ fn row_ttl_active_after_wal_replay() {
         "short-TTL row should survive WAL replay: {resp}"
     );
 
-    // The TTL is still active: `gone` expires on its refreshed schedule, `keep` stays.
+    // The original deadline remains active: `gone` expires while `keep` stays.
     thread::sleep(Duration::from_millis(2600));
     let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
     assert!(
@@ -1176,15 +1166,13 @@ fn row_ttl_active_after_wal_replay() {
     );
     assert!(
         !resp.contains("gone"),
-        "short-TTL row should expire after WAL replay refreshed its TTL: {resp}"
+        "short-TTL row should expire on its original schedule after WAL replay: {resp}"
     );
 }
 
-// A TTL set by an UPDATE must survive WAL replay. The update path applies the TTL
-// in the leaf and logs it as a trailing `TTL <secs>` on the TUPDATE, so replay
-// re-applies it. Without that, the update's TTL is dropped on replay and the row
-// lives forever. Guarantee (WAL-only, relative TTL refreshes on replay): the row
-// recovers AND its TTL stays active, so it still expires.
+// A TTL set by an UPDATE must survive WAL replay. The table leaf records the
+// resolved row image with its absolute deadline. Without that, the update's TTL
+// is dropped on replay and the row lives forever.
 #[test]
 fn update_ttl_active_after_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();

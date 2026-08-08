@@ -19,14 +19,15 @@ fn pipelined_raw_kv_read_of_auth_keys_is_blocked() {
         "_t:auth.signing_keys:row:1",
         "private_key_encrypted",
     ]));
+    batch.extend_from_slice(&common::resp_cmd(&["GET", "_auth:oauth_state:unguessable"]));
     conn.write_all(&batch).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
     let resp = common::read_all(&mut conn);
 
     let blocked = resp.matches("reserved internal namespace").count();
-    assert!(
-        blocked >= 2,
-        "both pipelined auth-key reads must be blocked, got: {resp:?}"
+    assert_eq!(
+        blocked, 3,
+        "all pipelined auth-key reads must be blocked: {resp:?}"
     );
 }
 
@@ -40,6 +41,29 @@ fn raw_kv_read_of_auth_key_is_blocked() {
         resp.contains("reserved internal namespace"),
         "auth-key read must be refused, got: {resp:?}"
     );
+}
+
+#[test]
+fn raw_kv_access_to_auth_runtime_state_is_blocked() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+
+    for command in [
+        ["GET", "_auth:oauth_state:x", ""],
+        ["SET", "_auth:oauth_state:x", "forged"],
+        ["DEL", "_auth:access_revoked_after:session", ""],
+    ] {
+        let args: Vec<&str> = command
+            .iter()
+            .copied()
+            .filter(|arg| !arg.is_empty())
+            .collect();
+        let response = send_and_read(&mut conn, &args);
+        assert!(
+            response.contains("reserved internal namespace"),
+            "{args:?} must be refused, got: {response:?}"
+        );
+    }
 }
 
 #[test]

@@ -18,7 +18,7 @@ pub fn fuzz_snapshot(data: &[u8]) {
         },
         ..Default::default()
     }));
-    let _ = crate::snapshot::load_binary(&store, &mut Cursor::new(data), true, true);
+    let _ = crate::snapshot::load_binary(&store, &mut Cursor::new(data), true, true, false);
 }
 
 /// RESP request parser.

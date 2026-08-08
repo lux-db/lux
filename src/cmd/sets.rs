@@ -2,7 +2,7 @@ use bytes::BytesMut;
 use std::time::Instant;
 
 use crate::resp;
-use crate::store::Store;
+use crate::store::{JournalPlan, Store};
 
 use super::{cmd_eq, parse_i64, parse_u64, CmdResult};
 
@@ -112,22 +112,51 @@ pub fn cmd_spop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'spop' command");
         return CmdResult::Written;
     }
-    if args.len() <= 2 {
-        match store.spop_one(args[1], now) {
-            Some(member) => resp::write_bulk(out, &member),
-            None => resp::write_null(out),
+    let has_count = args.len() > 2;
+    let count = if has_count {
+        match parse_usize_arg(args[2], out) {
+            Some(count) => count,
+            None => return CmdResult::Written,
         }
-        return CmdResult::Written;
-    }
-    let count = match parse_usize_arg(args[2], out) {
-        Some(count) => count,
-        None => return CmdResult::Written,
+    } else {
+        1
     };
-    match store.spop(args[1], count, now) {
+    let route: [&[u8]; 2] = [b"SPOP", args[1]];
+    let result = store.commit_prepared(
+        &route,
+        || {
+            let members = store.preview_spop(args[1], count, now)?;
+            if members.is_empty() {
+                return Ok(JournalPlan::no_op(members));
+            }
+            let mut command = vec![b"SREM".to_vec(), args[1].to_vec()];
+            command.extend(members.iter().map(|member| member.as_bytes().to_vec()));
+            Ok(JournalPlan::command(command, members))
+        },
+        |members| {
+            let refs: Vec<&[u8]> = members.iter().map(String::as_bytes).collect();
+            let removed = store.srem(args[1], &refs, now)?;
+            if removed as usize != members.len() {
+                return Err("ERR set pop changed while committing".to_string());
+            }
+            Ok(members)
+        },
+    );
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => Err(format!("ERR WAL append failed: {error}")),
+    };
+    match result {
         Ok(members) => {
-            resp::write_array_header(out, members.len());
-            for m in &members {
-                resp::write_bulk(out, m);
+            if has_count {
+                resp::write_array_header(out, members.len());
+                for member in &members {
+                    resp::write_bulk(out, member);
+                }
+            } else if let Some(member) = members.first() {
+                resp::write_bulk(out, member);
+            } else {
+                resp::write_null(out);
             }
         }
         Err(e) => resp::write_error(out, &e),
@@ -184,22 +213,36 @@ pub fn cmd_smove(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         resp::write_error(out, "ERR wrong number of arguments for 'smove' command");
         return CmdResult::Written;
     }
-    match store.smove(args[1], args[2], args[3], now) {
-        Ok(b) => {
-            // Self-log the resolved effect as a keyed SREM on src + SADD on dst so
-            // each replays in its own WAL shard's order. The raw SMOVE would land
-            // wholesale in src's shard and replay the dst insert out of order vs
-            // dst's own writes. Batched: atomic when src/dst share a shard, split
-            // (correctly sharded) when they don't. No-op if nothing moved.
-            if b && store.wal_enabled() {
-                let srem: [&[u8]; 3] = [b"SREM", args[1], args[3]];
-                let sadd: [&[u8]; 3] = [b"SADD", args[2], args[3]];
-                let batch: [&[&[u8]]; 2] = [&srem, &sadd];
-                if let Err(e) = store.wal_log_command_batch(&batch) {
-                    resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-                    return CmdResult::Written;
-                }
+    let result = store.commit_prepared(
+        args,
+        || -> Result<JournalPlan<bool>, String> {
+            let should_move = store.smove_would_move(args[1], args[2], args[3], now)?;
+            if should_move {
+                Ok(JournalPlan::batch(
+                    vec![
+                        vec![b"SREM".to_vec(), args[1].to_vec(), args[3].to_vec()],
+                        vec![b"SADD".to_vec(), args[2].to_vec(), args[3].to_vec()],
+                    ],
+                    true,
+                ))
+            } else {
+                Ok(JournalPlan::no_op(false))
             }
+        },
+        |should_move| {
+            if should_move {
+                store.smove(args[1], args[2], args[3], now)
+            } else {
+                Ok(false)
+            }
+        },
+    );
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => Err(format!("ERR WAL append failed: {error}")),
+    };
+    match result {
+        Ok(b) => {
             resp::write_integer(out, if b { 1 } else { 0 });
         }
         Err(e) => resp::write_error(out, &e),

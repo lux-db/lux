@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 // checksummed format (v2). Files without this magic are treated as legacy.
 const WAL_MAGIC: &[u8; 4] = b"LXW1";
 const DATA_MAGIC: &[u8; 4] = b"LXD1";
+const WAL_BATCH_MARKER: &[u8] = b"\0LUX:BATCH";
 
 /// CRC32 (ISO 3309 / ITU-T V.42) computed with a lookup table.
 /// Used to detect corruption in WAL frames and disk entries.
@@ -54,7 +55,7 @@ pub enum StorageMode {
 pub struct StorageConfig {
     /// Storage mode used by the runtime.
     pub mode: StorageMode,
-    /// Directory for tiered data files and WAL shards.
+    /// Directory for tiered data files and the mutation journal.
     pub dir: String,
 }
 
@@ -79,10 +80,13 @@ impl StorageMode {
 
 /// Write-ahead log for crash recovery.
 ///
-/// Stores raw command bytes in a length-prefixed binary format. Every write
-/// command is appended here before the in-memory mutation. On crash, the WAL
-/// is replayed by re-executing each command. Truncated after each snapshot
-/// since the snapshot contains all data.
+/// Stores resolved mutation commands in a length-prefixed binary format. Each
+/// logical mutation is appended here before its in-memory effects are applied.
+/// On crash, the WAL is replayed by re-executing those commands. It is truncated
+/// after each snapshot because the snapshot already contains their effects.
+///
+/// A multi-command logical mutation is encoded inside one checksummed frame, so
+/// recovery accepts the entire batch or none of it.
 ///
 /// v2 frame format: [4B frame_len][4B crc32][4B argc][for each arg: 4B len + bytes]
 /// Legacy format:   [4B frame_len][4B argc][for each arg: 4B len + bytes]
@@ -109,9 +113,32 @@ pub struct WalReplay {
 
 impl Wal {
     pub fn open(dir: &Path, shard_id: usize) -> io::Result<Self> {
-        let shard_dir = dir.join(format!("shard_{shard_id}"));
-        fs::create_dir_all(&shard_dir)?;
-        let path = shard_dir.join("wal.lux");
+        Self::open_in(dir.join(format!("shard_{shard_id}")))
+    }
+
+    /// Open the authoritative, process-wide mutation journal.
+    ///
+    /// `open` remains for reading the legacy per-shard WAL layout during an
+    /// in-place upgrade. New writes use this named journal so multi-key
+    /// mutations have one atomic frame stream and recovery has one total order.
+    pub fn open_named(dir: &Path, name: &str) -> io::Result<Self> {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid WAL name",
+            ));
+        }
+        Self::open_in(dir.join(name))
+    }
+
+    fn open_in(wal_dir: impl AsRef<Path>) -> io::Result<Self> {
+        let wal_dir = wal_dir.as_ref();
+        fs::create_dir_all(wal_dir)?;
+        let path = wal_dir.join("wal.lux");
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -165,6 +192,7 @@ impl Wal {
     /// writes it in a single call to minimize partial-write risk. If the
     /// write fails (e.g. ENOSPC), truncates back to the pre-write position
     /// so the WAL stays clean for the next attempt.
+    #[cfg(test)]
     pub fn append_command(&mut self, args: &[&[u8]]) -> io::Result<()> {
         let mut frame = Vec::new();
         Self::encode_command_frame(args, &mut frame);
@@ -172,21 +200,27 @@ impl Wal {
         self.append_encoded_frames(&frame)
     }
 
-    /// Append multiple command frames in one write/flush. Used by pipelined
-    /// single-shard writes so durability preserves the same batching advantage
-    /// as the in-memory executor.
+    /// Append one logical mutation batch as one checksummed frame.
+    ///
+    /// Recovery expands the frame back into its ordered commands only after the
+    /// complete frame passes length and checksum validation. A torn write can
+    /// therefore never replay a valid prefix of a multi-command mutation.
     pub fn append_commands<'a, I>(&mut self, commands: I) -> io::Result<()>
     where
         I: IntoIterator<Item = &'a [&'a [u8]]>,
     {
-        let mut frames = Vec::new();
-        for args in commands {
-            Self::encode_command_frame(args, &mut frames);
-        }
-        if frames.is_empty() {
+        let commands: Vec<&[&[u8]]> = commands.into_iter().collect();
+        if commands.is_empty() {
             return Ok(());
         }
-        self.append_encoded_frames(&frames)
+        let mut frame = Vec::new();
+        if commands.len() == 1 {
+            Self::encode_command_frame(commands[0], &mut frame);
+        } else {
+            let payload = encode_command_batch(&commands)?;
+            Self::encode_command_frame(&[WAL_BATCH_MARKER, &payload], &mut frame);
+        }
+        self.append_encoded_frames(&frame)
     }
 
     fn append_encoded_frames(&mut self, frames: &[u8]) -> io::Result<()> {
@@ -203,6 +237,19 @@ impl Wal {
 
     pub fn fsync(&mut self) -> io::Result<()> {
         self.file.sync_all()
+    }
+
+    /// Capture the end offset before a durability attempt so a failed fsync can
+    /// remove the unacknowledged frames instead of replaying them after restart.
+    pub fn end_offset(&mut self) -> io::Result<u64> {
+        self.file.seek(SeekFrom::End(0))
+    }
+
+    pub fn rollback_to(&mut self, offset: u64) -> io::Result<()> {
+        self.file.set_len(offset)?;
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.sync_all()?;
+        Ok(())
     }
 
     /// Read all commands from the WAL for replay. Partial/corrupt frames
@@ -281,7 +328,13 @@ impl Wal {
                 }
             }
             if valid && !args.is_empty() {
-                commands.push(args);
+                if args.len() == 2 && args[0] == WAL_BATCH_MARKER {
+                    if let Ok(batch) = decode_command_batch(&args[1]) {
+                        commands.extend(batch);
+                    }
+                } else {
+                    commands.push(args);
+                }
             }
         }
         self.file.seek(SeekFrom::End(0))?;
@@ -300,6 +353,52 @@ impl Wal {
         self.has_checksums = true;
         Ok(())
     }
+}
+
+fn encode_command_batch(commands: &[&[&[u8]]]) -> io::Result<Vec<u8>> {
+    let command_count = u32::try_from(commands.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many WAL commands"))?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&command_count.to_le_bytes());
+    for command in commands {
+        let argc = u32::try_from(command.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many WAL arguments"))?;
+        out.extend_from_slice(&argc.to_le_bytes());
+        for arg in *command {
+            let len = u32::try_from(arg.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "WAL argument is too large")
+            })?;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(arg);
+        }
+    }
+    Ok(out)
+}
+
+fn decode_command_batch(mut input: &[u8]) -> io::Result<Vec<Vec<Vec<u8>>>> {
+    let command_count = read_u32(&mut input)? as usize;
+    let mut commands = Vec::new();
+    for _ in 0..command_count {
+        let argc = read_u32(&mut input)? as usize;
+        if argc == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty command in WAL batch",
+            ));
+        }
+        let mut command = Vec::new();
+        for _ in 0..argc {
+            command.push(read_bytes(&mut input)?);
+        }
+        commands.push(command);
+    }
+    if !input.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing bytes in WAL batch",
+        ));
+    }
+    Ok(commands)
 }
 
 /// In-memory metadata for a cold entry on disk. The actual data lives in the
@@ -1241,6 +1340,42 @@ mod tests {
             ]
         );
         assert!(replay.corrupted_frames.is_empty());
+    }
+
+    #[test]
+    fn torn_wal_batch_replays_no_partial_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut wal = Wal::open(dir.path(), 0).unwrap();
+            let first: &[&[u8]] = &[b"SET", b"k1", b"v1"];
+            let second: &[&[u8]] = &[b"SET", b"k2", b"v2"];
+            wal.append_commands([first, second]).unwrap();
+            wal.fsync().unwrap();
+        }
+
+        let wal_path = dir.path().join("shard_0/wal.lux");
+        let file = OpenOptions::new().write(true).open(&wal_path).unwrap();
+        let len = file.metadata().unwrap().len();
+        file.set_len(len - 1).unwrap();
+        file.sync_all().unwrap();
+
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        let replay = wal.replay().unwrap();
+        assert!(replay.commands.is_empty());
+    }
+
+    #[test]
+    fn wal_rollback_removes_unacknowledged_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        wal.append_command(&[b"SET", b"accepted", b"one"]).unwrap();
+        let accepted_end = wal.end_offset().unwrap();
+        wal.append_command(&[b"SET", b"rejected", b"two"]).unwrap();
+        wal.rollback_to(accepted_end).unwrap();
+
+        let replay = wal.replay().unwrap();
+        assert_eq!(replay.commands.len(), 1);
+        assert_eq!(replay.commands[0][1], b"accepted");
     }
 
     #[test]

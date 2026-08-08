@@ -3,11 +3,12 @@ use std::time::{Duration, Instant};
 
 use crate::pubsub::Broker;
 use crate::resp;
-use crate::store::{Store, StoreValue};
+use crate::store::{JournalPlan, Store, StoreValue};
 
 use super::{arg_str, cmd_eq, parse_i64, parse_u64, CmdResult};
 
 const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
+type ListPopResult = Option<(Vec<u8>, Vec<Bytes>)>;
 
 fn parse_i64_arg(arg: &[u8], out: &mut BytesMut) -> Option<i64> {
     match parse_i64(arg) {
@@ -64,7 +65,7 @@ fn decrypt_out(store: &Store, raw: Bytes) -> Bytes {
 
 /// Shared LPUSH/RPUSH body. Supports a trailing `ENCRYPTED` flag (mirrors
 /// `SET ... ENCRYPTED`): each pushed element is sealed as an envelope and the
-/// resolved ciphertext is self-logged to the WAL as `ENC RAWLPUSH/RAWRPUSH` so
+/// resolved ciphertext crosses the journal as `ENC RAWLPUSH/RAWRPUSH` so
 /// replay is deterministic (envelopes carry random nonces).
 fn push_list(
     args: &[&[u8]],
@@ -103,6 +104,26 @@ fn push_list(
     } else {
         args[2..end].iter().map(|v| v.to_vec()).collect()
     };
+    let journal_args = if encrypted {
+        let raw_cmd: &[u8] = if front { b"RAWLPUSH" } else { b"RAWRPUSH" };
+        let mut command = vec![b"ENC".to_vec(), raw_cmd.to_vec(), args[1].to_vec()];
+        command.extend(stored.iter().cloned());
+        Some(command)
+    } else {
+        None
+    };
+    let _commit = if let Some(journal_args) = &journal_args {
+        let refs: Vec<&[u8]> = journal_args.iter().map(Vec::as_slice).collect();
+        match store.begin_journaled(&refs) {
+            Ok(commit) => Some(commit),
+            Err(e) => {
+                resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                return CmdResult::Written;
+            }
+        }
+    } else {
+        None
+    };
     let refs: Vec<&[u8]> = stored.iter().map(Vec::as_slice).collect();
     let res = if front {
         store.lpush(args[1], &refs, now)
@@ -111,23 +132,10 @@ fn push_list(
     };
     match res {
         Ok(n) => {
-            if encrypted && store.wal_enabled() {
-                let raw_cmd: &[u8] = if front { b"RAWLPUSH" } else { b"RAWRPUSH" };
-                let mut owned: Vec<Vec<u8>> =
-                    vec![b"ENC".to_vec(), raw_cmd.to_vec(), args[1].to_vec()];
-                owned.extend(stored.iter().cloned());
-                let log_refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-                if let Err(e) = store.wal_log_command(&log_refs) {
-                    resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-                    return CmdResult::Written;
-                }
-            }
             resp::write_integer(out, n);
             let key_s = arg_str(args[1]);
             if broker.has_list_waiters(key_s) {
-                let shard_idx = store.shard_for_key(args[1]);
-                let mut shard = store.lock_write_shard(shard_idx);
-                broker.drain_list_waiters(key_s, &mut shard.data, store, now);
+                broker.drain_list_waiters(key_s, store, now);
             }
         }
         Err(e) => resp::write_error(out, &e),
@@ -535,36 +543,46 @@ pub fn cmd_lpos(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     CmdResult::Written
 }
 
-/// Self-log a resolved list move as its two keyed single-key effects: a POP on
-/// `src` (keyed on src) and a PUSH of the moved element on `dst` (keyed on dst).
-/// The raw LMOVE/RPOPLPUSH is skipped in execute_with_wal (it would shard on src
-/// and replay dst's push out of order vs dst's own writes). Batched so it stays
-/// one atomic append when src and dst share a WAL shard and splits into
-/// correctly-sharded frames when they don't. A plain PUSH stores the moved bytes
-/// verbatim (no re-encryption), so this is correct for encrypted lists too.
-/// Returns false and writes an error to `out` if the WAL append fails.
-fn wal_log_list_move(
+/// Resolve, journal, and apply a list move under the same mutation gates.
+fn journaled_list_move(
     store: &Store,
     src: &[u8],
     dst: &[u8],
-    moved: &[u8],
     src_left: bool,
     dst_left: bool,
-    out: &mut BytesMut,
-) -> bool {
-    if !store.wal_enabled() {
-        return true;
-    }
-    let pop: &[u8] = if src_left { b"LPOP" } else { b"RPOP" };
-    let push: &[u8] = if dst_left { b"LPUSH" } else { b"RPUSH" };
-    let pop_cmd: [&[u8]; 2] = [pop, src];
-    let push_cmd: [&[u8]; 3] = [push, dst, moved];
-    let batch: [&[&[u8]]; 2] = [&pop_cmd, &push_cmd];
-    if let Err(e) = store.wal_log_command_batch(&batch) {
-        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-        return false;
-    }
-    true
+    now: Instant,
+) -> Result<Option<Bytes>, String> {
+    let route: [&[u8]; 3] = [b"LMOVE", src, dst];
+    store
+        .commit_prepared(
+            &route,
+            || {
+                let moved = store.preview_lmove(src, dst, src_left, now)?;
+                let Some(moved) = moved else {
+                    return Ok(JournalPlan::no_op(None));
+                };
+                let pop = if src_left { b"LPOP" } else { b"RPOP" };
+                let push = if dst_left { b"LPUSH" } else { b"RPUSH" };
+                Ok(JournalPlan::batch(
+                    vec![
+                        vec![pop.to_vec(), src.to_vec()],
+                        vec![push.to_vec(), dst.to_vec(), moved.to_vec()],
+                    ],
+                    Some(moved),
+                ))
+            },
+            |expected| {
+                let Some(expected) = expected else {
+                    return Ok(None);
+                };
+                let actual = store.lmove(src, dst, src_left, dst_left, now);
+                if actual.as_ref() != Some(&expected) {
+                    return Err("ERR list move changed while committing".to_string());
+                }
+                Ok(actual)
+            },
+        )
+        .map_err(|error| format!("ERR WAL append failed: {error}"))?
 }
 
 pub fn cmd_lmove(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
@@ -580,14 +598,12 @@ pub fn cmd_lmove(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         Some(side) => side,
         None => return CmdResult::Written,
     };
-    match store.lmove(args[1], args[2], src_left, dst_left, now) {
-        Some(v) => {
-            if !wal_log_list_move(store, args[1], args[2], v.as_ref(), src_left, dst_left, out) {
-                return CmdResult::Written;
-            }
+    match journaled_list_move(store, args[1], args[2], src_left, dst_left, now) {
+        Ok(Some(v)) => {
             resp::write_bulk_raw(out, &decrypt_out(store, v));
         }
-        None => resp::write_null(out),
+        Ok(None) => resp::write_null(out),
+        Err(error) => resp::write_error(out, &error),
     }
     CmdResult::Written
 }
@@ -597,14 +613,12 @@ pub fn cmd_rpoplpush(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Ins
         resp::write_error(out, "ERR wrong number of arguments for 'rpoplpush' command");
         return CmdResult::Written;
     }
-    match store.lmove(args[1], args[2], false, true, now) {
-        Some(v) => {
-            if !wal_log_list_move(store, args[1], args[2], v.as_ref(), false, true, out) {
-                return CmdResult::Written;
-            }
+    match journaled_list_move(store, args[1], args[2], false, true, now) {
+        Ok(Some(v)) => {
             resp::write_bulk_raw(out, &decrypt_out(store, v));
         }
-        None => resp::write_null(out),
+        Ok(None) => resp::write_null(out),
+        Err(error) => resp::write_error(out, &error),
     }
     CmdResult::Written
 }
@@ -629,17 +643,20 @@ pub fn cmd_blpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         .iter()
         .map(|k| arg_str(k).to_string())
         .collect();
-
-    for key in &keys {
-        let val = if pop_left {
-            store.lpop(key.as_bytes(), now)
-        } else {
-            store.rpop(key.as_bytes(), now)
-        };
-        if let Some(v) = val {
+    let key_refs: Vec<&[u8]> = args[1..args.len() - 1].to_vec();
+    match journaled_lmpop(store, &key_refs, pop_left, 1, now) {
+        Ok(Some((key, mut items))) => {
+            let v = items
+                .pop()
+                .expect("journaled single list pop returned one item");
             resp::write_array_header(out, 2);
-            resp::write_bulk(out, key);
+            resp::write_bulk_raw(out, &key);
             resp::write_bulk_raw(out, &decrypt_out(store, v));
+            return CmdResult::Written;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            resp::write_error(out, &error);
             return CmdResult::Written;
         }
     }
@@ -675,12 +692,16 @@ pub fn cmd_blmove(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
     // same way (it isn't classified as a write command, so execute_with_wal never
     // logs it). Self-log the resolved pop+push keyed per-key. The blocked path
     // (CmdResult::BlockMove) is logged when the waiter is later satisfied.
-    if let Some(v) = store.lmove(args[1], args[2], src_left, dst_left, now) {
-        if !wal_log_list_move(store, args[1], args[2], v.as_ref(), src_left, dst_left, out) {
+    match journaled_list_move(store, args[1], args[2], src_left, dst_left, now) {
+        Ok(Some(v)) => {
+            resp::write_bulk_raw(out, &decrypt_out(store, v));
             return CmdResult::Written;
         }
-        resp::write_bulk_raw(out, &decrypt_out(store, v));
-        return CmdResult::Written;
+        Ok(None) => {}
+        Err(error) => {
+            resp::write_error(out, &error);
+            return CmdResult::Written;
+        }
     }
 
     CmdResult::BlockMove {
@@ -749,25 +770,44 @@ fn write_lmpop_reply(store: &Store, out: &mut BytesMut, key: &[u8], items: &[Byt
     }
 }
 
-/// Self-log an LMPOP/BLMPOP pop as a keyed `LPOP|RPOP key n` so a sharded WAL
-/// replays it in the popped key's shard (the raw command shards on numkeys).
-pub(crate) fn wal_log_lmpop(
+pub(crate) fn journaled_lmpop(
     store: &Store,
-    key: &[u8],
+    keys: &[&[u8]],
     pop_left: bool,
-    n: usize,
-    out: &mut BytesMut,
-) -> bool {
-    if !store.wal_enabled() {
-        return true;
-    }
-    let cmd: &[u8] = if pop_left { b"LPOP" } else { b"RPOP" };
-    let n_str = n.to_string();
-    if let Err(e) = store.wal_log_command(&[cmd, key, n_str.as_bytes()]) {
-        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
-        return false;
-    }
-    true
+    count: usize,
+    now: Instant,
+) -> Result<ListPopResult, String> {
+    let route: [&[u8]; 1] = [b"LMPOP"];
+    store
+        .commit_prepared(
+            &route,
+            || {
+                let expected = store.preview_lmpop(keys, pop_left, count, now)?;
+                let Some((key, items)) = &expected else {
+                    return Ok(JournalPlan::no_op(None));
+                };
+                let command = if pop_left { b"LPOP" } else { b"RPOP" };
+                Ok(JournalPlan::command(
+                    vec![
+                        command.to_vec(),
+                        key.clone(),
+                        items.len().to_string().into_bytes(),
+                    ],
+                    expected,
+                ))
+            },
+            |expected| {
+                let Some(expected) = expected else {
+                    return Ok(None);
+                };
+                let actual = store.lmpop(keys, pop_left, count, now)?;
+                if actual.as_ref() != Some(&expected) {
+                    return Err("ERR list pop changed while committing".to_string());
+                }
+                Ok(actual)
+            },
+        )
+        .map_err(|error| format!("ERR WAL append failed: {error}"))?
 }
 
 pub fn cmd_lmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
@@ -779,11 +819,8 @@ pub fn cmd_lmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
     let Some((keys, pop_left, count)) = parse_lmpop_args(args, 1, out) else {
         return CmdResult::Written;
     };
-    match store.lmpop(&keys, pop_left, count, now) {
+    match journaled_lmpop(store, &keys, pop_left, count, now) {
         Ok(Some((key, items))) => {
-            if !wal_log_lmpop(store, &key, pop_left, items.len(), out) {
-                return CmdResult::Written;
-            }
             write_lmpop_reply(store, out, &key, &items);
         }
         Ok(None) => resp::write_null_array(out),
@@ -805,12 +842,9 @@ pub fn cmd_blmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
     let Some((keys, pop_left, count)) = parse_lmpop_args(args, 2, out) else {
         return CmdResult::Written;
     };
-    // Immediately satisfiable -> behave like LMPOP and self-log the effect.
-    match store.lmpop(&keys, pop_left, count, now) {
+    // Immediately satisfiable -> behave like LMPOP and journal the resolved effect.
+    match journaled_lmpop(store, &keys, pop_left, count, now) {
         Ok(Some((key, items))) => {
-            if !wal_log_lmpop(store, &key, pop_left, items.len(), out) {
-                return CmdResult::Written;
-            }
             write_lmpop_reply(store, out, &key, &items);
             return CmdResult::Written;
         }
@@ -850,12 +884,16 @@ pub fn cmd_brpoplpush(
         None => return CmdResult::Written,
     };
     let (src_left, dst_left) = (false, true);
-    if let Some(v) = store.lmove(args[1], args[2], src_left, dst_left, now) {
-        if !wal_log_list_move(store, args[1], args[2], v.as_ref(), src_left, dst_left, out) {
+    match journaled_list_move(store, args[1], args[2], src_left, dst_left, now) {
+        Ok(Some(v)) => {
+            resp::write_bulk_raw(out, &decrypt_out(store, v));
             return CmdResult::Written;
         }
-        resp::write_bulk_raw(out, &decrypt_out(store, v));
-        return CmdResult::Written;
+        Ok(None) => {}
+        Err(error) => {
+            resp::write_error(out, &error);
+            return CmdResult::Written;
+        }
     }
     CmdResult::BlockMove {
         src,

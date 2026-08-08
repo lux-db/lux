@@ -2,7 +2,6 @@ use super::*;
 
 const APPLE_PRIVATE_KEY_MAX_BYTES: usize = 16 * 1024;
 const APPLE_NATIVE_NONCE_PREFIX: &str = "_auth:apple_native_nonce:";
-static APPLE_NATIVE_NONCE_CONSUME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(super) fn admin_upsert_apple_provider(
     parsed: &Value,
@@ -465,21 +464,17 @@ fn apple_native_nonce_key(nonce: &str) -> String {
 pub(super) fn issue_apple_native_nonce(store: &Store) -> AuthHttpResponse {
     let nonce = random_token(32);
     let key = apple_native_nonce_key(&nonce);
-    store.set(key.as_bytes(), b"1", Some(OAUTH_STATE_TTL), Instant::now());
+    if let Err(e) = persist_oauth_state(store, key.as_bytes(), b"1") {
+        let (status, status_text, body) = error(500, "Internal Server Error", &e);
+        return AuthHttpResponse::json(status, status_text, body);
+    }
     let (status, status_text, body) = ok(json!({"nonce": nonce}));
     AuthHttpResponse::json(status, status_text, body)
 }
 
-fn consume_apple_native_nonce(store: &Store, nonce: &str) -> bool {
-    let _guard = APPLE_NATIVE_NONCE_CONSUME_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap();
+fn consume_apple_native_nonce(store: &Store, nonce: &str) -> Result<bool, String> {
     let key = apple_native_nonce_key(nonce);
-    if store.get(key.as_bytes(), Instant::now()).is_none() {
-        return false;
-    }
-    store.del(&[key.as_bytes()]) > 0
+    take_oauth_state(store, key.as_bytes(), Instant::now()).map(|state| state.is_some())
 }
 
 /// Verify an Apple identity token against Apple's JWKS. Checks RS256 signature,
@@ -565,13 +560,20 @@ pub(super) async fn signin_apple(
         }
     };
     let nonce_claim = sha256_hex(&nonce);
-    if !consume_apple_native_nonce(store, &nonce) {
-        let (status, status_text, body) = error(
-            401,
-            "Unauthorized",
-            "invalid or expired Apple sign-in nonce",
-        );
-        return AuthHttpResponse::json(status, status_text, body);
+    match consume_apple_native_nonce(store, &nonce) {
+        Ok(true) => {}
+        Ok(false) => {
+            let (status, status_text, body) = error(
+                401,
+                "Unauthorized",
+                "invalid or expired Apple sign-in nonce",
+            );
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+        Err(e) => {
+            let (status, status_text, body) = error(500, "Internal Server Error", &e);
+            return AuthHttpResponse::json(status, status_text, body);
+        }
     }
     let name = parsed
         .get("user")

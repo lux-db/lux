@@ -790,6 +790,30 @@ async fn embedded_client_can_parse_typed_values() {
 }
 
 #[tokio::test]
+async fn embedded_typed_reads_cannot_bypass_internal_namespaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = lux::ServerConfig {
+        enable_resp: false,
+        shards: 4,
+        data_dir: tmp.path().display().to_string(),
+        ..Default::default()
+    };
+    let handle = lux::run_with_config(cfg).await.unwrap();
+    let client = handle.client();
+
+    for key in ["_t:auth.users:row:x", "_auth:oauth_state:x"] {
+        assert!(matches!(
+            client.get(key).await,
+            Err(lux::LuxError::Command(message))
+                if message.contains("reserved internal namespace")
+        ));
+    }
+
+    drop(client);
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
 async fn embedded_client_has_typed_convenience_methods() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = lux::ServerConfig {
@@ -1130,6 +1154,40 @@ async fn embedded_client_exposes_typed_redis_command_facade() {
             Some(bytes::Bytes::from_static(b"three")),
         ]
     );
+
+    // Typed pipelines must cross the same state-aware mutation boundary as
+    // raw RESP. In particular, MSET may not use its old direct shard batch to
+    // overwrite an encrypted string with plaintext.
+    client
+        .execute_bytes_value(&[b"ENC", b"INIT", b"KEYID", b"pipeline-key"])
+        .await
+        .unwrap();
+    client
+        .execute_bytes_value(&[
+            b"SET",
+            b"native:pipeline:mset:encrypted",
+            b"secret",
+            b"ENCRYPTED",
+        ])
+        .await
+        .unwrap();
+    let mut encrypted_mset = lux::EmbeddedPipeline::new();
+    encrypted_mset.mset(vec![(
+        b"native:pipeline:mset:encrypted".as_slice(),
+        b"plaintext-overwrite".as_slice(),
+    )]);
+    let encrypted_mset_error = client
+        .execute_embedded_pipeline(&encrypted_mset)
+        .await
+        .unwrap_err();
+    assert!(encrypted_mset_error
+        .to_string()
+        .contains("encrypted string"));
+    assert_eq!(
+        client.get("native:pipeline:mset:encrypted").await.unwrap(),
+        Some(bytes::Bytes::from_static(b"secret"))
+    );
+
     let mut mset_discard_pipeline = lux::EmbeddedPipeline::new();
     mset_discard_pipeline.mset(vec![
         (

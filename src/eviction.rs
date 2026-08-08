@@ -74,8 +74,16 @@ pub fn eviction_enabled(store: &Store) -> bool {
     cfg.max_memory > 0
 }
 
-pub fn evict_if_needed(store: &Store) -> Result<(), &'static str> {
+pub fn evict_if_needed(store: &Store) -> Result<(), String> {
     if !eviction_enabled(store) {
+        return Ok(());
+    }
+
+    // Recovery must reproduce the eviction decisions that were made while the
+    // server was live. Memory-mode evictions are journaled as concrete DELs;
+    // making fresh LRU/random choices while replaying the commands that led up
+    // to those DELs could remove additional keys.
+    if store.wal_replaying() {
         return Ok(());
     }
     let cfg = store.config().eviction;
@@ -91,14 +99,14 @@ pub fn evict_if_needed(store: &Store) -> Result<(), &'static str> {
                 // In tiered mode, data spills to disk. Never reject writes.
                 return Ok(());
             }
-            return Err("OOM command not allowed when used memory > 'maxmemory'");
+            return Err("OOM command not allowed when used memory > 'maxmemory'".to_string());
         }
 
         let evicted = match cfg.policy {
-            EvictionPolicy::AllKeysLru => evict_lru(store, cfg.sample_size, false),
-            EvictionPolicy::VolatileLru => evict_lru(store, cfg.sample_size, true),
-            EvictionPolicy::AllKeysRandom => evict_random(store, false),
-            EvictionPolicy::VolatileRandom => evict_random(store, true),
+            EvictionPolicy::AllKeysLru => evict_lru(store, cfg.sample_size, false)?,
+            EvictionPolicy::VolatileLru => evict_lru(store, cfg.sample_size, true)?,
+            EvictionPolicy::AllKeysRandom => evict_random(store, false)?,
+            EvictionPolicy::VolatileRandom => evict_random(store, true)?,
             EvictionPolicy::NoEviction => false,
         };
 
@@ -106,13 +114,13 @@ pub fn evict_if_needed(store: &Store) -> Result<(), &'static str> {
             if tiered {
                 return Ok(());
             }
-            return Err("OOM command not allowed when used memory > 'maxmemory'");
+            return Err("OOM command not allowed when used memory > 'maxmemory'".to_string());
         }
     }
     Ok(())
 }
 
-fn evict_lru(store: &Store, sample_size: usize, volatile_only: bool) -> bool {
+fn evict_lru(store: &Store, sample_size: usize, volatile_only: bool) -> Result<bool, String> {
     let n = store.shard_count();
     let seed = store.approximate_memory();
     let start_shard = seed % n;
@@ -162,13 +170,13 @@ fn evict_lru(store: &Store, sample_size: usize, volatile_only: bool) -> bool {
     }
 
     if let Some(key) = best_key {
-        store.evict_key(best_shard, &key)
+        evict_selected_key(store, best_shard, &key)
     } else {
-        false
+        Ok(false)
     }
 }
 
-fn evict_random(store: &Store, volatile_only: bool) -> bool {
+fn evict_random(store: &Store, volatile_only: bool) -> Result<bool, String> {
     let n = store.shard_count();
     let seed = store.approximate_memory();
     let start_shard = seed % n;
@@ -205,10 +213,24 @@ fn evict_random(store: &Store, volatile_only: bool) -> bool {
         drop(shard);
 
         if let Some(k) = key {
-            return store.evict_key(shard_idx, &k);
+            return evict_selected_key(store, shard_idx, &k);
         }
     }
-    false
+    Ok(false)
+}
+
+/// Tiered eviction only changes physical placement: the value remains part of
+/// the logical database on disk. Memory-mode eviction is a permanent delete,
+/// so record its exact key before removing it from memory.
+fn evict_selected_key(store: &Store, shard_idx: usize, key: &[u8]) -> Result<bool, String> {
+    if store.is_tiered() {
+        return Ok(store.evict_key(shard_idx, key));
+    }
+
+    let command: [&[u8]; 2] = [b"DEL", key];
+    store
+        .commit_journaled(&command, || store.evict_key(shard_idx, key))
+        .map_err(|error| format!("ERR WAL append failed: {error}"))
 }
 
 pub fn is_write_command(cmd: &[u8]) -> bool {
@@ -274,7 +296,11 @@ pub fn is_write_command(cmd: &[u8]) -> bool {
         || eq(cmd, b"XTRIM")
         || eq(cmd, b"XGROUP")
         || eq(cmd, b"XACK")
+        || eq(cmd, b"XREADGROUP")
+        || eq(cmd, b"XCLAIM")
+        || eq(cmd, b"XAUTOCLAIM")
         || eq(cmd, b"RENAME")
+        || eq(cmd, b"RENAMENX")
         || eq(cmd, b"RESTORE")
         || eq(cmd, b"DEL")
         || eq(cmd, b"UNLINK")
@@ -284,6 +310,7 @@ pub fn is_write_command(cmd: &[u8]) -> bool {
         || eq(cmd, b"PEXPIREAT")
         || eq(cmd, b"PERSIST")
         || eq(cmd, b"GETDEL")
+        || eq(cmd, b"DELIFEQ")
         || eq(cmd, b"GETEX")
         || eq(cmd, b"FLUSHDB")
         || eq(cmd, b"FLUSHALL")
@@ -304,6 +331,8 @@ pub fn is_write_command(cmd: &[u8]) -> bool {
         || eq(cmd, b"TDELETE")
         || eq(cmd, b"TDROP")
         || eq(cmd, b"TALTER")
+        || eq(cmd, b"TINDEX")
+        || eq(cmd, b"TDROPINDEX")
         || eq(cmd, b"TSET")
         || eq(cmd, b"EVAL")
         || eq(cmd, b"EVALSHA")
@@ -322,6 +351,9 @@ pub fn is_write_command(cmd: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DurabilityConfig, DurabilityPolicy, ServerConfig};
+    use std::sync::Arc;
+    use std::time::Instant;
 
     #[test]
     fn parse_memory_sizes() {
@@ -342,5 +374,46 @@ mod tests {
         assert!(!is_write_command(b"GET"));
         assert!(!is_write_command(b"PING"));
         assert!(!is_write_command(b"INFO"));
+    }
+
+    #[test]
+    fn memory_eviction_is_journaled_before_delete_and_replays_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            durability: DurabilityConfig {
+                policy: DurabilityPolicy::AlwaysSync,
+                ..DurabilityConfig::default()
+            },
+            eviction: EvictionConfig {
+                max_memory: 1,
+                policy: EvictionPolicy::AllKeysRandom,
+                sample_size: 1,
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        let set: [&[u8]; 3] = [b"SET", b"evicted", b"value"];
+        store
+            .commit_journaled(&set, || {
+                store.set(b"evicted", b"value", None, Instant::now())
+            })
+            .unwrap();
+
+        store.inject_journal_failures(1);
+        let error = evict_if_needed(&store).unwrap_err();
+        assert!(error.contains("WAL append failed"), "{error}");
+        assert_eq!(
+            store.get(b"evicted", Instant::now()).unwrap(),
+            b"value".as_slice()
+        );
+
+        evict_if_needed(&store).unwrap();
+        assert!(store.get(b"evicted", Instant::now()).is_none());
+        drop(store);
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&crate::pubsub::Broker::new());
+        assert!(restored.get(b"evicted", Instant::now()).is_none());
     }
 }

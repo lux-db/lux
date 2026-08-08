@@ -1,85 +1,51 @@
 use super::*;
 
-/// `(fields_added, stored_pairs)` where each stored pair is the on-disk
-/// `(field, value)` bytes (value is ciphertext when the column is encrypted).
-type HsetKvOutcome = (i64, Vec<(Vec<u8>, Vec<u8>)>);
+type PreparedHashPairs = Vec<(Vec<u8>, Vec<u8>)>;
 
 impl Store {
-    pub fn hset(&self, key: &[u8], pairs: &[(&[u8], &[u8])], now: Instant) -> Result<i64, String> {
-        let idx = self.shard_index(key);
-        let mut shard = self.shards[idx].write();
-        shard.version += 1;
-        self.hset_on_shard(&mut shard, key, pairs, now)
-    }
-
-    pub(crate) fn hset_kv(
+    pub(crate) fn prepare_hset_kv(
         &self,
         key: &[u8],
         pairs: &[(&[u8], &[u8])],
         encrypted: bool,
         now: Instant,
-    ) -> Result<HsetKvOutcome, String> {
+    ) -> Result<PreparedHashPairs, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        let existing = match shard
+            .data
+            .get(key)
+            .filter(|entry| !entry.is_expired_at(now))
+        {
+            Some(entry) => match &entry.value {
+                StoreValue::Hash(map) => Some(map),
+                _ => return Err(WRONGTYPE.to_string()),
+            },
+            None => None,
+        };
+        pairs
+            .iter()
+            .map(|(field, value)| {
+                let existing_encrypted = existing.is_some_and(|map| {
+                    map.fields.get(key_str(field)).is_some_and(|raw| {
+                        crate::encryption::EncryptionKeyring::is_encrypted_value(raw)
+                    })
+                });
+                let stored = if encrypted || existing_encrypted {
+                    self.encrypt_hash_field_value(key, field, value)?
+                } else {
+                    value.to_vec()
+                };
+                Ok((field.to_vec(), stored))
+            })
+            .collect()
+    }
+
+    pub fn hset(&self, key: &[u8], pairs: &[(&[u8], &[u8])], now: Instant) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_bytes(key);
-        let entry = match shard.data.entry(ks) {
-            hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
-            hashbrown::hash_map::Entry::Vacant(v) => {
-                self.key_added();
-                v.insert(Entry {
-                    value: StoreValue::Hash(HashData::default()),
-                    expires_at: None,
-                    lru_clock: self.lru_clock(),
-                })
-            }
-        };
-        if entry.is_expired_at(now) {
-            entry.value = StoreValue::Hash(HashData::default());
-            entry.expires_at = None;
-        }
-        match &mut entry.value {
-            StoreValue::Hash(map) => {
-                map.purge_expired(epoch_ms());
-                let mut added = 0i64;
-                let mut mem_delta: isize = 0;
-                let mut stored_pairs = Vec::with_capacity(pairs.len());
-                for (field, value) in pairs {
-                    let field_name = key_string(field);
-                    let existing_encrypted = map.fields.get(&field_name).is_some_and(|raw| {
-                        crate::encryption::EncryptionKeyring::is_encrypted_value(raw)
-                    });
-                    let stored_value = if encrypted || existing_encrypted {
-                        self.encrypt_hash_field_value(key, field, value)?
-                    } else {
-                        value.to_vec()
-                    };
-                    let new_size = (field.len() + stored_value.len() + 64) as isize;
-                    // Setting a field's value clears any TTL it had (Redis 7.4).
-                    map.expiries.remove(&field_name);
-                    if let Some(old_val) = map
-                        .fields
-                        .insert(field_name, Bytes::copy_from_slice(&stored_value))
-                    {
-                        mem_delta += stored_value.len() as isize - old_val.len() as isize;
-                    } else {
-                        added += 1;
-                        mem_delta += new_size;
-                    }
-                    stored_pairs.push((field.to_vec(), stored_value));
-                }
-                if mem_delta > 0 {
-                    shard.used_memory += mem_delta as usize;
-                    self.mem_add(mem_delta as usize);
-                } else if mem_delta < 0 {
-                    let freed = (-mem_delta) as usize;
-                    shard.used_memory = shard.used_memory.saturating_sub(freed);
-                    self.mem_sub(freed);
-                }
-                Ok((added, stored_pairs))
-            }
-            _ => Err(WRONGTYPE.to_string()),
-        }
+        self.hset_on_shard(&mut shard, key, pairs, now)
     }
 
     /// HSET variant for callers that already hold the correct shard write lock.

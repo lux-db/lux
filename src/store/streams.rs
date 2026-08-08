@@ -10,7 +10,122 @@ fn nogroup_err(group: &str, key: &[u8]) -> String {
     )
 }
 
+type StreamEntries = Vec<(StreamId, Vec<(String, Bytes)>)>;
+type StreamReadGroupResult = Vec<(String, StreamEntries)>;
+
+enum StreamGroupReadEffect {
+    Deliver {
+        key: String,
+        group: String,
+        consumer: Option<String>,
+        last_delivered_id: StreamId,
+        pending_ids: Vec<StreamId>,
+    },
+    CreateConsumer {
+        key: String,
+        group: String,
+        consumer: String,
+    },
+}
+
+struct StreamReadGroupPlan {
+    result: StreamReadGroupResult,
+    effects: Vec<StreamGroupReadEffect>,
+}
+
+struct StreamClaimPlan {
+    result: StreamEntries,
+    claims: Vec<(StreamId, u64)>,
+}
+
+struct StreamAutoClaimPlan {
+    next_start: StreamId,
+    result: StreamEntries,
+    deleted_ids: Vec<StreamId>,
+    claims: Vec<(StreamId, u64)>,
+}
+
 impl Store {
+    pub(crate) fn preview_xadd_id(
+        &self,
+        key: &[u8],
+        id_input: &str,
+        now: Instant,
+    ) -> Result<StreamId, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Stream(stream) => Self::resolve_xadd_id(stream, id_input),
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Self::resolve_xadd_id(
+                &StreamData {
+                    entries: BTreeMap::new(),
+                    last_id: StreamId::zero(),
+                    groups: std::collections::HashMap::new(),
+                },
+                id_input,
+            ),
+        }
+    }
+
+    fn resolve_xadd_id(stream: &StreamData, id_input: &str) -> Result<StreamId, String> {
+        let id = if id_input == "*" {
+            let ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            if ms > stream.last_id.ms {
+                StreamId { ms, seq: 0 }
+            } else {
+                StreamId {
+                    ms: stream.last_id.ms,
+                    seq: stream.last_id.seq + 1,
+                }
+            }
+        } else {
+            let parts: Vec<&str> = id_input.splitn(2, '-').collect();
+            let ms = parts[0].parse::<u64>().map_err(|_| {
+                "ERR Invalid stream ID specified as stream command argument".to_string()
+            })?;
+            let seq = if parts.len() > 1 {
+                if parts[1] == "*" {
+                    if ms == stream.last_id.ms {
+                        stream.last_id.seq + 1
+                    } else {
+                        0
+                    }
+                } else {
+                    parts[1].parse::<u64>().map_err(|_| {
+                        "ERR Invalid stream ID specified as stream command argument".to_string()
+                    })?
+                }
+            } else {
+                0
+            };
+            StreamId { ms, seq }
+        };
+
+        if id <= stream.last_id
+            && stream.last_id != StreamId::zero()
+            && (id.ms < stream.last_id.ms
+                || (id.ms == stream.last_id.ms && id.seq <= stream.last_id.seq))
+        {
+            return Err(
+                "ERR The ID specified in XADD is equal or smaller than the target stream top item"
+                    .to_string(),
+            );
+        }
+        if id == StreamId::zero() && !stream.entries.is_empty() {
+            return Err(
+                "ERR The ID specified in XADD is equal or smaller than the target stream top item"
+                    .to_string(),
+            );
+        }
+        Ok(id)
+    }
+
     pub fn xadd(
         &self,
         key: &[u8],
@@ -62,53 +177,7 @@ impl Store {
         }
         match &mut entry.value {
             StoreValue::Stream(stream) => {
-                let id = if id_input == "*" {
-                    let ms = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    if ms > stream.last_id.ms {
-                        StreamId { ms, seq: 0 }
-                    } else {
-                        StreamId {
-                            ms: stream.last_id.ms,
-                            seq: stream.last_id.seq + 1,
-                        }
-                    }
-                } else {
-                    let parts: Vec<&str> = id_input.splitn(2, '-').collect();
-                    let ms = parts[0].parse::<u64>().map_err(|_| {
-                        "ERR Invalid stream ID specified as stream command argument".to_string()
-                    })?;
-                    let seq = if parts.len() > 1 {
-                        if parts[1] == "*" {
-                            if ms == stream.last_id.ms {
-                                stream.last_id.seq + 1
-                            } else {
-                                0
-                            }
-                        } else {
-                            parts[1].parse::<u64>().map_err(|_| {
-                                "ERR Invalid stream ID specified as stream command argument"
-                                    .to_string()
-                            })?
-                        }
-                    } else {
-                        0
-                    };
-                    StreamId { ms, seq }
-                };
-
-                if id <= stream.last_id
-                    && stream.last_id != StreamId::zero()
-                    && (id.ms < stream.last_id.ms
-                        || (id.ms == stream.last_id.ms && id.seq <= stream.last_id.seq))
-                {
-                    return Err("ERR The ID specified in XADD is equal or smaller than the target stream top item".to_string());
-                }
-                if id == StreamId::zero() && !stream.entries.is_empty() {
-                    return Err("ERR The ID specified in XADD is equal or smaller than the target stream top item".to_string());
-                }
+                let id = Self::resolve_xadd_id(stream, id_input)?;
 
                 stream.last_id = id;
                 let added: usize = stream_entry_memory(&fields);
@@ -481,18 +550,110 @@ impl Store {
         count: Option<usize>,
         noack: bool,
         now: Instant,
-    ) -> Result<Vec<(String, Vec<(StreamId, Vec<(String, Bytes)>)>)>, String> {
+    ) -> Result<StreamReadGroupResult, String> {
+        let route: [&[u8]; 1] = [b"XREADGROUP"];
+        self.commit_prepared(
+            &route,
+            || {
+                let plan =
+                    self.preview_xreadgroup(group, consumer, keys, ids, count, noack, now)?;
+                let commands = plan
+                    .effects
+                    .iter()
+                    .map(|effect| match effect {
+                        StreamGroupReadEffect::Deliver {
+                            key,
+                            group,
+                            consumer,
+                            last_delivered_id,
+                            pending_ids,
+                        } => {
+                            let mut command = vec![
+                                b"LXGROUPREAD".to_vec(),
+                                key.as_bytes().to_vec(),
+                                group.as_bytes().to_vec(),
+                                last_delivered_id.to_string().into_bytes(),
+                                consumer.as_deref().unwrap_or("").as_bytes().to_vec(),
+                            ];
+                            command.extend(
+                                pending_ids
+                                    .iter()
+                                    .map(|pending_id| pending_id.to_string().into_bytes()),
+                            );
+                            command
+                        }
+                        StreamGroupReadEffect::CreateConsumer {
+                            key,
+                            group,
+                            consumer,
+                        } => vec![
+                            b"XGROUP".to_vec(),
+                            b"CREATECONSUMER".to_vec(),
+                            key.as_bytes().to_vec(),
+                            group.as_bytes().to_vec(),
+                            consumer.as_bytes().to_vec(),
+                        ],
+                    })
+                    .collect::<Vec<_>>();
+                if commands.is_empty() {
+                    Ok(JournalPlan::no_op(plan))
+                } else {
+                    Ok(JournalPlan::batch(commands, plan))
+                }
+            },
+            |plan| {
+                for effect in &plan.effects {
+                    match effect {
+                        StreamGroupReadEffect::Deliver {
+                            key,
+                            group,
+                            consumer,
+                            last_delivered_id,
+                            pending_ids,
+                        } => self.apply_lxgroupread(
+                            key.as_bytes(),
+                            group,
+                            consumer.as_deref(),
+                            *last_delivered_id,
+                            pending_ids,
+                            now,
+                        )?,
+                        StreamGroupReadEffect::CreateConsumer {
+                            key,
+                            group,
+                            consumer,
+                        } => {
+                            self.xgroup_createconsumer(key.as_bytes(), group, consumer, now)?;
+                        }
+                    }
+                }
+                Ok(plan.result)
+            },
+        )
+        .map_err(|error| format!("ERR WAL append failed: {error}"))?
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn preview_xreadgroup(
+        &self,
+        group: &str,
+        consumer: &str,
+        keys: &[String],
+        ids: &[String],
+        count: Option<usize>,
+        noack: bool,
+        now: Instant,
+    ) -> Result<StreamReadGroupPlan, String> {
         let mut result = Vec::new();
-        let inst_now = Instant::now();
+        let mut effects = Vec::new();
         for (i, key) in keys.iter().enumerate() {
             let id_str = &ids[i];
             let idx = self.shard_index(key.as_bytes());
-            let mut shard = self.shards[idx].write();
-            shard.version += 1;
-            if let Some(entry) = shard.data.get_mut(key.as_bytes()) {
+            let shard = self.shards[idx].read();
+            if let Some(entry) = shard.data.get(key.as_bytes()) {
                 if !entry.is_expired_at(now) {
-                    if let StoreValue::Stream(s) = &mut entry.value {
-                        let cg = match s.groups.get_mut(group) {
+                    if let StoreValue::Stream(s) = &entry.value {
+                        let cg = match s.groups.get(group) {
                             Some(g) => g,
                             None => {
                                 return Err(format!(
@@ -513,26 +674,6 @@ impl Store {
                                     *id,
                                     self.decrypt_stream_fields(key.as_bytes(), fields),
                                 ));
-                                if !noack {
-                                    cg.pel.insert(
-                                        *id,
-                                        PendingEntry {
-                                            consumer: consumer.to_string(),
-                                            delivery_time: inst_now,
-                                            delivery_count: 1,
-                                        },
-                                    );
-                                    let c = cg
-                                        .consumers
-                                        .entry(consumer.to_string())
-                                        .or_insert_with(|| Consumer {
-                                            pel: HashSet::new(),
-                                            seen_time: inst_now,
-                                        });
-                                    c.pel.insert(*id);
-                                    c.seen_time = inst_now;
-                                }
-                                cg.last_delivered_id = *id;
                                 if let Some(c) = count {
                                     if entries.len() >= c {
                                         break;
@@ -540,19 +681,38 @@ impl Store {
                                 }
                             }
                             if !entries.is_empty() {
+                                let last_delivered_id = entries
+                                    .last()
+                                    .map(|(id, _)| *id)
+                                    .expect("non-empty delivery");
+                                effects.push(StreamGroupReadEffect::Deliver {
+                                    key: key.clone(),
+                                    group: group.to_string(),
+                                    consumer: (!noack).then(|| consumer.to_string()),
+                                    last_delivered_id,
+                                    pending_ids: if noack {
+                                        Vec::new()
+                                    } else {
+                                        entries.iter().map(|(id, _)| *id).collect()
+                                    },
+                                });
                                 result.push((key.clone(), entries));
                             }
                         } else {
                             let after_id = StreamId::parse(id_str).unwrap_or(StreamId::zero());
-                            let c = cg.consumers.entry(consumer.to_string()).or_insert_with(|| {
-                                Consumer {
-                                    pel: HashSet::new(),
-                                    seen_time: inst_now,
-                                }
-                            });
                             let mut entries = Vec::new();
-                            let pending_ids: Vec<StreamId> =
-                                c.pel.iter().filter(|id| **id > after_id).cloned().collect();
+                            let pending_ids: Vec<StreamId> = cg
+                                .consumers
+                                .get(consumer)
+                                .map(|consumer| {
+                                    consumer
+                                        .pel
+                                        .iter()
+                                        .filter(|id| **id > after_id)
+                                        .copied()
+                                        .collect()
+                                })
+                                .unwrap_or_default();
                             let mut sorted: Vec<StreamId> = pending_ids;
                             sorted.sort();
                             for id in sorted {
@@ -568,13 +728,80 @@ impl Store {
                                     }
                                 }
                             }
+                            if !cg.consumers.contains_key(consumer) {
+                                effects.push(StreamGroupReadEffect::CreateConsumer {
+                                    key: key.clone(),
+                                    group: group.to_string(),
+                                    consumer: consumer.to_string(),
+                                });
+                            }
                             result.push((key.clone(), entries));
                         }
                     }
                 }
             }
         }
-        Ok(result)
+        Ok(StreamReadGroupPlan { result, effects })
+    }
+
+    pub(crate) fn apply_lxgroupread(
+        &self,
+        key: &[u8],
+        group: &str,
+        consumer: Option<&str>,
+        last_delivered_id: StreamId,
+        pending_ids: &[StreamId],
+        now: Instant,
+    ) -> Result<(), String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        shard.version += 1;
+        let Some(entry) = shard
+            .data
+            .get_mut(key)
+            .filter(|entry| !entry.is_expired_at(now))
+        else {
+            return Err(nogroup_err(group, key));
+        };
+        let StoreValue::Stream(stream) = &mut entry.value else {
+            return Err(WRONGTYPE.to_string());
+        };
+        let Some(consumer_group) = stream.groups.get_mut(group) else {
+            return Err(nogroup_err(group, key));
+        };
+        consumer_group.last_delivered_id = last_delivered_id;
+        let Some(consumer_name) = consumer else {
+            return Ok(());
+        };
+        let applied_at = Instant::now();
+        let consumer_name = consumer_name.to_string();
+        for id in pending_ids {
+            if let Some(previous) = consumer_group.pel.get(id) {
+                if let Some(previous_consumer) =
+                    consumer_group.consumers.get_mut(&previous.consumer)
+                {
+                    previous_consumer.pel.remove(id);
+                }
+            }
+            consumer_group.pel.insert(
+                *id,
+                PendingEntry {
+                    consumer: consumer_name.clone(),
+                    delivery_time: applied_at,
+                    delivery_count: 1,
+                },
+            );
+        }
+        let target = consumer_group
+            .consumers
+            .entry(consumer_name)
+            .or_insert_with(|| Consumer {
+                pel: HashSet::new(),
+                seen_time: applied_at,
+            });
+        target.pel.extend(pending_ids.iter().copied());
+        target.seen_time = applied_at;
+        Ok(())
     }
 
     pub fn xack(
@@ -716,14 +943,43 @@ impl Store {
         ids: &[StreamId],
         now: Instant,
     ) -> Result<Vec<(StreamId, Vec<(String, Bytes)>)>, String> {
+        let route: [&[u8]; 2] = [b"XCLAIM", key];
+        self.commit_prepared(
+            &route,
+            || {
+                let plan = self.preview_xclaim(key, group, min_idle_ms, ids, now)?;
+                if plan.claims.is_empty() {
+                    return Ok(JournalPlan::no_op(plan));
+                }
+                Ok(JournalPlan::command(
+                    Self::lxgroupclaim_command(key, group, consumer, &plan.claims),
+                    plan,
+                ))
+            },
+            |plan| {
+                self.apply_lxgroupclaim(key, group, consumer, &plan.claims, now)?;
+                Ok(plan.result)
+            },
+        )
+        .map_err(|error| format!("ERR WAL append failed: {error}"))?
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn preview_xclaim(
+        &self,
+        key: &[u8],
+        group: &str,
+        min_idle_ms: u64,
+        ids: &[StreamId],
+        now: Instant,
+    ) -> Result<StreamClaimPlan, String> {
         let idx = self.shard_index(key);
-        let mut shard = self.shards[idx].write();
-        shard.version += 1;
+        let shard = self.shards[idx].read();
         let inst_now = Instant::now();
-        match shard.data.get_mut(key) {
-            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+        match shard.data.get(key) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Stream(s) => {
-                    let cg = match s.groups.get_mut(group) {
+                    let cg = match s.groups.get(group) {
                         Some(g) => g,
                         None => {
                             return Err(format!(
@@ -734,37 +990,28 @@ impl Store {
                         }
                     };
                     let mut result = Vec::new();
+                    let mut claims = Vec::new();
                     for id in ids {
-                        if let Some(pe) = cg.pel.get_mut(id) {
-                            let idle = inst_now.duration_since(pe.delivery_time).as_millis() as u64;
+                        if let Some(pe) = cg.pel.get(id) {
+                            let idle = inst_now
+                                .saturating_duration_since(pe.delivery_time)
+                                .as_millis() as u64;
                             if idle >= min_idle_ms {
-                                let old_consumer = pe.consumer.clone();
-                                pe.consumer = consumer.to_string();
-                                pe.delivery_time = inst_now;
-                                pe.delivery_count += 1;
-                                if let Some(c) = cg.consumers.get_mut(&old_consumer) {
-                                    c.pel.remove(id);
-                                }
-                                let c =
-                                    cg.consumers.entry(consumer.to_string()).or_insert_with(|| {
-                                        Consumer {
-                                            pel: HashSet::new(),
-                                            seen_time: inst_now,
-                                        }
-                                    });
-                                c.pel.insert(*id);
-                                c.seen_time = inst_now;
+                                claims.push((*id, pe.delivery_count.saturating_add(1)));
                                 if let Some(fields) = s.entries.get(id) {
                                     result.push((*id, self.decrypt_stream_fields(key, fields)));
                                 }
                             }
                         }
                     }
-                    Ok(result)
+                    Ok(StreamClaimPlan { result, claims })
                 }
                 _ => Err(WRONGTYPE.to_string()),
             },
-            _ => Ok(vec![]),
+            _ => Ok(StreamClaimPlan {
+                result: Vec::new(),
+                claims: Vec::new(),
+            }),
         }
     }
 
@@ -786,14 +1033,44 @@ impl Store {
         ),
         String,
     > {
+        let route: [&[u8]; 2] = [b"XAUTOCLAIM", key];
+        self.commit_prepared(
+            &route,
+            || {
+                let plan = self.preview_xautoclaim(key, group, min_idle_ms, start, count, now)?;
+                if plan.claims.is_empty() {
+                    return Ok(JournalPlan::no_op(plan));
+                }
+                Ok(JournalPlan::command(
+                    Self::lxgroupclaim_command(key, group, consumer, &plan.claims),
+                    plan,
+                ))
+            },
+            |plan| {
+                self.apply_lxgroupclaim(key, group, consumer, &plan.claims, now)?;
+                Ok((plan.next_start, plan.result, plan.deleted_ids))
+            },
+        )
+        .map_err(|error| format!("ERR WAL append failed: {error}"))?
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn preview_xautoclaim(
+        &self,
+        key: &[u8],
+        group: &str,
+        min_idle_ms: u64,
+        start: StreamId,
+        count: Option<usize>,
+        now: Instant,
+    ) -> Result<StreamAutoClaimPlan, String> {
         let idx = self.shard_index(key);
-        let mut shard = self.shards[idx].write();
-        shard.version += 1;
+        let shard = self.shards[idx].read();
         let inst_now = Instant::now();
-        match shard.data.get_mut(key) {
-            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+        match shard.data.get(key) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Stream(s) => {
-                    let cg = match s.groups.get_mut(group) {
+                    let cg = match s.groups.get(group) {
                         Some(g) => g,
                         None => {
                             return Err(format!(
@@ -806,6 +1083,7 @@ impl Store {
                     let max = count.unwrap_or(100);
                     let mut claimed = Vec::new();
                     let mut deleted_ids = Vec::new();
+                    let mut claims = Vec::new();
                     let mut next_start = StreamId::zero();
                     let pending_ids: Vec<StreamId> =
                         cg.pel.range(start..).map(|(id, _)| *id).collect();
@@ -814,25 +1092,12 @@ impl Store {
                             next_start = id;
                             break;
                         }
-                        if let Some(pe) = cg.pel.get_mut(&id) {
-                            let idle = inst_now.duration_since(pe.delivery_time).as_millis() as u64;
+                        if let Some(pe) = cg.pel.get(&id) {
+                            let idle = inst_now
+                                .saturating_duration_since(pe.delivery_time)
+                                .as_millis() as u64;
                             if idle >= min_idle_ms {
-                                let old_consumer = pe.consumer.clone();
-                                pe.consumer = consumer.to_string();
-                                pe.delivery_time = inst_now;
-                                pe.delivery_count += 1;
-                                if let Some(c) = cg.consumers.get_mut(&old_consumer) {
-                                    c.pel.remove(&id);
-                                }
-                                let c =
-                                    cg.consumers.entry(consumer.to_string()).or_insert_with(|| {
-                                        Consumer {
-                                            pel: HashSet::new(),
-                                            seen_time: inst_now,
-                                        }
-                                    });
-                                c.pel.insert(id);
-                                c.seen_time = inst_now;
+                                claims.push((id, pe.delivery_count.saturating_add(1)));
                                 if let Some(fields) = s.entries.get(&id) {
                                     claimed.push((id, self.decrypt_stream_fields(key, fields)));
                                 } else {
@@ -841,7 +1106,12 @@ impl Store {
                             }
                         }
                     }
-                    Ok((next_start, claimed, deleted_ids))
+                    Ok(StreamAutoClaimPlan {
+                        next_start,
+                        result: claimed,
+                        deleted_ids,
+                        claims,
+                    })
                 }
                 _ => Err(WRONGTYPE.to_string()),
             },
@@ -851,6 +1121,87 @@ impl Store {
                 key_str(key)
             )),
         }
+    }
+
+    fn lxgroupclaim_command(
+        key: &[u8],
+        group: &str,
+        consumer: &str,
+        claims: &[(StreamId, u64)],
+    ) -> Vec<Vec<u8>> {
+        let mut command = vec![
+            b"LXGROUPCLAIM".to_vec(),
+            key.to_vec(),
+            group.as_bytes().to_vec(),
+            consumer.as_bytes().to_vec(),
+        ];
+        for (id, delivery_count) in claims {
+            command.push(id.to_string().into_bytes());
+            command.push(delivery_count.to_string().into_bytes());
+        }
+        command
+    }
+
+    pub(crate) fn apply_lxgroupclaim(
+        &self,
+        key: &[u8],
+        group: &str,
+        consumer: &str,
+        claims: &[(StreamId, u64)],
+        now: Instant,
+    ) -> Result<(), String> {
+        if claims.is_empty() {
+            return Ok(());
+        }
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        shard.version += 1;
+        let Some(entry) = shard
+            .data
+            .get_mut(key)
+            .filter(|entry| !entry.is_expired_at(now))
+        else {
+            return Err(nogroup_err(group, key));
+        };
+        let StoreValue::Stream(stream) = &mut entry.value else {
+            return Err(WRONGTYPE.to_string());
+        };
+        let Some(consumer_group) = stream.groups.get_mut(group) else {
+            return Err(nogroup_err(group, key));
+        };
+        let applied_at = Instant::now();
+        for (id, delivery_count) in claims {
+            let Some(previous_consumer) = consumer_group
+                .pel
+                .get(id)
+                .map(|pending| pending.consumer.clone())
+            else {
+                return Err(format!(
+                    "ERR pending stream ID '{id}' disappeared during claim"
+                ));
+            };
+            if let Some(previous) = consumer_group.consumers.get_mut(&previous_consumer) {
+                previous.pel.remove(id);
+            }
+            let Some(pending) = consumer_group.pel.get_mut(id) else {
+                return Err(format!(
+                    "ERR pending stream ID '{id}' disappeared during claim"
+                ));
+            };
+            pending.consumer = consumer.to_string();
+            pending.delivery_time = applied_at;
+            pending.delivery_count = *delivery_count;
+        }
+        let target = consumer_group
+            .consumers
+            .entry(consumer.to_string())
+            .or_insert_with(|| Consumer {
+                pel: HashSet::new(),
+                seen_time: applied_at,
+            });
+        target.pel.extend(claims.iter().map(|(id, _)| *id));
+        target.seen_time = applied_at;
+        Ok(())
     }
 
     pub fn xdel(&self, key: &[u8], ids: &[StreamId], now: Instant) -> Result<i64, String> {

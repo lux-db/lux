@@ -11,7 +11,7 @@ envelope and operators can test recovery procedures.
 Lux persists state through:
 
 - `lux.dat`: point-in-time snapshot of the in-memory database.
-- Per-shard WAL files: command log replayed after the snapshot.
+- One ordered mutation journal: committed effects replayed after the snapshot.
 - Tiered storage files: cold entries evicted from memory when tiered mode is
   enabled.
 
@@ -22,9 +22,10 @@ Storage layout and durability are independent:
 - `tiered` adds disk-backed cold storage. Its WAL remains in the tiered storage
   directory so existing deployments keep their current recovery files.
 
-Persistent startup loads the snapshot, replays valid WAL frames, and rebuilds
-tiered indexes as needed. Lux refuses to start when a layout change would hide
-known WAL or tiered shard state.
+Persistent startup loads the snapshot, replays valid legacy per-shard WAL files
+from pre-1.0 versions, then replays the ordered journal and rebuilds tiered
+indexes as needed. New writes use only the ordered journal. Lux refuses to start
+when a layout change would hide known journal or tiered shard state.
 
 ## Durability Policies
 
@@ -50,12 +51,20 @@ Expected power-loss behavior:
 - Writes acknowledged after the last fsync may be lost on sudden power failure.
 - The default maximum expected power-loss window is approximately one second of
   writes.
+- A failed periodic fsync emits a critical runtime error and increments the
+  `persistence_err_wal_fsync` counter. The one-second bound does not apply while
+  the storage device cannot complete synchronization.
 - `ServerHandle::shutdown_and_wait` flushes pending WAL data before returning.
 
 Process crash behavior:
 
 - Valid WAL frames before the crash must replay.
 - Partial WAL frames at the end of a file must be ignored safely.
+- A single logical mutation whose resolved recovery form contains multiple
+  commands is stored in one checksummed frame, so a torn frame replays every
+  effect or none of them. This applies to commands such as cross-key moves and
+  replacements; it does not make a `MULTI`/`EXEC` queue one crash-atomic
+  mutation.
 - Corrupt WAL frames must be skipped or rejected without panicking.
 
 ## Snapshots
@@ -85,6 +94,7 @@ so replay is deterministic and reproduces exactly the state clients observed.
 Replay behavior:
 
 - All write commands that mutate durable state are WAL logged.
+- New writes share one journal order across shards and command surfaces.
 - Logged commands carry resolved values, so replaying them never regenerates a
   different primary key, timestamp, or default.
 - Table writes log their own resolved command from the table layer (so HTTP
@@ -123,8 +133,8 @@ Restore behavior:
 
 - Restore accepts any valid Lux snapshot header (current and older versions).
 - Restore writes a new `lux.dat` snapshot atomically.
-- Restore purges only Lux-owned `shard_*` storage directories, never the whole
-  storage parent or unrelated files.
+- Restore purges only Lux-owned legacy `shard_*` and current `global` journal or
+  tiered-storage directories, never the storage parent or unrelated files.
 - After restore, stale WAL or cold tiered data must not overwrite restored
   state on restart.
 - Operators should restart the process after restore so startup rebuilds state

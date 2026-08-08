@@ -225,8 +225,11 @@ Known differences:
   `PUBLISH`/`SUBSCRIBE`. `PUBSUB CHANNELS`/`NUMSUB`/`NUMPAT` are supported.
 - **Transactions**: `MULTI`/`EXEC` is supported with WATCH-based optimistic
   concurrency. Lux commands in an EXEC execute sequentially and may be observed
-  between steps by other clients. Redis avoids this through single-threaded
-  execution.
+  between steps by other clients. Each mutating command also crosses its own
+  durability boundary, so a process crash during EXEC can recover a completed
+  prefix of an EXEC whose response was never acknowledged. Redis avoids both
+  differences through its single-threaded execution and transaction-aware AOF
+  framing.
 - **Concurrency**: Lux is sharded and concurrent. Commands touching different
   shards can execute in parallel.
 - **Restricted mode**: Lux may reject scan-heavy or administrative commands

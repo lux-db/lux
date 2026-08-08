@@ -523,7 +523,14 @@ pub(crate) fn bootstrap(
         &["key STR PRIMARY KEY,", "value STR,", "updated_at INT"],
         now,
     )?;
-    store.set(AUTH_SCHEMA_VERSION_KEY, AUTH_SCHEMA_VERSION, None, now);
+    if store.get(AUTH_SCHEMA_VERSION_KEY, now).as_deref() != Some(AUTH_SCHEMA_VERSION) {
+        let command: [&[u8]; 3] = [b"SET", AUTH_SCHEMA_VERSION_KEY, AUTH_SCHEMA_VERSION];
+        store
+            .commit_journaled(&command, || {
+                store.set(AUTH_SCHEMA_VERSION_KEY, AUTH_SCHEMA_VERSION, None, now)
+            })
+            .map_err(|error| format!("ERR WAL append failed: {error}"))?;
+    }
     Ok(())
 }
 
@@ -2272,12 +2279,11 @@ fn oauth_authorize(
         "oidc_nonce": oidc_nonce,
         "created_at": unix_seconds(),
     });
-    store.set(
-        state_key.as_bytes(),
-        payload.to_string().as_bytes(),
-        Some(OAUTH_STATE_TTL),
-        Instant::now(),
-    );
+    let payload = payload.to_string();
+    if let Err(e) = persist_oauth_state(store, state_key.as_bytes(), payload.as_bytes()) {
+        let (status, status_text, body) = error(500, "Internal Server Error", &e);
+        return AuthHttpResponse::json(status, status_text, body);
+    }
 
     let callback = if config.redirect_uri.is_empty() {
         default_callback_url(headers, &provider)
@@ -2309,11 +2315,17 @@ async fn oauth_callback(
         }
     };
     let state_key = oauth_state_key(state);
-    let Some(raw_state) = store.get(state_key.as_bytes(), Instant::now()) else {
-        let (status, status_text, body) = error(400, "Bad Request", "invalid oauth state");
-        return AuthHttpResponse::json(status, status_text, body);
+    let raw_state = match take_oauth_state(store, state_key.as_bytes(), Instant::now()) {
+        Ok(Some(raw_state)) => raw_state,
+        Ok(None) => {
+            let (status, status_text, body) = error(400, "Bad Request", "invalid oauth state");
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+        Err(e) => {
+            let (status, status_text, body) = error(500, "Internal Server Error", &e);
+            return AuthHttpResponse::json(status, status_text, body);
+        }
     };
-    let _ = store.del(&[state_key.as_bytes()]);
     let state_value: Value = serde_json::from_slice(&raw_state).unwrap_or_else(|_| json!({}));
     if state_value.get("provider").and_then(Value::as_str) != Some(provider.as_str()) {
         let (status, status_text, body) =
@@ -2753,9 +2765,8 @@ pub(crate) fn create_table_if_missing(
 /// has already shipped: new projects pick the column up from the CREATE, and
 /// projects created before it get it from here.
 ///
-/// `tables::table_add_column` does not append to the WAL of its own accord. RESP
-/// and HTTP `TALTER` are raw-logged by `execute_with_wal`, which internal callers
-/// never reach, so log the resolved command here or the column is lost on replay.
+/// Internal schema upgrades bypass command dispatch, so they cross the same
+/// journal-before-apply boundary explicitly here.
 pub(crate) fn add_column_if_missing(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -2781,8 +2792,12 @@ pub(crate) fn add_column_if_missing(
         b"ADD".to_vec(),
     ];
     args.extend(field_spec.split_whitespace().map(|t| t.as_bytes().to_vec()));
-    log_command(store, &args)?;
-    tables::table_add_column(store, cache, table, field_spec, now)
+    let refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
+    store
+        .commit_journaled(&refs, || {
+            tables::table_add_column(store, cache, table, field_spec, now)
+        })
+        .map_err(|error| format!("ERR WAL append failed: {error}"))?
 }
 
 pub(crate) fn durable_table_insert(
@@ -2792,12 +2807,6 @@ pub(crate) fn durable_table_insert(
     field_values: &[(&str, &str)],
     now: Instant,
 ) -> Result<i64, String> {
-    let mut args: Vec<Vec<u8>> = vec![b"TINSERT".to_vec(), table.as_bytes().to_vec()];
-    for (field, value) in field_values {
-        args.push(field.as_bytes().to_vec());
-        args.push(value.as_bytes().to_vec());
-    }
-    log_command(store, &args)?;
     tables::table_insert(store, cache, table, field_values, now)
 }
 
@@ -2809,20 +2818,6 @@ pub(crate) fn durable_table_update_where(
     where_args: &[&str],
     now: Instant,
 ) -> Result<i64, String> {
-    let mut args: Vec<Vec<u8>> = vec![
-        b"TUPDATE".to_vec(),
-        table.as_bytes().to_vec(),
-        b"SET".to_vec(),
-    ];
-    for (field, value) in field_values {
-        args.push(field.as_bytes().to_vec());
-        args.push(value.as_bytes().to_vec());
-    }
-    args.push(b"WHERE".to_vec());
-    for arg in where_args {
-        args.push(arg.as_bytes().to_vec());
-    }
-    log_command(store, &args)?;
     tables::table_update_where(store, cache, table, field_values, where_args, now)
 }
 
@@ -2833,24 +2828,7 @@ pub(crate) fn durable_table_delete_where(
     where_args: &[&str],
     now: Instant,
 ) -> Result<i64, String> {
-    let mut args: Vec<Vec<u8>> = vec![
-        b"TDELETE".to_vec(),
-        b"FROM".to_vec(),
-        table.as_bytes().to_vec(),
-    ];
-    args.push(b"WHERE".to_vec());
-    for arg in where_args {
-        args.push(arg.as_bytes().to_vec());
-    }
-    log_command(store, &args)?;
     tables::table_delete_where(store, cache, table, where_args, now)
-}
-
-fn log_command(store: &Store, args: &[Vec<u8>]) -> Result<(), String> {
-    let refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
-    store
-        .wal_log_command(&refs)
-        .map_err(|e| format!("ERR WAL append failed: {e}"))
 }
 
 fn ensure_signing_key(
@@ -3429,18 +3407,26 @@ fn persist_access_revocation(
     now: Instant,
 ) -> Result<(), String> {
     let key = access_revoked_after_key(session_id);
-    let args = vec![
-        b"SET".to_vec(),
-        key.clone(),
-        revoked_after.as_bytes().to_vec(),
-    ];
-    log_command(store, &args)?;
-    store.set(
+    let ttl = store.config().auth.access_token_ttl;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+    let deadline_ms = now_ms.saturating_add(ttl_ms);
+    let deadline = deadline_ms.to_string();
+    let args: [&[u8]; 5] = [
+        b"SET",
         &key,
         revoked_after.as_bytes(),
-        Some(store.config().auth.access_token_ttl),
-        now,
-    );
+        b"PXAT",
+        deadline.as_bytes(),
+    ];
+    store
+        .commit_journaled(&args, || {
+            store.set(&key, revoked_after.as_bytes(), Some(ttl), now)
+        })
+        .map_err(|error| format!("ERR WAL append failed: {error}"))?;
     Ok(())
 }
 
@@ -3693,6 +3679,39 @@ fn default_oauth_scopes(provider: &str) -> &'static str {
 
 fn oauth_state_key(state: &str) -> String {
     format!("_auth:oauth_state:{state}")
+}
+
+fn persist_oauth_state(store: &Store, key: &[u8], payload: &[u8]) -> Result<(), String> {
+    let now = Instant::now();
+    let ttl_ms = i64::try_from(OAUTH_STATE_TTL.as_millis()).unwrap_or(i64::MAX);
+    let deadline = crate::store::epoch_ms().saturating_add(ttl_ms).to_string();
+    let command: [&[u8]; 5] = [b"SET", key, payload, b"PXAT", deadline.as_bytes()];
+    store
+        .commit_journaled(&command, || {
+            store.set(key, payload, Some(OAUTH_STATE_TTL), now)
+        })
+        .map_err(|error| format!("ERR WAL append failed: {error}"))?;
+    Ok(())
+}
+
+fn take_oauth_state(
+    store: &Store,
+    key: &[u8],
+    now: Instant,
+) -> Result<Option<bytes::Bytes>, String> {
+    let command: [&[u8]; 2] = [b"DEL", key];
+    let prepare = store
+        .prepare_journaled(&command)
+        .map_err(|error| format!("ERR WAL append failed: {error}"))?;
+    let Some(payload) = store.get(key, now) else {
+        return Ok(None);
+    };
+    let _commit = prepare
+        .commit(&command)
+        .map_err(|error| format!("ERR WAL append failed: {error}"))?;
+    let removed = store.del(&[key]);
+    debug_assert_eq!(removed, 1);
+    Ok(Some(payload))
 }
 
 fn default_callback_url(headers: &[(String, String)], provider: &str) -> String {

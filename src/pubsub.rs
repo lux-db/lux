@@ -52,6 +52,9 @@ impl KeyEventCounters {
 pub struct BlockedPopRequest {
     pub tx: mpsc::Sender<(String, Bytes)>,
     pub pop_left: bool,
+    /// BLMOVE/BRPOPLPUSH are completed in the broker as one journaled move.
+    /// Plain BLPOP/BRPOP leave this empty.
+    pub destination: Option<(String, bool)>,
     pub waiter_id: u64,
 }
 
@@ -209,43 +212,141 @@ impl Broker {
     pub(crate) fn drain_list_waiters(
         &self,
         key: &str,
-        shard_data: &mut crate::store::ShardData,
         store: &crate::store::Store,
         now: std::time::Instant,
     ) {
-        let mut waiters = self.list_waiters.lock();
-        let queue = match waiters.get_mut(key) {
-            Some(q) => q,
-            None => return,
-        };
-
-        while !queue.is_empty() {
-            let entry = match shard_data.get_mut(key.as_bytes()) {
-                Some(e) if !e.is_expired_at(now) => e,
-                _ => return,
+        loop {
+            let req = {
+                let mut waiters = self.list_waiters.lock();
+                let Some(queue) = waiters.get_mut(key) else {
+                    return;
+                };
+                let Some(req) = queue.pop_front() else {
+                    waiters.remove(key);
+                    return;
+                };
+                self.list_waiter_count.fetch_sub(1, Ordering::Relaxed);
+                if queue.is_empty() {
+                    waiters.remove(key);
+                }
+                req
             };
-            let list = match &mut entry.value {
-                crate::store::StoreValue::List(l) if !l.is_empty() => l,
-                _ => return,
+
+            let permit = match req.tx.clone().try_reserve_owned() {
+                Ok(permit) => permit,
+                Err(mpsc::error::TrySendError::Closed(_)) => continue,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let mut waiters = self.list_waiters.lock();
+                    waiters.entry(key.to_string()).or_default().push_front(req);
+                    self.list_waiter_count.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
             };
 
-            let req = queue.pop_front().unwrap();
-            self.list_waiter_count.fetch_sub(1, Ordering::Relaxed);
-            let val = if req.pop_left {
-                list.pop_front()
+            let raw = if let Some((destination, push_left)) = &req.destination {
+                let route: [&[u8]; 3] = [b"LMOVE", key.as_bytes(), destination.as_bytes()];
+                store.commit_prepared(
+                    &route,
+                    || -> Result<crate::store::JournalPlan<Option<Bytes>>, String> {
+                        let value = store.preview_lmove(
+                            key.as_bytes(),
+                            destination.as_bytes(),
+                            req.pop_left,
+                            now,
+                        )?;
+                        let Some(value) = value else {
+                            return Ok(crate::store::JournalPlan::no_op(None));
+                        };
+                        let pop = if req.pop_left { b"LPOP" } else { b"RPOP" };
+                        let push = if *push_left { b"LPUSH" } else { b"RPUSH" };
+                        Ok(crate::store::JournalPlan::batch(
+                            vec![
+                                vec![pop.to_vec(), key.as_bytes().to_vec()],
+                                vec![
+                                    push.to_vec(),
+                                    destination.as_bytes().to_vec(),
+                                    value.to_vec(),
+                                ],
+                            ],
+                            Some(value),
+                        ))
+                    },
+                    |expected| -> Result<Option<Bytes>, String> {
+                        let Some(expected) = expected else {
+                            return Ok(None);
+                        };
+                        let moved = store.lmove(
+                            key.as_bytes(),
+                            destination.as_bytes(),
+                            req.pop_left,
+                            *push_left,
+                            now,
+                        );
+                        if moved.as_ref() != Some(&expected) {
+                            return Err(
+                                "ERR list changed during journaled blocked move".to_string()
+                            );
+                        }
+                        Ok(moved)
+                    },
+                )
             } else {
-                list.pop_back()
+                let pop: &[u8] = if req.pop_left { b"LPOP" } else { b"RPOP" };
+                let route: [&[u8]; 2] = [pop, key.as_bytes()];
+                store.commit_prepared(
+                    &route,
+                    || -> Result<crate::store::JournalPlan<Option<Bytes>>, String> {
+                        let preview =
+                            store.preview_lmpop(&[key.as_bytes()], req.pop_left, 1, now)?;
+                        let Some((_, mut values)) = preview else {
+                            return Ok(crate::store::JournalPlan::no_op(None));
+                        };
+                        let value = values.pop().expect("non-empty blocked pop preview");
+                        Ok(crate::store::JournalPlan::command(
+                            vec![pop.to_vec(), key.as_bytes().to_vec()],
+                            Some(value),
+                        ))
+                    },
+                    |expected| -> Result<Option<Bytes>, String> {
+                        let Some(expected) = expected else {
+                            return Ok(None);
+                        };
+                        let value = if req.pop_left {
+                            store.lpop(key.as_bytes(), now)
+                        } else {
+                            store.rpop(key.as_bytes(), now)
+                        };
+                        if value.as_ref() != Some(&expected) {
+                            return Err("ERR list changed during journaled blocked pop".to_string());
+                        }
+                        Ok(value)
+                    },
+                )
             };
-            if let Some(v) = val {
-                // Decrypt encrypted list elements before handing them to the
-                // blocked waiter (deferred BLPOP/BRPOP resolution).
-                let v = store.decrypt_list_element(v.clone()).unwrap_or(v);
-                let _ = req.tx.try_send((key.to_string(), v));
-            }
-        }
 
-        if queue.is_empty() {
-            waiters.remove(key);
+            let raw = match raw {
+                Ok(Ok(Some(value))) => value,
+                Ok(Ok(None)) => {
+                    let mut waiters = self.list_waiters.lock();
+                    waiters.entry(key.to_string()).or_default().push_front(req);
+                    self.list_waiter_count.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Ok(Err(_)) | Err(_) => {
+                    let mut waiters = self.list_waiters.lock();
+                    waiters.entry(key.to_string()).or_default().push_front(req);
+                    self.list_waiter_count.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+            let value = store.decrypt_list_element(raw.clone()).unwrap_or(raw);
+            permit.send((key.to_string(), value));
+
+            if let Some((destination, _)) = &req.destination {
+                if destination != key && self.has_list_waiters(destination) {
+                    self.drain_list_waiters(destination, store, now);
+                }
+            }
         }
     }
 
@@ -716,6 +817,25 @@ fn do_glob(p: &[char], s: &[char], pi: usize, si: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DurabilityConfig, DurabilityPolicy, ServerConfig, StorageConfig, StorageMode};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn journal_store(dir: &std::path::Path) -> (crate::store::Store, Arc<ServerConfig>) {
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.to_string_lossy().to_string(),
+            },
+            durability: DurabilityConfig {
+                policy: DurabilityPolicy::EverySecond,
+                ..Default::default()
+            },
+            ..ServerConfig::default()
+        });
+        (crate::store::Store::new_with_config(config.clone()), config)
+    }
 
     #[test]
     fn subscribe_and_publish() {
@@ -828,5 +948,79 @@ mod tests {
             pk: "x".to_string(),
         });
         assert!(!broker.has_any_row_delta_subs());
+    }
+
+    #[test]
+    fn blocked_pop_does_not_mutate_when_the_journal_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = journal_store(dir.path());
+        let now = Instant::now();
+        store.lpush(b"jobs", &[b"one"], now).unwrap();
+
+        let broker = Broker::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        broker.register_list_waiter(
+            "jobs",
+            BlockedPopRequest {
+                tx,
+                pop_left: true,
+                destination: None,
+                waiter_id: broker.next_waiter_id(),
+            },
+        );
+        store.inject_journal_failures(1);
+        broker.drain_list_waiters("jobs", &store, now);
+
+        assert_eq!(store.llen(b"jobs", now).unwrap(), 1);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(broker.list_waiter_count(), 1);
+
+        broker.drain_list_waiters("jobs", &store, now);
+        assert_eq!(rx.try_recv().unwrap().1.as_ref(), b"one");
+        assert_eq!(store.llen(b"jobs", now).unwrap(), 0);
+    }
+
+    #[test]
+    fn blocked_move_is_one_durable_resolved_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, config) = journal_store(dir.path());
+        let now = Instant::now();
+        let push: [&[u8]; 3] = [b"LPUSH", b"source", b"one"];
+        store
+            .commit_journaled(&push, || store.lpush(b"source", &[b"one"], now))
+            .unwrap()
+            .unwrap();
+
+        let broker = Broker::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        broker.register_list_waiter(
+            "source",
+            BlockedPopRequest {
+                tx,
+                pop_left: true,
+                destination: Some(("destination".to_string(), false)),
+                waiter_id: broker.next_waiter_id(),
+            },
+        );
+        broker.drain_list_waiters("source", &store, now);
+
+        assert_eq!(rx.try_recv().unwrap().1.as_ref(), b"one");
+        assert_eq!(store.llen(b"source", now).unwrap(), 0);
+        assert_eq!(
+            store.lrange(b"destination", 0, -1, now).unwrap()[0],
+            b"one".as_slice()
+        );
+        store.fsync_wal();
+        drop(store);
+
+        let restored = crate::store::Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        assert_eq!(restored.llen(b"source", Instant::now()).unwrap(), 0);
+        assert_eq!(
+            restored
+                .lrange(b"destination", 0, -1, Instant::now())
+                .unwrap()[0],
+            b"one".as_slice()
+        );
     }
 }
