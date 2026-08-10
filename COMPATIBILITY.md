@@ -58,14 +58,96 @@ following areas are intended to be Redis-compatible for normal client use:
 Compatibility must be backed by integration tests and, where practical,
 Redis/Valkey differential tests.
 
+## Redis OSS/Core Inventory
+
+The pinned Redis OSS/core command inventory lives in
+`tests/redis_parity_inventory.rs`. It derives Lux's implemented RESP surface by
+parsing the in-repo command registry in `src/cmd/mod.rs`, then classifies each
+known command as one of:
+
+- **Supported**: registered by Lux and expected to behave like Redis for normal
+  client use.
+- **Partial**: registered by Lux, but currently a compatibility shim, partial
+  implementation, or documented semantic difference.
+- **Missing**: Redis OSS/core command not currently registered by Lux and
+  tracked for this parity project.
+- **Excluded**: Redis OSS command intentionally outside this project.
+- **Lux-native**: public Lux command with no Redis compatibility claim.
+
+For local compatibility exploration, run selected Valkey Tcl suites against a
+running Lux RESP listener:
+
+```sh
+# Terminal 1
+cargo build
+LUX_PORT=6379 ./target/debug/lux
+
+# Terminal 2
+VALKEY_DIR=/tmp/valkey LUX_PORT=6379 just valkey-compat
+```
+
+The recipe is intentionally local/manual. It runs Redis OSS/core-oriented suites
+for strings, keyspace, lists, hashes, sets, sorted sets, streams, scripting, and
+transactions in durable mode so one missing command does not stop the whole
+report, with `VALKEY_TIMEOUT` defaulting to 60 seconds to keep blocking-command
+failures bounded. It does not run Redis Stack/module suites, cluster suites,
+replication suites, or CI gates. It ignores Valkey internal encoding checks and
+skips individual tests whose assertions are about replication, command
+propagation, or Valkey's exact expiry scheduling; those are separate
+compatibility targets from single-node command semantics.
+
+Current partial/stub surfaces:
+
+- `CLIENT` -- common client-library subcommands only.
+- `COMMAND` -- metadata parity incomplete.
+- `CONFIG`, `INFO`, `LATENCY`, `MEMORY`, `OBJECT` -- server/admin metadata
+  needs audit.
+- `DEBUG`, `RESET` -- compatibility behavior needs explicit implementation or
+  rejection.
+- `DUMP`/`RESTORE` -- implemented with a Lux-internal value format (not RDB;
+  round-trips within Lux). `TOUCH` returns the key count without an
+  access-recency effect.
+- `FUNCTION` -- Redis Functions decision pending.
+- `SWAPDB`/multi-DB behavior -- product decision pending.
+
+Current missing Redis OSS/core command groups:
+
+- Streams: `XSETID` (top-level command). Consumer-group lifecycle
+  (`XGROUP CREATE`/`SETID`/`DESTROY`/`CREATECONSUMER`/`DELCONSUMER`/`HELP`)
+  and `XINFO STREAM`/`GROUPS`/`CONSUMERS` are implemented.
+- Scripting/functions: `EVAL_RO`, `EVALSHA_RO`, `FCALL`, `FCALL_RO`.
+- Admin/diagnostics and key migration: `ACL`, `BGREWRITEAOF`, `LOLWUT`,
+  `MONITOR`, `MOVE`, `ROLE`, `SLOWLOG`.
+
+Explicitly excluded from this parity project:
+
+- Redis Cluster commands and cluster routing behavior.
+- Redis multi-node replication/failover commands and Sentinel behavior.
+- Redis module APIs and Redis Stack/module command families.
+- Exact Redis AOF/RDB persistence semantics.
+- Process lifecycle commands such as `SHUTDOWN`.
+
 ## Documented Redis Differences
 
 Known 1.0 differences:
 
 - **Persistence**: Lux uses snapshots plus WAL instead of Redis AOF/RDB
   semantics. See `DURABILITY.md`.
+- **Hash field TTLs**: `HEXPIRE`/`HTTL`/`HGETEX`/`HGETDEL` and the full
+  family are supported. Expired fields are hidden from reads immediately;
+  a hash whose last field expires is reclaimed on the next write that
+  touches it (or an active cycle), not necessarily at the instant of
+  expiry, so `EXISTS` may briefly report an all-expired hash.
+- **Serialization / migration**: `DUMP`/`RESTORE` use a Lux-internal value
+  format that round-trips within Lux; the payload is not Redis RDB-compatible.
+  `MIGRATE` (inter-node key movement) and `WAITAOF` (AOF fsync wait) return
+  explicit unsupported errors; use `DUMP`/`RESTORE` to move a key between Lux
+  instances.
 - **RESP version**: RESP2 only.
 - **Cluster**: no Redis Cluster mode.
+- **Sharded Pub/Sub**: `SPUBLISH`/`SSUBSCRIBE`/`SUNSUBSCRIBE` return explicit
+  unsupported errors (they exist for Redis Cluster, which Lux does not run). Use
+  `PUBLISH`/`SUBSCRIBE`. `PUBSUB CHANNELS`/`NUMSUB`/`NUMPAT` are supported.
 - **Transactions**: `MULTI`/`EXEC` is supported with WATCH-based optimistic
   concurrency. Lux commands in an EXEC execute sequentially and may be observed
   between steps by other clients. Redis avoids this through single-threaded

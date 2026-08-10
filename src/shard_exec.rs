@@ -278,11 +278,17 @@ impl ShardExecutor {
             .all(|command| command.args.len() == 2 && command.args[0].eq_ignore_ascii_case(b"GET"))
         {
             for command in commands {
-                Store::get_and_write(&shard.data, command.args[1], now, out);
+                self.store
+                    .get_kv_and_write_from_shard(&shard.data, command.args[1], now, out);
             }
         } else {
             for command in commands {
-                cmd::execute_on_shard_read(&shard.data, command.args, out, now);
+                if command.args.len() == 2 && command.args[0].eq_ignore_ascii_case(b"GET") {
+                    self.store
+                        .get_kv_and_write_from_shard(&shard.data, command.args[1], now, out);
+                } else {
+                    cmd::execute_on_shard_read(&shard.data, command.args, out, now);
+                }
             }
         }
     }
@@ -305,11 +311,18 @@ impl ShardExecutor {
             args.len() == 2 && args[0].eq_ignore_ascii_case(b"GET")
         }) {
             for command in commands {
-                Store::get_and_write(&shard.data, command.argv()[1], now, out);
+                self.store
+                    .get_kv_and_write_from_shard(&shard.data, command.argv()[1], now, out);
             }
         } else {
             for command in commands {
-                cmd::execute_on_shard_read(&shard.data, command.argv(), out, now);
+                let args = command.argv();
+                if args.len() == 2 && args[0].eq_ignore_ascii_case(b"GET") {
+                    self.store
+                        .get_kv_and_write_from_shard(&shard.data, args[1], now, out);
+                } else {
+                    cmd::execute_on_shard_read(&shard.data, args, out, now);
+                }
             }
         }
     }
@@ -318,6 +331,7 @@ impl ShardExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::SetOptions;
     use std::sync::Arc;
 
     #[test]
@@ -369,6 +383,49 @@ mod tests {
 
         assert_eq!(before, store.shard_version(shard_idx));
         assert_eq!(&out[..], b"$-1\r\n");
+    }
+
+    #[test]
+    fn read_batch_get_decrypts_encrypted_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::new_with_config(Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..Default::default()
+        })));
+        store.encryption().init(Some("k1")).unwrap();
+        let now = Instant::now();
+        store
+            .set_conditional(
+                b"secret",
+                b"abcdef",
+                SetOptions {
+                    ttl: None,
+                    keep_ttl: false,
+                    nx: false,
+                    xx: false,
+                    ifeq: None,
+                    get: false,
+                    encrypted: true,
+                },
+                now,
+            )
+            .unwrap();
+
+        let broker = Broker::new();
+        let executor = ShardExecutor::new(store.clone(), broker);
+        let shard_idx = store.shard_for_key(b"secret");
+        let get: [&[u8]; 2] = [b"GET", b"secret"];
+        let commands = [ShardPipelineCommand {
+            args: &get,
+            access: PipelineAccess::Read,
+        }];
+        let mut out = BytesMut::new();
+
+        executor
+            .execute_pipeline_batch(shard_idx, &commands, &mut out, now)
+            .unwrap();
+
+        assert_eq!(&out[..], b"$6\r\nabcdef\r\n");
     }
 
     #[test]

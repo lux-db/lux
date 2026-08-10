@@ -26,7 +26,9 @@ unauthenticated Lux ports directly to the public internet.
 These surfaces are security-sensitive and treated as release-blocking when
 regressions are found:
 
-- Operator authentication and `LUX_PASSWORD`.
+- Credential resolution (`resolve_credential`): the single path every surface
+  uses to turn a presented secret key, publishable key, end-user token or
+  `LUX_PASSWORD` into an identity.
 - App auth, sessions, refresh tokens, OAuth provider configuration, project
   keys, and row-level grants.
 - Reserved auth tables (`_t:auth.*`) and the raw-KV guard that protects them.

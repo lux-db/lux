@@ -20,6 +20,8 @@ jobs:
 
   build:
     needs: test
+    env:
+      LUX_BUILD_SHA: ${{ github.sha }}
     strategy:
       matrix:
         include:

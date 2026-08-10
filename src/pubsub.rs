@@ -55,7 +55,7 @@ pub struct BlockedPopRequest {
     pub waiter_id: u64,
 }
 
-pub struct BlockedZPopRequest {
+pub struct StreamWaiter {
     pub tx: mpsc::Sender<()>,
     pub waiter_id: u64,
 }
@@ -76,10 +76,12 @@ pub struct Broker {
     key_event_counters: Arc<KeyEventCounters>,
     list_waiters: Arc<parking_lot::Mutex<HashMap<String, VecDeque<BlockedPopRequest>>>>,
     list_waiter_count: Arc<AtomicU64>,
-    zset_waiters: Arc<parking_lot::Mutex<HashMap<String, Vec<BlockedZPopRequest>>>>,
-    zset_waiter_count: Arc<AtomicU64>,
-    stream_waiters: Arc<parking_lot::Mutex<HashMap<String, Vec<mpsc::Sender<()>>>>>,
+    stream_waiters: Arc<parking_lot::Mutex<HashMap<String, Vec<StreamWaiter>>>>,
+    stream_waiter_count: Arc<AtomicU64>,
     waiter_counter: Arc<AtomicU64>,
+    /// Per-table broadcast of typed row deltas for reactive live queries.
+    row_delta_subs: Arc<parking_lot::RwLock<HashMap<String, broadcast::Sender<RowDelta>>>>,
+    row_delta_sub_count: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -95,6 +97,18 @@ pub struct Message {
     pub pattern: Option<String>,
     pub kind: MessageKind,
 }
+
+/// A typed hint, emitted at the table mutation site, that row `pk` in `table`
+/// changed. The live-query engine re-evaluates just that pk against each
+/// affected subscription, so the delta only carries the identity of what moved,
+/// not the row image.
+#[derive(Clone, Debug)]
+pub struct RowDelta {
+    pub table: String,
+    pub pk: String,
+}
+
+const ROW_DELTA_CAPACITY: usize = 4096;
 
 impl Broker {
     pub fn new() -> Self {
@@ -127,7 +141,48 @@ impl Broker {
             zset_waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             zset_waiter_count: Arc::new(AtomicU64::new(0)),
             stream_waiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            stream_waiter_count: Arc::new(AtomicU64::new(0)),
             waiter_counter: Arc::new(AtomicU64::new(0)),
+            row_delta_subs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            row_delta_sub_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Cheap global gate: are there any reactive live-query subscribers at all?
+    /// Checked on the table write hot path before doing any delta work.
+    pub fn has_any_row_delta_subs(&self) -> bool {
+        self.row_delta_sub_count.load(Ordering::Relaxed) > 0
+    }
+
+    /// Subscribe to typed row deltas for `table`. The receiver is per live query.
+    pub fn subscribe_row_deltas(&self, table: &str) -> broadcast::Receiver<RowDelta> {
+        let mut subs = self.row_delta_subs.write();
+        let tx = subs
+            .entry(table.to_string())
+            .or_insert_with(|| broadcast::channel(ROW_DELTA_CAPACITY).0);
+        let rx = tx.subscribe();
+        self.row_delta_sub_count.fetch_add(1, Ordering::Relaxed);
+        rx
+    }
+
+    /// Drop one live-query subscription to `table`'s row deltas.
+    pub fn unsubscribe_row_deltas(&self, table: &str) {
+        self.row_delta_sub_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            })
+            .ok();
+        let mut subs = self.row_delta_subs.write();
+        if subs.get(table).is_some_and(|tx| tx.receiver_count() == 0) {
+            subs.remove(table);
+        }
+    }
+
+    /// Publish a typed row delta to any live queries watching its table.
+    pub fn publish_row_delta(&self, delta: RowDelta) {
+        let subs = self.row_delta_subs.read();
+        if let Some(tx) = subs.get(&delta.table) {
+            let _ = tx.send(delta);
         }
     }
 
@@ -143,6 +198,10 @@ impl Broker {
         self.list_waiter_count.load(Ordering::Relaxed) > 0
     }
 
+    pub fn list_waiter_count(&self) -> u64 {
+        self.list_waiter_count.load(Ordering::Relaxed)
+    }
+
     pub fn register_list_waiter(&self, key: &str, req: BlockedPopRequest) {
         let mut waiters = self.list_waiters.lock();
         waiters.entry(key.to_string()).or_default().push_back(req);
@@ -153,6 +212,7 @@ impl Broker {
         &self,
         key: &str,
         shard_data: &mut crate::store::ShardData,
+        store: &crate::store::Store,
         now: std::time::Instant,
     ) {
         let mut waiters = self.list_waiters.lock();
@@ -179,6 +239,9 @@ impl Broker {
                 list.pop_back()
             };
             if let Some(v) = val {
+                // Decrypt encrypted list elements before handing them to the
+                // blocked waiter (deferred BLPOP/BRPOP resolution).
+                let v = store.decrypt_list_element(v.clone()).unwrap_or(v);
                 let _ = req.tx.try_send((key.to_string(), v));
             }
         }
@@ -248,14 +311,38 @@ impl Broker {
 
     pub fn register_stream_waiter(&self, key: &str, tx: mpsc::Sender<()>) {
         let mut waiters = self.stream_waiters.lock();
-        waiters.entry(key.to_string()).or_default().push(tx);
+        waiters
+            .entry(key.to_string())
+            .or_default()
+            .push(StreamWaiter { tx, waiter_id });
+        self.stream_waiter_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn remove_stream_waiters_by_id(&self, keys: &[String], id: u64) {
+        let mut waiters = self.stream_waiters.lock();
+        for key in keys {
+            if let Some(queue) = waiters.get_mut(key) {
+                let before = queue.len();
+                queue.retain(|r| r.waiter_id != id);
+                let removed = before - queue.len();
+                if removed > 0 {
+                    self.stream_waiter_count
+                        .fetch_sub(removed as u64, Ordering::Relaxed);
+                }
+                if queue.is_empty() {
+                    waiters.remove(key);
+                }
+            }
+        }
     }
 
     pub fn wake_stream_waiters(&self, key: &str) {
         let mut waiters = self.stream_waiters.lock();
         if let Some(senders) = waiters.remove(key) {
-            for tx in senders {
-                let _ = tx.try_send(());
+            self.stream_waiter_count
+                .fetch_sub(senders.len() as u64, Ordering::Relaxed);
+            for waiter in senders {
+                let _ = waiter.tx.try_send(());
             }
         }
     }
@@ -325,6 +412,36 @@ impl Broker {
             }
         }
         count
+    }
+
+    /// PUBSUB CHANNELS: active channels (those with at least one subscriber),
+    /// optionally filtered by a glob `pattern`.
+    pub fn pubsub_channels(&self, pattern: Option<&str>) -> Vec<String> {
+        let channels = self.channels.read();
+        channels
+            .iter()
+            .filter(|(_, tx)| tx.receiver_count() > 0)
+            .map(|(name, _)| name.clone())
+            .filter(|name| pattern.is_none_or(|p| glob_match(p, name)))
+            .collect()
+    }
+
+    /// PUBSUB NUMSUB: number of subscribers for an exact channel name.
+    pub fn pubsub_numsub(&self, channel: &str) -> i64 {
+        let channels = self.channels.read();
+        channels
+            .get(channel)
+            .map(|tx| tx.receiver_count() as i64)
+            .unwrap_or(0)
+    }
+
+    /// PUBSUB NUMPAT: number of active pattern subscriptions.
+    pub fn pubsub_numpat(&self) -> i64 {
+        let patterns = self.pattern_subs.read();
+        patterns
+            .values()
+            .filter(|tx| tx.receiver_count() > 0)
+            .count() as i64
     }
 
     pub fn ksubscribe(&self, pattern: &str) -> broadcast::Receiver<Message> {
@@ -703,5 +820,46 @@ mod tests {
             rx2.try_recv().err(),
             Some(broadcast::error::TryRecvError::Empty)
         );
+    }
+
+    #[test]
+    fn row_delta_subscriber_count_gates_and_reclaims() {
+        let broker = Broker::new();
+        assert!(!broker.has_any_row_delta_subs());
+
+        let rx1 = broker.subscribe_row_deltas("tasks");
+        let mut rx2 = broker.subscribe_row_deltas("tasks");
+        assert!(broker.has_any_row_delta_subs());
+
+        // A published delta reaches every live receiver on the table.
+        broker.publish_row_delta(RowDelta {
+            table: "tasks".to_string(),
+            pk: "t1".to_string(),
+        });
+        assert_eq!(rx2.try_recv().unwrap().pk, "t1");
+
+        // Dropping one receiver then unsubscribing keeps the channel (rx2 lives).
+        drop(rx1);
+        broker.unsubscribe_row_deltas("tasks");
+        assert!(broker.has_any_row_delta_subs());
+        assert!(broker.row_delta_subs.read().contains_key("tasks"));
+
+        // Dropping the last receiver before unsubscribe reclaims the channel and
+        // flips the global gate back off.
+        drop(rx2);
+        broker.unsubscribe_row_deltas("tasks");
+        assert!(!broker.has_any_row_delta_subs());
+        assert!(!broker.row_delta_subs.read().contains_key("tasks"));
+    }
+
+    #[test]
+    fn publish_row_delta_to_idle_table_is_noop() {
+        let broker = Broker::new();
+        // No panic, no subscribers, nothing to receive.
+        broker.publish_row_delta(RowDelta {
+            table: "ghost".to_string(),
+            pk: "x".to_string(),
+        });
+        assert!(!broker.has_any_row_delta_subs());
     }
 }

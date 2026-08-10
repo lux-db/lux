@@ -1,4 +1,5 @@
 use bytes::BytesMut;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::pubsub::Broker;
@@ -6,6 +7,12 @@ use crate::resp;
 use crate::store::Store;
 
 use super::{arg_str, cmd_eq, is_restricted, CmdResult};
+
+static ZSET_MAX_ZIPLIST_ENTRIES: AtomicUsize = AtomicUsize::new(128);
+
+pub(crate) fn zset_max_ziplist_entries() -> usize {
+    ZSET_MAX_ZIPLIST_ENTRIES.load(Ordering::Relaxed)
+}
 
 pub fn cmd_ping(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
     if args.len() > 1 {
@@ -110,7 +117,11 @@ pub fn cmd_info(
     } else {
         "all".to_string()
     };
-    let info = build_info(store, broker, &section, now);
+    let mut info = build_info(store, broker, &section, now);
+    if section == "all" || section == "push" {
+        info.push_str("\r\n");
+        crate::push::append_info(&mut info);
+    }
     resp::write_bulk(out, &info);
     CmdResult::Written
 }
@@ -175,26 +186,68 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub fn cmd_auth(args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+pub fn cmd_auth(
+    args: &[&[u8]],
+    store: &Store,
+    cache: &crate::tables::SharedSchemaCache,
+    out: &mut BytesMut,
+    _now: Instant,
+) -> CmdResult {
     if args.len() < 2 {
         resp::write_error(out, "ERR wrong number of arguments for 'auth' command");
         return CmdResult::Written;
     }
-    let expected = &store.config().password;
-    if expected.is_empty() {
+    // RESP accepts the operator password or a secret key. A publishable key is
+    // browser-embedded and must never reach this protocol, so the resolver
+    // rejects it for `Surface::Resp` and we surface that reason verbatim.
+    let presented = arg_str(args[1]);
+    let no_credentials =
+        store.config().password.is_empty() && !crate::auth::project_keys_configured(store, cache);
+    if no_credentials {
         resp::write_error(out, "ERR Client sent AUTH, but no password is set");
-    } else if constant_time_eq(arg_str(args[1]).as_bytes(), expected.as_bytes()) {
-        resp::write_ok(out);
-        return CmdResult::Authenticated;
-    } else {
-        resp::write_error(out, "WRONGPASS invalid password");
+        return CmdResult::Written;
     }
-    CmdResult::Written
+    match crate::auth::resolve_credential(presented, "", crate::auth::Surface::Resp, store, cache) {
+        Ok(crate::auth::Credential::Operator | crate::auth::Credential::Secret) => {
+            resp::write_ok(out);
+            CmdResult::Authenticated
+        }
+        Err(e) => {
+            resp::write_error(out, &format!("WRONGPASS {e}"));
+            CmdResult::Written
+        }
+        Ok(_) => {
+            resp::write_error(out, "WRONGPASS invalid password");
+            CmdResult::Written
+        }
+    }
 }
 
 pub fn cmd_config(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
-    if args.len() > 1 && cmd_eq(args[1], b"GET") {
-        resp::write_array_header(out, 0);
+    if args.len() > 2 && cmd_eq(args[1], b"GET") {
+        if cmd_eq(args[2], b"zset-max-ziplist-entries")
+            || cmd_eq(args[2], b"zset-max-listpack-entries")
+        {
+            resp::write_array_header(out, 2);
+            resp::write_bulk(out, arg_str(args[2]));
+            resp::write_bulk(out, &zset_max_ziplist_entries().to_string());
+        } else {
+            resp::write_array_header(out, 0);
+        }
+    } else if args.len() > 3 && cmd_eq(args[1], b"SET") {
+        if cmd_eq(args[2], b"zset-max-ziplist-entries")
+            || cmd_eq(args[2], b"zset-max-listpack-entries")
+        {
+            match arg_str(args[3]).parse::<usize>() {
+                Ok(value) => {
+                    ZSET_MAX_ZIPLIST_ENTRIES.store(value, Ordering::Relaxed);
+                    resp::write_ok(out);
+                }
+                Err(_) => resp::write_error(out, "ERR invalid argument"),
+            }
+        } else {
+            resp::write_ok(out);
+        }
     } else {
         resp::write_ok(out);
     }
@@ -206,17 +259,143 @@ pub fn cmd_client(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Ins
     CmdResult::Written
 }
 
-pub fn cmd_select(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
-    resp::write_ok(out);
+pub fn cmd_select(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    // Lux is single-database. SELECT 0 is a no-op OK; any other index is an
+    // honest out-of-range error instead of a silent fake OK.
+    let Some(idx) = args.get(1) else {
+        resp::write_error(out, "ERR wrong number of arguments for 'select' command");
+        return CmdResult::Written;
+    };
+    match arg_str(idx).parse::<i64>() {
+        Ok(0) => resp::write_ok(out),
+        Ok(_) => resp::write_error(out, "ERR DB index is out of range"),
+        Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
+    }
     CmdResult::Written
 }
 
 pub fn cmd_command(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
-    if args.len() > 1 && cmd_eq(args[1], b"DOCS") {
+    if args.len() > 1 && cmd_eq(args[1], b"COUNT") {
+        // Real count of registered commands, not a fake +OK.
+        resp::write_integer(out, super::command_count() as i64);
+    } else if args.len() > 1 && (cmd_eq(args[1], b"GETKEYS") || cmd_eq(args[1], b"GETKEYSANDFLAGS"))
+    {
+        resp::write_error(out, "ERR COMMAND GETKEYS is not supported");
+    } else {
+        // COMMAND / COMMAND INFO / COMMAND DOCS / COMMAND LIST: per-command
+        // metadata is not implemented yet, so return an empty array of the
+        // correct shape rather than a fake +OK.
+        resp::write_array_header(out, 0);
+    }
+    CmdResult::Written
+}
+
+/// WAIT reports how many replicas acknowledged. Lux has no replication, so the
+/// honest answer is the integer 0 (Redis WAIT returns an integer, not +OK).
+pub fn cmd_wait(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    resp::write_integer(out, 0);
+    CmdResult::Written
+}
+
+/// SWAPDB requires multiple databases, which Lux does not have.
+pub fn cmd_swapdb(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    resp::write_error(out, "ERR SWAPDB is not supported: Lux is a single database");
+    CmdResult::Written
+}
+
+/// LATENCY: no latency monitoring is kept. RESET clears 0 events; the reporting
+/// forms return an empty array of the right shape instead of a fake +OK.
+pub fn cmd_latency(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    if args.len() > 1 && cmd_eq(args[1], b"RESET") {
+        resp::write_integer(out, 0);
+    } else {
+        resp::write_array_header(out, 0);
+    }
+    CmdResult::Written
+}
+
+/// RESET replies with the +RESET status line (Redis-correct), not +OK.
+pub fn cmd_reset(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    resp::write_simple(out, "RESET");
+    CmdResult::Written
+}
+
+/// Redis Functions are not implemented. LIST honestly reports no libraries; any
+/// other subcommand returns a clear unsupported error instead of a fake +OK.
+pub fn cmd_function(
+    args: &[&[u8]],
+    _store: &Store,
+    out: &mut BytesMut,
+    _now: Instant,
+) -> CmdResult {
+    if args.len() > 1 && cmd_eq(args[1], b"LIST") {
         resp::write_array_header(out, 0);
     } else {
-        resp::write_ok(out);
+        resp::write_error(out, "ERR FUNCTION is not supported");
     }
+    CmdResult::Written
+}
+
+/// DUMP has no serialization format in Lux; a fake +OK would hand clients a
+/// bogus payload, so return a clear unsupported error.
+pub fn cmd_dump(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() != 2 {
+        resp::write_error(out, "ERR wrong number of arguments for 'dump' command");
+        return CmdResult::Written;
+    }
+    match store.dump_key(args[1], now) {
+        Ok(Some(blob)) => resp::write_bulk_raw(out, &blob),
+        Ok(None) => resp::write_null(out),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+/// RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME n] [FREQ n].
+/// The serialized value must come from Lux DUMP (not RDB-compatible).
+pub fn cmd_restore(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 4 {
+        resp::write_error(out, "ERR wrong number of arguments for 'restore' command");
+        return CmdResult::Written;
+    }
+    let Ok(ttl_ms) = arg_str(args[2]).parse::<i64>() else {
+        resp::write_error(out, "ERR value is not an integer or out of range");
+        return CmdResult::Written;
+    };
+    let mut replace = false;
+    let mut absttl = false;
+    let mut i = 4;
+    while i < args.len() {
+        if cmd_eq(args[i], b"REPLACE") {
+            replace = true;
+            i += 1;
+        } else if cmd_eq(args[i], b"ABSTTL") {
+            absttl = true;
+            i += 1;
+        } else if (cmd_eq(args[i], b"IDLETIME") || cmd_eq(args[i], b"FREQ")) && i + 1 < args.len() {
+            // Accepted for compatibility; Lux does not use LRU/LFU restore hints.
+            i += 2;
+        } else {
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
+        }
+    }
+    match store.restore_key(args[1], ttl_ms, args[3], replace, absttl, now) {
+        Ok(()) => resp::write_ok(out),
+        Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+/// TOUCH key [key ...]: returns the number of keys that exist (Lux does not
+/// track access recency for eviction the way Redis LRU/LFU does).
+pub fn cmd_touch(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 2 {
+        resp::write_error(out, "ERR wrong number of arguments for 'touch' command");
+        return CmdResult::Written;
+    }
+    let keys: Vec<&[u8]> = args[1..].to_vec();
+    resp::write_integer(out, store.exists(&keys, now));
     CmdResult::Written
 }
 
@@ -248,6 +427,8 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
          \r\n\
          # Clients\r\n\
          connected_clients:{}\r\n\
+         blocked_list_waiters:{}\r\n\
+         blocked_stream_waiters:{}\r\n\
          \r\n\
          # Stats\r\n\
          total_commands_processed:{}\r\n\
@@ -279,6 +460,8 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
         store.shard_count(),
         store.uptime_seconds(),
         store.connected_clients(),
+        broker.list_waiter_count(),
+        broker.stream_waiter_count(),
         store.total_commands(),
         key_event_stats.enqueued,
         key_event_stats.dropped,

@@ -22,6 +22,74 @@ fn multi_set_get_exec_returns_array() {
 }
 
 #[test]
+fn multi_eval_exec_applies_script_and_returns_result() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+
+    assert!(send_and_read(&mut conn, &["MULTI"]).contains("+OK"));
+    assert!(send_and_read(
+        &mut conn,
+        &[
+            "EVAL",
+            "redis.call('SET', KEYS[1], ARGV[1]); return redis.call('GET', KEYS[1])",
+            "1",
+            "txlua",
+            "scripted",
+        ],
+    )
+    .contains("+QUEUED"));
+    assert!(send_and_read(&mut conn, &["GET", "txlua"]).contains("+QUEUED"));
+
+    let resp = send_and_read(&mut conn, &["EXEC"]);
+    assert!(resp.contains("*2"), "EXEC array: {resp}");
+    assert!(
+        resp.contains("scripted"),
+        "EXEC contains Lua result: {resp}"
+    );
+
+    let resp = send_and_read(&mut conn, &["GET", "txlua"]);
+    assert!(resp.contains("scripted"), "script write persisted: {resp}");
+}
+
+#[test]
+fn multi_evalsha_exec_uses_loaded_script_engine() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+
+    let resp = send_and_read(
+        &mut conn,
+        &[
+            "SCRIPT",
+            "LOAD",
+            "redis.call('INCRBY', KEYS[1], ARGV[1]); return redis.call('GET', KEYS[1])",
+        ],
+    );
+    let sha = resp
+        .lines()
+        .find(|l| l.len() > 10 && !l.starts_with('$'))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    assert!(!sha.is_empty(), "SCRIPT LOAD returned sha: {resp}");
+
+    assert!(send_and_read(&mut conn, &["MULTI"]).contains("+OK"));
+    assert!(
+        send_and_read(&mut conn, &["EVALSHA", &sha, "1", "txcounter", "7"]).contains("+QUEUED")
+    );
+    assert!(
+        send_and_read(&mut conn, &["EVALSHA", &sha, "1", "txcounter", "5"]).contains("+QUEUED")
+    );
+
+    let resp = send_and_read(&mut conn, &["EXEC"]);
+    assert!(resp.contains("*2"), "EXEC array: {resp}");
+    assert!(resp.contains("7"), "first EVALSHA result: {resp}");
+    assert!(resp.contains("12"), "second EVALSHA result: {resp}");
+
+    let resp = send_and_read(&mut conn, &["GET", "txcounter"]);
+    assert!(resp.contains("12"), "counter persisted: {resp}");
+}
+
+#[test]
 fn multi_discard_clears_queue() {
     let server = LuxServer::start();
     let mut conn = server.conn();

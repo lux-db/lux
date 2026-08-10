@@ -66,20 +66,23 @@ fn evalsha_after_script_load() {
 fn pipelined_evalsha_does_not_deadlock() {
     let server = LuxServer::start();
     let mut conn = server.conn();
-    let resp = send_and_read(&mut conn, &["SCRIPT", "LOAD", "return 123"]);
+    let resp = send_and_read(&mut conn, &["SCRIPT", "LOAD", "return redis.call('PING')"]);
     let sha = resp
         .lines()
         .find(|l| l.len() > 10 && !l.starts_with('$'))
         .unwrap_or("")
-        .trim();
+        .trim()
+        .to_string();
+    assert!(!sha.is_empty(), "script load returned sha: {resp}");
 
-    let mut pipeline = resp_cmd(&["EVALSHA", sha, "0"]);
-    pipeline.extend_from_slice(&resp_cmd(&["PING"]));
-    conn.write_all(&pipeline).unwrap();
-    thread::sleep(Duration::from_millis(50));
+    conn.set_read_timeout(Some(Duration::from_millis(1000)))
+        .unwrap();
+    conn.write_all(&resp_cmd(&["EVALSHA", &sha, "0"])).unwrap();
+    conn.write_all(&resp_cmd(&["EVALSHA", &sha, "0"])).unwrap();
+
     let resp = read_all(&mut conn);
-    assert!(resp.contains(":123"), "evalsha response: {resp}");
-    assert!(resp.contains("PONG"), "ping response: {resp}");
+    let pongs = resp.matches("PONG").count();
+    assert_eq!(pongs, 2, "pipelined evalsha responses: {resp}");
 }
 
 #[test]
@@ -217,4 +220,31 @@ fn eval_denies_admin_and_control_commands() {
             "`{cmd}` must be denied from scripts: {resp}"
         );
     }
+}
+
+#[test]
+fn ping_remains_responsive_while_lua_script_is_busy() {
+    let server = LuxServer::start();
+    let mut script_conn = server.conn();
+    script_conn
+        .set_read_timeout(Some(Duration::from_millis(5000)))
+        .unwrap();
+
+    let script = "for i = 1, 100000 do redis.call('PING') end; return 1";
+    script_conn
+        .write_all(&resp_cmd(&["EVAL", script, "0"]))
+        .unwrap();
+    thread::sleep(Duration::from_millis(25));
+
+    let mut ping_conn = server.conn();
+    ping_conn
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let resp = send_and_read(&mut ping_conn, &["PING"]);
+    assert!(
+        resp.contains("PONG"),
+        "PING should bypass script gate: {resp}"
+    );
+
+    let _ = read_all(&mut script_conn);
 }

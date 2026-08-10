@@ -1,10 +1,12 @@
 mod common;
 use common::{send, LuxServer};
 
+#[track_caller]
 fn assert_has(resp: &str, needle: &str) {
     assert!(resp.contains(needle), "missing {needle:?}: {resp}");
 }
 
+#[track_caller]
 fn assert_error(resp: &str) {
     assert!(resp.starts_with("-ERR"), "expected error, got: {resp}");
 }
@@ -147,15 +149,16 @@ fn expire_ttl_and_persist_surface() {
     let server = LuxServer::start();
     let mut conn = server.conn();
 
-    send(&mut conn, &["SET", "exp", "v"]);
-    assert_has(&send(&mut conn, &["EXPIRE", "exp", "10"]), ":1");
+    assert_has(&send(&mut conn, &["SET", "exp", "v"]), "+OK");
+    assert_has(&send(&mut conn, &["GET", "exp"]), "v");
+    assert_has(&send(&mut conn, &["EXPIRE", "exp", "60"]), ":1");
     assert_has(&send(&mut conn, &["TTL", "exp"]), ":");
     assert_has(&send(&mut conn, &["PTTL", "exp"]), ":");
     assert_has(&send(&mut conn, &["EXPIRETIME", "exp"]), ":");
     assert_has(&send(&mut conn, &["PEXPIRETIME", "exp"]), ":");
     assert_has(&send(&mut conn, &["PERSIST", "exp"]), ":1");
     assert_has(&send(&mut conn, &["TTL", "exp"]), ":-1");
-    assert_has(&send(&mut conn, &["PEXPIRE", "exp", "10000"]), ":1");
+    assert_has(&send(&mut conn, &["PEXPIRE", "exp", "60000"]), ":1");
     assert_has(
         &send(&mut conn, &["PEXPIREAT", "exp", "9999999999999"]),
         ":1",

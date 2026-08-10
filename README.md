@@ -5,8 +5,12 @@
 <h1 align="center">Lux</h1>
 
 <p align="center">
-  <strong>An open-source application database engine.</strong><br/>
-  Tables, cache, vectors, realtime, queues, time series, auth, and Redis-compatible commands in one Rust runtime. MIT licensed forever.
+  <strong>A database that works the way your app does.</strong>
+</p>
+
+<p align="center">
+  The Application Database: one engine for tables, cache, vectors, realtime, queues, time series,<br/>
+  and auth, instead of six services glued together. Written in Rust. MIT licensed forever.
 </p>
 
 <p align="center">
@@ -33,13 +37,19 @@ Use Lux when you want one database process to cover the hot path of your applica
 
 ## Why Lux?
 
-Redis is single-threaded by design. That simplicity is part of why it became foundational infrastructure. But it also creates a ceiling: once one core is saturated, the usual answer is to shard at the client or cluster level and accept the operational complexity.
+Every app has a second data layer beyond its primary rows: cache, sessions, live UI state, semantic search, jobs, metrics, queues, leaderboards. Today you assemble it from Redis + Postgres + Pinecone + Kafka-style plumbing + BullMQ + a metrics store, each its own connection string, SDK, dashboard, bill, and thing that breaks at 3am.
 
-Lux uses a **sharded concurrent architecture** that safely uses all your cores in a single process. Each key maps to one of N shards, each protected by a `parking_lot` RwLock. Reads never block reads. Writes only block the shard they touch. Tokio handles thousands of connections across cores. The result is single-digit microsecond latency at low concurrency and throughput that keeps scaling with cores and pipeline depth.
+Lux collapses that into one engine. Tables, cache, vectors, realtime, queues, time series, and auth share one runtime, one connection surface, one durability layer, and one SDK. You add primitives as the app needs them instead of standing up another service for each one.
+
+It speaks RESP, so your existing Redis clients (ioredis, redis-py, go-redis, Jedis, redis-rb, redis-cli), BullMQ, and tooling connect unchanged. That compatibility is the on-ramp, not the ceiling; reach for the Lux SDK and CLI when you want tables, migrations, gateway auth, and app-first workflows.
+
+## Performance
+
+Redis is single-threaded by design, which caps one instance at a single core. Lux uses a **sharded concurrent architecture** that safely uses all your cores in one process. Each key maps to one of N shards, each protected by a `parking_lot` RwLock. Reads never block reads. Writes only block the shard they touch. Tokio handles thousands of connections across cores. The result is single-digit microsecond latency at low concurrency and throughput that keeps scaling with cores and pipeline depth.
 
 The concurrency model is deliberately conservative. Commands acquire a shard lock, do their work, and release it. There are no cross-shard locks in normal command execution and no lock-ordering games. MULTI/EXEC uses WATCH-based optimistic concurrency with shard versioning, matching what Redis clients rely on.
 
-**Compatibility:** ioredis, redis-py, go-redis, Jedis, redis-rb, BullMQ, redis-cli, and other RESP clients can connect directly. Use the Lux SDK and CLI when you want higher-level tables, migrations, Cloud gateway auth, and app-first workflows.
+As a drop-in for Redis workloads, it's also faster on the measured single-key command set:
 
 ### Benchmarks
 
@@ -77,7 +87,7 @@ Lux Cloud is the fastest path when you want to build an app backend around Lux w
 ## Features
 
 - **200+ commands** -- strings, lists, hashes, sets, sorted sets, streams, vectors, geo, time series, tables, HyperLogLog, bitops, pub/sub, transactions
-- **Relational tables** -- TCREATE, TINSERT, TSELECT, TUPDATE (WHERE), TDELETE (WHERE), TALTER with typed fields (str, int, float, bool, timestamp, uuid, vector, json, array), unique constraints, foreign keys, joins, GROUP BY/HAVING, WHERE/ORDER BY/LIMIT, `IN`/`NOT IN`, JSON dot-path queries with `IS VALID`, array `CONTAINS`, declared JSON-path indexes, and vector-aware NEAR queries. Structured data without standing up a separate primary database
+- **Relational tables** -- TCREATE, TINSERT, TSELECT, TUPDATE (WHERE), TDELETE (WHERE), TALTER with typed fields (str, int, float, bool, timestamp, uuid, vector, json, array), unique constraints, foreign keys, encrypted columns, joins, GROUP BY/HAVING, WHERE/ORDER BY/LIMIT, `IN`/`NOT IN`, JSON dot-path queries with `IS VALID`, array `CONTAINS`, declared JSON-path indexes, and vector-aware NEAR queries. Structured data without standing up a separate primary database
 - **Realtime key subscriptions** -- KSUB/KUNSUB: subscribe to key patterns, receive events when matching keys are mutated. Zero overhead when unused. No global config flags, no separate services. Unlike Redis keyspace notifications which tax every write globally, KSUB is surgical and async
 - **Native time series** -- TSADD, TSGET, TSRANGE, TSMRANGE with aggregation (avg, sum, min, max, count, std), retention policies, and label-based filtering. No modules, no sidecars. TSGET 4x faster than Redis GET
 - **Native vector search** -- VSET, VGET, VSEARCH with cosine similarity and metadata filtering, plus `VECTOR(n)` table columns that compose with table filters and live queries. No extensions, no sidecars
@@ -93,7 +103,7 @@ Lux Cloud is the fastest path when you want to build an app backend around Lux w
 - **Zero-copy parser** -- RESP arguments are byte slices into the read buffer
 - **Pipeline batching** -- consecutive same-shard commands batched under a single lock
 - **Persistence** -- automatic snapshots, write-ahead log (WAL) with CRC32 checksums, tiered hot/cold storage with automatic eviction to disk
-- **Auth** -- password authentication via `LUX_PASSWORD`, plus optional app auth with users, identities, sessions, OAuth providers, JWTs, auth-owned system tables, and per-table row-level grants (`GRANT read, write ON t WHERE user_id = auth.uid()`) that gate reads, writes, and `.live()`
+- **Auth** -- project secret/publishable keys or the `LUX_PASSWORD` operator credential, plus optional app auth with users, identities, sessions, OAuth providers, JWTs, auth-owned system tables, and per-table row-level grants (`GRANT read, write ON t WHERE user_id = auth.uid()`) that gate reads, writes, and `.live()`
 - **Pub/Sub** -- SUBSCRIBE, PSUBSCRIBE, PUBLISH, plus KSUB/KUNSUB for realtime key change events
 - **TTL support** -- EX, PX, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL
 - **MIT licensed** -- no license rug-pulls, unlike Redis (RSALv2/SSPL)
@@ -295,6 +305,12 @@ redis-cli TSELECT '*' FROM events WHERE metadata.count IS VALID       # existenc
 redis-cli TSELECT '*' FROM events WHERE tags CONTAINS a               # array membership; tags.0 indexes an element
 redis-cli TINDEX events metadata.plan.tier STR                        # declare a JSON-path index
 
+# Encrypted columns keep values encrypted in WAL/snapshots/tiered storage.
+# Add SEARCHABLE when you need exact equality filters or UNIQUE. ENCRYPTED
+# columns do not support DEFAULT because defaults are stored in schema metadata.
+redis-cli TCREATE secrets id UUID PRIMARY KEY, token STR ENCRYPTED, email STR UNIQUE ENCRYPTED SEARCHABLE
+redis-cli TSELECT '*' FROM secrets WHERE email = alice@example.com
+
 # Alter tables
 redis-cli TALTER users ADD role STR
 redis-cli TALTER users DROP role
@@ -302,7 +318,7 @@ redis-cli TALTER users DROP role
 
 Field types: `STR`, `INT`, `FLOAT`, `BOOL`, `TIMESTAMP`, `UUID`, `VECTOR(n)`, `JSON`, `ARRAY`.
 WHERE operators: `= != < > <= >=`, `IN`/`NOT IN`, JSON `IS VALID`/`IS NOT VALID`, and `CONTAINS`.
-Use SQL-style constraints like `UNIQUE`, `PRIMARY KEY`, and `REFERENCES table(field)`.
+Use SQL-style constraints like `UNIQUE`, `PRIMARY KEY`, and `REFERENCES table(field)`. Encrypted columns and encrypted provider secrets use native `ENC` state (`ENC INIT`, `ENC ROTATE`, `ENC LIST`); `lux start` and Lux Cloud auto-initialize their managed keyrings.
 
 ### CLI
 
@@ -313,20 +329,24 @@ curl -fsSL https://luxdb.dev/install.sh | sh
 ```bash
 lux init                               # scaffold local Lux project files
 lux start                              # run a local engine + Studio (web UI) in Docker
+lux start --bind 0.0.0.0               # explicitly expose local ports on the network
 lux studio                             # open Lux Studio against the local engine
 lux stop                               # stop the local engine + Studio
 lux login                              # authenticate with a lux_ token
-lux link my-app                        # save a default project for this repo
+lux link my-app                        # associate this repo with a cloud project
+lux target                             # show local, linked-cloud, and app-env targets
 lux projects                           # list projects
 lux create my-app --accept-charges     # create a new project
-lux status                             # show linked project status and metrics
+lux status                             # show local engine status
+lux status my-app                      # show explicit cloud status and metrics
 lux exec my-app SET hello world        # run a command
-lux logs                               # fetch linked project logs
-lux restart                            # restart linked project
+lux logs my-app                        # fetch explicit cloud project logs
+lux restart my-app                     # restart explicit cloud project
 lux connect my-app                     # interactive REPL via cloud
 lux connect lux://localhost:6379       # connect to local instance
 lux keys list                          # list project API keys
-lux env pull                           # write .env.local for the linked project
+lux env pull my-app                    # save a private cloud env profile
+lux env use my-app                     # safely activate its Lux variables
 lux destroy my-app --accept-consequences  # delete project
 ```
 
@@ -441,74 +461,81 @@ Project clients use the Cloud/self-hosted HTTP gateway and return `{ data, error
 Lux has a built-in HTTP/JSON API. Set `LUX_HTTP_PORT` to enable it alongside the RESP protocol. Every data primitive gets its own RESTful routes.
 
 ```bash
-LUX_HTTP_PORT=8080 ./target/release/lux
+LUX_HTTP_PORT=5890 ./target/release/lux
 ```
 
 **Key-Value:**
 ```bash
-curl http://localhost:8080/v1/kv/mykey                    # GET
-curl -X PUT http://localhost:8080/v1/kv/mykey \
+curl http://localhost:5890/v1/kv/mykey                    # GET
+curl -X PUT http://localhost:5890/v1/kv/mykey \
   -d '{"value":"hello","ex":3600}'                        # SET (with optional TTL)
-curl -X DELETE http://localhost:8080/v1/kv/mykey           # DEL
-curl -X POST http://localhost:8080/v1/kv/counter/incr      # INCR
-curl http://localhost:8080/v1/kv/myhash/hash               # HGETALL
-curl http://localhost:8080/v1/kv/mylist/list                # LRANGE
-curl http://localhost:8080/v1/kv/myset/set                 # SMEMBERS
-curl http://localhost:8080/v1/kv/myzset/zset               # ZRANGEBYSCORE
+curl -X DELETE http://localhost:5890/v1/kv/mykey           # DEL
+curl -X POST http://localhost:5890/v1/kv/counter/incr      # INCR
+curl http://localhost:5890/v1/kv/myhash/hash               # HGETALL
+curl http://localhost:5890/v1/kv/mylist/list                # LRANGE
+curl http://localhost:5890/v1/kv/myset/set                 # SMEMBERS
+curl http://localhost:5890/v1/kv/myzset/zset               # ZRANGEBYSCORE
 ```
 
 **Tables:**
 ```bash
-curl -X POST http://localhost:8080/v1/tables \
+curl -X POST http://localhost:5890/v1/tables \
   -d '{"name":"users","columns":["id INT PRIMARY KEY","name STR","age INT"]}'   # TCREATE
-curl http://localhost:8080/v1/tables                        # TLIST
-curl -X POST http://localhost:8080/v1/tables/users \
+curl http://localhost:5890/v1/tables                        # TLIST
+curl -X POST http://localhost:5890/v1/tables/users \
   -d '{"name":"Alice","age":"28"}'                          # TINSERT
-curl 'http://localhost:8080/v1/tables/users?where=age>25&order=name&limit=10'  # TSELECT
-curl http://localhost:8080/v1/tables/users/1                # row lookup endpoint
-curl -X PUT http://localhost:8080/v1/tables/users/1 \
+curl 'http://localhost:5890/v1/tables/users?where=age>25&order=name&limit=10'  # TSELECT
+curl http://localhost:5890/v1/tables/users/1                # row lookup endpoint
+curl -X PUT http://localhost:5890/v1/tables/users/1 \
   -d '{"name":"Alicia"}'                                    # TUPDATE ... WHERE id = 1
-curl -X DELETE http://localhost:8080/v1/tables/users/1      # TDELETE FROM ... WHERE id = 1
+curl -X DELETE http://localhost:5890/v1/tables/users/1      # TDELETE FROM ... WHERE id = 1
 ```
 
 **Time Series:**
 ```bash
-curl -X POST http://localhost:8080/v1/ts/cpu:host1 \
+curl -X POST http://localhost:5890/v1/ts/cpu:host1 \
   -d '{"value":72.5,"labels":{"host":"server1"}}'          # TSADD
-curl http://localhost:8080/v1/ts/cpu:host1/latest           # TSGET
-curl 'http://localhost:8080/v1/ts/cpu:host1?from=-&to=+&agg=avg&bucket=3600000'  # TSRANGE
-curl http://localhost:8080/v1/ts/cpu:host1/info             # TSINFO
+curl http://localhost:5890/v1/ts/cpu:host1/latest           # TSGET
+curl 'http://localhost:5890/v1/ts/cpu:host1?from=-&to=+&agg=avg&bucket=3600000'  # TSRANGE
+curl http://localhost:5890/v1/ts/cpu:host1/info             # TSINFO
 ```
 
 **Vectors:**
 ```bash
-curl -X POST http://localhost:8080/v1/vectors/doc:1 \
+curl -X POST http://localhost:5890/v1/vectors/doc:1 \
   -d '{"vector":[0.1,0.2,0.3],"metadata":{"title":"hello"}}'  # VSET
-curl http://localhost:8080/v1/vectors/doc:1                     # VGET
-curl -X POST http://localhost:8080/v1/vectors/search \
+curl http://localhost:5890/v1/vectors/doc:1                     # VGET
+curl -X POST http://localhost:5890/v1/vectors/search \
   -d '{"vector":[0.1,0.2,0.3],"k":5}'                         # VSEARCH
-curl http://localhost:8080/v1/vectors                            # VCARD
+curl http://localhost:5890/v1/vectors                            # VCARD
 ```
 
 **Exec (any command):**
 ```bash
-curl -X POST http://localhost:8080/v1/exec \
+curl -X POST http://localhost:5890/v1/exec \
   -d '{"command":["HSET","user:1","name","alice"]}'
 ```
 
-Auth via `Authorization: Bearer <password>` when `LUX_PASSWORD` is set. CORS enabled by default. 174K ops/sec at 256 concurrent connections with keep-alive.
+Auth via `Authorization: Bearer <credential>` where the credential is a project secret key (`lux_sec_*`) or the operator password. CORS enabled by default. 174K ops/sec at 256 concurrent connections with keep-alive.
 
 ### App Auth
 
-Lux can also expose a Supabase-style app auth surface. This is optional and is separate from the database password:
+Lux can also expose a Supabase-style app auth surface. Project keys are engine
+credentials in their own right, so one secret key covers auth, data, native
+commands, vectors, pubsub, lua and `.live()`:
 
-- `LUX_PASSWORD` protects direct RESP/admin HTTP access.
+- `LUX_PASSWORD` is the operator/break-glass credential; it still works everywhere.
 - `LUX_AUTH_ENABLED=true` creates and serves app auth endpoints.
 - `LUX_AUTH_PUBLISHABLE_KEY` is safe for browser/client auth calls.
-- `LUX_AUTH_SECRET_KEY` is for trusted servers and admin auth operations.
+- `LUX_AUTH_SECRET_KEY` is the server-side credential: full project access on
+  every surface, including RESP.
+
+An engine is credential-gated once it has a password *or* project keys.
+Publishable keys never reach RESP and, on HTTP, reach only `/auth/v1/*` until a
+signed-in user's JWT accompanies them; grants then decide which rows.
 
 ```bash
-LUX_HTTP_PORT=8080 \
+LUX_HTTP_PORT=5890 \
 LUX_AUTH_ENABLED=true \
 LUX_AUTH_PUBLISHABLE_KEY=lux_pub_local \
 LUX_AUTH_SECRET_KEY=lux_sec_local \
@@ -534,24 +561,66 @@ POST /auth/v1/token
 GET  /auth/v1/user
 POST /auth/v1/logout
 GET  /auth/v1/authorize?provider=google&redirect_to=http://localhost:5173/callback
+POST /auth/v1/signin/apple
 ```
+
+OAuth authorization-code clients can send an RFC 7636
+`code_challenge` with `code_challenge_method=S256`, then include the matching
+`code_verifier` in the token exchange. Lux binds and verifies the pair before
+consuming the one-time code. PKCE is required for custom-scheme callback URLs;
+browser HTTP(S) flows remain backward compatible.
+
+Lux supports Google, GitHub, and Apple OAuth. Configure a local or remote
+self-hosted engine with the CLI; managed Cloud projects use the **Auth** page in
+the Lux dashboard.
+
+```bash
+# Google
+lux auth provider google \
+  --client-id GOOGLE_CLIENT_ID \
+  --client-secret GOOGLE_CLIENT_SECRET
+
+# GitHub
+lux auth provider github \
+  --client-id GITHUB_CLIENT_ID \
+  --client-secret GITHUB_CLIENT_SECRET
+
+# Native iOS/macOS
+lux auth provider apple --bundle-id com.example.app
+
+# Apple web (the engine must be reachable at a public HTTPS URL)
+lux auth provider apple \
+  --url https://db.example.com \
+  --password "$LUX_ENGINE_PASSWORD" \
+  --services-id com.example.web \
+  --team-id YOUR_TEAM_ID \
+  --key-id YOUR_KEY_ID \
+  --p8 /path/to/AuthKey.p8
+```
+
+`lux start` initializes encrypted provider storage automatically. Other
+self-hosted deployments must initialize the keyring before uploading an Apple
+`.p8`; Lux refuses to persist that key in plaintext. Remote provider
+configuration requires HTTPS, while plain HTTP is accepted only for localhost.
+Local Studio exposes the same Google, GitHub, and Apple provider settings from
+its **Auth -> Providers** tab.
 
 OAuth providers are configured through admin routes with a secret key:
 
 ```bash
-curl -X PUT http://localhost:8080/auth/v1/admin/providers/google \
+curl -X PUT http://localhost:5890/auth/v1/admin/providers/google \
   -H "Authorization: Bearer lux_sec_local" \
   -H "Content-Type: application/json" \
   -d '{
     "enabled": true,
     "client_id": "GOOGLE_CLIENT_ID",
     "client_secret": "GOOGLE_CLIENT_SECRET",
-    "redirect_uri": "http://localhost:8080/auth/v1/callback/google",
+    "redirect_uri": "http://localhost:5890/auth/v1/callback/google",
     "scopes": "openid email profile"
   }'
 ```
 
-Use `createBrowserClient(url, publishableKey)` in browsers and `createClient(url, secretKey)` on trusted servers. Browser live subscriptions use the publishable key plus the signed-in user's JWT; direct RESP access still uses the database password.
+Use `createBrowserClient(url, publishableKey)` in browsers and `createClient(url, secretKey)` on trusted servers. Browser live subscriptions use the publishable key plus the signed-in user's JWT. Direct RESP access takes the secret key (`AUTH lux_sec_...`) or the operator password.
 
 #### Grants (row-level access)
 
@@ -575,9 +644,9 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LUX_PORT` | `6379` | TCP port |
-| `LUX_HTTP_PORT` | (disabled) | HTTP API port (set to enable) |
-| `LUX_PASSWORD` | (none) | Enable AUTH (applies to both RESP and HTTP) |
+| `LUX_PORT` | `6379` | RESP (Redis-compatible) TCP port |
+| `LUX_HTTP_PORT` | (disabled) | HTTP API port (set to enable; `lux start` defaults it to `5890`) |
+| `LUX_PASSWORD` | (none) | Operator/break-glass AUTH (RESP and HTTP). Project keys also gate the engine |
 | `LUX_DATA_DIR` | `.` | Snapshot directory |
 | `LUX_SAVE_INTERVAL` | `60` | Snapshot interval in seconds (0 to disable) |
 | `LUX_SHARDS` | auto | Shard count (default: num_cpus * 16) |
@@ -684,6 +753,8 @@ Every push and pull request runs:
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo test --all-targets`
 - Integration tests against the Valkey test harness
+- CLI end-to-end tests against a real encrypted engine for migration failure
+  repair and APNs/VAPID configuration lifecycle
 
 Release and Docker builds only proceed after tests pass.
 
@@ -694,6 +765,7 @@ Lux 1.0 is defined by public contracts, not by an open-ended feature list:
 - [GA.md](GA.md) -- release criteria and 1.0 gate
 - [COMPATIBILITY.md](COMPATIBILITY.md) -- Redis-compatible, Lux-native, divergent, and unsupported behavior
 - [DURABILITY.md](DURABILITY.md) -- snapshot, WAL, restore, crash recovery, and data-loss expectations
+- [MANAGEMENT_API.md](MANAGEMENT_API.md) -- version discovery, engine-owned migrations, repair, and push configuration
 - [SECURITY.md](SECURITY.md) -- disclosure, deployment model, sensitive surfaces, and supported versions
 
 After 1.0, Lux follows semantic versioning for documented public APIs.

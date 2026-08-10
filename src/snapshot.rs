@@ -133,7 +133,7 @@ fn save_entries(store: &Store, entries: &[crate::store::DumpEntry]) -> io::Resul
     let tmp = format!("{path}.{}.tmp", std::process::id());
     let file = fs::File::create(&tmp)?;
     let mut w = BufWriter::new(file);
-    save_binary(&mut w, entries)?;
+    save_binary(&mut w, entries, store)?;
     w.into_inner().map_err(io::Error::other)?.sync_all()?;
     fs::rename(&tmp, &path)?;
     Ok(entries.len())
@@ -221,17 +221,24 @@ fn purge_lux_storage_shards(storage_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn save_binary(w: &mut impl Write, entries: &[crate::store::DumpEntry]) -> io::Result<()> {
+fn save_binary(
+    w: &mut impl Write,
+    entries: &[crate::store::DumpEntry],
+    store: &Store,
+) -> io::Result<()> {
     w.write_all(HEADER)?;
     for entry in entries {
         let type_byte: u8 = match &entry.value {
             DumpValue::Str(_) => b'S',
             DumpValue::List(_) => b'L',
-            DumpValue::Hash(_) => b'H',
+            // 'h' carries a per-field TTL section; 'H' stays backward-compatible.
+            DumpValue::Hash(_, e) if !e.is_empty() => b'h',
+            DumpValue::Hash(_, _) => b'H',
             DumpValue::Set(_) => b'T',
             DumpValue::SortedSet(_) => b'Z',
             DumpValue::Stream(..) => b'X',
-            DumpValue::Vector(..) => b'V',
+            DumpValue::Vector(_, _, true) => b'W',
+            DumpValue::Vector(_, _, false) => b'V',
             DumpValue::HyperLogLog(..) => b'P',
             DumpValue::TimeSeries(..) => b'I',
         };
@@ -257,11 +264,19 @@ fn save_binary(w: &mut impl Write, entries: &[crate::store::DumpEntry]) -> io::R
                     write_bytes(w, item)?;
                 }
             }
-            DumpValue::Hash(pairs) => {
+            DumpValue::Hash(pairs, expiries) => {
                 write_u32(w, pairs.len() as u32)?;
                 for (k, v) in pairs {
                     write_bytes(w, k.as_bytes())?;
                     write_bytes(w, v)?;
+                }
+                // The per-field TTL section is present only under the 'h' type byte.
+                if !expiries.is_empty() {
+                    write_u32(w, expiries.len() as u32)?;
+                    for (f, ms) in expiries {
+                        write_bytes(w, f.as_bytes())?;
+                        write_i64(w, *ms)?;
+                    }
                 }
             }
             DumpValue::Set(members) => {
@@ -308,10 +323,18 @@ fn save_binary(w: &mut impl Write, entries: &[crate::store::DumpEntry]) -> io::R
                     }
                 }
             }
-            DumpValue::Vector(data, metadata) => {
-                write_u32(w, data.len() as u32)?;
-                for f in data {
-                    w.write_all(&f.to_le_bytes())?;
+            DumpValue::Vector(data, metadata, encrypted) => {
+                if *encrypted {
+                    // Seal the f32 payload; the 'W' type byte marks it encrypted.
+                    let sealed = store
+                        .encrypt_vector(entry.key.as_bytes(), data)
+                        .map_err(io::Error::other)?;
+                    write_bytes(w, &sealed)?;
+                } else {
+                    write_u32(w, data.len() as u32)?;
+                    for f in data {
+                        w.write_all(&f.to_le_bytes())?;
+                    }
                 }
                 match metadata {
                     Some(m) => {
@@ -405,146 +428,7 @@ pub(crate) fn load_binary(
             (Some(Duration::from_millis(ttl_ms as u64)), false)
         };
 
-        let value = match type_buf[0] {
-            b'S' => DumpValue::Str(read_bytes(r)?),
-            b'L' => {
-                let len = read_count(r, "list item")?;
-                let mut items = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..len {
-                    items.push(read_bytes(r)?);
-                }
-                DumpValue::List(items)
-            }
-            b'H' => {
-                let len = read_count(r, "hash field")?;
-                let mut pairs = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..len {
-                    let k = read_string(r)?;
-                    let v = read_bytes(r)?;
-                    pairs.push((k, v));
-                }
-                DumpValue::Hash(pairs)
-            }
-            b'T' => {
-                let len = read_count(r, "set member")?;
-                let mut members = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..len {
-                    members.push(read_string(r)?);
-                }
-                DumpValue::Set(members)
-            }
-            b'Z' => {
-                let len = read_count(r, "sorted set member")?;
-                let mut members = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..len {
-                    let m = read_string(r)?;
-                    let s = read_f64(r)?;
-                    members.push((m, s));
-                }
-                DumpValue::SortedSet(members)
-            }
-            b'X' => {
-                let last_id = read_string(r)?;
-                let entry_count = read_count(r, "stream entry")?;
-                let mut entries = Vec::with_capacity(entry_count.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..entry_count {
-                    let id = read_string(r)?;
-                    let field_count = read_count(r, "stream field")?;
-                    let mut fields = Vec::with_capacity(field_count.min(SNAPSHOT_PREALLOC_CAP));
-                    for _ in 0..field_count {
-                        let k = read_string(r)?;
-                        let v = read_bytes(r)?;
-                        fields.push((k, v));
-                    }
-                    entries.push((id, fields));
-                }
-                let mut groups = Vec::new();
-                if stream_groups {
-                    let group_count = read_count(r, "stream group")?;
-                    groups.reserve(group_count.min(SNAPSHOT_PREALLOC_CAP));
-                    for _ in 0..group_count {
-                        let name = read_string(r)?;
-                        let last_delivered_id = read_string(r)?;
-                        let consumer_count = read_count(r, "stream consumer")?;
-                        let mut consumers =
-                            Vec::with_capacity(consumer_count.min(SNAPSHOT_PREALLOC_CAP));
-                        for _ in 0..consumer_count {
-                            let consumer = read_string(r)?;
-                            let pending_count = read_count(r, "stream consumer pending")?;
-                            let mut pending_ids =
-                                Vec::with_capacity(pending_count.min(SNAPSHOT_PREALLOC_CAP));
-                            for _ in 0..pending_count {
-                                pending_ids.push(read_string(r)?);
-                            }
-                            consumers.push((consumer, pending_ids));
-                        }
-                        let pending_count = read_count(r, "stream group pending")?;
-                        let mut pending =
-                            Vec::with_capacity(pending_count.min(SNAPSHOT_PREALLOC_CAP));
-                        for _ in 0..pending_count {
-                            let id = read_string(r)?;
-                            let consumer = read_string(r)?;
-                            let delivery_count = read_u32(r)? as u64;
-                            pending.push((id, consumer, delivery_count));
-                        }
-                        groups.push((name, last_delivered_id, consumers, pending));
-                    }
-                }
-                DumpValue::Stream(entries, last_id, groups)
-            }
-            b'V' => {
-                let dims = read_sized_count(r, "vector dimension", std::mem::size_of::<f32>())?;
-                let mut data = Vec::with_capacity(dims.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..dims {
-                    let mut buf = [0u8; 4];
-                    r.read_exact(&mut buf)?;
-                    data.push(f32::from_le_bytes(buf));
-                }
-                let mut flag = [0u8; 1];
-                r.read_exact(&mut flag)?;
-                let metadata = if flag[0] == 1 {
-                    Some(read_string(r)?)
-                } else {
-                    None
-                };
-                DumpValue::Vector(data, metadata)
-            }
-            b'P' => {
-                let len = read_sized_count(r, "hyperloglog register", 1)?;
-                let mut regs = vec![0u8; len];
-                r.read_exact(&mut regs)?;
-                let cached = crate::hll::hll_count(&regs);
-                DumpValue::HyperLogLog(regs, cached)
-            }
-            b'I' => {
-                let sample_count = read_sized_count(
-                    r,
-                    "timeseries sample",
-                    std::mem::size_of::<i64>() + std::mem::size_of::<f64>(),
-                )?;
-                let mut samples = Vec::with_capacity(sample_count.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..sample_count {
-                    let ts = read_i64(r)?;
-                    let val = read_f64(r)?;
-                    samples.push((ts, val));
-                }
-                let retention = read_i64(r)? as u64;
-                let label_count = read_count(r, "timeseries label")?;
-                let mut labels = Vec::with_capacity(label_count.min(SNAPSHOT_PREALLOC_CAP));
-                for _ in 0..label_count {
-                    let k = read_string(r)?;
-                    let v = read_string(r)?;
-                    labels.push((k, v));
-                }
-                DumpValue::TimeSeries(samples, retention, labels)
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unknown type byte: {}", type_buf[0]),
-                ))
-            }
-        };
+        let value = read_dump_value(store, r, type_buf[0], &key, stream_groups)?;
 
         // The value bytes were read above to advance the stream; only store the
         // entry if its absolute deadline hasn't already passed during downtime.
@@ -554,6 +438,240 @@ pub(crate) fn load_binary(
         }
     }
     Ok(count)
+}
+
+fn read_dump_value(
+    store: &Store,
+    r: &mut impl Read,
+    type_byte: u8,
+    key: &str,
+    stream_groups: bool,
+) -> io::Result<DumpValue> {
+    Ok(match type_byte {
+        b'S' => DumpValue::Str(read_bytes(r)?),
+        b'L' => {
+            let len = read_count(r, "list item")?;
+            let mut items = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..len {
+                items.push(read_bytes(r)?);
+            }
+            DumpValue::List(items)
+        }
+        b'H' | b'h' => {
+            let len = read_count(r, "hash field")?;
+            let mut pairs = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..len {
+                let k = read_string(r)?;
+                let v = read_bytes(r)?;
+                pairs.push((k, v));
+            }
+            // 'h' appends a per-field TTL section (absolute epoch-ms deadlines).
+            let expiries = if type_byte == b'h' {
+                let elen = read_count(r, "hash field ttl")?;
+                let mut e = Vec::with_capacity(elen.min(SNAPSHOT_PREALLOC_CAP));
+                for _ in 0..elen {
+                    let f = read_string(r)?;
+                    let ms = read_i64(r)?;
+                    e.push((f, ms));
+                }
+                e
+            } else {
+                Vec::new()
+            };
+            DumpValue::Hash(pairs, expiries)
+        }
+        b'T' => {
+            let len = read_count(r, "set member")?;
+            let mut members = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..len {
+                members.push(read_string(r)?);
+            }
+            DumpValue::Set(members)
+        }
+        b'Z' => {
+            let len = read_count(r, "sorted set member")?;
+            let mut members = Vec::with_capacity(len.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..len {
+                let m = read_string(r)?;
+                let s = read_f64(r)?;
+                members.push((m, s));
+            }
+            DumpValue::SortedSet(members)
+        }
+        b'X' => {
+            let last_id = read_string(r)?;
+            let entry_count = read_count(r, "stream entry")?;
+            let mut entries = Vec::with_capacity(entry_count.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..entry_count {
+                let id = read_string(r)?;
+                let field_count = read_count(r, "stream field")?;
+                let mut fields = Vec::with_capacity(field_count.min(SNAPSHOT_PREALLOC_CAP));
+                for _ in 0..field_count {
+                    let k = read_string(r)?;
+                    let v = read_bytes(r)?;
+                    fields.push((k, v));
+                }
+                entries.push((id, fields));
+            }
+            let mut groups = Vec::new();
+            if stream_groups {
+                let group_count = read_count(r, "stream group")?;
+                groups.reserve(group_count.min(SNAPSHOT_PREALLOC_CAP));
+                for _ in 0..group_count {
+                    let name = read_string(r)?;
+                    let last_delivered_id = read_string(r)?;
+                    let consumer_count = read_count(r, "stream consumer")?;
+                    let mut consumers =
+                        Vec::with_capacity(consumer_count.min(SNAPSHOT_PREALLOC_CAP));
+                    for _ in 0..consumer_count {
+                        let consumer = read_string(r)?;
+                        let pending_count = read_count(r, "stream consumer pending")?;
+                        let mut pending_ids =
+                            Vec::with_capacity(pending_count.min(SNAPSHOT_PREALLOC_CAP));
+                        for _ in 0..pending_count {
+                            pending_ids.push(read_string(r)?);
+                        }
+                        consumers.push((consumer, pending_ids));
+                    }
+                    let pending_count = read_count(r, "stream group pending")?;
+                    let mut pending = Vec::with_capacity(pending_count.min(SNAPSHOT_PREALLOC_CAP));
+                    for _ in 0..pending_count {
+                        let id = read_string(r)?;
+                        let consumer = read_string(r)?;
+                        let delivery_count = read_u32(r)? as u64;
+                        pending.push((id, consumer, delivery_count));
+                    }
+                    groups.push((name, last_delivered_id, consumers, pending));
+                }
+            }
+            DumpValue::Stream(entries, last_id, groups)
+        }
+        b'V' => {
+            let dims = read_sized_count(r, "vector dimension", std::mem::size_of::<f32>())?;
+            let mut data = Vec::with_capacity(dims.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..dims {
+                let mut buf = [0u8; 4];
+                r.read_exact(&mut buf)?;
+                data.push(f32::from_le_bytes(buf));
+            }
+            let mut flag = [0u8; 1];
+            r.read_exact(&mut flag)?;
+            let metadata = if flag[0] == 1 {
+                Some(read_string(r)?)
+            } else {
+                None
+            };
+            DumpValue::Vector(data, metadata, false)
+        }
+        b'W' => {
+            // Encrypted vector: sealed f32 payload, decrypted with the key.
+            let sealed = read_bytes(r)?;
+            let mut flag = [0u8; 1];
+            r.read_exact(&mut flag)?;
+            let metadata = if flag[0] == 1 {
+                Some(read_string(r)?)
+            } else {
+                None
+            };
+            let data = store
+                .decrypt_vector(key.as_bytes(), &sealed)
+                .map_err(io::Error::other)?;
+            DumpValue::Vector(data, metadata, true)
+        }
+        b'P' => {
+            let len = read_sized_count(r, "hyperloglog register", 1)?;
+            let mut regs = vec![0u8; len];
+            r.read_exact(&mut regs)?;
+            let cached = crate::hll::hll_count(&regs);
+            DumpValue::HyperLogLog(regs, cached)
+        }
+        b'I' => {
+            let sample_count = read_sized_count(
+                r,
+                "timeseries sample",
+                std::mem::size_of::<i64>() + std::mem::size_of::<f64>(),
+            )?;
+            let mut samples = Vec::with_capacity(sample_count.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..sample_count {
+                let ts = read_i64(r)?;
+                let val = read_f64(r)?;
+                samples.push((ts, val));
+            }
+            let retention = read_i64(r)? as u64;
+            let label_count = read_count(r, "timeseries label")?;
+            let mut labels = Vec::with_capacity(label_count.min(SNAPSHOT_PREALLOC_CAP));
+            for _ in 0..label_count {
+                let k = read_string(r)?;
+                let v = read_string(r)?;
+                labels.push((k, v));
+            }
+            DumpValue::TimeSeries(samples, retention, labels)
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown type byte: {type_byte}"),
+            ))
+        }
+    })
+}
+
+/// Decode a blob produced by `encode_dump_blob` and return its value plus the
+/// embedded TTL (ms) WITHOUT loading it, so RESTORE can apply the value under a
+/// caller-chosen key and TTL.
+pub(crate) fn decode_dump_blob_value(store: &Store, blob: &[u8]) -> io::Result<(DumpValue, i64)> {
+    let mut cursor = io::Cursor::new(blob);
+    let mut header = [0u8; 4];
+    cursor.read_exact(&mut header)?;
+    let stream_groups = if &header == HEADER || &header == HEADER_V2 {
+        true
+    } else if &header == HEADER_V1 {
+        false
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RESTORE payload is not a lux dump",
+        ));
+    };
+    let mut type_buf = [0u8; 1];
+    cursor.read_exact(&mut type_buf)?;
+    let key = read_string(&mut cursor)?;
+    let ttl_ms = read_i64(&mut cursor)?;
+    let value = read_dump_value(store, &mut cursor, type_buf[0], &key, stream_groups)?;
+    Ok((value, ttl_ms))
+}
+
+/// Encode a single key/value into the on-disk snapshot format (header + one
+/// entry). Used to self-log COPY to the WAL as a keyed `LXRESTORE dst <blob>`
+/// so replay reconstructs the destination from its own WAL shard, rather than
+/// re-reading a source key whose shard may not have replayed yet.
+pub(crate) fn encode_dump_blob(
+    store: &Store,
+    entry: &crate::store::DumpEntry,
+) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    save_binary(&mut buf, std::slice::from_ref(entry), store)?;
+    Ok(buf)
+}
+
+/// Decode a blob produced by `encode_dump_blob` and load its entry into the
+/// store, overwriting any existing key. Replay path for `LXRESTORE`.
+pub(crate) fn decode_dump_blob(store: &Store, blob: &[u8]) -> io::Result<usize> {
+    let mut cursor = io::Cursor::new(blob);
+    let mut header = [0u8; 4];
+    cursor.read_exact(&mut header)?;
+    if &header == HEADER {
+        load_binary(store, &mut cursor, true, true)
+    } else if &header == HEADER_V2 {
+        load_binary(store, &mut cursor, true, false)
+    } else if &header == HEADER_V1 {
+        load_binary(store, &mut cursor, false, false)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "LXRESTORE payload is not a lux snapshot",
+        ))
+    }
 }
 
 fn load_legacy(store: &Store, file: fs::File) -> io::Result<usize> {
@@ -628,7 +746,7 @@ fn load_legacy(store: &Store, file: fs::File) -> io::Result<usize> {
                         })
                         .collect()
                 };
-                DumpValue::Hash(pairs)
+                DumpValue::Hash(pairs, Vec::new())
             }
             "T" => {
                 let members: Vec<String> = if raw_value.is_empty() {
@@ -731,7 +849,7 @@ fn save_to_path(store: &Store, path: &str) -> io::Result<usize> {
     let tmp = format!("{path}.tmp");
     let file = fs::File::create(&tmp)?;
     let mut w = BufWriter::new(file);
-    save_binary(&mut w, &entries)?;
+    save_binary(&mut w, &entries, store)?;
     w.into_inner().map_err(io::Error::other)?.sync_all()?;
     fs::rename(&tmp, path)?;
     Ok(entries.len())
@@ -760,7 +878,7 @@ fn save_legacy_to_path(store: &Store, path: &str) -> io::Result<usize> {
         let type_char = match &entry.value {
             DumpValue::Str(_) => 'S',
             DumpValue::List(_) => 'L',
-            DumpValue::Hash(_) => 'H',
+            DumpValue::Hash(_, _) => 'H',
             DumpValue::Set(_) => 'T',
             DumpValue::SortedSet(_) => 'Z',
             DumpValue::Stream(..) => 'X',
@@ -775,7 +893,7 @@ fn save_legacy_to_path(store: &Store, path: &str) -> io::Result<usize> {
                 .map(|b| String::from_utf8_lossy(b).into_owned())
                 .collect::<Vec<_>>()
                 .join("\x1f"),
-            DumpValue::Hash(pairs) => pairs
+            DumpValue::Hash(pairs, _) => pairs
                 .iter()
                 .map(|(k, v)| format!("{}\x1e{}", k, String::from_utf8_lossy(v)))
                 .collect::<Vec<_>>()

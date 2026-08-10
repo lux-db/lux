@@ -1,5 +1,4 @@
 import type {
-	KSubEvent,
 	LuxError,
 	LuxResult,
 	TableChangeEvent,
@@ -17,6 +16,8 @@ type TableWhereOp =
 	| '<'
 	| '>='
 	| '<='
+	| 'LIKE'
+	| 'ILIKE'
 	| 'IN'
 	| 'NOT IN'
 	| 'IS VALID'
@@ -89,167 +90,62 @@ interface TableHavingCondition {
 interface TableClient {
 	call(command: string, ...args: Array<string | number>): Promise<unknown>;
 	_tselect(args: string[]): Promise<TableRow[]>;
-	_subscribePattern(pattern: string, handler: (event: KSubEvent) => void): Promise<() => void>;
 }
 
 export interface TableQueryBuilderOptions<T extends object> {
 	schema?: TableSchema<T>;
 }
 
-export class TableSubscription<T extends object> {
-	private client: TableClient;
-	private table: string;
-	private selectArgsBuilder: (extra?: TableWhereCondition[]) => string[];
-	private handlers: {
-		change: Array<(event: TableChangeEvent<T>) => void>;
-		insert: Array<(event: TableChangeEvent<T>) => void>;
-		update: Array<(event: TableChangeEvent<T>) => void>;
-		delete: Array<(event: TableChangeEvent<T>) => void>;
-		error: Array<(event: TableErrorEvent) => void>;
-	} = {
-		change: [],
-		insert: [],
-		update: [],
-		delete: [],
-		error: [],
-	};
-	private knownRows = new Map<string, T>();
-	private unsubscribeFn: (() => void) | null = null;
-	private initError: LuxError | null;
-
+/**
+ * Point access to a single row by primary key over RESP (TGET/TSET). `.set`
+ * updates one or more cells directly; `.get(field)` reads one cell; `.get()`
+ * reads the whole row as raw string cells (use the query builder's `.single()`
+ * for schema-decoded rows).
+ */
+export class LuxTableRow {
 	constructor(
-		client: TableClient,
-		table: string,
-		selectArgsBuilder: (extra?: TableWhereCondition[]) => string[],
-		initError: LuxError | null = null,
-	) {
-		this.client = client;
-		this.table = table;
-		this.selectArgsBuilder = selectArgsBuilder;
-		this.initError = initError;
-		void this.start();
-	}
+		private readonly client: TableClient,
+		private readonly name: string,
+		private readonly key: string,
+	) {}
 
-	on(event: 'insert' | 'update' | 'delete' | 'change', handler: (event: TableChangeEvent<T>) => void): this;
-	on(event: 'error', handler: (event: TableErrorEvent) => void): this;
-	on(
-		event: TableChangeType,
-		handler: ((event: TableChangeEvent<T>) => void) | ((event: TableErrorEvent) => void),
-	): this {
-		(this.handlers[event] as Array<typeof handler>).push(handler);
-		return this;
-	}
-
-	async unsubscribe(): Promise<void> {
-		if (this.unsubscribeFn) {
-			this.unsubscribeFn();
-			this.unsubscribeFn = null;
+	async set(
+		fieldOrPatch: string | Record<string, unknown>,
+		value?: unknown,
+	): Promise<LuxResult<number>> {
+		const pairs: Array<string | number> = [];
+		if (typeof fieldOrPatch === 'string') {
+			pairs.push(fieldOrPatch, serializeFieldValue(value));
+		} else {
+			for (const [k, v] of Object.entries(fieldOrPatch)) {
+				pairs.push(k, serializeFieldValue(v));
+			}
 		}
-	}
-
-	private emitError(error: LuxError): void {
-		for (const handler of this.handlers.error) {
-			handler({ type: 'error', table: this.table, error });
-		}
-	}
-
-	private emitChange(event: TableChangeEvent<T>): void {
-		for (const handler of this.handlers.change) handler(event);
-		for (const handler of this.handlers[event.type]) handler(event);
-	}
-
-	private extractPkFromKey(key: string): string | null {
-		const prefix = `_t:${this.table}:row:`;
-		if (!key.startsWith(prefix)) return null;
-		return key.slice(prefix.length);
-	}
-
-	private async fetchMatches(extra?: TableWhereCondition[]): Promise<T[]> {
-		const args = this.selectArgsBuilder(extra);
-		const rows = await this.client._tselect(args);
-		return rows as T[];
-	}
-
-	private async start(): Promise<void> {
-		if (this.initError) {
-			this.emitError(this.initError);
-			return;
-		}
-
 		try {
-			const initial = await this.fetchMatches();
-			for (const row of initial) {
-				const id = (row as { id?: number | string }).id;
-				if (id == null) continue;
-				this.knownRows.set(String(id), row);
-			}
-
-			const pattern = `_t:${this.table}:row:*`;
-			this.unsubscribeFn = await this.client._subscribePattern(pattern, (raw) => {
-				void this.handleRawChange(raw);
-			});
+			const result = (await this.client.call('TSET', this.name, this.key, ...pairs)) as
+				| string
+				| number;
+			return ok(Number(result) || 0);
 		} catch (error) {
-			this.emitError(toLuxError(error, 'LUX_SUBSCRIBE_INIT_ERROR'));
+			return err('LUX_TSET_ERROR', error instanceof Error ? error.message : String(error));
 		}
 	}
 
-	private async handleRawChange(raw: KSubEvent): Promise<void> {
-		const pk = this.extractPkFromKey(raw.key);
-		if (!pk) return;
-
+	async get(field?: string): Promise<LuxResult<unknown>> {
 		try {
-			const previous = this.knownRows.get(pk) ?? null;
-			const rows = await this.fetchMatches([{ field: 'id', op: '=', value: pk }]);
-			const next = rows[0] ?? null;
-
-			if (!previous && !next) return;
-
-			if (!previous && next) {
-				this.knownRows.set(pk, next);
-				this.emitChange({
-					type: 'insert',
-					table: this.table,
-					pk,
-					operation: raw.operation,
-					new: next,
-					old: null,
-					raw,
-				});
-				return;
+			if (field !== undefined) {
+				const v = await this.client.call('TGET', this.name, this.key, field);
+				return ok(v ?? null);
 			}
-
-			if (previous && !next) {
-				this.knownRows.delete(pk);
-				this.emitChange({
-					type: 'delete',
-					table: this.table,
-					pk,
-					operation: raw.operation,
-					new: null,
-					old: previous,
-					raw,
-				});
-				return;
+			const arr = (await this.client.call('TGET', this.name, this.key)) as unknown[] | null;
+			if (!Array.isArray(arr)) return ok(null);
+			const row: Record<string, unknown> = {};
+			for (let i = 0; i + 1 < arr.length; i += 2) {
+				row[String(arr[i])] = arr[i + 1];
 			}
-
-			if (!previous || !next) return;
-
-			this.knownRows.set(pk, next);
-			const previousRow = previous as Record<string, unknown>;
-			const nextRow = next as Record<string, unknown>;
-			const changed = Object.keys(nextRow).filter((key) => previousRow[key] !== nextRow[key]);
-			this.emitChange({
-				type: 'update',
-				table: this.table,
-				pk,
-				operation: raw.operation,
-				new: next,
-				old: previous,
-				changed,
-				raw,
-			});
+			return ok(row);
 		} catch (error) {
-			this.emitError(toLuxError(error, 'LUX_SUBSCRIBE_EVENT_ERROR'));
+			return err('LUX_TGET_ERROR', error instanceof Error ? error.message : String(error));
 		}
 	}
 }
@@ -268,12 +164,20 @@ export class TableQueryBuilder<T extends object = TableRow> {
 	private havingConditions: TableHavingCondition[] = [];
 	private selectClause = '*';
 	private expectSingle = false;
+	private allowEmptySingle = false;
 	private schema?: TableSchema<T>;
 
 	constructor(client: TableClient, name: string, options?: TableQueryBuilderOptions<T>) {
 		this.client = client;
 		this.name = name;
 		this.schema = options?.schema;
+	}
+
+	/**
+	 * Point access to a row by primary key over RESP (TGET/TSET). See `LuxTableRow`.
+	 */
+	row(pk: string | number): LuxTableRow {
+		return new LuxTableRow(this.client, this.name, String(pk));
 	}
 
 	private validateRow(row: TableRow): T {
@@ -359,6 +263,16 @@ export class TableQueryBuilder<T extends object = TableRow> {
 
 	single(): this {
 		this.expectSingle = true;
+		this.allowEmptySingle = false;
+		if (this.limitCount == null) {
+			this.limitCount = 1;
+		}
+		return this;
+	}
+
+	maybeSingle(): this {
+		this.expectSingle = true;
+		this.allowEmptySingle = true;
 		if (this.limitCount == null) {
 			this.limitCount = 1;
 		}
@@ -392,6 +306,14 @@ export class TableQueryBuilder<T extends object = TableRow> {
 
 	lte(field: string, value: TableWhereValue): this {
 		return this.where(field, '<=', value);
+	}
+
+	like(field: string, value: string): this {
+		return this.where(field, 'LIKE', value);
+	}
+
+	ilike(field: string, value: string): this {
+		return this.where(field, 'ILIKE', value);
 	}
 
 	in(field: string, values: TableWhereValue[]): this {
@@ -490,6 +412,7 @@ export class TableQueryBuilder<T extends object = TableRow> {
 
 			if (this.expectSingle) {
 				if (validated.length === 0) {
+					if (this.allowEmptySingle) return ok(null as unknown as T);
 					return err('NOT_FOUND', `No rows found in table '${this.name}'`);
 				}
 				return ok(validated[0]);
@@ -597,9 +520,5 @@ export class TableQueryBuilder<T extends object = TableRow> {
 		} catch (error) {
 			return err('TDELETE_ERROR', `Failed to delete from '${this.name}'`, toLuxError(error));
 		}
-	}
-
-	subscribe(): TableSubscription<T> {
-		return new TableSubscription<T>(this.client, this.name, (extra) => this.buildSelectArgs(extra));
 	}
 }

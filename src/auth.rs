@@ -1,10 +1,17 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use base64::Engine;
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::jwk::{Jwk, JwkSet, KeyAlgorithm, PublicKeyUse};
+use jsonwebtoken::{
+    decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+};
+use p256::pkcs8::{EncodePrivateKey, LineEnding};
+use p256::SecretKey;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,7 +21,19 @@ use tokio::task::block_in_place;
 
 use crate::store::Store;
 use crate::tables::{self, CmpOp, SelectPlan, SelectResult, SharedSchemaCache, WhereClause};
-use crate::AuthConfig;
+use crate::{AuthConfig, AuthManagedEmailConfig};
+
+mod apple;
+use apple::{
+    admin_upsert_apple_provider, exchange_apple_code, issue_apple_native_nonce,
+    migrate_apple_private_key_storage, migrate_provider_apple_columns, mint_apple_client_secret,
+    parse_apple_callback_name, signin_apple, unseal_apple_private_key,
+};
+#[cfg(test)]
+use apple::{
+    seal_apple_private_key, seed_apple_jwks_for_test, sha256_hex, verify_apple_id_token,
+    APPLE_ISSUER,
+};
 
 pub(crate) const USERS_TABLE: &str = "auth.users";
 pub(crate) const IDENTITIES_TABLE: &str = "auth.identities";
@@ -23,16 +42,99 @@ pub(crate) const KEYS_TABLE: &str = "auth.keys";
 pub(crate) const SIGNING_KEYS_TABLE: &str = "auth.signing_keys";
 pub(crate) const GRANTS_TABLE: &str = "auth.grants";
 pub(crate) const PROVIDERS_TABLE: &str = "auth.providers";
+pub(crate) const FLOW_TOKENS_TABLE: &str = "auth.flow_tokens";
+pub(crate) const SETTINGS_TABLE: &str = "auth.settings";
 
 const AUTH_SCHEMA_VERSION_KEY: &[u8] = b"_auth:schema_version";
-const AUTH_SCHEMA_VERSION: &[u8] = b"1";
+const AUTH_SCHEMA_VERSION: &[u8] = b"3";
 const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+const OAUTH_CALLBACK_BODY_LIMIT: usize = 64 * 1024;
+const POSTMARK_EMAIL_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCESS_REVOKED_AFTER_PREFIX: &[u8] = b"_auth:access_revoked_after:";
+static FLOW_TOKEN_CONSUME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ApiKeyKind {
+pub(crate) enum ApiKeyKind {
     Publishable,
     Secret,
+}
+
+#[derive(Clone, Debug)]
+struct SigningKey {
+    kid: String,
+    algorithm: String,
+    public_jwk: String,
+    private_key: String,
+}
+
+#[derive(Clone, Debug)]
+struct AuthSettings {
+    email_confirmation_required: bool,
+    flow_token_ttl: Duration,
+    site_url: String,
+    redirect_allow_list: Vec<String>,
+    email_provider: String,
+    email_from: Option<String>,
+    email_reply_to: Option<String>,
+    email_postmark_server_token: Option<String>,
+    email_postmark_message_stream: String,
+    email_app_name: String,
+    email_from_name: Option<String>,
+}
+
+struct FlowTokenInsert<'a> {
+    settings: &'a AuthSettings,
+    kind: &'a str,
+    user_id: &'a str,
+    email: &'a str,
+    redirect_to: &'a str,
+    metadata: Value,
+}
+
+#[derive(Clone, Debug)]
+struct EffectiveEmailDelivery {
+    provider: String,
+    from: Option<String>,
+    reply_to: Option<String>,
+    postmark_server_token: Option<String>,
+    postmark_message_stream: String,
+    app_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthEmailMessage {
+    from: String,
+    to: String,
+    reply_to: Option<String>,
+    subject: String,
+    text_body: String,
+    html_body: String,
+    message_stream: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PostmarkEmailPayload {
+    #[serde(rename = "From")]
+    from: String,
+    #[serde(rename = "To")]
+    to: String,
+    #[serde(rename = "Subject")]
+    subject: String,
+    #[serde(rename = "TextBody")]
+    text_body: String,
+    #[serde(rename = "HtmlBody")]
+    html_body: String,
+    #[serde(rename = "MessageStream")]
+    message_stream: String,
+    #[serde(rename = "ReplyTo", skip_serializing_if = "Option::is_none")]
+    reply_to: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PasswordVerification {
+    Invalid,
+    Valid,
+    ValidNeedsRehash,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,6 +146,11 @@ struct AccessClaims {
     role: String,
     iat: usize,
     exp: usize,
+    // Anonymous (signInAnonymously) sessions. Gates decryption of ENCRYPTED
+    // columns: anonymous callers get NULL, real users get plaintext. Defaulted
+    // so tokens minted before this field decode (missing -> not anonymous).
+    #[serde(default)]
+    is_anonymous: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -83,10 +190,19 @@ pub(crate) struct AuthPrincipal {
     pub email: String,
     pub session_id: String,
     pub role: String,
+    /// Anonymous (signInAnonymously) session. Encrypted columns are NULLed for
+    /// these principals; real users and the operator get plaintext.
+    pub is_anonymous: bool,
 }
 
 pub(crate) fn is_reserved_auth_table(table: &str) -> bool {
     table.starts_with("auth.")
+}
+
+/// Reserved system scopes managed by the engine (auth + push). Client `T*`/raw-KV
+/// access is blocked and sensitive columns are redacted on operator reads.
+pub(crate) fn is_reserved_system_table(table: &str) -> bool {
+    table.starts_with("auth.") || table.starts_with("push.")
 }
 
 pub(crate) fn reserved_table_mutation_error(args: &[&[u8]], store: &Store) -> Option<String> {
@@ -103,13 +219,13 @@ pub(crate) fn reserved_table_mutation_error(args: &[&[u8]], store: &Store) -> Op
         .unwrap_or("")
         .to_ascii_uppercase();
     let table = match cmd.as_str() {
-        "TCREATE" | "TINSERT" | "TUPDATE" | "TDROP" | "TALTER" => args.get(1),
+        "TCREATE" | "TINSERT" | "TUPDATE" | "TDROP" | "TALTER" | "TSET" => args.get(1),
         "TDELETE" => args.get(2),
         _ => None,
     }
     .and_then(|raw| std::str::from_utf8(raw).ok())?;
 
-    if is_reserved_auth_table(table) {
+    if is_reserved_system_table(table) {
         Some(reserved_table_error(table))
     } else {
         None
@@ -117,7 +233,7 @@ pub(crate) fn reserved_table_mutation_error(args: &[&[u8]], store: &Store) -> Op
 }
 
 pub(crate) fn reserved_table_access_error(table: &str) -> Option<String> {
-    if is_reserved_auth_table(table) {
+    if is_reserved_system_table(table) {
         Some(reserved_table_error(table))
     } else {
         None
@@ -146,14 +262,14 @@ pub(crate) fn reserved_key_mutation_error(args: &[&[u8]], store: &Store) -> Opti
     // `T*` table commands are handled by `reserved_table_mutation_error`.
     if matches!(
         cmd.as_str(),
-        "TINSERT" | "TUPSERT" | "TUPDATE" | "TDELETE" | "TCREATE" | "TDROP" | "TALTER"
+        "TINSERT" | "TUPSERT" | "TUPDATE" | "TDELETE" | "TCREATE" | "TDROP" | "TALTER" | "TSET"
     ) {
         return None;
     }
     for raw in &args[1..] {
         if let Ok(k) = std::str::from_utf8(raw) {
-            if k.starts_with("_t:auth.") {
-                return Some("ERR access to Lux Auth internal keys is not permitted".to_string());
+            if k.starts_with("_t:auth.") || k.starts_with("_t:push.") {
+                return Some("ERR access to Lux internal keys is not permitted".to_string());
             }
         }
     }
@@ -175,11 +291,67 @@ pub(crate) fn reserved_plan_access_error(plan: &SelectPlan) -> Option<String> {
     None
 }
 
+pub(crate) fn redact_auth_table_row(table: &str, row: &mut [(String, String)]) {
+    if !is_reserved_system_table(table) {
+        return;
+    }
+    if table == SETTINGS_TABLE {
+        let key = row
+            .iter()
+            .find(|(field, _)| bare_auth_field(field) == "key")
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("");
+        if key == "email_postmark_server_token" {
+            redact_row_field(row, "value");
+        }
+        return;
+    }
+    for field in sensitive_auth_fields(table) {
+        redact_row_field(row, field);
+    }
+}
+
+pub(crate) fn redact_auth_select_row(plan: &SelectPlan, row: &mut [(String, String)]) {
+    redact_auth_table_row(&plan.table, row);
+    for join in &plan.joins {
+        redact_auth_table_row(&join.table, row);
+    }
+}
+
+fn redact_row_field(row: &mut [(String, String)], field: &str) {
+    for (name, value) in row {
+        if bare_auth_field(name) == field && !value.is_empty() {
+            *value = "<redacted>".to_string();
+        }
+    }
+}
+
+fn bare_auth_field(field: &str) -> &str {
+    field.rsplit('.').next().unwrap_or(field)
+}
+
+fn sensitive_auth_fields(table: &str) -> &'static [&'static str] {
+    match table {
+        USERS_TABLE => &["encrypted_password"],
+        SESSIONS_TABLE => &["refresh_token_hash"],
+        KEYS_TABLE => &["key_hash"],
+        SIGNING_KEYS_TABLE => &["private_key_encrypted"],
+        PROVIDERS_TABLE => &["client_secret", "apple_private_key"],
+        FLOW_TOKENS_TABLE => &["token_hash"],
+        "push.devices" => &["token"],
+        "push.credentials" => &["apns_p8_pem", "vapid_private"],
+        "push.outbox" => &["target_token"],
+        _ => &[],
+    }
+}
+
 fn reserved_table_error(table: &str) -> String {
-    format!(
-        "ERR table '{}' is managed by Lux Auth; use /auth/v1 APIs",
-        table
-    )
+    let scope = if table.starts_with("push.") {
+        "Lux Push"
+    } else {
+        "Lux Auth"
+    };
+    format!("ERR table '{table}' is managed by {scope}; use its API")
 }
 
 pub(crate) fn bootstrap(
@@ -300,8 +472,42 @@ pub(crate) fn bootstrap(
             "redirect_uri STR,",
             "scopes STR,",
             "created_at INT,",
-            "updated_at INT",
+            "updated_at INT,",
+            // Apple Sign In key material. `apple_private_key` holds the .p8, sealed
+            // with the encryption keyring when one is active (see seal_apple_private_key).
+            "apple_team_id STR,",
+            "apple_key_id STR,",
+            "apple_services_id STR,",
+            "apple_bundle_ids STR,",
+            "apple_private_key STR",
         ],
+        now,
+    )?;
+    migrate_provider_apple_columns(store, cache, now)?;
+    migrate_apple_private_key_storage(store, cache, now)?;
+    create_table_if_missing(
+        store,
+        cache,
+        FLOW_TOKENS_TABLE,
+        &[
+            "id STR PRIMARY KEY,",
+            "type STR,",
+            "token_hash STR UNIQUE,",
+            "user_id UUID,",
+            "email STR,",
+            "redirect_to STR,",
+            "metadata STR,",
+            "expires_at INT,",
+            "consumed_at INT,",
+            "created_at INT",
+        ],
+        now,
+    )?;
+    create_table_if_missing(
+        store,
+        cache,
+        SETTINGS_TABLE,
+        &["key STR PRIMARY KEY,", "value STR,", "updated_at INT"],
         now,
     )?;
     store.set(AUTH_SCHEMA_VERSION_KEY, AUTH_SCHEMA_VERSION, None, now);
@@ -337,6 +543,50 @@ pub(crate) async fn route_http_response(
         ("GET", ["callback", provider]) => {
             oauth_callback(provider, params, headers, store, cache).await
         }
+        // Apple uses response_mode=form_post, so its callback arrives as a POST
+        // with form-encoded code/state in the body rather than the query string.
+        ("POST", ["callback", "apple"]) => {
+            if body.len() > OAUTH_CALLBACK_BODY_LIMIT {
+                let (status, status_text, body) =
+                    error(413, "Payload Too Large", "oauth callback body is too large");
+                return AuthHttpResponse::json(status, status_text, body);
+            }
+            if !header_value(headers, "content-type")
+                .map(|value| value.starts_with("application/x-www-form-urlencoded"))
+                .unwrap_or(false)
+            {
+                let (status, status_text, body) = error(
+                    415,
+                    "Unsupported Media Type",
+                    "apple callback must be form encoded",
+                );
+                return AuthHttpResponse::json(status, status_text, body);
+            }
+            let mut form = parse_form_urlencoded(body);
+            form.extend_from_slice(params);
+            oauth_callback("apple", &form, headers, store, cache).await
+        }
+        ("POST", ["callback", _]) => {
+            let (status, status_text, body) =
+                error(405, "Method Not Allowed", "provider callback must use GET");
+            AuthHttpResponse::json(status, status_text, body)
+        }
+        ("POST", ["signin", "apple", "nonce"]) => {
+            if let Err((status, status_text, body)) =
+                require_publishable_or_secret(headers, store, cache)
+            {
+                return AuthHttpResponse::json(status, status_text, body);
+            }
+            issue_apple_native_nonce(store)
+        }
+        ("POST", ["signin", "apple"]) => {
+            if let Err((status, status_text, body)) =
+                require_publishable_or_secret(headers, store, cache)
+            {
+                return AuthHttpResponse::json(status, status_text, body);
+            }
+            signin_apple(body, headers, store, cache).await
+        }
         _ => {
             let (status, status_text, body) = route_http(
                 method,
@@ -359,6 +609,35 @@ pub(crate) fn bootstrap_runtime(
 ) -> Result<(), String> {
     let now = Instant::now();
     ensure_signing_key(store, cache, now)?;
+    ensure_auth_setting(
+        store,
+        cache,
+        "email_confirmation_required",
+        if config.email_confirmation_required {
+            "true"
+        } else {
+            "false"
+        },
+        now,
+    )?;
+    ensure_auth_setting(
+        store,
+        cache,
+        "flow_token_ttl_seconds",
+        &config.flow_token_ttl.as_secs().to_string(),
+        now,
+    )?;
+    ensure_auth_setting(store, cache, "site_url", &config.site_url, now)?;
+    ensure_auth_setting(store, cache, "redirect_allow_list", "", now)?;
+    ensure_auth_setting(store, cache, "email_provider", "console", now)?;
+    ensure_auth_setting(
+        store,
+        cache,
+        "email_postmark_message_stream",
+        "outbound",
+        now,
+    )?;
+    ensure_auth_setting(store, cache, "email_app_name", "Lux", now)?;
     if let Some(key) = config.initial_publishable_key.as_deref() {
         ensure_api_key(
             store,
@@ -397,6 +676,7 @@ pub(crate) fn route_http(
 
     match (method, base) {
         ("GET", ["health"]) => ok(json!({"result":"ok"})),
+        ("GET", [".well-known", "jwks.json"]) => jwks(store, cache),
         ("POST", ["signup"]) => {
             if let Err(response) = require_publishable_or_secret(headers, store, cache) {
                 return response;
@@ -416,7 +696,20 @@ pub(crate) fn route_http(
             let grant_type = get_param(params, "grant_type").unwrap_or("");
             token(body, grant_type, headers, store, cache)
         }
+        ("POST", ["recover"]) => {
+            if let Err(response) = require_publishable_or_secret(headers, store, cache) {
+                return response;
+            }
+            recover(body, store, cache)
+        }
+        ("POST", ["verify"]) => {
+            if let Err(response) = require_publishable_or_secret(headers, store, cache) {
+                return response;
+            }
+            verify_otp(body, headers, store, cache)
+        }
         ("GET", ["user"]) => user_from_bearer(headers, store, cache),
+        ("PUT", ["user"]) | ("PATCH", ["user"]) => update_user(body, headers, store, cache),
         ("POST", ["logout"]) => logout(body, headers, store, cache),
         ("GET", ["admin", "users"]) => {
             if let Err(response) = require_secret(headers, store, cache) {
@@ -424,11 +717,29 @@ pub(crate) fn route_http(
             }
             admin_list_users(store, cache)
         }
+        ("GET", ["admin", "users", user_id]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_get_user(user_id, store, cache)
+        }
         ("POST", ["admin", "users"]) => {
             if let Err(response) = require_secret(headers, store, cache) {
                 return response;
             }
             admin_create_user(body, store, cache)
+        }
+        ("PATCH", ["admin", "users", user_id]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_update_user(user_id, body, store, cache)
+        }
+        ("DELETE", ["admin", "users", user_id]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_delete_user(user_id, store, cache)
         }
         ("GET", ["admin", "keys"]) => {
             if let Err(response) = require_secret(headers, store, cache) {
@@ -453,6 +764,18 @@ pub(crate) fn route_http(
                 return response;
             }
             admin_list_providers(store, cache)
+        }
+        ("GET", ["admin", "settings"]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_get_settings(store, cache)
+        }
+        ("PATCH", ["admin", "settings"]) => {
+            if let Err(response) = require_secret(headers, store, cache) {
+                return response;
+            }
+            admin_update_settings(body, store, cache)
         }
         ("POST", ["admin", "providers", provider]) | ("PUT", ["admin", "providers", provider]) => {
             if let Err(response) = require_secret(headers, store, cache) {
@@ -506,28 +829,43 @@ fn signup(
     };
     let user_meta = parsed
         .get("data")
+        .or_else(|| {
+            parsed
+                .get("options")
+                .and_then(|options| options.get("data"))
+        })
         .or_else(|| parsed.get("user_metadata"))
         .cloned()
         .unwrap_or_else(|| json!({}))
         .to_string();
     let app_meta = json!({"provider":"email","providers":["email"]}).to_string();
+    let settings = match auth_settings(store, cache, now) {
+        Ok(settings) => settings,
+        Err(e) => return error(400, "Bad Request", &e),
+    };
+    let signup_redirect_to = if settings.email_confirmation_required {
+        match auth_redirect_to_with_default(&parsed, &settings) {
+            Ok(redirect_to) => Some(redirect_to),
+            Err(e) => return error(400, "Bad Request", &e),
+        }
+    } else {
+        None
+    };
+    let now_sec_str = now_sec.to_string();
+    let mut fields = vec![
+        ("id", user_id.as_str()),
+        ("email", email.as_str()),
+        ("encrypted_password", password_hash.as_str()),
+        ("raw_user_meta_data", user_meta.as_str()),
+        ("raw_app_meta_data", app_meta.as_str()),
+        ("created_at", now_sec_str.as_str()),
+        ("updated_at", now_sec_str.as_str()),
+    ];
+    if !settings.email_confirmation_required {
+        fields.push(("email_confirmed_at", now_sec_str.as_str()));
+    }
 
-    if let Err(e) = durable_table_insert(
-        store,
-        cache,
-        USERS_TABLE,
-        &[
-            ("id", user_id.as_str()),
-            ("email", email.as_str()),
-            ("encrypted_password", password_hash.as_str()),
-            ("email_confirmed_at", &now_sec.to_string()),
-            ("raw_user_meta_data", user_meta.as_str()),
-            ("raw_app_meta_data", app_meta.as_str()),
-            ("created_at", &now_sec.to_string()),
-            ("updated_at", &now_sec.to_string()),
-        ],
-        now,
-    ) {
+    if let Err(e) = durable_table_insert(store, cache, USERS_TABLE, &fields, now) {
         return error(400, "Bad Request", &e);
     }
     if let Err(e) = durable_table_insert(
@@ -540,13 +878,39 @@ fn signup(
             ("provider", "email"),
             ("provider_id", email.as_str()),
             ("identity_data", json!({"email":email}).to_string().as_str()),
-            ("created_at", &now_sec.to_string()),
-            ("updated_at", &now_sec.to_string()),
+            ("created_at", now_sec_str.as_str()),
+            ("updated_at", now_sec_str.as_str()),
         ],
         now,
     ) {
         let _ = durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", &user_id], now);
         return error(400, "Bad Request", &e);
+    }
+
+    if settings.email_confirmation_required {
+        let redirect_to = signup_redirect_to.as_deref().unwrap_or("/");
+        if let Err(response) =
+            create_email_flow_token(store, cache, "signup", &user_id, &email, redirect_to, now)
+        {
+            let _ = durable_table_delete_where(
+                store,
+                cache,
+                IDENTITIES_TABLE,
+                &["user_id", "=", &user_id],
+                now,
+            );
+            let _ =
+                durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", &user_id], now);
+            return response;
+        }
+        return ok(json!({
+            "access_token": Value::Null,
+            "token_type": "bearer",
+            "expires_in": 0,
+            "refresh_token": Value::Null,
+            "session": Value::Null,
+            "user": user_json(store, cache, &user_id, now).unwrap_or_else(|| json!({"id":user_id,"email":email}))
+        }));
     }
 
     match issue_session_response(store, cache, headers, &user_id, &email, now) {
@@ -630,6 +994,7 @@ fn token(
     match grant_type {
         "password" => password_grant(&parsed, headers, store, cache),
         "refresh_token" => refresh_token_grant(&parsed, headers, store, cache),
+        "authorization_code" | "pkce" => authorization_code_grant(&parsed, headers, store, cache),
         _ => error(400, "Bad Request", "unsupported grant_type"),
     }
 }
@@ -664,9 +1029,44 @@ fn password_grant(
     if let Err(response) = validate_user_active(&user, unix_seconds()) {
         return response;
     }
-    match verify_password(password, password_hash) {
-        Ok(true) => {}
-        Ok(false) => return error(400, "Bad Request", "invalid login credentials"),
+    let settings = match auth_settings(store, cache, now) {
+        Ok(settings) => settings,
+        Err(e) => return error(400, "Bad Request", &e),
+    };
+    if settings.email_confirmation_required
+        && user
+            .get("email_confirmed_at")
+            .map(|value| value.trim().is_empty() || value == "0")
+            .unwrap_or(true)
+    {
+        return error(401, "Unauthorized", "email not confirmed");
+    }
+    match verify_password_state(password, password_hash) {
+        Ok(PasswordVerification::Valid) => {}
+        Ok(PasswordVerification::ValidNeedsRehash) => {
+            if let Some(user_id) = user.get("id") {
+                match hash_password(password) {
+                    Ok(hash) => {
+                        let now_sec = unix_seconds().to_string();
+                        let _ = durable_table_update_where(
+                            store,
+                            cache,
+                            USERS_TABLE,
+                            &[
+                                ("encrypted_password", hash.as_str()),
+                                ("updated_at", now_sec.as_str()),
+                            ],
+                            &["id", "=", user_id],
+                            now,
+                        );
+                    }
+                    Err(e) => return error(500, "Internal Server Error", &e),
+                }
+            }
+        }
+        Ok(PasswordVerification::Invalid) => {
+            return error(400, "Bad Request", "invalid login credentials")
+        }
         Err(e) => return error(500, "Internal Server Error", &e),
     }
     let Some(user_id) = user.get("id") else {
@@ -762,6 +1162,143 @@ fn refresh_token_grant(
     )
 }
 
+fn authorization_code_grant(
+    parsed: &Value,
+    headers: &[(String, String)],
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let code = match required_string(parsed, "code") {
+        Ok(code) => code,
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    let token = match consume_flow_token(store, cache, "oauth_code", code, now, |flow| {
+        verify_oauth_pkce(flow, parsed)
+    }) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let Some(user_id) = token.get("user_id") else {
+        return error(400, "Bad Request", "authorization code is missing user");
+    };
+    let Some(user) = find_row_by_field(store, cache, USERS_TABLE, "id", user_id, now)
+        .ok()
+        .flatten()
+    else {
+        return error(401, "Unauthorized", "user not found");
+    };
+    if let Err(response) = validate_user_active(&user, unix_seconds()) {
+        return response;
+    }
+    let email = user.get("email").cloned().unwrap_or_default();
+    issue_session_response(store, cache, headers, user_id, &email, now)
+}
+
+fn recover(body: &str, store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
+    if !store.config().auth.email_password_enabled {
+        return error(400, "Bad Request", "email/password auth is disabled");
+    }
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let email = match required_string(&parsed, "email") {
+        Ok(email) => normalize_email(email),
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    let settings = match auth_settings(store, cache, now) {
+        Ok(settings) => settings,
+        Err(e) => return error(400, "Bad Request", &e),
+    };
+    let redirect_to = match auth_redirect_to_with_default(&parsed, &settings) {
+        Ok(redirect_to) => redirect_to,
+        Err(e) => return error(400, "Bad Request", &e),
+    };
+    if let Some(user) = find_row_by_field(store, cache, USERS_TABLE, "email", &email, now)
+        .ok()
+        .flatten()
+    {
+        if validate_user_active(&user, unix_seconds()).is_ok() {
+            if let Some(user_id) = user.get("id") {
+                if let Err(response) = create_email_flow_token(
+                    store,
+                    cache,
+                    "recovery",
+                    user_id,
+                    &email,
+                    &redirect_to,
+                    now,
+                ) {
+                    return response;
+                }
+            }
+        }
+    }
+    ok(json!({}))
+}
+
+fn verify_otp(
+    body: &str,
+    headers: &[(String, String)],
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let token = match required_string(&parsed, "token_hash") {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let kind = match required_string(&parsed, "type") {
+        Ok(kind) => kind,
+        Err(response) => return response,
+    };
+    let expected_kind = match kind {
+        "signup" | "email" | "email_change" => "signup",
+        "recovery" => "recovery",
+        _ => return error(400, "Bad Request", "unsupported verification type"),
+    };
+    let now = Instant::now();
+    let flow = match consume_flow_token(store, cache, expected_kind, token, now, |_| Ok(())) {
+        Ok(flow) => flow,
+        Err(response) => return response,
+    };
+    let Some(user_id) = flow.get("user_id") else {
+        return error(400, "Bad Request", "verification token is missing user");
+    };
+    let Some(user) = find_row_by_field(store, cache, USERS_TABLE, "id", user_id, now)
+        .ok()
+        .flatten()
+    else {
+        return error(401, "Unauthorized", "user not found");
+    };
+    if let Err(response) = validate_user_active(&user, unix_seconds()) {
+        return response;
+    }
+    if expected_kind == "signup" {
+        let now_sec = unix_seconds().to_string();
+        if let Err(e) = durable_table_update_where(
+            store,
+            cache,
+            USERS_TABLE,
+            &[
+                ("email_confirmed_at", now_sec.as_str()),
+                ("updated_at", now_sec.as_str()),
+            ],
+            &["id", "=", user_id],
+            now,
+        ) {
+            return error(400, "Bad Request", &e);
+        }
+    }
+    let email = user.get("email").cloned().unwrap_or_default();
+    issue_session_response(store, cache, headers, user_id, &email, now)
+}
+
 fn issue_session_response(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -854,6 +1391,80 @@ fn user_from_bearer(
     }
 }
 
+fn update_user(
+    body: &str,
+    headers: &[(String, String)],
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let claims = match claims_from_bearer(headers, store, cache) {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    let now_sec = unix_seconds().to_string();
+    let mut updates: Vec<(String, String)> = Vec::new();
+
+    if let Some(password) = parsed.get("password").and_then(Value::as_str) {
+        if password.len() < 8 {
+            return error(400, "Bad Request", "password must be at least 8 characters");
+        }
+        match hash_password(password) {
+            Ok(hash) => updates.push(("encrypted_password".to_string(), hash)),
+            Err(e) => return error(500, "Internal Server Error", &e),
+        }
+    }
+    if let Some(email) = parsed.get("email").and_then(Value::as_str) {
+        let email = normalize_email(email);
+        if email.is_empty() {
+            return error(400, "Bad Request", "email cannot be empty");
+        }
+        if let Some(row) = find_row_by_field(store, cache, USERS_TABLE, "email", &email, now)
+            .ok()
+            .flatten()
+        {
+            if row.get("id").map(String::as_str) != Some(claims.sub.as_str()) {
+                return error(409, "Conflict", "email already exists");
+            }
+        }
+        updates.push(("email".to_string(), email));
+    }
+    if let Some(metadata) = parsed
+        .get("data")
+        .or_else(|| parsed.get("user_metadata"))
+        .cloned()
+    {
+        updates.push(("raw_user_meta_data".to_string(), metadata.to_string()));
+    }
+
+    if updates.is_empty() {
+        return error(400, "Bad Request", "no user attributes to update");
+    }
+    updates.push(("updated_at".to_string(), now_sec));
+    let update_refs: Vec<(&str, &str)> = updates
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    if let Err(e) = durable_table_update_where(
+        store,
+        cache,
+        USERS_TABLE,
+        &update_refs,
+        &["id", "=", &claims.sub],
+        now,
+    ) {
+        return error(400, "Bad Request", &e);
+    }
+    match user_json(store, cache, &claims.sub, now) {
+        Some(user) => ok(json!({"user": user})),
+        None => error(404, "Not Found", "user not found"),
+    }
+}
+
 fn logout(
     body: &str,
     headers: &[(String, String)],
@@ -888,6 +1499,43 @@ fn logout(
     error(401, "Unauthorized", "missing bearer token or refresh_token")
 }
 
+fn jwks(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
+    let plan = SelectPlan {
+        table: SIGNING_KEYS_TABLE.to_string(),
+        alias: None,
+        projections: Vec::new(),
+        aggregates: Vec::new(),
+        joins: Vec::new(),
+        conditions: Vec::new(),
+        group_by: Vec::new(),
+        having: Vec::new(),
+        near: None,
+        order_by: None,
+        limit: Some(100),
+        offset: None,
+        decrypt_authorized: true,
+    };
+    match tables::table_select(store, cache, &plan, Instant::now()) {
+        Ok(SelectResult::Rows(rows)) => {
+            let keys = rows
+                .into_iter()
+                .map(|row| row.into_iter().collect::<HashMap<_, _>>())
+                .filter(|row| {
+                    parse_bool(row.get("active"))
+                        && row.get("algorithm").map(String::as_str) != Some("HS256")
+                })
+                .filter_map(|row| {
+                    row.get("public_jwk")
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                })
+                .collect::<Vec<_>>();
+            ok(json!({"keys": keys}))
+        }
+        Ok(SelectResult::Aggregate(_)) => ok(json!({"keys": []})),
+        Err(e) => error(400, "Bad Request", &e),
+    }
+}
+
 fn admin_list_users(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
     let plan = SelectPlan {
         table: USERS_TABLE.to_string(),
@@ -902,6 +1550,7 @@ fn admin_list_users(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static 
         order_by: None,
         limit: Some(1000),
         offset: None,
+        decrypt_authorized: true,
     };
     match tables::table_select(store, cache, &plan, Instant::now()) {
         Ok(SelectResult::Rows(rows)) => {
@@ -918,7 +1567,302 @@ fn admin_create_user(
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
-    signup(body, &[], store, cache)
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let email = match required_string(&parsed, "email") {
+        Ok(email) => normalize_email(email),
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    if find_row_by_field(store, cache, USERS_TABLE, "email", &email, now)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return error(409, "Conflict", "user already exists");
+    }
+
+    let user_id = parsed
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(tables::generate_uuid_v7);
+    let password_hash = match admin_password_hash(&parsed) {
+        Ok(hash) => hash,
+        Err(response) => return response,
+    };
+    let now_sec = unix_seconds();
+    let now_sec_str = now_sec.to_string();
+    let email_confirmed_at = admin_confirmed_at(&parsed, "email_confirmed_at", "email_confirmed")
+        .unwrap_or_else(|| now_sec.to_string());
+    let phone = optional_json_string(&parsed, "phone");
+    let phone_confirmed_at =
+        admin_confirmed_at(&parsed, "phone_confirmed_at", "phone_confirmed").unwrap_or_default();
+    let user_meta = parsed
+        .get("user_metadata")
+        .or_else(|| parsed.get("data"))
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+        .to_string();
+    let app_meta = parsed
+        .get("app_metadata")
+        .cloned()
+        .unwrap_or_else(|| json!({"provider":"email","providers":["email"]}))
+        .to_string();
+    let banned_until = optional_json_string(&parsed, "banned_until");
+
+    let mut fields = vec![
+        ("id", user_id.as_str()),
+        ("email", email.as_str()),
+        ("raw_user_meta_data", user_meta.as_str()),
+        ("raw_app_meta_data", app_meta.as_str()),
+        ("created_at", now_sec_str.as_str()),
+        ("updated_at", now_sec_str.as_str()),
+    ];
+    if !email_confirmed_at.is_empty() {
+        fields.push(("email_confirmed_at", email_confirmed_at.as_str()));
+    }
+    if let Some(password_hash) = password_hash.as_deref() {
+        fields.push(("encrypted_password", password_hash));
+    }
+    if let Some(phone) = phone.as_deref() {
+        fields.push(("phone", phone));
+    }
+    if !phone_confirmed_at.is_empty() {
+        fields.push(("phone_confirmed_at", phone_confirmed_at.as_str()));
+    }
+    if let Some(banned_until) = banned_until.as_deref() {
+        fields.push(("banned_until", banned_until));
+    }
+
+    if let Err(e) = durable_table_insert(store, cache, USERS_TABLE, &fields, now) {
+        return error(400, "Bad Request", &e);
+    }
+    if let Err(e) = durable_table_insert(
+        store,
+        cache,
+        IDENTITIES_TABLE,
+        &[
+            ("id", random_id("idn").as_str()),
+            ("user_id", user_id.as_str()),
+            ("provider", "email"),
+            ("provider_id", email.as_str()),
+            ("identity_data", json!({"email":email}).to_string().as_str()),
+            ("created_at", now_sec_str.as_str()),
+            ("updated_at", now_sec_str.as_str()),
+        ],
+        now,
+    ) {
+        let _ = durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", &user_id], now);
+        return error(400, "Bad Request", &e);
+    }
+
+    ok(
+        json!({"user": user_json(store, cache, &user_id, now).unwrap_or_else(|| json!({"id":user_id,"email":email}))}),
+    )
+}
+
+fn admin_get_user(
+    user_id: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    match user_json(store, cache, user_id, Instant::now()) {
+        Some(user) => ok(json!({"user": user})),
+        None => error(404, "Not Found", "user not found"),
+    }
+}
+
+fn admin_update_user(
+    user_id: &str,
+    body: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    let Some(existing) = find_row_by_field(store, cache, USERS_TABLE, "id", user_id, now)
+        .ok()
+        .flatten()
+    else {
+        return error(404, "Not Found", "user not found");
+    };
+
+    let mut updates: Vec<(String, String)> = Vec::new();
+    let mut new_email = None;
+    if let Some(email) = parsed.get("email").and_then(Value::as_str) {
+        let email = normalize_email(email);
+        if email.is_empty() {
+            return error(400, "Bad Request", "email cannot be empty");
+        }
+        if existing.get("email").map(String::as_str) != Some(email.as_str()) {
+            if let Some(row) = find_row_by_field(store, cache, USERS_TABLE, "email", &email, now)
+                .ok()
+                .flatten()
+            {
+                if row.get("id").map(String::as_str) != Some(user_id) {
+                    return error(409, "Conflict", "user already exists");
+                }
+            }
+        }
+        updates.push(("email".to_string(), email.clone()));
+        new_email = Some(email);
+    }
+    if let Some(phone) = optional_json_string(&parsed, "phone") {
+        updates.push(("phone".to_string(), phone));
+    }
+    match admin_password_hash(&parsed) {
+        Ok(Some(hash)) => updates.push(("encrypted_password".to_string(), hash)),
+        Ok(None) => {}
+        Err(response) => return response,
+    }
+    if let Some(value) = parsed.get("user_metadata").or_else(|| parsed.get("data")) {
+        updates.push(("raw_user_meta_data".to_string(), value.clone().to_string()));
+    }
+    if let Some(value) = parsed.get("app_metadata") {
+        updates.push(("raw_app_meta_data".to_string(), value.clone().to_string()));
+    }
+    if let Some(value) = admin_confirmed_at(&parsed, "email_confirmed_at", "email_confirmed") {
+        updates.push(("email_confirmed_at".to_string(), value));
+    }
+    if let Some(value) = admin_confirmed_at(&parsed, "phone_confirmed_at", "phone_confirmed") {
+        updates.push(("phone_confirmed_at".to_string(), value));
+    }
+    if let Some(value) = optional_json_string(&parsed, "banned_until") {
+        updates.push(("banned_until".to_string(), value));
+    }
+    if let Some(value) = optional_json_string(&parsed, "deleted_at") {
+        updates.push(("deleted_at".to_string(), value));
+    }
+    let now_sec = unix_seconds().to_string();
+    updates.push(("updated_at".to_string(), now_sec.clone()));
+
+    let refs: Vec<(&str, &str)> = updates
+        .iter()
+        .map(|(field, value)| (field.as_str(), value.as_str()))
+        .collect();
+    if let Err(e) =
+        durable_table_update_where(store, cache, USERS_TABLE, &refs, &["id", "=", user_id], now)
+    {
+        return error(400, "Bad Request", &e);
+    }
+    if let Some(email) = new_email {
+        let identity_data = json!({"email":email}).to_string();
+        let _ = durable_table_update_where(
+            store,
+            cache,
+            IDENTITIES_TABLE,
+            &[
+                ("provider_id", email.as_str()),
+                ("identity_data", identity_data.as_str()),
+                ("updated_at", now_sec.as_str()),
+            ],
+            &["user_id", "=", user_id],
+            now,
+        );
+    }
+
+    match user_json(store, cache, user_id, now) {
+        Some(user) => ok(json!({"user": user})),
+        None => error(404, "Not Found", "user not found"),
+    }
+}
+
+fn admin_delete_user(
+    user_id: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let now = Instant::now();
+    let Some(user) = user_json(store, cache, user_id, now) else {
+        return error(404, "Not Found", "user not found");
+    };
+    if let Err(e) = durable_table_delete_where(
+        store,
+        cache,
+        IDENTITIES_TABLE,
+        &["user_id", "=", user_id],
+        now,
+    ) {
+        return error(400, "Bad Request", &e);
+    }
+    if let Err(e) = durable_table_delete_where(
+        store,
+        cache,
+        SESSIONS_TABLE,
+        &["user_id", "=", user_id],
+        now,
+    ) {
+        return error(400, "Bad Request", &e);
+    }
+    match durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", user_id], now) {
+        Ok(0) => error(404, "Not Found", "user not found"),
+        Ok(_) => ok(json!({"user": user})),
+        Err(e) => error(400, "Bad Request", &e),
+    }
+}
+
+fn admin_password_hash(parsed: &Value) -> Result<Option<String>, (u16, &'static str, String)> {
+    if let Some(hash) = parsed
+        .get("encrypted_password")
+        .and_then(Value::as_str)
+        .filter(|hash| !hash.is_empty())
+    {
+        return Ok(Some(hash.to_string()));
+    }
+    if let Some(password) = parsed
+        .get("password")
+        .and_then(Value::as_str)
+        .filter(|password| !password.is_empty())
+    {
+        if password.len() < 8 {
+            return Err(error(
+                400,
+                "Bad Request",
+                "password must be at least 8 characters",
+            ));
+        }
+        return hash_password(password)
+            .map(Some)
+            .map_err(|e| error(500, "Internal Server Error", &e));
+    }
+    Ok(None)
+}
+
+fn admin_confirmed_at(parsed: &Value, timestamp_field: &str, bool_field: &str) -> Option<String> {
+    if let Some(value) = parsed.get(timestamp_field) {
+        return json_scalar_to_string(value);
+    }
+    parsed
+        .get(bool_field)
+        .and_then(Value::as_bool)
+        .map(|confirmed| {
+            if confirmed {
+                unix_seconds().to_string()
+            } else {
+                String::new()
+            }
+        })
+}
+
+fn optional_json_string(parsed: &Value, field: &str) -> Option<String> {
+    parsed.get(field).and_then(json_scalar_to_string)
+}
+
+fn json_scalar_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Null => Some(String::new()),
+        _ => None,
+    }
 }
 
 fn admin_list_providers(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
@@ -935,15 +1879,186 @@ fn admin_list_providers(store: &Store, cache: &SharedSchemaCache) -> (u16, &'sta
         order_by: None,
         limit: Some(100),
         offset: None,
+        decrypt_authorized: true,
     };
     match tables::table_select(store, cache, &plan, Instant::now()) {
         Ok(SelectResult::Rows(rows)) => {
             let providers: Vec<Value> = rows.into_iter().map(provider_row_json).collect();
-            ok(json!({"providers": providers}))
+            ok(json!({
+                "providers": providers,
+                "capabilities": {"apple_native": true, "apple_web": true},
+            }))
         }
-        Ok(SelectResult::Aggregate(_)) => ok(json!({"providers": []})),
+        Ok(SelectResult::Aggregate(_)) => ok(json!({
+            "providers": [],
+            "capabilities": {"apple_native": true, "apple_web": true},
+        })),
         Err(e) => error(400, "Bad Request", &e),
     }
+}
+
+fn admin_get_settings(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
+    match auth_settings(store, cache, Instant::now()) {
+        Ok(settings) => ok(
+            json!({"settings": auth_settings_json(&settings, store.config().auth.managed_email.as_ref())}),
+        ),
+        Err(e) => error(400, "Bad Request", &e),
+    }
+}
+
+fn admin_update_settings(
+    body: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed = match parse_json(body) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let Some(object) = parsed.as_object() else {
+        return error(400, "Bad Request", "settings payload must be an object");
+    };
+    let now = Instant::now();
+    let managed_email = store.config().auth.managed_email.as_ref();
+    if managed_email.is_some()
+        && [
+            "email_provider",
+            "email_from",
+            "email_reply_to",
+            "email_postmark_server_token",
+            "email_postmark_message_stream",
+        ]
+        .iter()
+        .any(|field| object.contains_key(*field))
+    {
+        return error(
+            400,
+            "Bad Request",
+            "managed email delivery settings cannot be changed on this project",
+        );
+    }
+
+    if let Some(value) = object.get("email_confirmation_required") {
+        let Some(enabled) = value.as_bool() else {
+            return error(
+                400,
+                "Bad Request",
+                "email_confirmation_required must be a boolean",
+            );
+        };
+        if let Err(e) = set_auth_setting(
+            store,
+            cache,
+            "email_confirmation_required",
+            if enabled { "true" } else { "false" },
+            now,
+        ) {
+            return error(400, "Bad Request", &e);
+        }
+    }
+
+    if let Some(value) = object.get("flow_token_ttl_seconds") {
+        let Some(ttl) = value.as_u64() else {
+            return error(
+                400,
+                "Bad Request",
+                "flow_token_ttl_seconds must be a positive integer",
+            );
+        };
+        if ttl == 0 {
+            return error(
+                400,
+                "Bad Request",
+                "flow_token_ttl_seconds must be greater than zero",
+            );
+        }
+        if let Err(e) = set_auth_setting(
+            store,
+            cache,
+            "flow_token_ttl_seconds",
+            &ttl.to_string(),
+            now,
+        ) {
+            return error(400, "Bad Request", &e);
+        }
+    }
+
+    if let Some(value) = object.get("site_url") {
+        let Some(site_url) = value.as_str().map(str::trim).filter(|url| !url.is_empty()) else {
+            return error(400, "Bad Request", "site_url must be a non-empty string");
+        };
+        if let Err(e) = set_auth_setting(store, cache, "site_url", site_url, now) {
+            return error(400, "Bad Request", &e);
+        }
+    }
+
+    if let Some(value) = object.get("redirect_allow_list") {
+        let allow_list = match optional_string_list_setting(value) {
+            Some(values) => values,
+            None => {
+                return error(
+                    400,
+                    "Bad Request",
+                    "redirect_allow_list must be an array, string, or null",
+                )
+            }
+        };
+        if let Err(e) = set_auth_setting(
+            store,
+            cache,
+            "redirect_allow_list",
+            &allow_list.join("\n"),
+            now,
+        ) {
+            return error(400, "Bad Request", &e);
+        }
+    }
+
+    if let Some(value) = object.get("email_provider") {
+        let Some(provider) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) else {
+            return error(
+                400,
+                "Bad Request",
+                "email_provider must be a non-empty string",
+            );
+        };
+        let provider = provider.to_ascii_lowercase();
+        if !matches!(provider.as_str(), "console" | "log" | "postmark") {
+            return error(400, "Bad Request", "unsupported email_provider");
+        }
+        let provider = if provider == "log" {
+            "console".to_string()
+        } else {
+            provider
+        };
+        if let Err(e) = set_auth_setting(store, cache, "email_provider", &provider, now) {
+            return error(400, "Bad Request", &e);
+        }
+    }
+
+    for field in [
+        "email_from",
+        "email_reply_to",
+        "email_postmark_server_token",
+        "email_postmark_message_stream",
+        "email_app_name",
+        "email_from_name",
+    ] {
+        if let Some(value) = object.get(field) {
+            let Some(value) = optional_setting_string(value) else {
+                return error(
+                    400,
+                    "Bad Request",
+                    &format!("{field} must be a string or null"),
+                );
+            };
+            if let Err(e) = set_auth_setting(store, cache, field, &value, now) {
+                return error(400, "Bad Request", &e);
+            }
+        }
+    }
+
+    admin_get_settings(store, cache)
 }
 
 fn admin_upsert_provider(
@@ -960,6 +2075,9 @@ fn admin_upsert_provider(
         Ok(parsed) => parsed,
         Err(response) => return response,
     };
+    if provider == "apple" {
+        return admin_upsert_apple_provider(&parsed, store, cache);
+    }
     let client_id = match required_string(&parsed, "client_id") {
         Ok(client_id) => client_id.trim(),
         Err(response) => return response,
@@ -1075,7 +2193,41 @@ fn oauth_authorize(
     let redirect_to = get_param(params, "redirect_to")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("/");
-    let redirect_to = sanitize_header_value(redirect_to);
+    let settings = match auth_settings(store, cache, Instant::now()) {
+        Ok(settings) => settings,
+        Err(e) => {
+            let (status, status_text, body) = error(400, "Bad Request", &e);
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+    };
+    let redirect_to = match validate_auth_redirect(redirect_to, &settings) {
+        Ok(redirect_to) => redirect_to,
+        Err(e) => {
+            let (status, status_text, body) = error(400, "Bad Request", &e);
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+    };
+    let flow = get_param(params, "flow").unwrap_or("code");
+    if !matches!(flow, "code" | "implicit") {
+        let (status, status_text, body) = error(400, "Bad Request", "unsupported oauth flow");
+        return AuthHttpResponse::json(status, status_text, body);
+    }
+    let code_challenge = match oauth_pkce_challenge(params) {
+        Ok(challenge) => challenge,
+        Err(response) => {
+            let (status, status_text, body) = response;
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+    };
+    let is_custom_scheme = !redirect_to.starts_with('/') && url_origin(&redirect_to).is_none();
+    if flow == "code" && is_custom_scheme && code_challenge.is_none() {
+        let (status, status_text, body) = error(
+            400,
+            "Bad Request",
+            "custom-scheme oauth code flows require PKCE",
+        );
+        return AuthHttpResponse::json(status, status_text, body);
+    }
     let config = match oauth_provider_config(store, cache, &provider, Instant::now()) {
         Ok(Some(config)) if config.enabled => config,
         Ok(Some(_)) => {
@@ -1091,11 +2243,20 @@ fn oauth_authorize(
             return AuthHttpResponse::json(status, status_text, body);
         }
     };
+    if provider == "apple" && mint_apple_client_secret(&config).is_err() {
+        let (status, status_text, body) =
+            error(400, "Bad Request", "apple web sign-in is not configured");
+        return AuthHttpResponse::json(status, status_text, body);
+    }
     let state = random_token(32);
+    let oidc_nonce = random_token(32);
     let state_key = oauth_state_key(&state);
     let payload = json!({
         "provider": provider,
         "redirect_to": redirect_to,
+        "flow": flow,
+        "code_challenge": code_challenge,
+        "oidc_nonce": oidc_nonce,
         "created_at": unix_seconds(),
     });
     store.set(
@@ -1110,7 +2271,7 @@ fn oauth_authorize(
     } else {
         config.redirect_uri.clone()
     };
-    let url = oauth_authorization_url(&config, &callback, &state);
+    let url = oauth_authorization_url(&config, &callback, &state, &oidc_nonce);
     AuthHttpResponse::redirect(url)
 }
 
@@ -1125,16 +2286,6 @@ async fn oauth_callback(
         Ok(provider) => provider,
         Err((status, status_text, body)) => {
             return AuthHttpResponse::json(status, status_text, body)
-        }
-    };
-    if let Some(oauth_error) = get_param(params, "error") {
-        return redirect_oauth_error(params, oauth_error);
-    }
-    let code = match get_param(params, "code") {
-        Some(code) if !code.is_empty() => code,
-        _ => {
-            let (status, status_text, body) = error(400, "Bad Request", "missing code");
-            return AuthHttpResponse::json(status, status_text, body);
         }
     };
     let state = match get_param(params, "state") {
@@ -1161,6 +2312,16 @@ async fn oauth_callback(
         .and_then(Value::as_str)
         .unwrap_or("/");
     let redirect_to = sanitize_header_value(redirect_to);
+    if let Some(oauth_error) = get_param(params, "error") {
+        return AuthHttpResponse::redirect(oauth_error_url(&redirect_to, oauth_error));
+    }
+    let code = match get_param(params, "code") {
+        Some(code) if !code.is_empty() => code,
+        _ => {
+            let (status, status_text, body) = error(400, "Bad Request", "missing code");
+            return AuthHttpResponse::json(status, status_text, body);
+        }
+    };
     let config = match oauth_provider_config(store, cache, &provider, Instant::now()) {
         Ok(Some(config)) if config.enabled => config,
         Ok(Some(_)) => {
@@ -1184,28 +2345,129 @@ async fn oauth_callback(
     } else {
         config.redirect_uri.clone()
     };
-    let oauth_user = match exchange_oauth_code(&config, code, &callback).await {
+    let oidc_nonce = state_value
+        .get("oidc_nonce")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let apple_name = if provider == "apple" {
+        get_param(params, "user").and_then(parse_apple_callback_name)
+    } else {
+        None
+    };
+    let oauth_user = match exchange_oauth_code(
+        &config,
+        code,
+        &callback,
+        (!oidc_nonce.is_empty()).then_some(oidc_nonce),
+        apple_name,
+    )
+    .await
+    {
         Ok(user) => user,
         Err(e) => return AuthHttpResponse::redirect(oauth_error_url(&redirect_to, &e)),
     };
-    match oauth_sign_in(&oauth_user, headers, store, cache) {
-        (200, _, body) => match serde_json::from_str::<Value>(&body) {
-            Ok(session) => AuthHttpResponse::redirect(oauth_success_url(&redirect_to, &session)),
-            Err(_) => AuthHttpResponse::redirect(oauth_error_url(&redirect_to, "invalid_session")),
-        },
-        (_, _, body) => AuthHttpResponse::redirect(oauth_error_url(
+    let flow = state_value
+        .get("flow")
+        .and_then(Value::as_str)
+        .unwrap_or("code");
+    match oauth_resolve_user(&oauth_user, store, cache) {
+        Ok(subject) if flow == "implicit" => {
+            match issue_session_response(
+                store,
+                cache,
+                headers,
+                &subject.user_id,
+                &subject.email,
+                Instant::now(),
+            ) {
+                (200, _, body) => match serde_json::from_str::<Value>(&body) {
+                    Ok(session) => {
+                        AuthHttpResponse::redirect(oauth_success_url(&redirect_to, &session))
+                    }
+                    Err(_) => {
+                        AuthHttpResponse::redirect(oauth_error_url(&redirect_to, "invalid_session"))
+                    }
+                },
+                (_, _, body) => AuthHttpResponse::redirect(oauth_error_url(
+                    &redirect_to,
+                    &json_error_message(&body)
+                        .unwrap_or_else(|| "oauth_sign_in_failed".to_string()),
+                )),
+            }
+        }
+        Ok(subject) => {
+            let now = Instant::now();
+            let settings = match auth_settings(store, cache, now) {
+                Ok(settings) => settings,
+                Err(_) => {
+                    return AuthHttpResponse::redirect(oauth_error_url(
+                        &redirect_to,
+                        "invalid_session",
+                    ))
+                }
+            };
+            match create_flow_token(
+                store,
+                cache,
+                FlowTokenInsert {
+                    settings: &settings,
+                    kind: "oauth_code",
+                    user_id: &subject.user_id,
+                    email: &subject.email,
+                    redirect_to: &redirect_to,
+                    metadata: json!({
+                        "code_challenge": state_value
+                            .get("code_challenge")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    }),
+                },
+                now,
+            ) {
+                Ok(code) => AuthHttpResponse::redirect(oauth_code_url(&redirect_to, &code)),
+                Err(_) => {
+                    AuthHttpResponse::redirect(oauth_error_url(&redirect_to, "invalid_session"))
+                }
+            }
+        }
+        Err((_, _, body)) => AuthHttpResponse::redirect(oauth_error_url(
             &redirect_to,
             &json_error_message(&body).unwrap_or_else(|| "oauth_sign_in_failed".to_string()),
         )),
     }
 }
 
+#[derive(Clone, Debug)]
+struct AuthSessionSubject {
+    user_id: String,
+    email: String,
+}
+
+#[cfg(test)]
 fn oauth_sign_in(
     oauth_user: &OAuthUser,
     headers: &[(String, String)],
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
+    match oauth_resolve_user(oauth_user, store, cache) {
+        Ok(subject) => issue_session_response(
+            store,
+            cache,
+            headers,
+            &subject.user_id,
+            &subject.email,
+            Instant::now(),
+        ),
+        Err(response) => response,
+    }
+}
+
+fn oauth_resolve_user(
+    oauth_user: &OAuthUser,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> Result<AuthSessionSubject, (u16, &'static str, String)> {
     let provider = oauth_user.provider.as_str();
     let provider_user_id = oauth_user.provider_id.as_str();
     let email = normalize_email(&oauth_user.email);
@@ -1224,24 +2486,22 @@ fn oauth_sign_in(
         now,
     ) {
         Ok(identity) => identity,
-        Err(e) => return error(400, "Bad Request", &e),
+        Err(e) => return Err(error(400, "Bad Request", &e)),
     } {
         let Some(user_id) = identity.get("user_id") else {
-            return error(
+            return Err(error(
                 500,
                 "Internal Server Error",
                 "identity row is missing user_id",
-            );
+            ));
         };
         let Some(user) = (match find_row_by_field(store, cache, USERS_TABLE, "id", user_id, now) {
             Ok(user) => user,
-            Err(e) => return error(400, "Bad Request", &e),
+            Err(e) => return Err(error(400, "Bad Request", &e)),
         }) else {
-            return error(401, "Unauthorized", "user not found");
+            return Err(error(401, "Unauthorized", "user not found"));
         };
-        if let Err(response) = validate_user_active(&user, unix_seconds()) {
-            return response;
-        }
+        validate_user_active(&user, unix_seconds())?;
         let user_email = user.get("email").cloned().unwrap_or_else(|| email.clone());
         let now_sec = unix_seconds().to_string();
         let merged_app_meta =
@@ -1274,17 +2534,39 @@ fn oauth_sign_in(
             ],
             now,
         );
-        return issue_session_response(store, cache, headers, user_id, &user_email, now);
+        return Ok(AuthSessionSubject {
+            user_id: user_id.to_string(),
+            email: user_email,
+        });
+    }
+
+    if email.is_empty() {
+        return Err(error(
+            400,
+            "Bad Request",
+            "verified email is required for a new oauth identity",
+        ));
+    }
+    if !email_confirmed {
+        return Err(error(
+            400,
+            "Bad Request",
+            "verified email is required for oauth account linking",
+        ));
     }
 
     let now_sec = unix_seconds();
     let existing_user = match find_row_by_field(store, cache, USERS_TABLE, "email", &email, now) {
         Ok(user) => user,
-        Err(e) => return error(400, "Bad Request", &e),
+        Err(e) => return Err(error(400, "Bad Request", &e)),
     };
     let (user_id, created_user) = if let Some(user) = existing_user {
         let Some(user_id) = user.get("id").cloned() else {
-            return error(500, "Internal Server Error", "auth user row is missing id");
+            return Err(error(
+                500,
+                "Internal Server Error",
+                "auth user row is missing id",
+            ));
         };
         let merged_app_meta =
             app_metadata_with_provider(user.get("raw_app_meta_data").map(String::as_str), provider);
@@ -1299,34 +2581,27 @@ fn oauth_sign_in(
             &["id", "=", &user_id],
             now,
         ) {
-            return error(400, "Bad Request", &e);
+            return Err(error(400, "Bad Request", &e));
         }
         (user_id, false)
     } else {
         let user_id = tables::generate_uuid_v7();
         let user_meta = user_meta.to_string();
         let app_meta = app_metadata_with_provider(None, provider);
-        let email_confirmed_at = if email_confirmed {
-            now_sec.to_string()
-        } else {
-            String::new()
-        };
-        if let Err(e) = durable_table_insert(
-            store,
-            cache,
-            USERS_TABLE,
-            &[
-                ("id", user_id.as_str()),
-                ("email", email.as_str()),
-                ("email_confirmed_at", email_confirmed_at.as_str()),
-                ("raw_user_meta_data", user_meta.as_str()),
-                ("raw_app_meta_data", app_meta.as_str()),
-                ("created_at", &now_sec.to_string()),
-                ("updated_at", &now_sec.to_string()),
-            ],
-            now,
-        ) {
-            return error(400, "Bad Request", &e);
+        let now_sec_str = now_sec.to_string();
+        let mut fields = vec![
+            ("id", user_id.as_str()),
+            ("email", email.as_str()),
+            ("raw_user_meta_data", user_meta.as_str()),
+            ("raw_app_meta_data", app_meta.as_str()),
+            ("created_at", now_sec_str.as_str()),
+            ("updated_at", now_sec_str.as_str()),
+        ];
+        if email_confirmed {
+            fields.push(("email_confirmed_at", now_sec_str.as_str()));
+        }
+        if let Err(e) = durable_table_insert(store, cache, USERS_TABLE, &fields, now) {
+            return Err(error(400, "Bad Request", &e));
         }
         (user_id, true)
     };
@@ -1351,10 +2626,10 @@ fn oauth_sign_in(
             let _ =
                 durable_table_delete_where(store, cache, USERS_TABLE, &["id", "=", &user_id], now);
         }
-        return error(400, "Bad Request", &e);
+        return Err(error(400, "Bad Request", &e));
     }
 
-    issue_session_response(store, cache, headers, &user_id, &email, now)
+    Ok(AuthSessionSubject { user_id, email })
 }
 
 fn admin_list_keys(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
@@ -1371,6 +2646,7 @@ fn admin_list_keys(store: &Store, cache: &SharedSchemaCache) -> (u16, &'static s
         order_by: None,
         limit: Some(1000),
         offset: None,
+        decrypt_authorized: true,
     };
     match tables::table_select(store, cache, &plan, Instant::now()) {
         Ok(SelectResult::Rows(rows)) => {
@@ -1434,12 +2710,16 @@ fn admin_revoke_key(
         now,
     ) {
         Ok(0) => error(404, "Not Found", "key not found"),
-        Ok(_) => ok(json!({"result":"OK"})),
+        Ok(_) => {
+            // Revocation must take effect now, not when the cache entry ages out.
+            invalidate_api_key_cache(store);
+            ok(json!({"result":"OK"}))
+        }
         Err(e) => error(400, "Bad Request", &e),
     }
 }
 
-fn create_table_if_missing(
+pub(crate) fn create_table_if_missing(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -1448,11 +2728,51 @@ fn create_table_if_missing(
 ) -> Result<(), String> {
     match tables::table_schema(store, cache, table, now) {
         Ok(_) => Ok(()),
-        Err(_) => tables::table_create(store, cache, table, columns, now),
+        Err(error) if error == format!("ERR table '{table}' does not exist") => {
+            tables::table_create(store, cache, table, columns, now)
+        }
+        Err(error) => Err(format!("ERR could not inspect table '{table}': {error}")),
     }
 }
 
-fn durable_table_insert(
+/// Add a column to an existing internal table if it isn't there already. The
+/// companion to `create_table_if_missing` for schema that arrives after a table
+/// has already shipped: new projects pick the column up from the CREATE, and
+/// projects created before it get it from here.
+///
+/// `tables::table_add_column` does not append to the WAL of its own accord. RESP
+/// and HTTP `TALTER` are raw-logged by `execute_with_wal`, which internal callers
+/// never reach, so log the resolved command here or the column is lost on replay.
+pub(crate) fn add_column_if_missing(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_spec: &str,
+    now: Instant,
+) -> Result<(), String> {
+    let mut tokens = field_spec.split_whitespace();
+    let Some(column) = tokens.next() else {
+        return Err("ERR empty column spec".to_string());
+    };
+    let schema = tables::table_schema(store, cache, table, now)?;
+    if schema
+        .iter()
+        .any(|field| field.split_whitespace().next() == Some(column))
+    {
+        return Ok(());
+    }
+
+    let mut args: Vec<Vec<u8>> = vec![
+        b"TALTER".to_vec(),
+        table.as_bytes().to_vec(),
+        b"ADD".to_vec(),
+    ];
+    args.extend(field_spec.split_whitespace().map(|t| t.as_bytes().to_vec()));
+    log_command(store, &args)?;
+    tables::table_add_column(store, cache, table, field_spec, now)
+}
+
+pub(crate) fn durable_table_insert(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -1468,7 +2788,7 @@ fn durable_table_insert(
     tables::table_insert(store, cache, table, field_values, now)
 }
 
-fn durable_table_update_where(
+pub(crate) fn durable_table_update_where(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -1493,7 +2813,7 @@ fn durable_table_update_where(
     tables::table_update_where(store, cache, table, field_values, where_args, now)
 }
 
-fn durable_table_delete_where(
+pub(crate) fn durable_table_delete_where(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -1525,9 +2845,10 @@ fn ensure_signing_key(
     cache: &SharedSchemaCache,
     now: Instant,
 ) -> Result<(), String> {
-    if active_signing_secret(store, cache, now)?.is_some() {
+    if active_signing_key(store, cache, now)?.is_some() {
         return Ok(());
     }
+    let key = generate_es256_signing_key()?;
     let now_sec = unix_seconds().to_string();
     durable_table_insert(
         store,
@@ -1535,16 +2856,39 @@ fn ensure_signing_key(
         SIGNING_KEYS_TABLE,
         &[
             ("id", random_id("sgn").as_str()),
-            ("kid", random_id("kid").as_str()),
-            ("algorithm", "HS256"),
-            ("public_jwk", ""),
-            ("private_key_encrypted", random_token(48).as_str()),
+            ("kid", key.kid.as_str()),
+            ("algorithm", key.algorithm.as_str()),
+            ("public_jwk", key.public_jwk.as_str()),
+            ("private_key_encrypted", key.private_key.as_str()),
             ("active", "true"),
             ("created_at", now_sec.as_str()),
         ],
         now,
     )?;
     Ok(())
+}
+
+fn generate_es256_signing_key() -> Result<SigningKey, String> {
+    let kid = random_id("kid");
+    let secret = SecretKey::random(&mut OsRng);
+    let private_pem = secret
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|e| e.to_string())?
+        .to_string();
+    let encoding_key =
+        EncodingKey::from_ec_pem(private_pem.as_bytes()).map_err(|e| e.to_string())?;
+    let mut jwk =
+        Jwk::from_encoding_key(&encoding_key, Algorithm::ES256).map_err(|e| e.to_string())?;
+    jwk.common.key_id = Some(kid.clone());
+    jwk.common.public_key_use = Some(PublicKeyUse::Signature);
+    jwk.common.key_algorithm = Some(KeyAlgorithm::ES256);
+    let public_jwk = serde_json::to_string(&jwk).map_err(|e| e.to_string())?;
+    Ok(SigningKey {
+        kid,
+        algorithm: "ES256".to_string(),
+        public_jwk,
+        private_key: private_pem,
+    })
 }
 
 fn ensure_api_key(
@@ -1592,6 +2936,9 @@ fn insert_api_key(
         ],
         now,
     )?;
+    // A negative result for this key may already be cached (something tried it
+    // before it existed); drop it so the new key works immediately.
+    invalidate_api_key_cache(store);
     Ok(json!({
         "id": key_id,
         "name": name,
@@ -1604,15 +2951,134 @@ fn insert_api_key(
     }))
 }
 
+/// Which surface a credential is being presented to. The resolver enforces the
+/// surface rule itself so no call site has to remember it: a publishable key is
+/// browser-embedded and must never reach the raw command protocol, where lua,
+/// FLUSHALL and raw KV live and no grant can contain the blast radius.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Surface {
+    /// RESP command protocol. Secret keys and the operator password only.
+    Resp,
+    /// HTTP data routes and the `/live` websocket handshake.
+    Http,
+    /// `/auth/v1/*`, which publishable keys legitimately reach.
+    AuthApi,
+}
+
+/// What a presented credential turned out to be.
+///
+/// This is the *identity* of the caller, not their permissions: `Publishable`
+/// and `User` still answer to grants for every row they touch. Only `Secret` and
+/// `Operator` carry blanket project access.
+#[derive(Clone, Debug)]
+pub(crate) enum Credential {
+    /// No credential presented.
+    Anonymous,
+    /// Browser-safe project key. Reaches auth; reaches data only when an
+    /// end-user token rides along and supplies a principal.
+    Publishable,
+    /// Server-side project key: full project access.
+    Secret,
+    /// End-user access token: subject to grants.
+    User(AuthPrincipal),
+    /// `LUX_PASSWORD`. Break-glass and control-plane operations.
+    Operator,
+}
+
+/// Turn a presented credential into an identity, for any surface.
+///
+/// Every entry point (RESP `AUTH`, HTTP, `/live`, `/auth/v1/*`) funnels through
+/// here. The `_t:` namespace bug was two dispatch paths that had to agree and
+/// silently didn't; one resolver is what keeps that from recurring for auth.
+///
+/// `presented` is the api key or bearer token. `user_token` is a separate
+/// end-user access token when one accompanies a project key (the browser case:
+/// `apikey=lux_pub_...` plus `Authorization: Bearer <jwt>`).
+pub(crate) fn resolve_credential(
+    presented: &str,
+    user_token: &str,
+    surface: Surface,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> Result<Credential, String> {
+    let password = &store.config().password;
+
+    // Operator first: the password is the break-glass path and must keep working
+    // even if auth.keys is unreadable.
+    if !password.is_empty()
+        && !presented.is_empty()
+        && constant_time_eq(presented.as_bytes(), password.as_bytes())
+    {
+        return Ok(Credential::Operator);
+    }
+
+    if !presented.is_empty() {
+        if let Some(kind) = lookup_api_key(presented, store, cache)? {
+            return match (kind, surface) {
+                (ApiKeyKind::Publishable, Surface::Resp) => Err(
+                    "publishable keys cannot use the RESP protocol; use a secret key".to_string(),
+                ),
+                (ApiKeyKind::Publishable, _) => {
+                    // A publishable key alone is an identity of the project, not
+                    // of a person. Data access needs a principal on top.
+                    match resolve_user(user_token, store, cache)? {
+                        Some(principal) => Ok(Credential::User(principal)),
+                        None => Ok(Credential::Publishable),
+                    }
+                }
+                (ApiKeyKind::Secret, _) => Ok(Credential::Secret),
+            };
+        }
+    }
+
+    // No project key matched. An end-user token can still stand on its own.
+    if let Some(principal) = resolve_user(user_token, store, cache)? {
+        return Ok(Credential::User(principal));
+    }
+    if let Some(principal) = resolve_user(presented, store, cache)? {
+        return Ok(Credential::User(principal));
+    }
+
+    Ok(Credential::Anonymous)
+}
+
+/// Validate an end-user access token, if one was supplied and auth is on.
+fn resolve_user(
+    token: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> Result<Option<AuthPrincipal>, String> {
+    if token.is_empty() || !store.config().auth.enabled {
+        return Ok(None);
+    }
+    // A project key in this slot is not a user token; don't report it as a bad
+    // JWT.
+    if token.starts_with("lux_pub_") || token.starts_with("lux_sec_") {
+        return Ok(None);
+    }
+    match authenticate_access_token(token, store, cache) {
+        Ok(principal) => Ok(Some(principal)),
+        Err(e) => Err(e),
+    }
+}
+
+/// The project credential presented on an `/auth/v1/*` request.
+fn presented_key(headers: &[(String, String)]) -> &str {
+    header_value(headers, "apikey")
+        .or_else(|| bearer_token(headers))
+        .unwrap_or("")
+}
+
 fn require_publishable_or_secret(
     headers: &[(String, String)],
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> Result<(), (u16, &'static str, String)> {
-    match api_key_kind(headers, store, cache) {
-        Ok(Some(ApiKeyKind::Publishable | ApiKeyKind::Secret)) => Ok(()),
-        Ok(None) if no_project_keys_configured(store, cache) => Ok(()),
-        Ok(None) => Err(error(
+    match resolve_credential(presented_key(headers), "", Surface::AuthApi, store, cache) {
+        Ok(Credential::Publishable | Credential::Secret | Credential::Operator) => Ok(()),
+        // An engine with no keys configured yet is still open, as before.
+        Ok(_) if no_project_keys_configured(store, cache) => Ok(()),
+        Ok(_) => Err(error(
             401,
             "Unauthorized",
             "missing or invalid auth api key",
@@ -1626,45 +3092,93 @@ fn require_secret(
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> Result<(), (u16, &'static str, String)> {
-    if let Some(password) = bearer_token(headers) {
-        if !store.config().password.is_empty()
-            && constant_time_eq(password.as_bytes(), store.config().password.as_bytes())
-        {
-            return Ok(());
-        }
-    }
-    match api_key_kind(headers, store, cache) {
-        Ok(Some(ApiKeyKind::Secret)) => Ok(()),
+    match resolve_credential(presented_key(headers), "", Surface::AuthApi, store, cache) {
+        Ok(Credential::Secret | Credential::Operator) => Ok(()),
         _ => Err(error(401, "Unauthorized", "secret key required")),
     }
 }
 
-fn api_key_kind(
-    headers: &[(String, String)],
+/// Resolve a raw key string to its kind, or `None` if unknown or revoked. The
+/// single place `auth.keys` is consulted, shared by [`resolve_credential`] and
+/// the `/auth/v1/*` guards.
+fn lookup_api_key(
+    key: &str,
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> Result<Option<ApiKeyKind>, String> {
-    let Some(key) = header_value(headers, "apikey").or_else(|| bearer_token(headers)) else {
-        return Ok(None);
-    };
-
-    let hash = hash_secret(key);
-    let Some(row) = find_row_by_field(store, cache, KEYS_TABLE, "key_hash", &hash, Instant::now())?
-    else {
-        return Ok(None);
-    };
-    if row
-        .get("revoked_at")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-    {
+    if key.is_empty() {
         return Ok(None);
     }
-    Ok(match row.get("kind").map(String::as_str) {
-        Some("publishable") => Some(ApiKeyKind::Publishable),
-        Some("secret") => Some(ApiKeyKind::Secret),
-        _ => None,
-    })
+    let hash = hash_secret(key);
+
+    // HTTP authenticates per request, so an uncached lookup puts a hash plus a
+    // table read on the hot path (measured at roughly +5us/req against the
+    // password memcmp). Cache the resolution briefly. Misses are cached too, so
+    // a client looping with a bad key cannot turn into a read storm.
+    if let Some(kind) = cached_api_key(store, &hash) {
+        return Ok(kind);
+    }
+
+    let resolved =
+        match find_row_by_field(store, cache, KEYS_TABLE, "key_hash", &hash, Instant::now())? {
+            Some(row)
+                if row
+                    .get("revoked_at")
+                    .map(|v| !v.is_empty() && v != "0")
+                    .unwrap_or(false) =>
+            {
+                None
+            }
+            Some(row) => match row.get("kind").map(String::as_str) {
+                Some("publishable") => Some(ApiKeyKind::Publishable),
+                Some("secret") => Some(ApiKeyKind::Secret),
+                _ => None,
+            },
+            None => None,
+        };
+    store_cached_api_key(store, hash, resolved);
+    Ok(resolved)
+}
+
+/// How long a resolved key stays cached. The ceiling on revocation latency for
+/// anything that does not go through [`invalidate_api_key_cache`], not the
+/// normal path: minting and revoking both clear the cache outright.
+const API_KEY_CACHE_TTL: Duration = Duration::from_secs(5);
+
+pub(crate) type ApiKeyCache = parking_lot::RwLock<HashMap<String, (Option<ApiKeyKind>, Instant)>>;
+
+/// `Some(kind)` on a live cache hit, `None` when the caller must do the lookup.
+fn cached_api_key(store: &Store, hash: &str) -> Option<Option<ApiKeyKind>> {
+    let cache = store.api_key_cache.read();
+    let (kind, stored_at) = cache.get(hash)?;
+    if stored_at.elapsed() >= API_KEY_CACHE_TTL {
+        return None;
+    }
+    Some(*kind)
+}
+
+fn store_cached_api_key(store: &Store, hash: String, kind: Option<ApiKeyKind>) {
+    let mut cache = store.api_key_cache.write();
+    // Bounded so an attacker spraying distinct keys cannot grow it without
+    // limit; the working set is a handful of real keys.
+    if cache.len() > 1024 {
+        cache.retain(|_, (_, stored_at)| stored_at.elapsed() < API_KEY_CACHE_TTL);
+        if cache.len() > 1024 {
+            cache.clear();
+        }
+    }
+    cache.insert(hash, (kind, Instant::now()));
+}
+
+/// Drop every cached resolution. Called whenever a key is minted or revoked so
+/// the TTL is a backstop rather than the mechanism.
+pub(crate) fn invalidate_api_key_cache(store: &Store) {
+    store.api_key_cache.write().clear();
+}
+
+/// Whether this engine has project keys, i.e. whether key-based auth is in play.
+pub(crate) fn project_keys_configured(store: &Store, cache: &SharedSchemaCache) -> bool {
+    !no_project_keys_configured(store, cache)
 }
 
 fn no_project_keys_configured(store: &Store, cache: &SharedSchemaCache) -> bool {
@@ -1685,6 +3199,14 @@ fn sign_access_token(
 ) -> Result<String, String> {
     let now = unix_seconds();
     let exp = now + store.config().auth.access_token_ttl.as_secs();
+    // Derive is_anonymous from the user's stored app metadata so every mint path
+    // (signin, anonymous, refresh) stamps it consistently without threading a flag.
+    let is_anonymous = find_row_by_field(store, cache, USERS_TABLE, "id", user_id, Instant::now())
+        .ok()
+        .flatten()
+        .as_ref()
+        .map(row_is_anonymous)
+        .unwrap_or(false);
     let claims = AccessClaims {
         iss: store.config().auth.issuer.clone(),
         sub: user_id.to_string(),
@@ -1693,15 +3215,31 @@ fn sign_access_token(
         role: "authenticated".to_string(),
         iat: now as usize,
         exp: exp as usize,
+        is_anonymous,
     };
-    let secret = active_signing_secret(store, cache, Instant::now())?
+    let signing_key = active_signing_key(store, cache, Instant::now())?
         .ok_or_else(|| "missing active auth signing key".to_string())?;
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .map_err(|e| e.to_string())
+    match signing_key.algorithm.as_str() {
+        "ES256" => {
+            let mut header = Header::new(Algorithm::ES256);
+            header.kid = Some(signing_key.kid);
+            let key = EncodingKey::from_ec_pem(signing_key.private_key.as_bytes())
+                .map_err(|e| e.to_string())?;
+            encode(&header, &claims, &key).map_err(|e| e.to_string())
+        }
+        _ => {
+            let mut header = Header::new(Algorithm::HS256);
+            if !signing_key.kid.is_empty() {
+                header.kid = Some(signing_key.kid);
+            }
+            encode(
+                &header,
+                &claims,
+                &EncodingKey::from_secret(signing_key.private_key.as_bytes()),
+            )
+            .map_err(|e| e.to_string())
+        }
+    }
 }
 
 fn claims_from_bearer(
@@ -1727,6 +3265,7 @@ pub(crate) fn authenticate_access_token(
         email: claims.email,
         session_id: claims.session_id,
         role: claims.role,
+        is_anonymous: claims.is_anonymous,
     })
 }
 
@@ -1735,25 +3274,42 @@ fn claims_from_access_token(
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> Result<AccessClaims, (u16, &'static str, String)> {
-    let secret = active_signing_secret(store, cache, Instant::now())
-        .map_err(|e| error(500, "Internal Server Error", &e))?
-        .ok_or_else(|| {
-            error(
-                500,
-                "Internal Server Error",
-                "missing active auth signing key",
-            )
-        })?;
-    let mut validation = Validation::new(Algorithm::HS256);
+    let header =
+        decode_header(token).map_err(|_| error(401, "Unauthorized", "invalid bearer token"))?;
+    let signing_key = match header.alg {
+        Algorithm::ES256 => {
+            let kid = header
+                .kid
+                .as_deref()
+                .ok_or_else(|| error(401, "Unauthorized", "invalid bearer token"))?;
+            signing_key_by_kid(store, cache, kid, Instant::now())
+                .map_err(|e| error(500, "Internal Server Error", &e))?
+        }
+        Algorithm::HS256 => active_signing_key(store, cache, Instant::now())
+            .map_err(|e| error(500, "Internal Server Error", &e))?,
+        _ => None,
+    }
+    .ok_or_else(|| error(401, "Unauthorized", "invalid bearer token"))?;
+
+    let (algorithm, decoding_key) = match signing_key.algorithm.as_str() {
+        "ES256" => {
+            let jwk = serde_json::from_str::<Jwk>(&signing_key.public_jwk)
+                .map_err(|_| error(500, "Internal Server Error", "invalid auth signing key"))?;
+            let key = DecodingKey::from_jwk(&jwk)
+                .map_err(|_| error(500, "Internal Server Error", "invalid auth signing key"))?;
+            (Algorithm::ES256, key)
+        }
+        _ => (
+            Algorithm::HS256,
+            DecodingKey::from_secret(signing_key.private_key.as_bytes()),
+        ),
+    };
+    let mut validation = Validation::new(algorithm);
     validation.set_issuer(&[store.config().auth.issuer.as_str()]);
-    decode::<AccessClaims>(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &validation,
-    )
-    .map(|token| token.claims)
-    .map_err(|_| error(401, "Unauthorized", "invalid bearer token"))
-    .and_then(|claims| validate_access_claims(claims, store, cache))
+    decode::<AccessClaims>(token, &decoding_key, &validation)
+        .map(|token| token.claims)
+        .map_err(|_| error(401, "Unauthorized", "invalid bearer token"))
+        .and_then(|claims| validate_access_claims(claims, store, cache))
 }
 
 fn validate_access_claims(
@@ -1901,13 +3457,39 @@ fn row_field_is_set(row: &HashMap<String, String>, field: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn active_signing_secret(
+fn active_signing_key(
     store: &Store,
     cache: &SharedSchemaCache,
     now: Instant,
-) -> Result<Option<String>, String> {
+) -> Result<Option<SigningKey>, String> {
     let row = find_row_by_field(store, cache, SIGNING_KEYS_TABLE, "active", "true", now)?;
-    Ok(row.and_then(|row| row.get("private_key_encrypted").cloned()))
+    Ok(row.map(signing_key_from_row))
+}
+
+fn signing_key_by_kid(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    kid: &str,
+    now: Instant,
+) -> Result<Option<SigningKey>, String> {
+    let row = find_row_by_field(store, cache, SIGNING_KEYS_TABLE, "kid", kid, now)?;
+    Ok(row.map(signing_key_from_row))
+}
+
+fn signing_key_from_row(row: HashMap<String, String>) -> SigningKey {
+    SigningKey {
+        kid: row.get("kid").cloned().unwrap_or_default(),
+        algorithm: row
+            .get("algorithm")
+            .cloned()
+            .filter(|algorithm| !algorithm.is_empty())
+            .unwrap_or_else(|| "HS256".to_string()),
+        public_jwk: row.get("public_jwk").cloned().unwrap_or_default(),
+        private_key: row
+            .get("private_key_encrypted")
+            .cloned()
+            .unwrap_or_default(),
+    }
 }
 
 fn user_json(
@@ -1968,6 +3550,14 @@ struct OAuthProviderConfig {
     client_secret: String,
     redirect_uri: String,
     scopes: String,
+    // Apple Sign In: services_id is the web OAuth client_id (aud), bundle_ids is a
+    // comma-separated list of native audiences, apple_private_key is the unsealed
+    // .p8 PEM (empty unless configured). team_id/key_id identify the .p8 to Apple.
+    apple_team_id: String,
+    apple_key_id: String,
+    apple_services_id: String,
+    apple_bundle_ids: String,
+    apple_private_key: String,
     created_at: Value,
     updated_at: Value,
 }
@@ -1990,6 +3580,11 @@ fn provider_map_json(row: &HashMap<String, String>) -> Value {
         "redirect_uri": row.get("redirect_uri").cloned().unwrap_or_default(),
         "scopes": row.get("scopes").cloned().unwrap_or_default(),
         "has_client_secret": row.get("client_secret").map(|s| !s.is_empty()).unwrap_or(false),
+        "apple_team_id": row.get("apple_team_id").cloned().unwrap_or_default(),
+        "apple_key_id": row.get("apple_key_id").cloned().unwrap_or_default(),
+        "apple_services_id": row.get("apple_services_id").cloned().unwrap_or_default(),
+        "apple_bundle_ids": row.get("apple_bundle_ids").cloned().unwrap_or_default(),
+        "has_apple_private_key": row.get("apple_private_key").map(|s| !s.is_empty()).unwrap_or(false),
         "created_at": parse_optional_int(row.get("created_at")),
         "updated_at": parse_optional_int(row.get("updated_at")),
     })
@@ -2003,6 +3598,11 @@ fn provider_config_json(config: &OAuthProviderConfig) -> Value {
         "redirect_uri": config.redirect_uri,
         "scopes": config.scopes,
         "has_client_secret": !config.client_secret.is_empty(),
+        "apple_team_id": config.apple_team_id,
+        "apple_key_id": config.apple_key_id,
+        "apple_services_id": config.apple_services_id,
+        "apple_bundle_ids": config.apple_bundle_ids,
+        "has_apple_private_key": !config.apple_private_key.is_empty(),
         "created_at": config.created_at,
         "updated_at": config.updated_at,
     })
@@ -2018,6 +3618,10 @@ fn oauth_provider_config(
     else {
         return Ok(None);
     };
+    let apple_private_key = match row.get("apple_private_key") {
+        Some(stored) if !stored.is_empty() => unseal_apple_private_key(store, stored)?,
+        _ => String::new(),
+    };
     Ok(Some(OAuthProviderConfig {
         provider: row.get("provider").cloned().unwrap_or_default(),
         enabled: parse_bool(row.get("enabled")),
@@ -2028,6 +3632,11 @@ fn oauth_provider_config(
             .get("scopes")
             .cloned()
             .unwrap_or_else(|| default_oauth_scopes(provider).to_string()),
+        apple_team_id: row.get("apple_team_id").cloned().unwrap_or_default(),
+        apple_key_id: row.get("apple_key_id").cloned().unwrap_or_default(),
+        apple_services_id: row.get("apple_services_id").cloned().unwrap_or_default(),
+        apple_bundle_ids: row.get("apple_bundle_ids").cloned().unwrap_or_default(),
+        apple_private_key,
         created_at: parse_optional_int(row.get("created_at")),
         updated_at: parse_optional_int(row.get("updated_at")),
     }))
@@ -2036,7 +3645,7 @@ fn oauth_provider_config(
 fn normalize_oauth_provider(provider: &str) -> Result<String, (u16, &'static str, String)> {
     let provider = provider.trim().to_ascii_lowercase();
     match provider.as_str() {
-        "google" | "github" => Ok(provider),
+        "google" | "github" | "apple" => Ok(provider),
         _ => Err(error(400, "Bad Request", "unsupported provider")),
     }
 }
@@ -2045,6 +3654,7 @@ fn default_oauth_scopes(provider: &str) -> &'static str {
     match provider {
         "google" => "openid email profile",
         "github" => "read:user user:email",
+        "apple" => "name email",
         _ => "",
     }
 }
@@ -2062,6 +3672,7 @@ fn oauth_authorization_url(
     config: &OAuthProviderConfig,
     redirect_uri: &str,
     state: &str,
+    oidc_nonce: &str,
 ) -> String {
     match config.provider.as_str() {
         "google" => format!(
@@ -2078,22 +3689,42 @@ fn oauth_authorization_url(
             url_encode(&config.scopes),
             url_encode(state),
         ),
+        // Apple uses the Services ID as client_id and requires form_post response
+        // mode when name/email scopes are requested (Apple then POSTs the callback).
+        "apple" => format!(
+            "https://appleid.apple.com/auth/authorize?client_id={}&redirect_uri={}&response_type=code&response_mode=form_post&scope={}&state={}&nonce={}",
+            url_encode(&config.apple_services_id),
+            url_encode(redirect_uri),
+            url_encode(&config.scopes),
+            url_encode(state),
+            url_encode(oidc_nonce),
+        ),
         _ => String::new(),
     }
 }
+
+// ---- Sign in with Apple ----------------------------------------------------
 
 async fn exchange_oauth_code(
     config: &OAuthProviderConfig,
     code: &str,
     redirect_uri: &str,
+    expected_nonce: Option<&str>,
+    apple_name: Option<String>,
 ) -> Result<OAuthUser, String> {
     match config.provider.as_str() {
         "google" => exchange_google_code(config, code, redirect_uri).await,
         "github" => exchange_github_code(config, code, redirect_uri).await,
+        "apple" => {
+            exchange_apple_code(config, code, redirect_uri, expected_nonce, apple_name).await
+        }
         _ => Err("unsupported_provider".to_string()),
     }
 }
 
+/// Mint Apple's OAuth "client secret" on demand: an ES256 JWT signed with the
+/// stored .p8. Minted per exchange with a short expiry, so unlike a manually
+/// pasted secret it never goes stale and never needs rotation.
 async fn exchange_google_code(
     config: &OAuthProviderConfig,
     code: &str,
@@ -2275,21 +3906,726 @@ fn oauth_success_url(redirect_to: &str, session: &Value) -> String {
     append_fragment(redirect_to, &fragment.join("&"))
 }
 
-fn oauth_error_url(redirect_to: &str, message: &str) -> String {
-    append_fragment(redirect_to, &format!("error={}", url_encode(message)))
+fn oauth_code_url(redirect_to: &str, code: &str) -> String {
+    append_query(redirect_to, &[("code", code)])
 }
 
-fn redirect_oauth_error(params: &[(String, String)], message: &str) -> AuthHttpResponse {
-    let redirect_to = get_param(params, "redirect_to").unwrap_or("/");
-    AuthHttpResponse::redirect(oauth_error_url(
-        &sanitize_header_value(redirect_to),
-        message,
-    ))
+fn oauth_error_url(redirect_to: &str, message: &str) -> String {
+    append_query(redirect_to, &[("error", message)])
 }
 
 fn append_fragment(url: &str, fragment: &str) -> String {
     let separator = if url.contains('#') { "&" } else { "#" };
     format!("{url}{separator}{fragment}")
+}
+
+fn append_query(url: &str, params: &[(&str, &str)]) -> String {
+    let separator = if url.contains('?') { "&" } else { "?" };
+    let query = params
+        .iter()
+        .map(|(key, value)| format!("{}={}", url_encode(key), url_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{url}{separator}{query}")
+}
+
+fn auth_action_link(redirect_to: &str, token: &str, kind: &str) -> String {
+    append_query(redirect_to, &[("token_hash", token), ("type", kind)])
+}
+
+fn auth_redirect_to_with_default(
+    parsed: &Value,
+    settings: &AuthSettings,
+) -> Result<String, String> {
+    let redirect = parsed
+        .get("redirect_to")
+        .or_else(|| parsed.get("email_redirect_to"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            parsed
+                .get("options")
+                .and_then(|options| {
+                    options
+                        .get("emailRedirectTo")
+                        .or_else(|| options.get("redirectTo"))
+                })
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(sanitize_header_value)
+        .unwrap_or_else(|| settings.site_url.clone());
+    validate_auth_redirect(&redirect, settings)
+}
+
+fn validate_auth_redirect(redirect: &str, settings: &AuthSettings) -> Result<String, String> {
+    let redirect = sanitize_header_value(redirect).trim().to_string();
+    if redirect.is_empty() {
+        return Err("redirect URL cannot be empty".to_string());
+    }
+    if is_relative_redirect(&redirect) {
+        return Ok(redirect);
+    }
+    let Some(target_origin) = url_origin(&redirect) else {
+        // A custom scheme (`myapp://auth/callback`) has no http(s) origin, so it
+        // can only ever match an allow-list entry exactly. Native OAuth needs
+        // one of these or a universal link, and the allow list is the security
+        // boundary: an unlisted scheme is still refused. Without this the allow
+        // list accepted a value that `authorize` then rejected at sign-in time.
+        if settings
+            .redirect_allow_list
+            .iter()
+            .any(|allowed| allowed.trim() == redirect)
+        {
+            return Ok(redirect);
+        }
+        return Err(
+            "redirect URL must be relative, http(s), or a custom scheme on the redirect allow list"
+                .to_string(),
+        );
+    };
+    if url_origin(&settings.site_url).as_deref() == Some(target_origin.as_str()) {
+        return Ok(redirect);
+    }
+    if settings
+        .redirect_allow_list
+        .iter()
+        .any(|allowed| redirect_matches_allowed(&redirect, &target_origin, allowed))
+    {
+        return Ok(redirect);
+    }
+    Err("redirect URL is not allowed".to_string())
+}
+
+fn is_relative_redirect(value: &str) -> bool {
+    value.starts_with('/') && !value.starts_with("//") && !value.contains('\\')
+}
+
+fn redirect_matches_allowed(redirect: &str, target_origin: &str, allowed: &str) -> bool {
+    let allowed = allowed.trim();
+    if allowed.is_empty() {
+        return false;
+    }
+    if let Some(allowed_origin) = url_origin(allowed) {
+        if allowed_origin != target_origin {
+            return false;
+        }
+        if let Some(path_start) = url_path_start(allowed) {
+            let allowed_path = &allowed[path_start..];
+            if allowed_path == "/" {
+                return true;
+            }
+            return redirect
+                .get(path_start..)
+                .is_some_and(|path| path.starts_with(allowed_path));
+        }
+        return true;
+    }
+    redirect == allowed
+}
+
+fn url_origin(value: &str) -> Option<String> {
+    let scheme_end = value.find("://")?;
+    let scheme = &value[..scheme_end].to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let rest = &value[scheme_end + 3..];
+    if rest.is_empty() || rest.starts_with('/') {
+        return None;
+    }
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if host_end == 0 {
+        return None;
+    }
+    Some(format!(
+        "{}://{}",
+        scheme,
+        rest[..host_end].to_ascii_lowercase()
+    ))
+}
+
+fn url_path_start(value: &str) -> Option<usize> {
+    let scheme_end = value.find("://")?;
+    let rest_start = scheme_end + 3;
+    let rest = &value[rest_start..];
+    rest.find('/').map(|idx| rest_start + idx)
+}
+
+fn create_email_flow_token(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    kind: &str,
+    user_id: &str,
+    email: &str,
+    redirect_to: &str,
+    now: Instant,
+) -> Result<String, (u16, &'static str, String)> {
+    let settings = auth_settings(store, cache, now).map_err(|e| error(400, "Bad Request", &e))?;
+    let metadata = json!({
+        "action_link": auth_action_link(redirect_to, "", kind),
+    });
+    let token = create_flow_token(
+        store,
+        cache,
+        FlowTokenInsert {
+            settings: &settings,
+            kind,
+            user_id,
+            email,
+            redirect_to,
+            metadata,
+        },
+        now,
+    )?;
+    let action_link = auth_action_link(redirect_to, &token, kind);
+    let metadata = json!({ "action_link": action_link }).to_string();
+    durable_table_update_where(
+        store,
+        cache,
+        FLOW_TOKENS_TABLE,
+        &[("metadata", metadata.as_str())],
+        &["token_hash", "=", &hash_secret(&token)],
+        now,
+    )
+    .map_err(|e| error(400, "Bad Request", &e))?;
+    if let Err(e) = send_auth_email(store, &settings, kind, email, &action_link) {
+        let _ = durable_table_delete_where(
+            store,
+            cache,
+            FLOW_TOKENS_TABLE,
+            &["token_hash", "=", &hash_secret(&token)],
+            now,
+        );
+        return Err(error(502, "Bad Gateway", &e));
+    }
+    Ok(token)
+}
+
+fn send_auth_email(
+    store: &Store,
+    settings: &AuthSettings,
+    kind: &str,
+    email: &str,
+    action_link: &str,
+) -> Result<(), String> {
+    validate_auth_email_settings(settings, store.config().auth.managed_email.as_ref())?;
+    let delivery = effective_email_delivery(settings, store.config().auth.managed_email.as_ref())?;
+    match delivery.provider.as_str() {
+        "console" | "log" => {
+            eprintln!("Lux Auth {kind} link for {email}: {action_link}");
+            Ok(())
+        }
+        "postmark" => {
+            let token = delivery
+                .postmark_server_token
+                .clone()
+                .ok_or_else(|| "postmark email delivery requires a server token".to_string())?;
+            let message = auth_email_message(kind, email, action_link, &delivery)?;
+            run_async_work(send_postmark_email(token, message))
+        }
+        _ => Err("unsupported email_provider".to_string()),
+    }
+}
+
+fn effective_email_delivery(
+    settings: &AuthSettings,
+    managed_email: Option<&AuthManagedEmailConfig>,
+) -> Result<EffectiveEmailDelivery, String> {
+    if let Some(managed) = managed_email {
+        let provider = managed.provider.trim().to_ascii_lowercase();
+        let from = apply_email_from_name(&managed.from, settings.email_from_name.as_deref());
+        return Ok(EffectiveEmailDelivery {
+            provider,
+            from: Some(from),
+            reply_to: managed.reply_to.clone(),
+            postmark_server_token: managed.postmark_server_token.clone(),
+            postmark_message_stream: managed
+                .postmark_message_stream
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "outbound".to_string()),
+            app_name: settings.email_app_name.clone(),
+        });
+    }
+    Ok(EffectiveEmailDelivery {
+        provider: settings.email_provider.clone(),
+        from: settings.email_from.clone(),
+        reply_to: settings.email_reply_to.clone(),
+        postmark_server_token: settings.email_postmark_server_token.clone(),
+        postmark_message_stream: settings.email_postmark_message_stream.clone(),
+        app_name: settings.email_app_name.clone(),
+    })
+}
+
+fn auth_email_message(
+    kind: &str,
+    email: &str,
+    action_link: &str,
+    delivery: &EffectiveEmailDelivery,
+) -> Result<AuthEmailMessage, String> {
+    let from = delivery
+        .from
+        .clone()
+        .ok_or_else(|| "email delivery requires a from address".to_string())?;
+    let app_name = delivery.app_name.trim();
+    let app_name = if app_name.is_empty() { "Lux" } else { app_name };
+    let (subject, text_intro, html_heading) = match kind {
+        "signup" => (
+            format!("Confirm your email for {app_name}"),
+            format!("Confirm your email for {app_name} by opening this link:"),
+            "Confirm your email",
+        ),
+        "recovery" => (
+            format!("Reset your password for {app_name}"),
+            format!("Reset your password for {app_name} by opening this link:"),
+            "Reset your password",
+        ),
+        _ => (
+            format!("Continue signing in to {app_name}"),
+            format!("Continue signing in to {app_name} by opening this link:"),
+            "Continue signing in",
+        ),
+    };
+    let escaped_link = html_escape(action_link);
+    let escaped_heading = html_escape(html_heading);
+    let escaped_app = html_escape(app_name);
+    Ok(AuthEmailMessage {
+        from,
+        to: email.to_string(),
+        reply_to: delivery.reply_to.clone(),
+        subject,
+        text_body: format!("{text_intro}\n\n{action_link}\n\nIf you did not request this, you can ignore this email."),
+        html_body: format!(
+            "<h2>{escaped_heading}</h2><p>Use this link to continue with {escaped_app}:</p><p><a href=\"{escaped_link}\">{escaped_link}</a></p><p>If you did not request this, you can ignore this email.</p>"
+        ),
+        message_stream: delivery.postmark_message_stream.clone(),
+    })
+}
+
+fn postmark_payload(message: &AuthEmailMessage) -> PostmarkEmailPayload {
+    PostmarkEmailPayload {
+        from: message.from.clone(),
+        to: message.to.clone(),
+        subject: message.subject.clone(),
+        text_body: message.text_body.clone(),
+        html_body: message.html_body.clone(),
+        message_stream: message.message_stream.clone(),
+        reply_to: message.reply_to.clone(),
+    }
+}
+
+async fn send_postmark_email(
+    server_token: String,
+    message: AuthEmailMessage,
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(POSTMARK_EMAIL_TIMEOUT)
+        .build()
+        .map_err(|_| "postmark email client setup failed".to_string())?;
+    let response = client
+        .post("https://api.postmarkapp.com/email")
+        .header("Accept", "application/json")
+        .header("X-Postmark-Server-Token", server_token)
+        .json(&postmark_payload(&message))
+        .send()
+        .await
+        .map_err(|_| "postmark email request failed".to_string())?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "postmark email request failed with status {}",
+            response.status().as_u16()
+        ))
+    }
+}
+
+fn apply_email_from_name(from: &str, from_name: Option<&str>) -> String {
+    let Some(name) = from_name.map(str::trim).filter(|value| !value.is_empty()) else {
+        return sanitize_header_value(from);
+    };
+    let safe_name = sanitize_header_value(name)
+        .replace(['<', '>'], "")
+        .trim()
+        .to_string();
+    if safe_name.is_empty() {
+        return sanitize_header_value(from);
+    }
+    let safe_from = sanitize_header_value(from);
+    if let Some((_, rest)) = safe_from.split_once('<') {
+        if let Some((address, _)) = rest.split_once('>') {
+            return format!("{safe_name} <{}>", address.trim());
+        }
+    }
+    format!("{safe_name} <{}>", safe_from.trim())
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn create_flow_token(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    insert: FlowTokenInsert<'_>,
+    now: Instant,
+) -> Result<String, (u16, &'static str, String)> {
+    let token = random_token(32);
+    let token_hash = hash_secret(&token);
+    let now_sec = unix_seconds();
+    let expires_at = now_sec + insert.settings.flow_token_ttl.as_secs();
+    durable_table_insert(
+        store,
+        cache,
+        FLOW_TOKENS_TABLE,
+        &[
+            ("id", random_id("flt").as_str()),
+            ("type", insert.kind),
+            ("token_hash", token_hash.as_str()),
+            ("user_id", insert.user_id),
+            ("email", insert.email),
+            ("redirect_to", insert.redirect_to),
+            ("metadata", insert.metadata.to_string().as_str()),
+            ("expires_at", &expires_at.to_string()),
+            ("created_at", &now_sec.to_string()),
+        ],
+        now,
+    )
+    .map_err(|e| error(400, "Bad Request", &e))?;
+    Ok(token)
+}
+
+fn auth_settings_json(
+    settings: &AuthSettings,
+    managed_email: Option<&AuthManagedEmailConfig>,
+) -> Value {
+    let managed = managed_email.is_some();
+    json!({
+        "email_confirmation_required": settings.email_confirmation_required,
+        "flow_token_ttl_seconds": settings.flow_token_ttl.as_secs(),
+        "site_url": settings.site_url,
+        "redirect_allow_list": settings.redirect_allow_list.clone(),
+        "email_provider": if managed { "managed" } else { settings.email_provider.as_str() },
+        "email_delivery_managed": managed,
+        "email_delivery_configured": managed || matches!(settings.email_provider.as_str(), "console" | "log") || settings.email_postmark_server_token.is_some(),
+        "email_from": if managed { Value::Null } else { optional_string_json(settings.email_from.as_deref()) },
+        "email_reply_to": if managed { Value::Null } else { optional_string_json(settings.email_reply_to.as_deref()) },
+        "email_postmark_message_stream": if managed {
+            Value::Null
+        } else {
+            Value::String(settings.email_postmark_message_stream.clone())
+        },
+        "has_email_postmark_server_token": !managed && settings.email_postmark_server_token.is_some(),
+        "email_app_name": settings.email_app_name,
+        "email_from_name": optional_string_json(settings.email_from_name.as_deref()),
+    })
+}
+
+fn optional_string_json(value: Option<&str>) -> Value {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| Value::String(value.to_string()))
+        .unwrap_or(Value::Null)
+}
+
+fn ensure_auth_setting(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    key: &str,
+    value: &str,
+    now: Instant,
+) -> Result<(), String> {
+    if find_row_by_field(store, cache, SETTINGS_TABLE, "key", key, now)?.is_some() {
+        return Ok(());
+    }
+    let now_sec = unix_seconds().to_string();
+    durable_table_insert(
+        store,
+        cache,
+        SETTINGS_TABLE,
+        &[
+            ("key", key),
+            ("value", value),
+            ("updated_at", now_sec.as_str()),
+        ],
+        now,
+    )
+    .map(|_| ())
+}
+
+fn set_auth_setting(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    key: &str,
+    value: &str,
+    now: Instant,
+) -> Result<(), String> {
+    if find_row_by_field(store, cache, SETTINGS_TABLE, "key", key, now)?.is_some() {
+        let now_sec = unix_seconds().to_string();
+        durable_table_update_where(
+            store,
+            cache,
+            SETTINGS_TABLE,
+            &[("value", value), ("updated_at", now_sec.as_str())],
+            &["key", "=", key],
+            now,
+        )?;
+    } else {
+        ensure_auth_setting(store, cache, key, value, now)?;
+    }
+    Ok(())
+}
+
+fn auth_settings(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    now: Instant,
+) -> Result<AuthSettings, String> {
+    Ok(AuthSettings {
+        email_confirmation_required: auth_setting_value(
+            store,
+            cache,
+            "email_confirmation_required",
+            now,
+        )?
+        .map(|value| parse_setting_bool(&value))
+        .unwrap_or(store.config().auth.email_confirmation_required),
+        flow_token_ttl: Duration::from_secs(
+            auth_setting_value(store, cache, "flow_token_ttl_seconds", now)?
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_else(|| store.config().auth.flow_token_ttl.as_secs()),
+        ),
+        site_url: auth_setting_value(store, cache, "site_url", now)?
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| store.config().auth.site_url.clone()),
+        redirect_allow_list: auth_setting_value(store, cache, "redirect_allow_list", now)?
+            .map(|value| parse_redirect_allow_list(&value))
+            .unwrap_or_default(),
+        email_provider: auth_setting_value(store, cache, "email_provider", now)?
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.to_ascii_lowercase())
+            .map(|value| {
+                if value == "log" {
+                    "console".to_string()
+                } else {
+                    value
+                }
+            })
+            .unwrap_or_else(|| "console".to_string()),
+        email_from: auth_setting_value(store, cache, "email_from", now)?
+            .filter(|value| !value.trim().is_empty()),
+        email_reply_to: auth_setting_value(store, cache, "email_reply_to", now)?
+            .filter(|value| !value.trim().is_empty()),
+        email_postmark_server_token: auth_setting_value(
+            store,
+            cache,
+            "email_postmark_server_token",
+            now,
+        )?
+        .filter(|value| !value.trim().is_empty()),
+        email_postmark_message_stream: auth_setting_value(
+            store,
+            cache,
+            "email_postmark_message_stream",
+            now,
+        )?
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "outbound".to_string()),
+        email_app_name: auth_setting_value(store, cache, "email_app_name", now)?
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "Lux".to_string()),
+        email_from_name: auth_setting_value(store, cache, "email_from_name", now)?
+            .filter(|value| !value.trim().is_empty()),
+    })
+}
+
+fn auth_setting_value(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    key: &str,
+    now: Instant,
+) -> Result<Option<String>, String> {
+    Ok(
+        find_row_by_field(store, cache, SETTINGS_TABLE, "key", key, now)?
+            .and_then(|row| row.get("value").cloned()),
+    )
+}
+
+fn parse_setting_bool(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn optional_setting_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.trim().to_string()),
+        Value::Null => Some(String::new()),
+        _ => None,
+    }
+}
+
+fn optional_string_list_setting(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::Null => Some(Vec::new()),
+        Value::String(value) => Some(parse_redirect_allow_list(value)),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| value.as_str().map(|s| s.trim().to_string()))
+            .collect::<Option<Vec<_>>>()
+            .map(|values| {
+                values
+                    .into_iter()
+                    .filter(|value| !value.is_empty())
+                    .collect()
+            }),
+        _ => None,
+    }
+}
+
+fn parse_redirect_allow_list(value: &str) -> Vec<String> {
+    value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn validate_auth_email_settings(
+    settings: &AuthSettings,
+    managed_email: Option<&AuthManagedEmailConfig>,
+) -> Result<(), String> {
+    if let Some(managed) = managed_email {
+        if managed.provider.trim().eq_ignore_ascii_case("postmark")
+            && managed
+                .postmark_server_token
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+        {
+            return Err("managed postmark email delivery requires a server token".to_string());
+        }
+        return Ok(());
+    }
+    match settings.email_provider.as_str() {
+        "console" | "log" => Ok(()),
+        "postmark" => {
+            if settings.email_from.as_deref().unwrap_or("").is_empty() {
+                return Err("postmark email delivery requires email_from".to_string());
+            }
+            if settings
+                .email_postmark_server_token
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(
+                    "postmark email delivery requires email_postmark_server_token".to_string(),
+                );
+            }
+            Ok(())
+        }
+        _ => Err("unsupported email_provider".to_string()),
+    }
+}
+
+fn consume_flow_token<F>(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    kind: &str,
+    token: &str,
+    now: Instant,
+    validate: F,
+) -> Result<HashMap<String, String>, (u16, &'static str, String)>
+where
+    F: FnOnce(&HashMap<String, String>) -> Result<(), (u16, &'static str, String)>,
+{
+    let _guard = FLOW_TOKEN_CONSUME_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| {
+            error(
+                500,
+                "Internal Server Error",
+                "auth flow token lock poisoned",
+            )
+        })?;
+    let token_hash = hash_secret(token);
+    let Some(existing) = find_row_by_field(
+        store,
+        cache,
+        FLOW_TOKENS_TABLE,
+        "token_hash",
+        &token_hash,
+        now,
+    )
+    .map_err(|e| error(400, "Bad Request", &e))?
+    else {
+        return Err(error(400, "Bad Request", "invalid or expired token"));
+    };
+    if existing.get("type").map(String::as_str) != Some(kind) {
+        return Err(error(400, "Bad Request", "invalid token type"));
+    }
+    if existing
+        .get("consumed_at")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false)
+    {
+        return Err(error(400, "Bad Request", "token already consumed"));
+    }
+    let expires_at = existing
+        .get("expires_at")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let now_sec = unix_seconds();
+    if expires_at <= now_sec {
+        return Err(error(400, "Bad Request", "invalid or expired token"));
+    }
+    validate(&existing)?;
+    let consumed_at = now_sec.to_string();
+    let expires_at_s = expires_at.to_string();
+    let rows = tables::table_update_where_returning_ttl(
+        store,
+        cache,
+        FLOW_TOKENS_TABLE,
+        &[("consumed_at", consumed_at.as_str())],
+        &[
+            "token_hash",
+            "=",
+            &token_hash,
+            "AND",
+            "type",
+            "=",
+            kind,
+            "AND",
+            "expires_at",
+            "=",
+            &expires_at_s,
+            "AND",
+            "consumed_at",
+            "IS",
+            "NULL",
+        ],
+        None,
+        now,
+    )
+    .map_err(|e| error(400, "Bad Request", &e))?;
+    if rows.len() != 1 {
+        return Err(error(400, "Bad Request", "token already consumed"));
+    }
+    Ok(rows
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .into_iter()
+        .collect())
 }
 
 fn form_body(items: &[(&str, &str)]) -> String {
@@ -2300,13 +4636,63 @@ fn form_body(items: &[(&str, &str)]) -> String {
         .join("&")
 }
 
+fn parse_form_urlencoded(body: &str) -> Vec<(String, String)> {
+    body.split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next()?;
+            let value = parts.next().unwrap_or("");
+            Some((url_decode(key), url_decode(value)))
+        })
+        .collect()
+}
+
+fn url_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn sanitize_header_value(value: &str) -> String {
     value.replace(['\r', '\n'], "")
 }
 
+/// A user is anonymous when their app metadata records the anonymous provider
+/// (set by `signin_anonymous`). Single source of truth for the flag.
+fn row_is_anonymous(row: &HashMap<String, String>) -> bool {
+    parse_json_string(row.get("raw_app_meta_data"))
+        .get("provider")
+        .and_then(Value::as_str)
+        == Some("anonymous")
+}
+
 fn user_map_json(row: &HashMap<String, String>) -> Value {
     let app_metadata = parse_json_string(row.get("raw_app_meta_data"));
-    let is_anonymous = app_metadata.get("provider").and_then(Value::as_str) == Some("anonymous");
+    let is_anonymous = row_is_anonymous(row);
     json!({
         "id": row.get("id").cloned().unwrap_or_default(),
         "email": row.get("email").cloned().unwrap_or_default(),
@@ -2374,7 +4760,7 @@ fn app_metadata_with_provider(existing: Option<&str>, provider: &str) -> String 
     value.to_string()
 }
 
-fn find_row_by_field(
+pub(crate) fn find_row_by_field(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -2399,6 +4785,7 @@ fn find_row_by_field(
         order_by: None,
         limit: Some(1),
         offset: None,
+        decrypt_authorized: true,
     };
     match tables::table_select(store, cache, &plan, now)? {
         SelectResult::Rows(rows) => Ok(rows
@@ -2441,10 +4828,18 @@ pub(crate) fn put_grant(
     now: Instant,
 ) -> Result<(), String> {
     ensure_grants_table(store, cache, now)?;
-    let predicate = crate::grants::predicate_to_string(&grant.predicate);
     let created = unix_seconds().to_string();
     for scope in &grant.scopes {
         let id = format!("{}:{}", grant.table, scope.as_str());
+        let predicate = match load_grant_predicate(store, cache, &grant.table, *scope, now)? {
+            Some(mut predicate) => {
+                predicate.append_alternatives(&grant.predicate);
+                predicate
+            }
+            None => grant.predicate.clone(),
+        };
+        validate_grant_predicate_for_schema(store, cache, &grant.table, &predicate, now)?;
+        let predicate = crate::grants::predicate_to_string(&predicate);
         let _ =
             tables::table_delete_where(store, cache, GRANTS_TABLE, &["id", "=", id.as_str()], now);
         tables::table_insert(
@@ -2462,6 +4857,109 @@ pub(crate) fn put_grant(
         )?;
     }
     Ok(())
+}
+
+fn validate_grant_predicate_for_schema(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    predicate: &crate::grants::Predicate,
+    now: Instant,
+) -> Result<(), String> {
+    let Ok(schema) = tables::load_schema(store, cache, table, now) else {
+        return Ok(());
+    };
+    validate_grant_predicate_columns(store, cache, table, &schema, predicate, now)
+}
+
+fn validate_grant_predicate_columns(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    schema: &[tables::FieldDef],
+    predicate: &crate::grants::Predicate,
+    now: Instant,
+) -> Result<(), String> {
+    for clause in predicate.clauses() {
+        for condition in clause {
+            validate_grant_condition_columns(store, cache, table, schema, condition, now)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_grant_condition_columns(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    schema: &[tables::FieldDef],
+    condition: &crate::grants::Condition,
+    now: Instant,
+) -> Result<(), String> {
+    match condition {
+        crate::grants::Condition::Cmp { column, op, .. } => {
+            validate_grant_column_filter(table, schema, column, op)
+        }
+        crate::grants::Condition::InSubquery {
+            column,
+            negated,
+            subquery,
+        } => {
+            validate_grant_column_filter(
+                table,
+                schema,
+                column,
+                if *negated { "NOT IN" } else { "IN" },
+            )?;
+            if let Ok(inner_schema) = tables::load_schema(store, cache, &subquery.table, now) {
+                validate_grant_predicate_columns(
+                    store,
+                    cache,
+                    &subquery.table,
+                    &inner_schema,
+                    &subquery.inner,
+                    now,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_grant_column_filter(
+    table: &str,
+    schema: &[tables::FieldDef],
+    column: &str,
+    op: &str,
+) -> Result<(), String> {
+    if let Some((root, rest)) = column.split_once('.') {
+        if !rest.is_empty() && schema.iter().any(|f| f.name == root && f.encrypted) {
+            return Err(format!(
+                "ERR encrypted column '{}' in grant on '{}' does not support JSON path filters",
+                root, table
+            ));
+        }
+    }
+    let bare = column.split('.').next().unwrap_or(column);
+    let Some(field) = schema.iter().find(|f| f.name == bare) else {
+        return Ok(());
+    };
+    if !field.encrypted {
+        return Ok(());
+    }
+    if op == "=" && field.searchable {
+        return Ok(());
+    }
+    if op == "=" {
+        return Err(format!(
+            "ERR encrypted column '{}' in grant on '{}' must be SEARCHABLE for equality filters",
+            field.name, table
+        ));
+    }
+    Err(format!(
+        "ERR encrypted column '{}' in grant on '{}' only supports equality filters when SEARCHABLE",
+        field.name, table
+    ))
 }
 
 /// Remove a grant for (table, scope). Returns true if one existed.
@@ -2504,8 +5002,8 @@ fn load_grant_predicate(
 fn resolve_for_principal(
     pred: &crate::grants::Predicate,
     principal: &AuthPrincipal,
-) -> Result<Vec<crate::grants::ResolvedCondition>, String> {
-    crate::grants::resolve(pred, &principal.user_id, |claim| match claim {
+) -> Result<Vec<Vec<crate::grants::ResolvedCondition>>, String> {
+    crate::grants::resolve_clauses(pred, &principal.user_id, |claim| match claim {
         "role" => Some(principal.role.clone()),
         "email" => Some(principal.email.clone()),
         "sub" | "uid" => Some(principal.user_id.clone()),
@@ -2513,18 +5011,54 @@ fn resolve_for_principal(
     })
 }
 
-/// Convert a subquery's resolved inner conditions into query `WhereClause`s.
-fn inner_conds_to_where(conds: &[crate::grants::ResolvedCond]) -> Result<Vec<WhereClause>, String> {
-    conds
-        .iter()
-        .map(|rc| {
-            Ok(WhereClause::single(
-                rc.column.clone(),
-                tables::parse_cmp_op(&rc.op)?,
-                rc.value.clone(),
-            ))
-        })
-        .collect()
+/// Convert a subquery's enforced inner conditions into query `WhereClause`s.
+fn inner_conds_to_where(
+    conds: &[crate::grants::EnforcedCondition],
+) -> Result<Vec<WhereClause>, String> {
+    use crate::grants::EnforcedCondition;
+    let mut out = Vec::new();
+    for cond in conds {
+        match cond {
+            EnforcedCondition::Cmp(rc) => {
+                out.push(WhereClause::single(
+                    rc.column.clone(),
+                    tables::parse_cmp_op(&rc.op)?,
+                    rc.value.clone(),
+                ));
+            }
+            EnforcedCondition::InSet {
+                column,
+                negated,
+                values,
+            } => {
+                if values.is_empty() {
+                    if !negated {
+                        out.push(WhereClause::single(
+                            column.clone(),
+                            tables::CmpOp::IsNull,
+                            String::new(),
+                        ));
+                        out.push(WhereClause::single(
+                            column.clone(),
+                            tables::CmpOp::IsNotNull,
+                            String::new(),
+                        ));
+                    }
+                } else {
+                    out.push(WhereClause::in_list(
+                        column.clone(),
+                        if *negated {
+                            tables::CmpOp::NotIn
+                        } else {
+                            tables::CmpOp::In
+                        },
+                        values.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Execute any subquery conditions (once) against the store, turning resolved
@@ -2551,7 +5085,8 @@ fn execute_resolved(
                 if let Some(err) = reserved_table_access_error(&inner_table) {
                     return Err(err);
                 }
-                let where_clauses = inner_conds_to_where(&inner_conds)?;
+                let inner_enforced = execute_resolved(store, cache, inner_conds, now)?;
+                let where_clauses = inner_conds_to_where(&inner_enforced)?;
                 let values = tables::scan_projected_column(
                     store,
                     cache,
@@ -2571,6 +5106,39 @@ fn execute_resolved(
     Ok(out)
 }
 
+fn execute_resolved_clauses(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    clauses: Vec<Vec<crate::grants::ResolvedCondition>>,
+    now: Instant,
+) -> Result<Vec<Vec<crate::grants::EnforcedCondition>>, String> {
+    clauses
+        .into_iter()
+        .map(|conds| execute_resolved(store, cache, conds, now))
+        .collect()
+}
+
+fn collect_resolved_subquery_tables(
+    clauses: &[Vec<crate::grants::ResolvedCondition>],
+    tables: &mut Vec<String>,
+) {
+    for conds in clauses {
+        for condition in conds {
+            if let crate::grants::ResolvedCondition::InSubqueryResolved {
+                inner_table,
+                inner_conds,
+                ..
+            } = condition
+            {
+                if !tables.iter().any(|table| table == inner_table) {
+                    tables.push(inner_table.clone());
+                }
+                collect_resolved_subquery_tables(std::slice::from_ref(inner_conds), tables);
+            }
+        }
+    }
+}
+
 /// Render enforced conditions into a WHERE fragment that the query path ANDs
 /// onto the caller's own WHERE (RLS `USING`). `IN`/`NOT IN` sets render as
 /// `col IN ( a b c )` - the engine's WHERE parser already handles these.
@@ -2581,7 +5149,7 @@ fn execute_resolved(
 ///   render an always-false, type-agnostic contradiction `col IS NULL AND col
 ///   IS NOT NULL` so the query matches nothing.
 /// - empty negated set (`NOT IN ( )` matches everything): omit it.
-fn render_enforced(conds: &[crate::grants::EnforcedCondition]) -> String {
+fn render_enforced_clause(conds: &[crate::grants::EnforcedCondition]) -> String {
     use crate::grants::EnforcedCondition;
     let mut parts: Vec<String> = Vec::new();
     for c in conds {
@@ -2609,6 +5177,128 @@ fn render_enforced(conds: &[crate::grants::EnforcedCondition]) -> String {
     parts.join(" AND ")
 }
 
+fn render_enforced_or_clauses(
+    clauses: &[Vec<crate::grants::EnforcedCondition>],
+) -> Result<String, String> {
+    use crate::grants::EnforcedCondition;
+    if let Some(cond) = collapse_same_column_or_clauses(clauses) {
+        return Ok(render_enforced_clause(&[cond]));
+    }
+    let mut branches = Vec::new();
+    for clause in clauses {
+        if clause.is_empty() {
+            return Ok(String::new());
+        }
+        let mut parts = Vec::new();
+        let mut branch_is_false = false;
+        for condition in clause {
+            match condition {
+                EnforcedCondition::Cmp(rc) => {
+                    parts.push(format!("{} {} {}", rc.column, rc.op, rc.value));
+                }
+                EnforcedCondition::InSet {
+                    column,
+                    negated,
+                    values,
+                } => {
+                    if values.is_empty() {
+                        if *negated {
+                            continue;
+                        }
+                        branch_is_false = true;
+                        break;
+                    }
+                    let kw = if *negated { "NOT IN" } else { "IN" };
+                    parts.push(format!("{column} {kw} ( {} )", values.join(" ")));
+                }
+            }
+        }
+        if branch_is_false {
+            continue;
+        }
+        if parts.is_empty() {
+            return Ok(String::new());
+        }
+        if parts.len() != 1 {
+            return Err(
+                "OR grants with multi-condition branches are not supported yet".to_string(),
+            );
+        }
+        branches.push(parts.remove(0));
+    }
+    if branches.is_empty() {
+        let Some(first_column) = clauses
+            .iter()
+            .flat_map(|clause| clause.iter())
+            .map(|condition| match condition {
+                EnforcedCondition::Cmp(rc) => rc.column.as_str(),
+                EnforcedCondition::InSet { column, .. } => column.as_str(),
+            })
+            .next()
+        else {
+            return Ok(String::new());
+        };
+        return Ok(format!(
+            "{first_column} IS NULL AND {first_column} IS NOT NULL"
+        ));
+    }
+    Ok(branches.join(" OR "))
+}
+
+fn collapse_same_column_or_clauses(
+    clauses: &[Vec<crate::grants::EnforcedCondition>],
+) -> Option<crate::grants::EnforcedCondition> {
+    use crate::grants::EnforcedCondition;
+    let mut column: Option<String> = None;
+    let mut values: Vec<String> = Vec::new();
+    for clause in clauses {
+        if clause.len() != 1 {
+            return None;
+        }
+        match &clause[0] {
+            EnforcedCondition::Cmp(rc) if rc.op == "=" => {
+                if column.as_deref().is_some_and(|c| c != rc.column) {
+                    return None;
+                }
+                column.get_or_insert_with(|| rc.column.clone());
+                if !values.iter().any(|value| value == &rc.value) {
+                    values.push(rc.value.clone());
+                }
+            }
+            EnforcedCondition::InSet {
+                column: c,
+                negated: false,
+                values: set,
+            } => {
+                if column.as_deref().is_some_and(|column| column != c) {
+                    return None;
+                }
+                column.get_or_insert_with(|| c.clone());
+                for value in set {
+                    if !values.iter().any(|existing| existing == value) {
+                        values.push(value.clone());
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(EnforcedCondition::InSet {
+        column: column?,
+        negated: false,
+        values,
+    })
+}
+
+fn render_enforced_clauses(
+    clauses: &[Vec<crate::grants::EnforcedCondition>],
+) -> Result<String, String> {
+    if clauses.len() == 1 {
+        return Ok(render_enforced_clause(&clauses[0]));
+    }
+    render_enforced_or_clauses(clauses)
+}
+
 /// Resolve + execute the grant for `(table, scope)` into enforced conditions.
 /// `Ok(None)` means no grant exists (deny-by-default).
 fn enforced_conds(
@@ -2618,12 +5308,12 @@ fn enforced_conds(
     table: &str,
     scope: crate::grants::Scope,
     now: Instant,
-) -> Result<Option<Vec<crate::grants::EnforcedCondition>>, String> {
+) -> Result<Option<Vec<Vec<crate::grants::EnforcedCondition>>>, String> {
     let Some(pred) = load_grant_predicate(store, cache, table, scope, now)? else {
         return Ok(None);
     };
     let resolved = resolve_for_principal(&pred, principal)?;
-    Ok(Some(execute_resolved(store, cache, resolved, now)?))
+    Ok(Some(execute_resolved_clauses(store, cache, resolved, now)?))
 }
 
 /// Resolve the READ grant for `principal` into a WHERE filter fragment that
@@ -2649,13 +5339,14 @@ pub(crate) fn read_filter(
     else {
         return Err(format!("no read access to '{table}'"));
     };
-    Ok(render_enforced(&conds))
+    render_enforced_clauses(&conds)
 }
 
 /// Like `read_filter`, but returns the resolved conditions as structured tuples
 /// (column, op, value) instead of a rendered string. Used by the `.live()` path,
 /// which merges them into the subscription's own `where_conditions` so both the
 /// initial snapshot and streamed events are scoped to the grant.
+#[cfg(test)]
 pub(crate) fn read_filter_conds(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -2674,7 +5365,12 @@ pub(crate) fn read_filter_conds(
     else {
         return Err(format!("no read access to '{table}'"));
     };
-    Ok(conds)
+    if conds.len() != 1 {
+        return Err(
+            "read grant has OR alternatives; use read_filter for expression rendering".to_string(),
+        );
+    }
+    Ok(conds.into_iter().next().unwrap_or_default())
 }
 
 /// Return tables consulted by READ-grant membership subqueries. Live queries
@@ -2693,14 +5389,7 @@ pub(crate) fn read_filter_dependencies(
     };
     let resolved = resolve_for_principal(&pred, principal)?;
     let mut tables = Vec::new();
-    for condition in resolved {
-        if let crate::grants::ResolvedCondition::InSubqueryResolved { inner_table, .. } = condition
-        {
-            if !tables.iter().any(|table| table == &inner_table) {
-                tables.push(inner_table);
-            }
-        }
-    }
+    collect_resolved_subquery_tables(&resolved, &mut tables);
     Ok(tables)
 }
 
@@ -2724,7 +5413,10 @@ pub(crate) fn check_write_row(
     else {
         return Err(format!("no write access to '{table}'"));
     };
-    if crate::grants::enforced_row_satisfies(&conds, row_value) {
+    if conds
+        .iter()
+        .any(|clause| crate::grants::enforced_row_satisfies(clause, &row_value))
+    {
         Ok(())
     } else {
         Err(format!("row not permitted by write grant on '{table}'"))
@@ -2756,7 +5448,10 @@ pub(crate) fn check_update_set(
     else {
         return Err(format!("no write access to '{table}'"));
     };
-    if crate::grants::enforced_set_satisfies(&conds, set_fields) {
+    if conds
+        .iter()
+        .any(|clause| crate::grants::enforced_set_satisfies(clause, set_fields))
+    {
         Ok(())
     } else {
         Err(format!(
@@ -2788,7 +5483,7 @@ pub(crate) fn write_filter(
     else {
         return Err(format!("no write access to '{table}'"));
     };
-    Ok(render_enforced(&conds))
+    render_enforced_clauses(&conds)
 }
 
 fn find_rows_by_field(
@@ -2816,6 +5511,7 @@ fn find_rows_by_field(
         order_by: None,
         limit: Some(1000),
         offset: None,
+        decrypt_authorized: true,
     };
     match tables::table_select(store, cache, &plan, now)? {
         SelectResult::Rows(rows) => Ok(rows
@@ -2837,15 +5533,40 @@ fn hash_password(password: &str) -> Result<String, String> {
     })
 }
 
+#[cfg(test)]
 fn verify_password(password: &str, hash: &str) -> Result<bool, String> {
+    verify_password_state(password, hash).map(|state| state != PasswordVerification::Invalid)
+}
+
+fn verify_password_state(password: &str, hash: &str) -> Result<PasswordVerification, String> {
     let password = password.to_string();
     let hash = hash.to_string();
     run_password_work(move || {
+        if is_bcrypt_hash(&hash) {
+            return bcrypt::verify(&password, &hash)
+                .map(|valid| {
+                    if valid {
+                        PasswordVerification::ValidNeedsRehash
+                    } else {
+                        PasswordVerification::Invalid
+                    }
+                })
+                .map_err(|e| e.to_string());
+        }
         let parsed = PasswordHash::new(&hash).map_err(|e| e.to_string())?;
-        Ok(Argon2::default()
+        let valid = Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
-            .is_ok())
+            .is_ok();
+        Ok(if valid {
+            PasswordVerification::Valid
+        } else {
+            PasswordVerification::Invalid
+        })
     })
+}
+
+fn is_bcrypt_hash(hash: &str) -> bool {
+    hash.starts_with("$2a$") || hash.starts_with("$2b$") || hash.starts_with("$2y$")
 }
 
 fn run_password_work<T, F>(work: F) -> T
@@ -2859,6 +5580,32 @@ where
     }
 }
 
+fn run_async_work<T, F>(future: F) -> T
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            block_in_place(|| handle.block_on(future))
+        }
+        Ok(_) => std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build auth email runtime")
+                .block_on(future)
+        })
+        .join()
+        .expect("auth email runtime thread panicked"),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build auth email runtime")
+            .block_on(future),
+    }
+}
+
 fn hash_secret(secret: &str) -> String {
     let digest = Sha256::digest(secret.as_bytes());
     let mut out = String::with_capacity(digest.len() * 2);
@@ -2869,13 +5616,63 @@ fn hash_secret(secret: &str) -> String {
     out
 }
 
+fn oauth_pkce_challenge(
+    params: &[(String, String)],
+) -> Result<Option<String>, (u16, &'static str, String)> {
+    let Some(challenge) = get_param(params, "code_challenge") else {
+        return Ok(None);
+    };
+    if challenge.len() != 43
+        || !challenge
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(error(400, "Bad Request", "invalid PKCE code_challenge"));
+    }
+    if get_param(params, "code_challenge_method") != Some("S256") {
+        return Err(error(
+            400,
+            "Bad Request",
+            "PKCE code_challenge_method must be S256",
+        ));
+    }
+    Ok(Some(challenge.to_string()))
+}
+
+fn verify_oauth_pkce(
+    flow: &HashMap<String, String>,
+    request: &Value,
+) -> Result<(), (u16, &'static str, String)> {
+    let metadata = flow
+        .get("metadata")
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .unwrap_or_else(|| json!({}));
+    let Some(challenge) = metadata.get("code_challenge").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let verifier = required_string(request, "code_verifier")?;
+    if !(43..=128).contains(&verifier.len())
+        || !verifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+    {
+        return Err(error(400, "Bad Request", "invalid PKCE code_verifier"));
+    }
+    let digest = Sha256::digest(verifier.as_bytes());
+    let calculated = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    if !constant_time_eq(calculated.as_bytes(), challenge.as_bytes()) {
+        return Err(error(400, "Bad Request", "PKCE verification failed"));
+    }
+    Ok(())
+}
+
 fn random_token(bytes: usize) -> String {
     let mut raw = vec![0u8; bytes];
     OsRng.fill_bytes(&mut raw);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
 }
 
-fn random_id(prefix: &str) -> String {
+pub(crate) fn random_id(prefix: &str) -> String {
     format!("{prefix}_{}", random_token(18))
 }
 
@@ -2883,7 +5680,7 @@ fn key_prefix(key: &str) -> String {
     key.chars().take(12).collect()
 }
 
-fn unix_seconds() -> u64 {
+pub(crate) fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -2993,725 +5790,77 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
+#[path = "auth/tests.rs"]
+mod tests;
 
-    use parking_lot::RwLock;
-
+#[cfg(test)]
+mod redirect_validation_tests {
     use super::*;
-    use crate::tables::SchemaCache;
 
-    fn principal(uid: &str) -> AuthPrincipal {
-        AuthPrincipal {
-            user_id: uid.into(),
-            email: "u@x.dev".into(),
-            session_id: "sess".into(),
-            role: "authenticated".into(),
+    fn settings(site_url: &str, allow: &[&str]) -> AuthSettings {
+        AuthSettings {
+            email_confirmation_required: false,
+            flow_token_ttl: Duration::from_secs(3600),
+            site_url: site_url.to_string(),
+            redirect_allow_list: allow.iter().map(|s| s.to_string()).collect(),
+            email_provider: "console".to_string(),
+            email_from: None,
+            email_reply_to: None,
+            email_postmark_server_token: None,
+            email_postmark_message_stream: "outbound".to_string(),
+            email_app_name: "Lux".to_string(),
+            email_from_name: None,
         }
     }
 
-    fn cond(c: &str, o: &str, v: &str) -> crate::grants::ResolvedCond {
-        crate::grants::ResolvedCond {
-            column: c.into(),
-            op: o.into(),
-            value: v.into(),
-        }
-    }
-
+    /// The allow list used to accept a custom scheme that `authorize` then
+    /// refused, so the setting looked configured and failed at sign-in on a
+    /// phone. Native OAuth needs custom schemes, and the allow list is the
+    /// security boundary, so an explicitly listed one is honored.
     #[test]
-    fn read_grant_enforced_end_to_end() {
-        let store = Store::new();
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        let now = Instant::now();
-
-        // GRANT read ON messages WHERE user_id = auth.uid()
-        let grant = crate::grants::parse_grant(&[
-            "read",
-            "ON",
-            "messages",
-            "WHERE",
-            "user_id",
-            "=",
-            "auth.uid()",
-        ])
-        .unwrap();
-        put_grant(&store, &cache, &grant, now).unwrap();
-
-        let p = principal("123abc");
-        // Read grant resolves to a filter scoping the query to the caller's
-        // own rows (RLS USING) -- the caller's uid is substituted for auth.uid().
-        let filter = read_filter(&store, &cache, &p, "messages", now).unwrap();
-        assert_eq!(filter, "user_id = 123abc");
-        // A different principal gets a filter scoped to *their* uid, never others'.
-        let other = principal("999zzz");
-        let other_filter = read_filter(&store, &cache, &other, "messages", now).unwrap();
-        assert_eq!(other_filter, "user_id = 999zzz");
-        // No grant on another table -> deny-by-default (Err, not an open filter).
-        assert!(read_filter(&store, &cache, &p, "secrets", now).is_err());
-    }
-
-    #[test]
-    fn write_grant_with_check_end_to_end() {
-        let store = Store::new();
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        let now = Instant::now();
-
-        let grant = crate::grants::parse_grant(&[
-            "write",
-            "ON",
-            "messages",
-            "WHERE",
-            "user_id",
-            "=",
-            "auth.uid()",
-        ])
-        .unwrap();
-        put_grant(&store, &cache, &grant, now).unwrap();
-        let p = principal("123abc");
-
-        // Inserting a row owned by self -> allowed.
-        let own = |c: &str| match c {
-            "user_id" => Some("123abc".to_string()),
-            _ => None,
-        };
-        assert!(check_write_row(&store, &cache, &p, "messages", own, now).is_ok());
-        // Inserting a row for someone else -> denied (WITH CHECK).
-        let other = |c: &str| match c {
-            "user_id" => Some("evil".to_string()),
-            _ => None,
-        };
-        assert!(check_write_row(&store, &cache, &p, "messages", other, now).is_err());
-        // UPDATE/DELETE: the write grant resolves to a filter that scopes the
-        // statement to the caller's own rows (RLS USING).
-        let filter = write_filter(&store, &cache, &p, "messages", now).unwrap();
-        assert_eq!(filter, "user_id = 123abc");
-        // No write grant on another table -> deny-by-default (Err).
-        assert!(write_filter(&store, &cache, &p, "other", now).is_err());
-    }
-
-    #[test]
-    fn update_with_check_single_condition() {
-        let store = Store::new();
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        let now = Instant::now();
-        grant(
-            &store,
-            &cache,
-            &["write", "ON", "t", "WHERE", "owner", "=", "auth.uid()"],
-            now,
-        );
-        let p = principal("u1");
-        // moving ownership away -> rejected
-        assert!(check_update_set(&store, &cache, &p, "t", &[("owner", "u2")], now).is_err());
-        // setting owner to self -> ok
-        assert!(check_update_set(&store, &cache, &p, "t", &[("owner", "u1")], now).is_ok());
-        // a non-grant column -> ok (grant column untouched)
-        assert!(check_update_set(&store, &cache, &p, "t", &[("body", "hi")], now).is_ok());
-        // empty set -> ok
-        assert!(check_update_set(&store, &cache, &p, "t", &[], now).is_ok());
-        // no write grant on another table -> deny-by-default
-        assert!(check_update_set(&store, &cache, &p, "other", &[("x", "y")], now).is_err());
-    }
-
-    #[test]
-    fn update_with_check_multi_condition_enforces_each() {
-        let store = Store::new();
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        let now = Instant::now();
-        grant(
-            &store,
-            &cache,
-            &[
-                "write",
-                "ON",
-                "t",
-                "WHERE",
-                "owner",
-                "=",
-                "auth.uid()",
-                "AND",
-                "status",
-                "=",
-                "active",
-            ],
-            now,
-        );
-        let p = principal("u1");
-        // changing a *second* grant column to an invalid value is caught even
-        // though owner is untouched (every condition is enforced, not just the first)
-        assert!(check_update_set(&store, &cache, &p, "t", &[("status", "archived")], now).is_err());
-        assert!(check_update_set(&store, &cache, &p, "t", &[("status", "active")], now).is_ok());
-        assert!(check_update_set(&store, &cache, &p, "t", &[("owner", "u2")], now).is_err());
-        // both set validly -> ok; one of them invalid -> rejected
-        assert!(check_update_set(
-            &store,
-            &cache,
-            &p,
-            "t",
-            &[("owner", "u1"), ("status", "active")],
-            now
-        )
-        .is_ok());
-        assert!(check_update_set(
-            &store,
-            &cache,
-            &p,
-            "t",
-            &[("owner", "u1"), ("status", "x")],
-            now
-        )
-        .is_err());
-        // touching neither grant column -> ok
-        assert!(check_update_set(&store, &cache, &p, "t", &[("body", "z")], now).is_ok());
-    }
-
-    #[test]
-    fn update_with_check_comparison_operator() {
-        let store = Store::new();
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        let now = Instant::now();
-        grant(
-            &store,
-            &cache,
-            &["write", "ON", "t", "WHERE", "priority", ">=", "5"],
-            now,
-        );
-        let p = principal("u1");
-        // the >= operator is applied to the set value, numerically
-        assert!(check_update_set(&store, &cache, &p, "t", &[("priority", "3")], now).is_err());
-        assert!(check_update_set(&store, &cache, &p, "t", &[("priority", "5")], now).is_ok());
-        assert!(check_update_set(&store, &cache, &p, "t", &[("priority", "9")], now).is_ok());
-    }
-
-    #[test]
-    fn revoke_removes_grant() {
-        let store = Store::new();
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        let now = Instant::now();
-        let grant = crate::grants::parse_grant(&[
-            "read",
-            "ON",
-            "messages",
-            "WHERE",
-            "user_id",
-            "=",
-            "auth.uid()",
-        ])
-        .unwrap();
-        put_grant(&store, &cache, &grant, now).unwrap();
-        let p = principal("123abc");
-        assert!(read_filter(&store, &cache, &p, "messages", now).is_ok());
-        delete_grant(&store, &cache, "messages", crate::grants::Scope::Read, now).unwrap();
-        // After revoke -> deny-by-default.
-        assert!(read_filter(&store, &cache, &p, "messages", now).is_err());
-    }
-
-    // ── RLS auto-filter (USING) coverage ──
-
-    fn grant(store: &Store, cache: &SharedSchemaCache, args: &[&str], now: Instant) {
-        let g = crate::grants::parse_grant(args).unwrap();
-        put_grant(store, cache, &g, now).unwrap();
-    }
-
-    #[test]
-    fn read_filter_conds_returns_structured_conditions() {
-        let store = Store::new();
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        let now = Instant::now();
-        grant(
-            &store,
-            &cache,
-            &[
-                "read",
-                "ON",
-                "messages",
-                "WHERE",
-                "user_id",
-                "=",
-                "auth.uid()",
-            ],
-            now,
-        );
-        let p = principal("abc123");
-        let conds = read_filter_conds(&store, &cache, &p, "messages", now).unwrap();
+    fn allow_listed_custom_scheme_is_accepted() {
+        let s = settings("http://localhost:5990", &["vigil://auth/callback"]);
         assert_eq!(
-            conds,
-            vec![crate::grants::EnforcedCondition::Cmp(cond(
-                "user_id", "=", "abc123"
-            ))]
+            validate_auth_redirect("vigil://auth/callback", &s).unwrap(),
+            "vigil://auth/callback"
         );
     }
 
     #[test]
-    fn unconditional_grant_yields_empty_filter() {
-        // GRANT read ON public_posts (no WHERE) -> everyone with the grant reads
-        // all rows; the filter is empty (no narrowing), but access is NOT denied.
-        let store = Store::new();
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        let now = Instant::now();
-        grant(&store, &cache, &["read", "ON", "public_posts"], now);
-        let p = principal("anyone");
-        let filter = read_filter(&store, &cache, &p, "public_posts", now).unwrap();
-        assert_eq!(filter, "");
-        assert!(read_filter_conds(&store, &cache, &p, "public_posts", now)
-            .unwrap()
-            .is_empty());
+    fn unlisted_custom_scheme_is_still_refused() {
+        let s = settings("http://localhost:5990", &["vigil://auth/callback"]);
+        let err = validate_auth_redirect("evil://auth/callback", &s).unwrap_err();
+        assert!(err.contains("allow list"), "unexpected error: {err}");
+
+        // And with no allow list at all.
+        let s = settings("http://localhost:5990", &[]);
+        assert!(validate_auth_redirect("vigil://auth/callback", &s).is_err());
     }
 
+    /// A custom scheme matches only exactly: it has no origin to compare, so
+    /// prefix games must not get through.
     #[test]
-    fn multi_condition_grant_renders_and_chain() {
-        let store = Store::new();
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        let now = Instant::now();
-        grant(
-            &store,
-            &cache,
-            &[
-                "read",
-                "ON",
-                "messages",
-                "WHERE",
-                "user_id",
-                "=",
-                "auth.uid()",
-                "AND",
-                "room",
-                "=",
-                "general",
-            ],
-            now,
-        );
-        let p = principal("u1");
-        let filter = read_filter(&store, &cache, &p, "messages", now).unwrap();
-        assert_eq!(filter, "user_id = u1 AND room = general");
-    }
-
-    #[test]
-    fn grant_resolves_non_uid_claims() {
-        // auth.role / auth.email operands resolve from the principal's claims.
-        let store = Store::new();
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        let now = Instant::now();
-        grant(
-            &store,
-            &cache,
-            &["read", "ON", "audit", "WHERE", "owner", "=", "auth.email"],
-            now,
-        );
-        let p = principal("u1");
-        let filter = read_filter(&store, &cache, &p, "audit", now).unwrap();
-        assert_eq!(filter, "owner = u@x.dev");
-    }
-
-    #[test]
-    fn read_and_write_grants_are_independent_scopes() {
-        // A read grant does not imply a write filter and vice versa: each scope
-        // is loaded separately, so a read-only table denies write_filter.
-        let store = Store::new();
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        let now = Instant::now();
-        grant(
-            &store,
-            &cache,
-            &["read", "ON", "feed", "WHERE", "user_id", "=", "auth.uid()"],
-            now,
-        );
-        let p = principal("u1");
-        assert_eq!(
-            read_filter(&store, &cache, &p, "feed", now).unwrap(),
-            "user_id = u1"
-        );
-        // No write grant -> writes denied even though reads are allowed.
-        assert!(write_filter(&store, &cache, &p, "feed", now).is_err());
-        assert!(check_write_row(&store, &cache, &p, "feed", |_| None, now).is_err());
-    }
-
-    #[test]
-    fn comparison_operators_round_trip_into_filter() {
-        // Non-equality operators (>, >=, etc.) survive into the rendered filter
-        // so range grants (e.g. "created_at > X") scope correctly.
-        let store = Store::new();
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        let now = Instant::now();
-        grant(
-            &store,
-            &cache,
-            &["read", "ON", "events", "WHERE", "priority", ">=", "5"],
-            now,
-        );
-        let p = principal("u1");
-        assert_eq!(
-            read_filter(&store, &cache, &p, "events", now).unwrap(),
-            "priority >= 5"
-        );
-    }
-
-    #[test]
-    fn bootstrap_creates_auth_tables_idempotently() {
-        let store = Store::new();
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-
-        bootstrap(&store, &cache, &AuthConfig::default()).unwrap();
-        bootstrap(&store, &cache, &AuthConfig::default()).unwrap();
-
-        let now = Instant::now();
-        assert!(tables::table_schema(&store, &cache, USERS_TABLE, now).is_ok());
-        assert!(tables::table_schema(&store, &cache, SESSIONS_TABLE, now).is_ok());
-        assert_eq!(
-            store.get(AUTH_SCHEMA_VERSION_KEY, now).unwrap(),
-            AUTH_SCHEMA_VERSION
-        );
-    }
-
-    #[test]
-    fn auth_tables_are_reserved() {
-        assert!(is_reserved_auth_table("auth.users"));
-        assert!(!is_reserved_auth_table("users"));
-    }
-
-    #[test]
-    fn auth_config_debug_redacts_initial_keys() {
-        let config = AuthConfig {
-            enabled: true,
-            initial_publishable_key: Some("lux_pub_secret".to_string()),
-            initial_secret_key: Some("lux_sec_secret".to_string()),
-            ..AuthConfig::default()
-        };
-        let debug = format!("{config:?}");
-        assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains("lux_pub_secret"));
-        assert!(!debug.contains("lux_sec_secret"));
-    }
-
-    #[test]
-    fn password_hashes_verify_without_storing_plaintext() {
-        let hash = hash_password("correct horse battery staple").unwrap();
-        assert_ne!(hash, "correct horse battery staple");
-        assert!(verify_password("correct horse battery staple", &hash).unwrap());
-        assert!(!verify_password("wrong password", &hash).unwrap());
-    }
-
-    #[test]
-    fn reserved_table_mutations_are_blocked_for_client_commands() {
-        let store = Store::new();
-        let err = reserved_table_mutation_error(&[b"TINSERT", b"auth.users"], &store).unwrap();
-        assert!(err.contains("managed by Lux Auth"));
-
-        store
-            .wal_suppress
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        assert!(reserved_table_mutation_error(&[b"TINSERT", b"auth.users"], &store).is_none());
-    }
-
-    #[test]
-    fn reserved_auth_tables_are_blocked_from_generic_table_reads() {
-        let store = Store::new();
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        bootstrap(&store, &cache, &AuthConfig::default()).unwrap();
-
-        let broker = crate::pubsub::Broker::new();
-        // Both schema introspection and row reads of auth.* via the generic
-        // table commands must be refused; clients use /auth/v1 instead.
-        for cmd in [
-            &[b"TSCHEMA".as_ref(), b"auth.users".as_ref()][..],
-            &[
-                b"TSELECT".as_ref(),
-                b"*".as_ref(),
-                b"FROM".as_ref(),
-                b"auth.users".as_ref(),
-            ][..],
+    fn custom_scheme_matches_exactly_not_by_prefix() {
+        let s = settings("http://localhost:5990", &["vigil://auth/callback"]);
+        for attempt in [
+            "vigil://auth/callback/../elsewhere",
+            "vigil://auth/callbackevil",
+            "vigil://evil",
+            "vigil://auth",
         ] {
-            let mut out = bytes::BytesMut::new();
-            crate::cmd::execute(&store, &cache, &broker, cmd, &mut out, Instant::now());
-            let response = std::str::from_utf8(&out).unwrap();
-            assert!(response.starts_with("-ERR"), "{response}");
-            assert!(response.contains("managed by Lux Auth"), "{response}");
+            assert!(
+                validate_auth_redirect(attempt, &s).is_err(),
+                "{attempt} must not match the allow-listed scheme"
+            );
         }
     }
 
     #[test]
-    fn signup_and_password_grant_issue_tokens() {
-        let config = Arc::new(crate::ServerConfig {
-            auth: AuthConfig {
-                enabled: true,
-                ..AuthConfig::default()
-            },
-            ..crate::ServerConfig::default()
-        });
-        let store = Store::new_with_config(config);
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        bootstrap(&store, &cache, &store.config().auth).unwrap();
-        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
-
-        let (_, _, signup_body) = route_http(
-            "POST",
-            "/auth/v1/signup",
-            r#"{"email":"Test@Example.com","password":"password123"}"#,
-            &[],
-            &[],
-            &store,
-            &cache,
-        );
-        let signup_json: Value = serde_json::from_str(&signup_body).unwrap();
-        assert!(signup_json.get("access_token").is_some(), "{signup_body}");
-        assert_eq!(signup_json["user"]["email"], "test@example.com");
-
-        let (_, _, token_body) = route_http(
-            "POST",
-            "/auth/v1/token",
-            r#"{"grant_type":"password","email":"test@example.com","password":"password123"}"#,
-            &[],
-            &[],
-            &store,
-            &cache,
-        );
-        let token_json: Value = serde_json::from_str(&token_body).unwrap();
-        assert!(token_json.get("access_token").is_some(), "{token_body}");
-        assert!(token_json.get("refresh_token").is_some(), "{token_body}");
-    }
-
-    #[tokio::test]
-    async fn oauth_provider_config_and_authorize_redirect_are_core_owned() {
-        let config = Arc::new(crate::ServerConfig {
-            auth: AuthConfig {
-                enabled: true,
-                initial_secret_key: Some("lux_sec_test".to_string()),
-                ..AuthConfig::default()
-            },
-            ..crate::ServerConfig::default()
-        });
-        let store = Store::new_with_config(config);
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        bootstrap(&store, &cache, &store.config().auth).unwrap();
-        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
-
-        let (status, _, body) = route_http(
-            "PUT",
-            "/auth/v1/admin/providers/google",
-            r#"{"client_id":"google-client","client_secret":"google-secret","redirect_uri":"http://app.test/auth/callback","enabled":true}"#,
-            &[],
-            &[("apikey".to_string(), "lux_sec_test".to_string())],
-            &store,
-            &cache,
-        );
-        assert_eq!(status, 200, "{body}");
-        let provider: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(provider["provider"]["provider"], "google");
-        assert_eq!(provider["provider"]["has_client_secret"], true);
-        assert!(
-            !body.contains("google-secret"),
-            "admin provider response must not expose client secret: {body}"
-        );
-
-        let response = route_http_response(
-            "GET",
-            "/auth/v1/authorize",
-            "",
-            &[
-                ("provider".to_string(), "google".to_string()),
-                (
-                    "redirect_to".to_string(),
-                    "http://app.test/welcome".to_string(),
-                ),
-            ],
-            &[("host".to_string(), "localhost:17777".to_string())],
-            &store,
-            &cache,
-        )
-        .await;
-        assert_eq!(response.status, 302);
-        let location = response
-            .headers
-            .iter()
-            .find(|(key, _)| key == "Location")
-            .map(|(_, value)| value.as_str())
-            .unwrap_or("");
-        assert!(location.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
-        assert!(location.contains("client_id=google-client"), "{location}");
-        assert!(
-            location.contains("redirect_uri=http%3A%2F%2Fapp.test%2Fauth%2Fcallback"),
-            "{location}"
-        );
-        assert!(
-            location.contains("scope=openid%20email%20profile"),
-            "{location}"
-        );
-    }
-
-    #[test]
-    fn oauth_sign_in_links_identity_and_issues_session() {
-        let config = Arc::new(crate::ServerConfig {
-            auth: AuthConfig {
-                enabled: true,
-                ..AuthConfig::default()
-            },
-            ..crate::ServerConfig::default()
-        });
-        let store = Store::new_with_config(config);
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        bootstrap(&store, &cache, &store.config().auth).unwrap();
-        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
-
-        let oauth_user = OAuthUser {
-            provider: "github".to_string(),
-            provider_id: "42".to_string(),
-            email: "octo@example.com".to_string(),
-            email_verified: true,
-            user_metadata: json!({"name":"Octo"}),
-            identity_data: json!({"login":"octo"}),
-        };
-        let (status, _, body) = oauth_sign_in(&oauth_user, &[], &store, &cache);
-        assert_eq!(status, 200, "{body}");
-        let session: Value = serde_json::from_str(&body).unwrap();
-        assert!(session["access_token"].is_string(), "{body}");
-        assert_eq!(session["user"]["email"], "octo@example.com");
-
-        let identity = find_row_by_field(
-            &store,
-            &cache,
-            IDENTITIES_TABLE,
-            "provider_id",
-            "github:42",
-            Instant::now(),
-        )
-        .unwrap()
-        .expect("oauth identity should be stored");
-        assert_eq!(identity.get("provider").map(String::as_str), Some("github"));
-    }
-
-    #[test]
-    fn deleted_users_cannot_use_or_refresh_tokens() {
-        let config = Arc::new(crate::ServerConfig {
-            auth: AuthConfig {
-                enabled: true,
-                ..AuthConfig::default()
-            },
-            ..crate::ServerConfig::default()
-        });
-        let store = Store::new_with_config(config);
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        bootstrap(&store, &cache, &store.config().auth).unwrap();
-        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
-
-        let (_, _, signup_body) = route_http(
-            "POST",
-            "/auth/v1/signup",
-            r#"{"email":"deleted@example.com","password":"password123"}"#,
-            &[],
-            &[],
-            &store,
-            &cache,
-        );
-        let signup_json: Value = serde_json::from_str(&signup_body).unwrap();
-        let user_id = signup_json["user"]["id"].as_str().unwrap();
-        let access_token = signup_json["access_token"].as_str().unwrap();
-        let refresh_token = signup_json["refresh_token"].as_str().unwrap();
-
-        let deleted_at = unix_seconds().to_string();
-        durable_table_update_where(
-            &store,
-            &cache,
-            USERS_TABLE,
-            &[("deleted_at", deleted_at.as_str())],
-            &["id", "=", user_id],
-            Instant::now(),
-        )
-        .unwrap();
-
-        let (status, _, body) = route_http(
-            "GET",
-            "/auth/v1/user",
-            "",
-            &[],
-            &[(
-                "Authorization".to_string(),
-                format!("Bearer {access_token}"),
-            )],
-            &store,
-            &cache,
-        );
-        assert_eq!(status, 401, "{body}");
-        assert!(body.contains("user deleted"), "{body}");
-
-        let (status, _, body) = route_http(
-            "POST",
-            "/auth/v1/token",
-            &format!(
-                r#"{{"grant_type":"refresh_token","refresh_token":"{}"}}"#,
-                refresh_token
-            ),
-            &[],
-            &[],
-            &store,
-            &cache,
-        );
-        assert_eq!(status, 401, "{body}");
-
-        let (status, _, body) = route_http(
-            "POST",
-            "/auth/v1/token",
-            r#"{"grant_type":"password","email":"deleted@example.com","password":"password123"}"#,
-            &[],
-            &[],
-            &store,
-            &cache,
-        );
-        assert_eq!(status, 401, "{body}");
-    }
-
-    #[test]
-    fn auth_users_survive_wal_replay() {
-        let temp = tempfile::tempdir().unwrap();
-        let config = Arc::new(crate::ServerConfig {
-            auth: AuthConfig {
-                enabled: true,
-                ..AuthConfig::default()
-            },
-            storage: crate::StorageConfig {
-                mode: crate::StorageMode::Tiered,
-                dir: temp.path().to_string_lossy().to_string(),
-            },
-            ..crate::ServerConfig::default()
-        });
-
-        let store = Store::new_with_config(config.clone());
-        let cache = Arc::new(RwLock::new(SchemaCache::new()));
-        bootstrap(&store, &cache, &store.config().auth).unwrap();
-        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
-
-        let (_, _, signup_body) = route_http(
-            "POST",
-            "/auth/v1/signup",
-            r#"{"email":"wal@example.com","password":"password123"}"#,
-            &[],
-            &[],
-            &store,
-            &cache,
-        );
-        assert!(
-            serde_json::from_str::<Value>(&signup_body).unwrap()["access_token"].is_string(),
-            "{signup_body}"
-        );
-
-        let restored = Store::new_with_config(config);
-        let restored_cache = Arc::new(RwLock::new(SchemaCache::new()));
-        bootstrap(&restored, &restored_cache, &restored.config().auth).unwrap();
-        restored.replay_wal(&crate::pubsub::Broker::new());
-        bootstrap_runtime(&restored, &restored_cache, &restored.config().auth).unwrap();
-
-        let user = find_row_by_field(
-            &restored,
-            &restored_cache,
-            USERS_TABLE,
-            "email",
-            "wal@example.com",
-            Instant::now(),
-        )
-        .unwrap()
-        .expect("auth user should replay from WAL");
-        assert_eq!(
-            user.get("email").map(String::as_str),
-            Some("wal@example.com")
-        );
+    fn http_and_relative_redirects_still_behave() {
+        let s = settings("http://localhost:5990", &["http://localhost:3000/cb"]);
+        assert!(validate_auth_redirect("/dashboard", &s).is_ok());
+        assert!(validate_auth_redirect("http://localhost:5990/anything", &s).is_ok());
+        assert!(validate_auth_redirect("http://localhost:3000/cb", &s).is_ok());
+        assert!(validate_auth_redirect("http://evil.example/cb", &s).is_err());
     }
 }

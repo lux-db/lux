@@ -113,10 +113,9 @@ fn crash_recovery_all_types() {
 // WAL-only recovery. execute_with_wal logs the RAW command (literal `*`), so replay
 // regenerates a new time-based id and the entry's identity changes.
 //
-// QUARANTINED repro for ENG-1276 (un-ignore when fixing). Run with:
+// QUARANTINED repro for row TTL WAL replay drift (un-ignore when fixing). Run with:
 //   cargo test --release --test crash_recovery -- --ignored xadd_star_id_stable_after_wal_replay
 #[test]
-#[ignore = "ENG-1276: XADD * id is non-deterministic across WAL replay until fixed"]
 fn xadd_star_id_stable_after_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
@@ -141,15 +140,10 @@ fn xadd_star_id_stable_after_wal_replay() {
     );
 }
 
-// AUDIT PROBE: TSADD with a `*` server-generated timestamp must keep the SAME
-// timestamp across WAL replay. Same class as XADD * -- the raw `*` is logged and
-// replay resolves it to a different wall-clock time.
-//
-// QUARANTINED repro for ENG-1277 (un-ignore when fixing; shares the fix with
-// ENG-1276). Run with:
-//   cargo test --release --test crash_recovery -- --ignored tsadd_star_timestamp_stable_after_wal_replay
+// REGRESSION: TSADD with a `*` server-generated timestamp must keep the SAME
+// timestamp across WAL replay. TSADD/TSMADD self-log the resolved timestamp
+// (see log_resolved_tsadd) so replay reuses it instead of re-reading the clock.
 #[test]
-#[ignore = "ENG-1277: TSADD * timestamp is non-deterministic across WAL replay until fixed"]
 fn tsadd_star_timestamp_stable_after_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
@@ -171,6 +165,427 @@ fn tsadd_star_timestamp_stable_after_wal_replay() {
     assert!(
         range.contains(&ts),
         "TSADD * timestamp must be stable across WAL replay: was {ts}, after = {range:?}"
+    );
+}
+
+// PROBE (ENG-1316): ZUNIONSTORE reads source keys that may live on other WAL
+// shards. Per-shard replay applies each shard fully in order, so a dst whose
+// shard replays before a source's shard computes the union from empty sources.
+// With many sources spread across shards, most dsts are affected.
+#[test]
+fn zunionstore_cross_shard_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let n = 24usize;
+    let srcs: Vec<String> = (0..n).map(|i| format!("src{i}")).collect();
+    for (i, k) in srcs.iter().enumerate() {
+        send(&mut c, &["ZADD", k, "1", &format!("m{i}")]);
+    }
+    let numkeys = n.to_string();
+    for d in 0..10 {
+        let dst = format!("dst{d}");
+        let mut args: Vec<&str> = vec!["ZUNIONSTORE", &dst, &numkeys];
+        args.extend(srcs.iter().map(String::as_str));
+        send(&mut c, &args);
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for d in 0..10 {
+        let dst = format!("dst{d}");
+        let card = send(&mut c, &["ZCARD", &dst]);
+        assert!(
+            card.contains(&format!(":{n}\r\n")),
+            "dst{d} must hold all {n} union members after replay; got {card:?}"
+        );
+    }
+}
+
+// PROBE (ENG-1316): SMOVE adds the member to dst, which may live on a different
+// WAL shard than src. A conflicting SREM on dst must stay ordered after the move.
+// Under raw logging the whole move lands in src's shard and can replay after
+// dst's SREM, resurrecting the member. Self-logging `SREM src` + `SADD dst` keys
+// each effect to its own shard so append order is preserved on replay.
+#[test]
+fn smove_cross_shard_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let n = 24usize;
+    for i in 0..n {
+        let a = format!("a{i}");
+        let b = format!("b{i}");
+        send(&mut c, &["SADD", &a, "m"]);
+        send(&mut c, &["SMOVE", &a, &b, "m"]); // b{i} = {m}
+        send(&mut c, &["SREM", &b, "m"]); // b{i} = {}
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let a = format!("a{i}");
+        let b = format!("b{i}");
+        assert!(
+            send(&mut c, &["SCARD", &b]).contains(":0"),
+            "b{i} must be empty (SADD-then-SREM order preserved) after replay"
+        );
+        assert!(
+            send(&mut c, &["SISMEMBER", &a, "m"]).contains(":0"),
+            "a{i} must not resurrect the moved member after replay"
+        );
+    }
+}
+
+// PROBE (ENG-1316): LMOVE pushes the moved element onto dst, whose shard may
+// differ from src's. List order is significant, so a pre-existing element on dst
+// must stay ordered before the moved one. Raw logging puts the whole move in
+// src's shard and can replay it before dst's own push, inverting the order.
+#[test]
+fn lmove_cross_shard_order_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let n = 24usize;
+    for i in 0..n {
+        let a = format!("a{i}");
+        let b = format!("b{i}");
+        send(&mut c, &["RPUSH", &a, "M"]);
+        send(&mut c, &["RPUSH", &b, "P"]); // b{i} = [P]
+        send(&mut c, &["LMOVE", &a, &b, "LEFT", "RIGHT"]); // b{i} = [P, M]
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let b = format!("b{i}");
+        let range = send(&mut c, &["LRANGE", &b, "0", "-1"]);
+        let p = range.find("\r\nP\r\n");
+        let m = range.find("\r\nM\r\n");
+        assert!(
+            p.is_some() && m.is_some() && p < m,
+            "b{i} must be [P, M] after replay; got {range:?}"
+        );
+    }
+}
+
+// PROBE (ENG-1316): RPOPLPUSH is LMOVE src dst RIGHT LEFT; same cross-shard
+// ordering hazard on the destination push.
+#[test]
+fn rpoplpush_cross_shard_order_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let n = 24usize;
+    for i in 0..n {
+        let a = format!("a{i}");
+        let b = format!("b{i}");
+        send(&mut c, &["RPUSH", &a, "M"]);
+        send(&mut c, &["RPUSH", &b, "P"]); // b{i} = [P]
+        send(&mut c, &["RPOPLPUSH", &a, &b]); // pop tail M of a, push head of b => [M, P]
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let b = format!("b{i}");
+        let range = send(&mut c, &["LRANGE", &b, "0", "-1"]);
+        let m = range.find("\r\nM\r\n");
+        let p = range.find("\r\nP\r\n");
+        assert!(
+            m.is_some() && p.is_some() && m < p,
+            "b{i} must be [M, P] after replay; got {range:?}"
+        );
+    }
+}
+
+// PROBE (ENG-1316): an immediately-satisfiable BLMOVE moves like LMOVE and must
+// be logged the same way. BLMOVE isn't classified as a write command, so
+// execute_with_wal never logs it; the immediate path self-logs pop+push.
+#[test]
+fn blmove_immediate_cross_shard_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let n = 24usize;
+    for i in 0..n {
+        let a = format!("a{i}");
+        let b = format!("b{i}");
+        send(&mut c, &["RPUSH", &a, "M"]);
+        send(&mut c, &["RPUSH", &b, "P"]); // b{i} = [P]
+        send(&mut c, &["BLMOVE", &a, &b, "LEFT", "RIGHT", "0"]); // src non-empty => immediate
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let a = format!("a{i}");
+        let b = format!("b{i}");
+        let range = send(&mut c, &["LRANGE", &b, "0", "-1"]);
+        let p = range.find("\r\nP\r\n");
+        let m = range.find("\r\nM\r\n");
+        assert!(
+            p.is_some() && m.is_some() && p < m,
+            "b{i} must be [P, M] after replay; got {range:?}"
+        );
+        assert!(
+            send(&mut c, &["LLEN", &a]).contains(":0"),
+            "a{i} must be empty after replay"
+        );
+    }
+}
+
+// PROBE (ENG-1317): a BLOCKED BLMOVE later satisfied by a push. The satisfying
+// push is logged, but the consuming pop (src) and the deferred dst push happen
+// outside the WAL. The woken handler now logs both, keyed so each lands on its
+// own shard, so replay leaves the element only in dst. Cross-shard fan-out so
+// each bsrc{i}/bdst{i} pair spans different disk-WAL shards.
+#[test]
+fn blmove_blocked_completion_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let n = 16usize;
+    let port = srv.port();
+    let mut blockers = Vec::new();
+    for i in 0..n {
+        let h = thread::spawn(move || {
+            let mut b = common::connect(port);
+            let src = format!("bsrc{i}");
+            let dst = format!("bdst{i}");
+            // Blocks on empty src until the push below wakes it.
+            send(&mut b, &["BLMOVE", &src, &dst, "LEFT", "RIGHT", "5"]);
+        });
+        blockers.push(h);
+    }
+    thread::sleep(Duration::from_millis(400)); // let every BLMOVE register as a waiter
+    let mut c = srv.conn();
+    for i in 0..n {
+        let src = format!("bsrc{i}");
+        send(&mut c, &["RPUSH", &src, "V"]); // wakes the blocked BLMOVE: V moves to dst
+    }
+    for h in blockers {
+        h.join().unwrap();
+    }
+    for i in 0..n {
+        let dst = format!("bdst{i}");
+        assert!(
+            send(&mut c, &["LRANGE", &dst, "0", "-1"]).contains("V"),
+            "runtime move to bdst{i} must have happened"
+        );
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let src = format!("bsrc{i}");
+        let dst = format!("bdst{i}");
+        assert!(
+            send(&mut c, &["LRANGE", &dst, "0", "-1"]).contains("V"),
+            "bdst{i} must retain the moved element after replay"
+        );
+        assert!(
+            send(&mut c, &["LLEN", &src]).contains(":0"),
+            "bsrc{i} must be empty after replay (element moved, not left behind)"
+        );
+    }
+}
+
+// PROBE (ENG-1317): a BLOCKED BLPOP satisfied by a later push. The push is
+// logged; the waiter's consuming pop is now logged too (keyed on the popped
+// key), so replay does not resurrect the element into the source list.
+#[test]
+fn blpop_blocked_completion_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let n = 16usize;
+    let port = srv.port();
+    let mut blockers = Vec::new();
+    for i in 0..n {
+        let h = thread::spawn(move || {
+            let mut b = common::connect(port);
+            let q = format!("q{i}");
+            send(&mut b, &["BLPOP", &q, "5"]);
+        });
+        blockers.push(h);
+    }
+    thread::sleep(Duration::from_millis(400)); // let every BLPOP register as a waiter
+    let mut c = srv.conn();
+    for i in 0..n {
+        let q = format!("q{i}");
+        send(&mut c, &["RPUSH", &q, "V"]); // wakes the blocked BLPOP: V is consumed
+    }
+    for h in blockers {
+        h.join().unwrap();
+    }
+    for i in 0..n {
+        let q = format!("q{i}");
+        assert!(
+            send(&mut c, &["LLEN", &q]).contains(":0"),
+            "q{i} must be empty at runtime (consumed by the blocked BLPOP)"
+        );
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let q = format!("q{i}");
+        assert!(
+            send(&mut c, &["LLEN", &q]).contains(":0"),
+            "q{i} must stay empty after replay (pop was logged, not resurrected)"
+        );
+    }
+}
+
+// PROBE (ENG-1317): a BLOCKED BZPOPMIN satisfied by a later ZADD. handle_block_zpop
+// pops straight from the store outside the WAL; the removal is now logged as a
+// keyed ZREM so replay doesn't resurrect the popped member into the zset.
+#[test]
+fn bzpopmin_blocked_completion_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let n = 16usize;
+    let port = srv.port();
+    let mut blockers = Vec::new();
+    for i in 0..n {
+        let h = thread::spawn(move || {
+            let mut b = common::connect(port);
+            let z = format!("z{i}");
+            send(&mut b, &["BZPOPMIN", &z, "5"]);
+        });
+        blockers.push(h);
+    }
+    thread::sleep(Duration::from_millis(400)); // let every BZPOPMIN register/poll
+    let mut c = srv.conn();
+    for i in 0..n {
+        let z = format!("z{i}");
+        send(&mut c, &["ZADD", &z, "1", "m"]); // wakes the blocked BZPOPMIN: m consumed
+    }
+    for h in blockers {
+        h.join().unwrap();
+    }
+    for i in 0..n {
+        let z = format!("z{i}");
+        assert!(
+            send(&mut c, &["ZCARD", &z]).contains(":0"),
+            "z{i} must be empty at runtime (consumed by the blocked BZPOPMIN)"
+        );
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let z = format!("z{i}");
+        assert!(
+            send(&mut c, &["ZCARD", &z]).contains(":0"),
+            "z{i} must stay empty after replay (ZREM was logged, member not resurrected)"
+        );
+    }
+}
+
+// PROBE (ENG-1316): COPY writes only dst but the raw command shards on src and
+// re-reads src at replay, when a per-shard replay may not have rebuilt src yet
+// (and dst's own writes replay in a separate shard). COPY self-logs the resolved
+// dst value as a keyed `LXRESTORE dst <blob>`.
+#[test]
+fn copy_cross_shard_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let n = 24usize;
+    for i in 0..n {
+        let s = format!("s{i}");
+        let d = format!("d{i}");
+        send(&mut c, &["SET", &s, &format!("v{i}")]);
+        send(&mut c, &["SET", &d, "OLD"]); // independent write to dst's shard
+        send(&mut c, &["COPY", &s, &d, "REPLACE"]); // d{i} = v{i}
+    }
+    // Cover a non-string type through the dump blob.
+    send(&mut c, &["RPUSH", "lsrc", "l0", "l1", "l2"]);
+    send(&mut c, &["COPY", "lsrc", "ldst"]);
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let d = format!("d{i}");
+        let got = send(&mut c, &["GET", &d]);
+        assert!(
+            got.contains(&format!("v{i}\r")),
+            "d{i} must hold the copied value (not OLD) after replay; got {got:?}"
+        );
+    }
+    let l = send(&mut c, &["LRANGE", "ldst", "0", "-1"]);
+    assert!(
+        l.contains("l0") && l.contains("l1") && l.contains("l2"),
+        "list COPY must survive replay through the dump blob; got {l:?}"
+    );
+}
+
+// PROBE (ENG-1316): MSET writes many keys but the raw command shards on the
+// first key only, so a later independent write to a non-first key can replay
+// before the MSET's value for that key, losing the newer write. Self-logging a
+// keyed SET per pair puts each in its own shard in append order.
+#[test]
+fn mset_cross_shard_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    let n = 24usize;
+    for i in 0..n {
+        let a = format!("first{i}");
+        let b = format!("second{i}");
+        send(&mut c, &["MSET", &a, "F", &b, "S"]);
+        send(&mut c, &["SET", &b, "OVERWRITE"]); // later write to the non-first key
+    }
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    for i in 0..n {
+        let a = format!("first{i}");
+        let b = format!("second{i}");
+        assert!(
+            send(&mut c, &["GET", &a]).contains("F\r"),
+            "first{i} must survive MSET replay"
+        );
+        assert!(
+            send(&mut c, &["GET", &b]).contains("OVERWRITE"),
+            "second{i} must reflect the later SET, not the replayed MSET value"
+        );
+    }
+}
+
+// ZMPOP mutates the sorted set, so the pop must survive a WAL-only restart
+// (regression guard that ZMPOP is classified as a write and WAL-logged).
+#[test]
+fn zmpop_persists_across_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    send(&mut c, &["ZADD", "z", "1", "a", "2", "b", "3", "c"]);
+    send(&mut c, &["ZMPOP", "1", "z", "MIN", "COUNT", "2"]); // pops a and b
+                                                             // Control: an established write on a second key, to isolate ZMPOP.
+    send(&mut c, &["ZADD", "zc", "1", "a", "2", "b"]);
+    send(&mut c, &["ZPOPMIN", "zc", "1"]); // pops a
+    drop(c);
+
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    let control = send(&mut c, &["ZCARD", "zc"]);
+    assert!(
+        control.contains(":1"),
+        "control ZPOPMIN must persist; ZCARD(zc)={control:?}"
+    );
+    let card = send(&mut c, &["ZCARD", "z"]);
+    assert!(
+        card.contains(":1"),
+        "ZMPOP pop must persist across WAL replay; ZCARD={card:?}"
+    );
+    assert!(
+        send(&mut c, &["ZSCORE", "z", "a"]).contains("$-1"),
+        "popped member 'a' must stay gone after replay"
+    );
+    assert!(
+        send(&mut c, &["ZSCORE", "z", "c"]).contains('3'),
+        "unpopped member 'c' must remain after replay"
     );
 }
 
@@ -917,4 +1332,50 @@ fn snapshot_ttl_expires_across_downtime() {
         !resp.contains(":-1"),
         "long key must still have a TTL: {resp}"
     );
+}
+
+// Hash field TTLs (ENG-1290) must survive a WAL-only restart: HPEXPIREAT is
+// self-logged with its absolute deadline and replays deterministically.
+#[test]
+fn hash_field_ttl_survives_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    send(&mut c, &["HSET", "h", "f1", "v1", "f2", "v2"]);
+    send(
+        &mut c,
+        &["HPEXPIREAT", "h", "99999999999999", "FIELDS", "1", "f1"],
+    );
+    drop(c);
+    srv.kill();
+    srv.restart(); // WAL replay only
+    let mut c = srv.conn();
+    assert!(
+        send(&mut c, &["HPEXPIRETIME", "h", "FIELDS", "1", "f1"]).contains("99999999999999"),
+        "f1 field TTL survived WAL replay"
+    );
+    assert!(send(&mut c, &["HTTL", "h", "FIELDS", "1", "f2"]).contains(":-1"));
+    assert!(send(&mut c, &["HGET", "h", "f1"]).contains("v1"));
+}
+
+// Field TTLs must also survive a snapshot (BGSAVE truncates the WAL, so the
+// deadline has to be in the snapshot's 'h' hash record).
+#[test]
+fn hash_field_ttl_survives_snapshot() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    send(&mut c, &["HSET", "h", "f1", "v1"]);
+    send(
+        &mut c,
+        &["HPEXPIREAT", "h", "99999999999999", "FIELDS", "1", "f1"],
+    );
+    send(&mut c, &["BGSAVE"]); // snapshot + WAL truncate
+    drop(c);
+    srv.kill();
+    srv.restart(); // loads from the snapshot (WAL was truncated)
+    let mut c = srv.conn();
+    assert!(
+        send(&mut c, &["HPEXPIRETIME", "h", "FIELDS", "1", "f1"]).contains("99999999999999"),
+        "f1 field TTL survived the snapshot"
+    );
+    assert!(send(&mut c, &["HGET", "h", "f1"]).contains("v1"));
 }

@@ -265,3 +265,61 @@ fn unsubscribe_all_exits_sub_mode() {
         "normal commands work after unsubscribe all: {resp}"
     );
 }
+
+#[test]
+fn pubsub_channels_numsub_numpat() {
+    let server = LuxServer::start();
+    // Hold subscriber connections open so their subscriptions stay active.
+    let mut sub = server.conn();
+    send_and_read(&mut sub, &["SUBSCRIBE", "news", "sports"]);
+    let mut sub2 = server.conn();
+    send_and_read(&mut sub2, &["SUBSCRIBE", "news"]);
+    let mut psub = server.conn();
+    send_and_read(&mut psub, &["PSUBSCRIBE", "n*"]);
+    thread::sleep(Duration::from_millis(100));
+
+    let mut q = server.conn();
+    let r = send_and_read(&mut q, &["PUBSUB", "CHANNELS"]);
+    assert!(r.contains("news") && r.contains("sports"), "channels: {r}");
+    // Pattern filter (patterns are matched against channel names, not the p-subs).
+    let r = send_and_read(&mut q, &["PUBSUB", "CHANNELS", "sp*"]);
+    assert!(
+        r.contains("sports") && !r.contains("news"),
+        "pattern channels: {r}"
+    );
+    // NUMSUB: news=2, sports=1, missing=0.
+    let r = send_and_read(&mut q, &["PUBSUB", "NUMSUB", "news", "sports", "missing"]);
+    assert!(r.contains("news") && r.contains(":2"), "numsub news=2: {r}");
+    assert!(
+        r.contains("sports") && r.contains(":1"),
+        "numsub sports=1: {r}"
+    );
+    assert!(
+        r.contains("missing") && r.contains(":0"),
+        "numsub missing=0: {r}"
+    );
+    // NUMPAT: one pattern subscription.
+    assert!(
+        send_and_read(&mut q, &["PUBSUB", "NUMPAT"]).contains(":1"),
+        "numpat=1"
+    );
+    // HELP.
+    assert!(
+        send_and_read(&mut q, &["PUBSUB", "HELP"]).contains("CHANNELS"),
+        "help"
+    );
+    // Unknown subcommand errors.
+    assert!(
+        send_and_read(&mut q, &["PUBSUB", "BOGUS"]).contains("-ERR"),
+        "unknown subcmd"
+    );
+}
+
+#[test]
+fn sharded_pubsub_is_rejected() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    assert!(send_and_read(&mut conn, &["SPUBLISH", "ch", "m"]).contains("-ERR"));
+    assert!(send_and_read(&mut conn, &["SSUBSCRIBE", "ch"]).contains("-ERR"));
+    assert!(send_and_read(&mut conn, &["SUNSUBSCRIBE", "ch"]).contains("-ERR"));
+}

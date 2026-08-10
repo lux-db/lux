@@ -63,10 +63,121 @@ pub struct ConsumerGroup {
     pub pel: BTreeMap<StreamId, PendingEntry>,
 }
 
+/// BITFIELD overflow handling for SET/INCRBY (default WRAP).
+#[derive(Clone, Copy)]
+pub enum BitfieldOverflow {
+    Wrap,
+    Sat,
+    Fail,
+}
+
+/// A single BITFIELD/BITFIELD_RO sub-operation. `bits` is the field width,
+/// `signed` selects i<bits> vs u<bits>, `offset` is an absolute bit offset.
+pub enum BitfieldOp {
+    Get {
+        signed: bool,
+        bits: u32,
+        offset: u64,
+    },
+    Set {
+        signed: bool,
+        bits: u32,
+        offset: u64,
+        value: i64,
+        overflow: BitfieldOverflow,
+    },
+    IncrBy {
+        signed: bool,
+        bits: u32,
+        offset: u64,
+        incr: i64,
+        overflow: BitfieldOverflow,
+    },
+}
+
+/// Read `bits` bits at `offset` from the bitmap, MSB-first, interpreting the
+/// field as signed (two's complement, sign-extended) or unsigned. Bits past the
+/// end of `buf` read as zero.
+fn bf_read(buf: &[u8], offset: u64, bits: u32, signed: bool) -> i64 {
+    let mut val: u64 = 0;
+    for i in 0..bits as u64 {
+        let bit_index = offset + i;
+        let byte_index = (bit_index / 8) as usize;
+        let shift = 7 - (bit_index % 8);
+        let bit = if byte_index < buf.len() {
+            (buf[byte_index] >> shift) & 1
+        } else {
+            0
+        };
+        val = (val << 1) | bit as u64;
+    }
+    if signed && bits < 64 && (val >> (bits - 1)) & 1 == 1 {
+        (val | (!0u64 << bits)) as i64
+    } else {
+        val as i64
+    }
+}
+
+/// Write the low `bits` bits of `value` at `offset`, MSB-first, growing `buf` to
+/// fit the highest touched byte.
+fn bf_write(buf: &mut Vec<u8>, offset: u64, bits: u32, value: u64) {
+    let end_bit = offset + bits as u64;
+    let needed = end_bit.div_ceil(8) as usize;
+    if buf.len() < needed {
+        buf.resize(needed, 0);
+    }
+    for i in 0..bits as u64 {
+        let bit_index = offset + i;
+        let byte_index = (bit_index / 8) as usize;
+        let shift = 7 - (bit_index % 8);
+        let bit = ((value >> (bits as u64 - 1 - i)) & 1) as u8;
+        if bit == 1 {
+            buf[byte_index] |= 1 << shift;
+        } else {
+            buf[byte_index] &= !(1 << shift);
+        }
+    }
+}
+
+/// Apply BITFIELD overflow semantics to a candidate value for a signed/unsigned
+/// field of `bits` width. Returns None only for FAIL-on-overflow.
+fn bf_clamp(signed: bool, bits: u32, val: i128, mode: BitfieldOverflow) -> Option<i64> {
+    let (min, max): (i128, i128) = if signed {
+        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+    } else {
+        (0, (1i128 << bits) - 1)
+    };
+    if val >= min && val <= max {
+        return Some(val as i64);
+    }
+    match mode {
+        BitfieldOverflow::Fail => None,
+        BitfieldOverflow::Sat => Some(if val < min { min as i64 } else { max as i64 }),
+        BitfieldOverflow::Wrap => {
+            let range = 1i128 << bits;
+            let mut w = val.rem_euclid(range);
+            if signed && w > max {
+                w -= range;
+            }
+            Some(w as i64)
+        }
+    }
+}
+
 pub struct StreamData {
     pub entries: BTreeMap<StreamId, Vec<(String, Bytes)>>,
     pub last_id: StreamId,
     pub groups: std::collections::HashMap<String, ConsumerGroup>,
+}
+
+pub struct SetOptions<'a> {
+    pub ttl: Option<Duration>,
+    pub keep_ttl: bool,
+    pub nx: bool,
+    pub xx: bool,
+    pub ifeq: Option<&'a [u8]>,
+    pub get: bool,
+    pub encrypted: bool,
 }
 
 #[derive(Clone, Default)]
@@ -101,12 +212,18 @@ impl Hasher for FxHasher {
 #[allow(dead_code)]
 pub const MAX_SHARDS: usize = 1024;
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+const RENAME_ENCRYPTED_ERR: &str =
+    "ERR cannot relocate an encrypted key: its ciphertext is bound to the key name and would be unrecoverable at the destination; decrypt and re-set under the new key instead";
 
 pub struct VectorData {
     #[allow(dead_code)]
     pub dims: u32,
     pub data: Vec<f32>,
     pub metadata: Option<String>,
+    /// When true this vector is encrypted at rest: the in-memory `data` stays
+    /// plaintext (HNSW/search need it), but it is sealed when written to the
+    /// snapshot and self-logged as ciphertext in the WAL.
+    pub encrypted: bool,
 }
 
 pub struct TimeSeriesData {
@@ -185,11 +302,128 @@ impl SetData {
     }
 }
 
+/// Hash value with optional per-field TTLs (Redis 7.4 hash-field expiration).
+/// `fields` holds the data; `expiries` holds absolute unix-ms deadlines for the
+/// subset of fields that have a TTL. Derefs to `fields` so value-only access
+/// sites are unchanged; TTL-aware reads use the `*_live`/`purge_expired` helpers.
+#[derive(Default, Clone)]
+pub struct HashData {
+    pub fields: HashMap<String, Bytes>,
+    pub expiries: HashMap<String, i64>,
+}
+
+impl HashData {
+    pub fn from_fields(fields: HashMap<String, Bytes>) -> Self {
+        Self {
+            fields,
+            expiries: HashMap::new(),
+        }
+    }
+
+    /// True when `field` carries a TTL that is at or before `now_ms`.
+    pub fn field_expired(&self, field: &str, now_ms: i64) -> bool {
+        self.expiries.get(field).is_some_and(|&e| e <= now_ms)
+    }
+
+    pub fn get_live(&self, field: &str, now_ms: i64) -> Option<&Bytes> {
+        if self.field_expired(field, now_ms) {
+            None
+        } else {
+            self.fields.get(field)
+        }
+    }
+
+    pub fn contains_live(&self, field: &str, now_ms: i64) -> bool {
+        self.fields.contains_key(field) && !self.field_expired(field, now_ms)
+    }
+
+    pub fn live_iter(&self, now_ms: i64) -> impl Iterator<Item = (&String, &Bytes)> {
+        self.fields
+            .iter()
+            .filter(move |(k, _)| !self.field_expired(k, now_ms))
+    }
+
+    pub fn live_len(&self, now_ms: i64) -> usize {
+        self.fields
+            .keys()
+            .filter(|k| !self.field_expired(k, now_ms))
+            .count()
+    }
+
+    /// Drop fields whose TTL has passed. Returns (bytes freed, hash-now-empty).
+    pub fn purge_expired(&mut self, now_ms: i64) -> (usize, bool) {
+        if self.expiries.is_empty() {
+            return (0, self.fields.is_empty());
+        }
+        let expired: Vec<String> = self
+            .expiries
+            .iter()
+            .filter(|(_, &e)| e <= now_ms)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut freed = 0;
+        for f in &expired {
+            if let Some(v) = self.fields.remove(f) {
+                freed += f.len() + v.len() + 64;
+            }
+            self.expiries.remove(f);
+        }
+        (freed, self.fields.is_empty())
+    }
+}
+
+impl std::ops::Deref for HashData {
+    type Target = HashMap<String, Bytes>;
+    fn deref(&self) -> &Self::Target {
+        &self.fields
+    }
+}
+
+impl std::ops::DerefMut for HashData {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.fields
+    }
+}
+
+/// Condition flag for HEXPIRE-family commands (NX/XX/GT/LT).
+#[derive(Clone, Copy, PartialEq)]
+pub enum HExpireCond {
+    None,
+    Nx,
+    Xx,
+    Gt,
+    Lt,
+}
+
+/// Per-field result of an HTTL-family query.
+pub enum HFieldTtl {
+    Missing,
+    NoTtl,
+    ExpiresAtMs(i64),
+}
+
+/// TTL mutation requested by HGETEX for the fetched fields.
+#[derive(Clone, Copy)]
+pub enum HGetexTtl {
+    Keep,
+    Persist,
+    SetMs(i64),
+}
+
+/// Wall-clock now as unix-epoch milliseconds, used for absolute hash-field TTL
+/// deadlines (which must survive restarts, so they are stored as epoch-ms).
+pub(crate) fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub enum StoreValue {
     Str(Bytes),
     StrBuf(Vec<u8>),
     List(VecDeque<Bytes>),
-    Hash(HashMap<String, Bytes>),
+    Hash(HashData),
     Set(SetData),
     SortedSet(
         BTreeMap<(OrderedFloat<f64>, String), ()>,
@@ -296,6 +530,11 @@ impl StoreMetrics {
 
 pub struct Store {
     config: Arc<crate::ServerConfig>,
+    encryption: crate::encryption::EncryptionKeyring,
+    /// Short-lived API-key resolutions belong to this engine instance. Keeping
+    /// this on `Store` prevents one embedded server from authenticating against
+    /// another server's `auth.keys` table.
+    pub(crate) api_key_cache: crate::auth::ApiKeyCache,
     shards: Box<[RwLock<Shard>]>,
     metrics: StoreMetrics,
     /// Serializes Lua script execution for this runtime without blocking other
@@ -307,6 +546,10 @@ pub struct Store {
     disk_shards: Option<Box<[parking_lot::Mutex<crate::disk::DiskShard>]>>,
     wal_shards: Option<Box<[parking_lot::Mutex<crate::disk::Wal>]>>,
     pub(crate) wal_suppress: std::sync::atomic::AtomicBool,
+    /// Set once at runtime startup; sink for typed row deltas feeding reactive
+    /// live queries. Absent for embedded/replay-only stores, so emission is a
+    /// cheap no-op there.
+    row_delta_broker: std::sync::OnceLock<crate::pubsub::Broker>,
 }
 
 #[inline(always)]
@@ -350,12 +593,29 @@ fn parse_table_vector_key(key: &str) -> Option<(&str, &str, &str)> {
     Some((table, field, pk))
 }
 
+fn parse_table_row_key(key: &str) -> Option<(&str, &str)> {
+    let rest = key.strip_prefix("_t:")?;
+    let (table, pk) = rest.split_once(":row:")?;
+    if table.is_empty() || pk.is_empty() {
+        return None;
+    }
+    Some((table, pk))
+}
+
 fn table_vector_index_name(table: &str, field: &str) -> String {
     format!("{}.{}", table, field)
 }
 
 fn table_vector_key_for_pk(table: &str, field: &str, pk: &str) -> String {
     format!("_t:{}:vec:{}:{}", table, field, pk)
+}
+
+fn encrypted_value_would_be_orphaned(value: &[u8], remaining_key_ids: &HashSet<String>) -> bool {
+    crate::encryption::EncryptionKeyring::is_encrypted_value(value)
+        && !crate::encryption::EncryptionKeyring::envelope_decryptable_by_any(
+            value,
+            remaining_key_ids,
+        )
 }
 
 pub(crate) struct TableVectorCandidateQuery<'a> {
@@ -458,6 +718,9 @@ impl Store {
     }
 
     pub fn new_with_config(config: Arc<crate::ServerConfig>) -> Self {
+        let encryption =
+            crate::encryption::EncryptionKeyring::open(&config.encryption, &config.data_dir)
+                .unwrap_or_else(|e| panic!("invalid encryption config: {e}"));
         let n = config.shards;
         let shards: Vec<RwLock<Shard>> = (0..n)
             .map(|_| {
@@ -497,6 +760,8 @@ impl Store {
 
         Self {
             config,
+            encryption,
+            api_key_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             shards: shards.into_boxed_slice(),
             metrics: StoreMetrics::new(),
             script_gate: RwLock::new(()),
@@ -505,11 +770,304 @@ impl Store {
             disk_shards,
             wal_shards,
             wal_suppress: std::sync::atomic::AtomicBool::new(false),
+            row_delta_broker: std::sync::OnceLock::new(),
         }
     }
 
     pub fn config(&self) -> &crate::ServerConfig {
         &self.config
+    }
+
+    pub(crate) fn encryption(&self) -> &crate::encryption::EncryptionKeyring {
+        &self.encryption
+    }
+
+    /// Rewrap any encrypted values inside a cold-tier `DumpValue` under the
+    /// current keyset. Returns true if anything was re-encrypted. Mirrors the
+    /// in-memory rewrap AAD slots. Vectors never cold-tier (pinned hot).
+    fn reencrypt_cold_dump_value(&self, key: &str, value: &mut DumpValue) -> Result<bool, String> {
+        use crate::encryption::EncryptionKeyring as E;
+        let mut changed = false;
+        match value {
+            DumpValue::Str(v) => {
+                if E::is_encrypted_value(v) {
+                    *v = self.encryption().reencrypt("__lux_kv", "value", key, v)?;
+                    changed = true;
+                }
+            }
+            DumpValue::Hash(pairs, _) => {
+                for (field, v) in pairs.iter_mut() {
+                    if E::is_encrypted_value(v) {
+                        *v = self.encryption().reencrypt("__lux_hash", field, key, v)?;
+                        changed = true;
+                    }
+                }
+            }
+            DumpValue::List(items) => {
+                for v in items.iter_mut() {
+                    if E::is_encrypted_value(v) {
+                        *v = self
+                            .encryption()
+                            .reencrypt("__lux_list", "element", "", v)?;
+                        changed = true;
+                    }
+                }
+            }
+            DumpValue::Stream(entries, _, _) => {
+                for (_id, fields) in entries.iter_mut() {
+                    for (field, v) in fields.iter_mut() {
+                        if E::is_encrypted_value(v) {
+                            *v = self.encryption().reencrypt("__lux_stream", field, key, v)?;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(changed)
+    }
+
+    /// True if any encrypted value in a cold-tier `DumpValue` would become
+    /// undecryptable without the retiring key.
+    fn dump_value_would_orphan(value: &DumpValue, remaining: &HashSet<String>) -> bool {
+        match value {
+            DumpValue::Str(v) => encrypted_value_would_be_orphaned(v, remaining),
+            DumpValue::Hash(pairs, _) => pairs
+                .iter()
+                .any(|(_, v)| encrypted_value_would_be_orphaned(v, remaining)),
+            DumpValue::List(items) => items
+                .iter()
+                .any(|v| encrypted_value_would_be_orphaned(v, remaining)),
+            DumpValue::Stream(entries, _, _) => entries.iter().any(|(_, fields)| {
+                fields
+                    .iter()
+                    .any(|(_, v)| encrypted_value_would_be_orphaned(v, remaining))
+            }),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn enc_rewrap_all(&self) -> Result<usize, String> {
+        let mut count = 0usize;
+        for idx in 0..self.shards.len() {
+            let mut shard = self.shards[idx].write();
+            let mut shard_changed = false;
+            let mut mem_delta: isize = 0;
+            let mut disk_remove = Vec::new();
+            for (key, entry) in shard.data.iter_mut() {
+                if entry.is_expired_at(Instant::now()) {
+                    continue;
+                }
+                match &mut entry.value {
+                    StoreValue::Str(value) => {
+                        if crate::encryption::EncryptionKeyring::is_encrypted_value(value) {
+                            let key_name = key_string(key);
+                            let new_value = self
+                                .encryption()
+                                .reencrypt("__lux_kv", "value", &key_name, value)?;
+                            mem_delta += new_value.len() as isize - value.len() as isize;
+                            *value = Bytes::from(new_value);
+                            count += 1;
+                            shard_changed = true;
+                            disk_remove.push(key.clone());
+                        }
+                    }
+                    StoreValue::StrBuf(value) => {
+                        if crate::encryption::EncryptionKeyring::is_encrypted_value(value) {
+                            let key_name = key_string(key);
+                            let new_value = self
+                                .encryption()
+                                .reencrypt("__lux_kv", "value", &key_name, value)?;
+                            mem_delta += new_value.len() as isize - value.len() as isize;
+                            *value = new_value;
+                            count += 1;
+                            shard_changed = true;
+                            disk_remove.push(key.clone());
+                        }
+                    }
+                    StoreValue::Hash(map) => {
+                        let key_name = key_string(key);
+                        let table_row = parse_table_row_key(&key_name)
+                            .map(|(table, pk)| (table.to_string(), pk.to_string()));
+                        for (field, value) in map.iter_mut() {
+                            if !crate::encryption::EncryptionKeyring::is_encrypted_value(value) {
+                                continue;
+                            }
+                            let new_value = if let Some((table, pk)) = &table_row {
+                                self.encryption().reencrypt(table, field, pk, value)?
+                            } else {
+                                self.encryption().reencrypt(
+                                    "__lux_hash",
+                                    field,
+                                    &key_name,
+                                    value,
+                                )?
+                            };
+                            mem_delta += new_value.len() as isize - value.len() as isize;
+                            *value = Bytes::from(new_value);
+                            count += 1;
+                            shard_changed = true;
+                            disk_remove.push(key.clone());
+                        }
+                    }
+                    StoreValue::List(list) => {
+                        for elem in list.iter_mut() {
+                            if !crate::encryption::EncryptionKeyring::is_encrypted_value(elem) {
+                                continue;
+                            }
+                            let new_value =
+                                self.encryption()
+                                    .reencrypt("__lux_list", "element", "", elem)?;
+                            mem_delta += new_value.len() as isize - elem.len() as isize;
+                            *elem = Bytes::from(new_value);
+                            count += 1;
+                            shard_changed = true;
+                            disk_remove.push(key.clone());
+                        }
+                    }
+                    StoreValue::Stream(stream) => {
+                        let key_name = key_string(key);
+                        for fields in stream.entries.values_mut() {
+                            for (field, value) in fields.iter_mut() {
+                                if !crate::encryption::EncryptionKeyring::is_encrypted_value(value)
+                                {
+                                    continue;
+                                }
+                                let new_value = self.encryption().reencrypt(
+                                    "__lux_stream",
+                                    field,
+                                    &key_name,
+                                    value,
+                                )?;
+                                mem_delta += new_value.len() as isize - value.len() as isize;
+                                *value = Bytes::from(new_value);
+                                count += 1;
+                                shard_changed = true;
+                                disk_remove.push(key.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if shard_changed {
+                shard.version += 1;
+                if mem_delta > 0 {
+                    shard.used_memory += mem_delta as usize;
+                    self.mem_add(mem_delta as usize);
+                } else if mem_delta < 0 {
+                    let freed = (-mem_delta) as usize;
+                    shard.used_memory = shard.used_memory.saturating_sub(freed);
+                    self.mem_sub(freed);
+                }
+            }
+            drop(shard);
+            for key in disk_remove {
+                self.remove_from_disk(&key);
+            }
+        }
+        // Cold-tiered encrypted values live on disk, invisible to the in-RAM
+        // pass above; rewrap them in place too so a later RETIRE can't orphan them.
+        if let Some(disk_shards) = &self.disk_shards {
+            for ds in disk_shards.iter() {
+                let mut disk = ds.lock();
+                let entries = disk
+                    .dump_all(Instant::now())
+                    .map_err(|e| format!("ERR rewrap cold read failed: {e}"))?;
+                for mut entry in entries {
+                    if self.reencrypt_cold_dump_value(&entry.key, &mut entry.value)? {
+                        disk.put(&entry.key, &entry)
+                            .map_err(|e| format!("ERR rewrap cold write failed: {e}"))?;
+                        count += 1;
+                    }
+                }
+            }
+        }
+        // Make the rewrap durable: persist re-wrapped in-memory values, re-seal
+        // encrypted vectors (plaintext in RAM) under the current keyset, and
+        // truncate the WAL so a restart can't replay pre-rewrap (old-key) bytes.
+        crate::snapshot::save_and_truncate_wal_consistent(self)
+            .map_err(|e| format!("ERR rewrap persist failed: {e}"))?;
+        Ok(count)
+    }
+
+    pub(crate) fn enc_retire_key(&self, key_id: &str) -> Result<(), String> {
+        let remaining = self.encryption().remaining_key_ids_without(key_id);
+        if remaining.is_empty() {
+            return Err("ERR ENC cannot retire the last key".to_string());
+        }
+        for shard in self.shards.iter() {
+            let shard = shard.read();
+            for entry in shard.data.values() {
+                match &entry.value {
+                    StoreValue::Str(value) => {
+                        if encrypted_value_would_be_orphaned(value, &remaining) {
+                            return Err(
+                                "ERR ENC key is still required by encrypted data".to_string()
+                            );
+                        }
+                    }
+                    StoreValue::StrBuf(value) => {
+                        if encrypted_value_would_be_orphaned(value, &remaining) {
+                            return Err(
+                                "ERR ENC key is still required by encrypted data".to_string()
+                            );
+                        }
+                    }
+                    StoreValue::Hash(map) => {
+                        for value in map.values() {
+                            if encrypted_value_would_be_orphaned(value, &remaining) {
+                                return Err(
+                                    "ERR ENC key is still required by encrypted data".to_string()
+                                );
+                            }
+                        }
+                    }
+                    StoreValue::List(list) => {
+                        for elem in list.iter() {
+                            if encrypted_value_would_be_orphaned(elem, &remaining) {
+                                return Err(
+                                    "ERR ENC key is still required by encrypted data".to_string()
+                                );
+                            }
+                        }
+                    }
+                    StoreValue::Stream(stream) => {
+                        for fields in stream.entries.values() {
+                            for (_field, value) in fields {
+                                if encrypted_value_would_be_orphaned(value, &remaining) {
+                                    return Err("ERR ENC key is still required by encrypted data"
+                                        .to_string());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Cold-tiered encrypted values are invisible to the in-RAM scan above;
+        // scan the disk tier too so we never retire a key they still need.
+        if let Some(disk_shards) = &self.disk_shards {
+            for ds in disk_shards.iter() {
+                let mut disk = ds.lock();
+                let entries = disk
+                    .dump_all(Instant::now())
+                    .map_err(|e| format!("ERR retire cold scan failed: {e}"))?;
+                for entry in &entries {
+                    if Self::dump_value_would_orphan(&entry.value, &remaining) {
+                        return Err("ERR ENC key is still required by encrypted data".to_string());
+                    }
+                }
+            }
+        }
+        // Re-seal all at-rest data (in-memory values + plaintext-in-RAM vectors)
+        // under the current keyset and truncate the WAL before removing the key,
+        // so nothing persisted still references it.
+        crate::snapshot::save_and_truncate_wal_consistent(self)
+            .map_err(|e| format!("ERR retire persist failed: {e}"))?;
+        self.encryption().retire(key_id)
     }
 
     fn insert_vector_indexes(&self, key: String, dims: u32, data: Vec<f32>) {
@@ -706,6 +1264,55 @@ impl Store {
 
     pub(crate) fn wal_enabled(&self) -> bool {
         self.wal_shards.is_some() && !self.wal_suppress.load(Ordering::Relaxed)
+    }
+
+    /// True while `replay_wal` is re-applying logged commands. Gates internal
+    /// replay-only commands (e.g. `LXRESTORE`) so clients can't invoke them.
+    pub(crate) fn wal_replaying(&self) -> bool {
+        self.wal_suppress.load(Ordering::Relaxed)
+    }
+
+    /// Wire the row-delta sink (reactive live queries) at runtime startup.
+    pub fn set_row_delta_broker(&self, broker: crate::pubsub::Broker) {
+        let _ = self.row_delta_broker.set(broker);
+    }
+
+    /// Cheap gate for table mutation sites: is anyone watching row deltas right
+    /// now? Lets callers skip building old/new row snapshots when idle.
+    pub(crate) fn wants_row_deltas(&self) -> bool {
+        !self.wal_suppress.load(Ordering::Relaxed)
+            && self
+                .row_delta_broker
+                .get()
+                .is_some_and(|b| b.has_any_row_delta_subs())
+    }
+
+    /// Emit a typed row delta for a table row change. Cheap no-op unless a
+    /// broker is wired AND some live query is watching AND we aren't replaying
+    /// the WAL. The delta carries only the changed pk; the live-query engine
+    /// re-evaluates that pk against each subscription.
+    pub(crate) fn emit_row_delta(&self, table: &str, pk: &str) {
+        if self.wal_suppress.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(broker) = self.row_delta_broker.get() else {
+            return;
+        };
+        if !broker.has_any_row_delta_subs() {
+            return;
+        }
+        broker.publish_row_delta(crate::pubsub::RowDelta {
+            table: table.to_string(),
+            pk: pk.to_string(),
+        });
+    }
+
+    /// Decode and apply an `LXRESTORE` blob (COPY's self-logged effect). Only
+    /// honored during WAL replay.
+    pub(crate) fn apply_lxrestore(&self, blob: &[u8]) -> Result<(), String> {
+        crate::snapshot::decode_dump_blob(self, blob)
+            .map(|_| ())
+            .map_err(|e| format!("ERR LXRESTORE decode failed: {e}"))
     }
 
     pub(crate) fn lock_read_shard(&self, idx: usize) -> parking_lot::RwLockReadGuard<'_, Shard> {
@@ -1094,6 +1701,231 @@ impl Store {
     }
 
     #[inline(always)]
+    fn user_kv_key(key: &[u8]) -> String {
+        key_string(key)
+    }
+
+    #[inline(always)]
+    fn user_hash_field(field: &[u8]) -> String {
+        key_string(field)
+    }
+
+    #[inline(always)]
+    fn is_table_storage_key(key: &[u8]) -> bool {
+        key.starts_with(b"_t:")
+    }
+
+    pub(crate) fn decrypt_kv_string_value(
+        &self,
+        key: &[u8],
+        value: Bytes,
+    ) -> Result<Bytes, String> {
+        if !crate::encryption::EncryptionKeyring::is_encrypted_value(&value) {
+            return Ok(value);
+        }
+        let key_name = Self::user_kv_key(key);
+        self.encryption()
+            .decrypt("__lux_kv", "value", &key_name, &value)
+            .map(Bytes::from)
+    }
+
+    fn encrypt_kv_string_value(&self, key: &[u8], value: &[u8]) -> Result<Vec<u8>, String> {
+        let key_name = Self::user_kv_key(key);
+        self.encryption()
+            .encrypt("__lux_kv", "value", &key_name, value)
+    }
+
+    /// Encrypt a list element. AAD is intentionally key-independent so an
+    /// envelope stays decryptable after LMOVE/RPOPLPUSH move it to another list
+    /// (no re-keying). Per-value random DEK + nonce still protects each element.
+    pub(crate) fn encrypt_list_element(&self, value: &[u8]) -> Result<Vec<u8>, String> {
+        self.encryption()
+            .encrypt("__lux_list", "element", "", value)
+    }
+
+    /// Decrypt a list element if it is an encryption envelope; pass plaintext
+    /// through untouched so encrypted and plaintext elements can coexist.
+    pub(crate) fn decrypt_list_element(&self, value: Bytes) -> Result<Bytes, String> {
+        if !crate::encryption::EncryptionKeyring::is_encrypted_value(&value) {
+            return Ok(value);
+        }
+        self.encryption()
+            .decrypt("__lux_list", "element", "", &value)
+            .map(Bytes::from)
+    }
+
+    /// Encrypt a stream entry field value. AAD binds the stream key + field.
+    pub(crate) fn encrypt_stream_value(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        value: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let key_name = Self::user_kv_key(key);
+        let field_name = Self::user_hash_field(field);
+        self.encryption()
+            .encrypt("__lux_stream", &field_name, &key_name, value)
+    }
+
+    /// Decrypt a stream entry field value if it is an envelope.
+    pub(crate) fn decrypt_stream_value(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        value: Bytes,
+    ) -> Result<Bytes, String> {
+        if !crate::encryption::EncryptionKeyring::is_encrypted_value(&value) {
+            return Ok(value);
+        }
+        let key_name = Self::user_kv_key(key);
+        let field_name = Self::user_hash_field(field);
+        self.encryption()
+            .decrypt("__lux_stream", &field_name, &key_name, &value)
+            .map(Bytes::from)
+    }
+
+    /// Decrypt all field values of one stream entry for output. Plaintext (and,
+    /// defensively, undecryptable) values pass through unchanged.
+    pub(crate) fn decrypt_stream_fields(
+        &self,
+        key: &[u8],
+        fields: &[(String, Bytes)],
+    ) -> Vec<(String, Bytes)> {
+        fields
+            .iter()
+            .map(|(f, v)| {
+                let dv = self
+                    .decrypt_stream_value(key, f.as_bytes(), v.clone())
+                    .unwrap_or_else(|_| v.clone());
+                (f.clone(), dv)
+            })
+            .collect()
+    }
+
+    /// True if relocating this value to a different key would orphan encrypted
+    /// data, because its AEAD AAD is bound to the key name. Lists use a
+    /// key-independent AAD and vectors stay plaintext in RAM (re-sealed on the
+    /// next write), so both self-heal on a move and are not blocked.
+    pub(crate) fn value_has_key_bound_encryption(value: &StoreValue) -> bool {
+        use crate::encryption::EncryptionKeyring as E;
+        match value {
+            StoreValue::Str(v) => E::is_encrypted_value(v),
+            StoreValue::StrBuf(v) => E::is_encrypted_value(v),
+            StoreValue::Hash(map) => map.values().any(|v| E::is_encrypted_value(v)),
+            StoreValue::Stream(s) => s
+                .entries
+                .values()
+                .any(|fields| fields.iter().any(|(_, v)| E::is_encrypted_value(v))),
+            _ => false,
+        }
+    }
+
+    /// Seal a vector (as little-endian f32 bytes) for at-rest storage. AAD binds
+    /// the vector's storage key so envelopes can't be swapped between slots.
+    pub(crate) fn encrypt_vector(&self, key: &[u8], data: &[f32]) -> Result<Vec<u8>, String> {
+        let key_name = Self::user_kv_key(key);
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for f in data {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        self.encryption()
+            .encrypt("__lux_vec", "data", &key_name, &bytes)
+    }
+
+    /// Decrypt a sealed vector back into f32 values.
+    pub(crate) fn decrypt_vector(&self, key: &[u8], envelope: &[u8]) -> Result<Vec<f32>, String> {
+        let key_name = Self::user_kv_key(key);
+        let bytes = self
+            .encryption()
+            .decrypt("__lux_vec", "data", &key_name, envelope)?;
+        if !bytes.len().is_multiple_of(4) {
+            return Err("ERR corrupt encrypted vector payload".to_string());
+        }
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+    pub(crate) fn decrypt_hash_field_value(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        value: Bytes,
+    ) -> Result<Bytes, String> {
+        if Self::is_table_storage_key(key)
+            || !crate::encryption::EncryptionKeyring::is_encrypted_value(&value)
+        {
+            return Ok(value);
+        }
+        let key_name = Self::user_kv_key(key);
+        let field_name = Self::user_hash_field(field);
+        self.encryption()
+            .decrypt("__lux_hash", &field_name, &key_name, &value)
+            .map(Bytes::from)
+    }
+
+    fn encrypt_hash_field_value(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        value: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let key_name = Self::user_kv_key(key);
+        let field_name = Self::user_hash_field(field);
+        self.encryption()
+            .encrypt("__lux_hash", &field_name, &key_name, value)
+    }
+
+    pub(crate) fn kv_string_is_encrypted(&self, key: &[u8], now: Instant) -> bool {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        Self::get_from_shard(&shard.data, key, now)
+            .as_ref()
+            .is_some_and(|value| crate::encryption::EncryptionKeyring::is_encrypted_value(value))
+    }
+
+    pub(crate) fn hash_fields_need_encryption(
+        &self,
+        key: &[u8],
+        fields: &[&[u8]],
+        now: Instant,
+    ) -> bool {
+        if Self::is_table_storage_key(key) {
+            return false;
+        }
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        let Some(entry) = shard
+            .data
+            .get(key)
+            .filter(|entry| !entry.is_expired_at(now))
+        else {
+            return false;
+        };
+        let StoreValue::Hash(map) = &entry.value else {
+            return false;
+        };
+        fields.iter().any(|field| {
+            map.get(key_str(field)).is_some_and(|value| {
+                crate::encryption::EncryptionKeyring::is_encrypted_value(value)
+            })
+        })
+    }
+
+    pub(crate) fn get_raw_string(&self, key: &[u8], now: Instant) -> Option<Bytes> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        Self::get_from_shard(&shard.data, key, now)
+    }
+
+    pub(crate) fn get_kv_string(&self, key: &[u8], now: Instant) -> Result<Option<Bytes>, String> {
+        self.get_raw_string(key, now)
+            .map(|value| self.decrypt_kv_string_value(key, value))
+            .transpose()
+    }
+
+    #[inline(always)]
     #[allow(dead_code)]
     pub(crate) fn get_and_write(
         data: &ShardData,
@@ -1105,6 +1937,29 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => {
                 if let Some(s) = entry.value.string_bytes() {
                     crate::resp::write_bulk_raw(out, s);
+                } else {
+                    crate::resp::write_null(out);
+                }
+            }
+            _ => crate::resp::write_null(out),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn get_kv_and_write_from_shard(
+        &self,
+        data: &ShardData,
+        key: &[u8],
+        now: Instant,
+        out: &mut bytes::BytesMut,
+    ) {
+        match data.get(key) {
+            Some(entry) if !entry.is_expired_at(now) => {
+                if let Some(s) = entry.value.string_to_bytes() {
+                    match self.decrypt_kv_string_value(key, s) {
+                        Ok(value) => crate::resp::write_bulk_raw(out, &value),
+                        Err(err) => crate::resp::write_error(out, &err),
+                    }
                 } else {
                     crate::resp::write_null(out);
                 }
@@ -1304,6 +2159,90 @@ impl Store {
         shard.version += 1;
         self.set_on_shard(&mut shard.data, key, value, ttl, now);
         self.remove_from_disk(key);
+    }
+
+    pub fn set_conditional(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        options: SetOptions<'_>,
+        now: Instant,
+    ) -> Result<(bool, Option<Bytes>), String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        let mut exists = false;
+        let mut old = None;
+        let mut old_expires_at = None;
+        let mut existing_encrypted = false;
+        let mut ifeq_matches = options.ifeq.is_none();
+        if let Some(entry) = shard
+            .data
+            .get(key)
+            .filter(|entry| !entry.is_expired_at(now))
+        {
+            exists = true;
+            old_expires_at = entry.expires_at;
+            existing_encrypted = entry
+                .value
+                .string_bytes()
+                .is_some_and(crate::encryption::EncryptionKeyring::is_encrypted_value);
+            if options.get {
+                let raw = entry
+                    .value
+                    .string_to_bytes()
+                    .ok_or_else(|| WRONGTYPE.to_string())?;
+                old = Some(self.decrypt_kv_string_value(key, raw)?);
+            }
+            if let Some(expected) = options.ifeq {
+                let raw = entry
+                    .value
+                    .string_to_bytes()
+                    .ok_or_else(|| WRONGTYPE.to_string())?;
+                let current = self.decrypt_kv_string_value(key, raw)?;
+                ifeq_matches = current == expected;
+            }
+        }
+        let should_set = if options.ifeq.is_some() {
+            ifeq_matches
+        } else {
+            (!options.nx || !exists) && (!options.xx || exists)
+        };
+        if should_set {
+            shard.version += 1;
+            let expires_at = if options.keep_ttl {
+                old_expires_at
+            } else {
+                options.ttl.map(|d| now + d)
+            };
+            let stored_value = if options.encrypted || existing_encrypted {
+                self.encrypt_kv_string_value(key, value)?
+            } else {
+                value.to_vec()
+            };
+            let new_value = StoreValue::Str(Bytes::from(stored_value));
+            let mem = estimate_entry_memory(key, &new_value);
+            let old_entry = shard.data.insert(
+                key_bytes(key),
+                Entry {
+                    value: new_value,
+                    expires_at,
+                    lru_clock: self.lru_clock(),
+                },
+            );
+            if let Some(old_entry) = old_entry {
+                let old_mem = estimate_entry_memory(key, &old_entry.value);
+                if mem >= old_mem {
+                    self.mem_add(mem - old_mem);
+                } else {
+                    self.mem_sub(old_mem - mem);
+                }
+            } else {
+                self.mem_add(mem);
+                self.key_added();
+            }
+            self.remove_from_disk(key);
+        }
+        Ok((should_set, old))
     }
 
     pub fn set_nx(&self, key: &[u8], value: &[u8], now: Instant) -> bool {
@@ -1512,6 +2451,41 @@ impl Store {
             }
         }
         count
+    }
+
+    pub fn delifeq(&self, key: &[u8], expected: &[u8], now: Instant) -> Result<bool, String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        let action = match shard.data.get(key) {
+            Some(entry) if entry.is_expired_at(now) => Some(false),
+            Some(entry) => {
+                let current = entry
+                    .value
+                    .string_bytes()
+                    .ok_or_else(|| WRONGTYPE.to_string())?;
+                if current == expected {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
+        match action {
+            Some(should_count) => {
+                shard.version += 1;
+                if let Some(entry) = shard.data.remove(key) {
+                    self.key_removed();
+                    let mem = estimate_entry_memory(key, &entry.value);
+                    shard.used_memory = shard.used_memory.saturating_sub(mem);
+                    self.mem_sub(mem);
+                    self.remove_from_disk(key);
+                }
+                Ok(should_count)
+            }
+            None => Ok(false),
+        }
     }
 
     pub(crate) fn del_on_shard(&self, shard: &mut Shard, key: &[u8], now: Instant) -> i64 {
@@ -1878,6 +2852,16 @@ impl Store {
 
     pub fn rename(&self, key: &[u8], new_key: &[u8], now: Instant) -> Result<(), String> {
         let old_idx = self.shard_index(key);
+        {
+            // A value whose AEAD AAD is bound to the key name can't be decrypted
+            // at a new key; moving it would orphan it. Refuse rather than lose it.
+            let shard = self.shards[old_idx].read();
+            if let Some(e) = shard.data.get(key) {
+                if !e.is_expired_at(now) && Self::value_has_key_bound_encryption(&e.value) {
+                    return Err(RENAME_ENCRYPTED_ERR.to_string());
+                }
+            }
+        }
         let entry = {
             let mut shard = self.shards[old_idx].write();
             shard.version += 1;
@@ -1920,6 +2904,9 @@ impl Store {
             let ks = src;
             match shard.data.get(ks) {
                 Some(entry) if !entry.is_expired_at(now) => {
+                    if Self::value_has_key_bound_encryption(&entry.value) {
+                        return Err(RENAME_ENCRYPTED_ERR.to_string());
+                    }
                     let ttl = entry.expires_at.map(|exp| exp.duration_since(now));
                     let dv = store_value_to_dump_value(&entry.value);
                     (dv, ttl)
@@ -1938,8 +2925,110 @@ impl Store {
             }
         }
 
-        self.load_entry(key_string(dst), dump_val, ttl);
+        // Self-log the resolved destination value as `LXRESTORE dst <blob>` keyed
+        // on dst. The raw COPY is skipped in execute_with_wal: it shards on src
+        // (args[1]) and, worse, re-reads src at replay time, but a per-shard WAL
+        // replay can hit COPY before src's own shard has replayed its post-snapshot
+        // writes, copying a stale source. The self-logged blob captures dst's exact
+        // value and replays in dst's shard order. Log before mutating memory so a
+        // WAL failure leaves dst untouched.
+        if self.wal_enabled() {
+            let ttl_ms = ttl.map(|d| d.as_millis() as i64).unwrap_or(-1);
+            let entry = DumpEntry {
+                key: key_string(dst),
+                value: dump_val,
+                ttl_ms,
+            };
+            let blob = crate::snapshot::encode_dump_blob(self, &entry)
+                .map_err(|e| format!("ERR COPY encode failed: {e}"))?;
+            self.wal_log_command(&[b"LXRESTORE", dst, &blob])
+                .map_err(|e| format!("ERR WAL append failed: {e}"))?;
+            self.load_entry(entry.key, entry.value, ttl);
+        } else {
+            self.load_entry(key_string(dst), dump_val, ttl);
+        }
         Ok(true)
+    }
+
+    /// DUMP: serialize the value at `key` into Lux's snapshot value format.
+    /// Returns None when the key is missing/expired. The blob is Lux-internal
+    /// (not RDB-compatible) and round-trips within Lux via RESTORE. Refuses
+    /// key-bound-encrypted values, same as COPY.
+    pub fn dump_key(&self, key: &[u8], now: Instant) -> Result<Option<Vec<u8>>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key) {
+            Some(entry) if !entry.is_expired_at(now) => {
+                if Self::value_has_key_bound_encryption(&entry.value) {
+                    return Err(RENAME_ENCRYPTED_ERR.to_string());
+                }
+                let ttl_ms = entry
+                    .expires_at
+                    .map(|exp| exp.duration_since(now).as_millis() as i64)
+                    .unwrap_or(-1);
+                let value = store_value_to_dump_value(&entry.value);
+                let dentry = DumpEntry {
+                    key: key_string(key),
+                    value,
+                    ttl_ms,
+                };
+                let blob = crate::snapshot::encode_dump_blob(self, &dentry)
+                    .map_err(|e| format!("ERR DUMP failed: {e}"))?;
+                Ok(Some(blob))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// RESTORE: recreate `key` from a DUMP blob. `ttl_ms` is the new TTL in ms
+    /// (0 = persist); `absttl` reads it as an absolute unix-ms deadline. Returns
+    /// BUSYKEY if the key exists and `replace` is false.
+    pub fn restore_key(
+        &self,
+        key: &[u8],
+        ttl_ms: i64,
+        blob: &[u8],
+        replace: bool,
+        absttl: bool,
+        now: Instant,
+    ) -> Result<(), String> {
+        if ttl_ms < 0 {
+            return Err("ERR Invalid TTL value, must be >= 0".to_string());
+        }
+        {
+            let idx = self.shard_index(key);
+            let shard = self.shards[idx].read();
+            if let Some(entry) = shard.data.get(key) {
+                if !entry.is_expired_at(now) && !replace {
+                    return Err("BUSYKEY Target key name already exists.".to_string());
+                }
+            }
+        }
+        let (value, _embedded_ttl) = crate::snapshot::decode_dump_blob_value(self, blob)
+            .map_err(|_| "ERR Bad data format".to_string())?;
+        let ttl = if ttl_ms == 0 {
+            None
+        } else if absttl {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let remaining = ttl_ms.saturating_sub(now_ms);
+            if remaining <= 0 {
+                // Past absolute deadline: the key would expire immediately. Drop
+                // any existing key (REPLACE) and do not create a new one.
+                self.del(&[key]);
+                return Ok(());
+            }
+            Some(Duration::from_millis(remaining as u64))
+        } else {
+            Some(Duration::from_millis(ttl_ms as u64))
+        };
+        // Clear any existing value first so memory/key accounting stays exact on
+        // REPLACE (load_entry only adds).
+        self.del(&[key]);
+        self.load_entry(key_string(key), value, ttl);
+        Ok(())
     }
 
     pub fn dbsize(&self, now: Instant) -> i64 {
@@ -2232,6 +3321,56 @@ impl Store {
             },
             _ => None,
         }
+    }
+
+    /// LMPOP/BLMPOP core: pop up to `count` elements from the `pop_left` side of
+    /// the first non-empty list among `keys`. Returns the popped key and the
+    /// elements (raw, caller decrypts), or None if every key is missing/empty.
+    /// Errors WRONGTYPE if a scanned key holds a non-list value (Redis matches
+    /// on the first such key). Empty lists are left in place, mirroring LPOP.
+    #[allow(clippy::type_complexity)]
+    pub fn lmpop(
+        &self,
+        keys: &[&[u8]],
+        pop_left: bool,
+        count: usize,
+        now: Instant,
+    ) -> Result<Option<(Vec<u8>, Vec<Bytes>)>, String> {
+        for key in keys {
+            self.try_promote(key, now);
+            let idx = self.shard_index(key);
+            let mut shard = self.shards[idx].write();
+            match shard.data.get(*key) {
+                Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                    StoreValue::List(list) => {
+                        if list.is_empty() {
+                            continue;
+                        }
+                    }
+                    _ => return Err(WRONGTYPE.to_string()),
+                },
+                _ => continue,
+            }
+            let mut items = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                let popped = if pop_left {
+                    self.lpop_on_shard(&mut shard, key, now)
+                } else {
+                    self.rpop_on_shard(&mut shard, key, now)
+                };
+                match popped {
+                    Some(v) => items.push(v),
+                    None => break,
+                }
+            }
+            if !items.is_empty() {
+                shard.version += 1;
+                drop(shard);
+                self.remove_from_disk(key);
+                return Ok(Some((key.to_vec(), items)));
+            }
+        }
+        Ok(None)
     }
 
     pub fn llen(&self, key: &[u8], now: Instant) -> Result<i64, String> {
@@ -2714,8 +3853,12 @@ impl Store {
         let store_value = match value {
             DumpValue::Str(s) => StoreValue::Str(Bytes::from(s)),
             DumpValue::List(l) => StoreValue::List(l.into_iter().map(Bytes::from).collect()),
-            DumpValue::Hash(h) => {
-                StoreValue::Hash(h.into_iter().map(|(k, v)| (k, Bytes::from(v))).collect())
+            DumpValue::Hash(h, expiries) => {
+                let mut hd = HashData::from_fields(
+                    h.into_iter().map(|(k, v)| (k, Bytes::from(v))).collect(),
+                );
+                hd.expiries = expiries.into_iter().collect();
+                StoreValue::Hash(hd)
             }
             DumpValue::Set(s) => StoreValue::Set(SetData::from_members(s)),
             DumpValue::SortedSet(members) => {
@@ -2795,7 +3938,7 @@ impl Store {
                     groups,
                 })
             }
-            DumpValue::Vector(data, metadata) => {
+            DumpValue::Vector(data, metadata, encrypted) => {
                 let dims = data.len() as u32;
                 let index_data = data.clone();
                 let key_clone = key.clone();
@@ -2803,6 +3946,7 @@ impl Store {
                     dims,
                     data,
                     metadata,
+                    encrypted,
                 });
                 let expires_at = ttl.map(|d| Instant::now() + d);
                 let mem = estimate_entry_memory(&key, &sv);
@@ -2895,7 +4039,13 @@ impl Store {
         }
     }
 
-    pub fn getrange(&self, key: &[u8], start: i64, end: i64, now: Instant) -> Bytes {
+    pub fn getrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        end: i64,
+        now: Instant,
+    ) -> Result<Bytes, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key) {
@@ -2913,57 +4063,101 @@ impl Store {
                         (end + 1).min(len) as usize
                     };
                     if s_i >= e_i {
-                        Bytes::new()
+                        Ok(Bytes::new())
                     } else {
-                        Bytes::copy_from_slice(&s[s_i..e_i])
+                        Ok(Bytes::copy_from_slice(&s[s_i..e_i]))
                     }
                 } else {
-                    Bytes::new()
+                    Err(WRONGTYPE.to_string())
                 }
             }
-            _ => Bytes::new(),
+            _ => Ok(Bytes::new()),
         }
     }
 
-    pub fn setrange(&self, key: &[u8], offset: usize, value: &[u8], now: Instant) -> i64 {
+    pub fn setrange(
+        &self,
+        key: &[u8],
+        offset: usize,
+        value: &[u8],
+        now: Instant,
+    ) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
-        shard.version += 1;
         let ks = key_bytes(key);
-        let existed = shard.data.contains_key(&ks);
-        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::Str(Bytes::new()),
-            expires_at: None,
-            lru_clock: self.lru_clock(),
-        });
-        if !existed {
-            self.key_added();
+        let expired = shard
+            .data
+            .get(&ks)
+            .is_some_and(|entry| entry.is_expired_at(now));
+        if expired {
+            shard.data.remove(&ks);
+            self.key_removed();
         }
-        if entry.is_expired_at(now) {
-            entry.value = StoreValue::Str(Bytes::new());
-            entry.expires_at = None;
-        }
-        if let Some(s) = entry.value.string_bytes() {
-            let old_len = s.len();
-            let mut buf = s.to_vec();
-            let needed = offset + value.len();
-            if buf.len() < needed {
-                buf.resize(needed, 0);
+
+        let Some(entry) = shard.data.get(&ks) else {
+            if value.is_empty() {
+                return Ok(0);
             }
-            buf[offset..offset + value.len()].copy_from_slice(value);
-            let new_len = buf.len();
-            let len = new_len as i64;
-            entry.value = StoreValue::StrBuf(buf);
-            if new_len > old_len {
-                let added = new_len - old_len;
-                let _ = entry;
+            shard.version += 1;
+            let needed = offset + value.len();
+            let mut buf = vec![0; needed];
+            buf[offset..needed].copy_from_slice(value);
+            let new_value = StoreValue::StrBuf(buf);
+            let mem = estimate_entry_memory(&ks, &new_value);
+            shard.data.insert(
+                ks,
+                Entry {
+                    value: new_value,
+                    expires_at: None,
+                    lru_clock: self.lru_clock(),
+                },
+            );
+            shard.used_memory += mem;
+            self.mem_add(mem);
+            self.key_added();
+            return Ok(needed as i64);
+        };
+
+        let (expires_at, mut buf) = {
+            let Some(s) = entry.value.string_bytes() else {
+                return Err(WRONGTYPE.to_string());
+            };
+            if value.is_empty() {
+                return Ok(s.len() as i64);
+            }
+            (entry.expires_at, s.to_vec())
+        };
+
+        shard.version += 1;
+        let needed = offset + value.len();
+        if buf.len() < needed {
+            buf.resize(needed, 0);
+        }
+        buf[offset..offset + value.len()].copy_from_slice(value);
+        let len = buf.len() as i64;
+        let new_value = StoreValue::StrBuf(buf);
+        let mem = estimate_entry_memory(&ks, &new_value);
+        let old_entry = shard.data.insert(
+            ks,
+            Entry {
+                value: new_value,
+                expires_at,
+                lru_clock: self.lru_clock(),
+            },
+        );
+        if let Some(old_entry) = old_entry {
+            let old_mem = estimate_entry_memory(key, &old_entry.value);
+            if mem >= old_mem {
+                let added = mem - old_mem;
                 shard.used_memory += added;
                 self.mem_add(added);
+            } else {
+                let freed = old_mem - mem;
+                shard.used_memory = shard.used_memory.saturating_sub(freed);
+                self.mem_sub(freed);
             }
-            len
-        } else {
-            0
         }
+        Ok(len)
     }
 
     pub fn msetnx(&self, pairs: &[(&[u8], &[u8])], now: Instant) -> bool {
@@ -3043,6 +4237,116 @@ impl Store {
             },
             _ => Ok(0),
         }
+    }
+
+    /// BITFIELD/BITFIELD_RO: apply a batch of GET/SET/INCRBY operations against
+    /// the key's bitmap atomically (all under one shard lock). Returns one result
+    /// per op in order (None where an OVERFLOW FAIL suppressed a SET/INCRBY).
+    pub fn bitfield(
+        &self,
+        key: &[u8],
+        ops: &[BitfieldOp],
+        now: Instant,
+    ) -> Result<Vec<Option<i64>>, String> {
+        let has_write = ops.iter().any(|o| !matches!(o, BitfieldOp::Get { .. }));
+        let idx = self.shard_index(key);
+
+        if !has_write {
+            let shard = self.shards[idx].read();
+            let buf: Vec<u8> = match shard.data.get(key) {
+                Some(entry) if !entry.is_expired_at(now) => match entry.value.string_bytes() {
+                    Some(s) => s.to_vec(),
+                    None => return Err(WRONGTYPE.to_string()),
+                },
+                _ => Vec::new(),
+            };
+            let mut results = Vec::with_capacity(ops.len());
+            for op in ops {
+                if let BitfieldOp::Get {
+                    signed,
+                    bits,
+                    offset,
+                } = op
+                {
+                    results.push(Some(bf_read(&buf, *offset, *bits, *signed)));
+                }
+            }
+            return Ok(results);
+        }
+
+        let mut shard = self.shards[idx].write();
+        shard.version += 1;
+        let ks = key_bytes(key);
+        let existed = shard.data.contains_key(&ks);
+        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
+            value: StoreValue::Str(Bytes::new()),
+            expires_at: None,
+            lru_clock: self.lru_clock(),
+        });
+        if !existed {
+            self.key_added();
+        }
+        if entry.is_expired_at(now) {
+            entry.value = StoreValue::Str(Bytes::new());
+            entry.expires_at = None;
+        }
+        let mut buf = match entry.value.string_bytes() {
+            Some(s) => s.to_vec(),
+            None => return Err(WRONGTYPE.to_string()),
+        };
+        let old_len = buf.len();
+        let mut results = Vec::with_capacity(ops.len());
+        for op in ops {
+            match op {
+                BitfieldOp::Get {
+                    signed,
+                    bits,
+                    offset,
+                } => results.push(Some(bf_read(&buf, *offset, *bits, *signed))),
+                BitfieldOp::Set {
+                    signed,
+                    bits,
+                    offset,
+                    value,
+                    overflow,
+                } => {
+                    let old = bf_read(&buf, *offset, *bits, *signed);
+                    match bf_clamp(*signed, *bits, *value as i128, *overflow) {
+                        Some(v) => {
+                            bf_write(&mut buf, *offset, *bits, v as u64);
+                            results.push(Some(old));
+                        }
+                        None => results.push(None),
+                    }
+                }
+                BitfieldOp::IncrBy {
+                    signed,
+                    bits,
+                    offset,
+                    incr,
+                    overflow,
+                } => {
+                    let old = bf_read(&buf, *offset, *bits, *signed);
+                    let new = old as i128 + *incr as i128;
+                    match bf_clamp(*signed, *bits, new, *overflow) {
+                        Some(v) => {
+                            bf_write(&mut buf, *offset, *bits, v as u64);
+                            results.push(Some(v));
+                        }
+                        None => results.push(None),
+                    }
+                }
+            }
+        }
+        let new_len = buf.len();
+        entry.value = StoreValue::StrBuf(buf);
+        if new_len > old_len {
+            let added = new_len - old_len;
+            let _ = entry;
+            shard.used_memory += added;
+            self.mem_add(added);
+        }
+        Ok(results)
     }
 
     pub fn bitcount(
@@ -3625,7 +4929,7 @@ impl Store {
         let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::Hash(HashMap::new()),
+            value: StoreValue::Hash(HashData::default()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
@@ -3633,7 +4937,7 @@ impl Store {
             self.key_added();
         }
         if entry.is_expired_at(now) {
-            entry.value = StoreValue::Hash(HashMap::new());
+            entry.value = StoreValue::Hash(HashData::default());
             entry.expires_at = None;
         }
         match &mut entry.value {
@@ -3666,7 +4970,7 @@ impl Store {
         let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::Hash(HashMap::new()),
+            value: StoreValue::Hash(HashData::default()),
             expires_at: None,
             lru_clock: self.lru_clock(),
         });
@@ -3674,7 +4978,7 @@ impl Store {
             self.key_added();
         }
         if entry.is_expired_at(now) {
-            entry.value = StoreValue::Hash(HashMap::new());
+            entry.value = StoreValue::Hash(HashData::default());
             entry.expires_at = None;
         }
         match &mut entry.value {
@@ -3863,6 +5167,18 @@ impl Store {
         now: Instant,
     ) -> Result<bool, String> {
         let mem_size = member.len() + 32;
+        // Validate the destination type BEFORE mutating the source. Otherwise a
+        // wrong-type destination returns WRONGTYPE only after the member has
+        // already been removed from the source, losing it permanently.
+        let dst_idx = self.shard_index(dst);
+        {
+            let shard = self.shards[dst_idx].read();
+            if let Some(entry) = shard.data.get(dst) {
+                if !entry.is_expired_at(now) && !matches!(entry.value, StoreValue::Set(_)) {
+                    return Err(WRONGTYPE.to_string());
+                }
+            }
+        }
         let src_idx = self.shard_index(src);
         let removed = {
             let mut shard = self.shards[src_idx].write();
@@ -3885,7 +5201,6 @@ impl Store {
         if !removed {
             return Ok(false);
         }
-        let dst_idx = self.shard_index(dst);
         let mut shard = self.shards[dst_idx].write();
         shard.version += 1;
         let ks = key_bytes(dst);
@@ -3927,35 +5242,51 @@ impl Store {
         }
     }
 
+    /// Replace `dst` with `members` (as a set) and self-log the resolved effect
+    /// (DEL + SADD) keyed on dst, so replay rebuilds dst from its own WAL shard,
+    /// independent of the source keys' shard order. (The raw *STORE command is
+    /// skipped in execute_with_wal via command_self_logs_wal.)
+    fn write_computed_set(
+        &self,
+        dst: &[u8],
+        members: &[&[u8]],
+        now: Instant,
+    ) -> Result<i64, String> {
+        self.del(&[dst]);
+        if !members.is_empty() {
+            self.sadd(dst, members, now)?;
+        }
+        if self.wal_enabled() {
+            self.wal_log_command(&[b"DEL", dst])
+                .map_err(|e| format!("ERR WAL append failed: {e}"))?;
+            if !members.is_empty() {
+                let mut sadd: Vec<&[u8]> = Vec::with_capacity(members.len() + 2);
+                sadd.push(b"SADD");
+                sadd.push(dst);
+                sadd.extend_from_slice(members);
+                self.wal_log_command(&sadd)
+                    .map_err(|e| format!("ERR WAL append failed: {e}"))?;
+            }
+        }
+        Ok(members.len() as i64)
+    }
+
     pub fn sdiffstore(&self, dst: &[u8], keys: &[&[u8]], now: Instant) -> Result<i64, String> {
         let result = self.sdiff(keys, now)?;
         let members: Vec<&[u8]> = result.iter().map(|s| s.as_bytes()).collect();
-        self.del(&[dst]);
-        if !members.is_empty() {
-            let member_refs: Vec<&[u8]> = members;
-            self.sadd(dst, &member_refs, now)?;
-        }
-        Ok(result.len() as i64)
+        self.write_computed_set(dst, &members, now)
     }
 
     pub fn sinterstore(&self, dst: &[u8], keys: &[&[u8]], now: Instant) -> Result<i64, String> {
         let result = self.sinter(keys, now)?;
         let members: Vec<&[u8]> = result.iter().map(|s| s.as_bytes()).collect();
-        self.del(&[dst]);
-        if !members.is_empty() {
-            self.sadd(dst, &members, now)?;
-        }
-        Ok(result.len() as i64)
+        self.write_computed_set(dst, &members, now)
     }
 
     pub fn sunionstore(&self, dst: &[u8], keys: &[&[u8]], now: Instant) -> Result<i64, String> {
         let result = self.sunion(keys, now)?;
         let members: Vec<&[u8]> = result.iter().map(|s| s.as_bytes()).collect();
-        self.del(&[dst]);
-        if !members.is_empty() {
-            self.sadd(dst, &members, now)?;
-        }
-        Ok(result.len() as i64)
+        self.write_computed_set(dst, &members, now)
     }
 
     pub fn expire_sweep(&self, now: Instant) {
@@ -4201,9 +5532,13 @@ fn store_value_to_dump_value(value: &StoreValue) -> DumpValue {
         StoreValue::Str(s) => DumpValue::Str(s.to_vec()),
         StoreValue::StrBuf(s) => DumpValue::Str(s.clone()),
         StoreValue::List(l) => DumpValue::List(l.iter().map(|b| b.to_vec()).collect()),
-        StoreValue::Hash(h) => {
-            DumpValue::Hash(h.iter().map(|(k, v)| (k.clone(), v.to_vec())).collect())
-        }
+        StoreValue::Hash(h) => DumpValue::Hash(
+            h.fields
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_vec()))
+                .collect(),
+            h.expiries.iter().map(|(k, &ms)| (k.clone(), ms)).collect(),
+        ),
         StoreValue::Set(s) => DumpValue::Set(s.iter().cloned().collect()),
         StoreValue::SortedSet(_, scores) => {
             DumpValue::SortedSet(scores.iter().map(|(m, s)| (m.clone(), *s)).collect())
@@ -4251,7 +5586,7 @@ fn store_value_to_dump_value(value: &StoreValue) -> DumpValue {
                 .collect();
             DumpValue::Stream(entries, s.last_id.to_string(), groups)
         }
-        StoreValue::Vector(v) => DumpValue::Vector(v.data.clone(), v.metadata.clone()),
+        StoreValue::Vector(v) => DumpValue::Vector(v.data.clone(), v.metadata.clone(), v.encrypted),
         StoreValue::HyperLogLog(regs, cached) => DumpValue::HyperLogLog(regs.clone(), *cached),
         StoreValue::TimeSeries(ts) => {
             DumpValue::TimeSeries(ts.samples.clone(), ts.retention, ts.labels.clone())
@@ -4273,11 +5608,14 @@ pub type StreamGroupDump = (
 pub enum DumpValue {
     Str(Vec<u8>),
     List(Vec<Vec<u8>>),
-    Hash(Vec<(String, Vec<u8>)>),
+    /// Hash fields plus per-field absolute-ms TTLs (empty when no field has one).
+    Hash(Vec<(String, Vec<u8>)>, Vec<(String, i64)>),
     Set(Vec<String>),
     SortedSet(Vec<(String, f64)>),
     Stream(Vec<StreamDumpEntry>, String, Vec<StreamGroupDump>),
-    Vector(Vec<f32>, Option<String>),
+    /// f32 data, metadata, and whether it is encrypted-at-rest (sealed in the
+    /// snapshot; the in-memory copy is plaintext).
+    Vector(Vec<f32>, Option<String>, bool),
     HyperLogLog(Vec<u8>, u64),
     TimeSeries(Vec<(i64, f64)>, u64, Vec<(String, String)>),
 }
@@ -4303,6 +5641,11 @@ impl GlobMatcher {
     fn matches(&self, s: &str) -> bool {
         if self.pattern.len() == 1 && self.pattern[0] == '*' {
             return true;
+        }
+        if self.pattern.len() > 10_000
+            && self.pattern.iter().filter(|&&ch| ch == '*').count() > 1_000
+        {
+            return false;
         }
         let s: Vec<char> = s.chars().collect();
         Self::do_match(&self.pattern, &s)
@@ -4628,7 +5971,7 @@ mod tests {
         assert_eq!(store.append(b"key", b" world", n), 11);
         assert_eq!(store.get(b"key", n).unwrap(), &b"hello world"[..]);
         assert_eq!(store.strlen(b"key", n), 11);
-        assert_eq!(store.getrange(b"key", 6, -1, n), &b"world"[..]);
+        assert_eq!(store.getrange(b"key", 6, -1, n).unwrap(), &b"world"[..]);
     }
 
     #[test]
@@ -4785,8 +6128,8 @@ mod tests {
         let store = Store::new();
         let n = now();
         store.set(b"key", b"Hello, World!", None, n);
-        assert_eq!(store.getrange(b"key", 0, 4, n), &b"Hello"[..]);
-        assert_eq!(store.getrange(b"key", -6, -1, n), &b"World!"[..]);
+        assert_eq!(store.getrange(b"key", 0, 4, n).unwrap(), &b"Hello"[..]);
+        assert_eq!(store.getrange(b"key", -6, -1, n).unwrap(), &b"World!"[..]);
     }
 
     #[test]
@@ -4794,10 +6137,36 @@ mod tests {
         let store = Store::new();
         let n = now();
         store.set(b"key", b"Hello", None, n);
-        store.setrange(b"key", 6, b"World", n);
+        store.setrange(b"key", 6, b"World", n).unwrap();
         let val = store.get(b"key", n).unwrap();
         assert_eq!(val.len(), 11);
         assert_eq!(val[5], 0);
+    }
+
+    #[test]
+    fn setrange_empty_missing_does_not_create_key() {
+        let store = Store::new();
+        let n = now();
+
+        assert_eq!(store.setrange(b"key", 0, b"", n).unwrap(), 0);
+        assert!(store.get(b"key", n).is_none());
+        assert_eq!(store.dbsize(n), 0);
+    }
+
+    #[test]
+    fn range_commands_error_on_wrong_type() {
+        let store = Store::new();
+        let n = now();
+
+        store.lpush(b"list", &[b"value"], n).unwrap();
+        assert!(store
+            .getrange(b"list", 0, -1, n)
+            .unwrap_err()
+            .contains("WRONGTYPE"));
+        assert!(store
+            .setrange(b"list", 0, b"", n)
+            .unwrap_err()
+            .contains("WRONGTYPE"));
     }
 
     #[test]
@@ -5469,8 +6838,8 @@ mod tests {
     fn vector_search_indexes_are_dimension_scoped() {
         let store = Store::new();
         let n = now();
-        store.vset(b"two_dim", vec![1.0, 0.0], None, None, n);
-        store.vset(b"three_dim", vec![0.0, 1.0, 0.0], None, None, n);
+        store.vset(b"two_dim", vec![1.0, 0.0], None, None, false, n);
+        store.vset(b"three_dim", vec![0.0, 1.0, 0.0], None, None, false, n);
 
         let two_dim = store.vsearch(&[1.0, 0.0], 1, None, None, n);
         assert_eq!(
@@ -5514,5 +6883,16 @@ mod tests {
         let m3 = GlobMatcher::new("*");
         assert!(m3.matches("anything"));
         assert!(m3.matches(""));
+    }
+
+    #[test]
+    fn keys_matches_very_long_nested_pattern() {
+        let store = Store::new();
+        let n = now();
+        let key = "a".repeat(50_000);
+        let pattern = "*?".repeat(50_000);
+
+        store.set(key.as_bytes(), b"1", None, n);
+        assert!(store.keys(pattern.as_bytes(), n).is_empty());
     }
 }

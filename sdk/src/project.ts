@@ -1,4 +1,5 @@
 import { LuxAuthClient, type LuxAuthOptions } from './auth';
+import { LuxPushNamespace } from './push';
 import { LuxStorageNamespace } from './storage';
 import type { LuxError, LuxResult, LuxSchema, LuxTypedRow } from './types';
 import { err, ok, toLuxError } from './utils';
@@ -36,6 +37,8 @@ type FilterOperator =
 	| 'gte'
 	| 'lt'
 	| 'lte'
+	| 'like'
+	| 'ilike'
 	| 'is'
 	| 'in'
 	| 'notIn'
@@ -46,6 +49,7 @@ type FilterOperator =
 	| 'contains';
 type ProjectRowInput<T extends object> = Partial<T> & Record<string, QueryValue>;
 type ProjectSelectSingle<TResult> = TResult extends readonly (infer Row)[] ? Row : TResult;
+type ProjectSelectMaybeSingle<TResult> = ProjectSelectSingle<TResult> | null;
 
 interface QueryFilter {
 	column: string;
@@ -117,6 +121,7 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 	readonly key: string;
 	readonly auth: LuxAuthClient;
 	readonly storage: LuxStorageNamespace;
+	readonly push: LuxPushNamespace;
 	private fetchImpl: typeof fetch;
 	private WebSocketImpl?: typeof WebSocket;
 	private liveSocket: WebSocket | null = null;
@@ -140,6 +145,7 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 			else this.restartLiveSocket();
 		});
 		this.storage = new LuxStorageNamespace(this);
+		this.push = new LuxPushNamespace(this);
 	}
 
 	/**
@@ -272,6 +278,9 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 		const url = new URL(`${this.url}/live`);
 		url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
 		url.searchParams.set('apikey', this.key);
+		// Engines before the `apikey` alias only read `token` on /live. Send both so
+		// a current SDK keeps working against an already-deployed engine.
+		url.searchParams.set('token', this.key);
 		if (accessToken) url.searchParams.set('access_token', accessToken);
 
 		const socket = new WebSocketImpl(url.toString());
@@ -401,30 +410,30 @@ export class LuxProjectTable<T extends object> {
 		return this.select<T>().live() as Promise<LuxLiveResult<T>>;
 	}
 
-	insert(row: ProjectRowInput<T>, options?: { ttl?: number }): LuxProjectInsertBuilder<unknown>;
+	insert(row: ProjectRowInput<T>, options?: { ttl?: number }): LuxProjectInsertBuilder<T>;
 	insert(
 		rows: Array<ProjectRowInput<T>>,
 		options?: { ttl?: number },
-	): LuxProjectInsertBuilder<unknown[]>;
+	): LuxProjectInsertBuilder<T[]>;
 	insert(
 		rowOrRows: ProjectRowInput<T> | Array<ProjectRowInput<T>>,
 		options?: { ttl?: number },
-	): LuxProjectInsertBuilder<unknown | unknown[]> {
+	): LuxProjectInsertBuilder<T | T[]> {
 		return new LuxProjectInsertBuilder(this.client, this.name, rowOrRows, { ttl: options?.ttl });
 	}
 
 	upsert(
 		row: ProjectRowInput<T>,
 		options?: { onConflict?: string; ttl?: number },
-	): LuxProjectInsertBuilder<unknown>;
+	): LuxProjectInsertBuilder<T>;
 	upsert(
 		rows: Array<ProjectRowInput<T>>,
 		options?: { onConflict?: string; ttl?: number },
-	): LuxProjectInsertBuilder<unknown[]>;
+	): LuxProjectInsertBuilder<T[]>;
 	upsert(
 		rowOrRows: ProjectRowInput<T> | Array<ProjectRowInput<T>>,
 		options?: { onConflict?: string; ttl?: number },
-	): LuxProjectInsertBuilder<unknown | unknown[]> {
+	): LuxProjectInsertBuilder<T | T[]> {
 		return new LuxProjectInsertBuilder(this.client, this.name, rowOrRows, {
 			upsert: true,
 			onConflict: options?.onConflict,
@@ -432,11 +441,11 @@ export class LuxProjectTable<T extends object> {
 		});
 	}
 
-	update(patch: ProjectRowInput<T>): LuxProjectMutationBuilder<unknown> {
+	update(patch: ProjectRowInput<T>): LuxProjectMutationBuilder<T[]> {
 		return new LuxProjectMutationBuilder(this.client, this.name, 'PATCH', patch);
 	}
 
-	delete(): LuxProjectMutationBuilder<unknown> {
+	delete(): LuxProjectMutationBuilder<T[]> {
 		return new LuxProjectMutationBuilder(this.client, this.name, 'DELETE');
 	}
 
@@ -444,6 +453,58 @@ export class LuxProjectTable<T extends object> {
 		const result = await this.client.request('GET', `/tables/${encodeURIComponent(this.name)}/count`);
 		if (result.error) return result as LuxResult<number>;
 		return ok(unwrapResult<number>(result.data) ?? 0);
+	}
+
+	/**
+	 * Point access to a single row by primary key, without a query. Reads and
+	 * writes address the row directly (GET/PATCH `/tables/<t>/<pk>`); writes are
+	 * still grant-enforced server-side.
+	 */
+	row(pk: string | number): LuxProjectRow<T> {
+		return new LuxProjectRow<T>(this.client, this.name, pk);
+	}
+}
+
+export class LuxProjectRow<T extends object> {
+	constructor(
+		private client: LuxProjectClient<any>,
+		private name: string,
+		private pk: string | number,
+	) {}
+
+	private path(): string {
+		return `/tables/${encodeURIComponent(this.name)}/${encodeURIComponent(String(this.pk))}`;
+	}
+
+	/** Read the whole row, or a single column's value. */
+	get(): Promise<LuxResult<T>>;
+	get<K extends keyof T>(field: K): Promise<LuxResult<T[K]>>;
+	async get(field?: string): Promise<LuxResult<unknown>> {
+		const res = await this.client.request('GET', this.path());
+		if (res.error) return res;
+		const payload = res.data as { result?: Record<string, unknown> };
+		// A missing row comes back as {"error":"row not found"} with a 200.
+		if (!payload || typeof payload !== 'object' || !('result' in payload)) {
+			return err('NOT_FOUND', `Row '${this.pk}' not found in '${this.name}'`);
+		}
+		const row = payload.result ?? {};
+		return ok(field === undefined ? row : row[field]);
+	}
+
+	/** Point-update one cell, or several via a patch object. */
+	set<K extends keyof T>(field: K, value: T[K]): Promise<LuxResult<T>>;
+	set(patch: Partial<T>): Promise<LuxResult<T>>;
+	async set(fieldOrPatch: string | Partial<T>, value?: unknown): Promise<LuxResult<T>> {
+		const patch =
+			typeof fieldOrPatch === 'string' ? { [fieldOrPatch]: value } : fieldOrPatch;
+		const res = await this.client.request('PATCH', this.path(), patch);
+		if (res.error) return res as LuxResult<T>;
+		const data = unwrapResult<unknown>(res.data);
+		const rows = Array.isArray(data) ? data : [];
+		if (rows.length === 0) {
+			return err('NOT_FOUND', `Row '${this.pk}' not found or not permitted in '${this.name}'`);
+		}
+		return ok(rows[0] as T);
 	}
 }
 
@@ -470,6 +531,7 @@ abstract class LuxProjectThenable<TResult> implements PromiseLike<LuxResult<TRes
 
 abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenable<TResult> {
 	protected filters: QueryFilter[] = [];
+	protected orFilters: string[] = [];
 	protected orderBy?: QueryOrder;
 	protected joins: QueryJoin[] = [];
 	protected groupColumns: string[] = [];
@@ -507,6 +569,19 @@ abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenabl
 
 	lte(column: string, value: QueryValue): TSelf {
 		return this.addFilter(column, 'lte', value);
+	}
+
+	like(column: string, value: string): TSelf {
+		return this.addFilter(column, 'like', value);
+	}
+
+	ilike(column: string, value: string): TSelf {
+		return this.addFilter(column, 'ilike', value);
+	}
+
+	or(filters: string): TSelf {
+		this.orFilters.push(filters);
+		return this as unknown as TSelf;
 	}
 
 	is(column: string, value: QueryValue): TSelf {
@@ -576,7 +651,11 @@ abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenabl
 
 	protected filteredQueryParams(): URLSearchParams {
 		const params = new URLSearchParams();
-		if (this.filters.length) params.set('where', filtersToWhere(this.filters));
+		const whereParts = [
+			this.filters.length ? filtersToWhere(this.filters) : '',
+			...this.orFilters.map(orFiltersToWhere),
+		].filter(Boolean);
+		if (whereParts.length) params.set('where', whereParts.join(' AND '));
 		for (const join of this.joins) {
 			const kind = join.type === 'left' ? ':left' : '';
 			params.append('join', `${join.table}:${join.alias}${kind}:on(${join.onLeft}=${join.onRight})`);
@@ -602,6 +681,7 @@ abstract class LuxProjectFilterBuilder<TResult, TSelf> extends LuxProjectThenabl
 
 export class LuxProjectSelectBuilder<T extends object, TResult> extends LuxProjectFilterBuilder<TResult, LuxProjectSelectBuilder<T, TResult>> {
 	private expectSingle = false;
+	private allowEmptySingle = false;
 
 	constructor(
 		client: LuxProjectClient<any>,
@@ -639,8 +719,16 @@ export class LuxProjectSelectBuilder<T extends object, TResult> extends LuxProje
 
 	single(): LuxProjectSelectBuilder<T, ProjectSelectSingle<TResult>> {
 		this.expectSingle = true;
-		if (this.limitCount == null) this.limitCount = 1;
+		this.allowEmptySingle = false;
+		if (this.limitCount == null) this.limitCount = 2;
 		return this as unknown as LuxProjectSelectBuilder<T, ProjectSelectSingle<TResult>>;
+	}
+
+	maybeSingle(): LuxProjectSelectBuilder<T, ProjectSelectMaybeSingle<TResult>> {
+		this.expectSingle = true;
+		this.allowEmptySingle = true;
+		if (this.limitCount == null) this.limitCount = 2;
+		return this as unknown as LuxProjectSelectBuilder<T, ProjectSelectMaybeSingle<TResult>>;
 	}
 
 	async execute(): Promise<LuxResult<TResult>> {
@@ -658,7 +746,11 @@ export class LuxProjectSelectBuilder<T extends object, TResult> extends LuxProje
 			return ok(rows as TResult);
 		}
 		if (rows.length === 0) {
+			if (this.allowEmptySingle) return ok(null as TResult);
 			return err('NOT_FOUND', `No rows found in table '${this.tableName}'`);
+		}
+		if (rows.length > 1) {
+			return err('MULTIPLE_ROWS', `Multiple rows found in table '${this.tableName}'`);
 		}
 		return ok(rows[0] as unknown as TResult);
 	}
@@ -913,6 +1005,8 @@ export class LuxProjectInsertBuilder<TResult> extends LuxProjectThenable<TResult
 }
 
 export class LuxProjectMutationBuilder<TResult> extends LuxProjectFilterBuilder<TResult, LuxProjectMutationBuilder<TResult>> {
+	private expectSingle = false;
+
 	constructor(
 		client: LuxProjectClient<any>,
 		tableName: string,
@@ -920,6 +1014,11 @@ export class LuxProjectMutationBuilder<TResult> extends LuxProjectFilterBuilder<
 		private body?: Record<string, QueryValue>,
 	) {
 		super(client, tableName);
+	}
+
+	single(): LuxProjectMutationBuilder<ProjectSelectSingle<TResult>> {
+		this.expectSingle = true;
+		return this as unknown as LuxProjectMutationBuilder<ProjectSelectSingle<TResult>>;
 	}
 
 	async execute(): Promise<LuxResult<TResult>> {
@@ -939,7 +1038,14 @@ export class LuxProjectMutationBuilder<TResult> extends LuxProjectFilterBuilder<
 			this.body,
 		);
 		if (res.error) return res as LuxResult<TResult>;
-		return ok(unwrapResult<TResult>(res.data) as TResult);
+		const data = unwrapResult<unknown>(res.data);
+		if (!this.expectSingle) return ok(data as TResult);
+
+		const rows = Array.isArray(data) ? data : [];
+		if (rows.length === 0) {
+			return err('NOT_FOUND', `No rows affected in table '${this.tableName}'`);
+		}
+		return ok(rows[0] as TResult);
 	}
 }
 
@@ -999,6 +1105,10 @@ function filterOperatorToWhere(operator: FilterOperator): string {
 			return '<';
 		case 'lte':
 			return '<=';
+		case 'like':
+			return 'LIKE';
+		case 'ilike':
+			return 'ILIKE';
 		case 'in':
 			return 'IN';
 		case 'notIn':
@@ -1016,6 +1126,61 @@ function filterOperatorToWhere(operator: FilterOperator): string {
 	}
 }
 
+function orFiltersToWhere(filters: string): string {
+	const clauses = splitTopLevel(filters, ',').map((filter) => filter.trim()).filter(Boolean);
+	return clauses.map(parseOrFilter).join(' OR ');
+}
+
+function parseOrFilter(filter: string): string {
+	const firstDot = filter.indexOf('.');
+	if (firstDot === -1) throw new Error(`Invalid or() filter '${filter}'`);
+	const secondDot = filter.indexOf('.', firstDot + 1);
+	if (secondDot === -1) throw new Error(`Invalid or() filter '${filter}'`);
+	const column = filter.slice(0, firstDot);
+	const operator = filter.slice(firstDot + 1, secondDot) as FilterOperator;
+	const rawValue = filter.slice(secondDot + 1);
+	const op = filterOperatorToWhere(operator);
+	if (operator === 'in' || operator === 'notIn') {
+		const values = parseListValue(rawValue);
+		return `${column} ${op} ( ${values.map(formatWhereValue).join(' ')} )`;
+	}
+	if (operator === 'is' && rawValue === 'null') return `${column} IS NULL`;
+	return `${column} ${op} ${formatWhereValue(parseQueryValue(rawValue))}`;
+}
+
+function splitTopLevel(value: string, separator: string): string[] {
+	const parts: string[] = [];
+	let start = 0;
+	let depth = 0;
+	for (let i = 0; i < value.length; i++) {
+		const ch = value[i];
+		if (ch === '(') depth++;
+		if (ch === ')' && depth > 0) depth--;
+		if (ch === separator && depth === 0) {
+			parts.push(value.slice(start, i));
+			start = i + 1;
+		}
+	}
+	parts.push(value.slice(start));
+	return parts;
+}
+
+function parseListValue(value: string): QueryValue[] {
+	const trimmed = value.trim();
+	const inner = trimmed.startsWith('(') && trimmed.endsWith(')')
+		? trimmed.slice(1, -1)
+		: trimmed;
+	return splitTopLevel(inner, ',').map((item) => parseQueryValue(item.trim()));
+}
+
+function parseQueryValue(value: string): QueryValue {
+	if (value === 'null') return null;
+	if (value === 'true') return true;
+	if (value === 'false') return false;
+	if (/^-?\d+(\.\d+)?$/.test(value)) return Number(value);
+	return value;
+}
+
 function formatWhereValue(value: QueryValue): string {
 	if (value === null) return '';
 	if (typeof value === 'number' || typeof value === 'boolean') return String(value);
@@ -1024,7 +1189,7 @@ function formatWhereValue(value: QueryValue): string {
 	// tokenizer (whitespace), or that start with a quote (which the tokenizer
 	// would treat as an opening quote). Everything else stays bare, so simple
 	// values keep working against engines that predate quoted-WHERE support.
-	if (!/\s/.test(str) && !str.startsWith("'")) return str;
+	if (!/[\s=<>!()]/.test(str) && !str.startsWith("'")) return str;
 	const escaped = str.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 	return `'${escaped}'`;
 }

@@ -22,24 +22,27 @@ const WEBSOCKET_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 enum HttpAuthContext {
     Anonymous,
+    /// Browser-safe project key with no end-user token behind it. Reaches
+    /// `/auth/v1/*` only; it identifies the project, not a person.
+    Publishable,
+    /// Server-side project key: full project access, same reach as the operator
+    /// password for data.
+    Secret,
     Operator,
     User(crate::auth::AuthPrincipal),
 }
 
-/// Constant-time byte comparison to prevent timing attacks on auth tokens.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        let mut _acc = 0u8;
-        for &byte in a {
-            _acc |= byte;
-        }
-        return false;
+/// Whether this caller may see decrypted values of ENCRYPTED columns. The
+/// operator and real authenticated users can; anonymous (signInAnonymously)
+/// principals cannot (encrypted columns are omitted from their reads).
+fn decrypt_authorized(ctx: &HttpAuthContext) -> bool {
+    match ctx {
+        // A secret key is a server-side credential with full project access, so
+        // it sees plaintext exactly as the operator does.
+        HttpAuthContext::Operator | HttpAuthContext::Secret => true,
+        HttpAuthContext::User(p) => !p.is_anonymous,
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => false,
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Runtime options for the HTTP API listener.
@@ -210,8 +213,15 @@ async fn handle_request(
         .map(|(_, v)| v.as_str())
         .and_then(|auth| auth.strip_prefix("Bearer "))
         .unwrap_or("");
+    // Browsers cannot set headers on a WebSocket handshake, so `/live` also takes
+    // the key as a query param. `apikey` is the name the SDK sends (and the
+    // Supabase-compatible one); `token` is accepted as the original alias. Only
+    // reading `token` here meant every keyed SDK client 401'd on the handshake
+    // unless it also had an end-user access token.
     let query_token = if path == "/live" {
-        get_param(&params, "token").unwrap_or("")
+        get_param(&params, "apikey")
+            .or_else(|| get_param(&params, "token"))
+            .unwrap_or("")
     } else {
         ""
     };
@@ -222,38 +232,70 @@ async fn handle_request(
     } else {
         ""
     };
-    let password_ok = !password.is_empty()
-        && (constant_time_eq(bearer.as_bytes(), password.as_bytes())
-            || constant_time_eq(query_token.as_bytes(), password.as_bytes()));
-    let user_token = if !bearer.is_empty() {
+    // The project credential: `apikey` header, then the /live query param, then
+    // the bearer. The bearer is overloaded -- it can be the operator password, a
+    // project key, or an end-user JWT -- so the resolver sorts it out.
+    let apikey_header = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("apikey"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let presented = if !apikey_header.is_empty() {
+        apikey_header
+    } else if !query_token.is_empty() {
+        query_token
+    } else {
+        bearer
+    };
+    // An end-user token rides *alongside* a project key (the browser case:
+    // `apikey=lux_pub_...` + `Authorization: Bearer <jwt>`). When the bearer is
+    // itself the presented credential, the resolver falls back to trying it as a
+    // user token on its own.
+    let user_token = if !query_access_token.is_empty() {
+        query_access_token
+    } else if presented != bearer {
         bearer
     } else {
-        query_access_token
+        ""
     };
-    let auth_context = if password_ok {
-        HttpAuthContext::Operator
-    } else if store.config().auth.enabled && !user_token.is_empty() {
-        match crate::auth::authenticate_access_token(user_token, store, cache) {
-            Ok(principal) => HttpAuthContext::User(principal),
-            Err(e) => {
-                let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
-                return send_json(socket, 401, "Unauthorized", &body).await;
-            }
+
+    let auth_context = match crate::auth::resolve_credential(
+        presented,
+        user_token,
+        crate::auth::Surface::Http,
+        store,
+        cache,
+    ) {
+        Ok(crate::auth::Credential::Operator) => HttpAuthContext::Operator,
+        Ok(crate::auth::Credential::Secret) => HttpAuthContext::Secret,
+        Ok(crate::auth::Credential::Publishable) => HttpAuthContext::Publishable,
+        Ok(crate::auth::Credential::User(principal)) => HttpAuthContext::User(principal),
+        Ok(crate::auth::Credential::Anonymous) => HttpAuthContext::Anonymous,
+        Err(e) => {
+            let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
+            return send_json(socket, 401, "Unauthorized", &body).await;
         }
-    } else {
-        HttpAuthContext::Anonymous
     };
-    if !password.is_empty() {
-        if !password_ok && !matches!(auth_context, HttpAuthContext::User(_)) {
-            let body = r#"{"error":"unauthorized"}"#;
+
+    // An engine is credential-gated once it has either a password or project
+    // keys. Before that (a bare local engine) it stays open, as it always has.
+    if !password.is_empty() || crate::auth::project_keys_configured(store, cache) {
+        let permitted = match &auth_context {
+            HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::User(_) => true,
+            // A publishable key identifies the project, not a person. It reaches
+            // auth (that is how a person is obtained) and nothing else until an
+            // end-user token makes it a User.
+            HttpAuthContext::Publishable => path.starts_with("/auth/v1"),
+            HttpAuthContext::Anonymous => false,
+        };
+        if !permitted {
+            let body = if matches!(auth_context, HttpAuthContext::Publishable) {
+                r#"{"error":"publishable key cannot access this route without an end-user token"}"#
+            } else {
+                r#"{"error":"unauthorized"}"#
+            };
             return send_json(socket, 401, "Unauthorized", body).await;
         }
-    } else if path == "/live"
-        && store.config().auth.enabled
-        && !matches!(auth_context, HttpAuthContext::User(_))
-    {
-        let body = r#"{"error":"unauthorized"}"#;
-        return send_json(socket, 401, "Unauthorized", body).await;
     }
 
     if method == "GET" && path == "/live" {
@@ -335,8 +377,11 @@ async fn handle_request(
                 let where_clause = get_param(&params, "where").unwrap_or("");
                 let combined = combine_where(where_clause, filter.as_deref().unwrap_or(""));
                 let scoped = params_with_where(&params, &combined);
-                return stream_table_query(socket, table, &scoped, prefer, store, cache, max_rows)
-                    .await;
+                let da = decrypt_authorized(&auth_context);
+                return stream_table_query(
+                    socket, table, &scoped, prefer, store, cache, max_rows, da,
+                )
+                .await;
             }
             ["v1", "tables", table, "count"] => {
                 let filter = match enforce_table_read(store, cache, &auth_context, table) {
@@ -396,22 +441,24 @@ async fn handle_request(
                 }
                 let now = std::time::Instant::now();
                 let scope = filter.as_deref().unwrap_or("");
-                let body = match id.parse::<i64>() {
-                    Ok(id_i64) => {
-                        match crate::tables::table_get_filtered(
-                            store, cache, table, id_i64, scope, now,
-                        ) {
-                            // A row that exists but is out of grant scope reads as
-                            // not-found, so we don't leak that it exists.
-                            Ok(Some(row)) => row_to_json_object(
-                                &row,
-                                &render_columns(store, cache, table, Instant::now()),
-                            ),
-                            Ok(None) => r#"{"error":"row not found"}"#.to_string(),
-                            Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
-                        }
-                    }
-                    Err(_) => r#"{"error":"invalid row id"}"#.to_string(),
+                // Keyed by the raw PK string, so int, UUID, and string PKs all work.
+                let body = match crate::tables::table_get_filtered_pk(
+                    store,
+                    cache,
+                    table,
+                    id,
+                    scope,
+                    now,
+                    decrypt_authorized(&auth_context),
+                ) {
+                    // A row that exists but is out of grant scope reads as
+                    // not-found, so we don't leak that it exists.
+                    Ok(Some(row)) => row_to_json_object(
+                        &row,
+                        &render_columns(store, cache, table, Instant::now()),
+                    ),
+                    Ok(None) => r#"{"error":"row not found"}"#.to_string(),
+                    Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
                 };
                 return send_json(socket, 200, "OK", &body).await;
             }
@@ -487,6 +534,7 @@ async fn stream_snapshot(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_table_query(
     socket: &mut tokio::net::TcpStream,
     table: &str,
@@ -495,18 +543,20 @@ async fn stream_table_query(
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
     max_rows: Option<usize>,
+    decrypt_authorized: bool,
 ) -> std::io::Result<bool> {
     use tokio::io::AsyncWriteExt;
 
     let now = std::time::Instant::now();
 
-    let (parsed, plan) = match parse_http_table_query(params, table, max_rows) {
+    let (parsed, mut plan) = match parse_http_table_query(params, table, max_rows) {
         Ok(v) => v,
         Err(e) => {
             let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
             return send_json(socket, 400, "Bad Request", &body).await;
         }
     };
+    plan.decrypt_authorized = decrypt_authorized;
     let has_where = parsed.has_where;
     let offset = parsed.offset;
     let count_exact = prefer.contains("count=exact");
@@ -611,16 +661,9 @@ async fn stream_table_query(
                     buf.push(',');
                 }
                 first_row = false;
-                buf.push('{');
-                let mut first_col = true;
-                for (k, v) in row {
-                    if !first_col {
-                        buf.push(',');
-                    }
-                    first_col = false;
-                    push_field_value(&mut buf, k, v, &cols);
-                }
-                buf.push('}');
+                let materialize_missing =
+                    plan.projections.is_empty() && plan.alias.is_none() && plan.joins.is_empty();
+                push_row_object(&mut buf, row, &cols, materialize_missing);
 
                 if buf.len() >= CHUNK_SIZE {
                     write_chunk(socket, buf.as_bytes()).await?;
@@ -767,7 +810,12 @@ fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
 fn live_auth_principal(auth: &HttpAuthContext) -> Option<crate::auth::AuthPrincipal> {
     match auth {
         HttpAuthContext::User(principal) => Some(principal.clone()),
-        HttpAuthContext::Anonymous | HttpAuthContext::Operator => None,
+        // No principal: Operator/Secret are unfiltered, and Publishable never
+        // reaches /live without an end-user token (rejected at the gate).
+        HttpAuthContext::Anonymous
+        | HttpAuthContext::Operator
+        | HttpAuthContext::Secret
+        | HttpAuthContext::Publishable => None,
     }
 }
 
@@ -786,8 +834,11 @@ fn enforce_table_read(
         return Ok(None);
     }
     match auth {
-        HttpAuthContext::Operator => Ok(None),
-        HttpAuthContext::Anonymous => Err((
+        // Full project access: no row filter.
+        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(None),
+        // Publishable is refused at the gate; deny here too rather than trust
+        // that an upstream caller got it right.
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
             401,
             "Unauthorized",
             r#"{"error":"unauthorized"}"#.to_string(),
@@ -820,8 +871,11 @@ fn enforce_table_insert(
         return Ok(());
     }
     match auth {
-        HttpAuthContext::Operator => Ok(()),
-        HttpAuthContext::Anonymous => Err((
+        // Full project access: no row filter.
+        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(()),
+        // Publishable is refused at the gate; deny here too rather than trust
+        // that an upstream caller got it right.
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
             401,
             "Unauthorized",
             r#"{"error":"unauthorized"}"#.to_string(),
@@ -860,8 +914,11 @@ fn enforce_table_write_where(
         return Ok(None);
     }
     match auth {
-        HttpAuthContext::Operator => Ok(None),
-        HttpAuthContext::Anonymous => Err((
+        // Full project access: no row filter.
+        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(None),
+        // Publishable is refused at the gate; deny here too rather than trust
+        // that an upstream caller got it right.
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
             401,
             "Unauthorized",
             r#"{"error":"unauthorized"}"#.to_string(),
@@ -894,8 +951,11 @@ fn enforce_table_update_check(
         return Ok(());
     }
     match auth {
-        HttpAuthContext::Operator => Ok(()),
-        HttpAuthContext::Anonymous => Err((
+        // Full project access: no row filter.
+        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(()),
+        // Publishable is refused at the gate; deny here too rather than trust
+        // that an upstream caller got it right.
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
             401,
             "Unauthorized",
             r#"{"error":"unauthorized"}"#.to_string(),
@@ -946,7 +1006,7 @@ fn params_with_where(params: &[(String, String)], where_value: &str) -> Vec<(Str
 /// Gate an operator-only route. Under the grant model, token principals have no
 /// access to privileged routes (raw KV, exec, catalog, etc.); only an operator
 /// credential passes. Auth-disabled instances are open.
-fn require_operator(
+fn require_project_access(
     store: &Arc<Store>,
     auth: &HttpAuthContext,
 ) -> Result<(), (u16, &'static str, String)> {
@@ -954,8 +1014,11 @@ fn require_operator(
         return Ok(());
     }
     match auth {
-        HttpAuthContext::Operator => Ok(()),
-        HttpAuthContext::Anonymous => Err((
+        // A secret key is the project's server-side credential; these routes
+        // (exec, raw kv, tables, ts, vectors) are exactly what it exists to
+        // reach. The operator password remains valid as break-glass.
+        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(()),
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
             401,
             "Unauthorized",
             r#"{"error":"unauthorized"}"#.to_string(),
@@ -963,7 +1026,7 @@ fn require_operator(
         HttpAuthContext::User(_) => Err((
             403,
             "Forbidden",
-            r#"{"error":"operator credentials required"}"#.to_string(),
+            r#"{"error":"a secret key is required for this route"}"#.to_string(),
         )),
     }
 }
@@ -1058,6 +1121,11 @@ enum LiveSubscription {
         spec: Box<LiveTableSpec>,
         state: LiveQueryState,
         receivers: Vec<broadcast::Receiver<crate::pubsub::Message>>,
+        /// When set, this query is maintained incrementally from typed row
+        /// deltas (single-table, no joins/near/limit/aggregate). `pk_col` is the
+        /// primary-key column used to re-evaluate a single changed row.
+        delta_rx: Option<broadcast::Receiver<crate::pubsub::RowDelta>>,
+        pk_col: String,
     },
     VectorNear {
         spec: LiveVectorNearSpec,
@@ -1170,8 +1238,16 @@ where
             }
             _ = tick.tick() => {
                 drain_live_subscription_events(&mut ws, &mut subscriptions, &store, &cache).await?;
+                drain_live_row_deltas(&mut ws, &mut subscriptions, &store, &cache).await?;
             }
         }
+    }
+
+    // Tear down every subscription on disconnect so broker bookkeeping (row-delta
+    // subscriber count, per-table channels) doesn't leak past the socket.
+    let ids: Vec<String> = subscriptions.keys().cloned().collect();
+    for id in ids {
+        stop_live_subscription(&broker, &mut subscriptions, &id);
     }
 
     Ok(())
@@ -1324,7 +1400,7 @@ async fn build_live_subscription(
                 // Validate access at subscribe time, but do not freeze the
                 // resolved conditions here: membership subqueries can change
                 // while the socket remains open.
-                crate::auth::read_filter_conds(store, cache, p, &table_spec.table, Instant::now())
+                crate::auth::read_filter(store, cache, p, &table_spec.table, Instant::now())
                     .map_err(|e| live_error("FORBIDDEN", &e))?;
                 table_spec.auth_dependencies = crate::auth::read_filter_dependencies(
                     store,
@@ -1337,7 +1413,21 @@ async fn build_live_subscription(
                 table_spec.principal = Some(p.clone());
             }
         }
-        let receivers = live_table_dependencies(&table_spec)
+        let pk_field = live_table_pk_field(store, cache, &table_spec.table);
+        let pk_col = pk_field.clone().unwrap_or_else(|| "id".to_string());
+        // A single-table query (no joins/near/limit/offset/aggregate) whose
+        // projection includes the pk is maintained incrementally from typed row
+        // deltas; anything else keeps the re-query-and-diff path. The pk must be
+        // projected so `state.rows` keys line up with the delta's pk. IVM subs
+        // still watch auth-dependency tables via key-events so a grant-membership
+        // change triggers a full resync.
+        let ivm = ivm_eligible(&table_spec) && select_projects_pk(&table_spec.select, &pk_col);
+        let key_tables: Vec<String> = if ivm {
+            table_spec.auth_dependencies.clone()
+        } else {
+            live_table_dependencies(&table_spec)
+        };
+        let receivers = key_tables
             .into_iter()
             .flat_map(|table| {
                 [
@@ -1346,8 +1436,8 @@ async fn build_live_subscription(
                 ]
             })
             .collect();
+        let delta_rx = ivm.then(|| broker.subscribe_row_deltas(&table_spec.table));
         let rows = fetch_live_table_rows(store, cache, &table_spec)?;
-        let pk_field = live_table_pk_field(store, cache, &table_spec.table);
         let query = json!({"type":"table","table":table_spec.table});
         let state = LiveQueryState {
             query: query.clone(),
@@ -1359,6 +1449,8 @@ async fn build_live_subscription(
                 spec: Box::new(table_spec),
                 state,
                 receivers,
+                delta_rx,
+                pk_col,
             },
             vec![json!({"kind":"snapshot","scope":"query","query":query,"rows":rows})],
         ));
@@ -1530,10 +1622,24 @@ fn stop_live_subscription(
         LiveSubscription::Key { pattern, .. } => broker.kunsub(&pattern),
         LiveSubscription::Channel { channel, .. } => broker.unsubscribe_channel(&channel),
         LiveSubscription::PubSubPattern { pattern, .. } => broker.punsubscribe_pattern(&pattern),
-        LiveSubscription::Table { spec, .. } => {
-            for table in live_table_dependencies(&spec) {
+        LiveSubscription::Table { spec, delta_rx, .. } => {
+            // Drop this receiver first so the row-delta channel's receiver_count
+            // reflects reality when unsubscribe decides whether to reclaim it.
+            let was_ivm = delta_rx.is_some();
+            drop(delta_rx);
+            // Mirror the subscribe set: IVM subs watch only auth-dependency tables
+            // via key-events (plus their own row-delta channel); others watch all.
+            let key_tables = if was_ivm {
+                spec.auth_dependencies.clone()
+            } else {
+                live_table_dependencies(&spec)
+            };
+            for table in key_tables {
                 broker.kunsub(&table);
                 broker.kunsub(&format!("_t:{table}:row:*"));
+            }
+            if was_ivm {
+                broker.unsubscribe_row_deltas(&spec.table);
             }
         }
         LiveSubscription::VectorNear { .. } => broker.kunsub("*"),
@@ -1575,6 +1681,162 @@ fn diff_live_query(
 
     state.rows = next;
     events
+}
+
+/// A single-table query with no joins/near/limit/offset/aggregate can be
+/// maintained incrementally from typed row deltas. Everything else keeps the
+/// re-query-and-diff path.
+fn ivm_eligible(spec: &LiveTableSpec) -> bool {
+    spec.joins.is_empty()
+        && spec.near.is_none()
+        && spec.limit.is_none()
+        && spec.offset.is_none()
+        && !select_has_aggregate(&spec.select)
+}
+
+fn select_has_aggregate(select: &str) -> bool {
+    let s = select.to_ascii_lowercase();
+    s.contains("count(")
+        || s.contains("sum(")
+        || s.contains("avg(")
+        || s.contains("min(")
+        || s.contains("max(")
+        || s.contains("group by")
+}
+
+/// True if the projection surfaces `pk_col`, so incrementally-maintained rows
+/// key on the same value the snapshot indexed on. `*` projects everything;
+/// otherwise the column must appear as a selected term (bare or aliased).
+fn select_projects_pk(select: &str, pk_col: &str) -> bool {
+    let s = select.trim();
+    if s == "*" {
+        return true;
+    }
+    let pk = pk_col.to_ascii_lowercase();
+    s.split(',').any(|term| {
+        // Drop any `AS alias`, then take the column past a `table.` qualifier.
+        let base = term.split_whitespace().next().unwrap_or("");
+        let col = base.rsplit('.').next().unwrap_or(base).trim();
+        col == "*" || col.eq_ignore_ascii_case(&pk)
+    })
+}
+
+/// Re-evaluate one row (by pk) against the live query + RLS, reusing the normal
+/// fetch so projection/typing/grants match the snapshot exactly. Returns the
+/// projected JSON row if that pk currently belongs in the result, else None.
+fn fetch_live_table_row_for_pk(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    spec: &LiveTableSpec,
+    pk_col: &str,
+    pk: &str,
+) -> Option<Value> {
+    let mut s = spec.clone();
+    s.where_conditions.push((
+        pk_col.to_string(),
+        "=".to_string(),
+        Value::String(pk.to_string()),
+    ));
+    s.order_by = None;
+    s.offset = None;
+    s.limit = Some(1);
+    fetch_live_table_rows(store, cache, &s)
+        .ok()?
+        .into_iter()
+        .next()
+}
+
+/// Incremental view maintenance: drain typed row deltas for IVM table
+/// subscriptions and emit per-row insert/update/delete by re-evaluating only the
+/// changed pk, instead of re-running the whole query.
+async fn drain_live_row_deltas<S>(
+    ws: &mut WebSocketStream<S>,
+    subscriptions: &mut HashMap<String, LiveSubscription>,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut outgoing: Vec<(String, Value)> = Vec::new();
+    for (id, subscription) in subscriptions.iter_mut() {
+        let LiveSubscription::Table {
+            spec,
+            state,
+            delta_rx: Some(rx),
+            pk_col,
+            ..
+        } = subscription
+        else {
+            continue;
+        };
+        // Distinct changed pks since the last tick (one re-eval each).
+        let mut changed: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut lagged = false;
+        loop {
+            match rx.try_recv() {
+                Ok(delta) => {
+                    if seen.insert(delta.pk.clone()) {
+                        changed.push(delta.pk);
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    lagged = true;
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+        if lagged {
+            // Fell behind the delta stream: resync from a fresh query (safe truth).
+            let rows = fetch_live_table_rows(store, cache, spec).unwrap_or_default();
+            outgoing.extend(diff_live_query(
+                id,
+                state,
+                rows,
+                Some(json!({"kind":"resync","scope":"query"})),
+            ));
+            continue;
+        }
+        for pk in changed {
+            let now_row = fetch_live_table_row_for_pk(store, cache, spec, pk_col, &pk);
+            let prev = state.rows.get(&pk).cloned();
+            // The cause reflects the row's transition in this query's result set
+            // (which is what the client observes); table names the source table.
+            let table = spec.table.as_str();
+            match (prev, now_row) {
+                (None, Some(row)) => {
+                    state.rows.insert(pk.clone(), row.clone());
+                    outgoing.push((
+                        id.clone(),
+                        json!({"kind":"insert","scope":"query","query":state.query,"pk":pk,"row":row,"previous":null,"cause":{"kind":"table.insert","table":table,"operation":"tinsert"}}),
+                    ));
+                }
+                (Some(before), None) => {
+                    state.rows.remove(&pk);
+                    outgoing.push((
+                        id.clone(),
+                        json!({"kind":"delete","scope":"query","query":state.query,"pk":pk,"row":null,"previous":before,"cause":{"kind":"table.delete","table":table,"operation":"tdelete"}}),
+                    ));
+                }
+                (Some(before), Some(row)) => {
+                    if row_fingerprint(&before) != row_fingerprint(&row) {
+                        state.rows.insert(pk.clone(), row.clone());
+                        outgoing.push((
+                            id.clone(),
+                            json!({"kind":"update","scope":"query","query":state.query,"pk":pk,"row":row,"previous":before,"changed":changed_json_fields(&before,&row),"cause":{"kind":"table.update","table":table,"operation":"tupdate"}}),
+                        ));
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+    }
+    for (id, event) in outgoing {
+        send_live_json(ws, json!({"type":"live.event","id":id,"event":event})).await?;
+    }
+    Ok(())
 }
 
 fn parse_live_table_spec(spec: &Value) -> Result<LiveTableSpec, Value> {
@@ -1698,7 +1960,7 @@ fn fetch_live_table_rows(
     if spec.deny_all {
         return Ok(Vec::new());
     }
-    let Some(where_conditions) = live_table_where_conditions(store, cache, spec)? else {
+    let Some(where_tokens) = live_table_where_tokens(store, cache, spec)? else {
         return Ok(Vec::new());
     };
     let mut tokens = vec![spec.select.clone(), "FROM".to_string(), spec.table.clone()];
@@ -1720,40 +1982,9 @@ fn fetch_live_table_rows(
             },
         ]);
     }
-    if !where_conditions.is_empty() {
+    if !where_tokens.is_empty() {
         tokens.push("WHERE".to_string());
-        for (index, (field, op, value)) in where_conditions.iter().enumerate() {
-            if index > 0 {
-                tokens.push("AND".to_string());
-            }
-            tokens.push(field.clone());
-            let op_upper = op.to_ascii_uppercase();
-            if op_upper == "IN" || op_upper == "NOT IN" {
-                if op_upper == "NOT IN" {
-                    tokens.push("NOT".to_string());
-                }
-                tokens.push("IN".to_string());
-                tokens.push("(".to_string());
-                match value.as_array() {
-                    Some(arr) => {
-                        for v in arr {
-                            tokens.push(live_value_to_token(v));
-                        }
-                    }
-                    None => tokens.push(live_value_to_token(value)),
-                }
-                tokens.push(")".to_string());
-            } else if op_upper == "IS VALID" || op_upper == "IS NOT VALID" {
-                tokens.push("IS".to_string());
-                if op_upper == "IS NOT VALID" {
-                    tokens.push("NOT".to_string());
-                }
-                tokens.push("VALID".to_string());
-            } else {
-                tokens.push(op.clone());
-                tokens.push(live_value_to_token(value));
-            }
-        }
+        tokens.extend(where_tokens);
     }
     if let Some(near) = &spec.near {
         tokens.push("NEAR".to_string());
@@ -1788,7 +2019,11 @@ fn fetch_live_table_rows(
         tokens.push(offset.to_string());
     }
     let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-    let plan = crate::tables::parse_select(&refs).map_err(|e| live_error("TSELECT_ERROR", &e))?;
+    let mut plan =
+        crate::tables::parse_select(&refs).map_err(|e| live_error("TSELECT_ERROR", &e))?;
+    // Anonymous subscribers get encrypted columns omitted; operator (no principal)
+    // and real users see plaintext. Covers both the initial fetch and change refetch.
+    plan.decrypt_authorized = spec.principal.as_ref().is_none_or(|p| !p.is_anonymous);
     if let Some(err) = crate::auth::reserved_plan_access_error(&plan) {
         return Err(live_error("FORBIDDEN", &err));
     }
@@ -1802,43 +2037,60 @@ fn fetch_live_table_rows(
     }
 }
 
-fn live_table_where_conditions(
+fn live_table_where_tokens(
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
     spec: &LiveTableSpec,
-) -> Result<Option<LiveTableWhereConditions>, Value> {
-    let mut conditions = spec.where_conditions.clone();
-    let Some(principal) = &spec.principal else {
-        return Ok(Some(conditions));
-    };
-    let grant_conds =
-        crate::auth::read_filter_conds(store, cache, principal, &spec.table, Instant::now())
+) -> Result<Option<Vec<String>>, Value> {
+    let mut tokens = live_where_conditions_to_tokens(&spec.where_conditions);
+    if let Some(principal) = &spec.principal {
+        let grant = crate::auth::read_filter(store, cache, principal, &spec.table, Instant::now())
             .map_err(|e| live_error("FORBIDDEN", &e))?;
-    for condition in grant_conds {
-        match condition {
-            crate::grants::EnforcedCondition::Cmp(rc) => {
-                conditions.push((rc.column, rc.op, Value::String(rc.value)));
+        if !grant.trim().is_empty() {
+            if !tokens.is_empty() {
+                tokens.push("AND".to_string());
             }
-            crate::grants::EnforcedCondition::InSet {
-                column,
-                negated,
-                values,
-            } => {
-                if values.is_empty() {
-                    if !negated {
-                        return Ok(None);
-                    }
-                } else {
-                    conditions.push((
-                        column,
-                        if negated { "NOT IN" } else { "IN" }.to_string(),
-                        Value::Array(values.into_iter().map(Value::String).collect()),
-                    ));
-                }
-            }
+            tokens.extend(tokenize_where(&grant).map_err(|e| live_error("FORBIDDEN", &e))?);
         }
     }
-    Ok(Some(conditions))
+    Ok(Some(tokens))
+}
+
+fn live_where_conditions_to_tokens(conditions: &LiveTableWhereConditions) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for (index, (field, op, value)) in conditions.iter().enumerate() {
+        if index > 0 {
+            tokens.push("AND".to_string());
+        }
+        tokens.push(field.clone());
+        let op_upper = op.to_ascii_uppercase();
+        if op_upper == "IN" || op_upper == "NOT IN" {
+            if op_upper == "NOT IN" {
+                tokens.push("NOT".to_string());
+            }
+            tokens.push("IN".to_string());
+            tokens.push("(".to_string());
+            match value.as_array() {
+                Some(arr) => {
+                    for v in arr {
+                        tokens.push(live_value_to_token(v));
+                    }
+                }
+                None => tokens.push(live_value_to_token(value)),
+            }
+            tokens.push(")".to_string());
+        } else if op_upper == "IS VALID" || op_upper == "IS NOT VALID" {
+            tokens.push("IS".to_string());
+            if op_upper == "IS NOT VALID" {
+                tokens.push("NOT".to_string());
+            }
+            tokens.push("VALID".to_string());
+        } else {
+            tokens.push(op.clone());
+            tokens.push(live_value_to_token(value));
+        }
+    }
+    tokens
 }
 
 fn live_table_dependencies(spec: &LiveTableSpec) -> Vec<String> {
@@ -2404,11 +2656,7 @@ fn route_request_with_auth(
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     if segments.is_empty() || (segments.len() == 1 && segments[0] == "v1") {
-        return (
-            200,
-            "OK",
-            r#"{"lux":"ok","version":""#.to_string() + env!("CARGO_PKG_VERSION") + r#""}"#,
-        );
+        return engine_root();
     }
 
     let base = if segments[0] == "v1" {
@@ -2417,15 +2665,43 @@ fn route_request_with_auth(
         &segments[..]
     };
 
-    if route_requires_operator(method, base) {
-        if let Err(response) = require_operator(store, auth) {
+    if route_requires_project_access(method, base) {
+        if let Err(response) = require_project_access(store, auth) {
             return response;
         }
     }
 
     match (method, base) {
+        // ── engine management contract ──
+        ("GET", ["version"]) => engine_version(),
+        ("GET", ["migrations"]) => migration_list(params, store, cache),
+        ("POST", ["migrations", "plan"]) => migration_plan(body, store, cache),
+        ("POST", ["migrations", "apply"]) => {
+            migration_apply(body, store, broker, cache, script_engine)
+        }
+        ("POST", ["migrations", "repair"]) => {
+            migration_repair(body, store, broker, cache, script_engine)
+        }
+
         // ── exec (escape hatch) ──
         ("POST", ["exec"]) => ok(handle_exec(body, store, broker, cache, script_engine)),
+
+        // ── push routes (lux push) ──
+        ("POST", ["push", "devices"]) => push_register(body, store, cache, auth),
+        ("GET", ["push", "devices"]) => push_list_devices(params, store, cache, auth),
+        ("DELETE", ["push", "devices", id]) => push_delete_device(id, store, cache, auth),
+        ("DELETE", ["push", "devices"]) => push_delete_device_by_token(body, store, cache, auth),
+        ("POST", ["push", "send"]) => push_send(body, store, cache),
+        ("POST", ["push", "credentials"]) => push_set_credentials(body, store, cache),
+        ("GET", ["push", "config"]) => push_config(params, store, cache),
+        ("PUT", ["push", "config", "apns"]) => push_update_apns(body, store, cache),
+        ("DELETE", ["push", "config", "apns"]) => push_clear_apns(params, store, cache),
+        ("POST", ["push", "config", "vapid"]) => push_enable_vapid(body, store, cache),
+        ("DELETE", ["push", "config", "vapid"]) => push_disable_vapid(params, store, cache),
+        ("GET", ["push", "admin", "devices"]) => push_admin_devices(store, cache),
+        ("GET", ["push", "admin", "outbox"]) => push_admin_outbox(store, cache),
+        ("GET", ["push", "admin", "stats"]) => push_admin_stats(),
+        ("GET", ["push", "vapid"]) => push_vapid_public(params, store, cache),
 
         // ── KV routes ──
         ("GET", ["kv", key]) => ok(exec_json(
@@ -2537,7 +2813,14 @@ fn route_request_with_auth(
             let where_clause = get_param(params, "where").unwrap_or("");
             let combined = combine_where(where_clause, filter.as_deref().unwrap_or(""));
             let scoped = params_with_where(params, &combined);
-            route_table_query(table, &scoped, store, broker, cache)
+            route_table_query(
+                table,
+                &scoped,
+                store,
+                broker,
+                cache,
+                decrypt_authorized(auth),
+            )
         }
         ("GET", ["tables", table, "schema"]) => {
             if let Err(resp) = enforce_table_read(store, cache, auth, table) {
@@ -2603,6 +2886,32 @@ fn route_request_with_auth(
             script_engine,
             auth,
         ),
+        // Point update by primary key: PATCH /tables/<t>/<id> with a {field: value}
+        // body. Synthesizes `where <pk> = <id>` and routes through the same
+        // grant-enforced update path (RLS USING + WITH CHECK + .live() event), so
+        // it is a convenience over the bulk path, not a new authorization surface.
+        // Works for any PK type (the id path segment is used verbatim).
+        ("PATCH", ["tables", table, id]) => {
+            // Implicit-id tables don't flag the column primary_key; fall back to
+            // "id" exactly like the engine's pk_column_name does.
+            let pk = live_table_pk_field(store, cache, table).unwrap_or_else(|| "id".to_string());
+            let mut point_params: Vec<(String, String)> = params
+                .iter()
+                .filter(|(k, _)| k != "where")
+                .cloned()
+                .collect();
+            point_params.push(("where".to_string(), format!("{pk} = {id}")));
+            route_table_update(
+                table,
+                &point_params,
+                body,
+                store,
+                broker,
+                cache,
+                script_engine,
+                auth,
+            )
+        }
         // Bulk delete via DELETE with where parameter (TDROP is separate)
         ("DELETE", ["tables", table]) => {
             route_table_delete(table, params, store, broker, cache, script_engine, auth)
@@ -2744,10 +3053,14 @@ fn route_request_with_auth(
 /// exec, time-series, vectors, table catalog) is off-limits to them. Per-table
 /// data routes (`/tables/{table}` GET/POST/PATCH/DELETE) deliberately return
 /// `false` here so the generic gate defers to the inline grant check.
-fn route_requires_operator(method: &str, base: &[&str]) -> bool {
+fn route_requires_project_access(method: &str, base: &[&str]) -> bool {
     matches!(
         (method, base),
         ("POST", ["exec"])
+            | ("GET", ["migrations"])
+            | ("POST", ["migrations", "plan"])
+            | ("POST", ["migrations", "apply"])
+            | ("POST", ["migrations", "repair"])
             | ("GET", ["dbsize"])
             | ("GET", ["keys"])
             | ("GET", ["keys", _])
@@ -2768,11 +3081,641 @@ fn route_requires_operator(method: &str, base: &[&str]) -> bool {
             | ("GET", ["vectors", ..])
             | ("POST", ["vectors", ..])
             | ("DELETE", ["vectors", _])
+            | ("POST", ["push", "send"])
+            | ("POST", ["push", "credentials"])
+            | ("GET", ["push", "config"])
+            | ("PUT", ["push", "config", "apns"])
+            | ("DELETE", ["push", "config", "apns"])
+            | ("POST", ["push", "config", "vapid"])
+            | ("DELETE", ["push", "config", "vapid"])
+            | ("GET", ["push", "admin", "devices"])
+            | ("GET", ["push", "admin", "outbox"])
+            | ("GET", ["push", "admin", "stats"])
     )
+}
+
+fn engine_version() -> (u16, &'static str, String) {
+    let build_sha = option_env!("LUX_BUILD_SHA").unwrap_or("unknown");
+    ok(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "build_sha": build_sha,
+        "api_version": crate::migrations::API_VERSION,
+        "studio_api": crate::migrations::STUDIO_API_VERSION,
+        "capabilities": crate::migrations::CAPABILITIES
+    })
+    .to_string())
+}
+
+fn engine_root() -> (u16, &'static str, String) {
+    ok(json!({
+        "lux": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "studio_api": crate::migrations::STUDIO_API_VERSION,
+        "capabilities": crate::migrations::CAPABILITIES
+    })
+    .to_string())
+}
+
+fn migration_list(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let limit = get_param(params, "limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100);
+    let offset = get_param(params, "offset")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    match crate::migrations::list(store, cache, limit, offset, Instant::now()) {
+        Ok(migrations) => ok(json!({
+            "migrations": migrations,
+            "limit": limit.clamp(1, 1000),
+            "offset": offset
+        })
+        .to_string()),
+        Err(error) => migration_json_error(&error),
+    }
+}
+
+fn parse_migration_request(body: &str) -> Result<(String, String), (u16, &'static str, String)> {
+    let parsed: Value = serde_json::from_str(body)
+        .map_err(|_| push_json_error(400, "Bad Request", "invalid json"))?;
+    let filename = crate::migrations::resolve_filename(
+        parsed.get("filename").and_then(Value::as_str),
+        parsed.get("name").and_then(Value::as_str),
+    )
+    .map_err(|error| migration_json_error(&error))?;
+    let migration_body = parsed
+        .get("body")
+        .and_then(Value::as_str)
+        .ok_or_else(|| push_json_error(400, "Bad Request", "body is required"))?
+        .to_string();
+    Ok((filename, migration_body))
+}
+
+fn migration_plan(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let (filename, migration_body) = match parse_migration_request(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match crate::migrations::plan(store, cache, &filename, &migration_body, Instant::now()) {
+        Ok(plan) => ok(json!({ "plan": plan }).to_string()),
+        Err(error) => migration_json_error(&error),
+    }
+}
+
+fn execute_migration_command(
+    command: &[String],
+    store: &Arc<Store>,
+    broker: &Broker,
+    cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
+) -> Result<(), String> {
+    if command
+        .first()
+        .is_some_and(|value| value.eq_ignore_ascii_case("LUX"))
+    {
+        return Err("nested LUX commands are not allowed in migrations".to_string());
+    }
+    let args: Vec<&str> = command.iter().map(String::as_str).collect();
+    let response =
+        exec_resp(store, broker, cache, script_engine, &args).map_err(|error| error.to_string())?;
+    if response.first() == Some(&b'-') {
+        let message = std::str::from_utf8(&response[1..])
+            .unwrap_or("engine command failed")
+            .trim_end_matches("\r\n");
+        Err(message.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn migration_apply(
+    body: &str,
+    store: &Arc<Store>,
+    broker: &Broker,
+    cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
+) -> (u16, &'static str, String) {
+    let (filename, migration_body) = match parse_migration_request(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match crate::migrations::apply(
+        store,
+        cache,
+        &filename,
+        &migration_body,
+        Instant::now(),
+        |command| execute_migration_command(command, store, broker, cache, script_engine),
+    ) {
+        Ok(result) => ok(json!({
+            "migration": result.migration,
+            "already_applied": result.already_applied
+        })
+        .to_string()),
+        Err(error) => migration_json_error(&error),
+    }
+}
+
+fn migration_repair(
+    body: &str,
+    store: &Arc<Store>,
+    broker: &Broker,
+    cache: &SharedSchemaCache,
+    script_engine: &Arc<lua::ScriptEngine>,
+) -> (u16, &'static str, String) {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let filename = match parsed.get("filename").and_then(Value::as_str) {
+        Some(value) => value,
+        None => return push_json_error(400, "Bad Request", "filename is required"),
+    };
+    let action = match parsed.get("action").and_then(Value::as_str) {
+        Some("resume") => {
+            let Some(from_command) = parsed.get("from_command").and_then(Value::as_u64) else {
+                return push_json_error(
+                    400,
+                    "Bad Request",
+                    "resume requires an explicit zero-based from_command",
+                );
+            };
+            crate::migrations::RepairAction::Resume {
+                from_command: from_command as usize,
+            }
+        }
+        Some("mark_applied") => crate::migrations::RepairAction::MarkApplied,
+        Some("abandon") => crate::migrations::RepairAction::Abandon,
+        _ => {
+            return push_json_error(
+                400,
+                "Bad Request",
+                "action must be resume, mark_applied, or abandon",
+            )
+        }
+    };
+    match crate::migrations::repair(store, cache, filename, action, Instant::now(), |command| {
+        execute_migration_command(command, store, broker, cache, script_engine)
+    }) {
+        Ok(migration) => ok(json!({ "migration": migration }).to_string()),
+        Err(error) => migration_json_error(&error),
+    }
+}
+
+fn migration_json_error(message: &str) -> (u16, &'static str, String) {
+    let message = message.strip_prefix("ERR ").unwrap_or(message);
+    push_json_error(400, "Bad Request", message)
 }
 
 fn ok(result: String) -> (u16, &'static str, String) {
     (200, "OK", result)
+}
+
+// ── Push handlers (lux push) ──
+
+fn push_json_error(
+    status: u16,
+    status_text: &'static str,
+    msg: &str,
+) -> (u16, &'static str, String) {
+    (
+        status,
+        status_text,
+        format!(
+            r#"{{"error":{}}}"#,
+            serde_json::Value::String(msg.to_string())
+        ),
+    )
+}
+
+/// `POST /v1/push/devices` — register a device token under a subject id.
+/// A **secret key / operator** caller supplies `subject_id` explicitly (this is
+/// the Supabase-auth-style path: your server registers on the user's behalf).
+/// A **user JWT** caller omits it; the subject is taken from `auth.uid()`.
+fn push_register(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+) -> (u16, &'static str, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let token = parsed["token"].as_str().unwrap_or("");
+    if token.is_empty() {
+        return push_json_error(400, "Bad Request", "token is required");
+    }
+    let subject_id = match auth {
+        HttpAuthContext::User(principal) => principal.user_id.clone(),
+        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+            let s = parsed["subject_id"].as_str().unwrap_or("");
+            if s.is_empty() {
+                return push_json_error(
+                    400,
+                    "Bad Request",
+                    "subject_id is required for secret-key registration",
+                );
+            }
+            s.to_string()
+        }
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
+            return push_json_error(401, "Unauthorized", "authentication required")
+        }
+    };
+    let platform = parsed["platform"].as_str().unwrap_or("ios");
+    let app_id = parsed["app_id"].as_str().unwrap_or("default");
+    // "sandbox" or "production". Optional: an app that omits it keeps the old
+    // behaviour of routing by the project's credential.
+    let environment = parsed["environment"].as_str().unwrap_or("");
+    // A self-registering end user is not trusted to name the delivery host, and
+    // this route accepts a user's own JWT. See `normalize_environment`.
+    let environment_source = match auth {
+        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+            crate::push::EnvironmentSource::Trusted
+        }
+        _ => crate::push::EnvironmentSource::User,
+    };
+    match crate::push::register_device(
+        store,
+        cache,
+        crate::push::DeviceRegistration {
+            subject_id: &subject_id,
+            token,
+            platform,
+            app_id,
+            environment,
+            environment_source,
+        },
+        Instant::now(),
+    ) {
+        Ok(id) => ok(format!(r#"{{"id":{}}}"#, serde_json::Value::String(id))),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `GET /v1/push/devices` — list devices. A user JWT lists its own; an operator
+/// lists a given `?subject_id=`.
+fn push_list_devices(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+) -> (u16, &'static str, String) {
+    let subject_id = match auth {
+        HttpAuthContext::User(principal) => principal.user_id.clone(),
+        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+            let s = get_param(params, "subject_id").unwrap_or("");
+            if s.is_empty() {
+                return push_json_error(400, "Bad Request", "subject_id query param is required");
+            }
+            s.to_string()
+        }
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
+            return push_json_error(401, "Unauthorized", "authentication required")
+        }
+    };
+    match crate::push::list_devices(store, cache, &subject_id, Instant::now()) {
+        Ok(devices) => ok(json!({ "devices": devices }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `DELETE /v1/push/devices/:id` — remove a device. A user JWT removes its own;
+/// an operator removes by id regardless of subject.
+fn push_delete_device(
+    id: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+) -> (u16, &'static str, String) {
+    let result = match auth {
+        HttpAuthContext::User(principal) => {
+            crate::push::delete_device(store, cache, &principal.user_id, id, Instant::now())
+        }
+        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+            crate::push::delete_device_by_id(store, cache, id, Instant::now())
+        }
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
+            return push_json_error(401, "Unauthorized", "authentication required")
+        }
+    };
+    match result {
+        Ok(deleted) => ok(json!({ "deleted": deleted }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `POST /v1/push/send` (operator) — fan a notification out to a subject's
+/// devices, or to many subjects at once via `subject_ids`.
+fn push_send(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let notification = parsed
+        .get("notification")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let now = Instant::now();
+    let result = if let Some(arr) = parsed.get("subject_ids").and_then(|v| v.as_array()) {
+        let ids: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        crate::push::enqueue_send_many(store, cache, &ids, &notification, now)
+    } else if let Some(subject_id) = parsed["subject_id"].as_str().filter(|s| !s.is_empty()) {
+        crate::push::enqueue_send(store, cache, subject_id, &notification, now)
+    } else {
+        return push_json_error(400, "Bad Request", "subject_id or subject_ids is required");
+    };
+    match result {
+        Ok(n) => ok(json!({ "enqueued": n }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `GET /v1/push/admin/devices` (operator) — every device in the project.
+fn push_admin_devices(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    match crate::push::list_all_devices(store, cache, Instant::now()) {
+        Ok(devices) => ok(json!({ "devices": devices }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `GET /v1/push/admin/outbox` (operator) — dead-lettered deliveries.
+fn push_admin_outbox(store: &Arc<Store>, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
+    match crate::push::list_dead_letters(store, cache, Instant::now()) {
+        Ok(dead) => ok(json!({ "dead_letters": dead }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `DELETE /v1/push/devices` — remove a device by its token. A user session can
+/// only remove its own row; an operator or secret key can remove any matching
+/// row. This gives logout-time cleanup a stable handle even when registration
+/// raced before the client received the internal device id.
+fn push_delete_device_by_token(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+) -> (u16, &'static str, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let Some(token) = parsed["token"].as_str().filter(|s| !s.is_empty()) else {
+        return push_json_error(400, "Bad Request", "token is required");
+    };
+    let result = match auth {
+        HttpAuthContext::User(principal) => crate::push::delete_device_by_token_for_subject(
+            store,
+            cache,
+            &principal.user_id,
+            token,
+            Instant::now(),
+        ),
+        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+            crate::push::delete_device_by_token(store, cache, token, Instant::now())
+        }
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
+            return push_json_error(401, "Unauthorized", "authentication required")
+        }
+    };
+    match result {
+        Ok(deleted) => ok(json!({ "deleted": deleted }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `GET /v1/push/admin/stats` (operator) — process-level delivery counters
+/// (reset on engine restart): sends, delivered, failed, and live device count.
+fn push_admin_stats() -> (u16, &'static str, String) {
+    use std::sync::atomic::Ordering;
+    let m = crate::push::metrics();
+    ok(json!({
+        "sends": m.sends.load(Ordering::Relaxed),
+        "delivered": m.delivered.load(Ordering::Relaxed),
+        "failed": m.failed.load(Ordering::Relaxed),
+        "devices": m.devices.load(Ordering::Relaxed),
+    })
+    .to_string())
+}
+
+/// `GET /v1/push/config?app_id=...` — secret-free configuration and health.
+fn push_config(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let app_id = get_param(params, "app_id").unwrap_or("default");
+    match crate::push::credential_config(store, cache, app_id, Instant::now()) {
+        Ok(config) => ok(json!({ "config": config }).to_string()),
+        Err(error) => push_json_error(400, "Bad Request", &error),
+    }
+}
+
+/// `PUT /v1/push/config/apns` — update APNs metadata. Omitting `p8_pem`
+/// preserves the existing encrypted key; first-time setup requires it.
+fn push_update_apns(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let app_id = parsed["app_id"].as_str().unwrap_or("default");
+    let team_id = parsed["team_id"].as_str().unwrap_or("");
+    let key_id = parsed["key_id"].as_str().unwrap_or("");
+    let topic = parsed["topic"].as_str().unwrap_or("");
+    let environment = parsed["environment"].as_str().unwrap_or("sandbox");
+    let p8_pem = parsed.get("p8_pem").and_then(Value::as_str);
+    if team_id.is_empty() || key_id.is_empty() || topic.is_empty() {
+        return push_json_error(
+            400,
+            "Bad Request",
+            "team_id, key_id, and topic are required",
+        );
+    }
+    match crate::push::update_apns_credentials(
+        store,
+        cache,
+        app_id,
+        team_id,
+        key_id,
+        p8_pem,
+        topic,
+        environment,
+        Instant::now(),
+    ) {
+        Ok(()) => match crate::push::credential_config(store, cache, app_id, Instant::now()) {
+            Ok(config) => ok(json!({ "config": config }).to_string()),
+            Err(error) => push_json_error(400, "Bad Request", &error),
+        },
+        Err(error) => push_json_error(400, "Bad Request", &error),
+    }
+}
+
+fn push_clear_apns(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let app_id = get_param(params, "app_id").unwrap_or("default");
+    match crate::push::clear_apns_credentials(store, cache, app_id, Instant::now()) {
+        Ok(()) => ok(json!({ "ok": true, "app_id": app_id }).to_string()),
+        Err(error) => push_json_error(400, "Bad Request", &error),
+    }
+}
+
+/// `POST /v1/push/config/vapid` with `action=enable|rotate`. Enable is
+/// idempotent; rotate intentionally replaces the browser-facing public key.
+fn push_enable_vapid(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let app_id = parsed["app_id"].as_str().unwrap_or("default");
+    let action = parsed["action"].as_str().unwrap_or("enable");
+    let subject = parsed["subject"]
+        .as_str()
+        .unwrap_or("mailto:push@luxdb.dev");
+    if let Err(error) = crate::push::credential_config(store, cache, app_id, Instant::now()) {
+        return push_json_error(400, "Bad Request", &error);
+    }
+    if action == "enable" {
+        match crate::push::vapid_public_key(store, cache, app_id, Instant::now()) {
+            Ok(Some(public_key)) => {
+                return ok(json!({
+                    "ok": true,
+                    "rotated": false,
+                    "public_key": public_key
+                })
+                .to_string())
+            }
+            Ok(None) => {}
+            Err(error) => return push_json_error(400, "Bad Request", &error),
+        }
+    } else if action != "rotate" {
+        return push_json_error(400, "Bad Request", "action must be enable or rotate");
+    }
+    match crate::push::rotate_vapid_credentials(store, cache, app_id, subject, Instant::now()) {
+        Ok(public_key) => ok(json!({
+            "ok": true,
+            "rotated": action == "rotate",
+            "public_key": public_key
+        })
+        .to_string()),
+        Err(error) => push_json_error(400, "Bad Request", &error),
+    }
+}
+
+fn push_disable_vapid(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let app_id = get_param(params, "app_id").unwrap_or("default");
+    match crate::push::disable_vapid_credentials(store, cache, app_id, Instant::now()) {
+        Ok(()) => ok(json!({ "ok": true, "app_id": app_id }).to_string()),
+        Err(error) => push_json_error(400, "Bad Request", &error),
+    }
+}
+
+/// `POST /v1/push/credentials` (operator) — set an app's APNs credentials.
+fn push_set_credentials(
+    body: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return push_json_error(400, "Bad Request", "invalid json"),
+    };
+    let app_id = parsed["app_id"].as_str().unwrap_or("default");
+    let now = Instant::now();
+
+    // VAPID (Web Push) credentials, distinguished by the presence of the key.
+    if let Some(vapid_private) = parsed["vapid_private"].as_str().filter(|s| !s.is_empty()) {
+        let vapid_public = parsed["vapid_public"].as_str().unwrap_or("");
+        let subject = parsed["vapid_subject"].as_str().unwrap_or("");
+        if vapid_public.is_empty() {
+            return push_json_error(400, "Bad Request", "vapid_public is required");
+        }
+        return match crate::push::set_vapid_credentials(
+            store,
+            cache,
+            app_id,
+            vapid_public,
+            vapid_private,
+            subject,
+            now,
+        ) {
+            Ok(()) => ok(json!({ "ok": true }).to_string()),
+            Err(e) => push_json_error(400, "Bad Request", &e),
+        };
+    }
+
+    // APNs credentials.
+    let team_id = parsed["team_id"].as_str().unwrap_or("");
+    let key_id = parsed["key_id"].as_str().unwrap_or("");
+    let p8_pem = parsed.get("p8_pem").and_then(Value::as_str);
+    let topic = parsed["topic"].as_str().unwrap_or("");
+    let environment = parsed["environment"].as_str().unwrap_or("sandbox");
+    if team_id.is_empty() || key_id.is_empty() || topic.is_empty() {
+        return push_json_error(
+            400,
+            "Bad Request",
+            "team_id, key_id, and topic are required; p8_pem is required only for first-time setup",
+        );
+    }
+    match crate::push::update_apns_credentials(
+        store,
+        cache,
+        app_id,
+        team_id,
+        key_id,
+        p8_pem,
+        topic,
+        environment,
+        now,
+    ) {
+        Ok(()) => ok(json!({ "ok": true }).to_string()),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
+}
+
+/// `GET /v1/push/vapid` (public) — the VAPID public key a browser needs to
+/// subscribe. Safe to expose; it's a public key.
+fn push_vapid_public(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let app_id = get_param(params, "app_id").unwrap_or("default");
+    match crate::push::vapid_public_key(store, cache, app_id, Instant::now()) {
+        Ok(Some(key)) => ok(json!({ "public_key": key }).to_string()),
+        Ok(None) => push_json_error(404, "Not Found", "web push is not configured"),
+        Err(e) => push_json_error(400, "Bad Request", &e),
+    }
 }
 
 // ── Table handlers ──
@@ -2821,7 +3764,7 @@ fn route_table_create(
     // Accepts two formats per element:
     //   - plain string: "id UUID PRIMARY KEY" (passed through as-is)
     //   - object: {"name":"email","type":"STR","primaryKey":true,"unique":true,"notNull":true,
-    //              "references":"users(id)","onDelete":"CASCADE"}
+    //              "encrypted":true,"searchable":true,"references":"users(id)","onDelete":"CASCADE"}
     let mut col_specs: Vec<String> = Vec::new();
     for col in columns {
         if let Some(s) = col.as_str() {
@@ -2845,6 +3788,20 @@ fn route_table_create(
                 .unwrap_or(false)
             {
                 spec.push_str(" NOT NULL");
+            }
+            if obj
+                .get("encrypted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                spec.push_str(" ENCRYPTED");
+            }
+            if obj
+                .get("searchable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                spec.push_str(" SEARCHABLE");
             }
             if let Some(refs) = obj.get("references").and_then(|v| v.as_str()) {
                 spec.push_str(&format!(" REFERENCES {}", refs));
@@ -2871,6 +3828,7 @@ fn route_table_query(
     store: &Arc<Store>,
     _broker: &Broker,
     cache: &SharedSchemaCache,
+    decrypt_authorized: bool,
 ) -> (u16, &'static str, String) {
     if let Some(err) = crate::auth::reserved_table_access_error(table) {
         return (
@@ -2884,14 +3842,22 @@ fn route_table_query(
 
     let cols = render_columns(store, cache, table, now);
     match parse_http_table_query(params, table, None) {
-        Ok((_, plan)) => match crate::tables::table_select(store, cache, &plan, now) {
-            Ok(result) => ok(select_result_to_json(result, &cols)),
-            Err(e) => (
-                400,
-                "Bad Request",
-                format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
-            ),
-        },
+        Ok((_, mut plan)) => {
+            plan.decrypt_authorized = decrypt_authorized;
+            match crate::tables::table_select(store, cache, &plan, now) {
+                Ok(result) => {
+                    let materialize_missing = plan.projections.is_empty()
+                        && plan.alias.is_none()
+                        && plan.joins.is_empty();
+                    ok(select_result_to_json(result, &cols, materialize_missing))
+                }
+                Err(e) => (
+                    400,
+                    "Bad Request",
+                    format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                ),
+            }
+        }
         Err(e) => (
             400,
             "Bad Request",
@@ -3170,7 +4136,7 @@ fn route_table_delete(
     // is a schema operation, not row access: operator-only.
     if let Some(val) = get_param(params, "drop") {
         if val == "true" {
-            if let Err((status, status_text, body)) = require_operator(store, auth) {
+            if let Err((status, status_text, body)) = require_project_access(store, auth) {
                 return (status, status_text, body);
             }
             return ok(exec_json(
@@ -3446,6 +4412,9 @@ fn handle_exec(
     if command.is_empty() {
         return r#"{"error":"empty command"}"#.to_string();
     }
+    if let Some(err) = reserved_auth_table_exec_read_error(&command) {
+        return format!(r#"{{"error":"{}"}}"#, escape_json(&err));
+    }
 
     exec_json(
         store,
@@ -3454,6 +4423,22 @@ fn handle_exec(
         script_engine,
         &command.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
     )
+}
+
+fn reserved_auth_table_exec_read_error(command: &[String]) -> Option<String> {
+    let cmd = command.first()?.to_ascii_uppercase();
+    match cmd.as_str() {
+        "TCOUNT" | "TSCHEMA" => {
+            let table = command.get(1)?;
+            crate::auth::reserved_table_access_error(table)
+        }
+        "TSELECT" => {
+            let refs: Vec<&str> = command.iter().skip(1).map(String::as_str).collect();
+            let plan = crate::tables::parse_select(&refs).ok()?;
+            crate::auth::reserved_plan_access_error(&plan)
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3466,7 +4451,10 @@ fn handle_exec(
 /// (`[1,2,3]`) to match the `number[]` type the SDK generates.
 #[derive(Default)]
 struct RenderCols {
+    fields: Vec<String>,
     json: std::collections::HashSet<String>,
+    number: std::collections::HashSet<String>,
+    bool_: std::collections::HashSet<String>,
     vector: std::collections::HashSet<String>,
 }
 
@@ -3479,9 +4467,19 @@ fn render_columns(
     let mut cols = RenderCols::default();
     if let Ok(fields) = crate::tables::load_schema(store, cache, table, now) {
         for f in fields {
+            cols.fields.push(f.name.clone());
             match f.field_type {
                 crate::tables::FieldType::Json | crate::tables::FieldType::Array => {
                     cols.json.insert(f.name);
+                }
+                crate::tables::FieldType::Int
+                | crate::tables::FieldType::Float
+                | crate::tables::FieldType::Timestamp
+                | crate::tables::FieldType::Ref(_) => {
+                    cols.number.insert(f.name);
+                }
+                crate::tables::FieldType::Bool => {
+                    cols.bool_.insert(f.name);
                 }
                 crate::tables::FieldType::Vector(_) => {
                     cols.vector.insert(f.name);
@@ -3493,10 +4491,10 @@ fn render_columns(
     cols
 }
 
-/// Append `"key":value` to a JSON object with type-correct encoding: VECTOR as a
-/// numeric array, JSON/ARRAY raw, numbers/bools bare, everything else a quoted
-/// string. The single source of truth for table-row JSON across the read,
-/// streaming, and write-RETURNING paths.
+/// Append `"key":value` to a JSON object with schema-correct encoding: VECTOR as
+/// a numeric array, JSON/ARRAY raw, declared numbers/bools bare, everything else
+/// a quoted string. The single source of truth for table-row JSON across the
+/// read, streaming, and write-RETURNING paths.
 fn push_field_value(out: &mut String, key: &str, v: &str, cols: &RenderCols) {
     out.push('"');
     push_escaped(out, key);
@@ -3516,7 +4514,9 @@ fn push_field_value(out: &mut String, key: &str, v: &str, cols: &RenderCols) {
         } else {
             out.push_str(v);
         }
-    } else if looks_numeric(v) || v == "true" || v == "false" {
+    } else if (cols.number.contains(key) && looks_numeric(v))
+        || (cols.bool_.contains(key) && (v == "true" || v == "false"))
+    {
         out.push_str(v);
     } else {
         out.push('"');
@@ -3525,7 +4525,17 @@ fn push_field_value(out: &mut String, key: &str, v: &str, cols: &RenderCols) {
     }
 }
 
-fn select_result_to_json(result: crate::tables::SelectResult, cols: &RenderCols) -> String {
+fn push_null_field(out: &mut String, key: &str) {
+    out.push('"');
+    push_escaped(out, key);
+    out.push_str("\":null");
+}
+
+fn select_result_to_json(
+    result: crate::tables::SelectResult,
+    cols: &RenderCols,
+    materialize_missing: bool,
+) -> String {
     match result {
         crate::tables::SelectResult::Rows(rows) => {
             // Estimate ~80 bytes per field, 4 fields avg per row - better than 64 flat
@@ -3538,16 +4548,7 @@ fn select_result_to_json(result: crate::tables::SelectResult, cols: &RenderCols)
                     out.push(',');
                 }
                 first_row = false;
-                out.push('{');
-                let mut first_col = true;
-                for (k, v) in &row {
-                    if !first_col {
-                        out.push(',');
-                    }
-                    first_col = false;
-                    push_field_value(&mut out, k, v, cols);
-                }
-                out.push('}');
+                push_row_object(&mut out, &row, cols, materialize_missing);
             }
             out.push_str("]}");
             out
@@ -3580,7 +4581,12 @@ fn select_result_to_json(result: crate::tables::SelectResult, cols: &RenderCols)
 
 /// Serialize a single row (from table_get) as a JSON object.
 /// Append a single row as a bare JSON object `{...}` (no `result` wrapper).
-fn push_row_object(out: &mut String, row: &[(String, String)], cols: &RenderCols) {
+fn push_row_object(
+    out: &mut String,
+    row: &[(String, String)],
+    cols: &RenderCols,
+    materialize_missing: bool,
+) {
     out.push('{');
     let mut first = true;
     for (k, v) in row {
@@ -3590,13 +4596,25 @@ fn push_row_object(out: &mut String, row: &[(String, String)], cols: &RenderCols
         first = false;
         push_field_value(out, k, v, cols);
     }
+    if materialize_missing {
+        for field in &cols.fields {
+            if row.iter().any(|(k, _)| k == field) {
+                continue;
+            }
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            push_null_field(out, field);
+        }
+    }
     out.push('}');
 }
 
 fn row_to_json_object(row: &[(String, String)], cols: &RenderCols) -> String {
     let mut out = String::with_capacity(row.len() * 32 + 12);
     out.push_str(r#"{"result":"#);
-    push_row_object(&mut out, row, cols);
+    push_row_object(&mut out, row, cols, true);
     out.push('}');
     out
 }
@@ -3609,7 +4627,7 @@ fn rows_to_json_array(rows: &[Vec<(String, String)>], cols: &RenderCols) -> Stri
         if i > 0 {
             out.push(',');
         }
-        push_row_object(&mut out, row, cols);
+        push_row_object(&mut out, row, cols, true);
     }
     out.push_str("]}");
     out
@@ -3636,9 +4654,12 @@ fn push_escaped(out: &mut String, s: &str) {
 /// Returns true if s looks like a JSON number (integer or float).
 #[inline]
 fn looks_numeric(s: &str) -> bool {
-    // Only emit as a bare JSON number if it actually parses as one.
-    // This prevents invalid JSON for strings like "-", "1.2.3", "1e", "1-2".
-    s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok()
+    // Only emit as a bare JSON number if it is valid JSON number syntax.
+    // This prevents invalid JSON for strings like "0123", "-", "1e", "1-2".
+    matches!(
+        serde_json::from_str::<serde_json::Value>(s),
+        Ok(serde_json::Value::Number(_))
+    )
 }
 
 fn exec_json(
@@ -3869,13 +4890,32 @@ mod tests {
         let mut cols = RenderCols::default();
         cols.json.insert("payload".to_string());
         cols.json.insert("tags".to_string());
-        let out = select_result_to_json(crate::tables::SelectResult::Rows(rows), &cols);
+        let out = select_result_to_json(crate::tables::SelectResult::Rows(rows), &cols, true);
         assert!(out.contains(r#""payload":{"a":1}"#), "json raw: {out}");
         assert!(out.contains(r#""tags":[1,2]"#), "array raw: {out}");
         assert!(
             out.contains(r#""note":"{\"x\":\"y\"}""#),
             "str quoted: {out}"
         );
+    }
+
+    #[test]
+    fn str_columns_that_look_numeric_stay_quoted_json() {
+        let rows = vec![vec![
+            ("code".to_string(), "0123".to_string()),
+            ("pin".to_string(), "1111".to_string()),
+            ("count".to_string(), "123".to_string()),
+            ("enabled".to_string(), "true".to_string()),
+        ]];
+        let mut cols = RenderCols::default();
+        cols.number.insert("count".to_string());
+        cols.bool_.insert("enabled".to_string());
+
+        let out = rows_to_json_array(&rows, &cols);
+        assert!(out.contains(r#""code":"0123""#), "str quoted: {out}");
+        assert!(out.contains(r#""pin":"1111""#), "str quoted: {out}");
+        assert!(out.contains(r#""count":123"#), "number bare: {out}");
+        assert!(out.contains(r#""enabled":true"#), "bool bare: {out}");
     }
 
     // The insert/update RETURNING echo must render JSON/ARRAY columns the same
@@ -3922,7 +4962,8 @@ mod tests {
             ("empty_vec".to_string(), String::new()),
         ]];
         cols.vector.insert("empty_vec".to_string());
-        let out = select_result_to_json(crate::tables::SelectResult::Rows(rows.clone()), &cols);
+        let out =
+            select_result_to_json(crate::tables::SelectResult::Rows(rows.clone()), &cols, true);
         assert!(
             out.contains(r#""embedding":[0.1,0.2,0.3]"#),
             "select: {out}"
@@ -3941,6 +4982,173 @@ mod tests {
     }
 
     #[test]
+    fn missing_schema_columns_render_as_null_for_full_rows() {
+        let rows = vec![vec![
+            ("id".to_string(), "1".to_string()),
+            ("body".to_string(), "edited".to_string()),
+        ]];
+        let mut cols = RenderCols::default();
+        cols.fields.push("id".to_string());
+        cols.fields.push("body".to_string());
+        cols.fields.push("created_at".to_string());
+        cols.number.insert("id".to_string());
+        cols.number.insert("created_at".to_string());
+
+        let out = rows_to_json_array(&rows, &cols);
+        assert!(out.contains(r#""id":1"#), "id typed: {out}");
+        assert!(out.contains(r#""body":"edited""#), "body present: {out}");
+        assert!(
+            out.contains(r#""created_at":null"#),
+            "absent nullable column materialized as null: {out}"
+        );
+    }
+
+    #[test]
+    fn explicit_select_does_not_materialize_missing_schema_columns() {
+        let rows = vec![vec![("body".to_string(), "edited".to_string())]];
+        let mut cols = RenderCols::default();
+        cols.fields.push("id".to_string());
+        cols.fields.push("body".to_string());
+        cols.fields.push("created_at".to_string());
+
+        let out = select_result_to_json(crate::tables::SelectResult::Rows(rows), &cols, false);
+        assert_eq!(out, r#"{"result":[{"body":"edited"}]}"#);
+    }
+
+    #[test]
+    fn update_returning_materializes_absent_nullable_columns_as_null() {
+        let store = Arc::new(Store::new());
+        let cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let broker = Broker::new();
+        let script_engine = Arc::new(lua::ScriptEngine::new());
+        let now = Instant::now();
+
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "messages",
+            &["id INT PRIMARY KEY,", "body STR,", "created_at TIMESTAMP"],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_insert(&store, &cache, "messages", &[("body", "hi")], now).unwrap();
+
+        let params = vec![("where".to_string(), "id = 1".to_string())];
+        let (status, _, body) = route_table_update(
+            "messages",
+            &params,
+            r#"{"body":"edited"}"#,
+            &store,
+            &broker,
+            &cache,
+            &script_engine,
+            &HttpAuthContext::Operator,
+        );
+
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""id":1"#), "{body}");
+        assert!(body.contains(r#""body":"edited""#), "{body}");
+        assert!(body.contains(r#""created_at":null"#), "{body}");
+    }
+
+    fn encrypted_http_fixture() -> (
+        Arc<Store>,
+        Broker,
+        SharedSchemaCache,
+        Arc<lua::ScriptEngine>,
+    ) {
+        let config = Arc::new(crate::ServerConfig {
+            encryption: crate::EncryptionConfig {
+                active_key_id: Some("k1".to_string()),
+                keys: vec![crate::EncryptionKeyConfig {
+                    id: "k1".to_string(),
+                    secret: b"http-encryption-secret".to_vec(),
+                    decrypt_only: false,
+                }],
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Arc::new(Store::new_with_config(config));
+        let cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let broker = Broker::new();
+        let script_engine = Arc::new(lua::ScriptEngine::new());
+        (store, broker, cache, script_engine)
+    }
+
+    #[test]
+    fn http_table_routes_round_trip_encrypted_columns_without_raw_plaintext() {
+        let (store, broker, cache, se) = encrypted_http_fixture();
+        let body = r#"{
+            "name":"secrets",
+            "columns":[
+                {"name":"id","type":"STR","primaryKey":true},
+                {"name":"email","type":"STR","encrypted":true,"searchable":true,"unique":true},
+                {"name":"token","type":"STR","encrypted":true}
+            ]
+        }"#;
+        let (status, _, out) = route_table_create(body, &store, &broker, &cache, &se);
+        assert_eq!(status, 200, "{out}");
+        assert!(!out.contains("error"), "{out}");
+
+        let (status, _, inserted) = route_table_insert(
+            "secrets",
+            &[],
+            r#"{"id":"s1","email":"person@example.com","token":"plain-secret"}"#,
+            &store,
+            &broker,
+            &cache,
+            &HttpAuthContext::Operator,
+        );
+        assert_eq!(status, 200, "{inserted}");
+        assert!(
+            inserted.contains(r#""email":"person@example.com""#),
+            "{inserted}"
+        );
+        assert!(inserted.contains(r#""token":"plain-secret""#), "{inserted}");
+
+        let raw_email = store
+            .hget(b"_t:secrets:row:s1", b"email", Instant::now())
+            .unwrap();
+        let raw_token = store
+            .hget(b"_t:secrets:row:s1", b"token", Instant::now())
+            .unwrap();
+        assert!(!raw_email
+            .windows(b"person@example.com".len())
+            .any(|w| w == b"person@example.com"));
+        assert!(!raw_token
+            .windows(b"plain-secret".len())
+            .any(|w| w == b"plain-secret"));
+
+        let params = vec![(
+            "where".to_string(),
+            "email = person@example.com".to_string(),
+        )];
+        let (status, _, queried) =
+            route_table_query("secrets", &params, &store, &broker, &cache, true);
+        assert_eq!(status, 200, "{queried}");
+        assert!(
+            queried.contains(r#""email":"person@example.com""#),
+            "{queried}"
+        );
+        assert!(queried.contains(r#""token":"plain-secret""#), "{queried}");
+    }
+
+    #[test]
+    fn http_table_create_rejects_encrypted_default() {
+        let (store, broker, cache, se) = encrypted_http_fixture();
+        let body = r#"{
+            "name":"secrets",
+            "columns":["id STR PRIMARY KEY","token STR ENCRYPTED DEFAULT leaked"]
+        }"#;
+        let (status, _, out) = route_table_create(body, &store, &broker, &cache, &se);
+        assert_eq!(status, 200, "{out}");
+        assert!(out.contains("cannot use DEFAULT"), "{out}");
+    }
+
+    #[test]
     fn per_table_data_routes_are_not_operator_only() {
         // Token principals reach the DB only through these; they must defer to
         // the inline grant check, never the operator gate.
@@ -3954,7 +5162,7 @@ mod tests {
             ("DELETE", vec!["tables", "messages"]),
         ] {
             assert!(
-                !route_requires_operator(m, &base),
+                !route_requires_project_access(m, &base),
                 "{m} /{} should be grant-gated, not operator-only",
                 base.join("/")
             );
@@ -3962,10 +5170,22 @@ mod tests {
     }
 
     #[test]
+    fn user_push_cleanup_route_is_not_operator_only() {
+        assert!(
+            !route_requires_project_access("DELETE", &["push", "devices"]),
+            "a user JWT must reach the subject-scoped token cleanup handler"
+        );
+    }
+
+    #[test]
     fn privileged_routes_are_operator_only() {
         // A bug here hands token users raw KV / exec / catalog. Lock it down.
         for (m, base) in [
             ("POST", vec!["exec"]),
+            ("GET", vec!["migrations"]),
+            ("POST", vec!["migrations", "plan"]),
+            ("POST", vec!["migrations", "apply"]),
+            ("POST", vec!["migrations", "repair"]),
             ("GET", vec!["dbsize"]),
             ("GET", vec!["keys"]),
             ("GET", vec!["kv", "secret"]),
@@ -3979,11 +5199,75 @@ mod tests {
             ("GET", vec!["vectors", "idx"]),
             ("POST", vec!["vectors", "idx"]),
             ("DELETE", vec!["vectors", "idx"]),
+            ("GET", vec!["push", "config"]),
+            ("PUT", vec!["push", "config", "apns"]),
+            ("DELETE", vec!["push", "config", "apns"]),
+            ("POST", vec!["push", "config", "vapid"]),
+            ("DELETE", vec!["push", "config", "vapid"]),
         ] {
             assert!(
-                route_requires_operator(m, &base),
+                route_requires_project_access(m, &base),
                 "{m} /{} must be operator-only",
                 base.join("/")
+            );
+        }
+    }
+
+    #[test]
+    fn migration_http_contract_executes_and_is_idempotent() {
+        let (store, broker, cache, script_engine) = encrypted_http_fixture();
+        let body = json!({
+            "filename": "001_messages.lux",
+            "body": "TCREATE messages id INT PRIMARY KEY, body STR;\nTINSERT messages id 1 body hello;"
+        })
+        .to_string();
+        let (status, _, response) = migration_apply(&body, &store, &broker, &cache, &script_engine);
+        assert_eq!(status, 200, "{response}");
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["migration"]["status"], "applied");
+        assert_eq!(parsed["migration"]["completed_commands"], 2);
+        assert_eq!(parsed["already_applied"], false);
+
+        let (status, _, response) = migration_apply(&body, &store, &broker, &cache, &script_engine);
+        assert_eq!(status, 200, "{response}");
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["already_applied"], true);
+    }
+
+    #[test]
+    fn version_contract_advertises_management_capabilities() {
+        let (status, _, response) = engine_version();
+        assert_eq!(status, 200);
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(parsed["api_version"], crate::migrations::API_VERSION);
+        assert_eq!(parsed["studio_api"], crate::migrations::STUDIO_API_VERSION);
+        assert!(parsed["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "migrations.apply"));
+    }
+
+    #[test]
+    fn root_contract_advertises_studio_capabilities() {
+        let (status, _, response) = engine_root();
+        assert_eq!(status, 200);
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["lux"], "ok");
+        assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(parsed["studio_api"], crate::migrations::STUDIO_API_VERSION);
+        let capabilities = parsed["capabilities"].as_array().unwrap();
+        for required in [
+            "engine.exec",
+            "engine.tables",
+            "engine.auth.providers.apple.web",
+            "engine.push.apns",
+            "engine.snapshots.restore",
+        ] {
+            assert!(
+                capabilities.iter().any(|value| value == required),
+                "missing {required}: {capabilities:?}"
             );
         }
     }
@@ -4229,11 +5513,16 @@ mod tests {
     }
 
     fn user_ctx(uid: &str) -> HttpAuthContext {
+        user_ctx_kind(uid, false)
+    }
+
+    fn user_ctx_kind(uid: &str, is_anonymous: bool) -> HttpAuthContext {
         HttpAuthContext::User(crate::auth::AuthPrincipal {
             user_id: uid.to_string(),
             email: format!("{uid}@x.dev"),
             session_id: "sess".to_string(),
             role: "authenticated".to_string(),
+            is_anonymous,
         })
     }
 
@@ -4263,7 +5552,8 @@ mod tests {
         let filter = enforce_table_read(&store, &cache, &alice, "messages").unwrap();
         let combined = combine_where("", filter.as_deref().unwrap_or(""));
         let scoped = params_with_where(&[], &combined);
-        let (status, _, body) = route_table_query("messages", &scoped, &store, &broker, &cache);
+        let (status, _, body) =
+            route_table_query("messages", &scoped, &store, &broker, &cache, true);
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("\"a1\"") && body.contains("\"a2\""), "{body}");
         assert!(!body.contains("\"b1\""), "bob's row leaked: {body}");
@@ -4279,7 +5569,8 @@ mod tests {
         let filter = enforce_table_read(&store, &cache, &alice, "messages").unwrap();
         let combined = combine_where("body = a1", filter.as_deref().unwrap_or(""));
         let scoped = params_with_where(&[], &combined);
-        let (status, _, body) = route_table_query("messages", &scoped, &store, &broker, &cache);
+        let (status, _, body) =
+            route_table_query("messages", &scoped, &store, &broker, &cache, true);
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("\"a1\""), "{body}");
         assert!(
@@ -4299,7 +5590,7 @@ mod tests {
         let filter =
             enforce_table_read(&store, &cache, &HttpAuthContext::Operator, "messages").unwrap();
         assert!(filter.is_none());
-        let (status, _, body) = route_table_query("messages", &[], &store, &broker, &cache);
+        let (status, _, body) = route_table_query("messages", &[], &store, &broker, &cache, true);
         assert_eq!(status, 200, "{body}");
         assert!(
             body.contains("\"b1\""),
@@ -4423,7 +5714,7 @@ mod tests {
         let filter = enforce_table_read(store, cache, ctx, "messages").unwrap();
         let combined = combine_where("", filter.as_deref().unwrap_or(""));
         let scoped = params_with_where(&[], &combined);
-        let (status, _, body) = route_table_query("messages", &scoped, store, broker, cache);
+        let (status, _, body) = route_table_query("messages", &scoped, store, broker, cache, true);
         (status, body)
     }
 
@@ -4581,6 +5872,129 @@ mod tests {
             Some("members"),
             "grant dependency changes must wake the live query"
         );
+    }
+
+    #[test]
+    fn live_table_allows_or_read_grants_on_different_columns() {
+        let config = std::sync::Arc::new(crate::ServerConfig {
+            auth: crate::AuthConfig {
+                enabled: true,
+                ..crate::AuthConfig::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Arc::new(Store::new_with_config(config));
+        let cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let now = Instant::now();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "invites",
+            &[
+                "id", "STR", "PRIMARY", "KEY,", "team_id", "STR,", "email", "STR",
+            ],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "members",
+            &[
+                "id", "STR", "PRIMARY", "KEY,", "user_id", "STR,", "team_id", "STR",
+            ],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "members",
+            &[("id", "m1"), ("user_id", "alice"), ("team_id", "team-a")],
+            now,
+        )
+        .unwrap();
+        for (id, team_id, email) in [
+            ("team", "team-a", "other@x.dev"),
+            ("email", "team-b", "alice@x.dev"),
+            ("hidden", "team-b", "other@x.dev"),
+        ] {
+            crate::tables::table_insert(
+                &store,
+                &cache,
+                "invites",
+                &[("id", id), ("team_id", team_id), ("email", email)],
+                now,
+            )
+            .unwrap();
+        }
+        for grant in [
+            crate::grants::parse_grant(&[
+                "read",
+                "ON",
+                "invites",
+                "WHERE",
+                "team_id",
+                "IN",
+                "(",
+                "SELECT",
+                "team_id",
+                "FROM",
+                "members",
+                "WHERE",
+                "user_id",
+                "=",
+                "auth.uid()",
+                ")",
+            ])
+            .unwrap(),
+            crate::grants::parse_grant(&[
+                "read",
+                "ON",
+                "invites",
+                "WHERE",
+                "email",
+                "=",
+                "auth.email",
+            ])
+            .unwrap(),
+        ] {
+            crate::auth::put_grant(&store, &cache, &grant, now).unwrap();
+        }
+        let principal = match user_ctx("alice") {
+            HttpAuthContext::User(principal) => principal,
+            _ => unreachable!(),
+        };
+        let spec = LiveTableSpec {
+            table: "invites".to_string(),
+            select: "*".to_string(),
+            where_conditions: vec![],
+            joins: vec![],
+            principal: Some(principal),
+            auth_dependencies: vec!["members".to_string()],
+            near: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            deny_all: false,
+        };
+
+        crate::auth::read_filter(
+            &store,
+            &cache,
+            spec.principal.as_ref().unwrap(),
+            "invites",
+            now,
+        )
+        .unwrap();
+        let body =
+            serde_json::to_string(&fetch_live_table_rows(&store, &cache, &spec).unwrap()).unwrap();
+        assert!(
+            body.contains("\"team\"") && body.contains("\"email\""),
+            "{body}"
+        );
+        assert!(!body.contains("\"hidden\""), "{body}");
     }
 
     #[test]
@@ -4801,12 +6215,12 @@ mod tests {
 
         // id=1 is alice's -> visible; id=3 is bob's -> reads as not-found.
         assert!(
-            crate::tables::table_get_filtered(&store, &cache, "messages", 1, scope, now)
+            crate::tables::table_get_filtered(&store, &cache, "messages", 1, scope, now, true)
                 .unwrap()
                 .is_some()
         );
         assert!(
-            crate::tables::table_get_filtered(&store, &cache, "messages", 3, scope, now)
+            crate::tables::table_get_filtered(&store, &cache, "messages", 3, scope, now, true)
                 .unwrap()
                 .is_none()
         );

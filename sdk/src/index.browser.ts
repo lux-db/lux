@@ -16,12 +16,15 @@ import type { LuxSchema } from './types';
 
 export type {
 	LuxAuthKey,
+	LuxAppleAuthProvider,
 	LuxAuthGrantRow,
 	LuxAuthIdentityRow,
 	LuxAuthChangeEvent,
 	LuxAuthOptions,
 	LuxAuthKeyRow,
 	LuxAuthProviderRow,
+	LuxAuthProvider,
+	LuxAuthProviderBase,
 	LuxAuthSession,
 	LuxAuthSessionRow,
 	LuxAuthSigningKeyRow,
@@ -33,11 +36,17 @@ export type {
 	LuxAuthUser,
 	LuxUser,
 	LuxOAuthProvider,
+	LuxClientSecretAuthProvider,
 	LuxOAuthUrl,
 	LuxSignInWithOAuthOptions,
 	LuxCreateApiKeyOptions,
 	LuxSignInOptions,
+	LuxSignInWithAppleOptions,
+	LuxAppleSignInNonce,
 	LuxSignUpOptions,
+	LuxUpsertAppleProviderOptions,
+	LuxUpsertClientSecretProviderOptions,
+	LuxUpsertProviderOptions,
 } from './auth';
 export { createProjectClient, LuxProjectClient };
 export { LuxProjectLiveSubscription } from './project';
@@ -61,6 +70,15 @@ export type {
 	LuxTableColumn,
 	LuxVectorSearchOptions,
 } from './project';
+export type {
+	LuxPushApnsOptions,
+	LuxPushCriticalSound,
+	LuxPushDevice,
+	LuxPushInterruptionLevel,
+	LuxPushJsonValue,
+	LuxPushNotification,
+	LuxPushRegisterOptions,
+} from './push';
 export type {
 	LuxStorageListOptions,
 	LuxStorageObject,
@@ -88,7 +106,7 @@ export type {
 	TSSample,
 	VSearchResult,
 } from './types';
-export { TableQueryBuilder, TableSubscription } from './table';
+export { TableQueryBuilder } from './table';
 export type { TableQueryBuilderOptions } from './table';
 
 /**

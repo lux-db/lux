@@ -1,5 +1,15 @@
 use super::*;
 
+/// Standard Redis error when a consumer group is not found for a key (also used
+/// when the key itself is missing, matching Redis for the consumer subcommands).
+fn nogroup_err(group: &str, key: &[u8]) -> String {
+    format!(
+        "NOGROUP No such consumer group '{}' for key name '{}'",
+        group,
+        key_str(key)
+    )
+}
+
 impl Store {
     pub fn xadd(
         &self,
@@ -157,7 +167,7 @@ impl Store {
                 StoreValue::Stream(s) => {
                     let mut result = Vec::new();
                     for (id, fields) in s.entries.range(start..=end) {
-                        result.push((*id, fields.clone()));
+                        result.push((*id, self.decrypt_stream_fields(key, fields)));
                         if let Some(c) = count {
                             if result.len() >= c {
                                 break;
@@ -188,7 +198,7 @@ impl Store {
                 StoreValue::Stream(s) => {
                     let mut result = Vec::new();
                     for (id, fields) in s.entries.range(start..=end).rev() {
-                        result.push((*id, fields.clone()));
+                        result.push((*id, self.decrypt_stream_fields(key, fields)));
                         if let Some(c) = count {
                             if result.len() >= c {
                                 break;
@@ -225,7 +235,7 @@ impl Store {
                         };
                         let mut entries = Vec::new();
                         for (id, fields) in s.entries.range(start..) {
-                            entries.push((*id, fields.clone()));
+                            entries.push((*id, self.decrypt_stream_fields(key.as_bytes(), fields)));
                             if let Some(c) = count {
                                 if entries.len() >= c {
                                     break;
@@ -282,6 +292,11 @@ impl Store {
         match shard.data.get_mut(&ks) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Stream(s) => {
+                    if s.groups.contains_key(group) {
+                        return Err(
+                            "BUSYGROUP Consumer Group name already exists".to_string()
+                        );
+                    }
                     let last_delivered_id = if id == "$" {
                         s.last_id
                     } else {
@@ -313,6 +328,146 @@ impl Store {
                 _ => Err(WRONGTYPE.to_string()),
             },
             _ => Ok(false),
+        }
+    }
+
+    pub fn xgroup_setid(
+        &self,
+        key: &[u8],
+        group: &str,
+        id: &str,
+        now: Instant,
+    ) -> Result<(), String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        shard.version += 1;
+        match shard.data.get_mut(key) {
+            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+                StoreValue::Stream(s) => {
+                    let Some(group) = s.groups.get_mut(group) else {
+                        return Err(format!(
+                            "NOGROUP No such consumer group '{}' for key name '{}'",
+                            group,
+                            key_str(key)
+                        ));
+                    };
+                    group.last_delivered_id = if id == "$" {
+                        s.last_id
+                    } else {
+                        StreamId::parse(id).ok_or_else(|| "ERR Invalid stream ID".to_string())?
+                    };
+                    Ok(())
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Err("ERR no such key".to_string()),
+        }
+    }
+
+    /// XGROUP CREATECONSUMER: create the consumer if it does not exist.
+    /// Returns true when a new consumer was created, false if it already existed.
+    pub fn xgroup_createconsumer(
+        &self,
+        key: &[u8],
+        group: &str,
+        consumer: &str,
+        now: Instant,
+    ) -> Result<bool, String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        shard.version += 1;
+        match shard.data.get_mut(key) {
+            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+                StoreValue::Stream(s) => {
+                    let Some(cg) = s.groups.get_mut(group) else {
+                        return Err(nogroup_err(group, key));
+                    };
+                    if cg.consumers.contains_key(consumer) {
+                        Ok(false)
+                    } else {
+                        cg.consumers.insert(
+                            consumer.to_string(),
+                            Consumer {
+                                pel: HashSet::new(),
+                                seen_time: now,
+                            },
+                        );
+                        Ok(true)
+                    }
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Err(nogroup_err(group, key)),
+        }
+    }
+
+    /// XGROUP DELCONSUMER: remove the consumer and its pending entries from the
+    /// group PEL. Returns the number of pending messages the consumer owned.
+    pub fn xgroup_delconsumer(
+        &self,
+        key: &[u8],
+        group: &str,
+        consumer: &str,
+        now: Instant,
+    ) -> Result<i64, String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        shard.version += 1;
+        match shard.data.get_mut(key) {
+            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+                StoreValue::Stream(s) => {
+                    let Some(cg) = s.groups.get_mut(group) else {
+                        return Err(nogroup_err(group, key));
+                    };
+                    match cg.consumers.remove(consumer) {
+                        Some(c) => {
+                            let count = c.pel.len() as i64;
+                            for id in &c.pel {
+                                cg.pel.remove(id);
+                            }
+                            Ok(count)
+                        }
+                        None => Ok(0),
+                    }
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Err(nogroup_err(group, key)),
+        }
+    }
+
+    /// XINFO CONSUMERS: per-consumer (name, pending, idle-ms, inactive-ms).
+    /// idle and inactive both derive from the consumer's last-seen time; Lux
+    /// does not yet track a distinct active time, so they report the same value.
+    pub fn xinfo_consumers(
+        &self,
+        key: &[u8],
+        group: &str,
+        now: Instant,
+    ) -> Result<Vec<(String, i64, i64, i64)>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Stream(s) => {
+                    let Some(cg) = s.groups.get(group) else {
+                        return Err(nogroup_err(group, key));
+                    };
+                    let mut consumers: Vec<(String, i64, i64, i64)> = cg
+                        .consumers
+                        .iter()
+                        .map(|(name, c)| {
+                            let idle =
+                                now.saturating_duration_since(c.seen_time).as_millis() as i64;
+                            (name.clone(), c.pel.len() as i64, idle, idle)
+                        })
+                        .collect();
+                    consumers.sort_by(|a, b| a.0.cmp(&b.0));
+                    Ok(consumers)
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Err(nogroup_err(group, key)),
         }
     }
 
@@ -354,7 +509,10 @@ impl Store {
                             };
                             let mut entries = Vec::new();
                             for (id, fields) in s.entries.range(start..) {
-                                entries.push((*id, fields.clone()));
+                                entries.push((
+                                    *id,
+                                    self.decrypt_stream_fields(key.as_bytes(), fields),
+                                ));
                                 if !noack {
                                     cg.pel.insert(
                                         *id,
@@ -399,7 +557,10 @@ impl Store {
                             sorted.sort();
                             for id in sorted {
                                 if let Some(fields) = s.entries.get(&id) {
-                                    entries.push((id, fields.clone()));
+                                    entries.push((
+                                        id,
+                                        self.decrypt_stream_fields(key.as_bytes(), fields),
+                                    ));
                                     if let Some(cnt) = count {
                                         if entries.len() >= cnt {
                                             break;
@@ -594,7 +755,7 @@ impl Store {
                                 c.pel.insert(*id);
                                 c.seen_time = inst_now;
                                 if let Some(fields) = s.entries.get(id) {
-                                    result.push((*id, fields.clone()));
+                                    result.push((*id, self.decrypt_stream_fields(key, fields)));
                                 }
                             }
                         }
@@ -673,7 +834,7 @@ impl Store {
                                 c.pel.insert(id);
                                 c.seen_time = inst_now;
                                 if let Some(fields) = s.entries.get(&id) {
-                                    claimed.push((id, fields.clone()));
+                                    claimed.push((id, self.decrypt_stream_fields(key, fields)));
                                 } else {
                                     deleted_ids.push(id);
                                 }

@@ -33,6 +33,80 @@ fn write_xread_result(
     }
 }
 
+fn xadd_id_arg_index(args: &[&[u8]]) -> Option<usize> {
+    let mut i = 2;
+    while i < args.len() {
+        if cmd_eq(args[i], b"MAXLEN") || cmd_eq(args[i], b"MINID") {
+            i += 1;
+            if i < args.len() && args[i] == b"~" {
+                i += 1;
+            }
+            if i < args.len() {
+                i += 1;
+            }
+        } else if cmd_eq(args[i], b"NOMKSTREAM") {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    (i < args.len()).then_some(i)
+}
+
+fn log_resolved_xadd(store: &Store, args: &[&[u8]], id: StreamId, out: &mut BytesMut) -> bool {
+    if !store.wal_enabled() {
+        return true;
+    }
+    let Some(id_idx) = xadd_id_arg_index(args) else {
+        return true;
+    };
+    let mut owned: Vec<Vec<u8>> = args.iter().map(|arg| arg.to_vec()).collect();
+    owned[id_idx] = id.to_string().into_bytes();
+    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+    match store.wal_log_command(&refs) {
+        Ok(()) => true,
+        Err(e) => {
+            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+            false
+        }
+    }
+}
+
+/// Self-log an encrypted XADD as a normal XADD carrying the resolved id and the
+/// sealed ciphertext values (the ENCRYPTED flag is dropped). On replay the
+/// envelope bytes are stored verbatim (no ENCRYPTED flag => no re-encryption),
+/// and reads decrypt them via the envelope magic prefix.
+fn log_encrypted_xadd(
+    store: &Store,
+    args: &[&[u8]],
+    id: StreamId,
+    fields: &[(String, Bytes)],
+    out: &mut BytesMut,
+) -> bool {
+    if !store.wal_enabled() {
+        return true;
+    }
+    let Some(id_idx) = xadd_id_arg_index(args) else {
+        return true;
+    };
+    let mut owned: Vec<Vec<u8>> = vec![b"XADD".to_vec(), args[1].to_vec()];
+    // Preserve trimming options (MAXLEN/MINID/NOMKSTREAM) that sit before the id.
+    owned.extend(args[2..id_idx].iter().map(|a| a.to_vec()));
+    owned.push(id.to_string().into_bytes());
+    for (name, val) in fields {
+        owned.push(name.as_bytes().to_vec());
+        owned.push(val.to_vec());
+    }
+    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+    match store.wal_log_command(&refs) {
+        Ok(()) => true,
+        Err(e) => {
+            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+            false
+        }
+    }
+}
+
 pub fn cmd_xadd(
     args: &[&[u8]],
     store: &Store,
@@ -44,6 +118,9 @@ pub fn cmd_xadd(
         resp::write_error(out, "ERR wrong number of arguments for 'xadd' command");
         return CmdResult::Written;
     }
+    // Trailing ENCRYPTED flag (mirrors SET/HSET): seal each field value.
+    let encrypted = args.last().is_some_and(|a| cmd_eq(a, b"ENCRYPTED"));
+    let arg_end = args.len() - encrypted as usize;
     let mut i = 2;
     let mut maxlen: Option<usize> = None;
     while i < args.len() {
@@ -62,26 +139,42 @@ pub fn cmd_xadd(
             break;
         }
     }
-    if i >= args.len() {
+    if i >= arg_end {
         resp::write_error(out, "ERR wrong number of arguments for 'xadd' command");
         return CmdResult::Written;
     }
     let id_input = arg_str(args[i]);
     i += 1;
-    if (args.len() - i) < 2 || !(args.len() - i).is_multiple_of(2) {
+    if (arg_end - i) < 2 || !(arg_end - i).is_multiple_of(2) {
         resp::write_error(out, "ERR wrong number of arguments for 'xadd' command");
         return CmdResult::Written;
     }
     let mut fields = Vec::new();
-    while i + 1 < args.len() {
-        fields.push((
-            arg_str(args[i]).to_string(),
-            Bytes::copy_from_slice(args[i + 1]),
-        ));
+    while i + 1 < arg_end {
+        let value = if encrypted {
+            match store.encrypt_stream_value(args[1], args[i], args[i + 1]) {
+                Ok(ct) => Bytes::from(ct),
+                Err(e) => {
+                    resp::write_error(out, &e);
+                    return CmdResult::Written;
+                }
+            }
+        } else {
+            Bytes::copy_from_slice(args[i + 1])
+        };
+        fields.push((arg_str(args[i]).to_string(), value));
         i += 2;
     }
-    match store.xadd(args[1], id_input, fields, maxlen, now) {
+    match store.xadd(args[1], id_input, fields.clone(), maxlen, now) {
         Ok(id) => {
+            let logged = if encrypted {
+                log_encrypted_xadd(store, args, id, &fields, out)
+            } else {
+                log_resolved_xadd(store, args, id, out)
+            };
+            if !logged {
+                return CmdResult::Written;
+            }
             resp::write_bulk(out, &id.to_string());
             _broker.wake_stream_waiters(arg_str(args[1]));
         }
@@ -276,10 +369,61 @@ pub fn cmd_xgroup(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
             Ok(removed) => resp::write_integer(out, if removed { 1 } else { 0 }),
             Err(e) => resp::write_error(out, &e),
         }
+    } else if cmd_eq(args[1], b"SETID") {
+        if args.len() < 5 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'xgroup|setid' command",
+            );
+            return CmdResult::Written;
+        }
+        match store.xgroup_setid(args[2], arg_str(args[3]), arg_str(args[4]), now) {
+            Ok(()) => resp::write_ok(out),
+            Err(e) => resp::write_error(out, &e),
+        }
     } else if cmd_eq(args[1], b"CREATECONSUMER") {
-        resp::write_integer(out, 1);
+        if args.len() < 5 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'xgroup|createconsumer' command",
+            );
+            return CmdResult::Written;
+        }
+        match store.xgroup_createconsumer(args[2], arg_str(args[3]), arg_str(args[4]), now) {
+            Ok(created) => resp::write_integer(out, if created { 1 } else { 0 }),
+            Err(e) => resp::write_error(out, &e),
+        }
     } else if cmd_eq(args[1], b"DELCONSUMER") {
-        resp::write_integer(out, 0);
+        if args.len() < 5 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'xgroup|delconsumer' command",
+            );
+            return CmdResult::Written;
+        }
+        match store.xgroup_delconsumer(args[2], arg_str(args[3]), arg_str(args[4]), now) {
+            Ok(pending) => resp::write_integer(out, pending),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(args[1], b"HELP") {
+        let help = [
+            "XGROUP CREATE <key> <groupname> <id|$> [MKSTREAM]",
+            "    Create a new consumer group.",
+            "XGROUP SETID <key> <groupname> <id|$>",
+            "    Set the current group ID.",
+            "XGROUP DESTROY <key> <groupname>",
+            "    Remove the specified group.",
+            "XGROUP CREATECONSUMER <key> <groupname> <consumer>",
+            "    Create a new consumer in the specified group.",
+            "XGROUP DELCONSUMER <key> <groupname> <consumer>",
+            "    Remove the specified consumer from the group.",
+            "XGROUP HELP",
+            "    Print this help.",
+        ];
+        resp::write_array_header(out, help.len());
+        for line in help {
+            resp::write_bulk(out, line);
+        }
     } else {
         resp::write_error(
             out,
@@ -632,6 +776,31 @@ pub fn cmd_xinfo(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
                         resp::write_bulk(out, k);
                         resp::write_bulk(out, v);
                     }
+                }
+            }
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(args[1], b"CONSUMERS") {
+        if args.len() < 4 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'xinfo|consumers' command",
+            );
+            return CmdResult::Written;
+        }
+        match store.xinfo_consumers(args[2], arg_str(args[3]), now) {
+            Ok(consumers) => {
+                resp::write_array_header(out, consumers.len());
+                for (name, pending, idle, inactive) in &consumers {
+                    resp::write_array_header(out, 8);
+                    resp::write_bulk(out, "name");
+                    resp::write_bulk(out, name);
+                    resp::write_bulk(out, "pending");
+                    resp::write_integer(out, *pending);
+                    resp::write_bulk(out, "idle");
+                    resp::write_integer(out, *idle);
+                    resp::write_bulk(out, "inactive");
+                    resp::write_integer(out, *inactive);
                 }
             }
             Err(e) => resp::write_error(out, &e),

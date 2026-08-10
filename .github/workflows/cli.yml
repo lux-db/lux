@@ -9,7 +9,20 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --manifest-path cli/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path cli/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path cli/Cargo.toml --all-targets
+      - run: cargo build --bin lux
+      - run: cargo build --manifest-path cli/Cargo.toml
+      - run: bash cli/tests/e2e-local.sh
+
   build:
+    needs: test
     strategy:
       matrix:
         include:
@@ -22,6 +35,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: lux-cli-macos-arm64
+          - target: x86_64-apple-darwin
+            os: macos-15
+            artifact: lux-cli-macos-x86_64
 
     runs-on: ${{ matrix.os }}
 

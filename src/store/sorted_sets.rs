@@ -503,7 +503,7 @@ impl Store {
         match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(tree, _) => {
-                    for ((score, member), _) in tree.iter() {
+                    for (score, member) in tree.keys() {
                         visit(member, score.0);
                     }
                     Ok(())
@@ -621,70 +621,78 @@ impl Store {
         }
     }
 
-    pub fn zunionstore(
+    /// Random members (with scores). Positive count returns up to `count`
+    /// distinct members; negative count returns `|count|` members with repeats.
+    /// Selection follows sorted-set order (mirrors the deterministic SRANDMEMBER).
+    pub fn zrandmember(
         &self,
-        dst: &[u8],
+        key: &[u8],
+        count: i64,
+        now: Instant,
+    ) -> Result<Vec<(String, f64)>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(tree, _scores) => {
+                    if count == 0 || tree.is_empty() {
+                        return Ok(vec![]);
+                    }
+                    let members: Vec<(String, f64)> =
+                        tree.keys().map(|(s, m)| (m.clone(), s.0)).collect();
+                    let abs = count.unsigned_abs() as usize;
+                    if count > 0 {
+                        Ok(members.into_iter().take(abs).collect())
+                    } else {
+                        Ok(members.iter().cloned().cycle().take(abs).collect())
+                    }
+                }
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Ok(vec![]),
+        }
+    }
+
+    /// Weighted union of the sorted sets, as a member->score map.
+    fn zunion_compute(
+        &self,
         keys: &[&[u8]],
         weights: &[f64],
         aggregate: &str,
         now: Instant,
-    ) -> Result<i64, String> {
+    ) -> Result<HashMap<String, f64>, String> {
         let mut result: HashMap<String, f64> = HashMap::new();
         for (i, key) in keys.iter().enumerate() {
             let w = weights.get(i).copied().unwrap_or(1.0);
             let set = self.collect_sorted_set(key, now)?;
             for (member, score) in set {
                 let weighted = score * w;
-                let entry = result.entry(member).or_insert(0.0);
-                match aggregate {
-                    "MIN" => *entry = entry.min(weighted),
-                    "MAX" => *entry = entry.max(weighted),
-                    _ => *entry += weighted,
+                // First occurrence seeds the value; only then does aggregate
+                // combine. (The old code seeded with 0.0, which broke MIN/MAX.)
+                if let Some(cur) = result.get_mut(&member) {
+                    match aggregate {
+                        "MIN" => *cur = cur.min(weighted),
+                        "MAX" => *cur = cur.max(weighted),
+                        _ => *cur += weighted,
+                    }
+                } else {
+                    result.insert(member, weighted);
                 }
             }
         }
-        let count = result.len() as i64;
-        self.del(&[dst]);
-        if !result.is_empty() {
-            let idx = self.shard_index(dst);
-            let mut shard = self.shards[idx].write();
-            shard.version += 1;
-            let mut tree = BTreeMap::new();
-            let mut scores = HashMap::new();
-            let mut mem = key_str(dst).len() + 64;
-            for (member, score) in result {
-                mem += member.len() + 48;
-                tree.insert((OrderedFloat(score), member.clone()), ());
-                scores.insert(member, score);
-            }
-            let old = shard.data.insert(
-                key_bytes(dst),
-                Entry {
-                    value: StoreValue::SortedSet(tree, scores),
-                    expires_at: None,
-                    lru_clock: self.lru_clock(),
-                },
-            );
-            if old.is_none() {
-                self.key_added();
-            }
-            shard.used_memory += mem;
-            self.mem_add(mem);
-        }
-        Ok(count)
+        Ok(result)
     }
 
-    pub fn zinterstore(
+    /// Weighted intersection of the sorted sets, as a member->score map.
+    fn zinter_compute(
         &self,
-        dst: &[u8],
         keys: &[&[u8]],
         weights: &[f64],
         aggregate: &str,
         now: Instant,
-    ) -> Result<i64, String> {
+    ) -> Result<HashMap<String, f64>, String> {
         if keys.is_empty() {
-            self.del(&[dst]);
-            return Ok(0);
+            return Ok(HashMap::new());
         }
         let first = self.collect_sorted_set(keys[0], now)?;
         let w0 = weights.first().copied().unwrap_or(1.0);
@@ -707,76 +715,213 @@ impl Store {
                 }
             });
         }
-        let count = result.len() as i64;
-        self.del(&[dst]);
-        if !result.is_empty() {
-            let idx = self.shard_index(dst);
-            let mut shard = self.shards[idx].write();
-            shard.version += 1;
-            let mut tree = BTreeMap::new();
-            let mut scores = HashMap::new();
-            let mut mem = key_str(dst).len() + 64;
-            for (member, score) in result {
-                mem += member.len() + 48;
-                tree.insert((OrderedFloat(score), member.clone()), ());
-                scores.insert(member, score);
-            }
-            let old = shard.data.insert(
-                key_bytes(dst),
-                Entry {
-                    value: StoreValue::SortedSet(tree, scores),
-                    expires_at: None,
-                    lru_clock: self.lru_clock(),
-                },
-            );
-            if old.is_none() {
-                self.key_added();
-            }
-            shard.used_memory += mem;
-            self.mem_add(mem);
-        }
-        Ok(count)
+        Ok(result)
     }
 
-    pub fn zdiffstore(&self, dst: &[u8], keys: &[&[u8]], now: Instant) -> Result<i64, String> {
+    /// Difference of the first sorted set minus the rest, as a member->score map.
+    fn zdiff_compute(&self, keys: &[&[u8]], now: Instant) -> Result<HashMap<String, f64>, String> {
         if keys.is_empty() {
-            self.del(&[dst]);
-            return Ok(0);
+            return Ok(HashMap::new());
         }
         let mut result = self.collect_sorted_set(keys[0], now)?;
         for key in &keys[1..] {
             let set = self.collect_sorted_set(key, now)?;
             result.retain(|m, _| !set.contains_key(m));
         }
+        Ok(result)
+    }
+
+    /// Delete `dst` and store `result` as a sorted set; returns the member count.
+    fn write_computed_zset(&self, dst: &[u8], result: HashMap<String, f64>) -> Result<i64, String> {
         let count = result.len() as i64;
         self.del(&[dst]);
-        if !result.is_empty() {
-            let idx = self.shard_index(dst);
-            let mut shard = self.shards[idx].write();
-            shard.version += 1;
-            let mut tree = BTreeMap::new();
-            let mut scores = HashMap::new();
-            let mut mem = key_str(dst).len() + 64;
-            for (member, score) in result {
-                mem += member.len() + 48;
-                tree.insert((OrderedFloat(score), member.clone()), ());
-                scores.insert(member, score);
+        let wal = self.wal_enabled();
+
+        if result.is_empty() {
+            // Self-log the clear so replay drops any prior dst on dst's own shard.
+            if wal {
+                self.wal_log_command(&[b"DEL", dst])
+                    .map_err(|e| format!("ERR WAL append failed: {e}"))?;
             }
-            let old = shard.data.insert(
-                key_bytes(dst),
-                Entry {
-                    value: StoreValue::SortedSet(tree, scores),
-                    expires_at: None,
-                    lru_clock: self.lru_clock(),
-                },
-            );
-            if old.is_none() {
-                self.key_added();
+            return Ok(count);
+        }
+
+        let idx = self.shard_index(dst);
+        let mut shard = self.shards[idx].write();
+        shard.version += 1;
+        let mut tree = BTreeMap::new();
+        let mut scores = HashMap::new();
+        let mut mem = key_str(dst).len() + 64;
+        // Captured for the self-logged ZADD below (only when WAL is on).
+        let mut members: Vec<String> = if wal {
+            Vec::with_capacity(result.len())
+        } else {
+            Vec::new()
+        };
+        let mut score_strs: Vec<String> = if wal {
+            Vec::with_capacity(result.len())
+        } else {
+            Vec::new()
+        };
+        for (member, score) in result {
+            mem += member.len() + 48;
+            tree.insert((OrderedFloat(score), member.clone()), ());
+            if wal {
+                score_strs.push(score.to_string());
+                members.push(member.clone());
             }
-            shard.used_memory += mem;
-            self.mem_add(mem);
+            scores.insert(member, score);
+        }
+        let old = shard.data.insert(
+            key_bytes(dst),
+            Entry {
+                value: StoreValue::SortedSet(tree, scores),
+                expires_at: None,
+                lru_clock: self.lru_clock(),
+            },
+        );
+        if old.is_none() {
+            self.key_added();
+        }
+        shard.used_memory += mem;
+        self.mem_add(mem);
+        drop(shard);
+
+        // Self-log the resolved effect keyed on dst (DEL + ZADD). The raw *STORE
+        // command reads source keys that may live on other WAL shards, so per-
+        // shard replay could apply it before the sources are restored. Logging
+        // DEL+ZADD to dst's own shard makes replay independent of source order.
+        // (The raw command is skipped in execute_with_wal via command_self_logs_wal.)
+        if wal {
+            self.wal_log_command(&[b"DEL", dst])
+                .map_err(|e| format!("ERR WAL append failed: {e}"))?;
+            let mut zadd: Vec<&[u8]> = Vec::with_capacity(members.len() * 2 + 2);
+            zadd.push(b"ZADD");
+            zadd.push(dst);
+            for (s, m) in score_strs.iter().zip(members.iter()) {
+                zadd.push(s.as_bytes());
+                zadd.push(m.as_bytes());
+            }
+            self.wal_log_command(&zadd)
+                .map_err(|e| format!("ERR WAL append failed: {e}"))?;
         }
         Ok(count)
+    }
+
+    /// Sort a member->score map into Redis order: by score ascending, ties by
+    /// member lexicographically.
+    fn sorted_zset_result(result: HashMap<String, f64>) -> Vec<(String, f64)> {
+        let mut v: Vec<(String, f64)> = result.into_iter().collect();
+        v.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        v
+    }
+
+    pub fn zunionstore(
+        &self,
+        dst: &[u8],
+        keys: &[&[u8]],
+        weights: &[f64],
+        aggregate: &str,
+        now: Instant,
+    ) -> Result<i64, String> {
+        let result = self.zunion_compute(keys, weights, aggregate, now)?;
+        self.write_computed_zset(dst, result)
+    }
+
+    /// ZMPOP/BZMPOP core: pop up to `count` MIN- or MAX-scored members from the
+    /// first non-empty sorted set among `keys`. Returns the popped key and the
+    /// (member, score) pairs, or None when every key is missing/empty. WRONGTYPE
+    /// propagates from the first non-zset key scanned.
+    #[allow(clippy::type_complexity)]
+    pub fn zmpop(
+        &self,
+        keys: &[&[u8]],
+        pop_min: bool,
+        count: usize,
+        now: Instant,
+    ) -> Result<Option<(Vec<u8>, Vec<(String, f64)>)>, String> {
+        for key in keys {
+            self.try_promote(key, now);
+            let popped = if pop_min {
+                self.zpopmin(key, count, now)
+            } else {
+                self.zpopmax(key, count, now)
+            };
+            match popped {
+                Ok(items) if !items.is_empty() => return Ok(Some((key.to_vec(), items))),
+                Ok(_) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
+    /// ZRANGESTORE: store already-resolved (member, score) pairs into `dst` as a
+    /// sorted set, replacing any prior value. Reuses `write_computed_zset`, which
+    /// self-logs a keyed DEL+ZADD so a sharded WAL replays it on dst's own shard
+    /// (the raw command reads a src key that may live on another shard).
+    pub fn zrangestore(&self, dst: &[u8], pairs: Vec<(String, f64)>) -> Result<i64, String> {
+        let map: HashMap<String, f64> = pairs.into_iter().collect();
+        self.write_computed_zset(dst, map)
+    }
+
+    pub fn zinterstore(
+        &self,
+        dst: &[u8],
+        keys: &[&[u8]],
+        weights: &[f64],
+        aggregate: &str,
+        now: Instant,
+    ) -> Result<i64, String> {
+        let result = self.zinter_compute(keys, weights, aggregate, now)?;
+        self.write_computed_zset(dst, result)
+    }
+
+    pub fn zdiffstore(&self, dst: &[u8], keys: &[&[u8]], now: Instant) -> Result<i64, String> {
+        let result = self.zdiff_compute(keys, now)?;
+        self.write_computed_zset(dst, result)
+    }
+
+    /// Direct-return union (sorted). WITHSCORES is applied at the command layer.
+    pub fn zunion(
+        &self,
+        keys: &[&[u8]],
+        weights: &[f64],
+        aggregate: &str,
+        now: Instant,
+    ) -> Result<Vec<(String, f64)>, String> {
+        Ok(Self::sorted_zset_result(
+            self.zunion_compute(keys, weights, aggregate, now)?,
+        ))
+    }
+
+    /// Direct-return intersection (sorted).
+    pub fn zinter(
+        &self,
+        keys: &[&[u8]],
+        weights: &[f64],
+        aggregate: &str,
+        now: Instant,
+    ) -> Result<Vec<(String, f64)>, String> {
+        Ok(Self::sorted_zset_result(
+            self.zinter_compute(keys, weights, aggregate, now)?,
+        ))
+    }
+
+    /// Direct-return difference (sorted).
+    pub fn zdiff(&self, keys: &[&[u8]], now: Instant) -> Result<Vec<(String, f64)>, String> {
+        Ok(Self::sorted_zset_result(self.zdiff_compute(keys, now)?))
+    }
+
+    /// Cardinality of the intersection. `limit` of 0 means no limit.
+    pub fn zintercard(&self, keys: &[&[u8]], limit: usize, now: Instant) -> Result<i64, String> {
+        let count = self.zinter_compute(keys, &[], "SUM", now)?.len();
+        let count = if limit == 0 { count } else { count.min(limit) };
+        Ok(count as i64)
     }
 
     #[allow(clippy::too_many_arguments)]

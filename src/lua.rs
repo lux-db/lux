@@ -2,6 +2,7 @@ use bytes::BytesMut;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,6 +11,40 @@ use crate::store::Store;
 
 pub struct ScriptEngine {
     scripts: Mutex<HashMap<String, String>>,
+}
+
+struct LuaExecutionBudget {
+    started_at: Instant,
+    max_elapsed: std::time::Duration,
+    max_redis_calls: u32,
+    redis_calls: AtomicU32,
+}
+
+impl LuaExecutionBudget {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            max_elapsed: std::time::Duration::from_secs(5),
+            max_redis_calls: 100_000,
+            redis_calls: AtomicU32::new(0),
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.started_at.elapsed() > self.max_elapsed {
+            return Err("ERR script exceeded maximum wall-clock execution time".to_string());
+        }
+        Ok(())
+    }
+
+    fn record_redis_call(&self) -> Result<(), String> {
+        self.check()?;
+        let count = self.redis_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if count > self.max_redis_calls {
+            return Err("ERR script exceeded maximum redis.call limit".to_string());
+        }
+        Ok(())
+    }
 }
 
 impl ScriptEngine {
@@ -233,6 +268,7 @@ pub fn eval(
     now: Instant,
 ) -> Result<BytesMut, String> {
     let lua = mlua::Lua::new();
+    let budget = Arc::new(LuaExecutionBudget::new());
     install_lua_sandbox(&lua)?;
 
     let keys_table = lua
@@ -270,10 +306,24 @@ pub fn eval(
     // `redis.call` raises on a command error (aborting the script); `redis.pcall`
     // returns the error as a `{err=...}` table. They were the same function before,
     // so `pcall` wrongly aborted instead of returning the error table.
-    let redis_call = create_redis_call(&lua, store.clone(), broker.clone(), now, true)
-        .map_err(|e| format!("ERR lua error: {}", e))?;
-    let redis_pcall = create_redis_call(&lua, store.clone(), broker.clone(), now, false)
-        .map_err(|e| format!("ERR lua error: {}", e))?;
+    let redis_call = create_redis_call(
+        &lua,
+        store.clone(),
+        broker.clone(),
+        budget.clone(),
+        now,
+        true,
+    )
+    .map_err(|e| format!("ERR lua error: {}", e))?;
+    let redis_pcall = create_redis_call(
+        &lua,
+        store.clone(),
+        broker.clone(),
+        budget.clone(),
+        now,
+        false,
+    )
+    .map_err(|e| format!("ERR lua error: {}", e))?;
 
     let redis = lua
         .create_table()
@@ -356,9 +406,11 @@ pub fn eval(
     // Limit execution to 1M VM instructions to prevent infinite loops,
     // infinite recursion, and CPU exhaustion from malicious scripts.
     lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(10_000), {
-        let count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count = Arc::new(AtomicU32::new(0));
+        let budget = budget.clone();
         move |_lua, _debug| {
-            let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            budget.check().map_err(mlua::Error::RuntimeError)?;
+            let n = count.fetch_add(1, Ordering::Relaxed);
             if n >= 100 {
                 // 100 callbacks * 10,000 instructions = 1M instructions max
                 Err(mlua::Error::RuntimeError(
@@ -385,10 +437,19 @@ fn create_redis_call(
     lua: &mlua::Lua,
     store: Arc<Store>,
     broker: Broker,
+    budget: Arc<LuaExecutionBudget>,
     now: Instant,
     raise_errors: bool,
 ) -> mlua::Result<mlua::Function> {
     lua.create_function(move |lua_ctx, args: mlua::MultiValue| {
+        if let Err(err) = budget.record_redis_call() {
+            if raise_errors {
+                return Err(mlua::Error::external(err));
+            }
+            let tbl = lua_ctx.create_table()?;
+            tbl.set("err", err)?;
+            return Ok(mlua::Value::Table(tbl));
+        }
         let mut cmd_args: Vec<Vec<u8>> = Vec::new();
         for arg in args {
             match arg {
@@ -434,6 +495,7 @@ fn create_redis_call(
 /// control, and subscription commands.
 fn lua_disallowed_command_error(cmd: &[u8]) -> Option<&'static str> {
     if crate::cmd::is_blocking_command(cmd)
+        || crate::cmd::is_script_command(cmd)
         || cmd.eq_ignore_ascii_case(b"SAVE")
         || cmd.eq_ignore_ascii_case(b"BGSAVE")
         || cmd.eq_ignore_ascii_case(b"MULTI")

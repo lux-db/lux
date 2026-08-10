@@ -34,6 +34,62 @@ const { data: session, error } = await lux.auth.signInWithPassword({
 if (error) throw error;
 ```
 
+## Push notifications
+
+Server-side callers can send to one subject or many with a secret key. Lux
+derives the APNs topic and push type, routes each device to its sandbox or
+production host, and validates the final APNs payload before enqueue.
+
+```ts
+import { createClient } from "@luxdb/sdk";
+
+const lux = createClient(process.env.LUX_URL!, process.env.LUX_SECRET_KEY!);
+
+await lux.push.send("agent-123", {
+  title: "Input needed",
+  body: "The agent is waiting for your answer.",
+  subtitle: "Vigil",
+  image: "https://example.com/question.png",
+  interruption_level: "time-sensitive",
+  target_content_id: "question-window",
+  relevance_score: 0.9,
+  filter_criteria: "work",
+  apns: {
+    collapse_id: "agent-123-question",
+    expiration: Math.floor(Date.now() / 1000) + 300,
+    priority: 10,
+  },
+  data: { question: { id: "q_123" }, requires_reply: true },
+});
+```
+
+The supported values are `passive`, `active`, `time-sensitive`, and `critical`.
+Time-sensitive notifications may break through Focus when the user allows it.
+Omit `interruption_level` for the normal `active` behavior.
+
+Images are delivered through a custom `image_url` payload field and
+automatically enable APNs `mutable-content`; the iOS app needs a Notification
+Service Extension that downloads the URL and attaches it to the notification.
+Action buttons use `category`, which must match a category registered by the
+app. Bundle localization is available through `title_loc_key`,
+`subtitle_loc_key`, `body_loc_key`, and their corresponding `_loc_args`.
+
+Critical notifications require Apple's Critical Alerts entitlement and can use
+a critical sound object:
+
+```ts
+await lux.push.send("agent-123", {
+  title: "Immediate action required",
+  interruption_level: "critical",
+  sound: { critical: true, name: "default", volume: 1 },
+});
+```
+
+APNs transport options support collapse IDs, delivery expiration, and
+priorities `1`, `5`, or `10`. Background-only notifications use push type
+`background` and require priority `5`; other notifications use `alert`. Lux
+generates a stable, unique APNs request UUID per durable outbox delivery.
+
 ## Tables
 
 Queries and mutations return a Supabase-style result object:
@@ -114,6 +170,29 @@ const { data: deleted } = await lux
   .delete()
   .eq("id", inserted?.id);
 ```
+
+### Point access by primary key
+
+When you already know a row's primary key, skip the query builder entirely and
+address the row directly with `.row(pk)`. It works for any PK type (int, UUID,
+string).
+
+```ts
+// read the whole row, or a single column
+const { data: user } = await lux.table<User>("users").row(123).get();
+const { data: age }  = await lux.table<User>("users").row(123).get("age");
+
+// point-update one cell, or several at once
+await lux.table("users").row(123).set("age", 30);
+await lux.table("users").row(123).set({ age: 30, name: "Ada" });
+```
+
+`.set()` updates an existing row (it is not an upsert) and resolves to the
+updated row. On the wire this is a direct cell write, not a `WHERE` query, so it
+skips the query planner — but it still runs the full table write path: column
+types, unique constraints, secondary/JSON indexes, encryption, TTL, and `.live()`
+change events are all enforced, and reads and writes are grant-checked exactly
+like the query builder. It is a typed fast path, not raw key/value access.
 
 ### Filters and JSON
 
@@ -211,6 +290,82 @@ await live.unsubscribe();
 const { data, error } = await lux.auth.signInWithOAuth({
   provider: "google",
   redirectTo: "https://app.example.com/auth/callback",
+});
+
+if (error) throw error;
+```
+
+For Sign in with Apple on the web, configure the provider from trusted server
+code with a secret project key. `apple_private_key` is the contents of the
+`AuthKey_*.p8` file from Apple, not its path. Omit it on later updates to retain
+the stored key.
+
+```ts
+import { createClient } from "@luxdb/sdk";
+
+const admin = createClient(
+  "https://api.example.com/v1/my-project",
+  process.env.LUX_SECRET_KEY!
+);
+
+const { data: provider, error: providerError } = await admin.auth.upsertProvider({
+  provider: "apple",
+  apple_services_id: "com.example.web",
+  apple_team_id: "TEAMID1234",
+  apple_key_id: "KEYID12345",
+  apple_private_key: process.env.APPLE_PRIVATE_KEY,
+  apple_bundle_ids: "com.example.ios,com.example.macos",
+  redirect_uri: "https://api.example.com/v1/my-project/auth/v1/callback/apple",
+});
+
+if (providerError) throw providerError;
+console.log(provider.has_apple_private_key);
+```
+
+`apple_bundle_ids` is a comma-separated list of native app audiences accepted
+from Apple identity tokens. It can be configured by itself for native-only
+Sign in with Apple:
+
+```ts
+await admin.auth.upsertProvider({
+  provider: "apple",
+  apple_bundle_ids: "com.example.ios,com.example.macos",
+});
+```
+
+To support web and native sign-in together, send `apple_bundle_ids` alongside
+the web fields as shown in the first example. Apple upserts preserve omitted
+fields, including an omitted `apple_private_key`.
+
+For native Apple sign-in, request the one-time nonce before presenting Apple's
+authorization UI. Pass the SHA-256 hash of `nonce.data.nonce` to Apple, then
+exchange Apple's identity token together with the original nonce:
+
+```ts
+const nonce = await lux.auth.getAppleSignInNonce();
+if (nonce.error) throw nonce.error;
+
+const name = [
+  appleCredential.fullName?.givenName,
+  appleCredential.fullName?.middleName,
+  appleCredential.fullName?.familyName,
+].filter(Boolean).join(" ");
+
+const result = await lux.auth.signInWithApple({
+  idToken: appleCredential.identityToken,
+  nonce: nonce.data.nonce,
+  user: name ? { name } : undefined,
+});
+```
+
+Start Apple sign-in from browser code using the same callback handling as the
+other OAuth providers:
+
+```ts
+const { data, error } = await lux.auth.signInWithOAuth({
+  provider: "apple",
+  redirectTo: "https://app.example.com/auth/callback",
+  flow: "code",
 });
 
 if (error) throw error;

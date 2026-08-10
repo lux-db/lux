@@ -398,6 +398,92 @@ async fn live_websocket_table_subscription_receives_http_insert() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_encrypted_table_streams_plaintext_rows_without_key_event_value_leak() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux_with_env(resp_port, http_port, None, &[("LUX_ENC_AUTO_INIT", "1")]);
+
+    let (status, created) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"encrypted_messages","columns":[{"name":"id","type":"STR","primaryKey":true},{"name":"email","type":"STR","encrypted":true,"searchable":true},{"name":"token","type":"STR","encrypted":true}]}"#,
+        None,
+    );
+    assert_eq!(status, 200, "create encrypted table: {created}");
+
+    let mut table_ws = connect_live(http_port, None).await;
+    send_json(
+        &mut table_ws,
+        json!({
+            "type":"live.subscribe",
+            "id":"messages",
+            "spec":{
+                "kind":"table",
+                "table":"encrypted_messages",
+                "where":{"email":"a@example.com"}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(recv_json(&mut table_ws).await["type"], "live.subscribed");
+    let snapshot = recv_live_event(&mut table_ws, "messages").await;
+    assert_eq!(snapshot["kind"], "snapshot");
+    assert_eq!(snapshot["rows"].as_array().unwrap().len(), 0);
+
+    let mut key_ws = connect_live(http_port, None).await;
+    send_json(
+        &mut key_ws,
+        json!({"type":"live.subscribe","id":"keys","spec":{"kind":"key","pattern":"encrypted_messages"}}),
+    )
+    .await;
+    assert_eq!(recv_json(&mut key_ws).await["type"], "live.subscribed");
+
+    let (status, inserted) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/encrypted_messages",
+        r#"{"id":"msg-1","email":"a@example.com","token":"live-secret"}"#,
+        None,
+    );
+    assert_eq!(status, 200, "insert encrypted row: {inserted}");
+    assert_eq!(inserted["result"]["token"], "live-secret");
+
+    let key_event = recv_live_event(&mut key_ws, "keys").await;
+    assert_eq!(key_event["kind"], "key.update");
+    assert_eq!(key_event["key"], "encrypted_messages");
+    let key_json = key_event.to_string();
+    assert!(
+        !key_json.contains("live-secret") && !key_json.contains("a@example.com"),
+        "key event leaked encrypted table values: {key_json}"
+    );
+
+    let insert = recv_live_event(&mut table_ws, "messages").await;
+    assert_eq!(insert["kind"], "insert");
+    assert_eq!(insert["pk"], "msg-1");
+    assert_eq!(insert["row"]["email"], "a@example.com");
+    assert_eq!(insert["row"]["token"], "live-secret");
+    let insert_json = insert.to_string();
+    assert!(
+        !insert_json.contains("LUXENC2"),
+        "table live event exposed encrypted envelope bytes: {insert_json}"
+    );
+
+    let (status, updated) = http_json_request(
+        http_port,
+        "PATCH",
+        "/v1/tables/encrypted_messages?where=email=a@example.com",
+        r#"{"token":"rotated-secret"}"#,
+        None,
+    );
+    assert_eq!(status, 200, "update encrypted row: {updated}");
+    let update = recv_live_event(&mut table_ws, "messages").await;
+    assert_eq!(update["kind"], "update");
+    assert_eq!(update["row"]["token"], "rotated-secret");
+    assert_eq!(update["previous"]["token"], "live-secret");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_websocket_join_reacts_to_joined_table_insert() {
     let (resp_port, http_port) = free_port_pair();
     let _server = start_lux(resp_port, http_port, None);
@@ -742,4 +828,459 @@ async fn live_anonymous_session_subscribes_granted_table() {
     assert_eq!(insert["kind"], "insert");
     assert_eq!(insert["pk"], "n1");
     assert_eq!(insert["row"]["body"], "hello");
+}
+
+// Incremental view maintenance: an UPDATE that moves a row across the WHERE
+// predicate must emit exactly one insert (move-in) or delete (move-out), and an
+// in-place change to a matching row must emit an update. This is the case the
+// coarse re-query path handled but the delta path must reproduce precisely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_table_where_predicate_transitions_emit_incremental_deltas() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, None);
+
+    let (status, created) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"tasks","columns":[{"name":"id","type":"STR","primaryKey":true},{"name":"status","type":"STR","notNull":true},{"name":"title","type":"STR"}]}"#,
+        None,
+    );
+    assert_eq!(status, 200, "create table: {created}");
+
+    let mut ws = connect_live(http_port, None).await;
+    send_json(
+        &mut ws,
+        json!({
+            "type":"live.subscribe",
+            "id":"open",
+            "spec":{"kind":"table","table":"tasks","where":{"status":"open"}}
+        }),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws).await["type"], "live.subscribed");
+    assert_eq!(recv_live_event(&mut ws, "open").await["kind"], "snapshot");
+
+    // Insert a matching row -> insert.
+    let (status, _) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/tasks",
+        r#"{"id":"t1","status":"open","title":"first"}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+    let e = recv_live_event(&mut ws, "open").await;
+    assert_eq!(e["kind"], "insert");
+    assert_eq!(e["pk"], "t1");
+    assert_eq!(e["cause"]["kind"], "table.insert");
+
+    // Insert a non-matching row -> no event.
+    let (status, _) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/tasks",
+        r#"{"id":"t2","status":"closed","title":"second"}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+    let none = tokio::time::timeout(Duration::from_millis(250), ws.next()).await;
+    assert!(none.is_err(), "non-matching insert should not emit");
+
+    // Move t2 into the predicate via UPDATE -> insert (not update).
+    let (status, _) = http_json_request(
+        http_port,
+        "PATCH",
+        "/v1/tables/tasks/t2",
+        r#"{"status":"open"}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+    let e = recv_live_event(&mut ws, "open").await;
+    assert_eq!(e["kind"], "insert", "move-in should read as insert: {e}");
+    assert_eq!(e["pk"], "t2");
+
+    // In-place change to a matching row -> update.
+    let (status, _) = http_json_request(
+        http_port,
+        "PATCH",
+        "/v1/tables/tasks/t1",
+        r#"{"title":"renamed"}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+    let e = recv_live_event(&mut ws, "open").await;
+    assert_eq!(e["kind"], "update", "in-place change should be update: {e}");
+    assert_eq!(e["pk"], "t1");
+    assert_eq!(e["row"]["title"], "renamed");
+    assert_eq!(e["cause"]["kind"], "table.update");
+
+    // Move t1 out of the predicate via UPDATE -> delete (not update).
+    let (status, _) = http_json_request(
+        http_port,
+        "PATCH",
+        "/v1/tables/tasks/t1",
+        r#"{"status":"done"}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+    let e = recv_live_event(&mut ws, "open").await;
+    assert_eq!(e["kind"], "delete", "move-out should read as delete: {e}");
+    assert_eq!(e["pk"], "t1");
+    assert_eq!(e["cause"]["kind"], "table.delete");
+
+    // An UPDATE to a row that is out of the set on both sides -> no event.
+    let (status, _) = http_json_request(
+        http_port,
+        "PATCH",
+        "/v1/tables/tasks/t1",
+        r#"{"title":"still done"}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+    let none = tokio::time::timeout(Duration::from_millis(250), ws.next()).await;
+    assert!(none.is_err(), "out-of-set update should not emit");
+
+    // Delete the remaining matching row -> delete.
+    let reply = resp_command(
+        resp_port,
+        &["TDELETE", "FROM", "tasks", "WHERE", "id", "=", "t2"],
+    );
+    assert!(!reply.contains("ERR"), "tdelete: {reply}");
+    let e = recv_live_event(&mut ws, "open").await;
+    assert_eq!(e["kind"], "delete");
+    assert_eq!(e["pk"], "t2");
+}
+
+// Parity: the incrementally-maintained result set must equal a fresh TSELECT of
+// the same query after an arbitrary write sequence (IVM == ground truth).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_table_ivm_result_matches_fresh_select() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, None);
+
+    let (status, created) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"items","columns":[{"name":"id","type":"STR","primaryKey":true},{"name":"bucket","type":"STR","notNull":true},{"name":"v","type":"INT"}]}"#,
+        None,
+    );
+    assert_eq!(status, 200, "create: {created}");
+
+    let mut ws = connect_live(http_port, None).await;
+    send_json(
+        &mut ws,
+        json!({
+            "type":"live.subscribe",
+            "id":"a",
+            "spec":{"kind":"table","table":"items","where":{"bucket":"a"}}
+        }),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws).await["type"], "live.subscribed");
+    assert_eq!(recv_live_event(&mut ws, "a").await["kind"], "snapshot");
+
+    // A mixed write sequence: inserts, in/out moves, in-place updates, deletes.
+    let writes: &[(&str, &str, &str)] = &[
+        (
+            "POST",
+            "/v1/tables/items",
+            r#"{"id":"i1","bucket":"a","v":1}"#,
+        ),
+        (
+            "POST",
+            "/v1/tables/items",
+            r#"{"id":"i2","bucket":"b","v":2}"#,
+        ),
+        (
+            "POST",
+            "/v1/tables/items",
+            r#"{"id":"i3","bucket":"a","v":3}"#,
+        ),
+        ("PATCH", "/v1/tables/items/i2", r#"{"bucket":"a"}"#), // move in
+        ("PATCH", "/v1/tables/items/i1", r#"{"v":10}"#),       // in-place
+        ("PATCH", "/v1/tables/items/i3", r#"{"bucket":"c"}"#), // move out
+        (
+            "POST",
+            "/v1/tables/items",
+            r#"{"id":"i4","bucket":"a","v":4}"#,
+        ),
+    ];
+    for (method, path, body) in writes {
+        let (status, resp) = http_json_request(http_port, method, path, body, None);
+        assert_eq!(status, 200, "{method} {path}: {resp}");
+    }
+    // Delete i2 (RESP, since HTTP delete-by-id is a where-filtered bulk route).
+    let reply = resp_command(
+        resp_port,
+        &["TDELETE", "FROM", "items", "WHERE", "id", "=", "i2"],
+    );
+    assert!(!reply.contains("ERR"), "tdelete: {reply}");
+
+    // Reconstruct the client's maintained result set purely from the delta
+    // stream, applying each event the way a real client would.
+    let mut client: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    while let Ok(event) =
+        tokio::time::timeout(Duration::from_millis(300), recv_live_event(&mut ws, "a")).await
+    {
+        let pk = event["pk"].as_str().unwrap().to_string();
+        match event["kind"].as_str().unwrap() {
+            "insert" | "update" => {
+                client.insert(pk, event["row"].clone());
+            }
+            "delete" => {
+                client.remove(&pk);
+            }
+            other => panic!("unexpected event kind {other}: {event}"),
+        }
+    }
+
+    // Ground truth after the sequence, restricted to bucket == "a":
+    //   i1: inserted (a,1) then v->10           => present, v=10
+    //   i2: (b,2) -> moved to a -> deleted        => absent
+    //   i3: (a,3) -> moved to c                    => absent
+    //   i4: inserted (a,4)                         => present, v=4
+    let mut client_ids: Vec<&String> = client.keys().collect();
+    client_ids.sort();
+    assert_eq!(
+        client_ids,
+        vec![&"i1".to_string(), &"i4".to_string()],
+        "IVM-maintained set must converge to ground truth: {client:?}"
+    );
+    assert_eq!(
+        client["i1"]["v"],
+        json!(10),
+        "i1 reflects the in-place update"
+    );
+    assert_eq!(client["i4"]["v"], json!(4));
+}
+
+// After a live socket disconnects, its row-delta subscription must be torn down
+// so the broker's per-table channel and subscriber gate are reclaimed. A fresh
+// connection re-subscribing to the same table must still receive deltas, proving
+// the teardown left the broker in a clean, reusable state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_table_ivm_survives_reconnect_after_disconnect() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, None);
+
+    let (status, _) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"beats","columns":[{"name":"id","type":"STR","primaryKey":true},{"name":"room","type":"STR"}]}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+
+    // First subscriber connects, gets its snapshot, then drops the socket.
+    {
+        let mut ws = connect_live(http_port, None).await;
+        send_json(
+            &mut ws,
+            json!({"type":"live.subscribe","id":"b","spec":{"kind":"table","table":"beats"}}),
+        )
+        .await;
+        assert_eq!(recv_json(&mut ws).await["type"], "live.subscribed");
+        assert_eq!(recv_live_event(&mut ws, "b").await["kind"], "snapshot");
+        // ws dropped here -> server-side teardown should reclaim the channel.
+    }
+
+    // Give the server a moment to observe the close and run teardown.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A brand-new connection re-subscribes to the same table and must still get
+    // incremental deltas (the reclaimed channel is transparently recreated).
+    let mut ws2 = connect_live(http_port, None).await;
+    send_json(
+        &mut ws2,
+        json!({"type":"live.subscribe","id":"b2","spec":{"kind":"table","table":"beats"}}),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws2).await["type"], "live.subscribed");
+    assert_eq!(recv_live_event(&mut ws2, "b2").await["kind"], "snapshot");
+
+    let (status, _) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables/beats",
+        r#"{"id":"k1","room":"main"}"#,
+        None,
+    );
+    assert_eq!(status, 200);
+
+    let e = recv_live_event(&mut ws2, "b2").await;
+    assert_eq!(e["kind"], "insert");
+    assert_eq!(e["pk"], "k1");
+}
+
+// --- Query-param handshake auth ----------------------------------------------
+//
+// A browser cannot set headers on a WebSocket handshake, so the SDK passes the
+// key in the query string. Every other test here authenticates via the
+// `Authorization` header, which is why a mismatch between the name the SDK sends
+// (`apikey`) and the name the engine read (`token`) shipped unnoticed: keyed
+// clients 401'd on the handshake unless they also had an end-user access token.
+
+async fn connect_live_query(http_port: u16, query: &str) -> Result<TestWs, String> {
+    match connect_async(format!("ws://127.0.0.1:{http_port}/live?{query}")).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Subscribe over an already-open socket to prove the connection is usable, not
+/// merely upgraded.
+async fn assert_live_subscribes(ws: &mut TestWs) {
+    send_json(
+        ws,
+        json!({"type":"live.subscribe","id":"q","spec":{"kind":"key","pattern":"probe:*"}}),
+    )
+    .await;
+    let subscribed = recv_json(ws).await;
+    assert_eq!(subscribed["type"], "live.subscribed");
+    assert_eq!(subscribed["id"], "q");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_accepts_apikey_query_param() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, Some("secret"));
+
+    let mut ws = connect_live_query(http_port, "apikey=secret")
+        .await
+        .expect("apikey query param should authenticate the handshake");
+    assert_live_subscribes(&mut ws).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_accepts_token_query_param() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, Some("secret"));
+
+    // `token` predates the `apikey` alias; keep it working so an older SDK does
+    // not break against a current engine.
+    let mut ws = connect_live_query(http_port, "token=secret")
+        .await
+        .expect("token query param should still authenticate the handshake");
+    assert_live_subscribes(&mut ws).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_rejects_wrong_query_param_key() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux(resp_port, http_port, Some("secret"));
+
+    for query in ["apikey=wrong", "token=wrong", "apikey=", "other=secret"] {
+        let err = connect_live_query(http_port, query)
+            .await
+            .expect_err("bad query credential must not upgrade");
+        assert!(err.contains("401"), "{query}: unexpected error: {err}");
+    }
+}
+
+// --- Secret key on /live ------------------------------------------------------
+//
+// A secret key is the server-side credential, so it must reach the live socket
+// on its own. Before the unified model the engine only knew the password, so a
+// server-side client could not subscribe at all and had to be given a session
+// (or hand-roll RESP pub/sub) instead.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_accepts_secret_key() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux_with_env(
+        resp_port,
+        http_port,
+        None,
+        &[
+            ("LUX_AUTH_ENABLED", "1"),
+            ("LUX_AUTH_SECRET_KEY", "lux_sec_livetest"),
+            ("LUX_AUTH_PUBLISHABLE_KEY", "lux_pub_livetest"),
+        ],
+    );
+
+    // Both the header and the query-param handshake, since the SDK uses the
+    // latter and browsers cannot set headers.
+    let mut ws = connect_live(http_port, Some("lux_sec_livetest")).await;
+    assert_live_subscribes(&mut ws).await;
+
+    let mut ws = connect_live_query(http_port, "apikey=lux_sec_livetest")
+        .await
+        .expect("secret key should authenticate the /live handshake");
+    assert_live_subscribes(&mut ws).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_secret_key_subscribes_to_a_table() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux_with_env(
+        resp_port,
+        http_port,
+        None,
+        &[
+            ("LUX_AUTH_ENABLED", "1"),
+            ("LUX_AUTH_SECRET_KEY", "lux_sec_livetest"),
+        ],
+    );
+
+    // Create the table over HTTP with the same key, which also demonstrates the
+    // point: one secret key covers both the data route and the live socket.
+    let (status, created) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/tables",
+        r#"{"name":"notes","columns":[{"name":"id","type":"STR","primaryKey":true},{"name":"body","type":"STR"}]}"#,
+        Some("lux_sec_livetest"),
+    );
+    assert!(
+        status < 400,
+        "create table with secret key: {status} {created}"
+    );
+
+    let mut ws = connect_live_query(http_port, "apikey=lux_sec_livetest")
+        .await
+        .expect("secret key handshake");
+    send_json(
+        &mut ws,
+        json!({"type":"live.subscribe","id":"t","spec":{"kind":"table","table":"notes","select":"*"}}),
+    )
+    .await;
+    let subscribed = recv_json(&mut ws).await;
+    assert_eq!(
+        subscribed["type"], "live.subscribed",
+        "secret key must open a table subscription: {subscribed}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_websocket_refuses_publishable_key_without_a_user() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux_with_env(
+        resp_port,
+        http_port,
+        None,
+        &[
+            ("LUX_AUTH_ENABLED", "1"),
+            ("LUX_AUTH_SECRET_KEY", "lux_sec_livetest"),
+            ("LUX_AUTH_PUBLISHABLE_KEY", "lux_pub_livetest"),
+        ],
+    );
+
+    // Publishable identifies the project, not a person. Without an end-user
+    // token there is no principal to evaluate grants against, so no data.
+    let err = connect_live_query(http_port, "apikey=lux_pub_livetest")
+        .await
+        .expect_err("publishable alone must not open a live socket");
+    assert!(err.contains("401"), "unexpected error: {err}");
 }

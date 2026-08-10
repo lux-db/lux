@@ -185,7 +185,23 @@ pub fn cmd_smove(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         return CmdResult::Written;
     }
     match store.smove(args[1], args[2], args[3], now) {
-        Ok(b) => resp::write_integer(out, if b { 1 } else { 0 }),
+        Ok(b) => {
+            // Self-log the resolved effect as a keyed SREM on src + SADD on dst so
+            // each replays in its own WAL shard's order. The raw SMOVE would land
+            // wholesale in src's shard and replay the dst insert out of order vs
+            // dst's own writes. Batched: atomic when src/dst share a shard, split
+            // (correctly sharded) when they don't. No-op if nothing moved.
+            if b && store.wal_enabled() {
+                let srem: [&[u8]; 3] = [b"SREM", args[1], args[3]];
+                let sadd: [&[u8]; 3] = [b"SADD", args[2], args[3]];
+                let batch: [&[&[u8]]; 2] = [&srem, &sadd];
+                if let Err(e) = store.wal_log_command_batch(&batch) {
+                    resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                    return CmdResult::Written;
+                }
+            }
+            resp::write_integer(out, if b { 1 } else { 0 });
+        }
         Err(e) => resp::write_error(out, &e),
     }
     CmdResult::Written

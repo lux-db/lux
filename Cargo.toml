@@ -1,6 +1,6 @@
 [package]
 name = "lux"
-version = "0.24.2"
+version = "0.37.0"
 edition = "2021"
 description = "An open-source application database engine with tables, cache, vectors, auth, realtime, queues, time series, and Redis-compatible commands."
 license = "MIT"
@@ -34,14 +34,18 @@ rmp = "0.8"
 serde_json = "1"
 tokio-tungstenite = "0.24"
 argon2 = "0.5"
+bcrypt = "0.17"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+p256 = { version = "0.13", features = ["jwk", "ecdh"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ring = "0.17"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+rsa = { version = "0.9", features = ["pem"] }
 
 [profile.release]
 opt-level = 3

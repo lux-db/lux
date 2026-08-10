@@ -87,23 +87,20 @@ fn extract_two_bulk_integers(data: &[u8]) -> Option<(i64, i64)> {
     let mut i = 0;
     while i < data.len() && vals.len() < 2 {
         if data[i] == b'$' {
-            if let Some(nl) = memchr(b'\n', &data[i..]) {
-                let len_str = std::str::from_utf8(&data[i + 1..i + nl - 1]).ok()?;
-                let len: i64 = len_str.parse().ok()?;
-                i += nl + 1;
-                if len < 0 {
-                    return None;
-                }
-                let end = i + len as usize;
-                if end > data.len() {
-                    return None;
-                }
-                let val_str = std::str::from_utf8(&data[i..end]).ok()?;
-                vals.push(val_str.parse::<i64>().ok()?);
-                i = end + 2;
-            } else {
+            let nl = memchr(b'\n', &data[i..])?;
+            let len_str = std::str::from_utf8(&data[i + 1..i + nl - 1]).ok()?;
+            let len: i64 = len_str.parse().ok()?;
+            i += nl + 1;
+            if len < 0 {
                 return None;
             }
+            let end = i + len as usize;
+            if end > data.len() {
+                return None;
+            }
+            let val_str = std::str::from_utf8(&data[i..end]).ok()?;
+            vals.push(val_str.parse::<i64>().ok()?);
+            i = end + 2;
         } else {
             i += 1;
         }

@@ -36,6 +36,91 @@ describe('Lux project client', () => {
 		expect(seen?.body).toEqual({ command: ['PING'] });
 	});
 
+	test('push registration forwards the APNs device environment', async () => {
+		let seen: { url: string; body?: any } | null = null;
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			seen = {
+				url: String(input),
+				body: init?.body ? JSON.parse(String(init.body)) : undefined,
+			};
+			return new Response(JSON.stringify({ id: 'dev_1' }), { status: 200 });
+		};
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const result = await client.push.register({
+			token: 'apns-device-token',
+			environment: 'production',
+		});
+
+		expect(result.error).toBeNull();
+		expect(seen?.url).toBe('http://localhost:3957/v1/project/push/devices');
+		expect(seen?.body).toEqual({
+			token: 'apns-device-token',
+			platform: 'ios',
+			app_id: 'default',
+			environment: 'production',
+		});
+	});
+
+	test('push send forwards the APNs interruption level', async () => {
+		let seen: { url: string; body?: any } | null = null;
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			seen = {
+				url: String(input),
+				body: init?.body ? JSON.parse(String(init.body)) : undefined,
+			};
+			return new Response(JSON.stringify({ enqueued: 1 }), { status: 200 });
+		};
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const result = await client.push.send('user-1', {
+			title_loc_key: 'QUESTION_TITLE',
+			title_loc_args: ['Codex'],
+			body: 'The agent is waiting.',
+			interruption_level: 'time-sensitive',
+			sound: 'alarm.caf',
+			target_content_id: 'question-window',
+			relevance_score: 0.9,
+			filter_criteria: 'work',
+			apns: {
+				collapse_id: 'question-user-1',
+				expiration: 1_900_000_000,
+				priority: 10,
+			},
+			data: { question: { id: 7 }, requires_reply: true },
+		});
+
+		expect(result).toEqual({ data: { enqueued: 1 }, error: null });
+		expect(seen?.url).toBe('http://localhost:3957/v1/project/push/send');
+		expect(seen?.body).toEqual({
+			subject_id: 'user-1',
+			notification: {
+				title_loc_key: 'QUESTION_TITLE',
+				title_loc_args: ['Codex'],
+				body: 'The agent is waiting.',
+				interruption_level: 'time-sensitive',
+				sound: 'alarm.caf',
+				target_content_id: 'question-window',
+				relevance_score: 0.9,
+				filter_criteria: 'work',
+				apns: {
+					collapse_id: 'question-user-1',
+					expiration: 1_900_000_000,
+					priority: 10,
+				},
+				data: { question: { id: 7 }, requires_reply: true },
+			},
+		});
+	});
+
 	test('default fetch is bound for browser project requests', async () => {
 		const originalFetch = globalThis.fetch;
 		let receiver: unknown;
@@ -106,6 +191,47 @@ describe('Lux project client', () => {
 		expect(seen?.headers.Authorization).toBe('Bearer existing-user-jwt');
 	});
 
+	test('row(pk) point access issues GET/PATCH by id', async () => {
+		const seen: Array<{ url: string; method: string; body?: string }> = [];
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const method = init?.method ?? 'GET';
+			seen.push({ url: String(input), method, body: init?.body as string | undefined });
+			const payload =
+				method === 'PATCH'
+					? { result: [{ id: 1, body: 'hi', age: 31 }] }
+					: { result: { id: 1, body: 'hi', age: 30 } };
+			return new Response(JSON.stringify(payload), { status: 200 });
+		};
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		// Whole row by pk.
+		const whole = await client.table('messages').row(1).get();
+		expect(whole.error).toBeNull();
+		expect(whole.data).toEqual({ id: 1, body: 'hi', age: 30 });
+		expect(seen.at(-1)?.method).toBe('GET');
+		expect(seen.at(-1)?.url).toBe('http://localhost:3957/v1/project/tables/messages/1');
+
+		// Single cell.
+		const cell = await client.table('messages').row(1).get('body');
+		expect(cell.data).toBe('hi');
+
+		// Point-set one cell -> PATCH by id with just that field.
+		const set1 = await client.table('messages').row(1).set('age', 31);
+		expect(set1.error).toBeNull();
+		expect(set1.data).toEqual({ id: 1, body: 'hi', age: 31 });
+		expect(seen.at(-1)?.method).toBe('PATCH');
+		expect(seen.at(-1)?.url).toBe('http://localhost:3957/v1/project/tables/messages/1');
+		expect(JSON.parse(seen.at(-1)?.body ?? '{}')).toEqual({ age: 31 });
+
+		// Point-set several cells via a patch object.
+		await client.table('messages').row(1).set({ body: 'x', age: 5 });
+		expect(JSON.parse(seen.at(-1)?.body ?? '{}')).toEqual({ body: 'x', age: 5 });
+	});
+
 	test('table filters use supabase-style fluent query builders', async () => {
 		const seen: string[] = [];
 		const fetchImpl = async (input: RequestInfo | URL) => {
@@ -132,6 +258,8 @@ describe('Lux project client', () => {
 		await client.table('tasks').select().isNull('deleted_at');
 		await client.table('tasks').select().is('deleted_at', null);
 		await client.table('tasks').select().isNotNull('deleted_at');
+		await client.table('profiles').select().ilike('display_name', '%mat%');
+		await client.table('profiles').select().or('display_name.ilike.%mat%,email.eq.m@example.com');
 
 		expect(seen).toEqual([
 			'http://localhost:3957/v1/project/tables/messages?where=id+%3D+1&limit=10',
@@ -142,6 +270,8 @@ describe('Lux project client', () => {
 			'http://localhost:3957/v1/project/tables/tasks?where=deleted_at+IS+NULL',
 			'http://localhost:3957/v1/project/tables/tasks?where=deleted_at+IS+NULL',
 			'http://localhost:3957/v1/project/tables/tasks?where=deleted_at+IS+NOT+NULL',
+			'http://localhost:3957/v1/project/tables/profiles?where=display_name+ILIKE+%25mat%25',
+			'http://localhost:3957/v1/project/tables/profiles?where=display_name+ILIKE+%25mat%25+OR+email+%3D+m%40example.com',
 		]);
 	});
 
@@ -161,6 +291,8 @@ describe('Lux project client', () => {
 		await client.table('posts').select().eq('title', 'a OR b').gt('rank', 5); // space -> quoted
 		await client.table('people').select().eq('name', "O'Brien"); // no space -> bare (back-compat)
 		await client.table('users').select().eq('email', 'a@b.com'); // no space -> bare
+		await client.table('filters').select().eq('expr', 'a=b'); // operator char -> quoted
+		await client.table('filters').select().eq('range', 'x<y'); // operator char -> quoted
 		await client.table('nums').select().eq('id', 42); // number -> bare
 
 		expect(seen).toEqual([
@@ -168,6 +300,8 @@ describe('Lux project client', () => {
 			"title = 'a OR b' AND rank > 5",
 			"name = O'Brien",
 			'email = a@b.com',
+			"expr = 'a=b'",
+			"range = 'x<y'",
 			'id = 42',
 		]);
 	});
@@ -189,6 +323,56 @@ describe('Lux project client', () => {
 			data: { id: 1, body: 'hello' },
 			error: null,
 		});
+	});
+
+	test('maybeSingle returns null for an empty result', async () => {
+		const fetchImpl = async () => {
+			return new Response(JSON.stringify({ result: [] }), { status: 200 });
+		};
+
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const result = await client.table<{ id: number; body: string }>('messages').select().eq('id', 99).maybeSingle();
+
+		expect(result).toEqual({
+			data: null,
+			error: null,
+		});
+	});
+
+	test('single and maybeSingle detect multiple rows', async () => {
+		const urls: string[] = [];
+		const fetchImpl = async (input: RequestInfo | URL) => {
+			urls.push(String(input));
+			return new Response(JSON.stringify({ result: [{ id: 1 }, { id: 2 }] }), { status: 200 });
+		};
+
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const single = await client.table<{ id: number }>('messages').select().eq('room', 'general').single();
+		const maybeSingle = await client.table<{ id: number }>('messages').select().eq('room', 'general').maybeSingle();
+
+		expect(single).toEqual({
+			data: null,
+			error: {
+				code: 'MULTIPLE_ROWS',
+				message: "Multiple rows found in table 'messages'",
+				details: undefined,
+			},
+		});
+		expect(maybeSingle.error?.code).toBe('MULTIPLE_ROWS');
+		expect(urls).toEqual([
+			'http://localhost:3957/v1/project/tables/messages?where=room+%3D+general&limit=2',
+			'http://localhost:3957/v1/project/tables/messages?where=room+%3D+general&limit=2',
+		]);
 	});
 
 	test('update and delete require fluent filters', async () => {
@@ -263,6 +447,69 @@ describe('Lux project client', () => {
 
 		const updated = await client.table('messages').update({ body: 'edited' }).eq('id', '019ed-uuid');
 		expect(updated).toEqual({ data: [{ id: '019ed-uuid', body: 'edited' }], error: null });
+	});
+
+	test('mutation single returns one affected row', async () => {
+		const calls: Array<{ method?: string; url: string }> = [];
+		const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({ method: init?.method, url: String(input) });
+			return new Response(JSON.stringify({ result: [{ id: '019ed-uuid', body: 'edited' }] }), {
+				status: 200,
+			});
+		};
+
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const updated = await client
+			.table<{ id: string; body: string }>('messages')
+			.update({ body: 'edited' })
+			.eq('id', '019ed-uuid')
+			.single();
+		const deleted = await client
+			.table<{ id: string; body: string }>('messages')
+			.delete()
+			.eq('id', '019ed-uuid')
+			.single();
+
+		expect(updated).toEqual({ data: { id: '019ed-uuid', body: 'edited' }, error: null });
+		expect(deleted).toEqual({ data: { id: '019ed-uuid', body: 'edited' }, error: null });
+		expect(calls).toEqual([
+			{
+				method: 'PATCH',
+				url: 'http://localhost:3957/v1/project/tables/messages?where=id+%3D+019ed-uuid',
+			},
+			{
+				method: 'DELETE',
+				url: 'http://localhost:3957/v1/project/tables/messages?where=id+%3D+019ed-uuid',
+			},
+		]);
+	});
+
+	test('mutation single errors when no rows are affected', async () => {
+		const fetchImpl = async () => {
+			return new Response(JSON.stringify({ result: [] }), { status: 200 });
+		};
+
+		const client = createProjectClient({
+			url: 'http://localhost:3957/v1/project',
+			key: 'lux_sec_test',
+			fetch: fetchImpl as typeof fetch,
+		});
+
+		const updated = await client.table('messages').update({ body: 'edited' }).eq('id', 'missing').single();
+
+		expect(updated).toEqual({
+			data: null,
+			error: {
+				code: 'NOT_FOUND',
+				message: "No rows affected in table 'messages'",
+				details: undefined,
+			},
+		});
 	});
 
 	test('multi-row insert sends one request with an array body', async () => {
@@ -507,7 +754,7 @@ describe('Lux project client', () => {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(sockets).toHaveLength(1);
 		expect(sockets[0].url).toBe(
-			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&access_token=user-jwt',
+			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&token=lux_pub_test&access_token=user-jwt',
 		);
 
 		sockets[0].open();
@@ -623,7 +870,9 @@ describe('Lux project client', () => {
 		const livePromise = client.table('messages').live();
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(sockets).toHaveLength(1);
-		expect(sockets[0].url).toBe('ws://localhost:3957/v1/project/live?apikey=lux_pub_test');
+		expect(sockets[0].url).toBe(
+			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&token=lux_pub_test',
+		);
 
 		sockets[0].open();
 		const firstSubscribe = JSON.parse(sockets[0].sent[0]);
@@ -647,7 +896,7 @@ describe('Lux project client', () => {
 
 		expect(sockets).toHaveLength(2);
 		expect(sockets[1].url).toBe(
-			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&access_token=user-jwt',
+			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&token=lux_pub_test&access_token=user-jwt',
 		);
 		sockets[1].open();
 		expect(JSON.parse(sockets[1].sent[0])).toEqual(firstSubscribe);
@@ -709,7 +958,7 @@ describe('Lux project client', () => {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(sockets).toHaveLength(1);
 		expect(sockets[0].url).toBe(
-			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&access_token=user-jwt',
+			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&token=lux_pub_test&access_token=user-jwt',
 		);
 
 		sockets[0].open();

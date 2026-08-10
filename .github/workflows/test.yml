@@ -16,18 +16,37 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
       - run: cargo build --release
-      - run: sudo apt-get update && sudo apt-get install -y redis-tools tcl
-      - run: git clone --depth 1 --branch 9.0.3 https://github.com/valkey-io/valkey.git /tmp/valkey
-      - name: Integration test
-        run: |
-          ./target/release/lux &
-          sleep 2
-          redis-cli PING
-          redis-cli SET hello world
-          test "$(redis-cli GET hello)" = "world"
-          redis-cli ZADD myzset 1 a 2 b 3 c
-          test "$(redis-cli ZCARD myzset)" = "3"
-      - name: Valkey string tests
-        run: cd /tmp/valkey && tclsh tests/test_helper.tcl --host 127.0.0.1 --port 6379 --single unit/type/string || true
-      - name: Valkey keyspace tests
-        run: cd /tmp/valkey && tclsh tests/test_helper.tcl --host 127.0.0.1 --port 6379 --single unit/keyspace || true
+
+  cli:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+      - run: cargo build --release
+
+  cli-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --bin lux
+      - run: cargo build --manifest-path cli/Cargo.toml
+      - run: bash cli/tests/e2e-local.sh
+
+  sdk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun run build

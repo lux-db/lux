@@ -13,6 +13,27 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Persist a TSADD to the WAL with the RESOLVED timestamp, so a server-generated
+/// `*` timestamp stays stable across a WAL-only crash recovery (otherwise replay
+/// re-runs `*` against the recovery-time clock and produces a different sample).
+/// `args[2]` is the timestamp slot. Returns false (and writes the error) on WAL
+/// failure; the caller must stop.
+fn log_resolved_tsadd(store: &Store, args: &[&[u8]], ts: i64, out: &mut BytesMut) -> bool {
+    if !store.wal_enabled() {
+        return true;
+    }
+    let mut owned: Vec<Vec<u8>> = args.iter().map(|arg| arg.to_vec()).collect();
+    owned[2] = ts.to_string().into_bytes();
+    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+    match store.wal_log_command(&refs) {
+        Ok(()) => true,
+        Err(e) => {
+            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+            false
+        }
+    }
+}
+
 pub fn cmd_tsadd(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 4 {
         resp::write_error(out, "ERR wrong number of arguments for 'tsadd' command");
@@ -63,7 +84,12 @@ pub fn cmd_tsadd(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
     }
 
     match store.tsadd(key, timestamp, value, retention, labels, now) {
-        Ok(ts) => resp::write_integer(out, ts),
+        Ok(ts) => {
+            if !log_resolved_tsadd(store, args, ts, out) {
+                return CmdResult::Written;
+            }
+            resp::write_integer(out, ts);
+        }
         Err(e) => resp::write_error(out, &e),
     }
     CmdResult::Written
@@ -86,7 +112,20 @@ pub fn cmd_tsmadd(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         };
         let value: f64 = arg_str(args[i + 2]).parse().unwrap_or(0.0);
         match store.tsadd(key, timestamp, value, None, None, now) {
-            Ok(ts) => resp::write_integer(out, ts),
+            Ok(ts) => {
+                // Self-log each sample with its RESOLVED timestamp (see
+                // log_resolved_tsadd) so `*` samples survive WAL replay unchanged.
+                if store.wal_enabled() {
+                    let ts_s = ts.to_string();
+                    let entry: [&[u8]; 4] = [b"TSADD", key, ts_s.as_bytes(), args[i + 2]];
+                    if let Err(e) = store.wal_log_command(&entry) {
+                        resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                        i += 3;
+                        continue;
+                    }
+                }
+                resp::write_integer(out, ts);
+            }
             Err(e) => resp::write_error(out, &e),
         }
         i += 3;

@@ -10,6 +10,7 @@ mod cmd;
 mod command;
 mod disk;
 mod embedded;
+mod encryption;
 mod eviction;
 #[cfg(feature = "fuzzing")]
 pub mod fuzz_api;
@@ -20,7 +21,9 @@ mod hnsw;
 mod http;
 mod jsonb;
 mod lua;
+mod migrations;
 mod pubsub;
+mod push;
 mod resp;
 mod shard_exec;
 mod snapshot;
@@ -48,6 +51,7 @@ pub use embedded::{
     EmbeddedPipeline, GeoMember, GeoPosition, GeoUnit, PreparedPipeline, RedisKeyType,
     ScoredMember, SetOptions,
 };
+pub use encryption::{EncryptionConfig, EncryptionKeyConfig};
 pub use eviction::{parse_eviction_policy, parse_memory_size, EvictionConfig, EvictionPolicy};
 
 const SUB_MODE_BATCH_MAX: usize = 64;
@@ -91,12 +95,55 @@ pub struct AuthConfig {
     pub refresh_token_ttl: Duration,
     /// Enables native email/password signup and sign-in.
     pub email_password_enabled: bool,
+    /// When true, email/password signup creates an unconfirmed user and requires
+    /// a confirmation token before password sign-in.
+    pub email_confirmation_required: bool,
     /// Enables accountless `signInAnonymously` sessions.
     pub anonymous_enabled: bool,
+    /// Lifetime for one-time auth flow tokens such as recovery links,
+    /// confirmation links, and OAuth authorization codes.
+    pub flow_token_ttl: Duration,
+    /// Base URL used when Lux needs to construct auth action links and no
+    /// explicit redirect target was supplied.
+    pub site_url: String,
     /// Optional initial publishable key material for local/bootstrap use.
     pub initial_publishable_key: Option<String>,
     /// Optional initial secret key material for local/bootstrap use.
     pub initial_secret_key: Option<String>,
+    /// Optional Cloud-managed email delivery config. This is intentionally not
+    /// seeded into `auth.settings`, so managed provider secrets can live
+    /// outside customer-readable project auth tables.
+    pub managed_email: Option<AuthManagedEmailConfig>,
+}
+
+/// Email delivery config injected by a host environment such as Lux Cloud.
+#[derive(Clone)]
+pub struct AuthManagedEmailConfig {
+    /// Delivery provider name. Supported today: `postmark`.
+    pub provider: String,
+    /// Sender address, optionally already formatted as `Name <email@example.com>`.
+    pub from: String,
+    /// Optional Reply-To address.
+    pub reply_to: Option<String>,
+    /// Postmark server token for managed delivery.
+    pub postmark_server_token: Option<String>,
+    /// Optional Postmark message stream. Defaults to `outbound`.
+    pub postmark_message_stream: Option<String>,
+}
+
+impl std::fmt::Debug for AuthManagedEmailConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthManagedEmailConfig")
+            .field("provider", &self.provider)
+            .field("from", &self.from)
+            .field("reply_to", &self.reply_to)
+            .field(
+                "postmark_server_token",
+                &self.postmark_server_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("postmark_message_stream", &self.postmark_message_stream)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for AuthConfig {
@@ -107,7 +154,13 @@ impl std::fmt::Debug for AuthConfig {
             .field("access_token_ttl", &self.access_token_ttl)
             .field("refresh_token_ttl", &self.refresh_token_ttl)
             .field("email_password_enabled", &self.email_password_enabled)
+            .field(
+                "email_confirmation_required",
+                &self.email_confirmation_required,
+            )
             .field("anonymous_enabled", &self.anonymous_enabled)
+            .field("flow_token_ttl", &self.flow_token_ttl)
+            .field("site_url", &self.site_url)
             .field(
                 "initial_publishable_key",
                 &self.initial_publishable_key.as_ref().map(|_| "<redacted>"),
@@ -116,6 +169,7 @@ impl std::fmt::Debug for AuthConfig {
                 "initial_secret_key",
                 &self.initial_secret_key.as_ref().map(|_| "<redacted>"),
             )
+            .field("managed_email", &self.managed_email)
             .finish()
     }
 }
@@ -124,13 +178,17 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            issuer: "http://localhost:7379/auth/v1".to_string(),
+            issuer: "http://localhost:5890/auth/v1".to_string(),
             access_token_ttl: Duration::from_secs(3600),
             refresh_token_ttl: Duration::from_secs(30 * 24 * 60 * 60),
             email_password_enabled: true,
+            email_confirmation_required: false,
             anonymous_enabled: true,
+            flow_token_ttl: Duration::from_secs(24 * 60 * 60),
+            site_url: "http://localhost:5890".to_string(),
             initial_publishable_key: None,
             initial_secret_key: None,
+            managed_email: None,
         }
     }
 }
@@ -177,6 +235,8 @@ pub struct ServerConfig {
     pub eviction: EvictionConfig,
     /// Per-project application auth configuration.
     pub auth: AuthConfig,
+    /// Table column encryption key configuration.
+    pub encryption: EncryptionConfig,
     /// Enables the RESP listener. Use this instead of overloading `port = 0`.
     pub enable_resp: bool,
     /// Optional informational event sink. Library mode is silent when unset.
@@ -206,6 +266,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("storage", &self.storage)
             .field("eviction", &self.eviction)
             .field("auth", &self.auth)
+            .field("encryption", &self.encryption)
             .field("enable_resp", &self.enable_resp)
             .field("on_info", &self.on_info.as_ref().map(|_| "<callback>"))
             .field("on_warn", &self.on_warn.as_ref().map(|_| "<callback>"))
@@ -233,6 +294,7 @@ impl Default for ServerConfig {
             storage: StorageConfig::default(),
             eviction: EvictionConfig::default(),
             auth: AuthConfig::default(),
+            encryption: EncryptionConfig::default(),
             enable_resp: true,
             on_info: None,
             on_warn: None,
@@ -357,9 +419,21 @@ fn validate_listener_security(config: &ServerConfig) -> std::io::Result<()> {
         return Ok(());
     }
 
-    let resp_exposed_without_auth =
-        config.enable_resp && (config.password.is_empty() || !config.require_auth);
-    let http_exposed_without_auth = config.http_port != 0 && config.password.is_empty();
+    // A project key is a credential in its own right, so a key-only engine (one
+    // with no LUX_PASSWORD) is authenticated and may bind a public interface.
+    // Judging this by the password alone would refuse to start exactly the
+    // configuration the unified credential model is moving towards.
+    //
+    // Publishable keys do not count for RESP: they can never use that protocol,
+    // so a publishable-only engine really would be unauthenticated there.
+    let resp_authenticated = (!config.password.is_empty() && config.require_auth)
+        || config.auth.initial_secret_key.is_some();
+    let http_authenticated = !config.password.is_empty()
+        || config.auth.initial_secret_key.is_some()
+        || config.auth.initial_publishable_key.is_some();
+
+    let resp_exposed_without_auth = config.enable_resp && !resp_authenticated;
+    let http_exposed_without_auth = config.http_port != 0 && !http_authenticated;
     if resp_exposed_without_auth || http_exposed_without_auth {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -411,6 +485,21 @@ fn validate_shard_count(config: &ServerConfig) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_encryption_config(config: &ServerConfig) -> std::io::Result<()> {
+    // Fail fast on a bad encryption config: unresolvable key material, a
+    // decrypt-only active key, or persisted state that no configured seal can
+    // unseal. Validate against the real data dir (not the process cwd, which
+    // would strand seal/state files there) with auto-init off, since creating a
+    // brand-new keyring is the store's job, not validation's.
+    let validation = EncryptionConfig {
+        auto_init: false,
+        ..config.encryption.clone()
+    };
+    crate::encryption::EncryptionKeyring::open(&validation, &config.data_dir)
+        .map(|_| ())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
 pub struct ServerHandle {
@@ -1684,9 +1773,12 @@ impl EmbeddedClient {
         }
         let key_s = std::str::from_utf8(key).unwrap_or("");
         if self.runtime.broker.has_list_waiters(key_s) {
-            self.runtime
-                .broker
-                .drain_list_waiters(key_s, &mut shard.data, now);
+            self.runtime.broker.drain_list_waiters(
+                key_s,
+                &mut shard.data,
+                &self.runtime.store,
+                now,
+            );
         }
     }
 
@@ -1721,6 +1813,8 @@ impl EmbeddedClient {
                 CmdResult::BlockMove { .. } => "BLMOVE",
                 CmdResult::BlockStreamRead { .. } => "XREAD/XREADGROUP",
                 CmdResult::BlockZPop { .. } => "BZPOP*",
+                CmdResult::BlockListMPop { .. } => "BLMPOP",
+                CmdResult::BlockZMPop { .. } => "BZMPOP",
                 _ => "unsupported",
             };
             return Err(LuxError::Unsupported(format!(
@@ -1925,7 +2019,14 @@ impl EmbeddedClient {
             ));
         };
 
-        wait_for_blocking_pop(&self.runtime.broker, &owned_keys, timeout, pop_left).await
+        wait_for_blocking_pop(
+            &self.runtime.store,
+            &self.runtime.broker,
+            &owned_keys,
+            timeout,
+            pop_left,
+        )
+        .await
     }
 
     async fn execute_owned(&self, argv: Vec<Vec<u8>>) -> Result<bytes::Bytes, LuxError> {
@@ -1947,6 +2048,8 @@ impl EmbeddedClient {
                 CmdResult::BlockMove { .. } => "BLMOVE",
                 CmdResult::BlockStreamRead { .. } => "XREAD/XREADGROUP",
                 CmdResult::BlockZPop { .. } => "BZPOP*",
+                CmdResult::BlockListMPop { .. } => "BLMPOP",
+                CmdResult::BlockZMPop { .. } => "BZMPOP",
                 _ => "unsupported",
             };
             return Err(LuxError::Unsupported(format!(
@@ -2629,6 +2732,7 @@ fn parse_blocking_pop_value(buf: &[u8]) -> Result<Option<(String, bytes::Bytes)>
 }
 
 async fn wait_for_blocking_pop(
+    store: &Store,
     broker: &Broker,
     keys: &[String],
     timeout: Duration,
@@ -2653,6 +2757,10 @@ async fn wait_for_blocking_pop(
         val = rx.recv() => val,
         _ = tokio::time::sleep(timeout) => None,
     };
+
+    if let Some((key, _)) = &result {
+        wal_log_blocked_pop(store, key.as_bytes(), pop_left);
+    }
 
     broker.remove_list_waiters_by_id(keys, waiter_id);
     Ok(result)
@@ -2825,6 +2933,7 @@ pub async fn run_with_config(config: ServerConfig) -> std::io::Result<ServerHand
     validate_listener_security(&config)?;
     validate_auth_config(&config)?;
     validate_shard_count(&config)?;
+    validate_encryption_config(&config)?;
     let listener = if config.enable_resp {
         let addr = config.listen_addr();
         Some(TcpListener::bind(&addr).await?)
@@ -2884,6 +2993,9 @@ async fn server_main(
                 _ = shutdown_rx.changed() => {
                     break;
                 }
+                joined = conn_tasks.join_next(), if !conn_tasks.is_empty() => {
+                    let _ = joined;
+                }
                 accepted = listener.accept() => {
                     let (socket, peer) = accepted?;
                     let runtime = runtime.clone();
@@ -2929,6 +3041,8 @@ impl Runtime {
         let schema_cache: SharedSchemaCache =
             std::sync::Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
         let broker = Broker::new();
+        // Wire the row-delta sink so table writes feed reactive live queries.
+        store.set_row_delta_broker(broker.clone());
         let shard_executor = ShardExecutor::new(store.clone(), broker.clone());
         let script_engine = Arc::new(lua::ScriptEngine::new());
 
@@ -2968,6 +3082,10 @@ impl Runtime {
                 ));
             }
         }
+        // lux push tables are created lazily on first use (see push::ensure_tables),
+        // so a project that never uses push carries no push.* tables. On restart,
+        // the `push.*` TCREATE/TINSERT commands are restored from the WAL like any
+        // other write, so no eager bootstrap is needed here.
         runtime
             .store
             .wal_suppress
@@ -2975,12 +3093,45 @@ impl Runtime {
         match snapshot::load(&runtime.store) {
             Ok(0) => emit_info(&runtime.config, ServerInfoEvent::NoSnapshotFound),
             Ok(n) => emit_info(&runtime.config, ServerInfoEvent::SnapshotLoaded { keys: n }),
-            Err(e) => emit_error(
-                &runtime.config,
-                ServerErrorEvent::SnapshotLoadFailed {
-                    error: e.to_string(),
-                },
-            ),
+            Err(e) => {
+                // Refuse to start on a load failure (e.g. an encrypted value the
+                // current keyring can't decrypt) rather than coming up with a
+                // truncated dataset that the background save would then overwrite.
+                // The on-disk snapshot is left intact and recoverable; supply the
+                // correct keyring/seal and restart.
+                runtime
+                    .store
+                    .wal_suppress
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                emit_error(
+                    &runtime.config,
+                    ServerErrorEvent::SnapshotLoadFailed {
+                        error: e.to_string(),
+                    },
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "refusing to start: snapshot load failed, on-disk data preserved (not overwritten): {e}"
+                    ),
+                ));
+            }
+        }
+        // A loaded snapshot can carry an older auth schema. Upgrade it before
+        // replaying WAL entries that may already reference newer columns.
+        if runtime.config.auth.enabled {
+            if let Err(e) =
+                auth::bootstrap(&runtime.store, &runtime.schema_cache, &runtime.config.auth)
+            {
+                runtime
+                    .store
+                    .wal_suppress
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("auth snapshot migration failed: {e}"),
+                ));
+            }
         }
         runtime
             .store
@@ -3018,6 +3169,15 @@ impl Runtime {
             }
         }
 
+        // One-time migration of any pre-`push.*` data (PR1 stored it under
+        // `auth.*`). Runs post-replay with WAL logging on; a no-op when there is
+        // no legacy data. Best-effort: a failure here must not block startup.
+        if let Err(e) =
+            push::migrate_from_auth_scope(&runtime.store, &runtime.schema_cache, Instant::now())
+        {
+            eprintln!("push scope migration skipped: {e}");
+        }
+
         background_tasks.spawn(snapshot::background_save_loop(runtime.store.clone()));
 
         {
@@ -3051,6 +3211,15 @@ impl Runtime {
                     }
                 }
             });
+        }
+
+        // lux push delivery worker: drains the durable `push.outbox` and delivers
+        // to APNs/etc. Runs unconditionally — push is a standalone scope and does
+        // not depend on Lux auth.
+        {
+            let store = runtime.store.clone();
+            let cache = runtime.schema_cache.clone();
+            background_tasks.spawn(push::worker::run_delivery_worker(store, cache));
         }
 
         if runtime.config.storage.mode == StorageMode::Tiered {
@@ -3293,6 +3462,7 @@ fn handle_tx_cmd(
     authenticated: &mut bool,
     store: &Arc<Store>,
     broker: &Broker,
+    script_engine: &lua::ScriptEngine,
     schema_cache: &SharedSchemaCache,
     write_buf: &mut BytesMut,
     now: Instant,
@@ -3366,14 +3536,28 @@ fn handle_tx_cmd(
                         CmdResult::BlockPop { .. }
                         | CmdResult::BlockMove { .. }
                         | CmdResult::BlockStreamRead { .. }
+                        | CmdResult::BlockListMPop { .. }
+                        | CmdResult::BlockZMPop { .. }
                         | CmdResult::BlockZPop { .. } => {
                             resp::write_error(
                                 write_buf,
                                 "ERR blocking commands not allowed inside a transaction",
                             );
                         }
-                        CmdResult::Eval { .. } | CmdResult::ScriptOp => {
-                            resp::write_error(write_buf, "ERR EVAL not supported in transaction");
+                        CmdResult::Eval { script, keys, argv } => {
+                            handle_eval(
+                                write_buf,
+                                store,
+                                broker,
+                                script_engine,
+                                &script,
+                                &keys,
+                                &argv,
+                                now,
+                            );
+                        }
+                        CmdResult::ScriptOp => {
+                            handle_script_op(write_buf, script_engine, &refs);
                         }
                     }
                 }
@@ -3488,6 +3672,7 @@ fn is_blocking_cmd(cmd: &[u8]) -> bool {
 
 pub(crate) struct CommandSession {
     authenticated: bool,
+    client_name: Option<String>,
     in_multi: bool,
     tx_queue: Vec<Vec<Vec<u8>>>,
     watched: Vec<(String, usize, u64)>,
@@ -3502,6 +3687,7 @@ impl CommandSession {
     pub(crate) fn new(require_auth: bool) -> Self {
         Self {
             authenticated: !require_auth,
+            client_name: None,
             in_multi: false,
             tx_queue: Vec::new(),
             watched: Vec::new(),
@@ -3516,6 +3702,49 @@ impl CommandSession {
     fn total_subscriptions(&self) -> i64 {
         (self.subscriptions.len() + self.pattern_subs.len() + self.key_subs.len()) as i64
     }
+}
+
+fn write_client_response(args: &[&[u8]], session: &mut CommandSession, out: &mut BytesMut) {
+    if args.len() < 2 {
+        resp::write_error(out, "ERR wrong number of arguments for 'client' command");
+        return;
+    }
+
+    if args[1].eq_ignore_ascii_case(b"SETNAME") {
+        if args.len() != 3 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'client|setname' command",
+            );
+            return;
+        }
+        session.client_name = Some(String::from_utf8_lossy(args[2]).into_owned());
+        resp::write_ok(out);
+    } else if args[1].eq_ignore_ascii_case(b"GETNAME") {
+        if args.len() != 2 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'client|getname' command",
+            );
+            return;
+        }
+        match session.client_name.as_deref() {
+            Some(name) => resp::write_bulk(out, name),
+            None => resp::write_null(out),
+        }
+    } else {
+        resp::write_ok(out);
+    }
+}
+
+fn is_script_gate_bypass_command(cmd: &[u8]) -> bool {
+    cmd.eq_ignore_ascii_case(b"PING")
+        || cmd.eq_ignore_ascii_case(b"ECHO")
+        || cmd.eq_ignore_ascii_case(b"CLIENT")
+        || cmd.eq_ignore_ascii_case(b"INFO")
+        || cmd.eq_ignore_ascii_case(b"TIME")
+        || cmd.eq_ignore_ascii_case(b"COMMAND")
+        || cmd.eq_ignore_ascii_case(b"CONFIG")
 }
 
 pub(crate) trait ArgvSlice {
@@ -3599,6 +3828,7 @@ impl CommandExecutor {
             &mut session.authenticated,
             &self.store,
             &self.broker,
+            &self.script_engine,
             &self.schema_cache,
             write_buf,
             now,
@@ -3606,9 +3836,29 @@ impl CommandExecutor {
             return None;
         }
 
+        if args[0].eq_ignore_ascii_case(b"CLIENT") {
+            write_client_response(args, session, write_buf);
+            return None;
+        }
+
+        if is_script_gate_bypass_command(args[0]) {
+            let cmd_result = cmd::execute_with_wal(
+                &self.store,
+                &self.schema_cache,
+                &self.broker,
+                args,
+                write_buf,
+                now,
+            );
+            return self.apply_cmd_result(cmd_result, args, session, write_buf, now);
+        }
+
         if !cmd::is_pipeline_special_command(args[0]) {
             let access = cmd::pipeline_access_for_args(args);
-            if access == cmd::PipelineAccess::Read {
+            // The shard-local read fast-path reads stored bytes directly and has
+            // no keyring, so it cannot decrypt. When encryption is active, fall
+            // through to the slow path (cmd::execute) which decrypts on read.
+            if access == cmd::PipelineAccess::Read && !self.store.encryption().has_active_key() {
                 let command = [ShardPipelineCommand { args, access }];
                 let shard_idx = self.store.shard_for_key(args[1]);
                 if let Err(err) = self
@@ -3670,6 +3920,36 @@ impl CommandExecutor {
             return None;
         }
 
+        if !session.in_multi
+            && session.authenticated
+            && commands.iter().all(|command| {
+                let args = command.argv();
+                !args.is_empty() && is_script_gate_bypass_command(args[0])
+            })
+        {
+            for command in commands {
+                let args = command.argv();
+                if args[0].eq_ignore_ascii_case(b"CLIENT") {
+                    write_client_response(args, session, write_buf);
+                    continue;
+                }
+                let cmd_result = cmd::execute_with_wal(
+                    &self.store,
+                    &self.schema_cache,
+                    &self.broker,
+                    args,
+                    write_buf,
+                    now,
+                );
+                if let Some(action) =
+                    self.apply_cmd_result(cmd_result, args, session, write_buf, now)
+                {
+                    return Some(action);
+                }
+            }
+            return None;
+        }
+
         let mut has_special = session.in_multi;
         let mut all_single_key_rw = true;
         let mut flags: Vec<cmd::PipelineAccess> = Vec::with_capacity(cmd_count);
@@ -3701,7 +3981,10 @@ impl CommandExecutor {
             }
         }
 
-        if has_special || !all_single_key_rw {
+        // When encryption is active, the shard-local fast batch path can neither
+        // encrypt writes nor decrypt reads (no keyring there), so force every
+        // command onto the slow path (cmd::execute) which handles both.
+        if has_special || !all_single_key_rw || self.store.encryption().has_active_key() {
             for command in commands {
                 let args = command.argv();
                 if !session.authenticated && !is_public_without_auth_cmd(args[0]) {
@@ -3717,6 +4000,7 @@ impl CommandExecutor {
                     &mut session.authenticated,
                     &self.store,
                     &self.broker,
+                    &self.script_engine,
                     &self.schema_cache,
                     write_buf,
                     now,
@@ -3863,6 +4147,8 @@ impl CommandExecutor {
             CmdResult::BlockPop { .. }
             | CmdResult::BlockMove { .. }
             | CmdResult::BlockStreamRead { .. }
+            | CmdResult::BlockListMPop { .. }
+            | CmdResult::BlockZMPop { .. }
             | CmdResult::BlockZPop { .. } => Some(cmd_result),
             CmdResult::Eval { script, keys, argv } => {
                 handle_eval(
@@ -3909,7 +4195,14 @@ async fn handle_connection(
     let mut write_buf = BytesMut::with_capacity(65536);
     let mut pending = BytesMut::new();
     let max_resp_request = runtime.config.max_resp_request;
-    let mut session = CommandSession::new(runtime.config.require_auth);
+    // An engine is credential-gated by a password *or* by project keys. Checked
+    // per connection rather than per command: `require_auth` is fixed at startup,
+    // so without this a key-only engine (no LUX_PASSWORD) would leave RESP wide
+    // open, and keys minted at runtime would never start gating it.
+    let mut session = CommandSession::new(
+        runtime.config.require_auth
+            || crate::auth::project_keys_configured(&runtime.store, &runtime.schema_cache),
+    );
     let executor = CommandExecutor::new(
         runtime.store.clone(),
         runtime.broker.clone(),
@@ -4067,33 +4360,33 @@ async fn handle_connection(
                         }
                     }
 
-                    for (_ch, rx) in session.subscriptions.iter_mut() {
+                    for rx in session.subscriptions.values_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
-                    for (_pat, rx) in session.pattern_subs.iter_mut() {
+                    for rx in session.pattern_subs.values_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
-                    for (_pat, rx) in session.key_subs.iter_mut() {
+                    for rx in session.key_subs.values_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    for (_ch, rx) in session.subscriptions.iter_mut() {
+                    for rx in session.subscriptions.values_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
-                    for (_pat, rx) in session.pattern_subs.iter_mut() {
+                    for rx in session.pattern_subs.values_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
                     }
-                    for (_pat, rx) in session.key_subs.iter_mut() {
+                    for rx in session.key_subs.values_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(vec![msg]);
                         }
@@ -4248,6 +4541,24 @@ async fn handle_connection(
                         handle_block_zpop(&mut socket, &store, &broker, &keys, timeout, pop_min)
                             .await?;
                     }
+                    CmdResult::BlockListMPop {
+                        keys,
+                        pop_left,
+                        count,
+                        timeout,
+                    } => {
+                        handle_block_lmpop(&mut socket, &store, &keys, pop_left, count, timeout)
+                            .await?;
+                    }
+                    CmdResult::BlockZMPop {
+                        keys,
+                        pop_min,
+                        count,
+                        timeout,
+                    } => {
+                        handle_block_zmpop(&mut socket, &store, &keys, pop_min, count, timeout)
+                            .await?;
+                    }
                     _ => {}
                 }
             }
@@ -4255,9 +4566,23 @@ async fn handle_connection(
     }
 }
 
+/// Log the pop that satisfied a blocked BLPOP/BRPOP/BLMOVE. The element was
+/// already removed from `key` in memory by the pushing side's drain, and the
+/// push that satisfied us was WAL-logged before we woke, so appending the
+/// matching pop here keeps WAL replay from resurrecting the element (ENG-1317).
+/// Runs in the woken task with no shard locks held, so there is no
+/// memory->WAL lock nesting.
+fn wal_log_blocked_pop(store: &Store, key: &[u8], pop_left: bool) {
+    if !store.wal_enabled() {
+        return;
+    }
+    let pop: &[u8] = if pop_left { b"LPOP" } else { b"RPOP" };
+    let _ = store.wal_log_command(&[pop, key]);
+}
+
 async fn handle_block_pop(
     socket: &mut tokio::net::TcpStream,
-    _store: &Arc<Store>,
+    store: &Arc<Store>,
     broker: &Broker,
     keys: &[String],
     timeout: std::time::Duration,
@@ -4286,6 +4611,7 @@ async fn handle_block_pop(
 
     match result {
         Some((key, val)) => {
+            wal_log_blocked_pop(store, key.as_bytes(), pop_left);
             resp::write_array_header(&mut write_buf, 2);
             resp::write_bulk(&mut write_buf, &key);
             resp::write_bulk_raw(&mut write_buf, &val);
@@ -4339,6 +4665,20 @@ async fn handle_block_move(
             } else {
                 let _ = store.rpush(dst.as_bytes(), vals, now);
             }
+            // Log both effects of the completed move: the src pop (done in the
+            // pushing side's drain) and the dst push (done just above). Neither
+            // went through the WAL yet; the satisfying push to src was logged
+            // before we woke, so replay order is push(src), pop(src), push(dst)
+            // -> element ends up only in dst (ENG-1317). Batched so a same-shard
+            // move is one atomic frame; a cross-shard move splits per shard.
+            if store.wal_enabled() {
+                let pop: &[u8] = if src_left { b"LPOP" } else { b"RPOP" };
+                let push: &[u8] = if dst_left { b"LPUSH" } else { b"RPUSH" };
+                let pop_cmd: [&[u8]; 2] = [pop, src.as_bytes()];
+                let push_cmd: [&[u8]; 3] = [push, dst.as_bytes(), val.as_ref()];
+                let batch: [&[&[u8]]; 2] = [&pop_cmd, &push_cmd];
+                let _ = store.wal_log_command_batch(&batch);
+            }
             resp::write_bulk_raw(&mut write_buf, &val);
         }
         None => {
@@ -4380,8 +4720,9 @@ async fn handle_block_stream_read(
         .collect();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+    let waiter_id = broker.next_waiter_id();
     for key in keys {
-        broker.register_stream_waiter(key, tx.clone());
+        broker.register_stream_waiter(key, tx.clone(), waiter_id);
     }
     drop(tx);
 
@@ -4414,6 +4755,8 @@ async fn handle_block_stream_read(
     } else {
         resp::write_null_array(&mut write_buf);
     }
+
+    broker.remove_stream_waiters_by_id(keys, waiter_id);
 
     socket.write_all(&write_buf).await
 }
@@ -4475,6 +4818,115 @@ fn handle_eval(
     }
 }
 
+async fn handle_block_lmpop(
+    socket: &mut tokio::net::TcpStream,
+    store: &Arc<Store>,
+    keys: &[String],
+    pop_left: bool,
+    count: usize,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
+    let mut write_buf = BytesMut::new();
+
+    loop {
+        let now = Instant::now();
+        match store.lmpop(&key_refs, pop_left, count, now) {
+            Ok(Some((key, items))) => {
+                // Popped straight from the store outside the WAL; log the
+                // compensating LPOP/RPOP keyed on the popped key so replay stays
+                // correct (ENG-1316/1317). No shard locks held here.
+                if store.wal_enabled() {
+                    let pop: &[u8] = if pop_left { b"LPOP" } else { b"RPOP" };
+                    let n = items.len().to_string();
+                    let _ = store.wal_log_command(&[pop, &key, n.as_bytes()]);
+                }
+                resp::write_array_header(&mut write_buf, 2);
+                resp::write_bulk_raw(&mut write_buf, &key);
+                resp::write_array_header(&mut write_buf, items.len());
+                for item in &items {
+                    let decrypted = store
+                        .decrypt_list_element(item.clone())
+                        .unwrap_or_else(|_| item.clone());
+                    resp::write_bulk_raw(&mut write_buf, &decrypted);
+                }
+                return socket.write_all(&write_buf).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                resp::write_error(&mut write_buf, &e);
+                return socket.write_all(&write_buf).await;
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            resp::write_null_array(&mut write_buf);
+            return socket.write_all(&write_buf).await;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn handle_block_zmpop(
+    socket: &mut tokio::net::TcpStream,
+    store: &Arc<Store>,
+    keys: &[String],
+    pop_min: bool,
+    count: usize,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
+    let mut write_buf = BytesMut::new();
+
+    loop {
+        let now = Instant::now();
+        match store.zmpop(&key_refs, pop_min, count, now) {
+            Ok(Some((key, items))) => {
+                // Popped straight from the store outside the WAL; self-log the
+                // removal as a keyed ZREM so replay stays correct (ENG-1316/1317).
+                if store.wal_enabled() {
+                    let mut zrem: Vec<&[u8]> = Vec::with_capacity(items.len() + 2);
+                    zrem.push(b"ZREM");
+                    zrem.push(&key);
+                    for (m, _) in &items {
+                        zrem.push(m.as_bytes());
+                    }
+                    let _ = store.wal_log_command(&zrem);
+                }
+                resp::write_array_header(&mut write_buf, 2);
+                resp::write_bulk_raw(&mut write_buf, &key);
+                resp::write_array_header(&mut write_buf, items.len());
+                for (member, score) in &items {
+                    resp::write_array_header(&mut write_buf, 2);
+                    resp::write_bulk(&mut write_buf, member);
+                    let score_str = if score.fract() == 0.0 && score.abs() < 1e15 {
+                        format!("{}", *score as i64)
+                    } else {
+                        format!("{score}")
+                    };
+                    resp::write_bulk(&mut write_buf, &score_str);
+                }
+                return socket.write_all(&write_buf).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                resp::write_error(&mut write_buf, &e);
+                return socket.write_all(&write_buf).await;
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            resp::write_null_array(&mut write_buf);
+            return socket.write_all(&write_buf).await;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 async fn handle_block_zpop(
     socket: &mut tokio::net::TcpStream,
     store: &Arc<Store>,
@@ -4500,19 +4952,34 @@ async fn handle_block_zpop(
         let waiter_id = broker.next_waiter_id();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
         for key in keys {
-            broker.register_zset_waiter(
-                key,
-                pubsub::BlockedZPopRequest {
-                    tx: tx.clone(),
-                    waiter_id,
-                },
-            );
-        }
-        drop(tx);
-
-        if write_zpop_response(store, keys, pop_min, &mut write_buf) {
-            broker.remove_zset_waiters_by_id(keys, waiter_id);
-            return socket.write_all(&write_buf).await;
+            let result = if pop_min {
+                store.zpopmin(key.as_bytes(), 1, now)
+            } else {
+                store.zpopmax(key.as_bytes(), 1, now)
+            };
+            if let Ok(items) = result {
+                if !items.is_empty() {
+                    let (member, score) = &items[0];
+                    // BZPOPMIN/BZPOPMAX pop straight from the store here, outside
+                    // the WAL; log the removal of the exact member so replay
+                    // doesn't resurrect it (ENG-1317). Keyed on `key` -> correct
+                    // shard; no shard locks held at this point.
+                    if store.wal_enabled() {
+                        let _ =
+                            store.wal_log_command(&[b"ZREM", key.as_bytes(), member.as_bytes()]);
+                    }
+                    resp::write_array_header(&mut write_buf, 3);
+                    resp::write_bulk(&mut write_buf, key);
+                    resp::write_bulk(&mut write_buf, member);
+                    let score_str = if score.fract() == 0.0 && score.abs() < 1e15 {
+                        format!("{}", *score as i64)
+                    } else {
+                        format!("{}", score)
+                    };
+                    resp::write_bulk(&mut write_buf, &score_str);
+                    return socket.write_all(&write_buf).await;
+                }
+            }
         }
 
         let woke = tokio::select! {
@@ -4624,6 +5091,7 @@ mod tx_tests {
     fn pubsub_commands_are_rejected_inside_multi() {
         let store = Arc::new(Store::new());
         let broker = Broker::new();
+        let script_engine = lua::ScriptEngine::new();
         let schema_cache: SharedSchemaCache =
             Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
 
@@ -4645,6 +5113,7 @@ mod tx_tests {
                 &mut authenticated,
                 &store,
                 &broker,
+                &script_engine,
                 &schema_cache,
                 &mut out,
                 Instant::now(),
@@ -4661,5 +5130,72 @@ mod tx_tests {
             assert!(tx_error, "{command} should mark the transaction dirty");
             assert!(tx_queue.is_empty(), "{command} should not be queued");
         }
+    }
+}
+
+#[cfg(test)]
+mod listener_security_tests {
+    use super::*;
+
+    /// A public-interface config with no credentials at all.
+    fn public_config() -> ServerConfig {
+        ServerConfig {
+            bind_host: "0.0.0.0".to_string(),
+            enable_resp: true,
+            http_port: 8080,
+            password: String::new(),
+            require_auth: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn refuses_public_listener_with_no_credentials() {
+        assert!(validate_listener_security(&public_config()).is_err());
+    }
+
+    #[test]
+    fn allows_public_listener_with_a_password() {
+        let mut config = public_config();
+        config.password = "s3cret".to_string();
+        config.require_auth = true;
+        assert!(validate_listener_security(&config).is_ok());
+    }
+
+    /// The key-only shape the credential model moves towards: a secret key and
+    /// no password. Judging this by the password alone would refuse to boot a
+    /// perfectly authenticated engine.
+    #[test]
+    fn allows_public_listener_with_only_a_secret_key() {
+        let mut config = public_config();
+        config.auth.initial_secret_key = Some("lux_sec_listener".to_string());
+        assert!(
+            validate_listener_security(&config).is_ok(),
+            "a secret key is a credential; key-only engines must be able to bind"
+        );
+    }
+
+    /// Publishable keys cannot use RESP, so a publishable-only engine really is
+    /// unauthenticated there and must still be refused.
+    #[test]
+    fn refuses_public_resp_listener_with_only_a_publishable_key() {
+        let mut config = public_config();
+        config.auth.initial_publishable_key = Some("lux_pub_listener".to_string());
+        assert!(validate_listener_security(&config).is_err());
+
+        // HTTP alone is fine: publishable is a real credential there.
+        config.enable_resp = false;
+        assert!(validate_listener_security(&config).is_ok());
+    }
+
+    #[test]
+    fn loopback_and_explicit_opt_out_still_bypass_the_check() {
+        let mut config = public_config();
+        config.bind_host = "127.0.0.1".to_string();
+        assert!(validate_listener_security(&config).is_ok());
+
+        let mut config = public_config();
+        config.allow_insecure_no_auth = true;
+        assert!(validate_listener_security(&config).is_ok());
     }
 }

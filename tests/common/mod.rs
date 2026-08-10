@@ -86,9 +86,7 @@ pub fn connect(port: u16) -> TcpStream {
         match TcpStream::connect(&addr) {
             Ok(stream) => {
                 stream.set_nodelay(true).ok();
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(500)))
-                    .ok();
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                 return stream;
             }
             Err(e) => {
@@ -111,17 +109,26 @@ pub fn resp_cmd(args: &[&str]) -> Vec<u8> {
 /// Drain whatever is currently readable on the stream (bounded by the stream's
 /// read timeout).
 pub fn read_all(stream: &mut TcpStream) -> String {
+    let original_timeout = stream.read_timeout().ok().flatten();
     let mut data = Vec::with_capacity(4096);
     let mut buf = [0u8; 8192];
+    let mut saw_data = false;
     loop {
         match stream.read(&mut buf) {
             Ok(0) => break,
-            Ok(len) => data.extend_from_slice(&buf[..len]),
+            Ok(len) => {
+                data.extend_from_slice(&buf[..len]);
+                if !saw_data {
+                    saw_data = true;
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
             Err(_) => break,
         }
     }
+    let _ = stream.set_read_timeout(original_timeout);
     String::from_utf8_lossy(&data).to_string()
 }
 
@@ -315,7 +322,9 @@ impl LuxServer {
             let mut child = build_command(&bin, &spec, dir, port, http_port)
                 .spawn()
                 .expect("spawn lux");
-            if wait_for_ready(port, &mut child) {
+            let resp_ready = wait_for_resp_ready(port, &mut child);
+            let http_ready = !spec.http || wait_for_http_ready(http_port, &mut child);
+            if resp_ready && http_ready {
                 return (child, port, http_port);
             }
             child.kill().ok();
@@ -392,20 +401,51 @@ pub fn spawn_lux_with_data_dir(
         cmd.env(key, value);
     }
     let mut child = cmd.spawn().expect("spawn lux");
-    if !wait_for_ready(http_port, &mut child) {
+    if !wait_for_http_ready(http_port, &mut child) {
         panic!("lux did not start on http port {http_port}");
     }
     child
 }
 
-/// Poll until the RESP port accepts a connection, bailing early if the child dies.
-fn wait_for_ready(port: u16, child: &mut Child) -> bool {
+/// Poll until the RESP port answers PING, bailing early if the child dies.
+fn wait_for_resp_ready(port: u16, child: &mut Child) -> bool {
     for _ in 0..100 {
         if let Ok(Some(_)) = child.try_wait() {
             return false;
         }
-        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return true;
+        if let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{port}")) {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+            if stream.write_all(&resp_cmd(&["PING"])).is_ok() {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = stream.read(&mut buf) {
+                    if String::from_utf8_lossy(&buf[..n]).contains("PONG") {
+                        return true;
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// Poll until the HTTP port returns an HTTP response, bailing early if the child dies.
+fn wait_for_http_ready(port: u16, child: &mut Child) -> bool {
+    for _ in 0..100 {
+        if let Ok(Some(_)) = child.try_wait() {
+            return false;
+        }
+        if let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{port}")) {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+            let req = b"GET /v1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+            if stream.write_all(req).is_ok() {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = stream.read(&mut buf) {
+                    if String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/") {
+                        return true;
+                    }
+                }
+            }
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -434,7 +474,18 @@ pub fn http_request_with_headers(
     auth: Option<&str>,
     extra_headers: &[&str],
 ) -> (u16, String) {
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    let addr = format!("127.0.0.1:{port}");
+    let mut last_err = None;
+    let mut stream = (0..40)
+        .find_map(|attempt| match TcpStream::connect(&addr) {
+            Ok(stream) => Some(stream),
+            Err(err) => {
+                last_err = Some(err);
+                thread::sleep(Duration::from_millis(25 * (attempt / 8 + 1)));
+                None
+            }
+        })
+        .unwrap_or_else(|| panic!("could not connect to lux http on {addr}: {last_err:?}"));
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();

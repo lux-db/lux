@@ -918,12 +918,11 @@ fn on_delete_cascade() {
     child.wait().ok();
 }
 
-// AUDIT PROBE: ON DELETE CASCADE must work for a non-INT (UUID) foreign key. The
-// cascade scan decodes child FK bytes as FieldType::Int regardless of the column's
-// real type (tables/mod.rs:2469), so a UUID FK never matches -> cascade is a no-op
-// and children are orphaned (referential-integrity corruption).
+// REGRESSION: ON DELETE CASCADE must work for a non-INT (UUID) foreign key. The
+// cascade scan now decodes child FK bytes using the column's real field_type
+// instead of a hardcoded FieldType::Int, so UUID/FLOAT/STR FKs match and cascade
+// (previously a silent no-op that orphaned children).
 #[test]
-#[ignore = "ENG-1278: FK cascade/restrict/set-null broken for non-INT FKs until fixed"]
 fn on_delete_cascade_uuid_fk() {
     let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
@@ -989,11 +988,10 @@ fn on_delete_cascade_uuid_fk() {
     child.wait().ok();
 }
 
-// AUDIT PROBE: SMOVE must not remove the member from the source when the
-// destination is the wrong type. The store removes from src BEFORE validating dst
-// (store/mod.rs:3858+), so a WRONGTYPE dst loses the element from src entirely.
+// REGRESSION: SMOVE must not remove the member from the source when the
+// destination is the wrong type. The store now validates the dst type before
+// mutating the src, so a WRONGTYPE dst errors with the member left intact.
 #[test]
-#[ignore = "ENG-1279: SMOVE loses source member on wrong-type dst until fixed"]
 fn smove_wrong_type_dst_preserves_source() {
     let (port, mut child) = start_server();
     let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
@@ -2015,6 +2013,179 @@ fn unique_constraint_still_correct_after_writes() {
     // And that new holder is now authoritative (rejects another dup).
     let r = send(&mut s, &["TINSERT", "u", "id", "4", "email", "a@x.com"]);
     assert!(r.starts_with('-'), "new holder enforces uniqueness: {}", r);
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+// ---- Point access: TSET / TGET ------------------------------------------
+
+#[test]
+fn tset_and_tget_point_access() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    send(&mut s, &["TCREATE", "users", "name STR,", "age INT"]);
+    send(&mut s, &["TINSERT", "users", "name", "alice", "age", "30"]); // id 1
+
+    // Point-update one cell by pk, no WHERE query.
+    assert_eq!(send(&mut s, &["TSET", "users", "1", "age", "31"]), ":1");
+    // Single-field read replies the bare value.
+    assert_eq!(send(&mut s, &["TGET", "users", "1", "age"]), "$31");
+    // Whole-row read reflects the update.
+    let row = send(&mut s, &["TGET", "users", "1"]);
+    assert!(
+        row.contains("age") && row.contains("31") && row.contains("alice"),
+        "{row}"
+    );
+    // Missing field -> nil; missing row -> nil.
+    assert_eq!(send(&mut s, &["TGET", "users", "1", "nope"]), "$-1");
+    assert_eq!(send(&mut s, &["TGET", "users", "999", "age"]), "$-1");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn tset_missing_row_errors() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    send(&mut s, &["TCREATE", "users", "age INT"]);
+    let r = send(&mut s, &["TSET", "users", "42", "age", "5"]);
+    assert!(r.starts_with('-') && r.contains("not found"), "{r}");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn tset_maintains_secondary_index() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    send(&mut s, &["TCREATE", "users", "name STR,", "age INT"]);
+    send(&mut s, &["TINSERT", "users", "name", "alice", "age", "30"]); // id 1
+    send(&mut s, &["TINSERT", "users", "name", "bob", "age", "40"]); // id 2
+
+    // Point-update moves alice from 30 to 40; the age index must follow.
+    assert_eq!(send(&mut s, &["TSET", "users", "1", "age", "40"]), ":1");
+    let by_new = send(
+        &mut s,
+        &["TSELECT", "*", "FROM", "users", "WHERE", "age", "=", "40"],
+    );
+    assert!(
+        by_new.contains("alice") && by_new.contains("bob"),
+        "{by_new}"
+    );
+    // The stale index entry for 30 must be gone.
+    let by_old = send(
+        &mut s,
+        &["TSELECT", "*", "FROM", "users", "WHERE", "age", "=", "30"],
+    );
+    assert!(
+        by_old.starts_with("*0"),
+        "stale index entry survived: {by_old}"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn tset_rejects_unique_violation() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    send(
+        &mut s,
+        &["TCREATE", "users", "name STR,", "email STR UNIQUE"],
+    );
+    send(
+        &mut s,
+        &["TINSERT", "users", "name", "alice", "email", "a@x.dev"],
+    ); // id 1
+    send(
+        &mut s,
+        &["TINSERT", "users", "name", "bob", "email", "b@x.dev"],
+    ); // id 2
+
+    let r = send(&mut s, &["TSET", "users", "2", "email", "a@x.dev"]);
+    assert!(
+        r.starts_with('-') && r.to_lowercase().contains("unique"),
+        "{r}"
+    );
+    // The original value is untouched after the rejected write.
+    assert_eq!(send(&mut s, &["TGET", "users", "2", "email"]), "$b@x.dev");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn tset_multi_field() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    send(&mut s, &["TCREATE", "users", "name STR,", "age INT"]);
+    send(&mut s, &["TINSERT", "users", "name", "alice", "age", "30"]); // id 1
+
+    assert_eq!(
+        send(
+            &mut s,
+            &["TSET", "users", "1", "name", "alicia", "age", "33"]
+        ),
+        ":2"
+    );
+    assert_eq!(send(&mut s, &["TGET", "users", "1", "name"]), "$alicia");
+    assert_eq!(send(&mut s, &["TGET", "users", "1", "age"]), "$33");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn tset_rejects_reserved_auth_table() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Point-writing auth internals must be blocked, same as TUPDATE.
+    let r = send(
+        &mut s,
+        &["TSET", "auth.users", "someid", "email", "x@y.dev"],
+    );
+    assert!(r.starts_with('-') && r.contains("Lux Auth"), "{r}");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn tset_tget_work_with_uuid_pk() {
+    let (port, mut child) = start_server();
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Point access is keyed by the raw pk string, so a UUID pk works the same
+    // as an int pk end to end.
+    send(
+        &mut s,
+        &["TCREATE", "docs", "id UUID PRIMARY KEY,", "name STR"],
+    );
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    send(&mut s, &["TINSERT", "docs", "id", uuid, "name", "alice"]);
+
+    assert_eq!(send(&mut s, &["TGET", "docs", uuid, "name"]), "$alice");
+    assert_eq!(send(&mut s, &["TSET", "docs", uuid, "name", "bob"]), ":1");
+    assert_eq!(send(&mut s, &["TGET", "docs", uuid, "name"]), "$bob");
+    let row = send(&mut s, &["TGET", "docs", uuid]);
+    assert!(row.contains("bob") && row.contains(uuid), "{row}");
 
     child.kill().ok();
     child.wait().ok();

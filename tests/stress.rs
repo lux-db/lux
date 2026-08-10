@@ -75,8 +75,17 @@ fn cmd(args: &[&str]) -> Vec<String> {
 
 fn wait_for_port(port: u16) {
     for _ in 0..80 {
-        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return;
+        if let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{port}")) {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+            if stream.write_all(&resp_cmd(&["PING".to_string()])).is_ok() {
+                let mut buf = [0u8; 64];
+                if stream
+                    .read(&mut buf)
+                    .is_ok_and(|n| String::from_utf8_lossy(&buf[..n]).contains("PONG"))
+                {
+                    return;
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -90,7 +99,8 @@ struct LuxServer {
 }
 
 impl LuxServer {
-    fn start(port: u16, tiered: bool) -> Self {
+    fn start(tiered: bool) -> Self {
+        let port = common::free_port();
         let tmpdir = std::env::temp_dir().join(format!(
             "lux_stress_{}_{}_{}",
             std::process::id(),
@@ -138,6 +148,7 @@ impl LuxServer {
 
     fn restart(&mut self, tiered: bool) {
         common::terminate_child(&mut self.child);
+        self.port = common::free_port();
         self.child = Self::spawn(self.port, &self.tmpdir, tiered);
         wait_for_port(self.port);
     }
@@ -145,6 +156,7 @@ impl LuxServer {
     fn crash_and_restart(&mut self, tiered: bool) {
         self.child.kill().ok();
         self.child.wait().ok();
+        self.port = common::free_port();
         self.child = Self::spawn(self.port, &self.tmpdir, tiered);
         wait_for_port(self.port);
     }
@@ -219,7 +231,7 @@ fn redis_addr_from_env() -> Option<String> {
     )
 }
 
-fn run_model_stress(seed: u64, port: u16, tiered: bool, redis_addr: Option<String>) {
+fn run_model_stress(seed: u64, tiered: bool, redis_addr: Option<String>) {
     let iters: usize = std::env::var("LUX_STRESS_ITERS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -227,7 +239,7 @@ fn run_model_stress(seed: u64, port: u16, tiered: bool, redis_addr: Option<Strin
     let prefix = format!("stress:{seed:x}:{}:", std::process::id());
     let mut rng = Rng::new(seed);
     let mut model = Model::default();
-    let mut server = LuxServer::start(port, tiered);
+    let mut server = LuxServer::start(tiered);
     let mut conn = server.conn();
     let mut redis = redis_addr.map(|addr| {
         let stream = TcpStream::connect(&addr)
@@ -494,12 +506,12 @@ fn verify_model(conn: &mut TcpStream, model: &Model, seed: u64) {
 
 #[test]
 fn deterministic_model_stress_memory_mode() {
-    run_model_stress(0x5154_4c55_584d_454d, 17920, false, None);
+    run_model_stress(0x5154_4c55_584d_454d, false, None);
 }
 
 #[test]
 fn deterministic_model_stress_tiered_mode() {
-    run_model_stress(0x5154_4c55_5854_4945, 17921, true, None);
+    run_model_stress(0x5154_4c55_5854_4945, true, None);
 }
 
 #[test]
@@ -508,5 +520,5 @@ fn optional_redis_differential_core_subset() {
         eprintln!("skipping Redis/Valkey differential stress; set LUX_STRESS_DIFF_REDIS=1");
         return;
     };
-    run_model_stress(0x5154_4c55_5844_4946, 17922, false, Some(redis_addr));
+    run_model_stress(0x5154_4c55_5844_4946, false, Some(redis_addr));
 }

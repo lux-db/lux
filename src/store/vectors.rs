@@ -1,12 +1,14 @@
 use super::*;
 
 impl Store {
+    #[allow(clippy::too_many_arguments)]
     pub fn vset(
         &self,
         key: &[u8],
         data: Vec<f32>,
         metadata: Option<String>,
         ttl: Option<Duration>,
+        encrypted: bool,
         now: Instant,
     ) {
         let idx = self.shard_index(key);
@@ -17,10 +19,18 @@ impl Store {
         let dims = data.len() as u32;
         let index_data = data.clone();
         let mut old_vector_dims = None;
+        // Sticky encryption: overwriting an encrypted vector without the flag
+        // must not silently downgrade it to plaintext-at-rest (mirrors SET).
+        let encrypted = encrypted
+            || matches!(
+                shard.data.get(&ks).map(|e| &e.value),
+                Some(StoreValue::Vector(v)) if v.encrypted
+            );
         let new_value = StoreValue::Vector(VectorData {
             dims,
             data,
             metadata,
+            encrypted,
         });
         let new_mem = estimate_entry_memory(&ks, &new_value);
         let expires_at = ttl.map(|d| now + d);
