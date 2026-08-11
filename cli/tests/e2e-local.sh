@@ -82,11 +82,8 @@ fi
 "$CLI_BIN" migrate repair 002_partial.lux abandon \
   --host 127.0.0.1 --port "$RESP_PORT" --password "$OPERATOR_KEY"
 
-cat >AuthKey_TEST.p8 <<'KEY'
------BEGIN PRIVATE KEY-----
-dGVzdC1vbmx5LW5vdC1hLXJlYWwta2V5
------END PRIVATE KEY-----
-KEY
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+  -out AuthKey_TEST.p8 2>/dev/null
 "$CLI_BIN" push status --check --output json
 "$CLI_BIN" push apns set \
   --team-id TEAM123 \

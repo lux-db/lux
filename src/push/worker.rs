@@ -4,10 +4,12 @@
 //! durable table helpers so they are WAL-logged and survive restart.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::{stream, StreamExt};
 use sha2::{Digest, Sha256};
 
 use crate::auth::{durable_table_delete_where, durable_table_update_where, unix_seconds};
@@ -17,11 +19,16 @@ use crate::tables::{CmpOp, SharedSchemaCache, WhereClause};
 use super::apns::{apns_request_id, ApnsSink, DeliveryError, DeliveryTarget, Sink};
 use super::webpush::WebPushSink;
 use super::{
-    get_apns_credentials, get_vapid_credentials, metrics, select_rows, DEVICES_TABLE, OUTBOX_TABLE,
+    get_apns_credentials, get_vapid_credentials, metrics, select_oldest_row_ids, select_rows,
+    DEVICES_TABLE, OUTBOX_TABLE,
 };
 
 const TICK: Duration = Duration::from_millis(500);
 const BATCH: usize = 100;
+const MAX_PROVIDER_CONCURRENCY: usize = 16;
+const MAX_DEAD_LETTERS: usize = 10_000;
+const DEAD_LETTER_PRUNE_BATCH: usize = 1_000;
+const MAX_PROVIDER_ERROR_BYTES: usize = 1_024;
 const MAX_ATTEMPTS: i64 = 6;
 const BACKOFF_BASE_SECS: u64 = 30;
 const BACKOFF_CAP_SECS: u64 = 3600;
@@ -30,6 +37,22 @@ const BACKOFF_CAP_SECS: u64 = 3600;
 fn backoff_secs(n: i64) -> u64 {
     let shift = (n.max(1) - 1).min(20) as u32;
     (BACKOFF_BASE_SECS.saturating_mul(1u64 << shift)).min(BACKOFF_CAP_SECS)
+}
+
+fn bounded_provider_error(error: &str) -> String {
+    let mut bounded = String::with_capacity(error.len().min(MAX_PROVIDER_ERROR_BYTES));
+    for character in error.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if bounded.len() + character.len_utf8() > MAX_PROVIDER_ERROR_BYTES {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
 }
 
 /// The state transition for one delivery attempt. Pure and unit-tested; the
@@ -89,6 +112,14 @@ enum AppSink {
     Web(WebPushSink),
 }
 
+struct DeliveryJob {
+    id: String,
+    token: String,
+    payload: String,
+    attempts: i64,
+    sink: Arc<AppSink>,
+}
+
 /// Hash all sink-affecting credential fields into a stable cache identity.
 /// Length-prefixing prevents boundary ambiguity. The fingerprint retains only
 /// the digest rather than duplicating private signing material in the cache.
@@ -136,6 +167,7 @@ async fn process_pending(
         now,
     )?;
 
+    let mut jobs = Vec::with_capacity(rows.len());
     for row in rows {
         let m: HashMap<String, String> = row.into_iter().collect();
         let id = m.get("id").cloned().unwrap_or_default();
@@ -182,29 +214,113 @@ async fn process_pending(
                 }
             };
 
-        let result = match &*app_sink {
+        jobs.push(DeliveryJob {
+            id,
+            token,
+            payload,
+            attempts,
+            sink: app_sink,
+        });
+    }
+
+    let outcomes = collect_with_provider_limit(jobs.into_iter().map(|job| async move {
+        let result = match &*job.sink {
             AppSink::Apns { sink, topic } => {
                 let target = DeliveryTarget {
-                    token: token.clone(),
+                    token: job.token.clone(),
                     topic: topic.clone(),
-                    request_id: apns_request_id(&id),
+                    request_id: apns_request_id(&job.id),
                 };
-                sink.deliver(&target, payload.as_bytes()).await
+                sink.deliver(&target, job.payload.as_bytes()).await
             }
             AppSink::Web(sink) => {
-                // The web token is the subscription JSON; topic is unused.
                 let target = DeliveryTarget {
-                    token: token.clone(),
+                    token: job.token.clone(),
                     topic: String::new(),
                     request_id: String::new(),
                 };
-                sink.deliver(&target, payload.as_bytes()).await
+                sink.deliver(&target, job.payload.as_bytes()).await
             }
         };
-        let action = decide(attempts, result, unix_seconds());
-        apply(store, cache, &action, &id, &token, now)?;
+        (job, result)
+    }))
+    .await;
+
+    for (job, result) in outcomes {
+        let action = decide(job.attempts, result, unix_seconds());
+        apply(store, cache, &action, &job.id, &job.token, Instant::now())?;
     }
+    prune_dead_letters(store, cache, Instant::now())?;
     Ok(())
+}
+
+async fn collect_with_provider_limit<I, F, T>(futures: I) -> Vec<T>
+where
+    I: IntoIterator<Item = F>,
+    F: Future<Output = T>,
+{
+    stream::iter(futures)
+        .buffer_unordered(MAX_PROVIDER_CONCURRENCY)
+        .collect()
+        .await
+}
+
+/// Keep terminal delivery history useful without allowing failed destinations
+/// to grow the durable outbox forever. Only ids are projected, so cleanup does
+/// not load retained notification payloads or device tokens into memory.
+fn prune_dead_letters(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    now: Instant,
+) -> Result<usize, String> {
+    prune_dead_letters_to(store, cache, MAX_DEAD_LETTERS, DEAD_LETTER_PRUNE_BATCH, now)
+}
+
+fn prune_dead_letters_to(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    max_retained: usize,
+    batch: usize,
+    now: Instant,
+) -> Result<usize, String> {
+    let rows = {
+        let _execution_guard = store
+            .execution_read_guard()
+            .map_err(|error| format!("push dead-letter scan failed: {error}"))?;
+        select_oldest_row_ids(
+            store,
+            cache,
+            OUTBOX_TABLE,
+            vec![WhereClause::single(
+                "state".into(),
+                CmpOp::Eq,
+                "dead".into(),
+            )],
+            max_retained.saturating_add(batch),
+            now,
+        )?
+    };
+    let remove = rows.len().saturating_sub(max_retained);
+    if remove == 0 {
+        return Ok(0);
+    }
+
+    let ids: Vec<String> = rows.into_iter().take(remove.min(batch)).collect();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let mut where_tokens = Vec::with_capacity(ids.len() + 3);
+    where_tokens.push("id".to_string());
+    where_tokens.push("IN".to_string());
+    where_tokens.push("(".to_string());
+    where_tokens.extend(ids);
+    where_tokens.push(")".to_string());
+    let where_args: Vec<&str> = where_tokens.iter().map(String::as_str).collect();
+    let _execution_guard = store
+        .execution_read_guard()
+        .map_err(|error| format!("push dead-letter prune failed: {error}"))?;
+    let removed = durable_table_delete_where(store, cache, OUTBOX_TABLE, &where_args, now)?;
+    usize::try_from(removed).map_err(|_| "invalid dead-letter prune count".to_string())
 }
 
 /// Build (or reuse a cached) sink for an app from its stored credentials.
@@ -277,7 +393,7 @@ fn resolve_sink(
                     return Ok(Some(sink.clone()));
                 }
             }
-            let base_url = ApnsSink::resolve_base_url(environment);
+            let base_url = ApnsSink::resolve_base_url(environment)?;
             (
                 fp,
                 AppSink::Apns {
@@ -312,6 +428,7 @@ fn apply(
         } => {
             let attempts_s = attempts.to_string();
             let next_s = next_at.to_string();
+            let error = bounded_provider_error(error);
             durable_table_update_where(
                 store,
                 cache,
@@ -327,6 +444,7 @@ fn apply(
         }
         Action::Dead { attempts, error } => {
             let attempts_s = attempts.to_string();
+            let error = bounded_provider_error(error);
             durable_table_update_where(
                 store,
                 cache,
@@ -343,6 +461,8 @@ fn apply(
         }
         Action::DisableDevice { error } => {
             let now_s = unix_seconds().to_string();
+            let error = bounded_provider_error(error);
+            let _registry = store.push_device_registry_guard();
             durable_table_update_where(
                 store,
                 cache,
@@ -375,6 +495,11 @@ fn apply(
 mod tests {
     use super::*;
 
+    use crate::auth::durable_table_insert;
+    use crate::tables::SchemaCache;
+    use parking_lot::RwLock;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
     #[test]
     fn backoff_is_exponential_and_capped() {
         assert_eq!(backoff_secs(1), 30);
@@ -382,6 +507,16 @@ mod tests {
         assert_eq!(backoff_secs(3), 120);
         assert_eq!(backoff_secs(4), 240);
         assert!(backoff_secs(20) <= BACKOFF_CAP_SECS);
+    }
+
+    #[test]
+    fn provider_errors_are_safe_and_bounded_before_storage() {
+        let raw = format!("provider\r\ninjected\0{}🙂", "x".repeat(2_000));
+        let bounded = bounded_provider_error(&raw);
+        assert!(bounded.len() <= MAX_PROVIDER_ERROR_BYTES);
+        assert!(!bounded.chars().any(char::is_control));
+        assert!(bounded.starts_with("provider  injected "));
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
     }
 
     #[test]
@@ -475,5 +610,80 @@ mod tests {
             Action::Dead { attempts, .. } => assert_eq!(attempts, MAX_ATTEMPTS),
             other => panic!("expected dead, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dead_letter_retention_prunes_only_the_oldest_terminal_rows() {
+        let store = Arc::new(Store::new());
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        let now = Instant::now();
+        super::super::ensure_tables(&store, &cache, now).unwrap();
+        for (id, state, created_at) in [
+            ("oldest", "dead", "1"),
+            ("older", "dead", "2"),
+            ("newer", "dead", "3"),
+            ("newest", "dead", "4"),
+            ("pending", "pending", "0"),
+        ] {
+            durable_table_insert(
+                &store,
+                &cache,
+                OUTBOX_TABLE,
+                &[("id", id), ("state", state), ("created_at", created_at)],
+                now,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            prune_dead_letters_to(&store, &cache, 2, 10, now).unwrap(),
+            2
+        );
+        let dead = select_rows(
+            &store,
+            &cache,
+            OUTBOX_TABLE,
+            vec![WhereClause::single(
+                "state".into(),
+                CmpOp::Eq,
+                "dead".into(),
+            )],
+            None,
+            now,
+        )
+        .unwrap();
+        let ids: std::collections::HashSet<String> = dead
+            .into_iter()
+            .filter_map(|row| {
+                row.into_iter()
+                    .find_map(|(column, value)| (column == "id").then_some(value))
+            })
+            .collect();
+        assert_eq!(ids, ["newer".to_string(), "newest".to_string()].into());
+        assert_eq!(
+            crate::tables::table_count(&store, &cache, OUTBOX_TABLE, now).unwrap(),
+            3,
+            "pending rows must not be pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_work_never_exceeds_the_concurrency_limit() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let futures = (0..(MAX_PROVIDER_CONCURRENCY * 3)).map(|_| {
+            let active = active.clone();
+            let maximum = maximum.clone();
+            async move {
+                let now = active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                maximum.fetch_max(now, AtomicOrdering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                active.fetch_sub(1, AtomicOrdering::SeqCst);
+            }
+        });
+        collect_with_provider_limit(futures).await;
+        let observed = maximum.load(AtomicOrdering::SeqCst);
+        assert!(observed > 1, "provider work should run concurrently");
+        assert!(observed <= MAX_PROVIDER_CONCURRENCY);
     }
 }

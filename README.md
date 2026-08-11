@@ -790,10 +790,11 @@ not contain both encrypted state and the key that seals it.
 | `LUX_ENCRYPTION_KEY` | (none) | Legacy single bootstrap key |
 | `LUX_ENCRYPTION_KEY_ID` | `local` | Active/bootstrap key ID for legacy configuration |
 
-`LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS` set to `1` is an unsafe local
-integration-test escape hatch for Web Push. It is not supported in production. See
-[COMPATIBILITY.md](COMPATIBILITY.md#configuration-contract) for lifecycle and
-file-format guarantees.
+`LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS` set to `1` is a local integration-test
+escape hatch that permits Push delivery only to loopback mocks. It does not
+permit other private-network destinations and is not supported in production.
+See [COMPATIBILITY.md](COMPATIBILITY.md#configuration-contract) for lifecycle
+and file-format guarantees.
 
 ### Node.js
 

@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 /// A single delivery target: the platform token plus whatever routing metadata
 /// the sink needs (APNs topic, etc.).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct DeliveryTarget {
     pub token: String,
     pub topic: String,
@@ -73,6 +73,10 @@ struct CachedToken {
 /// Apple rotates provider tokens on a 20-60 min window; refresh at 50 min.
 const APNS_TOKEN_TTL: Duration = Duration::from_secs(50 * 60);
 const APNS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const APNS_RESPONSE_BODY_LIMIT: usize = 8 * 1024;
+const APNS_PRODUCTION_URL: &str = "https://api.push.apple.com";
+const APNS_SANDBOX_URL: &str = "https://api.sandbox.push.apple.com";
+const ALLOW_PRIVATE_ENDPOINTS_ENV: &str = "LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS";
 
 /// The credential material for one app's APNs connection.
 #[derive(Clone)]
@@ -80,6 +84,12 @@ pub(crate) struct ApnsCredentials {
     pub team_id: String,
     pub key_id: String,
     pub p8_pem: String,
+}
+
+pub(super) fn validate_private_key(p8_pem: &str) -> Result<(), String> {
+    EncodingKey::from_ec_pem(p8_pem.as_bytes())
+        .map(|_| ())
+        .map_err(|_| "invalid APNs .p8 private key".to_string())
 }
 
 pub(crate) struct ApnsSink {
@@ -94,30 +104,28 @@ impl ApnsSink {
     /// `https://api.sandbox.push.apple.com` (sandbox); tests inject a localhost
     /// mock. A single reused HTTP/2 client (ALPN negotiates h2 over TLS).
     pub fn new(base_url: impl Into<String>, creds: ApnsCredentials) -> Result<Self, String> {
+        let base_url = base_url.into();
+        validate_base_url(&base_url, development_mock_allowed())?;
         let client = reqwest::Client::builder()
             .timeout(APNS_REQUEST_TIMEOUT)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("apns client setup failed: {e}"))?;
         Ok(Self {
             client,
-            base_url: base_url.into(),
+            base_url,
             creds,
             token_cache: Mutex::new(None),
         })
     }
 
-    /// Resolve the APNs base URL from the stored `environment`. `production`/
-    /// `prod` and anything else map to the two Apple hosts; a literal
-    /// `http(s)://` value is used verbatim (operator escape hatch for a relay,
-    /// and the seam tests point at a local mock).
-    pub fn resolve_base_url(environment: &str) -> String {
-        if environment.starts_with("http://") || environment.starts_with("https://") {
-            environment.trim_end_matches('/').to_string()
-        } else if environment == "production" || environment == "prod" {
-            "https://api.push.apple.com".to_string()
-        } else {
-            "https://api.sandbox.push.apple.com".to_string()
-        }
+    /// Resolve the APNs base URL from the stored `environment`. Known aliases
+    /// map to the two exact Apple hosts. A loopback mock URL requires the
+    /// explicit development override used by the integration harness;
+    /// arbitrary provider origins are never accepted.
+    pub fn resolve_base_url(environment: &str) -> Result<String, String> {
+        resolve_base_url(environment, development_mock_allowed())
     }
 
     /// Mint (or reuse a cached) ES256 provider JWT. Mirrors the auth-layer
@@ -155,28 +163,60 @@ impl ApnsSink {
     /// Map an APNs HTTP status + `reason` body into a delivery outcome. 410
     /// (`Unregistered`) and 400/`BadDeviceToken` are terminal (dead token);
     /// 429 and 5xx are retryable.
+    #[cfg(test)]
     fn classify_status(status: u16, reason: &str) -> Result<(), DeliveryError> {
+        Self::classify_status_with_diagnostic(status, reason, reason)
+    }
+
+    fn classify_status_with_diagnostic(
+        status: u16,
+        reason: &str,
+        diagnostic: &str,
+    ) -> Result<(), DeliveryError> {
         match status {
             200 => Ok(()),
             410 => Err(DeliveryError::InvalidTarget(format!(
-                "unregistered: {reason}"
+                "unregistered: {diagnostic}"
             ))),
             400 if reason.contains("BadDeviceToken")
                 || reason.contains("DeviceTokenNotForTopic") =>
             {
-                Err(DeliveryError::InvalidTarget(format!("bad token: {reason}")))
+                Err(DeliveryError::InvalidTarget(format!(
+                    "bad token: {diagnostic}"
+                )))
             }
             400 | 403 | 404 | 405 | 413 => Err(DeliveryError::Permanent(format!(
-                "rejected ({status}): {reason}"
+                "rejected ({status}): {diagnostic}"
             ))),
-            429 => Err(DeliveryError::Retryable(format!("throttled: {reason}"))),
+            300..=399 => Err(DeliveryError::Permanent(format!(
+                "APNs redirect refused ({status})"
+            ))),
+            429 => Err(DeliveryError::Retryable(format!("throttled: {diagnostic}"))),
             500..=599 => Err(DeliveryError::Retryable(format!(
-                "apns server error ({status}): {reason}"
+                "apns server error ({status}): {diagnostic}"
             ))),
             other => Err(DeliveryError::Retryable(format!(
-                "unexpected apns status {other}: {reason}"
+                "unexpected apns status {other}: {diagnostic}"
             ))),
         }
+    }
+}
+
+fn safe_response_reason(body: &[u8]) -> &'static str {
+    let Some(reason) = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|body| body.get("reason")?.as_str().map(str::to_owned))
+    else {
+        return "Unknown";
+    };
+    // Preserve only classification-relevant values from APNs' fixed reason
+    // vocabulary. Arbitrary provider response data never reaches durable
+    // diagnostics.
+    match reason.as_str() {
+        "BadDeviceToken" => "BadDeviceToken",
+        "DeviceTokenNotForTopic" => "DeviceTokenNotForTopic",
+        "Unregistered" => "Unregistered",
+        _ => "ProviderRejected",
     }
 }
 
@@ -393,6 +433,7 @@ fn with_optional_header(
 
 impl Sink for ApnsSink {
     async fn deliver(&self, target: &DeliveryTarget, payload: &[u8]) -> Result<(), DeliveryError> {
+        super::validate_apns_device_token(&target.token).map_err(DeliveryError::InvalidTarget)?;
         let now_secs = crate::auth::unix_seconds();
         let jwt = self.provider_token(now_secs)?;
         let url = format!("{}/3/device/{}", self.base_url, target.token);
@@ -416,22 +457,94 @@ impl Sink for ApnsSink {
             .body(body);
         let request = with_optional_header(request, "apns-expiration", &headers.expiration);
         let request = with_optional_header(request, "apns-collapse-id", &headers.collapse_id);
-        let resp = request.send().await.map_err(|e| {
-            if e.is_timeout() || e.is_connect() {
-                DeliveryError::Retryable(format!("apns transport: {e}"))
+        let mut resp = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                DeliveryError::Retryable("APNs request timed out".to_string())
+            } else if error.is_connect() {
+                DeliveryError::Retryable("APNs connection failed".to_string())
             } else {
-                DeliveryError::Retryable(format!("apns request failed: {e}"))
+                DeliveryError::Retryable("APNs request failed".to_string())
             }
         })?;
         let status = resp.status().as_u16();
-        let response_body = resp.text().await.unwrap_or_default();
-        let reason = if target.request_id.is_empty() {
-            response_body
+        let mut response_body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|_| DeliveryError::Retryable("APNs response read failed".to_string()))?
+        {
+            if response_body.len().saturating_add(chunk.len()) > APNS_RESPONSE_BODY_LIMIT {
+                return Err(DeliveryError::Permanent(
+                    "APNs response exceeded the safety limit".to_string(),
+                ));
+            }
+            response_body.extend_from_slice(&chunk);
+        }
+        let response_reason = safe_response_reason(&response_body);
+        let diagnostic_reason =
+            if !target.token.is_empty() && response_reason.contains(&target.token) {
+                "ProviderRejected"
+            } else {
+                response_reason
+            };
+        let diagnostic = if target.request_id.is_empty() {
+            diagnostic_reason.to_string()
         } else {
-            format!("apns-id {}: {response_body}", target.request_id)
+            format!("apns-id {}: {diagnostic_reason}", target.request_id)
         };
-        ApnsSink::classify_status(status, &reason)
+        ApnsSink::classify_status_with_diagnostic(status, response_reason, &diagnostic)
     }
+}
+
+fn development_mock_allowed() -> bool {
+    std::env::var(ALLOW_PRIVATE_ENDPOINTS_ENV).as_deref() == Ok("1")
+}
+
+fn resolve_base_url(environment: &str, allow_mock: bool) -> Result<String, String> {
+    let environment = environment.trim().trim_end_matches('/');
+    match environment.to_ascii_lowercase().as_str() {
+        "production" | "prod" => Ok(APNS_PRODUCTION_URL.to_string()),
+        "sandbox" | "development" | "dev" | "" => Ok(APNS_SANDBOX_URL.to_string()),
+        _ if environment == APNS_PRODUCTION_URL || environment == APNS_SANDBOX_URL => {
+            Ok(environment.to_string())
+        }
+        _ => {
+            validate_base_url(environment, allow_mock)?;
+            Ok(environment.to_string())
+        }
+    }
+}
+
+fn validate_base_url(base_url: &str, allow_mock: bool) -> Result<(), String> {
+    if base_url == APNS_PRODUCTION_URL || base_url == APNS_SANDBOX_URL {
+        return Ok(());
+    }
+    if !allow_mock {
+        return Err("APNs delivery is restricted to Apple's provider hosts".to_string());
+    }
+    let url = reqwest::Url::parse(base_url).map_err(|_| "invalid APNs mock URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err("invalid APNs mock URL".to_string());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "invalid APNs mock URL".to_string())?;
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if !loopback {
+        return Err("APNs development mock must use a loopback host".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -454,28 +567,28 @@ mod tests {
     #[test]
     fn base_url_splits_sandbox_from_production() {
         assert_eq!(
-            ApnsSink::resolve_base_url("production"),
-            "https://api.push.apple.com"
+            ApnsSink::resolve_base_url("production").unwrap(),
+            APNS_PRODUCTION_URL
         );
         assert_eq!(
-            ApnsSink::resolve_base_url("prod"),
-            "https://api.push.apple.com"
+            ApnsSink::resolve_base_url("prod").unwrap(),
+            APNS_PRODUCTION_URL
         );
         assert_eq!(
-            ApnsSink::resolve_base_url("sandbox"),
-            "https://api.sandbox.push.apple.com"
+            ApnsSink::resolve_base_url("sandbox").unwrap(),
+            APNS_SANDBOX_URL
         );
-        // Unknown values are sandbox, so a misconfiguration cannot silently
-        // deliver to real users.
+        // An omitted environment defaults safely to sandbox. Unknown values
+        // are rejected below rather than guessed.
+        assert_eq!(ApnsSink::resolve_base_url("").unwrap(), APNS_SANDBOX_URL);
+        // Mock origins are rejected unless the explicit development policy is
+        // active, and even then only loopback is accepted.
+        assert!(resolve_base_url("http://127.0.0.1:9000/", false).is_err());
         assert_eq!(
-            ApnsSink::resolve_base_url(""),
-            "https://api.sandbox.push.apple.com"
-        );
-        // An explicit base survives verbatim; the tests point it at a mock.
-        assert_eq!(
-            ApnsSink::resolve_base_url("http://127.0.0.1:9000/"),
+            resolve_base_url("http://127.0.0.1:9000/", true).unwrap(),
             "http://127.0.0.1:9000"
         );
+        assert!(resolve_base_url("https://attacker.example", true).is_err());
     }
 
     fn sink_with(p8: String) -> ApnsSink {
@@ -554,6 +667,9 @@ mod tests {
         let unavailable = ApnsSink::classify_status(503, "ServiceUnavailable").unwrap_err();
         assert!(!unavailable.is_permanent());
         assert!(!unavailable.invalidates_target());
+        let redirect = ApnsSink::classify_status(302, "redirect").unwrap_err();
+        assert!(redirect.is_permanent());
+        assert!(!redirect.invalidates_target());
     }
 
     #[test]
@@ -595,8 +711,8 @@ mod tests {
     #[test]
     fn body_maps_localization_launch_image_and_critical_sound() {
         let payload = br#"{
-            "title_loc_key":"QUESTION_TITLE","title_loc_args":["Codex"],
-            "subtitle_loc_key":"PROJECT_NAME","subtitle_loc_args":["Vigil"],
+            "title_loc_key":"QUESTION_TITLE","title_loc_args":["Alex"],
+            "subtitle_loc_key":"PROJECT_NAME","subtitle_loc_args":["Atlas"],
             "body_loc_key":"QUESTION_BODY","body_loc_args":["Deploy"],
             "launch_image":"LaunchQuestion",
             "sound":{"critical":true,"name":"alarm.caf","volume":0.4}
@@ -604,9 +720,9 @@ mod tests {
         let v: Value = serde_json::from_slice(&apns_body_from_payload(payload)).unwrap();
         let alert = &v["aps"]["alert"];
         assert_eq!(alert["title-loc-key"], "QUESTION_TITLE");
-        assert_eq!(alert["title-loc-args"], json!(["Codex"]));
+        assert_eq!(alert["title-loc-args"], json!(["Alex"]));
         assert_eq!(alert["subtitle-loc-key"], "PROJECT_NAME");
-        assert_eq!(alert["subtitle-loc-args"], json!(["Vigil"]));
+        assert_eq!(alert["subtitle-loc-args"], json!(["Atlas"]));
         assert_eq!(alert["loc-key"], "QUESTION_BODY");
         assert_eq!(alert["loc-args"], json!(["Deploy"]));
         assert_eq!(alert["launch-image"], "LaunchQuestion");

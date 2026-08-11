@@ -4,13 +4,14 @@
 //! credentials (`push.credentials`), a durable at-least-once delivery outbox
 //! (`push.outbox`), and the background worker that drains it through platform
 //! `Sink`s. A `subject_id` MAY be a Lux `auth.users.id` but doesn't have to be —
-//! push works with Lux auth entirely off, managed by the secret key. PR1 ships
-//! the APNs sink; WebPush/FCM/HTTP plug into the same `Sink` seam later.
+//! push works with Lux auth entirely off when managed by the secret key. APNs
+//! and Web Push delivery share the same bounded worker and `Sink` seam.
 
 pub(crate) mod apns;
 pub(crate) mod webpush;
 pub(crate) mod worker;
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::BytesMut;
@@ -22,7 +23,9 @@ use crate::auth::{
 };
 use crate::resp;
 use crate::store::Store;
-use crate::tables::{self, CmpOp, SelectPlan, SelectResult, SharedSchemaCache, WhereClause};
+use crate::tables::{
+    self, CmpOp, Projection, SelectPlan, SelectResult, SharedSchemaCache, WhereClause,
+};
 use std::time::Instant;
 
 /// Reserved `push.*` scope tables (protected + redacted by the shared reserved
@@ -30,6 +33,26 @@ use std::time::Instant;
 pub(crate) const DEVICES_TABLE: &str = "push.devices";
 pub(crate) const CREDENTIALS_TABLE: &str = "push.credentials";
 pub(crate) const OUTBOX_TABLE: &str = "push.outbox";
+
+const MAX_SUBJECT_ID_BYTES: usize = 256;
+const MAX_DEVICE_ID_BYTES: usize = 128;
+const MAX_APP_ID_BYTES: usize = 128;
+const MAX_APNS_TOKEN_BYTES: usize = 512;
+const MAX_WEB_SUBSCRIPTION_BYTES: usize = 8 * 1024;
+const MAX_SUBJECTS_PER_SEND: usize = 100;
+const MAX_DEVICES_PER_SUBJECT: usize = 64;
+const MAX_DEVICE_ROWS: usize = 100_000;
+const MAX_DELIVERIES_PER_SEND: usize = 1_000;
+const MAX_OUTBOX_ROWS: usize = 100_000;
+const MAX_APNS_TEAM_ID_BYTES: usize = 128;
+const MAX_APNS_KEY_ID_BYTES: usize = 128;
+const MAX_APNS_TOPIC_BYTES: usize = 255;
+const MAX_PROVIDER_PRIVATE_KEY_BYTES: usize = 16 * 1024;
+const MAX_VAPID_PUBLIC_KEY_BYTES: usize = 512;
+const MAX_VAPID_SUBJECT_BYTES: usize = 2_048;
+pub(crate) const DEFAULT_PAGE_SIZE: usize = 100;
+pub(crate) const MAX_PAGE_SIZE: usize = 1_000;
+pub(crate) const MAX_PAGE_OFFSET: usize = 100_000;
 
 /// Create the `push.*` tables if they don't exist. Called lazily on the first
 /// write (register / set-credentials / send) so a project that never uses push
@@ -360,17 +383,86 @@ pub(crate) enum EnvironmentSource {
     User,
 }
 
+impl EnvironmentSource {
+    fn is_trusted(self) -> bool {
+        self == Self::Trusted
+    }
+}
+
+fn validate_bounded_text(field: &str, value: &str, max_bytes: usize) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{field} is required"));
+    }
+    if value.len() > max_bytes {
+        return Err(format!("{field} must not exceed {max_bytes} bytes"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    Ok(())
+}
+
+fn validate_bounded_secret(field: &str, value: &str, max_bytes: usize) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} is required"));
+    }
+    if value.len() > max_bytes {
+        return Err(format!("{field} must not exceed {max_bytes} bytes"));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r'))
+    {
+        return Err(format!("{field} contains an invalid control character"));
+    }
+    Ok(())
+}
+
+fn validate_vapid_subject(subject: &str) -> Result<(), String> {
+    if subject.trim().is_empty() {
+        return Ok(());
+    }
+    validate_bounded_text("subject", subject, MAX_VAPID_SUBJECT_BYTES)?;
+    let url = reqwest::Url::parse(subject)
+        .map_err(|_| "VAPID subject must be an https URL or mailto address".to_string())?;
+    if !matches!(url.scheme(), "https" | "mailto") {
+        return Err("VAPID subject must be an https URL or mailto address".to_string());
+    }
+    Ok(())
+}
+
+fn normalized_platform(platform: &str) -> Result<&'static str, String> {
+    match platform.trim().to_ascii_lowercase().as_str() {
+        "ios" => Ok("ios"),
+        "web" => Ok("web"),
+        "desktop" => Ok("desktop"),
+        _ => Err("platform must be ios, web, or desktop".to_string()),
+    }
+}
+
+fn validate_apns_device_token(token: &str) -> Result<(), String> {
+    validate_bounded_text("token", token, MAX_APNS_TOKEN_BYTES)?;
+    if !token
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("invalid APNs device token".to_string());
+    }
+    Ok(())
+}
+
+fn validate_device_token_for_lookup(token: &str) -> Result<(), String> {
+    validate_bounded_text("token", token, MAX_WEB_SUBSCRIPTION_BYTES)
+}
+
 /// Normalize a caller-supplied APNs environment to what `resolve_base_url`
 /// understands. Anything unrecognized is treated as unspecified rather than
 /// guessed at, so delivery falls back to the app credential instead of silently
 /// routing to the wrong host.
 ///
-/// An explicit `http(s)://` base is only honored from a trusted caller. The
-/// delivery worker sends the APNs provider JWT as a bearer token to whatever
-/// host this resolves to, and that JWT is signed with the team's `.p8` and is
-/// good for the whole app, so letting an end user name the host would hand any
-/// signed-in user a way to collect it. Operators can already point the app
-/// credential at an arbitrary base, so they gain nothing new here.
+/// An explicit `http(s)://` base is only preserved from a trusted caller. The
+/// APNs sink separately restricts it to an explicit development-only loopback
+/// override; production delivery always resolves to Apple's exact hosts.
 pub(crate) fn normalize_environment(environment: &str, source: EnvironmentSource) -> String {
     let trimmed = environment.trim();
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -421,14 +513,34 @@ pub(crate) fn register_device(
         environment,
         environment_source,
     } = device;
-    if platform.eq_ignore_ascii_case("web") {
+    validate_bounded_text("subject_id", subject_id, MAX_SUBJECT_ID_BYTES)?;
+    validate_bounded_text("app_id", app_id, MAX_APP_ID_BYTES)?;
+    let platform = normalized_platform(platform)?;
+    validate_device_token_for_lookup(token)?;
+    if matches!(platform, "web" | "desktop") {
         webpush::validate_subscription_token(token)?;
+    } else {
+        validate_apns_device_token(token)?;
     }
+    let _registry = store.push_device_registry_guard();
     ensure_tables(store, cache, now)?;
     let environment = normalize_environment(environment, environment_source);
     let now_s = unix_seconds().to_string();
     if let Some(existing) = find_row_by_field(store, cache, DEVICES_TABLE, "token", token, now)? {
         let id = existing.get("id").cloned().unwrap_or_default();
+        let existing_subject = existing.get("subject_id").map(String::as_str).unwrap_or("");
+        if !environment_source.is_trusted() && existing_subject != subject_id {
+            return Err("device token is already registered".to_string());
+        }
+        let gains_active_device = existing_subject != subject_id
+            || existing.get("disabled_at").is_none_or(|value| value != "0");
+        if gains_active_device
+            && active_device_count(store, cache, subject_id, now)? >= MAX_DEVICES_PER_SUBJECT
+        {
+            return Err(format!(
+                "a subject may not register more than {MAX_DEVICES_PER_SUBJECT} active devices"
+            ));
+        }
         // A re-register that omits the environment must not erase a known one:
         // the same token cannot move hosts, so silence means "unchanged".
         let environment = if environment.is_empty() {
@@ -436,7 +548,12 @@ pub(crate) fn register_device(
         } else {
             environment
         };
-        durable_table_update_where(
+        let where_args = if environment_source.is_trusted() {
+            vec!["id", "=", id.as_str()]
+        } else {
+            vec!["id", "=", id.as_str(), "AND", "subject_id", "=", subject_id]
+        };
+        let updated = durable_table_update_where(
             store,
             cache,
             DEVICES_TABLE,
@@ -448,10 +565,25 @@ pub(crate) fn register_device(
                 ("last_seen_at", now_s.as_str()),
                 ("disabled_at", "0"),
             ],
-            &["id", "=", id.as_str()],
+            &where_args,
             now,
         )?;
+        if updated != 1 {
+            return Err("device token is already registered".to_string());
+        }
         return Ok(id);
+    }
+    if active_device_count(store, cache, subject_id, now)? >= MAX_DEVICES_PER_SUBJECT {
+        return Err(format!(
+            "a subject may not register more than {MAX_DEVICES_PER_SUBJECT} active devices"
+        ));
+    }
+    let device_rows = usize::try_from(tables::table_count(store, cache, DEVICES_TABLE, now)?)
+        .map_err(|_| "invalid push device count".to_string())?;
+    if device_rows >= MAX_DEVICE_ROWS {
+        return Err(format!(
+            "push device registry capacity of {MAX_DEVICE_ROWS} rows has been reached"
+        ));
     }
     let id = random_id("dev");
     durable_table_insert(
@@ -475,14 +607,13 @@ pub(crate) fn register_device(
     Ok(id)
 }
 
-/// List a subject's active devices as JSON, omitting the raw token.
-pub(crate) fn list_devices(
+fn active_device_count(
     store: &Store,
     cache: &SharedSchemaCache,
     subject_id: &str,
     now: Instant,
-) -> Result<Vec<Value>, String> {
-    let rows = select_rows(
+) -> Result<usize, String> {
+    select_rows(
         store,
         cache,
         DEVICES_TABLE,
@@ -490,7 +621,39 @@ pub(crate) fn list_devices(
             WhereClause::single("subject_id".into(), CmpOp::Eq, subject_id.into()),
             WhereClause::single("disabled_at".into(), CmpOp::Eq, "0".into()),
         ],
-        None,
+        Some(MAX_DEVICES_PER_SUBJECT),
+        now,
+    )
+    .map(|rows| rows.len())
+}
+
+/// List a bounded page of a subject's active devices, omitting raw tokens.
+pub(crate) fn list_devices_page(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    subject_id: &str,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    now: Instant,
+) -> Result<Vec<Value>, String> {
+    validate_bounded_text("subject_id", subject_id, MAX_SUBJECT_ID_BYTES)?;
+    let rows = select_projected_rows_page(
+        store,
+        cache,
+        DEVICES_TABLE,
+        vec![
+            WhereClause::single("subject_id".into(), CmpOp::Eq, subject_id.into()),
+            WhereClause::single("disabled_at".into(), CmpOp::Eq, "0".into()),
+        ],
+        &[
+            "id",
+            "platform",
+            "app_id",
+            "environment",
+            "created_at",
+            "last_seen_at",
+        ],
+        SelectPage::by_id(limit, offset),
         now,
     )?;
     Ok(rows
@@ -517,6 +680,9 @@ pub(crate) fn delete_device(
     id: &str,
     now: Instant,
 ) -> Result<bool, String> {
+    validate_bounded_text("subject_id", subject_id, MAX_SUBJECT_ID_BYTES)?;
+    validate_bounded_text("device id", id, MAX_DEVICE_ID_BYTES)?;
+    let _registry = store.push_device_registry_guard();
     let removed = durable_table_delete_where(
         store,
         cache,
@@ -538,6 +704,8 @@ pub(crate) fn delete_device_by_id(
     id: &str,
     now: Instant,
 ) -> Result<bool, String> {
+    validate_bounded_text("device id", id, MAX_DEVICE_ID_BYTES)?;
+    let _registry = store.push_device_registry_guard();
     let removed = durable_table_delete_where(store, cache, DEVICES_TABLE, &["id", "=", id], now)?;
     if removed > 0 {
         metrics().devices.fetch_sub(1, Ordering::Relaxed);
@@ -556,6 +724,9 @@ pub(crate) fn delete_device_by_token_for_subject(
     token: &str,
     now: Instant,
 ) -> Result<bool, String> {
+    validate_bounded_text("subject_id", subject_id, MAX_SUBJECT_ID_BYTES)?;
+    validate_device_token_for_lookup(token)?;
+    let _registry = store.push_device_registry_guard();
     let removed = durable_table_delete_where(
         store,
         cache,
@@ -577,6 +748,8 @@ pub(crate) fn delete_device_by_token(
     token: &str,
     now: Instant,
 ) -> Result<bool, String> {
+    validate_device_token_for_lookup(token)?;
+    let _registry = store.push_device_registry_guard();
     let removed =
         durable_table_delete_where(store, cache, DEVICES_TABLE, &["token", "=", token], now)?;
     if removed > 0 {
@@ -589,13 +762,32 @@ pub(crate) fn delete_device_by_token(
 // Admin reads (operator) — for the cloud dashboard
 // ---------------------------------------------------------------------------
 
-/// List every device across all users (operator view). Tokens are omitted.
-pub(crate) fn list_all_devices(
+/// List a bounded page of devices across all users. Tokens are omitted.
+pub(crate) fn list_all_devices_page(
     store: &Store,
     cache: &SharedSchemaCache,
+    limit: usize,
+    offset: usize,
     now: Instant,
 ) -> Result<Vec<Value>, String> {
-    let rows = select_rows(store, cache, DEVICES_TABLE, Vec::new(), None, now)?;
+    let rows = select_projected_rows_page(
+        store,
+        cache,
+        DEVICES_TABLE,
+        Vec::new(),
+        &[
+            "id",
+            "subject_id",
+            "platform",
+            "app_id",
+            "environment",
+            "created_at",
+            "last_seen_at",
+            "disabled_at",
+        ],
+        SelectPage::by_id(Some(limit), Some(offset)),
+        now,
+    )?;
     Ok(rows
         .into_iter()
         .map(|row| {
@@ -614,13 +806,15 @@ pub(crate) fn list_all_devices(
         .collect())
 }
 
-/// List dead-lettered deliveries (operator view). Target tokens are omitted.
-pub(crate) fn list_dead_letters(
+/// List a bounded page of dead-lettered deliveries. Target tokens are omitted.
+pub(crate) fn list_dead_letters_page(
     store: &Store,
     cache: &SharedSchemaCache,
+    limit: usize,
+    offset: usize,
     now: Instant,
 ) -> Result<Vec<Value>, String> {
-    let rows = select_rows(
+    let rows = select_projected_rows_page(
         store,
         cache,
         OUTBOX_TABLE,
@@ -629,7 +823,17 @@ pub(crate) fn list_dead_letters(
             CmpOp::Eq,
             "dead".into(),
         )],
-        Some(200),
+        &[
+            "id",
+            "subject_id",
+            "app_id",
+            "platform",
+            "environment",
+            "attempts",
+            "last_error",
+            "created_at",
+        ],
+        SelectPage::by_id(Some(limit), Some(offset)),
         now,
     )?;
     Ok(rows
@@ -724,9 +928,20 @@ pub(crate) fn update_apns_credentials(
     environment: &str,
     now: Instant,
 ) -> Result<(), String> {
+    validate_bounded_text("app_id", app_id, MAX_APP_ID_BYTES)?;
+    validate_bounded_text("team_id", team_id, MAX_APNS_TEAM_ID_BYTES)?;
+    validate_bounded_text("key_id", key_id, MAX_APNS_KEY_ID_BYTES)?;
+    validate_bounded_text("topic", topic, MAX_APNS_TOPIC_BYTES)?;
+    if let Some(p8_pem) = p8_pem {
+        validate_bounded_secret("p8_pem", p8_pem, MAX_PROVIDER_PRIVATE_KEY_BYTES)?;
+    }
     if p8_pem.is_some() && !store.encryption().has_active_key() {
         return Err("new push secrets require ENC INIT or an active encryption key".to_string());
     }
+    if let Some(p8_pem) = p8_pem {
+        apns::validate_private_key(p8_pem)?;
+    }
+    apns::ApnsSink::resolve_base_url(environment)?;
     ensure_tables(store, cache, now)?;
     if p8_pem.is_none() {
         let existing = get_apns_credentials(store, cache, app_id, now)?;
@@ -747,9 +962,6 @@ pub(crate) fn update_apns_credentials(
         fields.push(("apns_p8_pem", ""));
     }
     if let Some(p8_pem) = p8_pem {
-        if p8_pem.trim().is_empty() {
-            return Err("p8_pem cannot be empty; use clear to remove APNs".to_string());
-        }
         fields.push(("apns_p8_pem_encrypted", p8_pem));
     }
     upsert_credential_fields(store, cache, app_id, &fields, now)
@@ -761,6 +973,7 @@ pub(crate) fn clear_apns_credentials(
     app_id: &str,
     now: Instant,
 ) -> Result<(), String> {
+    validate_bounded_text("app_id", app_id, MAX_APP_ID_BYTES)?;
     ensure_tables(store, cache, now)?;
     let mut fields = vec![
         ("apns_team_id", ""),
@@ -785,11 +998,16 @@ pub(crate) fn set_vapid_credentials(
     subject: &str,
     now: Instant,
 ) -> Result<(), String> {
+    validate_bounded_text("app_id", app_id, MAX_APP_ID_BYTES)?;
+    validate_bounded_text("public_key", public_key, MAX_VAPID_PUBLIC_KEY_BYTES)?;
+    validate_bounded_secret("private_pem", private_pem, MAX_PROVIDER_PRIVATE_KEY_BYTES)?;
+    validate_vapid_subject(subject)?;
     if !store.encryption().has_active_key() {
         return Err(
             "push credential writes require ENC INIT or an active encryption key".to_string(),
         );
     }
+    webpush::validate_vapid_keypair(public_key, private_pem)?;
     ensure_tables(store, cache, now)?;
     upsert_credential_fields(
         store,
@@ -812,6 +1030,8 @@ pub(crate) fn rotate_vapid_credentials(
     subject: &str,
     now: Instant,
 ) -> Result<String, String> {
+    validate_bounded_text("app_id", app_id, MAX_APP_ID_BYTES)?;
+    validate_vapid_subject(subject)?;
     let (public_key, private_pem) = webpush::generate_vapid_keypair()?;
     set_vapid_credentials(
         store,
@@ -831,6 +1051,7 @@ pub(crate) fn disable_vapid_credentials(
     app_id: &str,
     now: Instant,
 ) -> Result<(), String> {
+    validate_bounded_text("app_id", app_id, MAX_APP_ID_BYTES)?;
     ensure_tables(store, cache, now)?;
     let mut fields = vec![
         ("vapid_public", ""),
@@ -880,6 +1101,7 @@ pub(crate) fn vapid_public_key(
     app_id: &str,
     now: Instant,
 ) -> Result<Option<String>, String> {
+    validate_bounded_text("app_id", app_id, MAX_APP_ID_BYTES)?;
     Ok(get_vapid_credentials(store, cache, app_id, now)?.map(|c| c.public_key))
 }
 
@@ -919,6 +1141,7 @@ pub(crate) fn credential_config(
     app_id: &str,
     now: Instant,
 ) -> Result<Value, String> {
+    validate_bounded_text("app_id", app_id, MAX_APP_ID_BYTES)?;
     ensure_tables(store, cache, now)?;
     let row = find_row_by_field(store, cache, CREDENTIALS_TABLE, "app_id", app_id, now)?;
     let fields = row.unwrap_or_default();
@@ -1145,6 +1368,9 @@ fn validate_notification_tail(notification: &Value) -> Result<(), String> {
             if collapse_id.len() > 64 {
                 return Err("apns.collapse_id must not exceed 64 bytes".to_string());
             }
+            if collapse_id.chars().any(char::is_control) {
+                return Err("apns.collapse_id must not contain control characters".to_string());
+            }
         }
         if let Some(expiration) = apns.get("expiration") {
             if expiration.as_u64().is_none() {
@@ -1163,6 +1389,11 @@ fn validate_notification_tail(notification: &Value) -> Result<(), String> {
     }
     let payload = serde_json::to_vec(notification)
         .map_err(|error| format!("invalid notification: {error}"))?;
+    if payload.len() > APNS_PAYLOAD_LIMIT_BYTES {
+        return Err(format!(
+            "push payload exceeds {APNS_PAYLOAD_LIMIT_BYTES} bytes"
+        ));
+    }
     let apns_body = apns::apns_body_from_payload(&payload);
     if apns_body.len() > APNS_PAYLOAD_LIMIT_BYTES {
         return Err(format!(
@@ -1182,9 +1413,7 @@ pub(crate) fn enqueue_send(
     notification: &Value,
     now: Instant,
 ) -> Result<usize, String> {
-    validate_notification(notification)?;
-    let payload = serde_json::to_string(notification).unwrap_or_else(|_| "{}".to_string());
-    enqueue_to_subject(store, cache, subject_id, &payload, now)
+    enqueue_send_many(store, cache, &[subject_id], notification, now)
 }
 
 /// Fan a notification out to many subjects in one call. Returns the total number
@@ -1197,79 +1426,142 @@ pub(crate) fn enqueue_send_many(
     now: Instant,
 ) -> Result<usize, String> {
     validate_notification(notification)?;
-    let payload = serde_json::to_string(notification).unwrap_or_else(|_| "{}".to_string());
-    let mut total = 0usize;
-    for subject_id in subject_ids {
-        total += enqueue_to_subject(store, cache, subject_id, &payload, now)?;
+    if subject_ids.len() > MAX_SUBJECTS_PER_SEND {
+        return Err(format!(
+            "subject_ids must not contain more than {MAX_SUBJECTS_PER_SEND} entries"
+        ));
     }
-    Ok(total)
+    let mut unique_subjects = BTreeSet::new();
+    for subject_id in subject_ids {
+        validate_bounded_text("subject_id", subject_id, MAX_SUBJECT_ID_BYTES)?;
+        unique_subjects.insert(*subject_id);
+    }
+    let payload = serde_json::to_string(notification).unwrap_or_else(|_| "{}".to_string());
+    enqueue_to_subjects(store, cache, &unique_subjects, &payload, now)
 }
 
-/// Insert one pending outbox row per active device of `subject_id`. `payload` is
-/// the already-serialized notification JSON.
-fn enqueue_to_subject(
+/// Resolve a bounded fan-out and insert it as one durable table mutation. A
+/// rejected request never leaves a partially enqueued subject list behind.
+fn enqueue_to_subjects(
     store: &Store,
     cache: &SharedSchemaCache,
-    subject_id: &str,
+    subject_ids: &BTreeSet<&str>,
     payload: &str,
     now: Instant,
 ) -> Result<usize, String> {
     ensure_tables(store, cache, now)?;
-    let rows = select_rows(
-        store,
-        cache,
-        DEVICES_TABLE,
-        vec![
-            WhereClause::single("subject_id".into(), CmpOp::Eq, subject_id.into()),
-            WhereClause::single("disabled_at".into(), CmpOp::Eq, "0".into()),
-        ],
-        None,
-        now,
-    )?;
     let now_s = unix_seconds().to_string();
-    let mut count = 0usize;
-    for row in rows {
-        let m: std::collections::HashMap<String, String> = row.into_iter().collect();
-        let token = m.get("token").cloned().unwrap_or_default();
-        if token.is_empty() {
-            continue;
-        }
-        let id = random_id("out");
-        durable_table_insert(
+    let mut outbox_rows = Vec::new();
+    for subject_id in subject_ids {
+        let rows = select_rows(
             store,
             cache,
-            OUTBOX_TABLE,
-            &[
-                ("id", id.as_str()),
-                ("subject_id", subject_id),
-                ("app_id", m.get("app_id").map(String::as_str).unwrap_or("")),
-                ("target_token", token.as_str()),
-                (
-                    "platform",
-                    m.get("platform").map(String::as_str).unwrap_or(""),
-                ),
-                (
-                    "environment",
-                    m.get("environment").map(String::as_str).unwrap_or(""),
-                ),
-                ("payload", payload),
-                ("attempts", "0"),
-                ("next_attempt_at", now_s.as_str()),
-                ("state", "pending"),
-                ("last_error", ""),
-                ("created_at", now_s.as_str()),
+            DEVICES_TABLE,
+            vec![
+                WhereClause::single("subject_id".into(), CmpOp::Eq, (*subject_id).into()),
+                WhereClause::single("disabled_at".into(), CmpOp::Eq, "0".into()),
             ],
+            Some(MAX_DEVICES_PER_SUBJECT + 1),
             now,
         )?;
-        count += 1;
+        if rows.len() > MAX_DEVICES_PER_SUBJECT {
+            return Err(format!(
+                "subject fan-out exceeds {MAX_DEVICES_PER_SUBJECT} active devices"
+            ));
+        }
+        for row in rows {
+            let fields: std::collections::HashMap<String, String> = row.into_iter().collect();
+            let token = fields.get("token").cloned().unwrap_or_default();
+            if token.is_empty() {
+                continue;
+            }
+            if outbox_rows.len() >= MAX_DELIVERIES_PER_SEND {
+                return Err(format!(
+                    "push fan-out exceeds {MAX_DELIVERIES_PER_SEND} deliveries"
+                ));
+            }
+            outbox_rows.push(vec![
+                ("id".to_string(), random_id("out")),
+                ("subject_id".to_string(), (*subject_id).to_string()),
+                (
+                    "app_id".to_string(),
+                    fields.get("app_id").cloned().unwrap_or_default(),
+                ),
+                ("target_token".to_string(), token),
+                (
+                    "platform".to_string(),
+                    fields.get("platform").cloned().unwrap_or_default(),
+                ),
+                (
+                    "environment".to_string(),
+                    fields.get("environment").cloned().unwrap_or_default(),
+                ),
+                ("payload".to_string(), payload.to_string()),
+                ("attempts".to_string(), "0".to_string()),
+                ("next_attempt_at".to_string(), now_s.clone()),
+                ("state".to_string(), "pending".to_string()),
+                ("last_error".to_string(), String::new()),
+                ("created_at".to_string(), now_s.clone()),
+            ]);
+        }
     }
-    metrics().sends.fetch_add(count as u64, Ordering::Relaxed);
-    Ok(count)
+    if outbox_rows.is_empty() {
+        return Ok(0);
+    }
+
+    let _enqueue = store.push_enqueue_guard();
+    let current = usize::try_from(tables::table_count(store, cache, OUTBOX_TABLE, now)?)
+        .map_err(|_| "invalid push outbox size".to_string())?;
+    validate_outbox_capacity(current, outbox_rows.len())?;
+    let inserted = tables::table_insert_many_returning_ttl(
+        store,
+        cache,
+        OUTBOX_TABLE,
+        &outbox_rows,
+        None,
+        now,
+    )?
+    .len();
+    metrics()
+        .sends
+        .fetch_add(inserted as u64, Ordering::Relaxed);
+    Ok(inserted)
+}
+
+fn validate_outbox_capacity(current: usize, additional: usize) -> Result<(), String> {
+    if additional > MAX_OUTBOX_ROWS.saturating_sub(current) {
+        Err(format!(
+            "push outbox capacity of {MAX_OUTBOX_ROWS} rows has been reached"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Shared select helper
 // ---------------------------------------------------------------------------
+
+struct SelectPage {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    order_by: Option<(String, bool)>,
+}
+
+impl SelectPage {
+    fn by_id(limit: Option<usize>, offset: Option<usize>) -> Self {
+        Self {
+            limit,
+            offset,
+            order_by: Some(("id".to_string(), true)),
+        }
+    }
+}
+
+struct SelectView {
+    projections: Vec<Projection>,
+    decrypt_authorized: bool,
+}
 
 pub(crate) fn select_rows(
     store: &Store,
@@ -1277,6 +1569,75 @@ pub(crate) fn select_rows(
     table: &str,
     conditions: Vec<WhereClause>,
     limit: Option<usize>,
+    now: Instant,
+) -> Result<Vec<Vec<(String, String)>>, String> {
+    select_rows_page(store, cache, table, conditions, limit, None, now)
+}
+
+pub(crate) fn select_rows_page(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    conditions: Vec<WhereClause>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    now: Instant,
+) -> Result<Vec<Vec<(String, String)>>, String> {
+    select_rows_page_with_projection(
+        store,
+        cache,
+        table,
+        conditions,
+        SelectView {
+            projections: Vec::new(),
+            decrypt_authorized: true,
+        },
+        SelectPage {
+            limit,
+            offset,
+            order_by: None,
+        },
+        now,
+    )
+}
+
+fn select_projected_rows_page(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    conditions: Vec<WhereClause>,
+    fields: &[&str],
+    page: SelectPage,
+    now: Instant,
+) -> Result<Vec<Vec<(String, String)>>, String> {
+    let projections = fields
+        .iter()
+        .map(|field| Projection {
+            expr: (*field).to_string(),
+            alias: None,
+        })
+        .collect();
+    select_rows_page_with_projection(
+        store,
+        cache,
+        table,
+        conditions,
+        SelectView {
+            projections,
+            decrypt_authorized: false,
+        },
+        page,
+        now,
+    )
+}
+
+fn select_rows_page_with_projection(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    conditions: Vec<WhereClause>,
+    view: SelectView,
+    page: SelectPage,
     now: Instant,
 ) -> Result<Vec<Vec<(String, String)>>, String> {
     // Push tables are created lazily on first write, so a project that has never
@@ -1292,20 +1653,65 @@ pub(crate) fn select_rows(
     let plan = SelectPlan {
         table: table.to_string(),
         alias: None,
-        projections: Vec::new(),
+        projections: view.projections,
         aggregates: Vec::new(),
         joins: Vec::new(),
         conditions,
         group_by: Vec::new(),
         having: Vec::new(),
         near: None,
-        order_by: None,
-        limit,
-        offset: None,
-        decrypt_authorized: true,
+        order_by: page.order_by,
+        limit: page.limit,
+        offset: page.offset,
+        decrypt_authorized: view.decrypt_authorized,
     };
     match tables::table_select(store, cache, &plan, now)? {
         SelectResult::Rows(rows) => Ok(rows),
+        SelectResult::Aggregate(_) => Ok(Vec::new()),
+    }
+}
+
+pub(crate) fn select_oldest_row_ids(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    conditions: Vec<WhereClause>,
+    limit: usize,
+    now: Instant,
+) -> Result<Vec<String>, String> {
+    match tables::table_schema(store, cache, table, now) {
+        Ok(_) => {}
+        Err(error) if error == format!("ERR table '{table}' does not exist") => {
+            return Ok(Vec::new())
+        }
+        Err(error) => return Err(error),
+    }
+    let plan = SelectPlan {
+        table: table.to_string(),
+        alias: None,
+        projections: vec![Projection {
+            expr: "id".to_string(),
+            alias: None,
+        }],
+        aggregates: Vec::new(),
+        joins: Vec::new(),
+        conditions,
+        group_by: Vec::new(),
+        having: Vec::new(),
+        near: None,
+        order_by: Some(("created_at".to_string(), true)),
+        limit: Some(limit),
+        offset: None,
+        decrypt_authorized: false,
+    };
+    match tables::table_select(store, cache, &plan, now)? {
+        SelectResult::Rows(rows) => Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                row.into_iter()
+                    .find_map(|(column, value)| (column == "id").then_some(value))
+            })
+            .collect()),
         SelectResult::Aggregate(_) => Ok(Vec::new()),
     }
 }
@@ -1343,7 +1749,7 @@ pub(crate) fn append_info(out: &mut String) {
 /// `LUX PUSH REGISTER <subject_id> <token> <platform> <app_id> [environment]`
 /// `LUX PUSH SEND <subject_id> <json>`
 /// `LUX PUSH CRED <app_id> <team_id> <key_id> <topic> <environment> <p8_pem>`
-/// `LUX PUSH DEVICES <subject_id>`
+/// `LUX PUSH DEVICES <subject_id> [limit] [offset]`
 /// `LUX PUSH STATS`
 ///
 /// Operator-level RESP parity for the HTTP surface. Self-logs resolved
@@ -1406,13 +1812,43 @@ pub(crate) fn cmd_push(
                 Err(e) => resp::write_error(out, &normalize_err(&e)),
             }
         }
-        "DEVICES" if args.len() >= 4 => match list_devices(store, cache, arg(3), now) {
-            Ok(devices) => {
-                let items: Vec<String> = devices.iter().map(|d| d.to_string()).collect();
-                resp::write_bulk_array(out, &items);
+        "DEVICES" if (4..=6).contains(&args.len()) => {
+            let limit = if args.len() >= 5 {
+                match arg(4).parse::<usize>() {
+                    Ok(limit) if (1..=MAX_PAGE_SIZE).contains(&limit) => limit,
+                    _ => {
+                        resp::write_error(
+                            out,
+                            &format!("ERR limit must be between 1 and {MAX_PAGE_SIZE}"),
+                        );
+                        return;
+                    }
+                }
+            } else {
+                DEFAULT_PAGE_SIZE
+            };
+            let offset = if args.len() >= 6 {
+                match arg(5).parse::<usize>() {
+                    Ok(offset) if offset <= MAX_PAGE_OFFSET => offset,
+                    _ => {
+                        resp::write_error(
+                            out,
+                            &format!("ERR offset must not exceed {MAX_PAGE_OFFSET}"),
+                        );
+                        return;
+                    }
+                }
+            } else {
+                0
+            };
+            match list_devices_page(store, cache, arg(3), Some(limit), Some(offset), now) {
+                Ok(devices) => {
+                    let items: Vec<String> = devices.iter().map(|d| d.to_string()).collect();
+                    resp::write_bulk_array(out, &items);
+                }
+                Err(e) => resp::write_error(out, &normalize_err(&e)),
             }
-            Err(e) => resp::write_error(out, &normalize_err(&e)),
-        },
+        }
         "STATS" => {
             let m = metrics();
             resp::write_bulk_array(
@@ -1500,7 +1936,7 @@ mod tests {
     fn notification_accepts_complete_standard_apns_surface() {
         let notification = json!({
             "title_loc_key": "TITLE",
-            "title_loc_args": ["Codex"],
+            "title_loc_args": ["Alex"],
             "subtitle_loc_key": "PROJECT",
             "subtitle_loc_args": ["Lux"],
             "body_loc_key": "BODY",
@@ -1541,6 +1977,10 @@ mod tests {
                 json!({"apns": {"collapse_id": ""}}),
                 "apns.collapse_id must not be empty",
             ),
+            (
+                json!({"apns": {"collapse_id": "safe\r\nx-header: injected"}}),
+                "apns.collapse_id must not contain control characters",
+            ),
             (json!({"data": {"aps": {}}}), "data.aps is reserved by APNs"),
             (
                 json!({"image": "https://example.com/image.png"}),
@@ -1571,7 +2011,246 @@ mod tests {
         });
         assert_eq!(
             validate_notification(&notification).unwrap_err(),
-            format!("APNs payload exceeds {APNS_PAYLOAD_LIMIT_BYTES} bytes")
+            format!("push payload exceeds {APNS_PAYLOAD_LIMIT_BYTES} bytes")
+        );
+        let ignored_by_apns = json!({"unknown": "x".repeat(APNS_PAYLOAD_LIMIT_BYTES)});
+        assert_eq!(
+            validate_notification(&ignored_by_apns).unwrap_err(),
+            format!("push payload exceeds {APNS_PAYLOAD_LIMIT_BYTES} bytes")
+        );
+    }
+
+    #[test]
+    fn send_limits_subjects_devices_and_outbox_growth() {
+        let store = Store::new();
+        let cache = cache();
+        let now = Instant::now();
+        let subjects: Vec<String> = (0..=MAX_SUBJECTS_PER_SEND)
+            .map(|index| format!("subject-{index}"))
+            .collect();
+        let subject_refs: Vec<&str> = subjects.iter().map(String::as_str).collect();
+        assert!(
+            enqueue_send_many(&store, &cache, &subject_refs, &json!({"title":"x"}), now)
+                .unwrap_err()
+                .contains("subject_ids")
+        );
+
+        for index in 0..MAX_DEVICES_PER_SUBJECT {
+            let token = format!("device-{index}");
+            register_device(
+                &store,
+                &cache,
+                DeviceRegistration {
+                    subject_id: "crowded-subject",
+                    token: &token,
+                    platform: "ios",
+                    app_id: "default",
+                    environment: "sandbox",
+                    environment_source: Trusted,
+                },
+                now,
+            )
+            .unwrap();
+        }
+        assert!(register_device(
+            &store,
+            &cache,
+            DeviceRegistration {
+                subject_id: "crowded-subject",
+                token: "one-device-too-many",
+                platform: "ios",
+                app_id: "default",
+                environment: "sandbox",
+                environment_source: Trusted,
+            },
+            now,
+        )
+        .unwrap_err()
+        .contains("active devices"));
+        durable_table_insert(
+            &store,
+            &cache,
+            DEVICES_TABLE,
+            &[
+                ("id", "disabled-extra-device"),
+                ("subject_id", "crowded-subject"),
+                ("token", "disabled-extra-token"),
+                ("platform", "ios"),
+                ("app_id", "default"),
+                ("environment", "sandbox"),
+                ("created_at", "1"),
+                ("last_seen_at", "1"),
+                ("disabled_at", "1"),
+            ],
+            now,
+        )
+        .unwrap();
+        assert!(register_device(
+            &store,
+            &cache,
+            DeviceRegistration {
+                subject_id: "crowded-subject",
+                token: "disabled-extra-token",
+                platform: "ios",
+                app_id: "default",
+                environment: "sandbox",
+                environment_source: User,
+            },
+            now,
+        )
+        .unwrap_err()
+        .contains("active devices"));
+        register_device(
+            &store,
+            &cache,
+            DeviceRegistration {
+                subject_id: "other-subject",
+                token: "operator-transfer-token",
+                platform: "ios",
+                app_id: "default",
+                environment: "sandbox",
+                environment_source: Trusted,
+            },
+            now,
+        )
+        .unwrap();
+        assert!(register_device(
+            &store,
+            &cache,
+            DeviceRegistration {
+                subject_id: "crowded-subject",
+                token: "operator-transfer-token",
+                platform: "ios",
+                app_id: "default",
+                environment: "sandbox",
+                environment_source: Trusted,
+            },
+            now,
+        )
+        .unwrap_err()
+        .contains("active devices"));
+        durable_table_insert(
+            &store,
+            &cache,
+            DEVICES_TABLE,
+            &[
+                ("id", "legacy-extra-device"),
+                ("subject_id", "crowded-subject"),
+                ("token", "legacy-extra-token"),
+                ("platform", "ios"),
+                ("app_id", "default"),
+                ("environment", "sandbox"),
+                ("created_at", "1"),
+                ("last_seen_at", "1"),
+                ("disabled_at", "0"),
+            ],
+            now,
+        )
+        .unwrap();
+        assert!(enqueue_send(
+            &store,
+            &cache,
+            "crowded-subject",
+            &json!({"title":"x"}),
+            now,
+        )
+        .unwrap_err()
+        .contains("subject fan-out"));
+        assert_eq!(
+            tables::table_count(&store, &cache, OUTBOX_TABLE, now).unwrap(),
+            0
+        );
+
+        assert!(validate_outbox_capacity(MAX_OUTBOX_ROWS, 1).is_err());
+        assert!(validate_outbox_capacity(MAX_OUTBOX_ROWS - 1, 1).is_ok());
+        assert!(validate_outbox_capacity(usize::MAX, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn duplicate_subjects_enqueue_each_device_once() {
+        let store = Store::new();
+        let cache = cache();
+        let now = Instant::now();
+        register_device(
+            &store,
+            &cache,
+            DeviceRegistration {
+                subject_id: "subject",
+                token: "device",
+                platform: "ios",
+                app_id: "default",
+                environment: "sandbox",
+                environment_source: Trusted,
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            enqueue_send_many(
+                &store,
+                &cache,
+                &["subject", "subject"],
+                &json!({"title":"x"}),
+                now,
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_users_cannot_both_claim_one_device_token() {
+        let store = Arc::new(Store::new());
+        let cache = cache();
+        ensure_tables(&store, &cache, Instant::now()).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles: Vec<_> = ["subject-a", "subject-b"]
+            .into_iter()
+            .map(|subject_id| {
+                let store = store.clone();
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    register_device(
+                        &store,
+                        &cache,
+                        DeviceRegistration {
+                            subject_id,
+                            token: "shared-device-token",
+                            platform: "ios",
+                            app_id: "default",
+                            environment: "sandbox",
+                            environment_source: User,
+                        },
+                        Instant::now(),
+                    )
+                })
+            })
+            .collect();
+        barrier.wait();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|result| result.is_err()).count(), 1);
+        assert_eq!(
+            select_rows(
+                &store,
+                &cache,
+                DEVICES_TABLE,
+                vec![WhereClause::single(
+                    "token".into(),
+                    CmpOp::Eq,
+                    "shared-device-token".into(),
+                )],
+                None,
+                Instant::now(),
+            )
+            .unwrap()
+            .len(),
+            1
         );
     }
 
@@ -1641,13 +2320,14 @@ mod tests {
         let store = encrypted_store();
         let cache = cache();
         let now = Instant::now();
+        let private_key = webpush::generate_vapid_keypair().unwrap().1;
         update_apns_credentials(
             &store,
             &cache,
             "default",
             "team",
             "key",
-            Some("private-v1"),
+            Some(&private_key),
             "com.example.app",
             "sandbox",
             now,
@@ -1668,20 +2348,70 @@ mod tests {
         let credentials = get_apns_credentials(&store, &cache, "default", now)
             .unwrap()
             .unwrap();
-        assert_eq!(credentials.creds.p8_pem, "private-v1");
+        assert_eq!(credentials.creds.p8_pem, private_key);
         assert_eq!(credentials.creds.key_id, "key-2");
         let config = credential_config(&store, &cache, "default", now).unwrap();
         assert_eq!(
             config["apns"]["secret_storage"],
             Value::String("encrypted".to_string())
         );
-        assert!(config.to_string().find("private-v1").is_none());
+        assert!(!config.to_string().contains("BEGIN PRIVATE KEY"));
 
         clear_apns_credentials(&store, &cache, "default", now).unwrap();
         let cleared = get_apns_credentials(&store, &cache, "default", now)
             .unwrap()
             .unwrap();
         assert!(cleared.creds.p8_pem.is_empty());
+    }
+
+    #[test]
+    fn malformed_provider_credentials_are_rejected_before_storage() {
+        let store = encrypted_store();
+        let cache = cache();
+        let now = Instant::now();
+        assert!(update_apns_credentials(
+            &store,
+            &cache,
+            "default",
+            "team",
+            "key",
+            Some("not-a-private-key"),
+            "com.example.app",
+            "sandbox",
+            now,
+        )
+        .unwrap_err()
+        .contains("invalid APNs"));
+
+        let (public_key, private_pem) = webpush::generate_vapid_keypair().unwrap();
+        let other_public_key = webpush::generate_vapid_keypair().unwrap().0;
+        assert!(set_vapid_credentials(
+            &store,
+            &cache,
+            "default",
+            &other_public_key,
+            &private_pem,
+            "mailto:test@example.com",
+            now,
+        )
+        .unwrap_err()
+        .contains("do not match"));
+        assert!(set_vapid_credentials(
+            &store,
+            &cache,
+            "default",
+            &public_key,
+            &private_pem,
+            "ftp://example.com/contact",
+            now,
+        )
+        .unwrap_err()
+        .contains("https URL or mailto"));
+        assert_eq!(
+            tables::table_schema(&store, &cache, CREDENTIALS_TABLE, now).unwrap_err(),
+            format!("ERR table '{CREDENTIALS_TABLE}' does not exist"),
+            "invalid credentials must fail before creating durable state"
+        );
     }
 
     #[test]

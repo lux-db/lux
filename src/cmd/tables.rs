@@ -741,8 +741,9 @@ pub fn cmd_tselect(
                 }
             }
         }
-        Ok(SelectResult::Aggregate(row)) => {
+        Ok(SelectResult::Aggregate(mut row)) => {
             // Single aggregate result row
+            crate::auth::redact_auth_select_row(&plan, &mut row);
             resp::write_array_header(out, 1);
             resp::write_array_header(out, row.len() * 2);
             for (k, v) in row {

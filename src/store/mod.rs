@@ -628,6 +628,12 @@ pub struct Store {
     /// ephemeral development exception. Initializing a key later does not make
     /// existing plaintext rows safe; bootstrap migration must clear this flag.
     auth_secret_storage_degraded: AtomicBool,
+    /// Keeps Push outbox capacity checks and batch fan-out inserts in one
+    /// engine-local critical section.
+    push_enqueue: parking_lot::Mutex<()>,
+    /// Serializes device ownership changes so a globally unique token cannot
+    /// be claimed twice through concurrent register/delete requests.
+    push_device_registry: parking_lot::Mutex<()>,
     /// Short-lived API-key resolutions belong to this engine instance. Keeping
     /// this on `Store` prevents one embedded server from authenticating against
     /// another server's `auth.keys` table.
@@ -1658,6 +1664,8 @@ impl Store {
             config,
             encryption,
             auth_secret_storage_degraded: AtomicBool::new(auth_secret_storage_degraded),
+            push_enqueue: parking_lot::Mutex::new(()),
+            push_device_registry: parking_lot::Mutex::new(()),
             api_key_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             shards: shards.into_boxed_slice(),
             metrics: StoreMetrics::new(),
@@ -1848,6 +1856,13 @@ impl Store {
             .store(degraded, Ordering::Release);
     }
 
+    pub(crate) fn push_enqueue_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.push_enqueue.lock()
+    }
+
+    pub(crate) fn push_device_registry_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.push_device_registry.lock()
+    }
     pub(crate) fn begin_recovery(&self) {
         // The sentinel only needs to outlive synchronous startup replay. Its
         // exact value, rather than elapsed time, identifies staged entries.

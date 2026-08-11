@@ -3145,8 +3145,8 @@ fn route_request_with_auth(
         ("DELETE", ["push", "config", "apns"]) => push_clear_apns(params, store, cache),
         ("POST", ["push", "config", "vapid"]) => push_enable_vapid(body, store, cache),
         ("DELETE", ["push", "config", "vapid"]) => push_disable_vapid(params, store, cache),
-        ("GET", ["push", "admin", "devices"]) => push_admin_devices(store, cache),
-        ("GET", ["push", "admin", "outbox"]) => push_admin_outbox(store, cache),
+        ("GET", ["push", "admin", "devices"]) => push_admin_devices(params, store, cache),
+        ("GET", ["push", "admin", "outbox"]) => push_admin_outbox(params, store, cache),
         ("GET", ["push", "admin", "stats"]) => push_admin_stats(),
         ("GET", ["push", "vapid"]) => push_vapid_public(params, store, cache),
 
@@ -3725,6 +3725,49 @@ fn ok(result: String) -> (u16, &'static str, String) {
 
 // ── Push handlers (lux push) ──
 
+fn push_page(params: &[(String, String)]) -> Result<(usize, usize), String> {
+    for key in ["limit", "offset"] {
+        if params.iter().filter(|(name, _)| name == key).count() > 1 {
+            return Err(format!("{key} query param must not be repeated"));
+        }
+    }
+    let limit = match get_param(params, "limit") {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| "limit must be a positive integer".to_string())?,
+        None => crate::push::DEFAULT_PAGE_SIZE,
+    };
+    if !(1..=crate::push::MAX_PAGE_SIZE).contains(&limit) {
+        return Err(format!(
+            "limit must be between 1 and {}",
+            crate::push::MAX_PAGE_SIZE
+        ));
+    }
+    let offset = match get_param(params, "offset") {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| "offset must be a non-negative integer".to_string())?,
+        None => 0,
+    };
+    if offset > crate::push::MAX_PAGE_OFFSET {
+        return Err(format!(
+            "offset must not exceed {}",
+            crate::push::MAX_PAGE_OFFSET
+        ));
+    }
+    Ok((limit, offset))
+}
+
+fn push_page_metadata(limit: usize, offset: usize, returned: usize, has_more: bool) -> Value {
+    json!({
+        "limit": limit,
+        "offset": offset,
+        "returned": returned,
+        "has_more": has_more,
+        "next_offset": has_more.then_some(offset + returned),
+    })
+}
+
 fn push_json_error(
     status: u16,
     status_text: &'static str,
@@ -3827,8 +3870,24 @@ fn push_list_devices(
             return push_json_error(401, "Unauthorized", "authentication required")
         }
     };
-    match crate::push::list_devices(store, cache, &subject_id, Instant::now()) {
-        Ok(devices) => ok(json!({ "devices": devices }).to_string()),
+    let (limit, offset) = match push_page(params) {
+        Ok(page) => page,
+        Err(error) => return push_json_error(400, "Bad Request", &error),
+    };
+    match crate::push::list_devices_page(
+        store,
+        cache,
+        &subject_id,
+        Some(limit + 1),
+        Some(offset),
+        Instant::now(),
+    ) {
+        Ok(mut devices) => {
+            let has_more = devices.len() > limit;
+            devices.truncate(limit);
+            let page = push_page_metadata(limit, offset, devices.len(), has_more);
+            ok(json!({ "devices": devices, "page": page }).to_string())
+        }
         Err(e) => push_json_error(400, "Bad Request", &e),
     }
 }
@@ -3875,7 +3934,13 @@ fn push_send(
         .unwrap_or_else(|| json!({}));
     let now = Instant::now();
     let result = if let Some(arr) = parsed.get("subject_ids").and_then(|v| v.as_array()) {
-        let ids: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        let Some(ids) = arr.iter().map(Value::as_str).collect::<Option<Vec<_>>>() else {
+            return push_json_error(
+                400,
+                "Bad Request",
+                "subject_ids must be an array of strings",
+            );
+        };
         crate::push::enqueue_send_many(store, cache, &ids, &notification, now)
     } else if let Some(subject_id) = parsed["subject_id"].as_str().filter(|s| !s.is_empty()) {
         crate::push::enqueue_send(store, cache, subject_id, &notification, now)
@@ -3890,19 +3955,42 @@ fn push_send(
 
 /// `GET /v1/push/admin/devices` (operator) — every device in the project.
 fn push_admin_devices(
+    params: &[(String, String)],
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
-    match crate::push::list_all_devices(store, cache, Instant::now()) {
-        Ok(devices) => ok(json!({ "devices": devices }).to_string()),
+    let (limit, offset) = match push_page(params) {
+        Ok(page) => page,
+        Err(error) => return push_json_error(400, "Bad Request", &error),
+    };
+    match crate::push::list_all_devices_page(store, cache, limit + 1, offset, Instant::now()) {
+        Ok(mut devices) => {
+            let has_more = devices.len() > limit;
+            devices.truncate(limit);
+            let page = push_page_metadata(limit, offset, devices.len(), has_more);
+            ok(json!({ "devices": devices, "page": page }).to_string())
+        }
         Err(e) => push_json_error(400, "Bad Request", &e),
     }
 }
 
 /// `GET /v1/push/admin/outbox` (operator) — dead-lettered deliveries.
-fn push_admin_outbox(store: &Arc<Store>, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
-    match crate::push::list_dead_letters(store, cache, Instant::now()) {
-        Ok(dead) => ok(json!({ "dead_letters": dead }).to_string()),
+fn push_admin_outbox(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let (limit, offset) = match push_page(params) {
+        Ok(page) => page,
+        Err(error) => return push_json_error(400, "Bad Request", &error),
+    };
+    match crate::push::list_dead_letters_page(store, cache, limit + 1, offset, Instant::now()) {
+        Ok(mut dead_letters) => {
+            let has_more = dead_letters.len() > limit;
+            dead_letters.truncate(limit);
+            let page = push_page_metadata(limit, offset, dead_letters.len(), has_more);
+            ok(json!({ "dead_letters": dead_letters, "page": page }).to_string())
+        }
         Err(e) => push_json_error(400, "Bad Request", &e),
     }
 }

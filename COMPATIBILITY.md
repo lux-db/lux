@@ -275,8 +275,9 @@ deployments should use persisted `ENC` state and an externally supplied
 `LUX_ENC_SEAL_KEY`; the legacy forms remain readable for compatibility.
 
 `LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS` set to `1` is **Excluded** from the
-production contract. It disables the Web Push private-network endpoint guard
-for local integration tests and must not be set in a production deployment.
+production contract. It permits APNs and Web Push delivery only to loopback
+mocks for local integration tests; all other private-network destinations stay
+blocked. It must not be set in a production deployment.
 
 The CLI's stable local configuration file is `lux/config.toml`. Its supported
 keys are `project_id`, `project_name`, `local_http_port`, `local_resp_port`, and
