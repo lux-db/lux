@@ -9,6 +9,7 @@ import type {
 	LuxTypedRow,
 	TableRow,
 	TSAddOptions,
+	TSMRangeOptions,
 	TSMRangeResult,
 	TSRangeOptions,
 	TSSample,
@@ -106,6 +107,7 @@ export type {
 	TableRow,
 	TableSchema,
 	TSAddOptions,
+	TSMRangeOptions,
 	TSMRangeResult,
 	TSRangeOptions,
 	TSSample,
@@ -327,12 +329,15 @@ export class Lux extends Redis {
 		if (options?.aggregation) {
 			args.push('AGGREGATION' as any, options.aggregation.type as any, options.aggregation.bucketSize);
 		}
+		if (options?.count != null) {
+			args.push('COUNT', options.count);
+		}
 		const result = await this.call('TSRANGE', ...args) as any;
 		if (!result || !Array.isArray(result)) return [];
 		return result.map((pair: any) => ({ timestamp: parseInt(pair[0], 10), value: parseFloat(pair[1]) }));
 	}
 
-	async tsmrange(from: number | '-', to: number | '+', filter: string, options?: TSRangeOptions): Promise<TSMRangeResult[]> {
+	async tsmrange(from: number | '-', to: number | '+', filter: string, options?: TSMRangeOptions): Promise<TSMRangeResult[]> {
 		const args: (string | number)[] = [from === '-' ? '-' : from, to === '+' ? '+' : to];
 		if (options?.aggregation) {
 			args.push('AGGREGATION' as any, options.aggregation.type as any, options.aggregation.bucketSize);

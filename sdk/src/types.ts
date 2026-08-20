@@ -14,11 +14,15 @@ export interface TSAddOptions {
 	labels?: Record<string, string>;
 }
 
-export interface TSRangeOptions {
+export interface TSMRangeOptions {
 	aggregation?: {
 		type: 'avg' | 'sum' | 'min' | 'max' | 'count' | 'first' | 'last' | 'range' | 'std.p' | 'std.s' | 'var.p' | 'var.s';
 		bucketSize: number;
 	};
+}
+
+export interface TSRangeOptions extends TSMRangeOptions {
+	count?: number;
 }
 
 export interface TSMRangeResult {

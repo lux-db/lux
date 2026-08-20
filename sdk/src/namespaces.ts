@@ -1,5 +1,6 @@
 import type {
 	TSAddOptions,
+	TSMRangeOptions,
 	TSMRangeResult,
 	TSRangeOptions,
 	TSSample,
@@ -14,7 +15,7 @@ interface NamespaceClient {
 	tsadd(key: string, timestamp: number | '*', value: number, options?: TSAddOptions): Promise<number>;
 	tsget(key: string): Promise<TSSample | null>;
 	tsrange(key: string, from: number | '-', to: number | '+', options?: TSRangeOptions): Promise<TSSample[]>;
-	tsmrange(from: number | '-', to: number | '+', filter: string, options?: TSRangeOptions): Promise<TSMRangeResult[]>;
+	tsmrange(from: number | '-', to: number | '+', filter: string, options?: TSMRangeOptions): Promise<TSMRangeResult[]>;
 	tsinfo(key: string): Promise<Record<string, unknown>>;
 }
 
@@ -65,7 +66,7 @@ export class TimeSeriesNamespace {
 		return this.client.tsrange(key, from, to, options);
 	}
 
-	async mrange(from: number | '-', to: number | '+', filter: string, options?: TSRangeOptions): Promise<TSMRangeResult[]> {
+	async mrange(from: number | '-', to: number | '+', filter: string, options?: TSMRangeOptions): Promise<TSMRangeResult[]> {
 		return this.client.tsmrange(from, to, filter, options);
 	}
 
@@ -73,4 +74,3 @@ export class TimeSeriesNamespace {
 		return this.client.tsinfo(key);
 	}
 }
-

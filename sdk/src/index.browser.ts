@@ -101,6 +101,7 @@ export type {
 	TableRow,
 	TableSchema,
 	TSAddOptions,
+	TSMRangeOptions,
 	TSMRangeResult,
 	TSRangeOptions,
 	TSSample,
