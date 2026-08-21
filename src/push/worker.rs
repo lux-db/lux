@@ -8,6 +8,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
 use crate::auth::{durable_table_delete_where, durable_table_update_where, unix_seconds};
 use crate::store::Store;
 use crate::tables::{CmpOp, SharedSchemaCache, WhereClause};
@@ -87,11 +89,23 @@ enum AppSink {
     Web(WebPushSink),
 }
 
+/// Hash all sink-affecting credential fields into a stable cache identity.
+/// Length-prefixing prevents boundary ambiguity. The fingerprint retains only
+/// the digest rather than duplicating private signing material in the cache.
+fn credential_fingerprint(kind: &str, fields: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for field in std::iter::once(kind).chain(fields.iter().copied()) {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// Spawned once in `Runtime::start`. Loops forever, delivering pending rows.
 pub(crate) async fn run_delivery_worker(store: Arc<Store>, cache: SharedSchemaCache) {
-    // Keyed by `{app_id}:{platform}` -> (credentials fingerprint, sink). The
-    // fingerprint invalidates the cached sink when credentials change so an
-    // updated topic/environment/key takes effect without an engine restart.
+    // Keyed by `{app_id}:{platform}:{environment}` -> (credential fingerprint,
+    // sink). The fingerprint invalidates the cached sink when credentials
+    // change so an updated topic/environment/key takes effect without restart.
     let mut sinks: HashMap<String, (String, Arc<AppSink>)> = HashMap::new();
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -224,8 +238,10 @@ fn resolve_sink(
                 sinks.remove(&cache_key);
                 return Ok(None);
             };
-            // The private PEM changes iff the public key does (they're a pair).
-            let fp = format!("web|{}|{}", vapid.public_key, vapid.subject);
+            let fp = credential_fingerprint(
+                "web",
+                &[&vapid.public_key, &vapid.subject, &vapid.private_pem],
+            );
             if let Some((cached_fp, sink)) = sinks.get(&cache_key) {
                 if *cached_fp == fp {
                     return Ok(Some(sink.clone()));
@@ -246,9 +262,15 @@ fn resolve_sink(
             } else {
                 environment
             };
-            let fp = format!(
-                "apns|{}|{}|{}|{}",
-                environment, resolved.topic, resolved.creds.team_id, resolved.creds.key_id
+            let fp = credential_fingerprint(
+                "apns",
+                &[
+                    environment,
+                    &resolved.topic,
+                    &resolved.creds.team_id,
+                    &resolved.creds.key_id,
+                    &resolved.creds.p8_pem,
+                ],
             );
             if let Some((cached_fp, sink)) = sinks.get(&cache_key) {
                 if *cached_fp == fp {
@@ -360,6 +382,45 @@ mod tests {
         assert_eq!(backoff_secs(3), 120);
         assert_eq!(backoff_secs(4), 240);
         assert!(backoff_secs(20) <= BACKOFF_CAP_SECS);
+    }
+
+    #[test]
+    fn credential_fingerprints_cover_private_key_rotation_without_retaining_secrets() {
+        let apns_before = credential_fingerprint(
+            "apns",
+            &[
+                "production",
+                "com.example.app",
+                "TEAM",
+                "KEY",
+                "apns-private-a",
+            ],
+        );
+        let apns_after = credential_fingerprint(
+            "apns",
+            &[
+                "production",
+                "com.example.app",
+                "TEAM",
+                "KEY",
+                "apns-private-b",
+            ],
+        );
+        let vapid_before = credential_fingerprint(
+            "web",
+            &["public-key", "mailto:push@example.com", "vapid-private-a"],
+        );
+        let vapid_after = credential_fingerprint(
+            "web",
+            &["public-key", "mailto:push@example.com", "vapid-private-b"],
+        );
+
+        assert_ne!(apns_before, apns_after);
+        assert_ne!(vapid_before, vapid_after);
+        for fingerprint in [apns_before, apns_after, vapid_before, vapid_after] {
+            assert_eq!(fingerprint.len(), 64);
+            assert!(!fingerprint.contains("private"));
+        }
     }
 
     #[test]

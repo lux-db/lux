@@ -1144,6 +1144,61 @@ fn direct_auth_table_reads_redact_sensitive_values() {
 }
 
 #[test]
+fn direct_push_credential_reads_redact_legacy_and_encrypted_secrets() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    tables::table_create(
+        &store,
+        &cache,
+        "push.credentials",
+        &[
+            "app_id STR PRIMARY KEY,",
+            "apns_p8_pem STR,",
+            "apns_p8_pem_encrypted STR,",
+            "vapid_private STR,",
+            "vapid_private_encrypted STR",
+        ],
+        Instant::now(),
+    )
+    .unwrap();
+    durable_table_insert(
+        &store,
+        &cache,
+        "push.credentials",
+        &[
+            ("app_id", "redaction-test"),
+            ("apns_p8_pem", "legacy-apns-sentinel"),
+            ("apns_p8_pem_encrypted", "encrypted-apns-sentinel"),
+            ("vapid_private", "legacy-vapid-sentinel"),
+            ("vapid_private_encrypted", "encrypted-vapid-sentinel"),
+        ],
+        Instant::now(),
+    )
+    .unwrap();
+
+    let broker = crate::pubsub::Broker::new();
+    let mut out = bytes::BytesMut::new();
+    crate::cmd::execute(
+        &store,
+        &cache,
+        &broker,
+        &[b"TSELECT", b"*", b"FROM", b"push.credentials"],
+        &mut out,
+        Instant::now(),
+    );
+    let response = std::str::from_utf8(&out).unwrap();
+    assert!(response.contains("<redacted>"), "{response}");
+    for secret in [
+        "legacy-apns-sentinel",
+        "encrypted-apns-sentinel",
+        "legacy-vapid-sentinel",
+        "encrypted-vapid-sentinel",
+    ] {
+        assert!(!response.contains(secret), "push secret leaked: {response}");
+    }
+}
+
+#[test]
 fn signup_and_password_grant_issue_tokens() {
     let config = Arc::new(crate::ServerConfig {
         auth: AuthConfig {

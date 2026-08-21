@@ -347,7 +347,12 @@ fn sensitive_auth_fields(table: &str) -> &'static [&'static str] {
         PROVIDERS_TABLE => &["client_secret", "apple_private_key"],
         FLOW_TOKENS_TABLE => &["token_hash"],
         "push.devices" => &["token"],
-        "push.credentials" => &["apns_p8_pem", "vapid_private"],
+        "push.credentials" => &[
+            "apns_p8_pem",
+            "apns_p8_pem_encrypted",
+            "vapid_private",
+            "vapid_private_encrypted",
+        ],
         "push.outbox" => &["target_token"],
         _ => &[],
     }

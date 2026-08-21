@@ -315,6 +315,10 @@ fn set_creds(http_port: u16, environment: &str) {
 }
 
 fn set_creds_topic(http_port: u16, environment: &str, topic: &str) {
+    set_creds_material(http_port, environment, topic, &test_p8());
+}
+
+fn set_creds_material(http_port: u16, environment: &str, topic: &str, p8_pem: &str) {
     let (s, b) = http(
         http_port,
         "POST",
@@ -323,7 +327,7 @@ fn set_creds_topic(http_port: u16, environment: &str, topic: &str) {
             "app_id": "default",
             "team_id": "TEAM123456",
             "key_id": "KEY7890AB",
-            "p8_pem": test_p8(),
+            "p8_pem": p8_pem,
             "topic": topic,
             "environment": environment,
         })
@@ -331,6 +335,74 @@ fn set_creds_topic(http_port: u16, environment: &str, topic: &str) {
         Some("rootsecret"),
     );
     assert_eq!(s, 200, "set creds: {b}");
+}
+
+#[test]
+fn private_key_rotation_rebuilds_cached_apns_sink() {
+    let mock = MockApns::start(200);
+    let dir = tempfile::tempdir().unwrap();
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start(dir.path(), resp_port, http_port, false);
+    let first_private_key = test_p8();
+    let second_private_key = test_p8();
+
+    set_creds_material(
+        http_port,
+        &mock.url(),
+        "com.example.unchanged",
+        &first_private_key,
+    );
+    let (token, uid) = anon_login(http_port);
+    let (status, body) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"token":"private-rotation-token","platform":"ios","app_id":"default"}).to_string(),
+        Some(&token),
+    );
+    assert_eq!(status, 200, "register: {body}");
+
+    let send = |body: &str| {
+        let (status, response) = http(
+            http_port,
+            "POST",
+            "/v1/push/send",
+            &json!({"subject_id":uid,"notification":{"title":"rotation","body":body}}).to_string(),
+            Some("rootsecret"),
+        );
+        assert_eq!(status, 200, "send: {response}");
+    };
+    send("before");
+    let first = mock
+        .wait_for_request(Duration::from_secs(5))
+        .expect("first delivery");
+
+    // Rotate only private signing material. Every non-secret sink field stays
+    // fixed, so a stale cache fingerprint would reuse the first provider token.
+    set_creds_material(
+        http_port,
+        &mock.url(),
+        "com.example.unchanged",
+        &second_private_key,
+    );
+    send("after");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let second_authorization = loop {
+        {
+            let requests = mock.requests.lock().unwrap();
+            if requests.len() >= 2 {
+                break requests[1].authorization.clone();
+            }
+        }
+        assert!(Instant::now() < deadline, "second delivery not received");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_ne!(
+        first.authorization, second_authorization,
+        "private-key-only rotation must rebuild the cached APNs signer"
+    );
 }
 
 // A credentials edit (here the APNs topic) must invalidate the worker's cached
