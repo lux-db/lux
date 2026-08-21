@@ -1,0 +1,10 @@
+spec: 0
+version: 0.1.0
+name: lux-realtime
+description: Build live Lux application features with table subscriptions, key events, UI synchronization, reconnects, and cleanup.
+runner: opencode
+model: openrouter/openai/gpt-5.6-terra
+instructions: ./instructions.md
+skills:
+  - ./skills/live-subscription-testing
+runtime: local
