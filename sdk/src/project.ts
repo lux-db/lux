@@ -116,6 +116,15 @@ interface LiveSubscriptionRecord {
 	error: (error: { code?: string; message?: string }) => void;
 }
 
+// Async iterators are pull-based, so an idle consumer must not retain an
+// unbounded history. Reaching this limit ends the iterator rather than losing
+// a delta and leaving a stateful consumer silently inconsistent.
+const LIVE_ITERATOR_BUFFER_CAPACITY = 1024;
+const LIVE_ITERATOR_OVERFLOW_ERROR = {
+	code: 'LIVE_ITERATOR_OVERFLOW',
+	message: 'Live iterator buffer overflow',
+};
+
 export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 	readonly url: string;
 	readonly key: string;
@@ -126,7 +135,9 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 	private WebSocketImpl?: typeof WebSocket;
 	private liveSocket: WebSocket | null = null;
 	private liveSubscriptions = new Map<string, LiveSubscriptionRecord>();
-	private livePending: string[] = [];
+	// Desired subscriptions awaiting the next open socket, keyed by subscription
+	// ID so repeated reconnect cycles cannot duplicate or grow this set.
+	private livePending = new Map<string, string>();
 
 	constructor(options: LuxProjectOptions) {
 		this.url = options.url.replace(/\/+$/, '');
@@ -255,6 +266,7 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 		});
 		return () => {
 			this.liveSubscriptions.delete(id);
+			this.livePending.delete(id);
 			this.sendLive({ type: 'live.unsubscribe', id });
 			if (this.liveSubscriptions.size === 0) {
 				this.liveSocket?.close();
@@ -287,10 +299,13 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 		this.liveSocket = socket;
 
 		socket.onopen = () => {
-			for (const message of this.livePending.splice(0)) socket.send(message);
+			if (this.liveSocket !== socket) return;
+			for (const message of this.livePending.values()) socket.send(message);
+			this.livePending.clear();
 		};
 
 		socket.onmessage = (event) => {
+			if (this.liveSocket !== socket) return;
 			let message: any;
 			try {
 				message = JSON.parse(String(event.data));
@@ -312,6 +327,7 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 		};
 
 		socket.onerror = () => {
+			if (this.liveSocket !== socket) return;
 			for (const subscription of this.liveSubscriptions.values()) {
 				subscription.error({ code: 'LIVE_SOCKET_ERROR', message: 'Live socket failed' });
 			}
@@ -333,7 +349,7 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 		if (this.liveSubscriptions.size === 0) return;
 		const socket = this.liveSocket;
 		this.liveSocket = null;
-		this.livePending = [];
+		this.livePending.clear();
 		this.queueLiveResubscriptions();
 		socket?.close();
 		void this.ensureLiveSocket();
@@ -342,13 +358,13 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 	private closeLiveSocket(): void {
 		const socket = this.liveSocket;
 		this.liveSocket = null;
-		this.livePending = [];
+		this.livePending.clear();
 		socket?.close();
 	}
 
 	private queueLiveResubscriptions(): void {
 		for (const subscription of this.liveSubscriptions.values()) {
-			this.livePending.push(JSON.stringify({
+			this.livePending.set(subscription.id, JSON.stringify({
 				type: 'live.subscribe',
 				id: subscription.id,
 				spec: subscription.spec,
@@ -363,7 +379,9 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 			this.liveSocket.send(payload);
 			return;
 		}
-		this.livePending.push(payload);
+		const id = typeof message.id === 'string' ? message.id : null;
+		if (message.type === 'live.subscribe' && id) this.livePending.set(id, payload);
+		if (message.type === 'live.unsubscribe' && id) this.livePending.delete(id);
 	}
 }
 
@@ -787,7 +805,8 @@ export class LuxProjectLiveSubscription<T extends object> {
 	};
 	private unsubscribeFn: (() => void) | null = null;
 	// Async-iterator plumbing: events buffer in `queue` until a `for await`
-	// consumer pulls them; pending `next()` calls park in `waiters`.
+	// consumer pulls them; pending `next()` calls park in `waiters`. `closed`
+	// only stops iteration: callback handlers remain live until unsubscribe.
 	private queue: LuxProjectLiveEvent<T>[] = [];
 	private waiters: Array<(r: IteratorResult<LuxProjectLiveEvent<T>>) => void> = [];
 	private closed = false;
@@ -883,6 +902,7 @@ export class LuxProjectLiveSubscription<T extends object> {
 	private close(): void {
 		if (this.closed) return;
 		this.closed = true;
+		this.queue = [];
 		for (const waiter of this.waiters.splice(0)) {
 			waiter({ value: undefined as never, done: true });
 		}
@@ -970,7 +990,20 @@ export class LuxProjectLiveSubscription<T extends object> {
 		if (this.closed) return;
 		const waiter = this.waiters.shift();
 		if (waiter) waiter({ value: event, done: false });
-		else this.queue.push(event);
+		else {
+			if (this.queue.length === LIVE_ITERATOR_BUFFER_CAPACITY) {
+				this.emit({
+					type: 'error',
+					table: this.table,
+					new: null,
+					old: null,
+					error: LIVE_ITERATOR_OVERFLOW_ERROR,
+				});
+				this.close();
+				return;
+			}
+			this.queue.push(event);
+		}
 	}
 }
 

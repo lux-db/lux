@@ -256,6 +256,11 @@ the query isn't permitted by a read grant, `error` is populated and `live` is
 `null`. The subscription is async-iterable: the buffered snapshot arrives first,
 then live changes.
 
+Async iterators buffer up to 1,024 unread events. If the limit is reached, the
+SDK emits one `error` callback with code `LIVE_ITERATOR_OVERFLOW`, clears the
+buffer, and ends the iterator rather than silently dropping a change. Callback
+handlers remain active until `unsubscribe()`.
+
 ```ts
 const { live, error } = await lux
   .table<{ id: string; channel_id: string; body: string }>("messages")

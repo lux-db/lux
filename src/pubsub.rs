@@ -475,6 +475,11 @@ impl Broker {
         self.key_sub_count.load(Ordering::Relaxed) > 0
     }
 
+    #[cfg(test)]
+    pub(crate) fn key_event_loop_started(&self) -> bool {
+        self.key_event_started.load(Ordering::Relaxed)
+    }
+
     #[inline(always)]
     pub fn enqueue_key_event(&self, key: &[u8], cmd: &[u8]) {
         if self.key_sub_count.load(Ordering::Relaxed) == 0 {

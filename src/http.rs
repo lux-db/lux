@@ -1428,16 +1428,28 @@ async fn build_live_subscription(
             live_table_dependencies(&table_spec)
         };
         let receivers = key_tables
-            .into_iter()
+            .iter()
             .flat_map(|table| {
                 [
-                    broker.ksubscribe(&table),
+                    broker.ksubscribe(table),
                     broker.ksubscribe(&format!("_t:{table}:row:*")),
                 ]
             })
             .collect();
         let delta_rx = ivm.then(|| broker.subscribe_row_deltas(&table_spec.table));
-        let rows = fetch_live_table_rows(store, cache, &table_spec)?;
+        let rows = match fetch_live_table_rows(store, cache, &table_spec) {
+            Ok(rows) => rows,
+            Err(error) => {
+                rollback_live_table_receivers(
+                    broker,
+                    receivers,
+                    delta_rx,
+                    &key_tables,
+                    &table_spec.table,
+                );
+                return Err(error);
+            }
+        };
         let query = json!({"type":"table","table":table_spec.table});
         let state = LiveQueryState {
             query: query.clone(),
@@ -1622,27 +1634,42 @@ fn stop_live_subscription(
         LiveSubscription::Key { pattern, .. } => broker.kunsub(&pattern),
         LiveSubscription::Channel { channel, .. } => broker.unsubscribe_channel(&channel),
         LiveSubscription::PubSubPattern { pattern, .. } => broker.punsubscribe_pattern(&pattern),
-        LiveSubscription::Table { spec, delta_rx, .. } => {
-            // Drop this receiver first so the row-delta channel's receiver_count
-            // reflects reality when unsubscribe decides whether to reclaim it.
-            let was_ivm = delta_rx.is_some();
-            drop(delta_rx);
+        LiveSubscription::Table {
+            spec,
+            receivers,
+            delta_rx,
+            ..
+        } => {
             // Mirror the subscribe set: IVM subs watch only auth-dependency tables
             // via key-events (plus their own row-delta channel); others watch all.
-            let key_tables = if was_ivm {
+            let key_tables = if delta_rx.is_some() {
                 spec.auth_dependencies.clone()
             } else {
                 live_table_dependencies(&spec)
             };
-            for table in key_tables {
-                broker.kunsub(&table);
-                broker.kunsub(&format!("_t:{table}:row:*"));
-            }
-            if was_ivm {
-                broker.unsubscribe_row_deltas(&spec.table);
-            }
+            rollback_live_table_receivers(broker, receivers, delta_rx, &key_tables, &spec.table);
         }
         LiveSubscription::VectorNear { .. } => broker.kunsub("*"),
+    }
+}
+
+fn rollback_live_table_receivers(
+    broker: &Broker,
+    receivers: Vec<broadcast::Receiver<crate::pubsub::Message>>,
+    delta_rx: Option<broadcast::Receiver<crate::pubsub::RowDelta>>,
+    key_tables: &[String],
+    table: &str,
+) {
+    // Broker bookkeeping relies on receiver_count, so release each receiver first.
+    drop(receivers);
+    for key_table in key_tables {
+        broker.kunsub(key_table);
+        broker.kunsub(&format!("_t:{key_table}:row:*"));
+    }
+    let has_row_deltas = delta_rx.is_some();
+    drop(delta_rx);
+    if has_row_deltas {
+        broker.unsubscribe_row_deltas(table);
     }
 }
 
@@ -4871,6 +4898,32 @@ fn escape_json(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::tables::JoinType;
+
+    #[tokio::test]
+    async fn failed_ivm_live_snapshot_reclaims_receivers() {
+        let (store, broker, cache) = membership_fixture();
+        let principal = match user_ctx("alice") {
+            HttpAuthContext::User(principal) => principal,
+            _ => unreachable!(),
+        };
+
+        let result = build_live_subscription(
+            // This is IVM-eligible and has an auth dependency, so setup allocates
+            // both key receivers for `members` and a typed delta receiver for
+            // `messages` before the malformed filter fails during the snapshot.
+            &json!({"kind":"table","table":"messages","select":"id","where":[{"field":"id","op":">>","value":1}]}),
+            &broker,
+            &store,
+            &cache,
+            Some(&principal),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(broker.key_event_loop_started());
+        assert!(!broker.has_key_subs());
+        assert!(!broker.has_any_row_delta_subs());
+    }
 
     #[test]
     fn json_columns_emit_raw_str_columns_quoted() {

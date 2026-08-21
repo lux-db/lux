@@ -901,7 +901,155 @@ describe('Lux project client', () => {
 		sockets[1].open();
 		expect(JSON.parse(sockets[1].sent[0])).toEqual(firstSubscribe);
 
+		await client.auth.setSession({
+			access_token: 'new-user-jwt',
+			refresh_token: 'new-refresh',
+			expires_in: 3600,
+			token_type: 'bearer',
+			user: { id: 'usr_1', email: 'user@example.com' },
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(sockets).toHaveLength(3);
+		expect(sockets[2].url).toBe(
+			'ws://localhost:3957/v1/project/live?apikey=lux_pub_test&token=lux_pub_test&access_token=new-user-jwt',
+		);
+		sockets[2].open();
+		expect(sockets[2].sent).toEqual([JSON.stringify(firstSubscribe)]);
+
 		await live!.unsubscribe();
+	});
+
+	test('live reconnects retain one desired subscribe per subscription', async () => {
+		const sockets: FakeWebSocket[] = [];
+		class FakeWebSocket {
+			static CONNECTING = 0;
+			static OPEN = 1;
+			static CLOSED = 3;
+			readyState = FakeWebSocket.CONNECTING;
+			onopen: (() => void) | null = null;
+			onmessage: ((event: { data: string }) => void) | null = null;
+			onclose: (() => void) | null = null;
+			sent: string[] = [];
+			constructor(_url: string) { sockets.push(this); }
+			send(message: string) { this.sent.push(message); }
+			close() { this.readyState = FakeWebSocket.CLOSED; this.onclose?.(); }
+			open() { this.readyState = FakeWebSocket.OPEN; this.onopen?.(); }
+			emit(message: unknown) { this.onmessage?.({ data: JSON.stringify(message) }); }
+		}
+
+		const client = createClient('http://localhost:3957/v1/project', 'lux_pub_test', {
+			websocket: FakeWebSocket as unknown as typeof WebSocket,
+			auth: { persistSession: false, autoRefreshToken: false },
+		});
+		const livePromise = client.table('messages').live();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		sockets[0].open();
+		const subscribe = JSON.parse(sockets[0].sent[0]);
+		sockets[0].emit({ type: 'live.event', id: subscribe.id, event: { kind: 'snapshot', rows: [] } });
+		const { live } = await livePromise;
+
+		for (let i = 0; i < 3; i++) {
+			sockets.at(-1)!.close();
+			await new Promise((resolve) => setTimeout(resolve, 1100));
+			sockets.at(-1)!.open();
+			expect(sockets.at(-1)!.sent).toEqual([JSON.stringify(subscribe)]);
+		}
+
+		await live!.unsubscribe();
+	});
+
+	test('live async iterators terminate explicitly when their buffer overflows', async () => {
+		const sockets: FakeWebSocket[] = [];
+		class FakeWebSocket {
+			static CONNECTING = 0;
+			static OPEN = 1;
+			readyState = FakeWebSocket.CONNECTING;
+			onopen: (() => void) | null = null;
+			onmessage: ((event: { data: string }) => void) | null = null;
+			onclose: (() => void) | null = null;
+			sent: string[] = [];
+			constructor(_url: string) { sockets.push(this); }
+			send(message: string) { this.sent.push(message); }
+			close() { this.readyState = 3; this.onclose?.(); }
+			open() { this.readyState = FakeWebSocket.OPEN; this.onopen?.(); }
+			emit(message: unknown) { this.onmessage?.({ data: JSON.stringify(message) }); }
+		}
+
+		const client = createClient('http://localhost:3957/v1/project', 'lux_pub_test', {
+			websocket: FakeWebSocket as unknown as typeof WebSocket,
+			auth: { persistSession: false, autoRefreshToken: false },
+		});
+		const livePromise = client.table<{ id: number }>('messages').live();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		sockets[0].open();
+		const id = JSON.parse(sockets[0].sent[0]).id;
+		sockets[0].emit({ type: 'live.event', id, event: { kind: 'snapshot', rows: [] } });
+		const { live } = await livePromise;
+		const iterator = live![Symbol.asyncIterator]();
+		await iterator.next();
+		const errors: Array<{ code?: string; message?: string }> = [];
+		const inserts: string[] = [];
+		live!.on('error', (event) => errors.push(event.error!));
+		live!.on('insert', (event) => inserts.push(event.pk!));
+
+		for (let i = 0; i < 1024; i++) {
+			sockets[0].emit({ type: 'live.event', id, event: { kind: 'insert', pk: String(i), row: { id: i } } });
+		}
+		expect(errors).toEqual([]);
+
+		sockets[0].emit({ type: 'live.event', id, event: { kind: 'insert', pk: '1024', row: { id: 1024 } } });
+		expect(errors).toEqual([{ code: 'LIVE_ITERATOR_OVERFLOW', message: 'Live iterator buffer overflow' }]);
+		expect(await iterator.next()).toEqual({ value: undefined, done: true });
+
+		// Overflow only terminates iteration: callback users keep receiving events.
+		sockets[0].emit({ type: 'live.event', id, event: { kind: 'insert', pk: '1025', row: { id: 1025 } } });
+		expect(inserts).toEqual(Array.from({ length: 1026 }, (_, i) => String(i)));
+		expect(errors).toHaveLength(1);
+		expect(await iterator.next()).toEqual({ value: undefined, done: true });
+
+		await live!.unsubscribe();
+	});
+
+	test('live ignores stale socket callbacks after unsubscribe while reconnecting', async () => {
+		const sockets: FakeWebSocket[] = [];
+		class FakeWebSocket {
+			static CONNECTING = 0;
+			static OPEN = 1;
+			static CLOSED = 3;
+			readyState = FakeWebSocket.CONNECTING;
+			onopen: (() => void) | null = null;
+			onmessage: ((event: { data: string }) => void) | null = null;
+			onclose: (() => void) | null = null;
+			sent: string[] = [];
+			constructor(_url: string) { sockets.push(this); }
+			send(message: string) { this.sent.push(message); }
+			close() { this.readyState = FakeWebSocket.CLOSED; this.onclose?.(); }
+			open() { this.readyState = FakeWebSocket.OPEN; this.onopen?.(); }
+			emit(message: unknown) { this.onmessage?.({ data: JSON.stringify(message) }); }
+		}
+
+		const client = createClient('http://localhost:3957/v1/project', 'lux_pub_test', {
+			websocket: FakeWebSocket as unknown as typeof WebSocket,
+			auth: { persistSession: false, autoRefreshToken: false },
+		});
+		const livePromise = client.table('messages').live();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		sockets[0].open();
+		const subscribe = JSON.parse(sockets[0].sent[0]);
+		sockets[0].emit({ type: 'live.event', id: subscribe.id, event: { kind: 'snapshot', rows: [] } });
+		const { live } = await livePromise;
+
+		sockets[0].close();
+		await new Promise((resolve) => setTimeout(resolve, 1100));
+		expect(sockets).toHaveLength(2);
+		await live!.unsubscribe();
+		sockets[1].open();
+		expect(sockets[1].sent).toEqual([]);
+
+		// A delayed callback from the closed socket cannot revive the subscription.
+		sockets[0].open();
+		expect(sockets[0].sent).toEqual([JSON.stringify(subscribe)]);
 	});
 
 	test('live subscriptions close without anonymous reconnect on sign out', async () => {
