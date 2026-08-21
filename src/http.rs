@@ -3176,12 +3176,6 @@ fn execute_migration_command(
     cache: &SharedSchemaCache,
     script_engine: &Arc<lua::ScriptEngine>,
 ) -> Result<(), String> {
-    if command
-        .first()
-        .is_some_and(|value| value.eq_ignore_ascii_case("LUX"))
-    {
-        return Err("nested LUX commands are not allowed in migrations".to_string());
-    }
     let args: Vec<&str> = command.iter().map(String::as_str).collect();
     let response =
         exec_resp(store, broker, cache, script_engine, &args).map_err(|error| error.to_string())?;
@@ -5232,6 +5226,26 @@ mod tests {
         assert_eq!(status, 200, "{response}");
         let parsed: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed["already_applied"], true);
+    }
+
+    #[test]
+    fn migration_http_rejects_unsuitable_commands_before_any_statement_runs() {
+        let (store, broker, cache, script_engine) = encrypted_http_fixture();
+        let body = json!({
+            "filename": "002_rejected.lux",
+            "body": "SET denied value; SUBSCRIBE events;"
+        })
+        .to_string();
+
+        let (status, _, response) = migration_apply(&body, &store, &broker, &cache, &script_engine);
+        assert_eq!(status, 400, "{response}");
+        assert!(response.contains("SUBSCRIBE"), "{response}");
+        assert!(store.get(b"denied", Instant::now()).is_none());
+        assert!(
+            crate::migrations::list(&store, &cache, 100, 0, Instant::now())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

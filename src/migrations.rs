@@ -17,7 +17,6 @@ use sha2::{Digest, Sha256};
 use crate::auth::{
     add_column_if_missing, durable_table_insert, durable_table_update_where, unix_seconds,
 };
-use crate::cmd::CmdResult;
 use crate::pubsub::Broker;
 use crate::resp;
 use crate::store::Store;
@@ -446,11 +445,12 @@ pub(crate) fn plan(
     now: Instant,
 ) -> Result<MigrationPlan, String> {
     validate_filename(filename)?;
-    ensure_ledger(store, cache, now)?;
     let commands = parse_migration_commands(body)?;
+    validate_migration_commands(&commands)?;
     if commands.is_empty() {
         return Err("ERR migration has no commands".to_string());
     }
+    ensure_ledger(store, cache, now)?;
     let records = all_records(store, cache, now)?;
     let wanted_checksum = checksum(body);
     let existing = records.iter().find(|record| record.filename == filename);
@@ -634,6 +634,7 @@ where
     match action {
         RepairAction::Resume { from_command } => {
             let commands = parse_migration_commands(&record.body)?;
+            validate_migration_commands(&commands)?;
             if from_command > commands.len() {
                 return Err(format!(
                     "ERR from_command {from_command} exceeds command count {}",
@@ -708,6 +709,65 @@ where
         .into_iter()
         .find(|record| record.filename == filename)
         .ok_or_else(|| "ERR repaired migration disappeared".to_string())
+}
+
+/// Reject commands whose result is meaningful only for a connection, an
+/// asynchronous operation, or an embedded script. This is checked before a
+/// migration is marked applying so every transport has the same no-side-effect
+/// boundary for unsuitable statements.
+fn validate_migration_commands(commands: &[Vec<String>]) -> Result<(), String> {
+    for command in commands {
+        let Some(name) = command.first() else {
+            return Err("ERR migration contains an empty command".to_string());
+        };
+        if name.eq_ignore_ascii_case("LUX") {
+            return Err("nested LUX commands are not allowed in migrations".to_string());
+        }
+        if crate::cmd::is_blocking_command(name.as_bytes()) || is_blocking_stream_read(command) {
+            return Err("blocking commands are not allowed in migrations".to_string());
+        }
+        if crate::cmd::is_script_command(name.as_bytes())
+            || matches!(
+                name.to_ascii_uppercase().as_str(),
+                "AUTH"
+                    | "HELLO"
+                    | "QUIT"
+                    | "SELECT"
+                    | "CLIENT"
+                    | "RESET"
+                    | "MULTI"
+                    | "EXEC"
+                    | "DISCARD"
+                    | "WATCH"
+                    | "UNWATCH"
+                    | "SUBSCRIBE"
+                    | "UNSUBSCRIBE"
+                    | "PSUBSCRIBE"
+                    | "PUNSUBSCRIBE"
+                    | "KSUB"
+                    | "KUNSUB"
+                    | "PUBLISH"
+            )
+        {
+            return Err(format!("ERR command '{name}' is not allowed in migrations"));
+        }
+    }
+    Ok(())
+}
+
+fn is_blocking_stream_read(command: &[String]) -> bool {
+    let Some(name) = command.first() else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case("XREAD") && !name.eq_ignore_ascii_case("XREADGROUP") {
+        return false;
+    }
+
+    command
+        .iter()
+        .skip(1)
+        .take_while(|argument| !argument.eq_ignore_ascii_case("STREAMS"))
+        .any(|argument| argument.eq_ignore_ascii_case("BLOCK"))
 }
 
 pub(crate) fn parse_migration_commands(content: &str) -> Result<Vec<Vec<String>>, String> {
@@ -954,27 +1014,18 @@ fn execute_resp_command(
     command: &[String],
     now: Instant,
 ) -> Result<(), String> {
-    if command
-        .first()
-        .is_some_and(|value| value.eq_ignore_ascii_case("LUX"))
-    {
-        return Err("nested LUX commands are not allowed in migrations".to_string());
-    }
     let owned: Vec<Vec<u8>> = command
         .iter()
         .map(|value| value.as_bytes().to_vec())
         .collect();
     let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
     let mut command_out = BytesMut::new();
-    let result = crate::cmd::execute_with_wal(store, cache, broker, &refs, &mut command_out, now);
+    crate::cmd::execute_with_wal(store, cache, broker, &refs, &mut command_out, now);
     if command_out.first() == Some(&b'-') {
         let message = std::str::from_utf8(&command_out[1..])
             .unwrap_or("engine command failed")
             .trim_end_matches("\r\n");
         return Err(message.to_string());
-    }
-    if !matches!(result, CmdResult::Written) {
-        return Err("blocking commands are not allowed in migrations".to_string());
     }
     Ok(())
 }
@@ -1013,6 +1064,62 @@ mod tests {
         );
         let generated = resolve_filename(None, Some("Create Messages!")).unwrap();
         assert!(generated.ends_with("_create_messages.lux"));
+    }
+
+    #[test]
+    fn migration_policy_accepts_synchronous_commands_and_rejects_unsuitable_classes() {
+        validate_migration_commands(
+            &parse_migration_commands(
+                "SET key value; XREAD STREAMS stream 0; XREAD STREAMS BLOCK 0;",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        for command in [
+            "AUTH password",
+            "MULTI",
+            "SUBSCRIBE events",
+            "PUBLISH events message",
+            "EVAL return 1 0",
+            "BLPOP queue 1",
+            "BRPOP queue 1",
+            "BLMOVE source destination LEFT RIGHT 1",
+            "BRPOPLPUSH source destination 1",
+            "BLMPOP 1 1 queue LEFT",
+            "BZPOPMIN scores 1",
+            "BZPOPMAX scores 1",
+            "BZMPOP 1 1 scores MIN",
+            "XREAD BLOCK 1 STREAMS stream $",
+            "XREADGROUP GROUP workers consumer BLOCK 1 STREAMS stream >",
+        ] {
+            let error = validate_migration_commands(&parse_migration_commands(command).unwrap())
+                .unwrap_err();
+            assert!(
+                error.contains("not allowed") || error.contains("blocking"),
+                "{command}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_apply_does_not_execute_or_create_a_ledger_record() {
+        let (store, cache) = state();
+        let error = apply(
+            &store,
+            &cache,
+            "001_rejected.lux",
+            "SET must_not_exist value; SUBSCRIBE events;",
+            Instant::now(),
+            |_| panic!("rejected migration command was executed"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("SUBSCRIBE"), "{error}");
+        assert!(store.get(b"must_not_exist", Instant::now()).is_none());
+        assert!(list(&store, &cache, 100, 0, Instant::now())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1076,6 +1183,74 @@ mod tests {
         assert_eq!(seen, vec!["TWO"]);
         assert_eq!(repaired.status, STATUS_APPLIED);
         assert_eq!(repaired.completed_commands, 2);
+    }
+
+    #[test]
+    fn failed_repair_keeps_the_migration_failed() {
+        let (store, cache) = state();
+        let now = Instant::now();
+        let _ = apply(
+            &store,
+            &cache,
+            "001_retry.lux",
+            "PING; FAIL;",
+            now,
+            |command| {
+                if command[0] == "FAIL" {
+                    Err("boom".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        let error = repair(
+            &store,
+            &cache,
+            "001_retry.lux",
+            RepairAction::Resume { from_command: 1 },
+            now,
+            |_| Err("still broken".to_string()),
+        )
+        .unwrap_err();
+        assert!(error.contains("failed at command 2"), "{error}");
+        assert_eq!(
+            list(&store, &cache, 100, 0, now).unwrap()[0].status,
+            STATUS_FAILED
+        );
+    }
+
+    #[test]
+    fn resp_migration_policy_matches_engine_apply_behavior() {
+        let (store, cache) = state();
+        let broker = Broker::new();
+        let now = Instant::now();
+        let mut out = BytesMut::new();
+        let accepted = [
+            b"LUX".as_slice(),
+            b"MIGRATE",
+            b"APPLY",
+            b"001_accepted.lux",
+            b"SET accepted value;",
+        ];
+        cmd_migrate(&accepted, &store, &cache, &broker, &mut out, now);
+        assert!(!out.starts_with(b"-"), "{out:?}");
+        assert_eq!(store.get(b"accepted", now).unwrap().as_ref(), b"value");
+
+        out.clear();
+        let rejected = [
+            b"LUX".as_slice(),
+            b"MIGRATE",
+            b"APPLY",
+            b"002_rejected.lux",
+            b"SET denied value; SUBSCRIBE events;",
+        ];
+        cmd_migrate(&rejected, &store, &cache, &broker, &mut out, now);
+        assert!(
+            out.starts_with(b"-ERR command 'SUBSCRIBE' is not allowed"),
+            "{out:?}"
+        );
+        assert!(store.get(b"denied", now).is_none());
     }
 
     #[test]
