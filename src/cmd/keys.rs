@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::resp;
-use crate::store::{Store, StoreValue};
+use crate::store::{epoch_ms, Store, StoreValue};
 
 use super::{arg_str, cmd_eq, parse_i64, parse_u64, CmdResult};
 
@@ -239,14 +239,21 @@ pub fn cmd_expire(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         return CmdResult::Written;
     }
     match parse_u64(args[2]) {
-        Ok(secs) => resp::write_integer(
-            out,
-            if store.expire(args[1], secs, now) {
-                1
-            } else {
-                0
-            },
-        ),
+        Ok(secs) => {
+            let changed = store.expire(args[1], secs, now);
+            if changed && store.wal_enabled() {
+                if let Err(e) = super::wal_log_resolved_ttl_command(
+                    store,
+                    args,
+                    epoch_ms()
+                        .saturating_add(secs.saturating_mul(1000).min(i64::MAX as u64) as i64),
+                ) {
+                    resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                    return CmdResult::Written;
+                }
+            }
+            resp::write_integer(out, i64::from(changed));
+        }
         Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
     }
     CmdResult::Written
@@ -258,14 +265,20 @@ pub fn cmd_pexpire(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
         return CmdResult::Written;
     }
     match parse_u64(args[2]) {
-        Ok(ms) => resp::write_integer(
-            out,
-            if store.pexpire(args[1], ms, now) {
-                1
-            } else {
-                0
-            },
-        ),
+        Ok(ms) => {
+            let changed = store.pexpire(args[1], ms, now);
+            if changed && store.wal_enabled() {
+                if let Err(e) = super::wal_log_resolved_ttl_command(
+                    store,
+                    args,
+                    epoch_ms().saturating_add(ms.min(i64::MAX as u64) as i64),
+                ) {
+                    resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                    return CmdResult::Written;
+                }
+            }
+            resp::write_integer(out, i64::from(changed));
+        }
         Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
     }
     CmdResult::Written

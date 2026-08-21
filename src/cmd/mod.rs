@@ -1245,9 +1245,6 @@ pub(crate) fn pipeline_access(cmd: &[u8]) -> PipelineAccess {
             if cmd_eq(cmd, b"EXISTS") {
                 return PipelineAccess::Read;
             }
-            if cmd_eq(cmd, b"EXPIRE") {
-                return PipelineAccess::Write;
-            }
         }
         b'G' => {
             if cmd_eq(cmd, b"GET") || cmd_eq(cmd, b"GEODIST") || cmd_eq(cmd, b"GEOPOS") {
@@ -2568,7 +2565,7 @@ pub fn execute_with_wal(
         // layer (for crash determinism + so HTTP table writes, which never reach
         // this function, are durable). Raw-logging them here too would apply the
         // row twice on replay, so skip them.
-        if !command_self_logs_wal_args(args, store, now) {
+        if !command_self_logs_wal_args(args, store, now) && !command_has_relative_ttl(args) {
             if let Err(e) = store.wal_log_command(args) {
                 resp::write_error(out, &format!("ERR WAL append failed: {e}"));
                 return CmdResult::Written;
@@ -2576,6 +2573,101 @@ pub fn execute_with_wal(
         }
     }
     execute(store, cache, broker, args, out, now)
+}
+
+/// Append an absolute replay command after a relative-TTL mutation succeeds.
+pub(crate) fn wal_log_resolved_ttl_command(
+    store: &Store,
+    args: &[&[u8]],
+    deadline_ms: i64,
+) -> std::io::Result<()> {
+    let deadline = deadline_ms.to_string().into_bytes();
+    let mut owned: Vec<Vec<u8>> = Vec::with_capacity(args.len() + 1);
+    if cmd_eq(args[0], b"SETEX") || cmd_eq(args[0], b"PSETEX") {
+        owned.extend([
+            b"SET".to_vec(),
+            args[1].to_vec(),
+            args[3].to_vec(),
+            b"PXAT".to_vec(),
+            deadline,
+        ]);
+    } else if cmd_eq(args[0], b"EXPIRE") || cmd_eq(args[0], b"PEXPIRE") {
+        owned.extend([b"PEXPIREAT".to_vec(), args[1].to_vec(), deadline]);
+    } else if cmd_eq(args[0], b"RESTORE") {
+        owned.extend(args.iter().map(|arg| arg.to_vec()));
+        owned[2] = deadline;
+        if !owned
+            .get(4..)
+            .unwrap_or_default()
+            .iter()
+            .any(|arg| cmd_eq(arg, b"ABSTTL"))
+        {
+            owned.push(b"ABSTTL".to_vec());
+        }
+    } else {
+        owned.extend(args.iter().map(|arg| arg.to_vec()));
+        if let Some(ttl_index) = relative_ttl_option_index(args) {
+            owned[ttl_index] = b"PXAT".to_vec();
+            owned[ttl_index + 1] = deadline;
+        }
+    }
+    let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+    store.wal_log_command(&refs)
+}
+
+pub(crate) fn command_has_relative_ttl(args: &[&[u8]]) -> bool {
+    if args.is_empty() {
+        return false;
+    }
+    if cmd_eq(args[0], b"SETEX")
+        || cmd_eq(args[0], b"PSETEX")
+        || cmd_eq(args[0], b"EXPIRE")
+        || cmd_eq(args[0], b"PEXPIRE")
+    {
+        return true;
+    }
+    if cmd_eq(args[0], b"RESTORE") {
+        return parse_i64(args.get(2).copied().unwrap_or_default()).is_ok_and(|ttl| ttl > 0)
+            && !args
+                .get(4..)
+                .unwrap_or_default()
+                .iter()
+                .any(|arg| cmd_eq(arg, b"ABSTTL"));
+    }
+    relative_ttl_option_index(args).is_some()
+}
+
+/// Returns the position of a relative TTL option, skipping data arguments that
+/// may happen to contain option-like bytes.
+fn relative_ttl_option_index(args: &[&[u8]]) -> Option<usize> {
+    if args.is_empty() {
+        return None;
+    }
+    let mut i = if cmd_eq(args[0], b"SET") {
+        3
+    } else if cmd_eq(args[0], b"GETEX") {
+        2
+    } else if cmd_eq(args[0], b"VSET") {
+        let dims = parse_u64(args.get(2)?).ok()? as usize;
+        3usize.checked_add(dims)?
+    } else {
+        return None;
+    };
+    while i < args.len() {
+        if cmd_eq(args[i], b"EX") || cmd_eq(args[i], b"PX") {
+            return args.get(i + 1).map(|_| i);
+        }
+        if cmd_eq(args[i], b"EXAT")
+            || cmd_eq(args[i], b"PXAT")
+            || cmd_eq(args[i], b"IFEQ")
+            || (cmd_eq(args[0], b"VSET") && cmd_eq(args[i], b"META"))
+        {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 /// Table writes that append their own resolved command to the WAL from the table
@@ -4111,6 +4203,175 @@ mod tests {
     }
 
     #[test]
+    fn set_values_named_ttl_options_are_raw_logged_and_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec_wal(&store, &[b"SET", b"literal-ex", b"EX"]);
+        exec_wal(&store, &[b"SET", b"literal-px", b"PX"]);
+        store.fsync_wal();
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        assert!(exec_str(&restored, &[b"GET", b"literal-ex"]).contains("EX"));
+        assert!(exec_str(&restored, &[b"GET", b"literal-px"]).contains("PX"));
+    }
+
+    #[test]
+    fn encrypted_set_with_absolute_ttl_self_logs_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        let deadline = crate::store::epoch_ms().saturating_add(60_000).to_string();
+        let out = exec_wal(
+            &store,
+            &[
+                b"SET",
+                b"absolute-secret",
+                b"absolute-secret-value",
+                b"ENCRYPTED",
+                b"PXAT",
+                deadline.as_bytes(),
+            ],
+        );
+        assert!(String::from_utf8_lossy(&out).contains("OK"));
+        store.fsync_wal();
+        let wal = read_wal_bytes(dir.path());
+        assert!(wal.windows(b"RAWSET".len()).any(|w| w == b"RAWSET"));
+        assert!(!wal
+            .windows(b"absolute-secret-value".len())
+            .any(|w| w == b"absolute-secret-value"));
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        assert!(
+            exec_str(&restored, &[b"GET", b"absolute-secret"]).contains("absolute-secret-value")
+        );
+    }
+
+    #[test]
+    fn encrypted_set_relative_ttl_replays_for_all_option_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+
+        let encrypted_first: &[&[u8]] = &[
+            b"SET",
+            b"encrypted-first",
+            b"one",
+            b"ENCRYPTED",
+            b"PX",
+            b"60000",
+        ];
+        let encrypted_last: &[&[u8]] = &[
+            b"SET",
+            b"encrypted-last",
+            b"two",
+            b"PX",
+            b"60000",
+            b"ENCRYPTED",
+        ];
+        let ifeq_ex_seed: &[&[u8]] = &[b"SET", b"ifeq-ex", b"EX", b"ENCRYPTED"];
+        let ifeq_ex_ttl: &[&[u8]] = &[
+            b"SET",
+            b"ifeq-ex",
+            b"three",
+            b"IFEQ",
+            b"EX",
+            b"ENCRYPTED",
+            b"PX",
+            b"60000",
+        ];
+        let ifeq_px_seed: &[&[u8]] = &[b"SET", b"ifeq-px", b"PX", b"ENCRYPTED"];
+        let ifeq_px_ttl: &[&[u8]] = &[
+            b"SET",
+            b"ifeq-px",
+            b"four",
+            b"IFEQ",
+            b"PX",
+            b"EX",
+            b"60",
+            b"ENCRYPTED",
+        ];
+        for args in [
+            encrypted_first,
+            encrypted_last,
+            ifeq_ex_seed,
+            ifeq_ex_ttl,
+            ifeq_px_seed,
+            ifeq_px_ttl,
+        ] {
+            assert!(String::from_utf8_lossy(&exec_wal(&store, args)).contains("OK"));
+        }
+        store.fsync_wal();
+
+        let wal = read_wal_bytes(dir.path());
+        assert!(wal.windows(b"PXAT".len()).any(|w| w == b"PXAT"));
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        for (key, value) in [
+            (b"encrypted-first".as_slice(), "one"),
+            (b"encrypted-last".as_slice(), "two"),
+            (b"ifeq-ex".as_slice(), "three"),
+            (b"ifeq-px".as_slice(), "four"),
+        ] {
+            assert!(exec_str(&restored, &[b"GET", key]).contains(value));
+        }
+    }
+
+    #[test]
+    fn zero_ttl_restore_is_raw_logged_and_replays_without_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec_wal(&store, &[b"SET", b"source", b"persisted"]);
+        let dump = exec(&store, &[b"DUMP", b"source"]);
+        let payload_start = dump.windows(2).position(|part| part == b"\r\n").unwrap() + 2;
+        let payload = &dump[payload_start..dump.len() - 2];
+        assert!(String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[b"RESTORE", b"target", b"0", payload]
+        ))
+        .contains("OK"));
+        store.fsync_wal();
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        assert!(exec_str(&restored, &[b"GET", b"target"]).contains("persisted"));
+        assert!(exec_str(&restored, &[b"PTTL", b"target"]).contains(":-1"));
+    }
+
+    #[test]
     fn encrypted_hset_self_logs_ciphertext_and_replays() {
         let dir = tempfile::tempdir().unwrap();
         let config = Arc::new(ServerConfig {
@@ -4383,6 +4644,47 @@ mod tests {
             got.contains("1.5") && got.contains("2.5") && got.contains("3.5"),
             "{got}"
         );
+    }
+
+    #[test]
+    fn encrypted_vset_with_absolute_ttl_preserves_deadline_on_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            ..ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        exec(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]);
+        let deadline = crate::store::epoch_ms().saturating_add(60_000).to_string();
+        let out = exec_wal(
+            &store,
+            &[
+                b"VSET",
+                b"absolute-vector",
+                b"2",
+                b"1.5",
+                b"2.5",
+                b"ENCRYPTED",
+                b"PXAT",
+                deadline.as_bytes(),
+            ],
+        );
+        assert!(String::from_utf8_lossy(&out).contains("OK"));
+        store.fsync_wal();
+        let wal = read_wal_bytes(dir.path());
+        assert!(wal.windows(b"RAWVSET".len()).any(|w| w == b"RAWVSET"));
+        assert!(wal
+            .windows(deadline.len())
+            .any(|w| w == deadline.as_bytes()));
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&Broker::new());
+        let got = exec_str(&restored, &[b"VGET", b"absolute-vector"]);
+        assert!(got.contains("1.5") && got.contains("2.5"), "{got}");
     }
 
     #[test]

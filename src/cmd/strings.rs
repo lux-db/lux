@@ -2,7 +2,7 @@ use bytes::{Bytes, BytesMut};
 use std::time::{Duration, Instant};
 
 use crate::resp;
-use crate::store::{Entry, SetOptions, Store, StoreValue};
+use crate::store::{epoch_ms, Entry, SetOptions, Store, StoreValue};
 
 use super::{arg_str, cmd_eq, parse_i64, parse_u64, CmdResult};
 
@@ -81,6 +81,7 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
     let mut get = false;
     let mut ifeq = None;
     let mut encrypted = false;
+    let mut relative_ttl = false;
     let mut i = 3;
     while i < args.len() {
         if cmd_eq(args[i], b"EX") {
@@ -93,6 +94,7 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
                 None => return CmdResult::Written,
             };
             ttl = Some(Duration::from_secs(secs));
+            relative_ttl = true;
             keep_ttl = false;
             i += 2;
         } else if cmd_eq(args[i], b"EXAT") {
@@ -125,6 +127,7 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
                 None => return CmdResult::Written,
             };
             ttl = Some(Duration::from_millis(ms));
+            relative_ttl = true;
             keep_ttl = false;
             i += 2;
         } else if cmd_eq(args[i], b"PXAT") {
@@ -204,8 +207,28 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
                     owned.push(b"RAWSET".to_vec());
                     owned.push(args[1].to_vec());
                     owned.push(raw.to_vec());
-                    for arg in &args[3..] {
-                        if !cmd_eq(arg, b"ENCRYPTED") {
+                    let ttl_index = relative_ttl
+                        .then(|| super::relative_ttl_option_index(args))
+                        .flatten();
+                    for (index, arg) in args.iter().enumerate().skip(3) {
+                        if cmd_eq(arg, b"ENCRYPTED") {
+                            continue;
+                        }
+                        if Some(index) == ttl_index {
+                            owned.push(b"PXAT".to_vec());
+                            owned.push(
+                                epoch_ms()
+                                    .saturating_add(
+                                        ttl.unwrap_or_default().as_millis().min(i64::MAX as u128)
+                                            as i64,
+                                    )
+                                    .to_string()
+                                    .into_bytes(),
+                            );
+                        } else if ttl_index == Some(index - 1) {
+                            // The relative TTL's duration is replaced above.
+                            continue;
+                        } else {
                             owned.push(arg.to_vec());
                         }
                     }
@@ -214,6 +237,14 @@ pub fn cmd_set(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
                         resp::write_error(out, &format!("ERR WAL append failed: {e}"));
                         return CmdResult::Written;
                     }
+                }
+            } else if set && relative_ttl && store.wal_enabled() {
+                let deadline = epoch_ms().saturating_add(
+                    ttl.unwrap_or_default().as_millis().min(i64::MAX as u128) as i64,
+                );
+                if let Err(e) = super::wal_log_resolved_ttl_command(store, args, deadline) {
+                    resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                    return CmdResult::Written;
                 }
             }
             if get {
@@ -267,6 +298,13 @@ pub fn cmd_setex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
                 Some(Duration::from_secs(secs as u64)),
                 now,
             );
+            if store.wal_enabled() {
+                let deadline = epoch_ms().saturating_add(secs.saturating_mul(1000));
+                if let Err(e) = super::wal_log_resolved_ttl_command(store, args, deadline) {
+                    resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                    return CmdResult::Written;
+                }
+            }
             resp::write_ok(out);
         }
         Err(_) => resp::write_error(out, "ERR value is not an integer or out of range"),
@@ -287,6 +325,13 @@ pub fn cmd_psetex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         None => return CmdResult::Written,
     };
     store.set(args[1], args[3], Some(Duration::from_millis(ms)), now);
+    if store.wal_enabled() {
+        let deadline = epoch_ms().saturating_add(ms.min(i64::MAX as u64) as i64);
+        if let Err(e) = super::wal_log_resolved_ttl_command(store, args, deadline) {
+            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+            return CmdResult::Written;
+        }
+    }
     resp::write_ok(out);
     CmdResult::Written
 }
@@ -351,6 +396,7 @@ pub fn cmd_getex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
     let mut ttl = None;
     let mut persist = false;
     let mut option_seen = false;
+    let mut relative_ttl = false;
     let mut i = 2;
     while i < args.len() {
         if cmd_eq(args[i], b"EX") && i + 1 < args.len() {
@@ -363,6 +409,7 @@ pub fn cmd_getex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
                 None => return CmdResult::Written,
             };
             ttl = Some(Duration::from_secs(secs));
+            relative_ttl = true;
             option_seen = true;
             i += 2;
         } else if cmd_eq(args[i], b"PX") && i + 1 < args.len() {
@@ -375,6 +422,7 @@ pub fn cmd_getex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
                 None => return CmdResult::Written,
             };
             ttl = Some(Duration::from_millis(ms));
+            relative_ttl = true;
             option_seen = true;
             i += 2;
         } else if cmd_eq(args[i], b"EXAT") && i + 1 < args.len() {
@@ -423,6 +471,14 @@ pub fn cmd_getex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         }
     }
     let value = store.getex(args[1], ttl, persist, now);
+    if value.is_some() && relative_ttl && store.wal_enabled() {
+        let deadline = epoch_ms()
+            .saturating_add(ttl.unwrap_or_default().as_millis().min(i64::MAX as u128) as i64);
+        if let Err(e) = super::wal_log_resolved_ttl_command(store, args, deadline) {
+            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+            return CmdResult::Written;
+        }
+    }
     match value
         .map(|value| store.decrypt_kv_string_value(args[1], value))
         .transpose()

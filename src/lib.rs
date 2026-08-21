@@ -1255,7 +1255,11 @@ impl EmbeddedClient {
         command: &Command<'_>,
     ) -> Result<Option<CommandOutput>, LuxError> {
         if matches!(command, Command::Raw { .. })
-            || matches!(command, Command::Set { options, .. } if !can_fast_path_set(options))
+            || matches!(command, Command::Set { options, .. } if !can_fast_path_set(options) || set_ttl(options).is_some())
+            || matches!(
+                command,
+                Command::SetEx { .. } | Command::PSetEx { .. } | Command::Expire { .. }
+            )
         {
             return Ok(None);
         }
@@ -2297,13 +2301,13 @@ fn native_pipeline_access<'a>(command: &Command<'a>) -> Option<(&'a [u8], Native
         Command::GeoPos { key, .. } => (*key, b"GEOPOS".as_slice()),
         Command::GeoDist { key, .. } => (*key, b"GEODIST".as_slice()),
         Command::Exists { keys } if keys.len() == 1 => (keys[0], b"EXISTS".as_slice()),
-        Command::Set { key, options, .. } if can_fast_path_set(options) => {
+        Command::Set { key, options, .. }
+            if can_fast_path_set(options) && set_ttl(options).is_none() =>
+        {
             (*key, b"SET".as_slice())
         }
         Command::GetSet { key, .. } => (*key, b"GETSET".as_slice()),
         Command::SetNx { key, .. } => (*key, b"SETNX".as_slice()),
-        Command::SetEx { key, .. } => (*key, b"SETEX".as_slice()),
-        Command::PSetEx { key, .. } => (*key, b"PSETEX".as_slice()),
         Command::Append { key, .. } => (*key, b"APPEND".as_slice()),
         Command::Incr { key } => (*key, b"INCR".as_slice()),
         Command::Decr { key } => (*key, b"DECR".as_slice()),

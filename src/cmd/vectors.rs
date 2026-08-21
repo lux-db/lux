@@ -2,7 +2,7 @@ use bytes::BytesMut;
 use std::time::{Duration, Instant};
 
 use crate::resp;
-use crate::store::Store;
+use crate::store::{epoch_ms, Store};
 
 use super::{arg_str, cmd_eq, parse_u64, CmdResult};
 
@@ -41,6 +41,8 @@ pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     let mut metadata = None;
     let mut ttl = None;
     let mut encrypted = false;
+    let mut relative_ttl = false;
+    let mut absolute_deadline = None;
     while i < args.len() {
         if cmd_eq(args[i], b"ENCRYPTED") {
             encrypted = true;
@@ -58,7 +60,10 @@ pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
                 return CmdResult::Written;
             }
             match parse_u64(args[i + 1]) {
-                Ok(s) => ttl = Some(Duration::from_secs(s)),
+                Ok(s) => {
+                    ttl = Some(Duration::from_secs(s));
+                    relative_ttl = true;
+                }
                 Err(_) => {
                     resp::write_error(out, "ERR value is not an integer or out of range");
                     return CmdResult::Written;
@@ -71,7 +76,28 @@ pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
                 return CmdResult::Written;
             }
             match parse_u64(args[i + 1]) {
-                Ok(ms) => ttl = Some(Duration::from_millis(ms)),
+                Ok(ms) => {
+                    ttl = Some(Duration::from_millis(ms));
+                    relative_ttl = true;
+                }
+                Err(_) => {
+                    resp::write_error(out, "ERR value is not an integer or out of range");
+                    return CmdResult::Written;
+                }
+            }
+            i += 2;
+        } else if cmd_eq(args[i], b"PXAT") {
+            if i + 1 >= args.len() {
+                resp::write_error(out, "ERR syntax error");
+                return CmdResult::Written;
+            }
+            match parse_u64(args[i + 1]) {
+                Ok(deadline) => {
+                    absolute_deadline = Some(deadline);
+                    ttl = Some(Duration::from_millis(
+                        deadline.saturating_sub(epoch_ms().max(0) as u64),
+                    ))
+                }
                 Err(_) => {
                     resp::write_error(out, "ERR value is not an integer or out of range");
                     return CmdResult::Written;
@@ -105,15 +131,32 @@ pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
                 owned.push(b"META".to_vec());
                 owned.push(m.as_bytes().to_vec());
             }
-            if let Some(d) = ttl {
-                owned.push(b"EX".to_vec());
-                owned.push(d.as_secs().to_string().into_bytes());
+            if let Some(deadline) = absolute_deadline {
+                owned.push(b"PXAT".to_vec());
+                owned.push(deadline.to_string().into_bytes());
+            } else if relative_ttl {
+                owned.push(b"PXAT".to_vec());
+                owned.push(
+                    epoch_ms()
+                        .saturating_add(
+                            ttl.unwrap_or_default().as_millis().min(i64::MAX as u128) as i64
+                        )
+                        .to_string()
+                        .into_bytes(),
+                );
             }
             let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
             if let Err(e) = store.wal_log_command(&refs) {
                 resp::write_error(out, &format!("ERR WAL append failed: {e}"));
                 return CmdResult::Written;
             }
+        }
+    } else if relative_ttl && store.wal_enabled() {
+        let deadline = epoch_ms()
+            .saturating_add(ttl.unwrap_or_default().as_millis().min(i64::MAX as u128) as i64);
+        if let Err(e) = super::wal_log_resolved_ttl_command(store, args, deadline) {
+            resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+            return CmdResult::Written;
         }
     }
     resp::write_ok(out);

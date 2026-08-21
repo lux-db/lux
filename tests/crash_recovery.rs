@@ -5,6 +5,7 @@
 //! that unit tests cannot: actual process crashes, WAL replay across
 //! restarts, snapshot + WAL interaction, and concurrent data type recovery.
 
+use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::thread;
@@ -52,6 +53,32 @@ fn fill_memory(conn: &mut TcpStream, count: usize) {
     for i in 0..count {
         send(conn, &["SET", &format!("filler:{i}"), &val]);
     }
+}
+
+fn remove_non_wal_files(path: &std::path::Path) {
+    for entry in fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        let child = entry.path();
+        if child.is_dir() {
+            remove_non_wal_files(&child);
+        } else if child.file_name().is_none_or(|name| name != "wal.lux") {
+            fs::remove_file(child).unwrap();
+        }
+    }
+}
+
+fn wal_bytes(path: &std::path::Path) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for entry in fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        let child = entry.path();
+        if child.is_dir() {
+            bytes.extend(wal_bytes(&child));
+        } else if child.file_name().is_some_and(|name| name == "wal.lux") {
+            bytes.extend(fs::read(child).unwrap());
+        }
+    }
+    bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +165,50 @@ fn xadd_star_id_stable_after_wal_replay() {
         range.contains(&id),
         "XADD * id must be stable across WAL replay: was {id}, after = {range:?}"
     );
+}
+
+// Relative TTLs must retain their original deadline during WAL-only recovery.
+// The second command is deliberately a conditional no-op: raw logging it would
+// resurrect `k` after the first command has expired during downtime.
+#[test]
+fn relative_ttl_effects_and_noops_remain_deterministic_after_wal_replay() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+
+    let mut pipeline = resp_cmd(&["SET", "k", "original", "PX", "1000"]);
+    pipeline.extend_from_slice(&resp_cmd(&["SET", "k", "ignored", "NX", "EX", "60"]));
+    pipeline.extend_from_slice(&resp_cmd(&["SETEX", "setex", "60", "value"]));
+    pipeline.extend_from_slice(&resp_cmd(&["PSETEX", "psetex", "60000", "value"]));
+    c.write_all(&pipeline).unwrap();
+    let responses = read_all(&mut c);
+    assert!(
+        responses.contains("+OK"),
+        "pipeline writes failed: {responses:?}"
+    );
+    thread::sleep(Duration::from_millis(2500));
+    drop(c);
+
+    srv.kill();
+    // Leave only WAL frames behind: the restart must not obtain an expiry from
+    // tiered storage or a snapshot.
+    remove_non_wal_files(srv.data_dir());
+    let wal = wal_bytes(srv.data_dir());
+    assert!(
+        wal.windows(4).any(|part| part == b"PXAT"),
+        "resolved SET deadline missing from WAL"
+    );
+    srv.restart();
+    // RESP captures `now` per connection; use a fresh connection after replay
+    // so an already-expired absolute deadline is observed.
+    thread::sleep(Duration::from_millis(20));
+    let mut c = srv.conn();
+    let k = send(&mut c, &["GET", "k"]);
+    assert!(
+        !k.contains("original") && !k.contains("ignored"),
+        "conditional no-op was replayed as an effect: {k:?}"
+    );
+    assert!(send(&mut c, &["GET", "setex"]).contains("value"));
+    assert!(send(&mut c, &["GET", "psetex"]).contains("value"));
 }
 
 // REGRESSION: TSADD with a `*` server-generated timestamp must keep the SAME

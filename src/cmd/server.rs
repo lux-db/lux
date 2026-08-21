@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::pubsub::Broker;
 use crate::resp;
-use crate::store::Store;
+use crate::store::{epoch_ms, Store};
 
 use super::{arg_str, cmd_eq, is_restricted, CmdResult};
 
@@ -381,7 +381,16 @@ pub fn cmd_restore(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
         }
     }
     match store.restore_key(args[1], ttl_ms, args[3], replace, absttl, now) {
-        Ok(()) => resp::write_ok(out),
+        Ok(()) => {
+            if ttl_ms > 0 && !absttl && store.wal_enabled() {
+                let deadline = epoch_ms().saturating_add(ttl_ms);
+                if let Err(e) = super::wal_log_resolved_ttl_command(store, args, deadline) {
+                    resp::write_error(out, &format!("ERR WAL append failed: {e}"));
+                    return CmdResult::Written;
+                }
+            }
+            resp::write_ok(out)
+        }
         Err(e) => resp::write_error(out, &e),
     }
     CmdResult::Written

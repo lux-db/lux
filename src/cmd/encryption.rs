@@ -223,7 +223,7 @@ fn cmd_rawvset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
     if args.len() < 4 {
         resp::write_error(
             out,
-            "ERR usage: ENC RAWVSET <key> <ciphertext> [META <m>] [EX <s>]",
+            "ERR usage: ENC RAWVSET <key> <ciphertext> [META <m>] [EX <s>|PXAT <ms>]",
         );
         return CmdResult::Written;
     }
@@ -245,6 +245,14 @@ fn cmd_rawvset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
         } else if cmd_eq(args[i], b"EX") && i + 1 < args.len() {
             if let Ok(s) = parse_u64(args[i + 1]) {
                 ttl = Some(Duration::from_secs(s));
+            }
+            i += 2;
+        } else if cmd_eq(args[i], b"PXAT") && i + 1 < args.len() {
+            if let Ok(ms) = parse_u64(args[i + 1]) {
+                let now_ms = crate::store::epoch_ms();
+                ttl = Some(Duration::from_millis(
+                    ms.saturating_sub(now_ms.max(0) as u64),
+                ));
             }
             i += 2;
         } else {
