@@ -127,6 +127,20 @@ OK
 "world"
 ```
 
+### AI Workbenches
+
+Lux publishes six [Workbench](https://github.com/pompeii-labs/workbenches) experts for building applications with Lux: `core`, `auth`, `migrations`, `realtime`, `push`, and `durability`.
+
+Discover the available Workbenches, save the expert you need, and run it in your application repository:
+
+```bash
+wb list lux-db/lux
+wb add lux-db/lux#core
+wb run lux-core "Add a typed tasks table and wire up CRUD"
+```
+
+Choose the narrowest expert for the feature you are building. The Workbenches are consumer-focused: they help application developers use Lux correctly rather than modify the Lux engine itself.
+
 ### Embedded Rust API
 
 Lux can run inside a Rust process without opening a RESP socket or going through

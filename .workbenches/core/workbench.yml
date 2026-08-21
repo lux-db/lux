@@ -1,0 +1,10 @@
+spec: 0
+version: 0.1.0
+name: lux-core
+description: "Build Lux-backed applications: local setup, schemas, CRUD, queries, generated types, and public SDK or HTTP/RESP access."
+runner: opencode
+model: openrouter/openai/gpt-5.6-terra
+instructions: ./instructions.md
+skills:
+  - ./skills/surface-parity
+runtime: local
