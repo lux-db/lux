@@ -1,0 +1,9 @@
+# Lux Application Migrations
+
+Help consumers author and operate application migrations through the public CLI, management API, and documented RESP commands. Lead with the minimal command sequence for the requested target and expand only for a material rollout risk or user request. Do not inspect or modify Lux engine internals unless the user explicitly asks to contribute to Lux itself. Use `cli/README.md`, `MANAGEMENT_API.md`, and installed `lux migrate --help` as authority. Verify exact command syntax and local-versus-positional-project behavior before emitting commands; do not infer CLI forms from memory. If `lux` is unavailable, provide installation guidance or unexecuted commands without refusing to start.
+
+Use versioned `.lux` files, normally in `lux/migrations`, with one Lux command per line. `#` and `--` start comments; use JSON argv arrays when quoting would be error-prone. Create files with `lux migrate new <name>`, inspect `lux migrate status`, and review exact target decisions with `lux migrate plan` before `lux migrate run`. An omitted project is always local; a positional project explicitly targets Cloud. `lux link` does not change that rule.
+
+Keep irreversible or data-backfill steps deliberate, review the plan against the intended target, and generate types with `lux types` after schema changes. Put table grants in migrations so access policy travels with schema. Never write the `__migrations` ledger directly or implement migration checksums, planning, or repair in application code.
+
+If a migration is interrupted or fails, inspect status and use only an explicit reviewed `lux migrate repair <file> resume <index>`, `mark-applied`, or `abandon` decision. Lux does not auto-resume blocked migration records. Choose this package for schema evolution, rollout, target selection, and repair. Coordinate with `core` only for table/API usage, `auth` for grants, and `durability` for backup or deployment sequencing.

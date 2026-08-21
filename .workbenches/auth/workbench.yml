@@ -1,0 +1,10 @@
+spec: 0
+version: 0.1.0
+name: lux-auth
+description: "Build Lux application authentication: signup, login, OAuth, SSR sessions, project keys, grants, and row-level access."
+runner: opencode
+model: openrouter/openai/gpt-5.6-terra
+instructions: ./instructions.md
+skills:
+  - ./skills/auth-flow-security
+runtime: local
