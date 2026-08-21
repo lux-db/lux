@@ -259,22 +259,33 @@ async fn handle_request(
         ""
     };
 
-    let auth_context = match crate::auth::resolve_credential(
+    let credential = match crate::auth::resolve_credential(
         presented,
         user_token,
         crate::auth::Surface::Http,
         store,
         cache,
     ) {
-        Ok(crate::auth::Credential::Operator) => HttpAuthContext::Operator,
-        Ok(crate::auth::Credential::Secret) => HttpAuthContext::Secret,
-        Ok(crate::auth::Credential::Publishable) => HttpAuthContext::Publishable,
-        Ok(crate::auth::Credential::User(principal)) => HttpAuthContext::User(principal),
-        Ok(crate::auth::Credential::Anonymous) => HttpAuthContext::Anonymous,
+        Ok(credential) => credential,
         Err(e) => {
             let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
             return send_json(socket, 401, "Unauthorized", &body).await;
         }
+    };
+    let live_user_credential = if path == "/live" {
+        match &credential {
+            crate::auth::Credential::User(credential) => Some((**credential).clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let auth_context = match credential {
+        crate::auth::Credential::Operator => HttpAuthContext::Operator,
+        crate::auth::Credential::Secret => HttpAuthContext::Secret,
+        crate::auth::Credential::Publishable => HttpAuthContext::Publishable,
+        crate::auth::Credential::User(credential) => HttpAuthContext::User(credential.principal),
+        crate::auth::Credential::Anonymous => HttpAuthContext::Anonymous,
     };
 
     // An engine is credential-gated once it has either a password or project
@@ -302,11 +313,11 @@ async fn handle_request(
         return handle_live_upgrade(
             socket,
             &headers,
-            &params,
             store.clone(),
             broker.clone(),
             cache.clone(),
             live_auth_principal(&auth_context),
+            live_user_credential,
         )
         .await;
     }
@@ -1165,11 +1176,11 @@ fn live_broker_event_from_message(message: &crate::pubsub::Message) -> Option<Li
 async fn handle_live_upgrade(
     socket: &mut tokio::net::TcpStream,
     headers: &[(String, String)],
-    _params: &[(String, String)],
     store: Arc<Store>,
     broker: Broker,
     cache: SharedSchemaCache,
     principal: Option<crate::auth::AuthPrincipal>,
+    user_credential: Option<crate::auth::UserCredential>,
 ) -> std::io::Result<bool> {
     let Some(key) = header_value(headers, "sec-websocket-key") else {
         return send_json(
@@ -1191,7 +1202,7 @@ async fn handle_live_upgrade(
     socket.write_all(response.as_bytes()).await?;
 
     let ws = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
-    run_live_socket(ws, store, broker, cache, principal).await?;
+    run_live_socket(ws, store, broker, cache, principal, user_credential).await?;
     Ok(false)
 }
 
@@ -1201,6 +1212,7 @@ async fn run_live_socket<S>(
     broker: Broker,
     cache: SharedSchemaCache,
     principal: Option<crate::auth::AuthPrincipal>,
+    user_credential: Option<crate::auth::UserCredential>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1208,6 +1220,10 @@ where
     let mut subscriptions: HashMap<String, LiveSubscription> = HashMap::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Session revocation is bounded to one second. This remains separate from
+    // the 1 ms event-drain timer so expensive state checks never run per event.
+    let mut auth_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    auth_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -1239,6 +1255,15 @@ where
             _ = tick.tick() => {
                 drain_live_subscription_events(&mut ws, &mut subscriptions, &store, &cache).await?;
                 drain_live_row_deltas(&mut ws, &mut subscriptions, &store, &cache).await?;
+            }
+            _ = auth_tick.tick(), if user_credential.is_some() => {
+                if let Some(credential) = user_credential.as_ref() {
+                    if crate::auth::revalidate_user_credential(credential, &store, &cache).is_err() {
+                        send_live_json(&mut ws, json!({"type":"live.error","error":{"code":"AUTH_REVOKED","message":"live authorization is no longer valid"}})).await?;
+                        let _ = ws.send(WsMessage::Close(None)).await;
+                        break;
+                    }
+                }
             }
         }
     }

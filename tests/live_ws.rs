@@ -307,6 +307,97 @@ async fn live_websocket_requires_lux_auth_token_when_auth_is_enabled() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_user_socket_closes_after_session_logout() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux_with_env(
+        resp_port,
+        http_port,
+        Some("rootsecret"),
+        &[("LUX_AUTH_ENABLED", "true")],
+    );
+
+    let exec = |cmd: &str| {
+        let (status, body) =
+            http_json_request(http_port, "POST", "/v1/exec", cmd, Some("rootsecret"));
+        assert_eq!(status, 200, "exec {cmd}: {body}");
+    };
+    exec(
+        r#"{"command":["TCREATE","live_revocation_notes","id","STR","PRIMARY","KEY",",","owner_id","STR",",","body","STR"]}"#,
+    );
+    exec(
+        r#"{"command":["GRANT","read","ON","live_revocation_notes","WHERE","owner_id","=","auth.uid()"]}"#,
+    );
+
+    let (status, session) = http_json_request(
+        http_port,
+        "POST",
+        "/auth/v1/signup",
+        r#"{"email":"live-revocation@example.com","password":"password123"}"#,
+        None,
+    );
+    assert_eq!(status, 200, "signup: {session}");
+    let access_token = session["access_token"].as_str().unwrap().to_string();
+    let user_id = session["user"]["id"].as_str().unwrap().to_string();
+
+    let mut ws = connect_live(http_port, Some(&access_token)).await;
+    send_json(
+        &mut ws,
+        json!({"type":"live.subscribe","id":"notes","spec":{"kind":"table","table":"live_revocation_notes"}}),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws).await["type"], "live.subscribed");
+    assert_eq!(recv_live_event(&mut ws, "notes").await["kind"], "snapshot");
+
+    let (status, logout) = http_json_request(
+        http_port,
+        "POST",
+        "/auth/v1/logout",
+        "{}",
+        Some(&access_token),
+    );
+    assert_eq!(status, 200, "logout: {logout}");
+
+    let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let message: Value = serde_json::from_str(&text).unwrap();
+                    if message["type"] == "live.error" {
+                        return message;
+                    }
+                    assert_ne!(
+                        message["type"], "live.event",
+                        "received row delta after logout"
+                    );
+                }
+                Some(Ok(Message::Close(_))) | None => return json!({"type":"closed"}),
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("websocket error before terminal auth state: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("live socket did not terminate within the revalidation bound");
+    if terminal["type"] == "live.error" {
+        assert_eq!(terminal["error"]["code"], "AUTH_REVOKED");
+    }
+
+    exec(&format!(
+        r#"{{"command":["TINSERT","live_revocation_notes","id","after-logout","owner_id","{user_id}","body","must not deliver"]}}"#
+    ));
+    if let Ok(Some(Ok(Message::Text(text)))) =
+        tokio::time::timeout(Duration::from_millis(250), ws.next()).await
+    {
+        let message: Value = serde_json::from_str(&text).unwrap();
+        assert_ne!(
+            message["type"], "live.event",
+            "received protected row delta after logout"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_websocket_delivers_key_and_pubsub_events() {
     let resp_port = free_port();
     let http_port = free_port();

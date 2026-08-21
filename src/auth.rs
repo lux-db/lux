@@ -195,6 +195,14 @@ pub(crate) struct AuthPrincipal {
     pub is_anonymous: bool,
 }
 
+/// An access token authenticated during credential resolution. The claims are
+/// retained only for bounded state revalidation by long-lived connections.
+#[derive(Clone, Debug)]
+pub(crate) struct UserCredential {
+    pub principal: AuthPrincipal,
+    claims: AccessClaims,
+}
+
 pub(crate) fn is_reserved_auth_table(table: &str) -> bool {
     table.starts_with("auth.")
 }
@@ -2980,7 +2988,7 @@ pub(crate) enum Credential {
     /// Server-side project key: full project access.
     Secret,
     /// End-user access token: subject to grants.
-    User(AuthPrincipal),
+    User(Box<UserCredential>),
     /// `LUX_PASSWORD`. Break-glass and control-plane operations.
     Operator,
 }
@@ -3022,7 +3030,7 @@ pub(crate) fn resolve_credential(
                     // A publishable key alone is an identity of the project, not
                     // of a person. Data access needs a principal on top.
                     match resolve_user(user_token, store, cache)? {
-                        Some(principal) => Ok(Credential::User(principal)),
+                        Some(credential) => Ok(Credential::User(Box::new(credential))),
                         None => Ok(Credential::Publishable),
                     }
                 }
@@ -3032,11 +3040,11 @@ pub(crate) fn resolve_credential(
     }
 
     // No project key matched. An end-user token can still stand on its own.
-    if let Some(principal) = resolve_user(user_token, store, cache)? {
-        return Ok(Credential::User(principal));
+    if let Some(credential) = resolve_user(user_token, store, cache)? {
+        return Ok(Credential::User(Box::new(credential)));
     }
-    if let Some(principal) = resolve_user(presented, store, cache)? {
-        return Ok(Credential::User(principal));
+    if let Some(credential) = resolve_user(presented, store, cache)? {
+        return Ok(Credential::User(Box::new(credential)));
     }
 
     Ok(Credential::Anonymous)
@@ -3047,7 +3055,7 @@ fn resolve_user(
     token: &str,
     store: &Store,
     cache: &SharedSchemaCache,
-) -> Result<Option<AuthPrincipal>, String> {
+) -> Result<Option<UserCredential>, String> {
     if token.is_empty() || !store.config().auth.enabled {
         return Ok(None);
     }
@@ -3056,8 +3064,8 @@ fn resolve_user(
     if token.starts_with("lux_pub_") || token.starts_with("lux_sec_") {
         return Ok(None);
     }
-    match authenticate_access_token(token, store, cache) {
-        Ok(principal) => Ok(Some(principal)),
+    match authenticate_user_credential(token, store, cache) {
+        Ok(credential) => Ok(Some(credential)),
         Err(e) => Err(e),
     }
 }
@@ -3253,20 +3261,36 @@ fn claims_from_bearer(
     claims_from_access_token(token, store, cache)
 }
 
-pub(crate) fn authenticate_access_token(
+fn authenticate_user_credential(
     token: &str,
     store: &Store,
     cache: &SharedSchemaCache,
-) -> Result<AuthPrincipal, String> {
+) -> Result<UserCredential, String> {
     let claims = claims_from_access_token(token, store, cache)
         .map_err(|(_, _, body)| json_error_message(&body).unwrap_or_else(|| body.clone()))?;
-    Ok(AuthPrincipal {
-        user_id: claims.sub,
-        email: claims.email,
-        session_id: claims.session_id,
-        role: claims.role,
-        is_anonymous: claims.is_anonymous,
+    Ok(UserCredential {
+        principal: AuthPrincipal {
+            user_id: claims.sub.clone(),
+            email: claims.email.clone(),
+            session_id: claims.session_id.clone(),
+            role: claims.role.clone(),
+            is_anonymous: claims.is_anonymous,
+        },
+        claims,
     })
+}
+
+/// Recheck a token that was cryptographically verified at connection setup.
+/// This deliberately performs only the mutable session/user checks, not JWT
+/// cryptography, so long-lived realtime sockets do not do that work per tick.
+pub(crate) fn revalidate_user_credential(
+    credential: &UserCredential,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> Result<(), String> {
+    validate_access_claims(credential.claims.clone(), store, cache)
+        .map(|_| ())
+        .map_err(|(_, _, body)| json_error_message(&body).unwrap_or(body))
 }
 
 fn claims_from_access_token(
@@ -3319,6 +3343,9 @@ fn validate_access_claims(
 ) -> Result<AccessClaims, (u16, &'static str, String)> {
     let now = Instant::now();
     let now_sec = unix_seconds();
+    if claims.exp as u64 <= now_sec {
+        return Err(error(401, "Unauthorized", "access token expired"));
+    }
     let session = find_row_by_field(store, cache, SESSIONS_TABLE, "id", &claims.session_id, now)
         .map_err(|e| error(500, "Internal Server Error", &e))?
         .ok_or_else(|| error(401, "Unauthorized", "session not found"))?;
