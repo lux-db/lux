@@ -427,11 +427,9 @@ fn cosine_unit_similarity(a: &[f32], b: &[f32]) -> f32 {
     // can use SIMD lanes. The accumulation order changes, so the result differs
     // by a rounding epsilon — fine for similarity ranking.
     let mut acc = [0f32; 8];
-    let ca = a.chunks_exact(8);
-    let cb = b.chunks_exact(8);
-    let ra = ca.remainder();
-    let rb = cb.remainder();
-    for (x, y) in ca.zip(cb) {
+    let (ca, ra) = a.as_chunks::<8>();
+    let (cb, rb) = b.as_chunks::<8>();
+    for (x, y) in ca.iter().zip(cb.iter()) {
         for j in 0..8 {
             acc[j] += x[j] * y[j];
         }

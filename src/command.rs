@@ -820,7 +820,7 @@ pub(crate) fn prepare_owned_argv(argv: Vec<Vec<u8>>) -> Result<OwnedCommand, Lux
         }
     } else if eq(name, b"GEOADD") && args.len() >= 4 && args.len() % 3 == 1 {
         let mut members = Vec::with_capacity(args.len() / 3);
-        for member in args[1..].chunks_exact(3) {
+        for member in args[1..].as_chunks::<3>().0 {
             members.push(OwnedGeoAddMember {
                 longitude: parse_arg(&member[0], "GEOADD longitude")?,
                 latitude: parse_arg(&member[1], "GEOADD latitude")?,
@@ -923,7 +923,9 @@ where
 
 /// Builds owned key/value pairs from alternating argv tokens.
 fn pairs_from_args(args: &[Vec<u8>]) -> Vec<(Vec<u8>, Vec<u8>)> {
-    args.chunks_exact(2)
+    args.as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| (pair[0].clone(), pair[1].clone()))
         .collect()
 }

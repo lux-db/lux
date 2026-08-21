@@ -2977,7 +2977,9 @@ pub(crate) fn execute_on_shard(
             shard_hset_one_fast(shard, store, key, args[2], args[3], now, out);
         } else {
             let pairs = args[2..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| (pair[0], pair[1]))
                 .collect::<Vec<_>>();
             write_int_result(out, store.hset_on_shard(shard, key, &pairs, now));

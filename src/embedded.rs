@@ -2748,7 +2748,9 @@ fn pair_bulk_vec(value: CommandOutput) -> Result<Vec<(Bytes, Bytes)>, LuxError> 
         return Err(protocol("expected an even number of array items"));
     }
     Ok(values
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
         .collect())
 }
@@ -2759,7 +2761,7 @@ fn scored_members(value: CommandOutput) -> Result<Vec<ScoredMember>, LuxError> {
         return Err(protocol("expected member/score pairs"));
     }
     let mut out = Vec::with_capacity(values.len() / 2);
-    for chunk in values.chunks_exact(2) {
+    for chunk in values.as_chunks::<2>().0 {
         out.push(ScoredMember {
             member: chunk[0].clone(),
             score: parse_f64(&chunk[1])?,
