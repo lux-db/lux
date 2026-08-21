@@ -142,6 +142,32 @@ fn append_corrupt_wal_frames(storage_dir: &std::path::Path) {
     }
 }
 
+fn remove_non_wal_files(path: &std::path::Path) {
+    for entry in std::fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        let child = entry.path();
+        if child.is_dir() {
+            remove_non_wal_files(&child);
+        } else if child.file_name().is_none_or(|name| name != "wal.lux") {
+            std::fs::remove_file(child).unwrap();
+        }
+    }
+}
+
+fn wal_bytes(path: &std::path::Path) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for entry in std::fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        let child = entry.path();
+        if child.is_dir() {
+            bytes.extend(wal_bytes(&child));
+        } else if child.file_name().is_some_and(|name| name == "wal.lux") {
+            bytes.extend(std::fs::read(child).unwrap());
+        }
+    }
+    bytes
+}
+
 #[tokio::test]
 async fn run_with_config_rejects_unauthenticated_non_loopback_listener() {
     let tmp = tempfile::tempdir().unwrap();
@@ -793,6 +819,204 @@ async fn embedded_client_has_typed_convenience_methods() {
         lux::EmbeddedValue::Int(1)
     );
 
+    drop(client);
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn embedded_typed_xadd_star_preserves_observed_id_after_wal_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = lux::ServerConfig {
+        enable_resp: false,
+        save_interval: Duration::ZERO,
+        data_dir: tmp.path().display().to_string(),
+        storage: lux::StorageConfig {
+            mode: lux::StorageMode::Tiered,
+            dir: tmp.path().join("storage").display().to_string(),
+        },
+        ..Default::default()
+    };
+
+    let handle = lux::run_with_config(cfg.clone()).await.unwrap();
+    let client = handle.client();
+    let id = client
+        .xadd("typed:wal:single", "*", &[("field", "value")])
+        .await
+        .unwrap();
+    drop(client);
+    handle.shutdown_and_wait().await.unwrap();
+
+    let handle = lux::run_with_config(cfg).await.unwrap();
+    let client = handle.client();
+    assert_eq!(
+        client
+            .execute_bytes_value(&[b"XLEN", b"typed:wal:single"])
+            .await
+            .unwrap(),
+        lux::EmbeddedValue::Int(1)
+    );
+    let range = client
+        .execute_bytes(&[b"XRANGE", b"typed:wal:single", b"-", b"+"])
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&range).contains(&id),
+        "WAL replay changed typed XADD * id: expected {id}, got {range:?}"
+    );
+    drop(client);
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn embedded_typed_relative_ttls_replay_from_wal_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage_dir = tmp.path().join("storage");
+    let cfg = lux::ServerConfig {
+        enable_resp: false,
+        save_interval: Duration::ZERO,
+        data_dir: tmp.path().display().to_string(),
+        storage: lux::StorageConfig {
+            mode: lux::StorageMode::Tiered,
+            dir: storage_dir.display().to_string(),
+        },
+        ..Default::default()
+    };
+
+    let handle = lux::run_with_config(cfg.clone()).await.unwrap();
+    let client = handle.client();
+    assert!(client
+        .set_options(
+            "typed:ttl:set:ex",
+            "value",
+            lux::SetOptions::default().ex(120)
+        )
+        .await
+        .unwrap());
+    assert!(client
+        .set_options(
+            "typed:ttl:set:px",
+            "value",
+            lux::SetOptions::default().px(120_000),
+        )
+        .await
+        .unwrap());
+    client
+        .setex("typed:ttl:setex", Duration::from_secs(120), "value")
+        .await
+        .unwrap();
+    client
+        .psetex("typed:ttl:psetex", Duration::from_millis(120_000), "value")
+        .await
+        .unwrap();
+    assert!(client.set("typed:ttl:expire", "value").await.unwrap());
+    assert!(client
+        .expire("typed:ttl:expire", Duration::from_secs(120))
+        .await
+        .unwrap());
+    let ex = lux::SetOptions::default().ex(120);
+    let px = lux::SetOptions::default().px(120_000);
+    let mut pipeline = lux::EmbeddedPipeline::new();
+    pipeline
+        .set_options(b"typed:ttl:pipe:set:ex", b"value", &ex)
+        .set_options(b"typed:ttl:pipe:set:px", b"value", &px)
+        .setex(b"typed:ttl:pipe:setex", 120, b"value")
+        .psetex(b"typed:ttl:pipe:psetex", 120_000, b"value")
+        .set(b"typed:ttl:pipe:expire", b"value")
+        .expire(b"typed:ttl:pipe:expire", 120);
+    assert_eq!(
+        client.execute_embedded_pipeline(&pipeline).await.unwrap(),
+        vec![
+            lux::EmbeddedValue::Simple("OK".to_string()),
+            lux::EmbeddedValue::Simple("OK".to_string()),
+            lux::EmbeddedValue::Simple("OK".to_string()),
+            lux::EmbeddedValue::Simple("OK".to_string()),
+            lux::EmbeddedValue::Simple("OK".to_string()),
+            lux::EmbeddedValue::Int(1),
+        ]
+    );
+    drop(client);
+    handle.shutdown_and_wait().await.unwrap();
+
+    let wal = wal_bytes(&storage_dir);
+    assert!(!wal.windows(5).any(|part| part == b"SETEX"));
+    assert!(!wal.windows(6).any(|part| part == b"PSETEX"));
+    assert_eq!(wal.windows(4).filter(|part| *part == b"PXAT").count(), 8);
+    assert_eq!(
+        wal.windows(9).filter(|part| *part == b"PEXPIREAT").count(),
+        2
+    );
+    remove_non_wal_files(&storage_dir);
+
+    let handle = lux::run_with_config(cfg).await.unwrap();
+    let client = handle.client();
+    for key in [
+        "typed:ttl:set:ex",
+        "typed:ttl:set:px",
+        "typed:ttl:setex",
+        "typed:ttl:psetex",
+        "typed:ttl:expire",
+        "typed:ttl:pipe:set:ex",
+        "typed:ttl:pipe:set:px",
+        "typed:ttl:pipe:setex",
+        "typed:ttl:pipe:psetex",
+        "typed:ttl:pipe:expire",
+    ] {
+        assert_eq!(
+            client.get(key).await.unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+    }
+    drop(client);
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn embedded_typed_pipeline_xadd_star_preserves_observed_id_after_wal_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = lux::ServerConfig {
+        enable_resp: false,
+        save_interval: Duration::ZERO,
+        data_dir: tmp.path().display().to_string(),
+        storage: lux::StorageConfig {
+            mode: lux::StorageMode::Tiered,
+            dir: tmp.path().join("storage").display().to_string(),
+        },
+        ..Default::default()
+    };
+
+    let handle = lux::run_with_config(cfg.clone()).await.unwrap();
+    let client = handle.client();
+    let mut pipeline = lux::EmbeddedPipeline::new();
+    pipeline.xadd(
+        b"typed:wal:pipeline",
+        b"*",
+        vec![(b"field".as_slice(), b"value".as_slice())],
+    );
+    let output = client.execute_embedded_pipeline(&pipeline).await.unwrap();
+    let [lux::EmbeddedValue::Bulk(id)] = output.as_slice() else {
+        panic!("unexpected typed XADD pipeline response: {output:?}");
+    };
+    let id = String::from_utf8_lossy(id).into_owned();
+    drop(client);
+    handle.shutdown_and_wait().await.unwrap();
+
+    let handle = lux::run_with_config(cfg).await.unwrap();
+    let client = handle.client();
+    assert_eq!(
+        client
+            .execute_bytes_value(&[b"XLEN", b"typed:wal:pipeline"])
+            .await
+            .unwrap(),
+        lux::EmbeddedValue::Int(1)
+    );
+    let range = client
+        .execute_bytes(&[b"XRANGE", b"typed:wal:pipeline", b"-", b"+"])
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&range).contains(&id),
+        "WAL replay changed typed pipeline XADD * id: expected {id}, got {range:?}"
+    );
     drop(client);
     handle.shutdown_and_wait().await.unwrap();
 }

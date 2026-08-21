@@ -39,7 +39,7 @@ use shard_exec::{ShardExecutionError, ShardExecutor, ShardPipelineCommand};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use store::Store;
+use store::{Store, StreamId};
 use tables::SharedSchemaCache;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -820,13 +820,19 @@ impl EmbeddedClient {
                         ensure_write_allowed(&self.runtime.store)?;
                         if emit_key_events {
                             let argv = command.to_owned_argv();
-                            let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                            self.runtime
-                                .store
-                                .wal_log_command(&refs)
-                                .map_err(wal_lux_error)?;
+                            if !matches!(command, Command::XAdd { .. })
+                                && !typed_command_has_relative_ttl(command)
+                            {
+                                let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                                self.runtime
+                                    .store
+                                    .wal_log_command(&refs)
+                                    .map_err(wal_lux_error)?;
+                            }
                             write_argvs.push(argv);
-                        } else {
+                        } else if !matches!(command, Command::XAdd { .. })
+                            && !typed_command_has_relative_ttl(command)
+                        {
                             wal_log_native_command(&self.runtime.store, command)?;
                         }
                     }
@@ -835,10 +841,10 @@ impl EmbeddedClient {
                 let mut shard = self.runtime.store.lock_write_shard(shard_idx);
                 shard.version += 1;
                 for command in batch {
+                    let output = self.execute_native_write_on_shard(command, &mut shard, now)?;
+                    wal_log_resolved_typed_ttl(&self.runtime.store, command, &output)?;
                     if collect_outputs {
-                        outputs.push(self.execute_native_write_on_shard(command, &mut shard, now)?);
-                    } else {
-                        self.execute_native_write_on_shard_discard(command, &mut shard, now)?;
+                        outputs.push(output);
                     }
                 }
             } else if collect_outputs {
@@ -988,6 +994,7 @@ impl EmbeddedClient {
                 value,
                 options,
             } if can_fast_path_set(options) => {
+                validate_fast_path_set_ttl(options)?;
                 self.runtime
                     .store
                     .set_on_shard(&mut shard.data, key, value, set_ttl(options), now);
@@ -1037,6 +1044,11 @@ impl EmbeddedClient {
                 milliseconds,
                 value,
             } => {
+                if *milliseconds == 0 {
+                    return Err(LuxError::Command(
+                        "ERR invalid expire time in 'psetex' command".to_string(),
+                    ));
+                }
                 let millis = u64::try_from(*milliseconds).map_err(|_| {
                     LuxError::Command("ERR value is not an integer or out of range".to_string())
                 })?;
@@ -1050,6 +1062,9 @@ impl EmbeddedClient {
                 self.runtime.store.remove_from_disk(key);
                 Ok(CommandOutput::Simple("OK"))
             }
+            Command::Expire { key, seconds } => Ok(CommandOutput::Int(i64::from(
+                Store::expire_on_shard(&mut shard.data, key, *seconds, now),
+            ))),
             Command::Append { key, value } => {
                 let len = self.runtime.store.append_on_shard(shard, key, value, now);
                 self.runtime.store.remove_from_disk(key);
@@ -1221,6 +1236,7 @@ impl EmbeddedClient {
                     .store
                     .xadd_on_shard(shard, key, arg_str(id), xadd_fields(fields), None, now)
                     .map_err(LuxError::Command)?;
+                wal_log_resolved_xadd(&self.runtime.store, key, id, fields)?;
                 self.runtime.broker.wake_stream_waiters(arg_str(key));
                 Ok(CommandOutput::Bulk(bytes::Bytes::from(id.to_string())))
             }
@@ -1240,26 +1256,12 @@ impl EmbeddedClient {
         }
     }
 
-    fn execute_native_write_on_shard_discard(
-        &self,
-        command: &Command<'_>,
-        shard: &mut store::Shard,
-        now: Instant,
-    ) -> Result<(), LuxError> {
-        self.execute_native_write_on_shard(command, shard, now)
-            .map(|_| ())
-    }
-
     async fn execute_command_fast_path(
         &self,
         command: &Command<'_>,
     ) -> Result<Option<CommandOutput>, LuxError> {
         if matches!(command, Command::Raw { .. })
-            || matches!(command, Command::Set { options, .. } if !can_fast_path_set(options) || set_ttl(options).is_some())
-            || matches!(
-                command,
-                Command::SetEx { .. } | Command::PSetEx { .. } | Command::Expire { .. }
-            )
+            || matches!(command, Command::Set { options, .. } if !can_fast_path_set(options))
         {
             return Ok(None);
         }
@@ -1276,12 +1278,14 @@ impl EmbeddedClient {
         } else {
             None
         };
-        if let Some(argv) = &write_argv {
-            let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-            self.runtime
-                .store
-                .wal_log_command(&refs)
-                .map_err(wal_lux_error)?;
+        if !matches!(command, Command::XAdd { .. }) && !typed_command_has_relative_ttl(command) {
+            if let Some(argv) = &write_argv {
+                let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                self.runtime
+                    .store
+                    .wal_log_command(&refs)
+                    .map_err(wal_lux_error)?;
+            }
         }
 
         let output = match command {
@@ -1307,6 +1311,7 @@ impl EmbeddedClient {
                 value,
                 options,
             } if can_fast_path_set(options) => {
+                validate_fast_path_set_ttl(options)?;
                 let ttl = set_ttl(options);
                 self.runtime.store.set(key, value, ttl, now);
                 CommandOutput::Simple("OK")
@@ -1337,6 +1342,11 @@ impl EmbeddedClient {
                 milliseconds,
                 value,
             } => {
+                if *milliseconds == 0 {
+                    return Err(LuxError::Command(
+                        "ERR invalid expire time in 'psetex' command".to_string(),
+                    ));
+                }
                 let millis = u64::try_from(*milliseconds).map_err(|_| {
                     LuxError::Command("ERR value is not an integer or out of range".to_string())
                 })?;
@@ -1732,12 +1742,14 @@ impl EmbeddedClient {
                     .store
                     .xadd(key, arg_str(id), xadd_fields(fields), None, now)
                     .map_err(LuxError::Command)?;
+                wal_log_resolved_xadd(&self.runtime.store, key, id, fields)?;
                 self.runtime.broker.wake_stream_waiters(arg_str(key));
                 CommandOutput::Bulk(bytes::Bytes::from(id.to_string()))
             }
             Command::Set { .. } | Command::Raw { .. } => unreachable!("handled before fast path"),
         };
 
+        wal_log_resolved_typed_ttl(&self.runtime.store, command, &output)?;
         self.runtime.store.add_total_commands(1);
         if let Some(argv) = write_argv.take() {
             let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
@@ -2234,6 +2246,28 @@ fn xadd_fields(fields: &[(&[u8], &[u8])]) -> Vec<(String, bytes::Bytes)> {
         .collect()
 }
 
+fn wal_log_resolved_xadd(
+    store: &Store,
+    key: &[u8],
+    id: StreamId,
+    fields: &[(&[u8], &[u8])],
+) -> Result<(), LuxError> {
+    if !store.wal_enabled() {
+        return Ok(());
+    }
+
+    let id = id.to_string();
+    let mut args = Vec::with_capacity(fields.len() * 2 + 3);
+    args.push(b"XADD".as_slice());
+    args.push(key);
+    args.push(id.as_bytes());
+    for (field, value) in fields {
+        args.push(*field);
+        args.push(*value);
+    }
+    store.wal_log_command(&args).map_err(wal_lux_error)
+}
+
 fn require_xadd_fields(fields: &[(&[u8], &[u8])]) -> Result<(), LuxError> {
     if fields.is_empty() {
         return Err(LuxError::Command(
@@ -2301,11 +2335,12 @@ fn native_pipeline_access<'a>(command: &Command<'a>) -> Option<(&'a [u8], Native
         Command::GeoPos { key, .. } => (*key, b"GEOPOS".as_slice()),
         Command::GeoDist { key, .. } => (*key, b"GEODIST".as_slice()),
         Command::Exists { keys } if keys.len() == 1 => (keys[0], b"EXISTS".as_slice()),
-        Command::Set { key, options, .. }
-            if can_fast_path_set(options) && set_ttl(options).is_none() =>
-        {
+        Command::Set { key, options, .. } if can_fast_path_set(options) => {
             (*key, b"SET".as_slice())
         }
+        Command::SetEx { key, .. } => (*key, b"SETEX".as_slice()),
+        Command::PSetEx { key, .. } => (*key, b"PSETEX".as_slice()),
+        Command::Expire { key, .. } => (*key, b"EXPIRE".as_slice()),
         Command::GetSet { key, .. } => (*key, b"GETSET".as_slice()),
         Command::SetNx { key, .. } => (*key, b"SETNX".as_slice()),
         Command::Append { key, .. } => (*key, b"APPEND".as_slice()),
@@ -2548,6 +2583,74 @@ fn set_ttl(options: &[SetOption]) -> Option<Duration> {
         SetOption::Px(milliseconds) => u64::try_from(*milliseconds).ok().map(Duration::from_millis),
         SetOption::Nx | SetOption::Xx | SetOption::KeepTtl => None,
     })
+}
+
+fn validate_fast_path_set_ttl(options: &[SetOption]) -> Result<(), LuxError> {
+    for option in options {
+        match option {
+            SetOption::Ex(0) | SetOption::Px(0) => {
+                return Err(LuxError::Command(
+                    "ERR invalid expire time in 'set' command".to_string(),
+                ));
+            }
+            SetOption::Px(milliseconds) if *milliseconds > u64::MAX as u128 => {
+                return Err(LuxError::Command(
+                    "ERR value is not an integer or out of range".to_string(),
+                ));
+            }
+            SetOption::Ex(_)
+            | SetOption::Px(_)
+            | SetOption::Nx
+            | SetOption::Xx
+            | SetOption::KeepTtl => {}
+        }
+    }
+    Ok(())
+}
+
+fn typed_command_has_relative_ttl(command: &Command<'_>) -> bool {
+    match command {
+        Command::Set { options, .. } => options
+            .iter()
+            .any(|option| matches!(option, SetOption::Ex(_) | SetOption::Px(_))),
+        Command::SetEx { .. } | Command::PSetEx { .. } | Command::Expire { .. } => true,
+        _ => false,
+    }
+}
+
+fn wal_log_resolved_typed_ttl(
+    store: &Store,
+    command: &Command<'_>,
+    output: &CommandOutput,
+) -> Result<(), LuxError> {
+    if !store.wal_enabled() || !typed_command_has_relative_ttl(command) {
+        return Ok(());
+    }
+    if matches!(command, Command::Expire { .. }) && !matches!(output, CommandOutput::Int(1)) {
+        return Ok(());
+    }
+
+    let ttl_ms = match command {
+        Command::Set { options, .. } => {
+            set_ttl(options).map(|ttl| ttl.as_millis().min(i64::MAX as u128) as i64)
+        }
+        Command::SetEx { seconds, .. } | Command::Expire { seconds, .. } => {
+            Some(seconds.saturating_mul(1000).min(i64::MAX as u64) as i64)
+        }
+        Command::PSetEx { milliseconds, .. } => Some((*milliseconds).min(i64::MAX as u128) as i64),
+        _ => None,
+    };
+    let Some(ttl_ms) = ttl_ms else {
+        return Ok(());
+    };
+    let argv = command.to_owned_argv();
+    let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    crate::cmd::wal_log_resolved_ttl_command(
+        store,
+        &refs,
+        crate::store::epoch_ms().saturating_add(ttl_ms),
+    )
+    .map_err(wal_lux_error)
 }
 
 fn parse_score_bound_bytes(input: &[u8], is_max: bool) -> (f64, bool) {

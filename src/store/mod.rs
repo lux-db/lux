@@ -2824,6 +2824,21 @@ impl Store {
         false
     }
 
+    pub(crate) fn expire_on_shard(
+        data: &mut ShardData,
+        key: &[u8],
+        seconds: u64,
+        now: Instant,
+    ) -> bool {
+        if let Some(entry) = data.get_mut(key) {
+            if !entry.is_expired_at(now) {
+                entry.expires_at = Some(now + Duration::from_secs(seconds));
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn pexpire(&self, key: &[u8], millis: u64, now: Instant) -> bool {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
