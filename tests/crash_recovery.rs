@@ -239,7 +239,7 @@ fn tsadd_star_timestamp_stable_after_wal_replay() {
     );
 }
 
-// PROBE (ENG-1316): ZUNIONSTORE reads source keys that may live on other WAL
+// Regression: ZUNIONSTORE reads source keys that may live on other WAL
 // shards. Per-shard replay applies each shard fully in order, so a dst whose
 // shard replays before a source's shard computes the union from empty sources.
 // With many sources spread across shards, most dsts are affected.
@@ -273,7 +273,7 @@ fn zunionstore_cross_shard_survives_wal_replay() {
     }
 }
 
-// PROBE (ENG-1316): SMOVE adds the member to dst, which may live on a different
+// Regression: SMOVE adds the member to dst, which may live on a different
 // WAL shard than src. A conflicting SREM on dst must stay ordered after the move.
 // Under raw logging the whole move lands in src's shard and can replay after
 // dst's SREM, resurrecting the member. Self-logging `SREM src` + `SADD dst` keys
@@ -308,7 +308,7 @@ fn smove_cross_shard_survives_wal_replay() {
     }
 }
 
-// PROBE (ENG-1316): LMOVE pushes the moved element onto dst, whose shard may
+// Regression: LMOVE pushes the moved element onto dst, whose shard may
 // differ from src's. List order is significant, so a pre-existing element on dst
 // must stay ordered before the moved one. Raw logging puts the whole move in
 // src's shard and can replay it before dst's own push, inverting the order.
@@ -340,7 +340,7 @@ fn lmove_cross_shard_order_survives_wal_replay() {
     }
 }
 
-// PROBE (ENG-1316): RPOPLPUSH is LMOVE src dst RIGHT LEFT; same cross-shard
+// Regression: RPOPLPUSH is LMOVE src dst RIGHT LEFT; same cross-shard
 // ordering hazard on the destination push.
 #[test]
 fn rpoplpush_cross_shard_order_survives_wal_replay() {
@@ -370,7 +370,7 @@ fn rpoplpush_cross_shard_order_survives_wal_replay() {
     }
 }
 
-// PROBE (ENG-1316): an immediately-satisfiable BLMOVE moves like LMOVE and must
+// Regression: an immediately-satisfiable BLMOVE moves like LMOVE and must
 // be logged the same way. BLMOVE isn't classified as a write command, so
 // execute_with_wal never logs it; the immediate path self-logs pop+push.
 #[test]
@@ -406,7 +406,7 @@ fn blmove_immediate_cross_shard_survives_wal_replay() {
     }
 }
 
-// PROBE (ENG-1317): a BLOCKED BLMOVE later satisfied by a push. The satisfying
+// Regression: a blocked BLMOVE later satisfied by a push. The satisfying
 // push is logged, but the consuming pop (src) and the deferred dst push happen
 // outside the WAL. The woken handler now logs both, keyed so each lands on its
 // own shard, so replay leaves the element only in dst. Cross-shard fan-out so
@@ -461,7 +461,7 @@ fn blmove_blocked_completion_survives_wal_replay() {
     }
 }
 
-// PROBE (ENG-1317): a BLOCKED BLPOP satisfied by a later push. The push is
+// Regression: a blocked BLPOP satisfied by a later push. The push is
 // logged; the waiter's consuming pop is now logged too (keyed on the popped
 // key), so replay does not resurrect the element into the source list.
 #[test]
@@ -507,7 +507,7 @@ fn blpop_blocked_completion_survives_wal_replay() {
     }
 }
 
-// PROBE (ENG-1317): a BLOCKED BZPOPMIN satisfied by a later ZADD. handle_block_zpop
+// Regression: a blocked BZPOPMIN satisfied by a later ZADD. handle_block_zpop
 // pops straight from the store outside the WAL; the removal is now logged as a
 // keyed ZREM so replay doesn't resurrect the popped member into the zset.
 #[test]
@@ -553,7 +553,7 @@ fn bzpopmin_blocked_completion_survives_wal_replay() {
     }
 }
 
-// PROBE (ENG-1316): COPY writes only dst but the raw command shards on src and
+// Regression: COPY writes only dst but the raw command shards on src and
 // re-reads src at replay, when a per-shard replay may not have rebuilt src yet
 // (and dst's own writes replay in a separate shard). COPY self-logs the resolved
 // dst value as a keyed `LXRESTORE dst <blob>`.
@@ -591,7 +591,7 @@ fn copy_cross_shard_survives_wal_replay() {
     );
 }
 
-// PROBE (ENG-1316): MSET writes many keys but the raw command shards on the
+// Regression: MSET writes many keys but the raw command shards on the
 // first key only, so a later independent write to a non-first key can replay
 // before the MSET's value for that key, losing the newer write. Self-logging a
 // keyed SET per pair puts each in its own shard in append order.
@@ -1405,7 +1405,7 @@ fn snapshot_ttl_expires_across_downtime() {
     );
 }
 
-// Hash field TTLs (ENG-1290) must survive a WAL-only restart: HPEXPIREAT is
+// Hash field TTLs must survive a WAL-only restart: HPEXPIREAT is
 // self-logged with its absolute deadline and replays deterministically.
 #[test]
 fn hash_field_ttl_survives_wal_replay() {

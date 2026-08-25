@@ -1,6 +1,6 @@
 name: Fuzz
 
-# Coverage-guided fuzzing of every untrusted-bytes decoder (see FUZZING.md).
+# Coverage-guided fuzzing of the targets documented in FUZZING.md.
 # Runs nightly and on demand -- not on every PR (the proptest fuzz targets in
 # `cargo test` already gate PRs). A crash fails the job and uploads the repro.
 on:

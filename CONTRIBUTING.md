@@ -22,14 +22,6 @@ cargo run --release
 cargo test --all-targets
 ```
 
-## Running benchmarks
-
-Lux vs Redis side-by-side benchmark (requires `redis-benchmark` and `redis-server`):
-
-```bash
-./bench.sh
-```
-
 ## Before you start
 
 - **Open an issue first** for anything beyond small bug fixes. This saves everyone time if the approach needs discussion.
@@ -45,8 +37,8 @@ Lux vs Redis side-by-side benchmark (requires `redis-benchmark` and `redis-serve
 
 ## Adding new Redis commands
 
-1. Add the command handler in `src/cmd.rs`
-2. Add the store operation in `src/store.rs`
+1. Add the command handler under `src/cmd/`
+2. Add the store operation under `src/store/`
 3. Add snapshot serialization/deserialization in `src/snapshot.rs` if it involves a new data type
 4. Update the command list in `README.md`
 

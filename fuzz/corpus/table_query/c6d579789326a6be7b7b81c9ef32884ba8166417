@@ -1,1 +1,0 @@
-* FROM t WHERE id IN ( SELEC( id FROM g)

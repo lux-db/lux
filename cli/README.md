@@ -14,24 +14,10 @@ From source (requires Rust):
 git clone https://github.com/lux-db/lux && cargo install --path lux/cli
 ```
 
-From GitHub Releases (manual download):
-```bash
-# macOS (Apple Silicon)
-curl -fsSL https://github.com/lux-db/lux/releases/latest/download/lux-cli-macos-arm64.tar.gz | tar xz
-mv lux-cli-macos-arm64 /usr/local/bin/lux
-
-# macOS (Intel)
-curl -fsSL https://github.com/lux-db/lux/releases/latest/download/lux-cli-macos-x86_64.tar.gz | tar xz
-mv lux-cli-macos-x86_64 /usr/local/bin/lux
-
-# Linux (x86_64)
-curl -fsSL https://github.com/lux-db/lux/releases/latest/download/lux-cli-linux-x86_64.tar.gz | tar xz
-mv lux-cli-linux-x86_64 /usr/local/bin/lux
-
-# Linux (ARM64)
-curl -fsSL https://github.com/lux-db/lux/releases/latest/download/lux-cli-linux-arm64.tar.gz | tar xz
-mv lux-cli-linux-arm64 /usr/local/bin/lux
-```
+For a manual install, download the archive for your platform from the newest
+[`cli-v*` release](https://github.com/lux-db/lux/releases), extract it, rename
+the binary to `lux`, and place it on your `PATH`. Engine releases use `v*` tags
+and do not contain CLI archives.
 
 ## Auth
 
@@ -245,11 +231,11 @@ authenticated direct connection while migration state uses Cloud's dedicated
 management endpoints; it never sends generic `LUX` commands through the
 restricted Cloud console.
 
-Self-hosted tooling can discover the engine's Studio contract without
-credentials from `GET /v1` (or the richer `GET /v1/version`). Both responses
-advertise `studio_api` and a capability list, allowing a Studio client to hide
-or label unavailable features instead of inferring support from a version
-number.
+Self-hosted tooling can discover the engine's Studio contract from `GET /v1`
+(or the richer `GET /v1/version`) using the engine's normal operator or secret
+credential when authentication is configured. Both responses advertise
+`studio_api` and a capability list, allowing a Studio client to hide or label
+unavailable features instead of inferring support from a version number.
 
 ## Auth providers
 

@@ -4548,7 +4548,7 @@ async fn handle_connection(
 /// Log the pop that satisfied a blocked BLPOP/BRPOP/BLMOVE. The element was
 /// already removed from `key` in memory by the pushing side's drain, and the
 /// push that satisfied us was WAL-logged before we woke, so appending the
-/// matching pop here keeps WAL replay from resurrecting the element (ENG-1317).
+/// matching pop here keeps WAL replay from resurrecting the element.
 /// Runs in the woken task with no shard locks held, so there is no
 /// memory->WAL lock nesting.
 fn wal_log_blocked_pop(store: &Store, key: &[u8], pop_left: bool) {
@@ -4648,7 +4648,7 @@ async fn handle_block_move(
             // pushing side's drain) and the dst push (done just above). Neither
             // went through the WAL yet; the satisfying push to src was logged
             // before we woke, so replay order is push(src), pop(src), push(dst)
-            // -> element ends up only in dst (ENG-1317). Batched so a same-shard
+            // -> element ends up only in dst. Batched so a same-shard
             // move is one atomic frame; a cross-shard move splits per shard.
             if store.wal_enabled() {
                 let pop: &[u8] = if src_left { b"LPOP" } else { b"RPOP" };
@@ -4815,7 +4815,7 @@ async fn handle_block_lmpop(
             Ok(Some((key, items))) => {
                 // Popped straight from the store outside the WAL; log the
                 // compensating LPOP/RPOP keyed on the popped key so replay stays
-                // correct (ENG-1316/1317). No shard locks held here.
+                // correct. No shard locks held here.
                 if store.wal_enabled() {
                     let pop: &[u8] = if pop_left { b"LPOP" } else { b"RPOP" };
                     let n = items.len().to_string();
@@ -4865,7 +4865,7 @@ async fn handle_block_zmpop(
         match store.zmpop(&key_refs, pop_min, count, now) {
             Ok(Some((key, items))) => {
                 // Popped straight from the store outside the WAL; self-log the
-                // removal as a keyed ZREM so replay stays correct (ENG-1316/1317).
+                // removal as a keyed ZREM so replay stays correct.
                 if store.wal_enabled() {
                     let mut zrem: Vec<&[u8]> = Vec::with_capacity(items.len() + 2);
                     zrem.push(b"ZREM");
@@ -4929,7 +4929,7 @@ async fn handle_block_zpop(
                     let (member, score) = &items[0];
                     // BZPOPMIN/BZPOPMAX pop straight from the store here, outside
                     // the WAL; log the removal of the exact member so replay
-                    // doesn't resurrect it (ENG-1317). Keyed on `key` -> correct
+                    // doesn't resurrect it. Keyed on `key` -> correct
                     // shard; no shard locks held at this point.
                     if store.wal_enabled() {
                         let _ =

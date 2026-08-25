@@ -6,7 +6,9 @@ the engine. CLI, Cloud, and Studio must use this contract rather than writing
 
 ## Discovery
 
-`GET /v1/version` and `LUX VERSION` return:
+`GET /v1/version` and `LUX VERSION` return the fields below. On a
+credential-gated engine, the HTTP route requires an operator or secret
+credential and RESP requires normal connection authentication.
 
 - `version`: engine semantic version
 - `build_sha`: source revision (`unknown` for builds that do not provide one)

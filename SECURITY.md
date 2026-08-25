@@ -42,10 +42,9 @@ regressions are found:
 
 ## Resource Exhaustion
 
-Lux rejects maliciously large or malformed inputs before unbounded CPU, memory,
-disk, or task growth. Reports here are security-relevant when they can crash the
-process, wedge the runtime, or create large sparse allocations from small
-requests. Examples:
+Resource-exhaustion reports are security-relevant when a small or unauthenticated
+input can cause disproportionate CPU, memory, disk, network, or task growth;
+crash the process; or wedge the runtime. Examples include:
 
 - Malformed length-prefixed data that drives a large allocation (snapshot, WAL,
   RESP, or MessagePack length prefixes).
@@ -102,9 +101,12 @@ We ask that you give us reasonable time to address the issue before public discl
 This policy covers:
 
 - The Lux database engine ([github.com/lux-db/lux](https://github.com/lux-db/lux))
-- Lux Cloud ([luxdb.dev](https://luxdb.dev))
 - The Lux CLI
 - The @luxdb/sdk npm package
+- The Workbenches distributed in this repository
+
+Lux Cloud and the Swift SDK are maintained in separate repositories and follow
+their own reporting and release processes.
 
 ## Contact
 

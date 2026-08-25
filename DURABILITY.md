@@ -1,6 +1,6 @@
 # Lux Durability Contract
 
-This document defines Lux persistence and recovery expectations for 1.0.
+This document defines Lux persistence and recovery behavior.
 
 Lux uses snapshots plus a write-ahead log (WAL). It does not use Redis AOF. The
 durability contract is intentionally explicit so users understand the data-loss
@@ -42,11 +42,12 @@ Process crash behavior:
 
 Snapshots are complete point-in-time images of the logical database.
 
-Required behavior:
+Snapshot behavior:
 
 - Manual `SAVE` writes a consistent snapshot and truncates WAL only after the
   snapshot succeeds.
-- `BGSAVE` uses the same consistency model from a background task.
+- `BGSAVE` currently uses the same synchronous save path as `SAVE`; it does not
+  yet provide Redis-compatible background execution.
 - Snapshot files use a binary format with explicit type tags and length fields.
 - Snapshot loading must reject invalid lengths and container counts before large
   allocation.
@@ -61,7 +62,7 @@ that generates a server-side value (an auto-generated primary key, a `now()`
 column default, a relative TTL) is logged with that value already materialized,
 so replay is deterministic and reproduces exactly the state clients observed.
 
-Required behavior:
+Replay behavior:
 
 - All write commands that mutate durable state are WAL logged.
 - Logged commands carry resolved values, so replaying them never regenerates a
@@ -121,7 +122,7 @@ Tiered mode expectations:
 
 ## Failure Modes That Must Be Bounded
 
-1.0 requires explicit tests or documented behavior for:
+Lux treats these as part of the durability failure surface:
 
 - Process kill during ordinary writes.
 - Process kill after snapshot before WAL truncation.
@@ -132,15 +133,6 @@ Tiered mode expectations:
 - Corrupted tiered data records.
 - Restore with invalid payload.
 - Restore with stale pre-restore WAL and tiered files.
-
-Recommended before 1.0:
-
-- I/O error during snapshot write.
-- I/O error during WAL append.
-- I/O error during WAL truncation.
-- I/O error during tiered write.
-- Crash during recovery from a previous crash.
-- Disk full during restore.
 
 ## Operator Runbook
 
@@ -166,13 +158,3 @@ Upgrade:
 3. Roll forward through documented upgrade paths.
 4. Do not downgrade across file-format changes unless release notes explicitly
    say it is safe.
-
-## Release Evidence
-
-Every 1.0 release candidate should record:
-
-- Full test command and result.
-- Crash-recovery test result.
-- Persistence fuzz or corpus result.
-- Backup/restore smoke test result.
-- Any known durability limitation.

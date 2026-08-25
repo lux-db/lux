@@ -1,11 +1,12 @@
-# Lux Compatibility Contract
+# Lux Compatibility
 
-This document defines what compatibility means for Lux 1.0.
+This document defines the Redis-compatible, Lux-native, divergent, and
+unsupported surfaces exposed by Lux.
 
 Lux is Redis-compatible where documented, but Lux is not a Redis clone. Lux adds
 tables, auth, vectors, time series, HTTP APIs, live subscriptions, tiered
-storage, and embedded APIs. Those Lux-native surfaces are part of the 1.0 public
-contract only where they are documented here or in the README.
+storage, and embedded APIs. A Lux-native surface is public only where it is
+documented here or in the README.
 
 ## Compatibility Classes
 
@@ -17,18 +18,18 @@ Lux behavior falls into five classes:
   known ways.
 - **Lux-native**: public Lux API with no Redis compatibility claim.
 - **Experimental**: available, but not yet stable for 1.x compatibility.
-- **Unsupported**: not part of 1.0.
+- **Unsupported**: not implemented or intentionally outside Lux's scope.
 
 ## RESP Protocol
 
-1.0 target:
+Current protocol:
 
 - RESP2 command protocol.
 - Binary-safe bulk strings.
 - Pipelined requests with per-client response order preserved.
 - Existing Redis clients can connect with `redis://`.
 
-Not 1.0:
+Not supported:
 
 - RESP3.
 - Redis Cluster protocol.
@@ -36,8 +37,10 @@ Not 1.0:
 
 ## Compatible Redis Surface
 
-The command list in README is the source of truth for supported commands. The
-following areas are intended to be Redis-compatible for normal client use:
+The README lists common commands. This document defines their compatibility
+class, and `tests/redis_parity_inventory.rs` keeps the command registry
+classified. The following areas are intended to be Redis-compatible for normal
+client use unless a partial behavior or difference is documented below:
 
 - Strings and bit operations.
 - Keys, TTL, expiry, rename, scan, and type inspection.
@@ -83,7 +86,7 @@ cargo build
 LUX_PORT=6379 ./target/debug/lux
 
 # Terminal 2
-VALKEY_DIR=/tmp/valkey LUX_PORT=6379 just valkey-compat
+VALKEY_DIR="$PWD/../valkey" LUX_PORT=6379 just valkey-compat
 ```
 
 The recipe is intentionally local/manual. It runs Redis OSS/core-oriented suites
@@ -98,17 +101,34 @@ compatibility targets from single-node command semantics.
 
 Current partial/stub surfaces:
 
-- `CLIENT` -- common client-library subcommands only.
+- `BGSAVE` -- performs a consistent save synchronously rather than scheduling a
+  background save.
+- `CLIENT` -- compatibility shim that returns `OK`; Redis client state and
+  metadata are not maintained.
 - `COMMAND` -- metadata parity incomplete.
-- `CONFIG`, `INFO`, `LATENCY`, `MEMORY`, `OBJECT` -- server/admin metadata
-  needs audit.
-- `DEBUG`, `RESET` -- compatibility behavior needs explicit implementation or
-  rejection.
+- `CONFIG` -- only the zset listpack/ziplist entry threshold is read and
+  changed; other settings are not implemented.
+- `INFO` -- reports Lux's server, client, storage, persistence, keyspace, and
+  push fields rather than the complete Redis field set.
+- `LATENCY` -- Lux does not retain Redis latency-monitor samples; reporting
+  forms return an empty array and `LATENCY RESET` returns `0`.
+- `MEMORY USAGE` and `OBJECT ENCODING` -- available for supported Lux values;
+  other Redis subcommands and metadata are not implemented.
+- `DEBUG` -- registered as a no-op compatibility shim.
+- `RESET` -- returns Redis's `+RESET` status, but connection-state parity is
+  incomplete.
 - `DUMP`/`RESTORE` -- implemented with a Lux-internal value format (not RDB;
   round-trips within Lux). `TOUCH` returns the key count without an
   access-recency effect.
-- `FUNCTION` -- Redis Functions decision pending.
-- `SWAPDB`/multi-DB behavior -- product decision pending.
+- `HELLO` -- identifies Lux as RESP2. RESP3 negotiation and RESP3 command
+  protocol are unsupported.
+- `LASTSAVE` -- currently returns the server's current Unix time rather than
+  the timestamp of the last successful snapshot.
+- `FUNCTION LIST` -- returns an empty library list; other Redis Functions
+  subcommands return an explicit unsupported error.
+- `SELECT` -- only database `0` is accepted. `SWAPDB` returns an explicit
+  unsupported error because Lux exposes one logical database.
+- `WAIT` -- returns `0` because Lux has no replicas.
 
 Current missing Redis OSS/core command groups:
 
@@ -129,7 +149,7 @@ Explicitly excluded from this parity project:
 
 ## Documented Redis Differences
 
-Known 1.0 differences:
+Known differences:
 
 - **Persistence**: Lux uses snapshots plus WAL instead of Redis AOF/RDB
   semantics. See `DURABILITY.md`.
@@ -165,7 +185,7 @@ Known 1.0 differences:
 
 ## Lux-Native Public Surface
 
-The following Lux-native surfaces are part of the 1.0 target:
+The following Lux-native surfaces are public:
 
 - Tables: `TCREATE`, `TINSERT`, `TSELECT`, `TUPDATE`, `TDELETE`, `TDROP`,
   `TCOUNT`, `TSCHEMA`, `TLIST`, `TALTER`, `TINDEX`, `TDROPINDEX`.
@@ -180,12 +200,9 @@ The following Lux-native surfaces are part of the 1.0 target:
 - Lux TypeScript SDK.
 - Lux CLI.
 
-Each Lux-native surface should have examples, tests, and stable error shape
-expectations before 1.0.
+## Unsupported
 
-## Unsupported in 1.0
-
-The following are not part of the 1.0 contract:
+The following are outside the documented public surface:
 
 - Redis Cluster.
 - Redis modules.
@@ -200,21 +217,11 @@ The following are not part of the 1.0 contract:
 
 ## Versioning Rules
 
-After 1.0:
+Starting with 1.0:
 
 - Patch releases fix bugs without public API breakage.
 - Minor releases add backward-compatible public functionality.
 - Major releases are required for backward-incompatible changes to documented
   public behavior.
-- Deprecations should be documented in at least one minor release before
-  removal in a major release.
-
-## Release Evidence
-
-A release is compatible enough for 1.0 only if:
-
-- Full test suite passes.
-- SDK tests pass.
-- Differential tests pass for the documented Redis-compatible subset.
-- Known divergences are listed here.
-- Release notes call out any newly discovered compatibility gap.
+- Deprecations are documented in at least one minor release before removal in a
+  major release.

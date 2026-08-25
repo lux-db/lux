@@ -1,8 +1,9 @@
 # Fuzzing
 
-Lux fuzzes every decoder that turns untrusted bytes into structured data. The
-contract for all of them is the same: **any input returns cleanly (Ok or Err)
-and never panics, OOMs, aborts, or hangs.**
+Lux fuzzes the untrusted-byte decoders listed below. A panic, abort, excessive
+allocation, or hang found by these targets is a bug. Fuzzing explores this
+failure surface; a bounded run does not prove that every possible input is
+safe.
 
 Covered decoders:
 
@@ -13,12 +14,12 @@ Covered decoders:
 - Lua MessagePack (`cmsgpack.unpack`)
 - WAL replay + on-disk entry reader (`src/disk.rs`)
 
-There are two layers, sharing the same targets.
+There are two complementary layers.
 
 ## Layer 1 — in-crate proptest (runs in CI, stable Rust)
 
-Property tests feed random bytes to each decoder and assert no panic. They run
-as ordinary unit tests on every push:
+Property tests feed random bytes to the decoders and assert that the tested
+inputs do not panic. They run as ordinary unit tests in the main CI suite:
 
 ```sh
 cargo test --release fuzz_
@@ -31,9 +32,11 @@ fuzzer has found live next to them (e.g. `malformed_snapshot_large_count_does_no
 
 ## Layer 2 — coverage-guided cargo-fuzz (deeper, out-of-band)
 
-libfuzzer targets in `fuzz/fuzz_targets/` drive the same decoders via the
-`fuzz_api` module (compiled only under `--features fuzzing`). Coverage-guided
-mutation finds bugs random testing can't (it learns which bytes reach new code).
+libFuzzer targets in `fuzz/fuzz_targets/` drive snapshot, RESP, command,
+table-query, and MessagePack decoding via the `fuzz_api` module (compiled only
+under `--features fuzzing`). Disk and WAL decoding currently have in-crate
+property tests but no cargo-fuzz target. Coverage-guided mutation uses execution
+feedback to explore paths that random generation may miss.
 
 Requires the nightly toolchain and cargo-fuzz:
 
@@ -54,11 +57,11 @@ with `cargo +nightly fuzz run <target> <artifact-path>`.
 
 ## Corpus
 
-`fuzz/corpus/<target>/` holds seed inputs: valid samples plus every malformed
-input a fuzzer has previously crashed on (e.g. `regression_oom_hash_count`,
-`regression_oom_stream_groups`). Keep these checked in so the seeds, and the
-fixed-bug coverage, persist. `fuzz/artifacts/` and `fuzz/target/` are not
-committed.
+`fuzz/corpus/<target>/` holds a small, curated set of readable valid and
+malformed seeds. Named regression inputs such as `regression_oom_hash_count`
+and `regression_oom_stream_groups` preserve fixed-bug coverage. libFuzzer's
+hash-named working corpus, `fuzz/artifacts/`, and `fuzz/target/` are generated
+locally and are not committed.
 
 ## Bugs found so far
 
