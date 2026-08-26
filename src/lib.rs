@@ -3504,6 +3504,12 @@ fn handle_tx_cmd(
                     };
                     match cmd_result {
                         CmdResult::Written => {}
+                        CmdResult::Quit => {
+                            resp::write_error(
+                                write_buf,
+                                "ERR QUIT is not allowed inside a transaction",
+                            );
+                        }
                         CmdResult::Authenticated => {
                             *authenticated = true;
                         }
@@ -3719,8 +3725,23 @@ fn write_client_response(args: &[&[u8]], session: &mut CommandSession, out: &mut
             Some(name) => resp::write_bulk(out, name),
             None => resp::write_null(out),
         }
-    } else {
+    } else if args[1].eq_ignore_ascii_case(b"SETINFO") {
+        if args.len() != 4
+            || !(args[2].eq_ignore_ascii_case(b"LIB-NAME")
+                || args[2].eq_ignore_ascii_case(b"LIB-VER"))
+        {
+            resp::write_error(
+                out,
+                "ERR only CLIENT SETINFO LIB-NAME and LIB-VER are supported",
+            );
+            return;
+        }
+        // Redis 7.2 clients send this metadata during connection setup. Lux does
+        // not expose a client list, so accepting these two fields is an explicit
+        // compatibility no-op.
         resp::write_ok(out);
+    } else {
+        resp::write_error(out, "ERR unsupported CLIENT subcommand");
     }
 }
 
@@ -4060,6 +4081,10 @@ impl CommandExecutor {
             CmdResult::Written => {
                 fire_key_events(&self.broker, args);
                 None
+            }
+            CmdResult::Quit => {
+                resp::write_ok(write_buf);
+                Some(CmdResult::Quit)
             }
             CmdResult::Authenticated => {
                 session.authenticated = true;
@@ -4465,6 +4490,7 @@ async fn handle_connection(
 
             if let Some(action) = deferred_action {
                 match action {
+                    CmdResult::Quit => return Ok(()),
                     CmdResult::BlockPop {
                         keys,
                         timeout,

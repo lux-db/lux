@@ -27,6 +27,26 @@ fn snapshot_path(store: &Store) -> String {
     format!("{}/lux.dat", dir.trim_end_matches('/'))
 }
 
+/// Unix timestamp of the most recent successfully installed snapshot.
+///
+/// The snapshot is written to a temporary file and atomically renamed into
+/// place only after it has been flushed, so the final file's modification time
+/// represents a completed save. A missing snapshot means the engine has not
+/// completed a save yet.
+pub(crate) fn last_save_unix_seconds(store: &Store) -> io::Result<Option<u64>> {
+    let modified = match fs::metadata(snapshot_path(store)) {
+        Ok(metadata) => metadata.modified()?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(Some(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    ))
+}
+
 fn snapshot_interval(store: &Store) -> Duration {
     store.config().save_interval
 }

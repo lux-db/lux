@@ -652,23 +652,78 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 
 ### Environment Variables
 
+#### Server and storage
+
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `LUX_RUNTIME_THREADS` | Tokio default | Positive number of async runtime worker threads |
+| `LUX_BIND_HOST` | `127.0.0.1` | Interface for RESP and HTTP listeners |
 | `LUX_PORT` | `6379` | RESP (Redis-compatible) TCP port |
 | `LUX_HTTP_PORT` | (disabled) | HTTP API port (set to enable; `lux start` defaults it to `5890`) |
 | `LUX_PASSWORD` | (none) | Operator/break-glass AUTH (RESP and HTTP). Project keys also gate the engine |
+| `LUX_ALLOW_INSECURE_NO_AUTH` | `false` | Explicitly allow an unauthenticated non-loopback bind; development only |
+| `LUX_ENABLE_RESP` | `true` | Set to `0` or `false` to disable the RESP listener |
+| `LUX_RESTRICTED` | `false` | Disable `KEYS`, `FLUSHALL`, `FLUSHDB`, and `DEBUG` |
 | `LUX_DATA_DIR` | `.` | Snapshot directory |
 | `LUX_SAVE_INTERVAL` | `60` | Snapshot interval in seconds (0 to disable) |
-| `LUX_SHARDS` | auto | Shard count (default: num_cpus * 16) |
+| `LUX_SHARDS` | auto | Next power of two at or above logical CPUs × 16, clamped to 16–1024 |
+| `LUX_MAX_ROWS` | (unlimited) | Optional maximum row count returned by an HTTP table query |
+| `LUX_MAX_BODY_SIZE` | `67108864` | Maximum HTTP request body in bytes |
+| `LUX_MAX_RESP_REQUEST_SIZE` | `67108864` | Maximum buffered RESP request in bytes |
 | `LUX_MAXMEMORY` | `0` (unlimited) | Memory limit (e.g. `100mb`, `1gb`) |
 | `LUX_MAXMEMORY_POLICY` | `noeviction` | Eviction policy: `allkeys-lru`, `volatile-lru`, `allkeys-random`, `volatile-random` |
 | `LUX_MAXMEMORY_SAMPLES` | `5` | Keys sampled per eviction round |
 | `LUX_STORAGE_MODE` | `memory` | Set to `tiered` for hot/cold storage with disk-backed eviction |
 | `LUX_STORAGE_DIR` | `{LUX_DATA_DIR}/storage` | Directory for tiered storage data files |
-| `LUX_RESTRICTED` | (none) | Set to `1` to disable `KEYS`, `FLUSHALL`, `FLUSHDB`, and `DEBUG` |
+
+#### App auth
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `LUX_AUTH_ENABLED` | `false` | Enable app auth tables and `/auth/v1` routes |
-| `LUX_AUTH_PUBLISHABLE_KEY` | (generated) | Browser-safe app auth key when auth is enabled |
-| `LUX_AUTH_SECRET_KEY` | (generated) | Server/admin app auth key when auth is enabled |
+| `LUX_AUTH_ACCESS_TOKEN_TTL` | `3600` | Access-token lifetime in seconds |
+| `LUX_AUTH_REFRESH_TOKEN_TTL` | `2592000` | Refresh-token lifetime in seconds |
+| `LUX_AUTH_ISSUER` | `http://localhost:{HTTP port}/auth/v1` | JWT issuer; the default HTTP port is `5890` |
+| `LUX_AUTH_SITE_URL` | local HTTP address | Application base URL used by auth flows |
+| `LUX_AUTH_EMAIL_PASSWORD` | `true` | Enable email/password sign-up and sign-in |
+| `LUX_AUTH_EMAIL_CONFIRMATION_REQUIRED` | `false` | Require email confirmation before normal sign-in |
+| `LUX_AUTH_ANONYMOUS` | `true` | Enable anonymous sign-in |
+| `LUX_AUTH_FLOW_TOKEN_TTL_SECONDS` | `86400` | Email confirmation/recovery flow-token lifetime |
+| `LUX_AUTH_PUBLISHABLE_KEY` | (none) | Initial browser-safe project key; `lux start` generates one |
+| `LUX_AUTH_SECRET_KEY` | (none) | Initial server/admin project key; `lux start` generates one |
+
+Managed email delivery is optional. Without it, auth uses the engine's console
+delivery behavior. The supported managed provider is Postmark.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LUX_AUTH_MANAGED_EMAIL_PROVIDER` | `postmark` when a token is set | Managed delivery provider; currently `postmark` |
+| `LUX_AUTH_MANAGED_EMAIL_FROM` | (none) | Required managed sender address, optionally `Name <address>` |
+| `LUX_AUTH_MANAGED_EMAIL_REPLY_TO` | (none) | Optional Reply-To address |
+| `LUX_AUTH_MANAGED_POSTMARK_SERVER_TOKEN` | (none) | Postmark server token |
+| `LUX_AUTH_MANAGED_POSTMARK_MESSAGE_STREAM` | `outbound` | Postmark message stream |
+
+#### Encryption at rest
+
+`ENC INIT`/`ENC ROTATE` with persisted state is the preferred configuration.
+For production, inject the seal key from a secret store so the data volume does
+not contain both encrypted state and the key that seals it.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LUX_ENC_AUTO_INIT` | `false` | Initialize a persisted encryption keyring when none exists |
+| `LUX_ENC_STATE_PATH` | `{LUX_DATA_DIR}/lux.enc` | Sealed encryption state path |
+| `LUX_ENC_SEAL_PATH` | `{LUX_DATA_DIR}/lux.enc.seal` | Local seal-key path for development |
+| `LUX_ENC_SEAL_KEY` | (none) | Base64-encoded 32-byte seal key supplied outside the data volume |
+| `LUX_ENC_SEAL_KEY_PREVIOUS` | (none) | Comma-separated prior seal keys accepted during rotation |
+| `LUX_ENCRYPTION_KEYS` | (none) | Legacy JSON bootstrap key list (`id`, `secret`, optional `decrypt_only`) |
+| `LUX_ENCRYPTION_KEY` | (none) | Legacy single bootstrap key |
+| `LUX_ENCRYPTION_KEY_ID` | `local` | Active/bootstrap key ID for legacy configuration |
+
+`LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS` set to `1` is an unsafe local
+integration-test escape hatch for Web Push. It is not supported in production. See
+[COMPATIBILITY.md](COMPATIBILITY.md#configuration-contract) for lifecycle and
+file-format guarantees.
 
 ### Node.js
 

@@ -371,9 +371,7 @@ pub fn cmd_flushdb(_args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Ins
 }
 
 pub fn cmd_object(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
-    if args.len() > 2 && cmd_eq(args[1], b"REFCOUNT") {
-        resp::write_integer(out, 1);
-    } else if args.len() > 2 && cmd_eq(args[1], b"ENCODING") {
+    if args.len() > 2 && cmd_eq(args[1], b"ENCODING") {
         let key = args[2];
         let idx = store.shard_for_key(key);
         let shard = store.lock_read_shard(idx);
@@ -435,10 +433,8 @@ pub fn cmd_object(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
             }
             _ => resp::write_error(out, "ERR no such key"),
         }
-    } else if args.len() > 2 && cmd_eq(args[1], b"IDLETIME") {
-        resp::write_integer(out, 0);
     } else {
-        resp::write_ok(out);
+        resp::write_error(out, "ERR only OBJECT ENCODING is supported");
     }
     CmdResult::Written
 }
@@ -485,7 +481,7 @@ pub fn cmd_memory(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
             _ => resp::write_null(out),
         }
     } else {
-        resp::write_ok(out);
+        resp::write_error(out, "ERR only MEMORY USAGE is supported");
     }
     CmdResult::Written
 }

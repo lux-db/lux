@@ -27,6 +27,7 @@ use crate::tables::SharedSchemaCache;
 
 pub enum CmdResult {
     Written,
+    Quit,
     Authenticated,
     Subscribe {
         channels: Vec<String>,
@@ -1021,10 +1022,6 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         min_arity: 2,
     },
     CommandSpec {
-        name: b"PFDEBUG",
-        min_arity: 2,
-    },
-    CommandSpec {
         name: b"SORT",
         min_arity: 2,
     },
@@ -1214,6 +1211,7 @@ pub(crate) fn is_pipeline_special_command(cmd: &[u8]) -> bool {
         || cmd_eq(cmd, b"KUNSUB")
         || cmd_eq(cmd, b"PUBLISH")
         || cmd_eq(cmd, b"AUTH")
+        || cmd_eq(cmd, b"QUIT")
         || cmd_eq(cmd, b"MULTI")
         || cmd_eq(cmd, b"EXEC")
         || cmd_eq(cmd, b"DISCARD")
@@ -1764,7 +1762,7 @@ pub fn execute(
                 return server::cmd_dump(args, store, out, now);
             }
             if cmd_eq(cmd, b"DEBUG") {
-                return server::cmd_noop_ok(args, store, out, now);
+                return server::cmd_debug(args, store, out, now);
             }
             if cmd_eq(cmd, b"DISCARD") {
                 resp::write_error(out, &format!("ERR unknown command '{}'", arg_str(cmd)));
@@ -1942,7 +1940,7 @@ pub fn execute(
                 return hashes::cmd_hgetdel(args, store, out, now);
             }
             if cmd_eq(cmd, b"HELLO") {
-                return server::cmd_hello(args, store, out, now);
+                return server::cmd_hello(args, store, cache, out, now);
             }
         }
         b'I' => {
@@ -2121,10 +2119,6 @@ pub fn execute(
             }
             if cmd_eq(cmd, b"PFMERGE") {
                 return hll::cmd_pfmerge(args, store, out, now);
-            }
-            if cmd_eq(cmd, b"PFDEBUG") {
-                resp::write_ok(out);
-                return CmdResult::Written;
             }
             if cmd_eq(cmd, b"PSUBSCRIBE") {
                 return pubsub::cmd_psubscribe(args, store, out, now);

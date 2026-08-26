@@ -6,8 +6,8 @@ ENGINE_BIN="$REPO_ROOT/target/debug/lux"
 CLI_BIN="$REPO_ROOT/cli/target/debug/lux"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/lux-cli-e2e.XXXXXX")"
 ENGINE_PID=""
-RESP_PORT=16379
-HTTP_PORT=15890
+RESP_PORT="${LUX_E2E_RESP_PORT:-16379}"
+HTTP_PORT="${LUX_E2E_HTTP_PORT:-15890}"
 OPERATOR_KEY="lux-cli-e2e-operator"
 
 cleanup() {

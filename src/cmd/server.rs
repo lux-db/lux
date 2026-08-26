@@ -32,14 +32,30 @@ pub fn cmd_echo(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instan
     CmdResult::Written
 }
 
-pub fn cmd_quit(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
-    resp::write_ok(out);
-    CmdResult::Written
+pub fn cmd_quit(_args: &[&[u8]], _store: &Store, _out: &mut BytesMut, _now: Instant) -> CmdResult {
+    CmdResult::Quit
 }
 
-pub fn cmd_hello(args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+pub fn cmd_hello(
+    args: &[&[u8]],
+    store: &Store,
+    cache: &crate::tables::SharedSchemaCache,
+    out: &mut BytesMut,
+    _now: Instant,
+) -> CmdResult {
+    let requested_proto = if let Some(proto) = args.get(1) {
+        match arg_str(proto).parse::<i64>() {
+            Ok(2) => 2,
+            _ => {
+                resp::write_error(out, "NOPROTO unsupported protocol version");
+                return CmdResult::Written;
+            }
+        }
+    } else {
+        2
+    };
+
     let mut authenticated = false;
-    let mut auth_failed = false;
     let mut i = 2;
     while i < args.len() {
         if cmd_eq(args[i], b"AUTH") {
@@ -50,40 +66,47 @@ pub fn cmd_hello(args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instan
                 );
                 return CmdResult::Written;
             }
-            let password = arg_str(args[i + 2]);
-            let expected = &store.config().password;
-            if expected.is_empty() {
+            let presented = arg_str(args[i + 2]);
+            let no_credentials = store.config().password.is_empty()
+                && !crate::auth::project_keys_configured(store, cache);
+            if no_credentials {
                 resp::write_error(out, "ERR Client sent AUTH, but no password is set");
                 return CmdResult::Written;
-            } else if constant_time_eq(password.as_bytes(), expected.as_bytes()) {
-                authenticated = true;
-            } else {
-                auth_failed = true;
+            }
+            match crate::auth::resolve_credential(
+                presented,
+                "",
+                crate::auth::Surface::Resp,
+                store,
+                cache,
+            ) {
+                Ok(crate::auth::Credential::Operator | crate::auth::Credential::Secret) => {
+                    authenticated = true;
+                }
+                Err(error) => {
+                    resp::write_error(out, &format!("WRONGPASS {error}"));
+                    return CmdResult::Written;
+                }
+                Ok(_) => {
+                    resp::write_error(out, "WRONGPASS invalid password");
+                    return CmdResult::Written;
+                }
             }
             i += 3;
         } else if cmd_eq(args[i], b"SETNAME") {
-            i += 2;
+            resp::write_error(
+                out,
+                "ERR HELLO SETNAME is not supported; use CLIENT SETNAME",
+            );
+            return CmdResult::Written;
         } else {
-            i += 1;
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
         }
     }
 
-    if auth_failed {
-        resp::write_error(out, "WRONGPASS invalid password");
-        return CmdResult::Written;
-    }
-
-    let requested_proto = if args.len() >= 2 {
-        arg_str(args[1]).parse::<i64>().unwrap_or(2)
-    } else {
-        2
-    };
-
-    if requested_proto == 3 {
-        resp::write_map_header(out, 7);
-    } else {
-        resp::write_array_header(out, 14);
-    }
+    debug_assert_eq!(requested_proto, 2);
+    resp::write_array_header(out, 14);
     resp::write_bulk(out, "server");
     resp::write_bulk(out, "lux");
     resp::write_bulk(out, "version");
@@ -146,7 +169,10 @@ pub fn cmd_save(_args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instan
 
 pub fn cmd_bgsave(_args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
     match crate::snapshot::save_and_truncate_wal_consistent(store) {
-        Ok(_) => resp::write_simple(out, "Background saving started"),
+        Ok(n) => resp::write_simple(
+            out,
+            &format!("OK ({n} keys saved synchronously; background save is not supported)"),
+        ),
         Err(e) => resp::write_error(out, &format!("ERR snapshot failed: {e}")),
     }
     CmdResult::Written
@@ -154,36 +180,17 @@ pub fn cmd_bgsave(_args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Inst
 
 pub fn cmd_lastsave(
     _args: &[&[u8]],
-    _store: &Store,
+    store: &Store,
     out: &mut BytesMut,
     _now: Instant,
 ) -> CmdResult {
-    resp::write_integer(
-        out,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-    );
-    CmdResult::Written
-}
-
-/// Constant-time byte comparison to prevent timing attacks on password auth.
-/// Always compares all bytes regardless of where the first mismatch is.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        // Still do a dummy comparison to avoid leaking length via timing.
-        let mut _acc = 0u8;
-        for &byte in a {
-            _acc |= byte;
+    match crate::snapshot::last_save_unix_seconds(store) {
+        Ok(timestamp) => resp::write_integer(out, timestamp.unwrap_or(0) as i64),
+        Err(error) => {
+            resp::write_error(out, &format!("ERR could not read last save time: {error}"))
         }
-        return false;
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    CmdResult::Written
 }
 
 pub fn cmd_auth(
@@ -246,16 +253,25 @@ pub fn cmd_config(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Inst
                 Err(_) => resp::write_error(out, "ERR invalid argument"),
             }
         } else {
-            resp::write_ok(out);
+            resp::write_error(
+                out,
+                &format!("ERR unsupported CONFIG parameter '{}'", arg_str(args[2])),
+            );
         }
     } else {
-        resp::write_ok(out);
+        resp::write_error(
+            out,
+            "ERR unsupported CONFIG subcommand or wrong number of arguments",
+        );
     }
     CmdResult::Written
 }
 
 pub fn cmd_client(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
-    resp::write_ok(out);
+    resp::write_error(
+        out,
+        "ERR CLIENT requires a network connection and is not supported on this surface",
+    );
     CmdResult::Written
 }
 
@@ -282,10 +298,10 @@ pub fn cmd_command(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Ins
     {
         resp::write_error(out, "ERR COMMAND GETKEYS is not supported");
     } else {
-        // COMMAND / COMMAND INFO / COMMAND DOCS / COMMAND LIST: per-command
-        // metadata is not implemented yet, so return an empty array of the
-        // correct shape rather than a fake +OK.
-        resp::write_array_header(out, 0);
+        resp::write_error(
+            out,
+            "ERR COMMAND metadata is not supported; use COMMAND COUNT",
+        );
     }
     CmdResult::Written
 }
@@ -314,9 +330,10 @@ pub fn cmd_latency(args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Ins
     CmdResult::Written
 }
 
-/// RESET replies with the +RESET status line (Redis-correct), not +OK.
+/// RESET would need to clear connection-local authentication, transaction, and
+/// subscription state. The generic command layer cannot safely do that.
 pub fn cmd_reset(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
-    resp::write_simple(out, "RESET");
+    resp::write_error(out, "ERR RESET is not supported");
     CmdResult::Written
 }
 
@@ -408,13 +425,8 @@ pub fn cmd_touch(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
     CmdResult::Written
 }
 
-pub fn cmd_noop_ok(
-    _args: &[&[u8]],
-    _store: &Store,
-    out: &mut BytesMut,
-    _now: Instant,
-) -> CmdResult {
-    resp::write_ok(out);
+pub fn cmd_debug(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
+    resp::write_error(out, "ERR DEBUG is not supported");
     CmdResult::Written
 }
 

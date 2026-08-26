@@ -136,7 +136,7 @@ fn hello_with_auth_authenticates() {
     let server = LuxServer::builder().password("secret123").start();
     let mut conn = server.conn();
 
-    let resp = send_and_read(&mut conn, &["HELLO", "3", "AUTH", "default", "secret123"]);
+    let resp = send_and_read(&mut conn, &["HELLO", "2", "AUTH", "default", "secret123"]);
     assert!(resp.contains("lux"), "HELLO returns server info: {resp}");
 
     let resp = send_and_read(&mut conn, &["SET", "k", "v"]);
@@ -148,11 +148,23 @@ fn hello_with_wrong_password_rejected() {
     let server = LuxServer::builder().password("secret123").start();
     let mut conn = server.conn();
 
-    let resp = send_and_read(&mut conn, &["HELLO", "3", "AUTH", "default", "wrongpass"]);
+    let resp = send_and_read(&mut conn, &["HELLO", "2", "AUTH", "default", "wrongpass"]);
     assert!(resp.contains("WRONGPASS"), "bad password in HELLO: {resp}");
 
     let resp = send_and_read(&mut conn, &["SET", "k", "v"]);
     assert!(resp.contains("NOAUTH"), "still locked out: {resp}");
+}
+
+#[test]
+fn hello_refuses_resp3_instead_of_emitting_a_mixed_protocol_reply() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+
+    let resp = send_and_read(&mut conn, &["HELLO", "3"]);
+    assert!(
+        resp.starts_with("-NOPROTO") && resp.contains("unsupported protocol"),
+        "RESP3 must fail explicitly: {resp}"
+    );
 }
 
 // --- Unified credential model -------------------------------------------------
@@ -203,6 +215,17 @@ fn resp_auth_accepts_secret_key_and_refuses_publishable() {
     let mut conn = server.conn();
     let resp = send_and_read(&mut conn, &["AUTH", "lux_sec_not_a_real_key"]);
     assert!(resp.starts_with("-WRONGPASS"), "unknown key: {resp}");
+
+    let mut conn = server.conn();
+    let resp = send_and_read(&mut conn, &["HELLO", "2", "AUTH", "default", SECRET]);
+    assert!(
+        resp.contains("lux"),
+        "HELLO should accept a secret key: {resp}"
+    );
+    assert!(
+        send_and_read(&mut conn, &["PING"]).contains("PONG"),
+        "HELLO-authenticated session should be usable"
+    );
 }
 
 #[test]

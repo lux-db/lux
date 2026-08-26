@@ -94,14 +94,6 @@ pub fn write_array_header(buf: &mut BytesMut, len: usize) {
     }
 }
 
-/// Writes a RESP3 map header (`%len`).
-pub fn write_map_header(buf: &mut BytesMut, len: usize) {
-    buf.put_u8(b'%');
-    let mut tmp = itoa::Buffer::new();
-    buf.extend_from_slice(tmp.format_usize(len).as_bytes());
-    buf.extend_from_slice(b"\r\n");
-}
-
 /// Writes an array of bulk strings from owned `String` values.
 pub fn write_bulk_array(buf: &mut BytesMut, items: &[String]) {
     write_array_header(buf, items.len());

@@ -66,9 +66,10 @@ fn stub_commands_return_honest_responses() {
         count.starts_with(':') && count.trim() != ":0",
         "COMMAND COUNT should be a real integer: {count:?}"
     );
-    // COMMAND (bare) and COMMAND INFO return an array shape, not +OK.
-    assert_has(&send(&mut conn, &["COMMAND"]), "*");
-    assert_has(&send(&mut conn, &["COMMAND", "INFO", "GET"]), "*");
+    // Metadata forms are not implemented, so they fail rather than claiming
+    // there are no registered commands.
+    assert_has(&send(&mut conn, &["COMMAND"]), "-ERR");
+    assert_has(&send(&mut conn, &["COMMAND", "INFO", "GET"]), "-ERR");
     // COMMAND GETKEYS can't be faked, so it errors rather than returning +OK.
     assert_has(
         &send(&mut conn, &["COMMAND", "GETKEYS", "SET", "k", "v"]),
@@ -80,8 +81,9 @@ fn stub_commands_return_honest_responses() {
     assert_has(&send(&mut conn, &["SELECT", "notanint"]), "-ERR");
     // SWAPDB is unsupported (single database) rather than a fake OK.
     assert_has(&send(&mut conn, &["SWAPDB", "0", "1"]), "-ERR");
-    // RESET replies with the +RESET status line.
-    assert_has(&send(&mut conn, &["RESET"]), "+RESET");
+    // RESET cannot safely clear connection-local state in the generic command
+    // layer, so it fails instead of claiming the reset happened.
+    assert_has(&send(&mut conn, &["RESET"]), "-ERR");
     // LATENCY RESET is an integer; reporting forms are arrays.
     assert_has(&send(&mut conn, &["LATENCY", "RESET"]), ":0");
     assert_has(&send(&mut conn, &["LATENCY", "HISTORY", "event"]), "*0");
@@ -96,6 +98,78 @@ fn stub_commands_return_honest_responses() {
         "-ERR",
     );
     assert_has(&send(&mut conn, &["WAITAOF", "1", "0", "0"]), "-ERR");
+    // Unsupported administrative compatibility commands never return fake OKs.
+    assert_has(&send(&mut conn, &["DEBUG", "HELP"]), "-ERR");
+    assert_has(
+        &send(&mut conn, &["CONFIG", "SET", "appendonly", "yes"]),
+        "-ERR",
+    );
+    assert_has(&send(&mut conn, &["CONFIG", "RESETSTAT"]), "-ERR");
+    assert_has(&send(&mut conn, &["CLIENT", "PAUSE", "100"]), "-ERR");
+    assert_has(&send(&mut conn, &["OBJECT", "IDLETIME", "k"]), "-ERR");
+    assert_has(&send(&mut conn, &["MEMORY", "STATS"]), "-ERR");
+}
+
+#[test]
+fn quit_closes_the_network_connection_after_replying() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+
+    assert_has(&send(&mut conn, &["QUIT"]), "+OK");
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        conn.read(&mut byte).unwrap(),
+        0,
+        "QUIT must close the socket"
+    );
+}
+
+#[test]
+fn quit_inside_a_transaction_is_one_error_reply() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+
+    assert_has(&send(&mut conn, &["MULTI"]), "+OK");
+    assert_has(&send(&mut conn, &["QUIT"]), "+QUEUED");
+    let exec = send(&mut conn, &["EXEC"]);
+    assert!(
+        exec.starts_with("*1\r\n-ERR QUIT is not allowed inside a transaction"),
+        "queued QUIT should produce exactly one error element: {exec:?}"
+    );
+    assert!(!exec.contains("+OK"), "queued QUIT must not claim success");
+    assert_has(&send(&mut conn, &["PING"]), "+PONG");
+}
+
+#[test]
+fn save_commands_report_real_completion_and_lastsave_time() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+
+    assert_eq!(send(&mut conn, &["LASTSAVE"]).trim(), ":0");
+    send(&mut conn, &["SET", "saved", "value"]);
+
+    let save = send(&mut conn, &["BGSAVE"]);
+    assert!(
+        save.starts_with("+OK") && save.contains("synchronously"),
+        "BGSAVE must disclose synchronous completion: {save:?}"
+    );
+
+    let lastsave = send(&mut conn, &["LASTSAVE"]);
+    let timestamp: u64 = lastsave
+        .trim()
+        .strip_prefix(':')
+        .expect("LASTSAVE integer response")
+        .parse()
+        .expect("LASTSAVE timestamp");
+    assert!(timestamp > 0, "completed snapshot should have a timestamp");
+    assert!(
+        timestamp
+            <= std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        "LASTSAVE must not report a future timestamp"
+    );
 }
 
 #[test]
@@ -194,6 +268,10 @@ fn client_setinfo_is_tolerated_for_ioredis() {
     assert_has(
         &send(&mut conn, &["CLIENT", "SETINFO", "LIB-VER", "5.0.0"]),
         "+OK",
+    );
+    assert_has(
+        &send(&mut conn, &["CLIENT", "SETINFO", "unknown", "value"]),
+        "-ERR",
     );
 }
 
