@@ -3,7 +3,7 @@ mod common;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::Child;
 use std::time::Duration;
 use tokio_tungstenite::connect_async;
@@ -26,12 +26,9 @@ impl Drop for LuxServer {
     }
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+fn free_port_pair() -> (u16, u16) {
+    let ports = common::free_ports(2);
+    (ports[0], ports[1])
 }
 
 fn start_lux(resp_port: u16, http_port: u16, password: Option<&str>) -> LuxServer {
@@ -222,8 +219,7 @@ fn resp_command(port: u16, args: &[&str]) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_websocket_requires_auth_when_password_is_set() {
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start_lux(resp_port, http_port, Some("secret"));
 
     let err = connect_async(format!("ws://127.0.0.1:{http_port}/live"))
@@ -244,8 +240,7 @@ async fn live_websocket_requires_auth_when_password_is_set() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_websocket_requires_lux_auth_token_when_auth_is_enabled() {
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start_lux_with_env(
         resp_port,
         http_port,
@@ -399,8 +394,7 @@ async fn live_user_socket_closes_after_session_logout() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_websocket_delivers_key_and_pubsub_events() {
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start_lux(resp_port, http_port, None);
     let mut ws = connect_live(http_port, None).await;
 
@@ -432,8 +426,7 @@ async fn live_websocket_delivers_key_and_pubsub_events() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_websocket_table_subscription_receives_http_insert() {
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start_lux(resp_port, http_port, None);
 
     let (status, created) = http_json_request(
@@ -583,8 +576,7 @@ async fn live_encrypted_table_streams_plaintext_rows_without_key_event_value_lea
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_websocket_join_reacts_to_joined_table_insert() {
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start_lux(resp_port, http_port, None);
 
     let (status, created) = http_json_request(
@@ -658,8 +650,7 @@ async fn live_websocket_join_reacts_to_joined_table_insert() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_websocket_unsubscribe_stops_delivery() {
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start_lux(resp_port, http_port, None);
     let mut ws = connect_live(http_port, None).await;
 
@@ -685,8 +676,7 @@ async fn live_websocket_unsubscribe_stops_delivery() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_websocket_vector_near_receives_vector_changes() {
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start_lux(resp_port, http_port, None);
     let mut ws = connect_live(http_port, None).await;
 
@@ -718,8 +708,7 @@ async fn live_websocket_vector_near_receives_vector_changes() {
 // (custom PK + FLOAT column) used by realtime apps.
 #[tokio::test]
 async fn live_table_events_with_custom_pk() {
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let pw = "secret-pw-live";
     let _server = start_lux_with_env(
         resp_port,
@@ -791,8 +780,7 @@ async fn live_table_events_with_custom_pk() {
 // way an explicit TDELETE does. Covers the realtime half of table-row TTL.
 #[tokio::test]
 async fn live_table_row_ttl_emits_delete() {
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start_lux(resp_port, http_port, None);
 
     let (status, created) = http_json_request(
@@ -837,8 +825,7 @@ async fn live_table_row_ttl_emits_delete() {
 // Multi-row insert (HTTP array body) with ?ttl applies the TTL to every row.
 #[tokio::test]
 async fn http_array_insert_applies_ttl_to_each() {
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start_lux(resp_port, http_port, None);
 
     let (status, _) = http_json_request(
@@ -889,8 +876,7 @@ async fn http_array_insert_applies_ttl_to_each() {
 // exactly like the swarm/cursors use case but with no signup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_anonymous_session_subscribes_granted_table() {
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start_lux_with_env(
         resp_port,
         http_port,
