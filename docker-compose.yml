@@ -8,6 +8,8 @@ services:
     environment:
       - LUX_PORT=6379
       - LUX_DATA_DIR=/data
+      - LUX_DURABILITY=every_second
+      - LUX_DURABILITY_SYNC_INTERVAL_MS=1000
       # - LUX_PASSWORD=changeme
       # - LUX_SHARDS=16
       # - LUX_SAVE_INTERVAL=300

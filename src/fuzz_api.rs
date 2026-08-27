@@ -11,8 +11,13 @@ use std::io::Cursor;
 
 /// Binary snapshot loader (`lux.dat`).
 pub fn fuzz_snapshot(data: &[u8]) {
-    let store =
-        crate::store::Store::new_with_config(std::sync::Arc::new(crate::ServerConfig::default()));
+    let store = crate::store::Store::new_with_config(std::sync::Arc::new(crate::ServerConfig {
+        durability: crate::DurabilityConfig {
+            policy: crate::DurabilityPolicy::Ephemeral,
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
     let _ = crate::snapshot::load_binary(&store, &mut Cursor::new(data), true, true);
 }
 
@@ -76,8 +81,13 @@ pub fn fuzz_command(data: &[u8]) {
     if SKIP.contains(&first_upper.as_slice()) {
         return;
     }
-    let store =
-        crate::store::Store::new_with_config(std::sync::Arc::new(crate::ServerConfig::default()));
+    let store = crate::store::Store::new_with_config(std::sync::Arc::new(crate::ServerConfig {
+        durability: crate::DurabilityConfig {
+            policy: crate::DurabilityPolicy::Ephemeral,
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
     let broker = crate::pubsub::Broker::new();
     let cache = std::sync::Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
     let mut out = bytes::BytesMut::new();

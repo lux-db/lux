@@ -210,13 +210,12 @@ pub fn restore_to_disk(store: &Store, dump: &[u8]) -> io::Result<()> {
     }
     fs::rename(&tmp, &path)?;
 
-    // Drop the Lux-owned per-shard dirs (WAL + cold data) so startup loads only
-    // lux.dat, with no WAL replaying post-snapshot writes over the restore. Only
-    // remove `shard_*` dirs we own, never the whole storage dir: in production
-    // storage.dir is a subdir of data_dir, but a misconfigured storage.dir that
-    // overlaps data_dir must never take lux.dat down with it.
-    let storage_dir = store.config().storage.dir.clone();
-    purge_lux_storage_shards(Path::new(&storage_dir))?;
+    // Drop the Lux-owned per-shard dirs (WAL and, for tiered layout, cold data)
+    // so startup loads only lux.dat. Memory and tiered layouts use different
+    // journal roots, so resolve the effective path from the active config.
+    // Remove only `shard_*` dirs we own, never the parent directory.
+    let journal_dir = store.config().journal_dir();
+    purge_lux_storage_shards(&journal_dir)?;
     Ok(())
 }
 
@@ -1320,7 +1319,7 @@ mod tests {
         );
     }
 
-    fn store_in_temp_dir() -> (Arc<Store>, std::path::PathBuf, impl Drop) {
+    fn store_in_temp_dir(mode: crate::StorageMode) -> (Arc<Store>, std::path::PathBuf, impl Drop) {
         let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
         let dir =
             std::env::temp_dir().join(format!("lux_restore_test_{}_{}", std::process::id(), id));
@@ -1329,8 +1328,8 @@ mod tests {
         let cfg = crate::ServerConfig {
             data_dir: dir.to_str().unwrap().to_string(),
             storage: crate::StorageConfig {
+                mode,
                 dir: storage_dir.to_str().unwrap().to_string(),
-                ..Default::default()
             },
             ..Default::default()
         };
@@ -1349,7 +1348,7 @@ mod tests {
     #[test]
     fn restore_accepts_all_known_headers_rejects_junk() {
         for header in [HEADER_V1, HEADER_V2, HEADER] {
-            let (store, dir, _g) = store_in_temp_dir();
+            let (store, dir, _g) = store_in_temp_dir(crate::StorageMode::Memory);
             let mut dump = header.to_vec();
             dump.extend_from_slice(b"trailing-body-bytes");
             restore_to_disk(&store, &dump)
@@ -1360,7 +1359,7 @@ mod tests {
             );
         }
 
-        let (store, _dir, _g) = store_in_temp_dir();
+        let (store, _dir, _g) = store_in_temp_dir(crate::StorageMode::Memory);
         let err = restore_to_disk(&store, b"XXXXnot-a-snapshot")
             .expect_err("junk header must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -1370,7 +1369,7 @@ mod tests {
     // misconfigured storage.dir overlapping data_dir must not take lux.dat down.
     #[test]
     fn restore_purges_only_owned_shard_dirs() {
-        let (store, _dir, _g) = store_in_temp_dir();
+        let (store, _dir, _g) = store_in_temp_dir(crate::StorageMode::Tiered);
         let storage_dir = std::path::PathBuf::from(&store.config().storage.dir);
         fs::create_dir_all(storage_dir.join("shard_0")).unwrap();
         fs::create_dir_all(storage_dir.join("shard_1")).unwrap();
@@ -1385,6 +1384,24 @@ mod tests {
         assert!(!storage_dir.join("shard_1").exists(), "shard_1 purged");
         assert!(storage_dir.join("keep.txt").exists(), "unrelated file kept");
         assert!(storage_dir.exists(), "storage dir itself kept");
+    }
+
+    #[test]
+    fn restore_purges_memory_layout_journal() {
+        let (store, _dir, _g) = store_in_temp_dir(crate::StorageMode::Memory);
+        let journal_dir = store.config().journal_dir();
+        fs::write(journal_dir.join("keep.txt"), b"keep").unwrap();
+
+        let mut dump = HEADER.to_vec();
+        dump.extend_from_slice(b"body");
+        restore_to_disk(&store, &dump).unwrap();
+
+        assert!(
+            !journal_dir.join("shard_0").exists(),
+            "memory WAL shards purged"
+        );
+        assert!(journal_dir.join("keep.txt").exists(), "unrelated file kept");
+        assert!(journal_dir.exists(), "journal dir itself kept");
     }
 
     // Fuzz: arbitrary bytes fed to the binary snapshot loader must never panic

@@ -462,11 +462,15 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
          used_memory_bytes:{}\r\n\
          \r\n\
          # Storage\r\n\
+         storage_layout:{}\r\n\
          storage_mode:{}\r\n\
          used_disk_bytes:{}\r\n\
          disk_keys:{}\r\n\
          \r\n\
          # Persistence\r\n\
+         durability:{}\r\n\
+         durability_sync_interval_ms:{}\r\n\
+         wal_enabled:{}\r\n\
          persistence_err_wal_append:{}\r\n\
          persistence_err_wal_fsync:{}\r\n\
          persistence_err_disk_write:{}\r\n\
@@ -489,6 +493,7 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
         key_event_stats.emitted,
         key_event_stats.coalesced,
         store.approximate_memory(),
+        store.config().storage.mode.as_str(),
         if store.config().storage.mode == crate::disk::StorageMode::Tiered {
             "tiered"
         } else {
@@ -496,6 +501,13 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
         },
         store.disk_usage_bytes(),
         store.disk_key_count(),
+        store.config().durability.policy.as_str(),
+        if store.config().durability.policy == crate::DurabilityPolicy::EverySecond {
+            store.config().durability.sync_interval.as_millis()
+        } else {
+            0
+        },
+        store.wal_enabled(),
         store.persistence_wal_append_errors(),
         store.persistence_wal_fsync_errors(),
         store.persistence_disk_write_errors(),

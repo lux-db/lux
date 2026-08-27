@@ -32,6 +32,8 @@ const RUNTIME_CONFIG: &[RuntimeConfig] = &[
     stable("LUX_AUTH_SITE_URL"),
     stable("LUX_BIND_HOST"),
     stable("LUX_DATA_DIR"),
+    stable("LUX_DURABILITY"),
+    stable("LUX_DURABILITY_SYNC_INTERVAL_MS"),
     stable("LUX_ENABLE_RESP"),
     stable("LUX_ENCRYPTION_KEY"),
     stable("LUX_ENCRYPTION_KEYS"),

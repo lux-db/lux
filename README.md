@@ -138,6 +138,7 @@ use std::time::Duration;
 
 let cfg = lux::ServerConfig {
     enable_resp: false,
+    data_dir: "./lux-data".to_string(),
     ..Default::default()
 };
 let handle = lux::run_with_config(cfg).await?;
@@ -174,7 +175,9 @@ because they already run inside the trusted process boundary.
 ### Docker
 
 ```bash
-docker run -d -p 6379:6379 ghcr.io/lux-db/lux:latest
+LUX_PASSWORD="$(openssl rand -hex 32)"
+docker run -d -p 6379:6379 -v lux-data:/data \
+  -e LUX_PASSWORD="$LUX_PASSWORD" ghcr.io/lux-db/lux:latest
 ```
 
 ### Docker Compose
@@ -664,7 +667,9 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 | `LUX_ALLOW_INSECURE_NO_AUTH` | `false` | Explicitly allow an unauthenticated non-loopback bind; development only |
 | `LUX_ENABLE_RESP` | `true` | Set to `0` or `false` to disable the RESP listener |
 | `LUX_RESTRICTED` | `false` | Disable `KEYS`, `FLUSHALL`, `FLUSHDB`, and `DEBUG` |
-| `LUX_DATA_DIR` | `.` | Snapshot directory |
+| `LUX_DATA_DIR` | image: `/data`; binary: `.` | Snapshot and journal root; persistent relative paths are resolved at startup |
+| `LUX_DURABILITY` | `every_second` | Acknowledgement policy: `ephemeral`, `every_second`, or `always_sync` |
+| `LUX_DURABILITY_SYNC_INTERVAL_MS` | `1000` | WAL sync interval for `every_second` (1–1000 ms); invalid for other policies |
 | `LUX_SAVE_INTERVAL` | `60` | Snapshot interval in seconds (0 to disable) |
 | `LUX_SHARDS` | auto | Next power of two at or above logical CPUs × 16, clamped to 16–1024 |
 | `LUX_MAX_ROWS` | (unlimited) | Optional maximum row count returned by an HTTP table query |
@@ -673,8 +678,8 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 | `LUX_MAXMEMORY` | `0` (unlimited) | Memory limit (e.g. `100mb`, `1gb`) |
 | `LUX_MAXMEMORY_POLICY` | `noeviction` | Eviction policy: `allkeys-lru`, `volatile-lru`, `allkeys-random`, `volatile-random` |
 | `LUX_MAXMEMORY_SAMPLES` | `5` | Keys sampled per eviction round |
-| `LUX_STORAGE_MODE` | `memory` | Set to `tiered` for hot/cold storage with disk-backed eviction |
-| `LUX_STORAGE_DIR` | `{LUX_DATA_DIR}/storage` | Directory for tiered storage data files |
+| `LUX_STORAGE_MODE` | `memory` | Data-placement layout: `memory` or `tiered`; independent of durability |
+| `LUX_STORAGE_DIR` | `{LUX_DATA_DIR}/storage` | Tiered data and WAL directory; valid only in `tiered` mode |
 
 #### App auth
 
@@ -840,7 +845,7 @@ partial, divergent, and unsupported behavior.
 Lux is Redis-compatible but not identical. Key differences:
 
 - **No AOF persistence** -- Lux uses snapshots plus a checksummed write-ahead
-  log (WAL) in tiered mode instead of Redis AOF. By default the WAL is fsynced
+  log (WAL) instead of Redis AOF. By default the WAL is fsynced
   approximately once per second; acknowledged writes since the last successful
   fsync may be lost on sudden power failure. See [DURABILITY.md](DURABILITY.md).
 - **No RESP3 protocol** -- RESP2 only
@@ -859,7 +864,7 @@ Client connections (tokio tasks)
         |
    Sharded In-Memory Store
         |
-   Snapshots + WAL (tiered mode)
+   Snapshots + WAL (persistent durability)
 ```
 
 Read the full deep dive at [luxdb.dev/architecture](https://luxdb.dev/architecture).

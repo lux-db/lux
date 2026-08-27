@@ -1,9 +1,7 @@
-//! Tiered storage: per-shard disk backing and write-ahead log.
+//! Per-shard cold storage and write-ahead log primitives.
 //!
-//! When LUX_STORAGE_MODE=tiered, each shard gets a DiskShard (append-only
-//! data file + in-memory index) and a Wal (command log for crash recovery).
-//! Evicted entries are written to the DiskShard instead of being deleted.
-//! On read miss, entries are transparently promoted back to memory.
+//! `DiskShard` belongs to the tiered storage layout. `Wal` belongs to the
+//! durability policy and may be enabled for either memory or tiered layouts.
 
 use crate::store::{DumpEntry, DumpValue, StreamGroupDump};
 use std::collections::HashMap;
@@ -46,7 +44,7 @@ fn crc32(data: &[u8]) -> u32 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageMode {
-    /// All data in memory. Eviction deletes permanently. Zero disk overhead.
+    /// Live data stays in memory. Persistence may still use a WAL and snapshots.
     Memory,
     /// Hot data in memory, cold data on disk. Automatic promotion on access.
     Tiered,

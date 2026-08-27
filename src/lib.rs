@@ -9,6 +9,7 @@ mod auth;
 mod cmd;
 mod command;
 mod disk;
+mod durability;
 mod embedded;
 mod encryption;
 mod eviction;
@@ -47,6 +48,7 @@ use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 pub use disk::{StorageConfig, StorageMode};
+pub use durability::{DurabilityConfig, DurabilityPolicy};
 pub use embedded::{
     EmbeddedPipeline, GeoMember, GeoPosition, GeoUnit, PreparedPipeline, RedisKeyType,
     ScoredMember, SetOptions,
@@ -231,6 +233,8 @@ pub struct ServerConfig {
     pub save_interval: Duration,
     /// Persistence/storage mode configuration.
     pub storage: StorageConfig,
+    /// Write acknowledgement policy, independent of the storage layout.
+    pub durability: DurabilityConfig,
     /// Memory pressure eviction configuration.
     pub eviction: EvictionConfig,
     /// Per-project application auth configuration.
@@ -264,6 +268,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("data_dir", &self.data_dir)
             .field("save_interval", &self.save_interval)
             .field("storage", &self.storage)
+            .field("durability", &self.durability)
             .field("eviction", &self.eviction)
             .field("auth", &self.auth)
             .field("encryption", &self.encryption)
@@ -292,6 +297,7 @@ impl Default for ServerConfig {
             data_dir: ".".to_string(),
             save_interval: Duration::from_secs(60),
             storage: StorageConfig::default(),
+            durability: DurabilityConfig::default(),
             eviction: EvictionConfig::default(),
             auth: AuthConfig::default(),
             encryption: EncryptionConfig::default(),
@@ -306,6 +312,12 @@ impl Default for ServerConfig {
 /// Informational runtime events emitted through `ServerConfig::on_info`.
 #[derive(Clone, Debug)]
 pub enum ServerInfoEvent {
+    /// Effective storage layout and acknowledgement policy selected at startup.
+    PersistenceConfigured {
+        storage_layout: StorageMode,
+        durability: DurabilityPolicy,
+        sync_interval_ms: Option<u64>,
+    },
     /// Tiered storage was configured for this data directory.
     TieredStorageEnabled { dir: String },
     /// Snapshot file was absent during startup.
@@ -405,6 +417,14 @@ impl ServerConfig {
     pub fn listen_addr(&self) -> String {
         format!("{}:{}", self.bind_host, self.port)
     }
+
+    pub(crate) fn journal_dir(&self) -> std::path::PathBuf {
+        if self.storage.mode == StorageMode::Tiered {
+            std::path::PathBuf::from(&self.storage.dir)
+        } else {
+            std::path::Path::new(&self.data_dir).join("journal")
+        }
+    }
 }
 
 fn is_loopback_bind_host(host: &str) -> bool {
@@ -483,6 +503,137 @@ fn validate_shard_count(config: &ServerConfig) -> std::io::Result<()> {
             std::io::ErrorKind::InvalidInput,
             "shard count must not exceed 65536",
         ));
+    }
+    Ok(())
+}
+
+fn absolute_config_path(raw: &str, field: &str) -> std::io::Result<String> {
+    if raw.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{field} must not be empty"),
+        ));
+    }
+    let path = std::path::PathBuf::from(raw);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn has_shard_state(dir: &std::path::Path) -> std::io::Result<bool> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir()
+            || !entry.file_name().to_string_lossy().starts_with("shard_")
+        {
+            continue;
+        }
+        if entry.path().join("wal.lux").exists() || entry.path().join("data.lux").exists() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn verify_writable_directory(path: &std::path::Path, field: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("cannot create {field} {}: {error}", path.display()),
+        )
+    })?;
+    if !std::fs::metadata(path)?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{field} must be a directory: {}", path.display()),
+        ));
+    }
+
+    static PROBE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = PROBE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let from = path.join(format!(".lux-write-probe-{}-{id}", std::process::id()));
+    let to = path.join(format!(".lux-rename-probe-{}-{id}", std::process::id()));
+    let result = (|| {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&from)?;
+        file.write_all(b"lux")?;
+        file.sync_all()?;
+        std::fs::rename(&from, &to)?;
+        #[cfg(unix)]
+        std::fs::File::open(path)?.sync_all()?;
+        std::fs::remove_file(&to)?;
+        Ok::<_, std::io::Error>(())
+    })();
+    let _ = std::fs::remove_file(&from);
+    let _ = std::fs::remove_file(&to);
+    result.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "{field} is not safely writable at {}: {error}",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn resolve_and_validate_persistence(config: &mut ServerConfig) -> std::io::Result<()> {
+    let policy = config.durability.policy;
+    if config.storage.mode == StorageMode::Tiered && policy == DurabilityPolicy::Ephemeral {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tiered storage requires every_second or always_sync durability",
+        ));
+    }
+    if policy == DurabilityPolicy::EverySecond
+        && (config.durability.sync_interval.is_zero()
+            || config.durability.sync_interval > Duration::from_secs(1))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "every_second durability sync interval must be from 1 to 1000 ms",
+        ));
+    }
+    if !policy.is_persistent() {
+        return Ok(());
+    }
+
+    config.data_dir = absolute_config_path(&config.data_dir, "data_dir")?;
+    if config.storage.mode == StorageMode::Tiered {
+        config.storage.dir = absolute_config_path(&config.storage.dir, "storage dir")?;
+    }
+
+    let data_dir = std::path::Path::new(&config.data_dir);
+    let memory_journal_dir = data_dir.join("journal");
+    let conventional_tiered_dir = data_dir.join("storage");
+    if config.storage.mode == StorageMode::Memory && has_shard_state(&conventional_tiered_dir)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tiered shard state exists; refusing an implicit switch to memory layout",
+        ));
+    }
+    if config.storage.mode == StorageMode::Tiered && has_shard_state(&memory_journal_dir)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "memory-layout journal state exists; refusing an implicit switch to tiered layout",
+        ));
+    }
+
+    verify_writable_directory(data_dir, "data_dir")?;
+    let journal_dir = config.journal_dir();
+    if journal_dir != data_dir {
+        verify_writable_directory(&journal_dir, "journal directory")?;
     }
     Ok(())
 }
@@ -3023,10 +3174,11 @@ pub async fn run() -> std::io::Result<()> {
 ///
 /// Readiness means storage has initialized, any snapshot has loaded, WAL replay
 /// has completed, and configured listeners have bound successfully.
-pub async fn run_with_config(config: ServerConfig) -> std::io::Result<ServerHandle> {
+pub async fn run_with_config(mut config: ServerConfig) -> std::io::Result<ServerHandle> {
     validate_listener_security(&config)?;
     validate_auth_config(&config)?;
     validate_shard_count(&config)?;
+    resolve_and_validate_persistence(&mut config)?;
     validate_encryption_config(&config)?;
     let listener = if config.enable_resp {
         let addr = config.listen_addr();
@@ -3059,7 +3211,14 @@ async fn server_main(
     ready_tx: oneshot::Sender<std::io::Result<Arc<Runtime>>>,
 ) -> std::io::Result<()> {
     let mut background_tasks = JoinSet::new();
-    let runtime = Runtime::start(config, &mut background_tasks).await?;
+    let runtime = match Runtime::start(config, &mut background_tasks).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let ready_error = std::io::Error::new(error.kind(), error.to_string());
+            let _ = ready_tx.send(Err(ready_error));
+            return Err(error);
+        }
+    };
 
     if let Some(http_startup_rx) = runtime.start_http_if_enabled(&mut background_tasks) {
         if let Err(e) = wait_for_startup(
@@ -3122,6 +3281,8 @@ async fn server_main(
     background_tasks.abort_all();
     while background_tasks.join_next().await.is_some() {}
 
+    runtime.store.fsync_wal_checked()?;
+
     Ok(())
 }
 
@@ -3131,7 +3292,7 @@ impl Runtime {
         background_tasks: &mut JoinSet<()>,
     ) -> std::io::Result<Arc<Self>> {
         let config = Arc::new(config);
-        let store = Arc::new(Store::new_with_config(config.clone()));
+        let store = Arc::new(Store::try_new_with_config(config.clone())?);
         let schema_cache: SharedSchemaCache =
             std::sync::Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
         let broker = Broker::new();
@@ -3148,6 +3309,17 @@ impl Runtime {
             script_engine,
             config,
         });
+
+        emit_info(
+            &runtime.config,
+            ServerInfoEvent::PersistenceConfigured {
+                storage_layout: runtime.config.storage.mode,
+                durability: runtime.config.durability.policy,
+                sync_interval_ms: (runtime.config.durability.policy
+                    == DurabilityPolicy::EverySecond)
+                    .then(|| runtime.config.durability.sync_interval.as_millis() as u64),
+            },
+        );
 
         if runtime.config.storage.mode == StorageMode::Tiered {
             emit_info(
@@ -3184,31 +3356,33 @@ impl Runtime {
             .store
             .wal_suppress
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        match snapshot::load(&runtime.store) {
-            Ok(0) => emit_info(&runtime.config, ServerInfoEvent::NoSnapshotFound),
-            Ok(n) => emit_info(&runtime.config, ServerInfoEvent::SnapshotLoaded { keys: n }),
-            Err(e) => {
-                // Refuse to start on a load failure (e.g. an encrypted value the
-                // current keyring can't decrypt) rather than coming up with a
-                // truncated dataset that the background save would then overwrite.
-                // The on-disk snapshot is left intact and recoverable; supply the
-                // correct keyring/seal and restart.
-                runtime
-                    .store
-                    .wal_suppress
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                emit_error(
-                    &runtime.config,
-                    ServerErrorEvent::SnapshotLoadFailed {
-                        error: e.to_string(),
-                    },
-                );
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "refusing to start: snapshot load failed, on-disk data preserved (not overwritten): {e}"
-                    ),
-                ));
+        if runtime.config.durability.policy.is_persistent() {
+            match snapshot::load(&runtime.store) {
+                Ok(0) => emit_info(&runtime.config, ServerInfoEvent::NoSnapshotFound),
+                Ok(n) => emit_info(&runtime.config, ServerInfoEvent::SnapshotLoaded { keys: n }),
+                Err(e) => {
+                    // Refuse to start on a load failure (e.g. an encrypted value the
+                    // current keyring can't decrypt) rather than coming up with a
+                    // truncated dataset that the background save would then overwrite.
+                    // The on-disk snapshot is left intact and recoverable; supply the
+                    // correct keyring/seal and restart.
+                    runtime
+                        .store
+                        .wal_suppress
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    emit_error(
+                        &runtime.config,
+                        ServerErrorEvent::SnapshotLoadFailed {
+                            error: e.to_string(),
+                        },
+                    );
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "refusing to start: snapshot load failed, on-disk data preserved (not overwritten): {e}"
+                        ),
+                    ));
+                }
             }
         }
         // A loaded snapshot can carry an older auth schema. Upgrade it before
@@ -3231,7 +3405,9 @@ impl Runtime {
             .store
             .wal_suppress
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        runtime.store.replay_wal(&runtime.broker);
+        if runtime.config.durability.policy.is_persistent() {
+            runtime.store.replay_wal(&runtime.broker);
+        }
         if runtime.config.auth.enabled {
             runtime
                 .store
@@ -3272,7 +3448,9 @@ impl Runtime {
             eprintln!("push scope migration skipped: {e}");
         }
 
-        background_tasks.spawn(snapshot::background_save_loop(runtime.store.clone()));
+        if runtime.config.durability.policy.is_persistent() {
+            background_tasks.spawn(snapshot::background_save_loop(runtime.store.clone()));
+        }
 
         {
             let store = runtime.store.clone();
@@ -3316,16 +3494,18 @@ impl Runtime {
             background_tasks.spawn(push::worker::run_delivery_worker(store, cache));
         }
 
+        if runtime.config.durability.policy == DurabilityPolicy::EverySecond {
+            let store = runtime.store.clone();
+            let sync_interval = runtime.config.durability.sync_interval;
+            background_tasks.spawn(async move {
+                loop {
+                    tokio::time::sleep(sync_interval).await;
+                    store.fsync_wal();
+                }
+            });
+        }
+
         if runtime.config.storage.mode == StorageMode::Tiered {
-            {
-                let store = runtime.store.clone();
-                background_tasks.spawn(async move {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        store.fsync_wal();
-                    }
-                });
-            }
             {
                 let store = runtime.store.clone();
                 background_tasks.spawn(async move {
@@ -5093,6 +5273,90 @@ mod tx_tests {
             assert!(tx_error, "{command} should mark the transaction dirty");
             assert!(tx_queue.is_empty(), "{command} should not be queued");
         }
+    }
+}
+
+#[cfg(test)]
+mod persistence_config_tests {
+    use super::*;
+
+    fn persistent_config(root: &std::path::Path, layout: StorageMode) -> ServerConfig {
+        ServerConfig {
+            data_dir: root.to_string_lossy().into_owned(),
+            storage: StorageConfig {
+                mode: layout,
+                dir: root.join("storage").to_string_lossy().into_owned(),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_policy_preserves_persistent_server_behavior() {
+        let config = ServerConfig::default();
+        assert_eq!(config.durability.policy, DurabilityPolicy::EverySecond);
+        assert_eq!(config.durability.sync_interval, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn tiered_layout_cannot_claim_ephemeral_durability() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = persistent_config(root.path(), StorageMode::Tiered);
+        config.durability.policy = DurabilityPolicy::Ephemeral;
+        let error = resolve_and_validate_persistence(&mut config).unwrap_err();
+        assert!(
+            error.to_string().contains("tiered storage requires"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn every_second_interval_is_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        for interval in [Duration::ZERO, Duration::from_millis(1_001)] {
+            let mut config = persistent_config(root.path(), StorageMode::Memory);
+            config.durability.sync_interval = interval;
+            let error = resolve_and_validate_persistence(&mut config).unwrap_err();
+            assert!(error.to_string().contains("1 to 1000 ms"), "{error}");
+        }
+    }
+
+    #[test]
+    fn persistent_layout_changes_refuse_to_hide_existing_state() {
+        let tiered_root = tempfile::tempdir().unwrap();
+        let tiered_shard = tiered_root.path().join("storage/shard_0");
+        std::fs::create_dir_all(&tiered_shard).unwrap();
+        std::fs::write(tiered_shard.join("wal.lux"), b"state").unwrap();
+        let mut memory = persistent_config(tiered_root.path(), StorageMode::Memory);
+        let error = resolve_and_validate_persistence(&mut memory).unwrap_err();
+        assert!(error.to_string().contains("switch to memory"), "{error}");
+
+        let memory_root = tempfile::tempdir().unwrap();
+        let memory_shard = memory_root.path().join("journal/shard_0");
+        std::fs::create_dir_all(&memory_shard).unwrap();
+        std::fs::write(memory_shard.join("wal.lux"), b"state").unwrap();
+        let mut tiered = persistent_config(memory_root.path(), StorageMode::Tiered);
+        let error = resolve_and_validate_persistence(&mut tiered).unwrap_err();
+        assert!(error.to_string().contains("switch to tiered"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn runtime_storage_error_reaches_the_embedded_caller() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::write(storage.join("shard_0"), b"not a directory").unwrap();
+
+        let mut config = persistent_config(root.path(), StorageMode::Tiered);
+        config.enable_resp = false;
+        let error = match run_with_config(config).await {
+            Ok(_) => panic!("invalid storage layout unexpectedly started"),
+            Err(error) => error,
+        };
+        assert_ne!(
+            error.to_string(),
+            "server startup failed before readiness signal"
+        );
     }
 }
 

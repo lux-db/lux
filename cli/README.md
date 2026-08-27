@@ -120,6 +120,11 @@ data volume and restart a running engine. Cloud updates first create a completed
 snapshot and automatically roll back to the prior immutable image if the new
 engine fails its management health check.
 
+The local engine uses tiered placement with explicit `every_second` durability
+and a 1,000 ms WAL sync interval. `lux status` reports both the storage layout
+and durability policy so disk placement is never mistaken for the write
+acknowledgement guarantee.
+
 ## Local Connections
 
 Connect directly to any Lux or Redis instance without going through the cloud API:

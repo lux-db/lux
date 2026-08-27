@@ -2708,7 +2708,7 @@ fn route_request_with_auth(
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     if segments.is_empty() || (segments.len() == 1 && segments[0] == "v1") {
-        return engine_root();
+        return engine_root(store);
     }
 
     let base = if segments[0] == "v1" {
@@ -2725,7 +2725,7 @@ fn route_request_with_auth(
 
     match (method, base) {
         // ── engine management contract ──
-        ("GET", ["version"]) => engine_version(),
+        ("GET", ["version"]) => engine_version(store),
         ("GET", ["migrations"]) => migration_list(params, store, cache),
         ("POST", ["migrations", "plan"]) => migration_plan(body, store, cache),
         ("POST", ["migrations", "apply"]) => {
@@ -3146,24 +3146,36 @@ fn route_requires_project_access(method: &str, base: &[&str]) -> bool {
     )
 }
 
-fn engine_version() -> (u16, &'static str, String) {
+fn persistence_json(store: &Store) -> Value {
+    json!({
+        "storage_layout": store.config().storage.mode.as_str(),
+        "durability": store.config().durability.policy.as_str(),
+        "journal_enabled": store.wal_enabled(),
+        "sync_interval_ms": (store.config().durability.policy == crate::DurabilityPolicy::EverySecond)
+            .then(|| store.config().durability.sync_interval.as_millis() as u64)
+    })
+}
+
+fn engine_version(store: &Store) -> (u16, &'static str, String) {
     let build_sha = option_env!("LUX_BUILD_SHA").unwrap_or("unknown");
     ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "build_sha": build_sha,
         "api_version": crate::migrations::API_VERSION,
         "studio_api": crate::migrations::STUDIO_API_VERSION,
-        "capabilities": crate::migrations::CAPABILITIES
+        "capabilities": crate::migrations::CAPABILITIES,
+        "persistence": persistence_json(store)
     })
     .to_string())
 }
 
-fn engine_root() -> (u16, &'static str, String) {
+fn engine_root(store: &Store) -> (u16, &'static str, String) {
     ok(json!({
         "lux": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "studio_api": crate::migrations::STUDIO_API_VERSION,
-        "capabilities": crate::migrations::CAPABILITIES
+        "capabilities": crate::migrations::CAPABILITIES,
+        "persistence": persistence_json(store)
     })
     .to_string())
 }
@@ -5131,6 +5143,10 @@ mod tests {
         Arc<lua::ScriptEngine>,
     ) {
         let config = Arc::new(crate::ServerConfig {
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::Ephemeral,
+                ..Default::default()
+            },
             encryption: crate::EncryptionConfig {
                 active_key_id: Some("k1".to_string()),
                 keys: vec![crate::EncryptionKeyConfig {
@@ -5328,12 +5344,16 @@ mod tests {
 
     #[test]
     fn version_contract_advertises_management_capabilities() {
-        let (status, _, response) = engine_version();
+        let (store, _, _, _) = encrypted_http_fixture();
+        let (status, _, response) = engine_version(&store);
         assert_eq!(status, 200);
         let parsed: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(parsed["api_version"], crate::migrations::API_VERSION);
         assert_eq!(parsed["studio_api"], crate::migrations::STUDIO_API_VERSION);
+        assert_eq!(parsed["persistence"]["storage_layout"], "memory");
+        assert_eq!(parsed["persistence"]["durability"], "ephemeral");
+        assert_eq!(parsed["persistence"]["journal_enabled"], false);
         assert!(parsed["capabilities"]
             .as_array()
             .unwrap()
@@ -5343,12 +5363,16 @@ mod tests {
 
     #[test]
     fn root_contract_advertises_studio_capabilities() {
-        let (status, _, response) = engine_root();
+        let (store, _, _, _) = encrypted_http_fixture();
+        let (status, _, response) = engine_root(&store);
         assert_eq!(status, 200);
         let parsed: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed["lux"], "ok");
         assert_eq!(parsed["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(parsed["studio_api"], crate::migrations::STUDIO_API_VERSION);
+        assert_eq!(parsed["persistence"]["storage_layout"], "memory");
+        assert_eq!(parsed["persistence"]["durability"], "ephemeral");
+        assert_eq!(parsed["persistence"]["journal_enabled"], false);
         let capabilities = parsed["capabilities"].as_array().unwrap();
         for required in [
             "engine.exec",

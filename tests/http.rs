@@ -35,6 +35,11 @@ fn http_health_check() {
     let resp = get(http, "/v1", "");
     assert!(resp.contains("\"lux\""), "health: {resp}");
     assert!(resp.contains("\"version\""), "version: {resp}");
+    let health: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(health["persistence"]["storage_layout"], "memory");
+    assert_eq!(health["persistence"]["durability"], "every_second");
+    assert_eq!(health["persistence"]["journal_enabled"], true);
+    assert_eq!(health["persistence"]["sync_interval_ms"], 1_000);
 }
 
 #[test]

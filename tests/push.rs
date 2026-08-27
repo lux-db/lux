@@ -46,7 +46,7 @@ fn start(dir: &std::path::Path, resp_port: u16, http_port: u16, keep_dir: bool) 
         .env("LUX_SHARDS", "4")
         .env("LUX_SAVE_INTERVAL", "0")
         .env("LUX_DATA_DIR", dir.to_str().unwrap())
-        // Tiered storage enables the WAL, so the registry survives restart.
+        // Persistent durability enables the WAL, so the registry survives restart.
         .env("LUX_STORAGE_MODE", "tiered")
         .env("LUX_STORAGE_DIR", dir.join("storage").to_str().unwrap())
         .env("LUX_PASSWORD", "rootsecret")

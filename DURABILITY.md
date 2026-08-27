@@ -15,9 +15,29 @@ Lux persists state through:
 - Tiered storage files: cold entries evicted from memory when tiered mode is
   enabled.
 
-On startup Lux loads the snapshot, replays valid WAL frames, and rebuilds tiered
-indexes as needed. The WAL exists only in tiered storage mode; memory mode is
-snapshot-only.
+Storage layout and durability are independent:
+
+- `memory` keeps live values in memory. Persistent policies place its WAL under
+  `{data_dir}/journal`.
+- `tiered` adds disk-backed cold storage. Its WAL remains in the tiered storage
+  directory so existing deployments keep their current recovery files.
+
+Persistent startup loads the snapshot, replays valid WAL frames, and rebuilds
+tiered indexes as needed. Lux refuses to start when a layout change would hide
+known WAL or tiered shard state.
+
+## Durability Policies
+
+- `ephemeral` performs no automatic snapshot load/save and creates no WAL. It
+  must be chosen explicitly.
+- `every_second` appends before mutation and synchronizes the WAL every 1,000 ms
+  by default. The interval can be lowered to 1 ms.
+- `always_sync` appends and synchronizes before applying each mutation.
+
+`every_second` is the default for both the standalone binary and
+`ServerConfig`. `LUX_STORAGE_MODE` never changes the durability policy.
+`INFO`, `GET /v1`, and `GET /v1/version` report the effective layout, policy,
+sync interval, and whether the journal is enabled.
 
 ## Default Data-Loss Envelope
 
@@ -30,7 +50,7 @@ Expected power-loss behavior:
 - Writes acknowledged after the last fsync may be lost on sudden power failure.
 - The default maximum expected power-loss window is approximately one second of
   writes.
-- Graceful shutdown should flush pending persistence state before exit.
+- `ServerHandle::shutdown_and_wait` flushes pending WAL data before returning.
 
 Process crash behavior:
 

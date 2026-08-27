@@ -14,6 +14,67 @@ fn runtime_threads_from_env() -> Option<usize> {
         .filter(|&value| value > 0)
 }
 
+fn invalid_config(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
+}
+
+fn parse_storage_mode(raw: Option<String>) -> std::io::Result<lux::StorageMode> {
+    match raw.as_deref().map(str::trim) {
+        None => Ok(lux::StorageMode::Memory),
+        Some(value) if value.eq_ignore_ascii_case("memory") => Ok(lux::StorageMode::Memory),
+        Some(value) if value.eq_ignore_ascii_case("tiered") => Ok(lux::StorageMode::Tiered),
+        Some(_) => Err(invalid_config(
+            "LUX_STORAGE_MODE must be one of: memory, tiered",
+        )),
+    }
+}
+
+fn parse_durability(
+    raw_policy: Option<String>,
+    raw_sync_interval_ms: Option<String>,
+) -> std::io::Result<lux::DurabilityConfig> {
+    let policy = match raw_policy.as_deref().map(str::trim) {
+        None => lux::DurabilityPolicy::EverySecond,
+        Some(value) if value.eq_ignore_ascii_case("ephemeral") => lux::DurabilityPolicy::Ephemeral,
+        Some(value) if value.eq_ignore_ascii_case("every_second") => {
+            lux::DurabilityPolicy::EverySecond
+        }
+        Some(value) if value.eq_ignore_ascii_case("always_sync") => {
+            lux::DurabilityPolicy::AlwaysSync
+        }
+        Some(_) => {
+            return Err(invalid_config(
+                "LUX_DURABILITY must be one of: ephemeral, every_second, always_sync",
+            ));
+        }
+    };
+
+    let sync_interval = match raw_sync_interval_ms {
+        Some(_) if policy != lux::DurabilityPolicy::EverySecond => {
+            return Err(invalid_config(
+                "LUX_DURABILITY_SYNC_INTERVAL_MS is valid only with every_second",
+            ));
+        }
+        Some(raw) => {
+            let millis = raw.parse::<u64>().map_err(|_| {
+                invalid_config("LUX_DURABILITY_SYNC_INTERVAL_MS must be an integer from 1 to 1000")
+            })?;
+            if !(1..=1_000).contains(&millis) {
+                return Err(invalid_config(
+                    "LUX_DURABILITY_SYNC_INTERVAL_MS must be from 1 to 1000",
+                ));
+            }
+            std::time::Duration::from_millis(millis)
+        }
+        None => std::time::Duration::from_secs(1),
+    };
+
+    Ok(lux::DurabilityConfig {
+        policy,
+        sync_interval,
+    })
+}
+
 async fn async_main() -> std::io::Result<()> {
     let password = std::env::var("LUX_PASSWORD").unwrap_or_default();
     let restricted = std::env::var("LUX_RESTRICTED").is_ok_and(|v| {
@@ -28,16 +89,19 @@ async fn async_main() -> std::io::Result<()> {
         .unwrap_or_else(lux::default_shard_count);
 
     let data_dir = std::env::var("LUX_DATA_DIR").unwrap_or_else(|_| ".".to_string());
-    let storage_mode = match std::env::var("LUX_STORAGE_MODE")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "tiered" => lux::StorageMode::Tiered,
-        _ => lux::StorageMode::Memory,
-    };
-    let storage_dir = std::env::var("LUX_STORAGE_DIR")
-        .unwrap_or_else(|_| format!("{}/storage", data_dir.trim_end_matches('/')));
+    let storage_mode = parse_storage_mode(std::env::var("LUX_STORAGE_MODE").ok())?;
+    let storage_dir_env = std::env::var("LUX_STORAGE_DIR").ok();
+    if storage_mode == lux::StorageMode::Memory && storage_dir_env.is_some() {
+        return Err(invalid_config(
+            "LUX_STORAGE_DIR is valid only when LUX_STORAGE_MODE=tiered",
+        ));
+    }
+    let storage_dir =
+        storage_dir_env.unwrap_or_else(|| format!("{}/storage", data_dir.trim_end_matches('/')));
+    let durability = parse_durability(
+        std::env::var("LUX_DURABILITY").ok(),
+        std::env::var("LUX_DURABILITY_SYNC_INTERVAL_MS").ok(),
+    )?;
     let save_interval_secs = std::env::var("LUX_SAVE_INTERVAL")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -121,6 +185,7 @@ async fn async_main() -> std::io::Result<()> {
             mode: storage_mode,
             dir: storage_dir,
         },
+        durability,
         eviction: lux::EvictionConfig {
             max_memory: eviction_max_memory,
             policy: eviction_policy,
@@ -346,6 +411,23 @@ fn managed_auth_email_from_env() -> Option<lux::AuthManagedEmailConfig> {
 
 fn print_info_event(event: lux::ServerInfoEvent) {
     match event {
+        lux::ServerInfoEvent::PersistenceConfigured {
+            storage_layout,
+            durability,
+            sync_interval_ms,
+        } => match sync_interval_ms {
+            Some(interval) => println!(
+                "persistence: layout={}, durability={} (sync interval: {}ms)",
+                storage_layout.as_str(),
+                durability.as_str(),
+                interval
+            ),
+            None => println!(
+                "persistence: layout={}, durability={}",
+                storage_layout.as_str(),
+                durability.as_str()
+            ),
+        },
         lux::ServerInfoEvent::TieredStorageEnabled { dir } => {
             println!("storage: tiered mode (dir: {dir})");
         }
@@ -444,7 +526,9 @@ fn print_error_event(event: lux::ServerErrorEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_seal_value, parse_encryption_keys_json};
+    use super::{
+        decode_seal_value, parse_durability, parse_encryption_keys_json, parse_storage_mode,
+    };
 
     #[test]
     fn decode_seal_value_requires_base64_of_32_bytes() {
@@ -492,5 +576,29 @@ mod tests {
             parse_encryption_keys_json(r#"[{"id":"k1","secret":"old","decryptOnly":true}]"#, None)
                 .unwrap_err();
         assert!(err.contains("at least one writable key"), "{err}");
+    }
+
+    #[test]
+    fn durability_defaults_safe_and_parses_explicit_policies() {
+        let default = parse_durability(None, None).unwrap();
+        assert_eq!(default.policy, lux::DurabilityPolicy::EverySecond);
+        assert_eq!(default.sync_interval, std::time::Duration::from_secs(1));
+
+        let ephemeral = parse_durability(Some("ephemeral".to_string()), None).unwrap();
+        assert_eq!(ephemeral.policy, lux::DurabilityPolicy::Ephemeral);
+
+        let always = parse_durability(Some("always_sync".to_string()), None).unwrap();
+        assert_eq!(always.policy, lux::DurabilityPolicy::AlwaysSync);
+    }
+
+    #[test]
+    fn persistence_environment_values_fail_closed() {
+        assert!(parse_durability(Some("sometimes".to_string()), None).is_err());
+        assert!(parse_durability(None, Some("0".to_string())).is_err());
+        assert!(parse_durability(None, Some("1001".to_string())).is_err());
+        assert!(
+            parse_durability(Some("always_sync".to_string()), Some("1000".to_string())).is_err()
+        );
+        assert!(parse_storage_mode(Some("unknown".to_string())).is_err());
     }
 }

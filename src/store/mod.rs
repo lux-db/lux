@@ -714,13 +714,31 @@ impl Store {
 
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::new_with_config(Arc::new(crate::ServerConfig::default()))
+        let mut config = crate::ServerConfig::default();
+        config.durability.policy = crate::DurabilityPolicy::Ephemeral;
+        config.save_interval = Duration::ZERO;
+        Self::new_with_config(Arc::new(config))
     }
 
-    pub fn new_with_config(config: Arc<crate::ServerConfig>) -> Self {
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn new_with_config(mut config: Arc<crate::ServerConfig>) -> Self {
+        // Most unit-test fixtures override one unrelated setting on top of the
+        // public defaults. Do not let those fixtures create a journal in the
+        // source tree; persistence tests opt in with an isolated data_dir.
+        if config.data_dir == "."
+            && config.storage.mode == crate::StorageMode::Memory
+            && config.durability == crate::DurabilityConfig::default()
+        {
+            Arc::make_mut(&mut config).durability.policy = crate::DurabilityPolicy::Ephemeral;
+        }
+        Self::try_new_with_config(config)
+            .unwrap_or_else(|error| panic!("failed to initialize Store: {error}"))
+    }
+
+    pub(crate) fn try_new_with_config(config: Arc<crate::ServerConfig>) -> std::io::Result<Self> {
         let encryption =
             crate::encryption::EncryptionKeyring::open(&config.encryption, &config.data_dir)
-                .unwrap_or_else(|e| panic!("invalid encryption config: {e}"));
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
         let n = config.shards;
         let shards: Vec<RwLock<Shard>> = (0..n)
             .map(|_| {
@@ -732,33 +750,33 @@ impl Store {
             })
             .collect();
 
-        let disk_shard_count = n.min(64);
-        let (disk_shards, wal_shards) = if config.storage.mode == crate::disk::StorageMode::Tiered {
+        let persistence_shard_count = n.min(64);
+        let disk_shards = if config.storage.mode == crate::disk::StorageMode::Tiered {
             let dir = std::path::Path::new(&config.storage.dir);
-            let ds: Vec<parking_lot::Mutex<crate::disk::DiskShard>> = (0..disk_shard_count)
+            let ds: Vec<parking_lot::Mutex<crate::disk::DiskShard>> = (0..persistence_shard_count)
                 .map(|i| {
                     // DiskShard records rebuild corruption locally; surface it
                     // through the configured callback while startup is still synchronous.
-                    let mut shard = crate::disk::DiskShard::open(dir, i)
-                        .unwrap_or_else(|e| panic!("failed to open disk shard {i}: {e}"));
+                    let mut shard = crate::disk::DiskShard::open(dir, i)?;
                     Self::emit_disk_rebuild_report(&config, i, shard.take_rebuild_report());
-                    parking_lot::Mutex::new(shard)
+                    Ok(parking_lot::Mutex::new(shard))
                 })
-                .collect();
-            let ws: Vec<parking_lot::Mutex<crate::disk::Wal>> = (0..disk_shard_count)
-                .map(|i| {
-                    parking_lot::Mutex::new(
-                        crate::disk::Wal::open(dir, i)
-                            .unwrap_or_else(|e| panic!("failed to open WAL {i}: {e}")),
-                    )
-                })
-                .collect();
-            (Some(ds.into_boxed_slice()), Some(ws.into_boxed_slice()))
+                .collect::<std::io::Result<_>>()?;
+            Some(ds.into_boxed_slice())
         } else {
-            (None, None)
+            None
+        };
+        let wal_shards = if config.durability.policy.is_persistent() {
+            let dir = config.journal_dir();
+            let ws: Vec<parking_lot::Mutex<crate::disk::Wal>> = (0..persistence_shard_count)
+                .map(|i| crate::disk::Wal::open(&dir, i).map(parking_lot::Mutex::new))
+                .collect::<std::io::Result<_>>()?;
+            Some(ws.into_boxed_slice())
+        } else {
+            None
         };
 
-        Self {
+        Ok(Self {
             config,
             encryption,
             api_key_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -771,7 +789,7 @@ impl Store {
             wal_shards,
             wal_suppress: std::sync::atomic::AtomicBool::new(false),
             row_delta_broker: std::sync::OnceLock::new(),
-        }
+        })
     }
 
     pub fn config(&self) -> &crate::ServerConfig {
@@ -1250,6 +1268,14 @@ impl Store {
         }
     }
 
+    #[inline(always)]
+    fn wal_shard_index(&self, key: &[u8]) -> usize {
+        match &self.wal_shards {
+            Some(shards) => (fx_hash(key) % shards.len() as u64) as usize,
+            None => 0,
+        }
+    }
+
     pub fn shard_for_key(&self, key: &[u8]) -> usize {
         self.shard_index(key)
     }
@@ -1489,6 +1515,20 @@ impl Store {
         }
     }
 
+    fn sync_appended_wal(&self, wal: &mut crate::disk::Wal) -> std::io::Result<()> {
+        if !self.config.durability.policy.syncs_each_append() {
+            return Ok(());
+        }
+        if let Err(error) = wal.fsync() {
+            self.record_wal_fsync_error();
+            self.emit_error(crate::ServerErrorEvent::WalFsyncFailed {
+                error: error.to_string(),
+            });
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Append a command to the per-shard WAL. Uses the key (args[1]) to
     /// determine which shard's WAL to write to. Suppressed during WAL replay
     /// and snapshot loading to prevent re-logging replayed commands.
@@ -1518,9 +1558,10 @@ impl Store {
                         });
                         return Err(e);
                     }
+                    self.sync_appended_wal(&mut wal)?;
                 }
             } else if args.len() >= 2 {
-                let idx = self.disk_shard_index(args[1]);
+                let idx = self.wal_shard_index(args[1]);
                 let mut wal = ws[idx].lock();
                 if let Err(e) = wal.append_command(args) {
                     self.record_wal_append_error();
@@ -1529,6 +1570,7 @@ impl Store {
                     });
                     return Err(e);
                 }
+                self.sync_appended_wal(&mut wal)?;
             }
         }
         Ok(())
@@ -1552,10 +1594,10 @@ impl Store {
         if commands.len() == 1 {
             return self.wal_log_command(first);
         }
-        let idx = self.disk_shard_index(first[1]);
+        let idx = self.wal_shard_index(first[1]);
         if commands
             .iter()
-            .any(|args| args.len() < 2 || self.disk_shard_index(args[1]) != idx)
+            .any(|args| args.len() < 2 || self.wal_shard_index(args[1]) != idx)
         {
             for args in commands {
                 self.wal_log_command(args)?;
@@ -1571,6 +1613,7 @@ impl Store {
             });
             return Err(e);
         }
+        self.sync_appended_wal(&mut wal)?;
         Ok(())
     }
 
@@ -1673,10 +1716,14 @@ impl Store {
         }
     }
 
-    /// Flush WAL data to disk. Called by a background task every 1 second
-    /// (matching Redis appendfsync everysec). Trades up to 1s of data loss
-    /// on power failure for significantly higher write throughput vs per-write fsync.
+    /// Flush WAL data to disk. `every_second` calls this on its configured
+    /// interval; `always_sync` calls the same primitive after each append.
     pub fn fsync_wal(&self) {
+        let _ = self.fsync_wal_checked();
+    }
+
+    pub(crate) fn fsync_wal_checked(&self) -> std::io::Result<()> {
+        let mut first_error = None;
         if let Some(ref ws) = self.wal_shards {
             for w in ws.iter() {
                 let mut wal = w.lock();
@@ -1685,8 +1732,15 @@ impl Store {
                     self.emit_error(crate::ServerErrorEvent::WalFsyncFailed {
                         error: e.to_string(),
                     });
+                    if first_error.is_none() {
+                        first_error = Some(std::io::Error::new(e.kind(), e.to_string()));
+                    }
                 }
             }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 

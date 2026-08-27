@@ -19,10 +19,12 @@ RUN touch src/lib.rs src/main.rs && cargo build --release
 
 FROM scratch
 
-ENV LUX_BIND_HOST=0.0.0.0
+ENV LUX_BIND_HOST=0.0.0.0 \
+    LUX_DATA_DIR=/data
 
 COPY --from=builder /build/target/release/lux /lux
 
 EXPOSE 6379
+VOLUME ["/data"]
 
 ENTRYPOINT ["/lux"]
