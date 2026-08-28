@@ -26,18 +26,17 @@ fn restore_snapshot(port: u16, dump: &[u8]) -> String {
 }
 
 #[test]
-fn memory_layout_defaults_to_every_second_and_recovers() {
+fn memory_layout_defaults_to_always_sync_and_recovers_after_immediate_kill() {
     let mut server = LuxServer::start();
     let mut connection = server.conn();
 
     let info = send(&mut connection, &["INFO"]);
     assert!(info.contains("storage_layout:memory"), "{info}");
-    assert!(info.contains("durability:every_second"), "{info}");
+    assert!(info.contains("durability:always_sync"), "{info}");
     assert!(info.contains("wal_enabled:true"), "{info}");
 
     assert!(send(&mut connection, &["SET", "durable:key", "value"]).contains("+OK"));
     drop(connection);
-    thread::sleep(Duration::from_millis(1_100));
     server.restart();
 
     let mut connection = server.conn();

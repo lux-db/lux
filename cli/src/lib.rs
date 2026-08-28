@@ -660,8 +660,7 @@ fn local_engine_env(state: &LocalState) -> Vec<String> {
         "LUX_HTTP_PORT=5890".to_string(),
         "LUX_BIND_HOST=0.0.0.0".to_string(),
         "LUX_DATA_DIR=/data".to_string(),
-        "LUX_DURABILITY=every_second".to_string(),
-        "LUX_DURABILITY_SYNC_INTERVAL_MS=1000".to_string(),
+        "LUX_DURABILITY=always_sync".to_string(),
         // Tiered controls hot/cold placement independently from the WAL policy.
         "LUX_STORAGE_MODE=tiered".to_string(),
         "LUX_STORAGE_DIR=/data/storage".to_string(),
@@ -1482,8 +1481,8 @@ fn local_status_value(state: &LocalState) -> serde_json::Value {
         "direct_port": state.resp_port,
         "data_volume": state.volume,
         "storage_layout": "tiered",
-        "durability": "every_second",
-        "durability_sync_interval_ms": 1000,
+        "durability": "always_sync",
+        "durability_sync_interval_ms": null,
         "encryption": "enabled",
         "active_env_profile": active_profile_label(),
     })
@@ -1512,7 +1511,7 @@ fn print_local_status(state: &LocalState, json_output: bool) {
     println!("{} {}", "App env:".bold(), active_profile_label());
     println!("{} {}", "Data volume:".bold(), state.volume);
     println!("{} tiered", "Storage layout:".bold());
-    println!("{} every_second (1000ms)", "Durability:".bold());
+    println!("{} always_sync", "Durability:".bold());
     println!("{} {}", "Encryption:".bold(), "enabled".green());
     if !running {
         println!("\nRun {} to boot it.", "lux start".cyan());
@@ -7556,10 +7555,10 @@ mod tests {
             .iter()
             .any(|e| e == "LUX_PASSWORD=lux_sec_local_deadbeef"));
         assert!(env.iter().any(|e| e == "LUX_STORAGE_MODE=tiered"));
-        assert!(env.iter().any(|e| e == "LUX_DURABILITY=every_second"));
-        assert!(env
+        assert!(env.iter().any(|e| e == "LUX_DURABILITY=always_sync"));
+        assert!(!env
             .iter()
-            .any(|e| e == "LUX_DURABILITY_SYNC_INTERVAL_MS=1000"));
+            .any(|e| e.starts_with("LUX_DURABILITY_SYNC_INTERVAL_MS=")));
     }
 
     #[test]

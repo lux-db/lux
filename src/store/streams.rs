@@ -292,6 +292,7 @@ impl Store {
     ) -> Result<Vec<(String, Vec<(StreamId, Vec<(String, Bytes)>)>)>, String> {
         let mut result = Vec::new();
         for (i, key) in keys.iter().enumerate() {
+            self.try_promote(key.as_bytes(), now)?;
             let after_id = ids[i];
             let idx = self.shard_index(key.as_bytes());
             let shard = self.shards[idx].read();
@@ -647,6 +648,7 @@ impl Store {
         let mut result = Vec::new();
         let mut effects = Vec::new();
         for (i, key) in keys.iter().enumerate() {
+            self.try_promote(key.as_bytes(), now)?;
             let id_str = &ids[i];
             let idx = self.shard_index(key.as_bytes());
             let shard = self.shards[idx].read();

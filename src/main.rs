@@ -34,7 +34,7 @@ fn parse_durability(
     raw_sync_interval_ms: Option<String>,
 ) -> std::io::Result<lux::DurabilityConfig> {
     let policy = match raw_policy.as_deref().map(str::trim) {
-        None => lux::DurabilityPolicy::EverySecond,
+        None => lux::DurabilityPolicy::AlwaysSync,
         Some(value) if value.eq_ignore_ascii_case("ephemeral") => lux::DurabilityPolicy::Ephemeral,
         Some(value) if value.eq_ignore_ascii_case("every_second") => {
             lux::DurabilityPolicy::EverySecond
@@ -451,18 +451,6 @@ fn print_info_event(event: lux::ServerInfoEvent) {
 
 fn print_warn_event(event: lux::ServerWarnEvent) {
     match event {
-        lux::ServerWarnEvent::WalCorruptedFrameSkipped {
-            stored_crc,
-            computed_crc,
-            ..
-        } => {
-            eprintln!(
-                "WAL: corrupted frame detected (crc mismatch: stored={stored_crc:#010x} computed={computed_crc:#010x}), skipping"
-            );
-        }
-        lux::ServerWarnEvent::WalCorruptedFramesSkipped { frames, .. } => {
-            eprintln!("WAL: skipped {frames} corrupted frame(s) during replay");
-        }
         lux::ServerWarnEvent::DiskCorruptedEntrySkipped { offset, .. } => {
             eprintln!("disk: corrupted entry at offset {offset} (crc mismatch), skipping");
         }
@@ -494,10 +482,12 @@ fn print_error_event(event: lux::ServerErrorEvent) {
         }
         lux::ServerErrorEvent::DiskEvictionWriteFailed { key, error } => {
             eprintln!(
-                "CRITICAL: disk eviction write failed for key '{}', keeping in memory. \
-                 Data will be LOST on restart if not re-evicted successfully: {error}",
+                "CRITICAL: disk eviction write failed for key '{}', keeping in memory: {error}",
                 key
             );
+        }
+        lux::ServerErrorEvent::DiskPromotionReadFailed { key, error } => {
+            eprintln!("CRITICAL: failed to promote cold key '{key}'; entry retained: {error}");
         }
         lux::ServerErrorEvent::InlineCompactionFailed { error } => {
             eprintln!("inline compaction error: {error}");
@@ -509,9 +499,7 @@ fn print_error_event(event: lux::ServerErrorEvent) {
             eprintln!("CRITICAL: WAL append failed, mutation was rejected: {error}");
         }
         lux::ServerErrorEvent::SnapshotDiskDumpFailed { error } => {
-            eprintln!(
-                "CRITICAL: failed to dump disk shard during snapshot, cold data may be lost: {error}"
-            );
+            eprintln!("CRITICAL: failed to dump disk shard; snapshot aborted: {error}");
         }
         lux::ServerErrorEvent::WalFsyncFailed { error } => {
             eprintln!(
@@ -581,7 +569,7 @@ mod tests {
     #[test]
     fn durability_defaults_safe_and_parses_explicit_policies() {
         let default = parse_durability(None, None).unwrap();
-        assert_eq!(default.policy, lux::DurabilityPolicy::EverySecond);
+        assert_eq!(default.policy, lux::DurabilityPolicy::AlwaysSync);
         assert_eq!(default.sync_interval, std::time::Duration::from_secs(1));
 
         let ephemeral = parse_durability(Some("ephemeral".to_string()), None).unwrap();
@@ -594,8 +582,10 @@ mod tests {
     #[test]
     fn persistence_environment_values_fail_closed() {
         assert!(parse_durability(Some("sometimes".to_string()), None).is_err());
-        assert!(parse_durability(None, Some("0".to_string())).is_err());
-        assert!(parse_durability(None, Some("1001".to_string())).is_err());
+        assert!(parse_durability(Some("every_second".to_string()), Some("0".to_string())).is_err());
+        assert!(
+            parse_durability(Some("every_second".to_string()), Some("1001".to_string())).is_err()
+        );
         assert!(
             parse_durability(Some("always_sync".to_string()), Some("1000".to_string())).is_err()
         );

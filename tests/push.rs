@@ -29,12 +29,9 @@ impl Drop for PushServer {
     }
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+fn free_port_pair() -> (u16, u16) {
+    let ports = common::free_ports(2);
+    (ports[0], ports[1])
 }
 
 fn start(dir: &std::path::Path, resp_port: u16, http_port: u16, keep_dir: bool) -> PushServer {
@@ -81,7 +78,7 @@ fn start(dir: &std::path::Path, resp_port: u16, http_port: u16, keep_dir: bool) 
 fn http(port: u16, method: &str, path: &str, body: &str, auth: Option<&str>) -> (u16, Value) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
+        .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     let auth_header = auth
         .map(|t| format!("Authorization: Bearer {t}\r\n"))
@@ -112,7 +109,10 @@ fn http(port: u16, method: &str, path: &str, body: &str, auth: Option<&str>) -> 
                     }
                 }
             }
-            Err(_) => break,
+            Err(error) => panic!(
+                "failed reading push HTTP response: {error}; partial response: {}",
+                String::from_utf8_lossy(&resp)
+            ),
         }
     }
     let text = String::from_utf8_lossy(&resp);
@@ -341,8 +341,7 @@ fn set_creds_material(http_port: u16, environment: &str, topic: &str, p8_pem: &s
 fn private_key_rotation_rebuilds_cached_apns_sink() {
     let mock = MockApns::start(200);
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start(dir.path(), resp_port, http_port, false);
     let first_private_key = test_p8();
     let second_private_key = test_p8();
@@ -412,8 +411,7 @@ fn private_key_rotation_rebuilds_cached_apns_sink() {
 fn credential_change_rebuilds_cached_sink() {
     let mock = MockApns::start(200);
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start(dir.path(), resp_port, http_port, false);
 
     set_creds_topic(http_port, &mock.url(), "com.example.first");
@@ -473,8 +471,7 @@ fn credential_change_rebuilds_cached_sink() {
 fn unregister_by_token_and_admin_stats() {
     let mock = MockApns::start(200);
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start(dir.path(), resp_port, http_port, false);
 
     set_creds(http_port, &mock.url());
@@ -529,8 +526,7 @@ fn unregister_by_token_and_admin_stats() {
 fn delete_by_token_edge_cases() {
     let mock = MockApns::start(200);
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start(dir.path(), resp_port, http_port, false);
 
     set_creds(http_port, &mock.url());
@@ -598,8 +594,7 @@ fn delete_by_token_edge_cases() {
 fn push_admin_routes_require_operator_and_token_cleanup_requires_auth() {
     let mock = MockApns::start(200);
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let _server = start(dir.path(), resp_port, http_port, false);
     set_creds(http_port, &mock.url());
     let (token, _uid) = anon_login(http_port);
@@ -658,8 +653,7 @@ fn info_field(port: u16, field: &str) -> i64 {
 fn push_end_to_end_delivers_to_apns_mock() {
     let mock = MockApns::start(200);
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let server = start(dir.path(), resp_port, http_port, false);
 
     set_creds(http_port, &mock.url());
@@ -744,8 +738,7 @@ fn push_end_to_end_delivers_to_apns_mock() {
 #[test]
 fn push_send_rejects_invalid_interruption_level() {
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let server = start(dir.path(), resp_port, http_port, false);
 
     let (s, b) = http(
@@ -772,8 +765,7 @@ fn push_send_rejects_invalid_interruption_level() {
 fn push_unregistered_token_disables_device() {
     let mock = MockApns::start(410);
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let server = start(dir.path(), resp_port, http_port, false);
 
     set_creds(http_port, &mock.url());
@@ -819,8 +811,7 @@ fn push_unregistered_token_disables_device() {
 fn push_bad_request_dead_letters_without_disabling_device() {
     let mock = MockApns::start_with_reason(400, r#"{"reason":"BadCollapseId"}"#);
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let server = start(dir.path(), resp_port, http_port, false);
 
     set_creds(http_port, &mock.url());
@@ -889,8 +880,7 @@ fn push_bad_request_dead_letters_without_disabling_device() {
 #[test]
 fn push_devices_scoped_and_reserved_guarded() {
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let server = start(dir.path(), resp_port, http_port, false);
 
     let (token_a, _uid_a) = anon_login(http_port);
@@ -975,8 +965,7 @@ fn push_devices_scoped_and_reserved_guarded() {
 #[test]
 fn push_registry_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
 
     // Register via the RESP operator form, then hard-restart on the same dir.
     {
@@ -997,8 +986,7 @@ fn push_registry_survives_restart() {
         drop(server);
     }
 
-    let resp_port2 = free_port();
-    let http_port2 = free_port();
+    let (resp_port2, http_port2) = free_port_pair();
     let server = start(dir.path(), resp_port2, http_port2, false);
     let reply = resp_cmd(
         resp_port2,
@@ -1059,8 +1047,7 @@ fn start_no_auth(dir: &std::path::Path, resp_port: u16, http_port: u16) -> PushS
 fn push_works_with_auth_disabled_via_secret_key() {
     let mock = MockApns::start(200);
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let server = start_no_auth(dir.path(), resp_port, http_port);
 
     set_creds(http_port, &mock.url());
@@ -1110,8 +1097,7 @@ fn push_works_with_auth_disabled_via_secret_key() {
 fn push_batch_send_to_many_subjects() {
     let mock = MockApns::start(200);
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let server = start_no_auth(dir.path(), resp_port, http_port);
     set_creds(http_port, &mock.url());
 
@@ -1155,8 +1141,7 @@ fn push_batch_send_to_many_subjects() {
 fn push_web_push_delivers_encrypted() {
     let mock = MockApns::start(201);
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let server = start_no_auth(dir.path(), resp_port, http_port);
 
     // Configure VAPID. The private key is any valid P-256 PKCS8 PEM (used to
@@ -1241,8 +1226,7 @@ fn push_routes_each_device_to_its_own_apns_host() {
     let testflight = MockApns::start(200);
     let development = MockApns::start(200);
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let server = start_no_auth(dir.path(), resp_port, http_port);
 
     // One credential, pointed at the "production" host. The same .p8 signs for
@@ -1305,8 +1289,7 @@ fn push_routes_each_device_to_its_own_apns_host() {
 #[test]
 fn push_device_environment_is_recorded_and_sticky() {
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let server = start_no_auth(dir.path(), resp_port, http_port);
 
     let register = |body: Value| {
@@ -1372,8 +1355,7 @@ fn user_session_cannot_redirect_delivery_to_its_own_host() {
     let real = MockApns::start(200);
     let attacker = MockApns::start(200);
     let dir = tempfile::tempdir().unwrap();
-    let resp_port = free_port();
-    let http_port = free_port();
+    let (resp_port, http_port) = free_port_pair();
     let server = start(dir.path(), resp_port, http_port, false);
 
     set_creds(http_port, &real.url());

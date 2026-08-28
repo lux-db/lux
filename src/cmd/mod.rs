@@ -117,6 +117,24 @@ fn cmd_eq(input: &[u8], expected: &[u8]) -> bool {
     true
 }
 
+/// Bring every key needed by a multi-key command into memory before the
+/// command starts producing output or mutating state. A cold-tier read error
+/// must be an explicit command failure, never an implicit missing key.
+pub(super) fn promote_keys(
+    store: &Store,
+    keys: &[&[u8]],
+    out: &mut BytesMut,
+    now: Instant,
+) -> bool {
+    for key in keys {
+        if let Err(error) = store.try_promote(key, now) {
+            resp::write_error(out, &error);
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn is_reserved_internal_argument(arg: &[u8]) -> bool {
     arg.starts_with(b"_t:") || arg.starts_with(b"_auth:")
 }
@@ -1166,6 +1184,312 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
 ];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalStrategy {
+    /// The command does not directly mutate the journaled logical database.
+    NoJournal,
+    /// Raw argv is deterministic and is committed by `execute_with_wal`.
+    Generic,
+    /// The handler commits a resolved recovery representation itself.
+    Resolved,
+    /// A registered command missing from this contract must fail closed.
+    Unclassified,
+}
+
+const GENERIC_JOURNAL_COMMANDS: &[&[u8]] = &[
+    b"DEL",
+    b"DELIFEQ",
+    b"SETNX",
+    b"GETSET",
+    b"APPEND",
+    b"INCR",
+    b"DECR",
+    b"INCRBY",
+    b"DECRBY",
+    b"INCRBYFLOAT",
+    b"SETRANGE",
+    b"LPOP",
+    b"RPOP",
+    b"LSET",
+    b"LINSERT",
+    b"LREM",
+    b"LTRIM",
+    b"LPUSHX",
+    b"RPUSHX",
+    b"SADD",
+    b"SREM",
+    b"HSETNX",
+    b"HDEL",
+    b"HINCRBY",
+    b"HINCRBYFLOAT",
+    b"HPERSIST",
+    b"HGETDEL",
+    b"ZADD",
+    b"ZREM",
+    b"ZINCRBY",
+    b"ZPOPMIN",
+    b"ZPOPMAX",
+    b"ZREMRANGEBYRANK",
+    b"ZREMRANGEBYSCORE",
+    b"ZREMRANGEBYLEX",
+    b"GEOADD",
+    b"GEOSEARCHSTORE",
+    b"GEORADIUS",
+    b"GEORADIUSBYMEMBER",
+    b"XDEL",
+    b"XTRIM",
+    b"XGROUP",
+    b"XACK",
+    b"RENAME",
+    b"RENAMENX",
+    b"UNLINK",
+    b"GETDEL",
+    b"FLUSHDB",
+    b"FLUSHALL",
+    b"PFADD",
+    b"PFMERGE",
+    b"SETBIT",
+    b"BITOP",
+    b"BITFIELD",
+    b"SORT",
+];
+
+const RESOLVED_JOURNAL_COMMANDS: &[&[u8]] = &[
+    b"SET",
+    b"SETEX",
+    b"PSETEX",
+    b"MSET",
+    b"MSETNX",
+    b"EXPIRE",
+    b"PEXPIRE",
+    b"EXPIREAT",
+    b"PEXPIREAT",
+    b"PERSIST",
+    b"GETEX",
+    b"LMOVE",
+    b"RPOPLPUSH",
+    b"LMPOP",
+    b"BLPOP",
+    b"BRPOP",
+    b"BLMOVE",
+    b"BLMPOP",
+    b"BRPOPLPUSH",
+    b"SPOP",
+    b"SMOVE",
+    b"SDIFFSTORE",
+    b"SINTERSTORE",
+    b"SUNIONSTORE",
+    b"HSET",
+    b"HMSET",
+    b"HEXPIRE",
+    b"HPEXPIRE",
+    b"HEXPIREAT",
+    b"HPEXPIREAT",
+    b"HGETEX",
+    b"ZRANGESTORE",
+    b"ZUNIONSTORE",
+    b"ZINTERSTORE",
+    b"ZDIFFSTORE",
+    b"ZMPOP",
+    b"BZPOPMIN",
+    b"BZPOPMAX",
+    b"BZMPOP",
+    b"COPY",
+    b"RESTORE",
+    b"XADD",
+    b"XREADGROUP",
+    b"XCLAIM",
+    b"XAUTOCLAIM",
+    b"EVAL",
+    b"EVALSHA",
+    b"LUX",
+    b"VSET",
+    b"TSADD",
+    b"TSMADD",
+    b"TCREATE",
+    b"TINSERT",
+    b"TUPSERT",
+    b"TUPDATE",
+    b"TDELETE",
+    b"TDROP",
+    b"TALTER",
+    b"TINDEX",
+    b"TDROPINDEX",
+    b"GRANT",
+    b"REVOKE",
+    b"TSET",
+];
+
+const ARGUMENT_DEPENDENT_JOURNAL_COMMANDS: &[&[u8]] = &[b"LPUSH", b"RPUSH"];
+
+const NO_JOURNAL_COMMANDS: &[&[u8]] = &[
+    b"GET",
+    b"PING",
+    b"ECHO",
+    b"QUIT",
+    b"MGET",
+    b"STRLEN",
+    b"EXISTS",
+    b"KEYS",
+    b"SCAN",
+    b"TTL",
+    b"PTTL",
+    b"TYPE",
+    b"DBSIZE",
+    b"LCS",
+    b"LLEN",
+    b"LRANGE",
+    b"LINDEX",
+    b"HGET",
+    b"HMGET",
+    b"HGETALL",
+    b"HKEYS",
+    b"HVALS",
+    b"HLEN",
+    b"HEXISTS",
+    b"SMEMBERS",
+    b"SISMEMBER",
+    b"SCARD",
+    b"SUNION",
+    b"SINTER",
+    b"SDIFF",
+    b"SAVE",
+    b"INFO",
+    b"CONFIG",
+    b"CLIENT",
+    b"SELECT",
+    b"COMMAND",
+    b"MULTI",
+    b"EXEC",
+    b"DISCARD",
+    b"WATCH",
+    b"UNWATCH",
+    b"GETRANGE",
+    b"GEODIST",
+    b"GEOPOS",
+    b"GEOHASH",
+    b"GEOSEARCH",
+    b"GEOSEARCH_RO",
+    b"GEORADIUS_RO",
+    b"GEORADIUSBYMEMBER_RO",
+    b"SUBSTR",
+    b"EXPIRETIME",
+    b"PEXPIRETIME",
+    b"LPOS",
+    b"HSTRLEN",
+    b"SRANDMEMBER",
+    b"SMISMEMBER",
+    b"SINTERCARD",
+    b"HRANDFIELD",
+    b"HTTL",
+    b"HPTTL",
+    b"HEXPIRETIME",
+    b"HPEXPIRETIME",
+    b"HSCAN",
+    b"SSCAN",
+    b"TIME",
+    b"RANDOMKEY",
+    b"HELLO",
+    b"PSUBSCRIBE",
+    b"PUNSUBSCRIBE",
+    b"FUNCTION",
+    b"DEBUG",
+    b"DUMP",
+    b"WAIT",
+    b"WAITAOF",
+    b"TOUCH",
+    b"MIGRATE",
+    b"RESET",
+    b"LATENCY",
+    b"SWAPDB",
+    b"OBJECT",
+    b"MEMORY",
+    b"BGSAVE",
+    b"LASTSAVE",
+    b"PUBLISH",
+    b"PUBSUB",
+    b"SPUBLISH",
+    b"SSUBSCRIBE",
+    b"SUNSUBSCRIBE",
+    b"SUBSCRIBE",
+    b"UNSUBSCRIBE",
+    b"ZSCORE",
+    b"ZRANK",
+    b"ZREVRANK",
+    b"ZREVRANGE",
+    b"ZCARD",
+    b"ZRANGE",
+    b"ZCOUNT",
+    b"ZUNION",
+    b"ZINTER",
+    b"ZDIFF",
+    b"ZINTERCARD",
+    b"ZRANDMEMBER",
+    b"ZSCAN",
+    b"ZMSCORE",
+    b"ZLEXCOUNT",
+    b"ZRANGEBYSCORE",
+    b"ZREVRANGEBYSCORE",
+    b"ZRANGEBYLEX",
+    b"ZREVRANGEBYLEX",
+    b"AUTH",
+    b"XLEN",
+    b"XRANGE",
+    b"XREVRANGE",
+    b"XREAD",
+    b"XPENDING",
+    b"XINFO",
+    b"ENC",
+    b"SCRIPT",
+    b"VGET",
+    b"VSEARCH",
+    b"VCARD",
+    b"PFCOUNT",
+    b"SORT_RO",
+    b"TSGET",
+    b"TSRANGE",
+    b"TSMRANGE",
+    b"TSINFO",
+    b"GETBIT",
+    b"BITCOUNT",
+    b"BITPOS",
+    b"BITFIELD_RO",
+    b"KSUB",
+    b"KUNSUB",
+    b"TCOUNT",
+    b"TSCHEMA",
+    b"TLIST",
+    b"TSELECT",
+    b"TGET",
+];
+
+fn command_in(cmd: &[u8], commands: &[&[u8]]) -> bool {
+    commands.iter().any(|candidate| cmd_eq(cmd, candidate))
+}
+
+fn journal_strategy_for_args(args: &[&[u8]]) -> JournalStrategy {
+    let Some(cmd) = args.first().copied() else {
+        return JournalStrategy::NoJournal;
+    };
+    if command_in(cmd, GENERIC_JOURNAL_COMMANDS) {
+        return JournalStrategy::Generic;
+    }
+    if command_in(cmd, RESOLVED_JOURNAL_COMMANDS) {
+        return JournalStrategy::Resolved;
+    }
+    if command_in(cmd, ARGUMENT_DEPENDENT_JOURNAL_COMMANDS) {
+        return if args.last().is_some_and(|arg| cmd_eq(arg, b"ENCRYPTED")) {
+            JournalStrategy::Resolved
+        } else {
+            JournalStrategy::Generic
+        };
+    }
+    if command_in(cmd, NO_JOURNAL_COMMANDS) {
+        return JournalStrategy::NoJournal;
+    }
+    JournalStrategy::Unclassified
+}
+
 fn command_spec(cmd: &[u8]) -> Option<&'static CommandSpec> {
     COMMAND_SPECS.iter().find(|spec| cmd_eq(cmd, spec.name))
 }
@@ -1642,7 +1966,10 @@ pub fn execute(
     }
 
     if args.len() > 1 {
-        store.try_promote(args[1], now);
+        if let Err(error) = store.try_promote(args[1], now) {
+            resp::write_error(out, &error);
+            return CmdResult::Written;
+        }
     }
 
     if crate::eviction::is_write_command(cmd) {
@@ -2588,7 +2915,19 @@ pub fn execute_with_wal(
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
-    if !args.is_empty() && crate::eviction::is_write_command(args[0]) {
+    let strategy = journal_strategy_for_args(args);
+    if matches!(strategy, JournalStrategy::Unclassified)
+        && args
+            .first()
+            .is_some_and(|command| command_spec(command).is_some())
+    {
+        resp::write_error(out, "ERR command durability strategy is not classified");
+        return CmdResult::Written;
+    }
+    if matches!(
+        strategy,
+        JournalStrategy::Generic | JournalStrategy::Resolved
+    ) {
         if let Some(err) = crate::auth::reserved_table_mutation_error(args, store) {
             resp::write_error(out, &err);
             return CmdResult::Written;
@@ -2597,130 +2936,46 @@ pub fn execute_with_wal(
             resp::write_error(out, &err);
             return CmdResult::Written;
         }
-        // State-dependent commands resolve and commit their recovery form in the
-        // owning command/table layer. Recording raw argv here as well would
-        // duplicate the mutation during replay.
-        if !command_owns_journal_boundary_args(args) {
-            return match store
-                .commit_journaled(args, || execute(store, cache, broker, args, out, now))
-            {
+        if strategy == JournalStrategy::Generic {
+            let output_start = out.len();
+            let result = match store.commit_journaled_checked(args, || {
+                let result = execute(store, cache, broker, args, out, now);
+                let committed =
+                    matches!(result, CmdResult::Written) && out.get(output_start) != Some(&b'-');
+                (result, committed)
+            }) {
                 Ok(result) => result,
                 Err(e) => {
+                    out.truncate(output_start);
                     resp::write_error(out, &format!("ERR WAL append failed: {e}"));
                     CmdResult::Written
                 }
             };
+            if matches!(result, CmdResult::Written)
+                && out.get(output_start) != Some(&b'-')
+                && args.len() >= 2
+                && (cmd_eq(args[0], b"LPUSH") || cmd_eq(args[0], b"RPUSH"))
+                && broker.has_list_waiters(arg_str(args[1]))
+            {
+                // Wake only after the outer journal/apply boundary has closed.
+                // Draining from inside the list handler would recursively append
+                // the blocked pop while the generic writer still owns the WAL.
+                broker.drain_list_waiters(arg_str(args[1]), store, now);
+            }
+            return result;
         }
     }
-    execute(store, cache, broker, args, out, now)
-}
-
-/// Writes whose owning command layer resolves and commits the durable form;
-/// `execute_with_wal` must not also record their raw client arguments.
-fn command_owns_journal_boundary(cmd: &[u8]) -> bool {
-    let mut up = [0u8; 12];
-    if cmd.len() > up.len() {
-        return false;
+    let output_start = out.len();
+    let result = execute(store, cache, broker, args, out, now);
+    if matches!(result, CmdResult::Written)
+        && out.get(output_start) != Some(&b'-')
+        && args.len() >= 2
+        && (cmd_eq(args[0], b"LPUSH") || cmd_eq(args[0], b"RPUSH"))
+        && broker.has_list_waiters(arg_str(args[1]))
+    {
+        broker.drain_list_waiters(arg_str(args[1]), store, now);
     }
-    for (i, b) in cmd.iter().enumerate() {
-        up[i] = b.to_ascii_uppercase();
-    }
-    let c = &up[..cmd.len()];
-    matches!(
-        c,
-        b"TINSERT"
-            | b"TROWSET"
-            | b"TUPSERT"
-            | b"TUPDATE"
-            | b"TDELETE"
-            | b"TCREATE"
-            | b"TDROP"
-            | b"TSET"
-            | b"XADD"
-            | b"TSADD"
-            | b"TSMADD"
-            | b"ZMPOP"
-            | b"LMPOP"
-            | b"SPOP"
-            | b"HEXPIRE"
-            | b"HPEXPIRE"
-            | b"HEXPIREAT"
-            | b"HPEXPIREAT"
-            | b"SETEX"
-            | b"PSETEX"
-            | b"GETEX"
-            | b"EXPIRE"
-            | b"PEXPIRE"
-            | b"EXPIREAT"
-            | b"PEXPIREAT"
-            | b"PERSIST"
-            | b"RESTORE"
-            | b"XREADGROUP"
-            | b"XCLAIM"
-            | b"XAUTOCLAIM"
-            | b"EVAL"
-            | b"EVALSHA"
-            | b"LUX"
-    )
-}
-
-fn command_owns_journal_boundary_args(args: &[&[u8]]) -> bool {
-    if args.is_empty() {
-        return false;
-    }
-    let cmd = args[0];
-    if command_owns_journal_boundary(cmd) {
-        return true;
-    }
-    // Commands whose durable effect cannot be derived from raw argv record their
-    // own resolved effects, so the generic boundary must not record them twice.
-    if cmd_eq(cmd, b"ZUNIONSTORE") || cmd_eq(cmd, b"ZINTERSTORE") || cmd_eq(cmd, b"ZDIFFSTORE") {
-        return true;
-    }
-    // ZRANGESTORE records the resolved DEL+ZADD instead of re-reading its source.
-    if cmd_eq(cmd, b"ZRANGESTORE") {
-        return true;
-    }
-    if cmd_eq(cmd, b"SUNIONSTORE") || cmd_eq(cmd, b"SINTERSTORE") || cmd_eq(cmd, b"SDIFFSTORE") {
-        return true;
-    }
-    // Movers atomically record their resolved source and destination effects.
-    if cmd_eq(cmd, b"LMOVE") || cmd_eq(cmd, b"RPOPLPUSH") || cmd_eq(cmd, b"SMOVE") {
-        return true;
-    }
-    // COPY records the resolved destination as LXRESTORE instead of re-reading src.
-    if cmd_eq(cmd, b"COPY") {
-        return true;
-    }
-    // MSET/MSETNX record resolved keyed SET effects as one journaled batch.
-    if cmd_eq(cmd, b"MSET") || cmd_eq(cmd, b"MSETNX") {
-        return true;
-    }
-    if cmd_eq(cmd, b"SET") && args.len() >= 3 {
-        return true;
-    }
-    if (cmd_eq(cmd, b"LPUSH") || cmd_eq(cmd, b"RPUSH")) && args.len() >= 4 {
-        // Encrypted pushes commit ENC RAWLPUSH/RAWRPUSH with resolved
-        // ciphertext; plaintext pushes take the generic boundary.
-        return args.last().is_some_and(|arg| cmd_eq(arg, b"ENCRYPTED"));
-    }
-    if (cmd_eq(cmd, b"HSET") || cmd_eq(cmd, b"HMSET")) && args.len() >= 4 {
-        let encrypted = args.last().is_some_and(|arg| cmd_eq(arg, b"ENCRYPTED"));
-        let end = if encrypted {
-            args.len() - 1
-        } else {
-            args.len()
-        };
-        if end > 2 && (end - 2).is_multiple_of(2) {
-            return true;
-        }
-    }
-    if cmd_eq(cmd, b"VSET") {
-        // VSET records an absolute TTL; encrypted variants additionally replace
-        // plaintext vector components with an ENC RAWVSET sealed payload.
-        return true;
-    }
-    false
+    result
 }
 
 #[allow(dead_code)]
@@ -4296,6 +4551,185 @@ mod tests {
             exec_str(&store, &[b"XPENDING", b"stream", b"group"]),
             "*4\r\n:0\r\n$-1\r\n$-1\r\n*-1\r\n"
         );
+
+        exec_wal(&store, &[b"TCREATE", b"ddl", b"payload JSON"]);
+        store.inject_journal_failures(1);
+        let reply = exec_str(
+            &store,
+            &[b"TALTER", b"ddl", b"ADD", b"active BOOL DEFAULT true"],
+        );
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert!(!exec_str(&store, &[b"TSCHEMA", b"ddl"]).contains("active"));
+
+        store.inject_journal_failures(1);
+        let reply = exec_str(&store, &[b"TINDEX", b"ddl", b"payload.age", b"INT"]);
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert_eq!(
+            exec_str(&store, &[b"TINDEX", b"ddl", b"payload.age", b"INT"]),
+            "+OK\r\n"
+        );
+
+        store.inject_journal_failures(1);
+        let reply = exec_str(&store, &[b"TDROPINDEX", b"ddl", b"payload.age"]);
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert_eq!(
+            exec_str(&store, &[b"TDROPINDEX", b"ddl", b"payload.age"]),
+            "+OK\r\n",
+            "a rejected index drop must leave the declaration intact"
+        );
+
+        assert_eq!(
+            exec_str(
+                &store,
+                &[b"TALTER", b"ddl", b"ADD", b"active BOOL DEFAULT true"],
+            ),
+            "+OK\r\n"
+        );
+        store.inject_journal_failures(1);
+        let reply = exec_str(&store, &[b"TALTER", b"ddl", b"DROP", b"active"]);
+        assert!(reply.contains("WAL append failed"), "{reply}");
+        assert!(exec_str(&store, &[b"TSCHEMA", b"ddl"]).contains("active"));
+    }
+
+    #[test]
+    fn rejected_generic_mutation_is_removed_from_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = journal_test_store(dir.path());
+
+        assert!(exec_str(&store, &[b"LPUSH", b"typed", b"value"]).starts_with(':'));
+        let before = read_wal_bytes(dir.path());
+
+        let reply = exec_str(&store, &[b"INCR", b"typed"]);
+        assert!(reply.starts_with("-WRONGTYPE"), "{reply}");
+        assert_eq!(
+            read_wal_bytes(dir.path()),
+            before,
+            "a rejected command must not remain authoritative"
+        );
+
+        assert_eq!(exec_str(&store, &[b"DEL", b"typed"]), ":1\r\n");
+        store.fsync_wal();
+        drop(store);
+
+        let restored = journal_test_store(dir.path());
+        restored.replay_wal(&Broker::new()).unwrap();
+        assert_eq!(exec_str(&restored, &[b"EXISTS", b"typed"]), ":0\r\n");
+    }
+
+    #[test]
+    fn corrupt_secondary_cold_key_aborts_multi_key_read_and_write() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = journal_test_store(dir.path());
+        assert_eq!(
+            String::from_utf8_lossy(&exec_wal(&store, &[b"SET", b"primary", b"one"])),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&exec_wal(&store, &[b"SET", b"secondary", b"two"])),
+            "+OK\r\n"
+        );
+        store.fsync_wal();
+        assert!(store.evict_key(store.shard_for_key(b"secondary"), b"secondary"));
+
+        let cold_path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("data.lux"))
+            .find(|path| std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 8))
+            .expect("the secondary key must have a cold record");
+        let mut cold_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(cold_path)
+            .unwrap();
+        cold_file.seek(SeekFrom::Start(8)).unwrap();
+        let mut byte = [0u8; 1];
+        cold_file.read_exact(&mut byte).unwrap();
+        cold_file.seek(SeekFrom::Start(8)).unwrap();
+        cold_file.write_all(&[byte[0] ^ 0xff]).unwrap();
+        cold_file.sync_all().unwrap();
+
+        let before = read_wal_bytes(dir.path());
+        let read = String::from_utf8_lossy(&exec_wal(&store, &[b"MGET", b"primary", b"secondary"]))
+            .to_string();
+        assert!(read.starts_with("-ERR cold storage read failed"), "{read}");
+        assert!(
+            !read.starts_with('*'),
+            "a partial array must not be emitted: {read}"
+        );
+
+        let write = String::from_utf8_lossy(&exec_wal(
+            &store,
+            &[b"MSET", b"primary", b"changed", b"secondary", b"changed"],
+        ))
+        .to_string();
+        assert!(write.contains("restart required") || write.contains("cold storage read failed"));
+        assert_eq!(read_wal_bytes(dir.path()), before);
+        assert_eq!(
+            store.get(b"primary", Instant::now()).unwrap(),
+            b"one".as_slice()
+        );
+        drop(store);
+
+        let restored = journal_test_store(dir.path());
+        restored.replay_wal(&Broker::new()).unwrap();
+        assert_eq!(
+            restored.get(b"primary", Instant::now()).unwrap(),
+            b"one".as_slice()
+        );
+        assert_eq!(
+            restored.get(b"secondary", Instant::now()).unwrap(),
+            b"two".as_slice()
+        );
+    }
+
+    #[test]
+    fn rejected_resolved_mutations_are_removed_from_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = journal_test_store(dir.path());
+
+        assert_eq!(exec_str(&store, &[b"SET", b"typed", b"value"]), "+OK\r\n");
+        assert!(exec_str(&store, &[b"ENC", b"INIT", b"KEYID", b"k1"]).contains("k1"));
+
+        for command in [
+            vec![
+                b"HPEXPIRE".as_slice(),
+                b"typed",
+                b"100",
+                b"FIELDS",
+                b"1",
+                b"field",
+            ],
+            vec![
+                b"HGETEX".as_slice(),
+                b"typed",
+                b"PX",
+                b"100",
+                b"FIELDS",
+                b"1",
+                b"field",
+            ],
+            vec![b"TSADD".as_slice(), b"typed", b"1", b"1.0"],
+            vec![b"LPUSH".as_slice(), b"typed", b"secret", b"ENCRYPTED"],
+        ] {
+            let before = read_wal_bytes(dir.path());
+            let reply = exec_str(&store, &command);
+            assert!(reply.contains("WRONGTYPE"), "{reply}");
+            assert_eq!(
+                read_wal_bytes(dir.path()),
+                before,
+                "rejected resolved command remained in WAL: {:?}",
+                String::from_utf8_lossy(command[0])
+            );
+        }
+
+        store.fsync_wal();
+        drop(store);
+        let restored = journal_test_store(dir.path());
+        restored.replay_wal(&Broker::new()).unwrap();
+        assert_eq!(exec_str(&restored, &[b"GET", b"typed"]), "$5\r\nvalue\r\n");
     }
 
     #[test]
@@ -4338,7 +4772,7 @@ mod tests {
         drop(store);
 
         let restored = journal_test_store(dir.path());
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         let pending = exec_str(
             &restored,
             &[b"XPENDING", b"stream", b"group", b"-", b"+", b"10"],
@@ -4394,7 +4828,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(140));
         let restored = journal_test_store(dir.path());
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         for key in [
             b"psetex".as_slice(),
             b"expire".as_slice(),
@@ -4433,7 +4867,7 @@ mod tests {
         let restored = journal_test_store(dir.path());
         restored.begin_recovery();
         crate::snapshot::load_for_recovery(&restored).unwrap();
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         restored.finish_recovery();
 
         assert!(restored.get(b"preserved", Instant::now()).is_none());
@@ -4532,7 +4966,7 @@ mod tests {
         assert!(wal.windows(b"RAWSET".len()).any(|w| w == b"RAWSET"));
 
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         let got = exec_str(&restored, &[b"GET", b"api-token"]);
         assert!(got.contains("wal-secret-value"), "{got}");
     }
@@ -4554,7 +4988,7 @@ mod tests {
         store.fsync_wal();
 
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         assert!(exec_str(&restored, &[b"GET", b"literal-ex"]).contains("EX"));
         assert!(exec_str(&restored, &[b"GET", b"literal-px"]).contains("PX"));
     }
@@ -4593,7 +5027,7 @@ mod tests {
             .any(|w| w == b"absolute-secret-value"));
 
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         assert!(
             exec_str(&restored, &[b"GET", b"absolute-secret"]).contains("absolute-secret-value")
         );
@@ -4666,7 +5100,7 @@ mod tests {
         let wal = read_wal_bytes(dir.path());
         assert!(wal.windows(b"PXAT".len()).any(|w| w == b"PXAT"));
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         for (key, value) in [
             (b"encrypted-first".as_slice(), "one"),
             (b"encrypted-last".as_slice(), "two"),
@@ -4701,7 +5135,7 @@ mod tests {
         store.fsync_wal();
 
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         assert!(exec_str(&restored, &[b"GET", b"target"]).contains("persisted"));
         assert!(exec_str(&restored, &[b"PTTL", b"target"]).contains(":-1"));
     }
@@ -4739,7 +5173,7 @@ mod tests {
         assert!(wal.windows(b"RAWHSET".len()).any(|w| w == b"RAWHSET"));
 
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         let got = exec_str(&restored, &[b"HGET", b"profile:1", b"token"]);
         assert!(got.contains("hash-secret-value"), "{got}");
         let scan = exec_str(&restored, &[b"HSCAN", b"profile:1", b"0"]);
@@ -4774,7 +5208,7 @@ mod tests {
         assert!(wal.windows(b"TROWSET".len()).any(|w| w == b"TROWSET"));
 
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         let got = exec_str(&restored, &[b"TGET", b"users", b"1", b"age"]);
         assert!(got.contains("31"), "{got}");
     }
@@ -4827,7 +5261,7 @@ mod tests {
         assert!(live.contains("new-secret-value"), "{live}");
 
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         let replayed = exec_str(&restored, &[b"TGET", b"vault", b"1", b"secret"]);
         assert!(replayed.contains("new-secret-value"), "{replayed}");
     }
@@ -4873,7 +5307,7 @@ mod tests {
         assert!(wal.windows(b"RAWRPUSH".len()).any(|w| w == b"RAWRPUSH"));
 
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         let got = exec_str(&restored, &[b"LRANGE", b"events", b"0", b"-1"]);
         assert!(got.contains("list-secret-one"), "{got}");
         assert!(got.contains("list-secret-two"), "{got}");
@@ -4928,7 +5362,7 @@ mod tests {
             .any(|w| w == b"stream-secret-value"));
 
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         let got = exec_str(&restored, &[b"XRANGE", b"stream:1", b"-", b"+"]);
         assert!(got.contains("stream-secret-value"), "{got}");
         assert!(got.contains("payload"), "{got}");
@@ -4973,7 +5407,7 @@ mod tests {
         );
 
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         let got = exec_str(&restored, &[b"VGET", b"emb:1"]);
         assert!(
             got.contains("1.5") && got.contains("2.5") && got.contains("3.5"),
@@ -5017,7 +5451,7 @@ mod tests {
             .any(|w| w == deadline.as_bytes()));
 
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         let got = exec_str(&restored, &[b"VGET", b"absolute-vector"]);
         assert!(got.contains("1.5") && got.contains("2.5"), "{got}");
     }
@@ -5084,7 +5518,7 @@ mod tests {
 
         let restored = Store::new_with_config(config);
         let _ = crate::snapshot::load(&restored);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         let l = exec_str(&restored, &[b"LRANGE", b"l", b"0", b"-1"]);
         assert!(
             l.contains("list-rotate-secret"),
@@ -5128,7 +5562,7 @@ mod tests {
 
         let restored = Store::new_with_config(config);
         let _ = crate::snapshot::load(&restored);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         let got = exec_str(&restored, &[b"VGET", b"emb:1"]);
         assert!(
             got.contains("1.5") && got.contains("2.5") && got.contains("3.5"),
@@ -5299,7 +5733,7 @@ mod tests {
 
         // Replay from WAL: the prior encrypted value must NOT come back.
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         let got = exec_str(&restored, &[b"GET", b"ek"]);
         assert!(
             !got.contains("orig-secret"),
@@ -5670,6 +6104,39 @@ mod tests {
             b"ZREVRANGE",
         ] {
             assert!(is_known_command(cmd), "missing command spec for {cmd:?}");
+        }
+    }
+
+    #[test]
+    fn every_registered_command_has_one_durability_strategy() {
+        let groups = [
+            GENERIC_JOURNAL_COMMANDS,
+            RESOLVED_JOURNAL_COMMANDS,
+            ARGUMENT_DEPENDENT_JOURNAL_COMMANDS,
+            NO_JOURNAL_COMMANDS,
+        ];
+
+        for spec in COMMAND_SPECS {
+            let classifications = groups
+                .iter()
+                .filter(|commands| command_in(spec.name, commands))
+                .count();
+            assert_eq!(
+                classifications,
+                1,
+                "command {} must have exactly one durability strategy",
+                String::from_utf8_lossy(spec.name)
+            );
+        }
+
+        for commands in groups {
+            for command in commands {
+                assert!(
+                    command_spec(command).is_some(),
+                    "durability strategy references unknown command {}",
+                    String::from_utf8_lossy(command)
+                );
+            }
         }
     }
 

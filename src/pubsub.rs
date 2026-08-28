@@ -1014,7 +1014,7 @@ mod tests {
         drop(store);
 
         let restored = crate::store::Store::new_with_config(config);
-        restored.replay_wal(&Broker::new());
+        restored.replay_wal(&Broker::new()).unwrap();
         assert_eq!(restored.llen(b"source", Instant::now()).unwrap(), 0);
         assert_eq!(
             restored

@@ -93,6 +93,10 @@ fn read_with_timeout(stream: &mut TcpStream, timeout_ms: u64) -> String {
 }
 
 fn read_exact_responses(stream: &mut TcpStream, expected: usize) -> Vec<u8> {
+    let original_timeout = stream.read_timeout().ok().flatten();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     let mut data = Vec::new();
     let mut buf = [0u8; 4096];
     let mut responses = 0usize;
@@ -108,6 +112,7 @@ fn read_exact_responses(stream: &mut TcpStream, expected: usize) -> Vec<u8> {
             Err(e) => panic!("failed reading RESP pipeline response: {e}"),
         }
     }
+    stream.set_read_timeout(original_timeout).unwrap();
     data
 }
 
@@ -1040,6 +1045,63 @@ async fn embedded_typed_pipeline_xadd_star_preserves_observed_id_after_wal_resta
     assert!(
         String::from_utf8_lossy(&range).contains(&id),
         "WAL replay changed typed pipeline XADD * id: expected {id}, got {range:?}"
+    );
+    drop(client);
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn embedded_pipeline_error_does_not_replay_later_unexecuted_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = lux::ServerConfig {
+        enable_resp: false,
+        save_interval: Duration::ZERO,
+        data_dir: tmp.path().display().to_string(),
+        durability: lux::DurabilityConfig {
+            policy: lux::DurabilityPolicy::AlwaysSync,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let handle = lux::run_with_config(cfg.clone()).await.unwrap();
+    let client = handle.client();
+    client
+        .hset("pipeline:error", "invalid", "not-an-integer")
+        .await
+        .unwrap();
+
+    let mut pipeline = lux::EmbeddedPipeline::new();
+    pipeline.hincrby(b"pipeline:error", b"invalid", 1).hincrby(
+        b"pipeline:error",
+        b"never-executed",
+        1,
+    );
+    let error = client
+        .execute_embedded_pipeline(&pipeline)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("integer"), "{error}");
+    assert_eq!(
+        client
+            .hget("pipeline:error", "never-executed")
+            .await
+            .unwrap(),
+        None
+    );
+
+    drop(client);
+    handle.shutdown_and_wait().await.unwrap();
+
+    let handle = lux::run_with_config(cfg).await.unwrap();
+    let client = handle.client();
+    assert_eq!(
+        client
+            .hget("pipeline:error", "never-executed")
+            .await
+            .unwrap(),
+        None,
+        "a command skipped after a pipeline error must not appear during replay"
     );
     drop(client);
     handle.shutdown_and_wait().await.unwrap();
@@ -2522,17 +2584,7 @@ async fn run_with_config_returns_after_snapshot_and_wal_replay() {
     drop(writer);
     handle.shutdown_and_wait().await.unwrap();
 
-    append_corrupt_wal_frames(&storage_dir);
-    let events = Arc::new(Mutex::new(Vec::<lux::ServerWarnEvent>::new()));
-    let sink = events.clone();
-    let cfg = lux::ServerConfig {
-        on_warn: Some(Arc::new(move |event| {
-            sink.lock().unwrap().push(event);
-        })),
-        ..cfg
-    };
-
-    let handle = lux::run_with_config(cfg).await.unwrap();
+    let handle = lux::run_with_config(cfg.clone()).await.unwrap();
     let addr = handle.local_addr().unwrap();
     let reader = UniversalClient::resp(addr);
     let snapshot_resp = reader.get("snapshot_key").await;
@@ -2552,16 +2604,14 @@ async fn run_with_config_returns_after_snapshot_and_wal_replay() {
     drop(reader);
     handle.shutdown_and_wait().await.unwrap();
 
-    let captured = events.lock().unwrap();
-    assert!(
-        captured.iter().any(|e| {
-            matches!(
-                e,
-                lux::ServerWarnEvent::WalCorruptedFramesSkipped { frames, .. } if *frames > 0
-            )
-        }),
-        "expected WAL corruption event, got: {captured:?}"
-    );
+    append_corrupt_wal_frames(&storage_dir);
+    match lux::run_with_config(cfg).await {
+        Ok(handle) => {
+            handle.shutdown_and_wait().await.unwrap();
+            panic!("a complete corrupt WAL frame must prevent readiness");
+        }
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::InvalidData),
+    }
 }
 
 #[tokio::test]

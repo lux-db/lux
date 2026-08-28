@@ -148,7 +148,7 @@ pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         journal_args.push(deadline.to_string().into_bytes());
     }
     let refs: Vec<&[u8]> = journal_args.iter().map(Vec::as_slice).collect();
-    let _commit = match store.begin_journaled(&refs) {
+    let commit = match store.begin_journaled(&refs) {
         Ok(commit) => commit,
         Err(e) => {
             resp::write_error(out, &format!("ERR WAL append failed: {e}"));
@@ -156,6 +156,10 @@ pub fn cmd_vset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         }
     };
     store.vset(key, data, metadata, ttl, encrypted, now);
+    if let Err(error) = commit.complete() {
+        resp::write_error(out, &format!("ERR journal apply failed: {error}"));
+        return CmdResult::Written;
+    }
     resp::write_ok(out);
     CmdResult::Written
 }

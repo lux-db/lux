@@ -1,3 +1,4 @@
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 use p256::pkcs8::EncodePublicKey;
@@ -117,9 +118,8 @@ fn add_column_if_missing_is_idempotent_and_leaves_existing_schema_alone() {
     assert_eq!(row.get("name").map(String::as_str), Some("bolt"));
 }
 
-// `table_add_column` does not log itself, and internal callers never reach
-// `execute_with_wal`, so without the explicit log in `add_column_if_missing`
-// the column would vanish on any restart that replays from the WAL.
+// Internal schema upgrades never reach `execute_with_wal`, so the table layer
+// must own their journal boundary just as it does for command-driven upgrades.
 #[test]
 fn add_column_if_missing_survives_wal_replay() {
     let dir = tempfile::tempdir().unwrap();
@@ -146,7 +146,7 @@ fn add_column_if_missing_survives_wal_replay() {
     store.fsync_wal();
 
     let restored = Arc::new(Store::new_with_config(config));
-    restored.replay_wal(&crate::pubsub::Broker::new());
+    restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
     let restored_cache = Arc::new(RwLock::new(SchemaCache::new()));
     let schema = crate::tables::table_schema(&restored, &restored_cache, "widgets", now).unwrap();
     assert!(
@@ -934,8 +934,54 @@ fn oauth_state_crosses_the_journal_boundary_on_create_and_consume() {
     drop(store);
 
     let restored = Store::new_with_config(config);
-    restored.replay_wal(&crate::pubsub::Broker::new());
+    restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
     assert!(restored.get(key, Instant::now()).is_none());
+}
+
+#[test]
+fn corrupt_cold_access_revocation_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    let config = Arc::new(ServerConfig {
+        data_dir: path.clone(),
+        storage: crate::StorageConfig {
+            mode: crate::StorageMode::Tiered,
+            dir: path,
+        },
+        durability: DurabilityConfig {
+            policy: DurabilityPolicy::AlwaysSync,
+            ..DurabilityConfig::default()
+        },
+        ..ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let now = Instant::now();
+    let session_id = "session-with-revocation";
+    persist_access_revocation(&store, session_id, "123", now).unwrap();
+    let key = access_revoked_after_key(session_id);
+    assert!(store.evict_key(store.shard_for_key(&key), &key));
+
+    let cold_path = std::fs::read_dir(&store.config().storage.dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("data.lux"))
+        .find(|path| std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 8))
+        .expect("the evicted revocation marker must have a cold data file");
+    let mut cold_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(cold_path)
+        .unwrap();
+    cold_file.seek(SeekFrom::Start(8)).unwrap();
+    let mut byte = [0u8; 1];
+    cold_file.read_exact(&mut byte).unwrap();
+    cold_file.seek(SeekFrom::Start(8)).unwrap();
+    cold_file.write_all(&[byte[0] ^ 0xff]).unwrap();
+    cold_file.sync_all().unwrap();
+
+    let error = access_revoked_after(&store, session_id, now).unwrap_err();
+    assert!(error.contains("cold storage read failed"), "{error}");
+    assert!(!store.wal_enabled());
 }
 
 #[test]
@@ -2320,7 +2366,7 @@ fn auth_users_survive_wal_replay() {
     let restored = Store::new_with_config(config);
     let restored_cache = Arc::new(RwLock::new(SchemaCache::new()));
     bootstrap(&restored, &restored_cache, &restored.config().auth).unwrap();
-    restored.replay_wal(&crate::pubsub::Broker::new());
+    restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
     bootstrap_runtime(&restored, &restored_cache, &restored.config().auth).unwrap();
 
     let user = find_row_by_field(

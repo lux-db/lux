@@ -4,6 +4,7 @@
 //! durability policy and may be enabled for either memory or tiered layouts.
 
 use crate::store::{DumpEntry, DumpValue, StreamGroupDump};
+use rand_core::{OsRng, RngCore};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -11,9 +12,17 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-// Magic bytes written at the start of WAL and data files to identify the
-// checksummed format (v2). Files without this magic are treated as legacy.
-const WAL_MAGIC: &[u8; 4] = b"LXW1";
+// LXW1 introduced checksummed frames. LXW2 adds a random generation so a
+// snapshot can identify the exact WAL prefix represented by its contents.
+const WAL_MAGIC_V1: &[u8; 4] = b"LXW1";
+const WAL_MAGIC_V2: &[u8; 4] = b"LXW2";
+const WAL_MAGIC: &[u8; 4] = b"LXW3";
+const WAL_GENERATION_LEN: usize = 16;
+const WAL_HEADER_V2_LEN: u64 = (WAL_MAGIC_V2.len() + WAL_GENERATION_LEN) as u64;
+const WAL_HEADER_LEN: u64 = WAL_HEADER_V2_LEN + 4;
+const WAL_FRAME_MAGIC: &[u8; 4] = b"LXF1";
+const LEGACY_WAL_GENERATION: [u8; WAL_GENERATION_LEN] = [0; WAL_GENERATION_LEN];
+const MAX_WAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 const DATA_MAGIC: &[u8; 4] = b"LXD1";
 const WAL_BATCH_MARKER: &[u8] = b"\0LUX:BATCH";
 
@@ -82,33 +91,39 @@ impl StorageMode {
 ///
 /// Stores resolved mutation commands in a length-prefixed binary format. Each
 /// logical mutation is appended here before its in-memory effects are applied.
-/// On crash, the WAL is replayed by re-executing those commands. It is truncated
+/// On crash, the WAL is replayed by re-executing those commands. It is rotated
 /// after each snapshot because the snapshot already contains their effects.
 ///
 /// A multi-command logical mutation is encoded inside one checksummed frame, so
 /// recovery accepts the entire batch or none of it.
 ///
-/// v2 frame format: [4B frame_len][4B crc32][4B argc][for each arg: 4B len + bytes]
+/// Checksummed frame: [4B frame_len][4B crc32][4B argc][for each arg: 4B len + bytes]
 /// Legacy format:   [4B frame_len][4B argc][for each arg: 4B len + bytes]
 pub struct Wal {
     file: File,
-    /// True if this WAL file starts with WAL_MAGIC (v2 checksummed format).
-    has_checksums: bool,
+    path: PathBuf,
+    frame_format: WalFrameFormat,
+    header_len: u64,
+    generation: [u8; WAL_GENERATION_LEN],
 }
 
-/// Checksum details for one corrupted WAL frame skipped during replay.
-pub struct WalCorruptedFrame {
-    pub stored_crc: u32,
-    pub computed_crc: u32,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalFrameFormat {
+    Legacy,
+    Checksummed,
+    Guarded,
+}
+
+/// Identifies the durable end of one WAL generation included in a snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WalCheckpoint {
+    pub generation: [u8; WAL_GENERATION_LEN],
+    pub offset: u64,
 }
 
 /// Result of scanning a WAL file for replay.
-///
-/// The low-level disk layer records corruption details here; the Store layer
-/// owns configuration and emits the corresponding warning events.
 pub struct WalReplay {
     pub commands: Vec<Vec<Vec<u8>>>,
-    pub corrupted_frames: Vec<WalCorruptedFrame>,
 }
 
 impl Wal {
@@ -137,8 +152,9 @@ impl Wal {
 
     fn open_in(wal_dir: impl AsRef<Path>) -> io::Result<Self> {
         let wal_dir = wal_dir.as_ref();
-        fs::create_dir_all(wal_dir)?;
+        create_dir_all_synced(wal_dir)?;
         let path = wal_dir.join("wal.lux");
+        let created = !path.exists();
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -146,31 +162,74 @@ impl Wal {
             .open(&path)?;
 
         let file_len = file.seek(SeekFrom::End(0))?;
-        let has_checksums = if file_len == 0 {
-            // New file: write magic header and start in v2 mode.
-            file.write_all(WAL_MAGIC)?;
-            file.flush()?;
-            true
+        let (frame_format, header_len, generation) = if file_len == 0 {
+            let generation = new_wal_generation();
+            write_wal_header(&mut file, &generation)?;
+            file.sync_all()?;
+            if created {
+                sync_directory(wal_dir)?;
+            }
+            (WalFrameFormat::Guarded, WAL_HEADER_LEN, generation)
         } else {
-            // Existing file: check for magic.
             file.seek(SeekFrom::Start(0))?;
             let mut magic = [0u8; 4];
-            if file.read_exact(&mut magic).is_ok() && &magic == WAL_MAGIC {
+            file.read_exact(&mut magic)?;
+            if &magic == WAL_MAGIC {
+                let mut generation = [0u8; WAL_GENERATION_LEN];
+                file.read_exact(&mut generation).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("truncated LXW3 WAL header: {error}"),
+                    )
+                })?;
+                let stored_crc = read_u32(&mut file).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("truncated LXW3 WAL header checksum: {error}"),
+                    )
+                })?;
+                let computed_crc = wal_header_crc(&generation);
+                if stored_crc != computed_crc {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "LXW3 WAL header checksum mismatch",
+                    ));
+                }
                 file.seek(SeekFrom::End(0))?;
-                true
+                (WalFrameFormat::Guarded, WAL_HEADER_LEN, generation)
+            } else if &magic == WAL_MAGIC_V2 {
+                let mut generation = [0u8; WAL_GENERATION_LEN];
+                file.read_exact(&mut generation).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("truncated LXW2 WAL header: {error}"),
+                    )
+                })?;
+                file.seek(SeekFrom::End(0))?;
+                (WalFrameFormat::Checksummed, WAL_HEADER_V2_LEN, generation)
+            } else if &magic == WAL_MAGIC_V1 {
+                file.seek(SeekFrom::End(0))?;
+                (
+                    WalFrameFormat::Checksummed,
+                    WAL_MAGIC_V1.len() as u64,
+                    LEGACY_WAL_GENERATION,
+                )
             } else {
                 file.seek(SeekFrom::End(0))?;
-                false
+                (WalFrameFormat::Legacy, 0, LEGACY_WAL_GENERATION)
             }
         };
 
         Ok(Wal {
             file,
-            has_checksums,
+            path,
+            frame_format,
+            header_len,
+            generation,
         })
     }
 
-    fn encode_command_frame(args: &[&[u8]], out: &mut Vec<u8>) {
+    fn encode_command_frame(format: WalFrameFormat, args: &[&[u8]], out: &mut Vec<u8>) {
         let mut payload = Vec::new();
         let argc = args.len() as u32;
         payload.extend_from_slice(&argc.to_le_bytes());
@@ -180,12 +239,30 @@ impl Wal {
             payload.extend_from_slice(arg);
         }
 
-        let checksum = crc32(&payload);
-        let frame_len = (4 + payload.len()) as u32;
-
-        out.extend_from_slice(&frame_len.to_le_bytes());
-        out.extend_from_slice(&checksum.to_le_bytes());
-        out.extend_from_slice(&payload);
+        match format {
+            WalFrameFormat::Guarded => {
+                let frame_len = payload.len() as u32;
+                let mut checksum_data = Vec::with_capacity(4 + payload.len());
+                checksum_data.extend_from_slice(&frame_len.to_le_bytes());
+                checksum_data.extend_from_slice(&payload);
+                out.extend_from_slice(WAL_FRAME_MAGIC);
+                out.extend_from_slice(&frame_len.to_le_bytes());
+                out.extend_from_slice(&(!frame_len).to_le_bytes());
+                out.extend_from_slice(&crc32(&checksum_data).to_le_bytes());
+                out.extend_from_slice(&payload);
+            }
+            WalFrameFormat::Checksummed => {
+                let checksum = crc32(&payload);
+                let frame_len = (4 + payload.len()) as u32;
+                out.extend_from_slice(&frame_len.to_le_bytes());
+                out.extend_from_slice(&checksum.to_le_bytes());
+                out.extend_from_slice(&payload);
+            }
+            WalFrameFormat::Legacy => {
+                out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                out.extend_from_slice(&payload);
+            }
+        }
     }
 
     /// Append a command to the WAL. Builds the entire frame in memory and
@@ -195,7 +272,7 @@ impl Wal {
     #[cfg(test)]
     pub fn append_command(&mut self, args: &[&[u8]]) -> io::Result<()> {
         let mut frame = Vec::new();
-        Self::encode_command_frame(args, &mut frame);
+        Self::encode_command_frame(self.frame_format, args, &mut frame);
 
         self.append_encoded_frames(&frame)
     }
@@ -215,10 +292,14 @@ impl Wal {
         }
         let mut frame = Vec::new();
         if commands.len() == 1 {
-            Self::encode_command_frame(commands[0], &mut frame);
+            Self::encode_command_frame(self.frame_format, commands[0], &mut frame);
         } else {
             let payload = encode_command_batch(&commands)?;
-            Self::encode_command_frame(&[WAL_BATCH_MARKER, &payload], &mut frame);
+            Self::encode_command_frame(
+                self.frame_format,
+                &[WAL_BATCH_MARKER, &payload],
+                &mut frame,
+            );
         }
         self.append_encoded_frames(&frame)
     }
@@ -245,6 +326,17 @@ impl Wal {
         self.file.seek(SeekFrom::End(0))
     }
 
+    pub(crate) fn checkpoint(&mut self) -> io::Result<WalCheckpoint> {
+        // The snapshot can safely name this offset only after the complete
+        // prefix is durable. Otherwise a power loss could preserve the newer
+        // snapshot but shorten its matching WAL below the recorded offset.
+        self.file.sync_all()?;
+        Ok(WalCheckpoint {
+            generation: self.generation,
+            offset: self.end_offset()?,
+        })
+    }
+
     pub fn rollback_to(&mut self, offset: u64) -> io::Result<()> {
         self.file.set_len(offset)?;
         self.file.seek(SeekFrom::End(0))?;
@@ -252,107 +344,373 @@ impl Wal {
         Ok(())
     }
 
-    /// Read all commands from the WAL for replay. Partial/corrupt frames
-    /// (from a crash mid-write) are safely skipped. Checksummed frames (v2)
-    /// are validated; frames with bad checksums are rejected and counted.
+    /// Read all commands from the WAL for replay. A partial final guarded frame
+    /// is an uncommitted append and is ignored; structural corruption fails
+    /// closed so recovery never silently skips an acknowledged mutation.
+    #[cfg(test)]
     pub fn replay(&mut self) -> io::Result<WalReplay> {
+        self.replay_from(None)
+    }
+
+    /// Replay commands not already represented by the installed snapshot.
+    /// A checkpoint only applies to the exact WAL generation it names.
+    pub(crate) fn replay_from(
+        &mut self,
+        checkpoint: Option<WalCheckpoint>,
+    ) -> io::Result<WalReplay> {
         let file_len = self.file.seek(SeekFrom::End(0))?;
         if file_len == 0 {
             return Ok(WalReplay {
                 commands: Vec::new(),
-                corrupted_frames: Vec::new(),
             });
         }
 
-        // Skip past magic header if present.
-        if self.has_checksums {
-            self.file.seek(SeekFrom::Start(4))?;
-        } else {
-            self.file.seek(SeekFrom::Start(0))?;
-        }
+        let replay_offset = match checkpoint {
+            Some(checkpoint) if checkpoint.generation == self.generation => {
+                self.validate_checkpoint_offset(checkpoint.offset, file_len)?;
+                checkpoint.offset
+            }
+            _ => self.header_len,
+        };
+        self.file.seek(SeekFrom::Start(replay_offset))?;
 
         let mut commands = Vec::new();
-        let mut corrupted_frames = Vec::new();
 
-        loop {
-            let frame_len = match read_u32(&mut self.file) {
-                Ok(l) => l as usize,
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(_) => break,
-            };
-            let payload_start = self.file.stream_position()?;
-            if payload_start + frame_len as u64 > file_len {
-                break;
-            }
-
-            let mut buf = vec![0u8; frame_len];
-            match self.file.read_exact(&mut buf) {
-                Ok(()) => {}
-                Err(_) => break, // partial frame at end (crash mid-write)
-            }
-
-            let payload = if self.has_checksums {
-                if buf.len() < 4 {
-                    continue;
-                }
-                let stored_crc = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                let data = &buf[4..];
-                let computed_crc = crc32(data);
-                if stored_crc != computed_crc {
-                    corrupted_frames.push(WalCorruptedFrame {
-                        stored_crc,
-                        computed_crc,
-                    });
-                    continue;
-                }
-                &buf[4..]
-            } else {
-                &buf[..]
-            };
+        while let Some(payload) = self.read_next_frame_payload(file_len)? {
+            let payload = payload.as_slice();
 
             let mut cursor = payload;
-            let argc = match read_u32(&mut cursor) {
-                Ok(n) => n as usize,
-                Err(_) => continue,
-            };
+            let argc = read_u32(&mut cursor).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("WAL frame has no argument count: {error}"),
+                )
+            })? as usize;
+            if argc == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WAL frame contains an empty command",
+                ));
+            }
 
             let mut args = Vec::new();
-            let mut valid = true;
             for _ in 0..argc {
-                match read_bytes(&mut cursor) {
-                    Ok(arg) => args.push(arg),
-                    Err(_) => {
-                        valid = false;
-                        break;
-                    }
-                }
+                args.push(read_bytes(&mut cursor).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("WAL frame contains a malformed argument: {error}"),
+                    )
+                })?);
             }
-            if valid && !args.is_empty() {
-                if args.len() == 2 && args[0] == WAL_BATCH_MARKER {
-                    if let Ok(batch) = decode_command_batch(&args[1]) {
-                        commands.extend(batch);
-                    }
-                } else {
-                    commands.push(args);
-                }
+            if !cursor.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WAL frame contains trailing bytes",
+                ));
+            }
+            if args.len() == 2 && args[0] == WAL_BATCH_MARKER {
+                commands.extend(decode_command_batch(&args[1])?);
+            } else {
+                commands.push(args);
             }
         }
         self.file.seek(SeekFrom::End(0))?;
-        Ok(WalReplay {
-            commands,
-            corrupted_frames,
-        })
+        Ok(WalReplay { commands })
+    }
+
+    fn read_next_frame_payload(&mut self, file_len: u64) -> io::Result<Option<Vec<u8>>> {
+        if self.file.stream_position()? >= file_len {
+            return Ok(None);
+        }
+        match self.frame_format {
+            WalFrameFormat::Guarded => {
+                let mut magic = [0u8; 4];
+                if let Err(error) = self.file.read_exact(&mut magic) {
+                    return if error.kind() == io::ErrorKind::UnexpectedEof {
+                        Ok(None)
+                    } else {
+                        Err(error)
+                    };
+                }
+                if &magic != WAL_FRAME_MAGIC {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "WAL frame boundary marker is corrupt",
+                    ));
+                }
+                let frame_len = match read_u32(&mut self.file) {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                let complement = match read_u32(&mut self.file) {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                let stored_crc = match read_u32(&mut self.file) {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                if complement != !frame_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "WAL frame length guard is corrupt",
+                    ));
+                }
+                let frame_len = frame_len as usize;
+                if frame_len > MAX_WAL_FRAME_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "WAL frame length exceeds maximum",
+                    ));
+                }
+                let payload_start = self.file.stream_position()?;
+                if payload_start
+                    .checked_add(frame_len as u64)
+                    .is_none_or(|end| end > file_len)
+                {
+                    return Ok(None);
+                }
+                let mut payload = vec![0u8; frame_len];
+                self.file.read_exact(&mut payload)?;
+                let mut checksum_data = Vec::with_capacity(4 + payload.len());
+                checksum_data.extend_from_slice(&(frame_len as u32).to_le_bytes());
+                checksum_data.extend_from_slice(&payload);
+                let computed_crc = crc32(&checksum_data);
+                if stored_crc != computed_crc {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "WAL frame checksum mismatch (stored={stored_crc:#010x} \
+                             computed={computed_crc:#010x})"
+                        ),
+                    ));
+                }
+                Ok(Some(payload))
+            }
+            WalFrameFormat::Checksummed | WalFrameFormat::Legacy => {
+                let frame_len = match read_u32(&mut self.file) {
+                    Ok(value) => value as usize,
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                if frame_len > MAX_WAL_FRAME_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "WAL frame length exceeds maximum",
+                    ));
+                }
+                let payload_start = self.file.stream_position()?;
+                if payload_start
+                    .checked_add(frame_len as u64)
+                    .is_none_or(|end| end > file_len)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "legacy WAL ends inside a frame",
+                    ));
+                }
+                let mut frame = vec![0u8; frame_len];
+                self.file.read_exact(&mut frame)?;
+                if self.frame_format == WalFrameFormat::Legacy {
+                    return Ok(Some(frame));
+                }
+                if frame.len() < 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "WAL frame is too short for its checksum",
+                    ));
+                }
+                let stored_crc = u32::from_le_bytes(frame[..4].try_into().unwrap());
+                let payload = frame[4..].to_vec();
+                let computed_crc = crc32(&payload);
+                if stored_crc != computed_crc {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "WAL frame checksum mismatch (stored={stored_crc:#010x} \
+                             computed={computed_crc:#010x})"
+                        ),
+                    ));
+                }
+                Ok(Some(payload))
+            }
+        }
+    }
+
+    fn validate_checkpoint_offset(&mut self, offset: u64, file_len: u64) -> io::Result<()> {
+        if offset < self.header_len || offset > file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot WAL checkpoint is outside the journal",
+            ));
+        }
+        let mut position = self.header_len;
+        self.file.seek(SeekFrom::Start(position))?;
+        while position < offset {
+            if self.read_next_frame_payload(file_len)?.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snapshot WAL checkpoint does not fall on a frame boundary",
+                ));
+            }
+            position = self.file.stream_position()?;
+            if position > offset {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snapshot WAL checkpoint does not fall on a frame boundary",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn truncate(&mut self) -> io::Result<()> {
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        // Re-write magic so new appends are checksummed.
-        self.file.write_all(WAL_MAGIC)?;
-        self.file.flush()?;
-        self.has_checksums = true;
-        Ok(())
+        let generation = new_wal_generation();
+        let tmp = self.path.with_extension(format!(
+            "lux.rotate.{}.{}",
+            std::process::id(),
+            u128::from_le_bytes(generation)
+        ));
+        let mut replacement = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .append(true)
+            .open(&tmp)?;
+        if let Err(error) = replacement
+            .write_all(&wal_header_bytes(&generation))
+            .and_then(|_| replacement.sync_all())
+        {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&tmp, &self.path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+
+        // Keep writing through the descriptor of the inode that was just
+        // installed even if the directory fsync itself reports an error.
+        self.file = replacement;
+        self.frame_format = WalFrameFormat::Guarded;
+        self.header_len = WAL_HEADER_LEN;
+        self.generation = generation;
+        sync_directory(
+            self.path
+                .parent()
+                .ok_or_else(|| io::Error::other("WAL path has no parent directory"))?,
+        )
     }
+}
+
+fn wal_header_crc(generation: &[u8; WAL_GENERATION_LEN]) -> u32 {
+    let mut protected = Vec::with_capacity(WAL_MAGIC.len() + generation.len());
+    protected.extend_from_slice(WAL_MAGIC);
+    protected.extend_from_slice(generation);
+    crc32(&protected)
+}
+
+fn wal_header_bytes(generation: &[u8; WAL_GENERATION_LEN]) -> Vec<u8> {
+    let mut header = Vec::with_capacity(WAL_HEADER_LEN as usize);
+    header.extend_from_slice(WAL_MAGIC);
+    header.extend_from_slice(generation);
+    header.extend_from_slice(&wal_header_crc(generation).to_le_bytes());
+    header
+}
+
+fn write_wal_header(file: &mut File, generation: &[u8; WAL_GENERATION_LEN]) -> io::Result<()> {
+    file.write_all(&wal_header_bytes(generation))
+}
+
+fn new_wal_generation() -> [u8; WAL_GENERATION_LEN] {
+    loop {
+        let mut generation = [0u8; WAL_GENERATION_LEN];
+        OsRng.fill_bytes(&mut generation);
+        if generation != LEGACY_WAL_GENERATION {
+            return generation;
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Create a directory tree and durably install each newly created component.
+pub(crate) fn create_dir_all_synced(path: &Path) -> io::Result<()> {
+    let absolute;
+    let path = if path.is_absolute() {
+        path
+    } else {
+        absolute = std::env::current_dir()?.join(path);
+        &absolute
+    };
+    if path.is_dir() {
+        return Ok(());
+    }
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        cursor = cursor.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory has no existing ancestor",
+            )
+        })?;
+    }
+    fs::create_dir_all(path)?;
+    for created in missing.iter().rev() {
+        if let Some(parent) = created.parent() {
+            sync_directory(parent)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove derived tiered-placement files before authoritative recovery.
+///
+/// Snapshots plus the mutation journal own durability. Reusing `data.lux`
+/// while replaying that same history can apply relative mutations twice, and
+/// its process-relative TTL metadata is not valid across a restart. Preserve
+/// per-shard WAL files and any unrelated operator-owned files.
+pub(crate) fn discard_tiered_cache(root: &Path) -> io::Result<()> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with("shard_") || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let shard_dir = entry.path();
+        let mut changed = false;
+        for file_name in ["data.lux", "data.compact.tmp"] {
+            let path = shard_dir.join(file_name);
+            match fs::remove_file(&path) {
+                Ok(()) => changed = true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if changed {
+            sync_directory(&shard_dir)?;
+        }
+    }
+    Ok(())
 }
 
 fn encode_command_batch(commands: &[&[&[u8]]]) -> io::Result<Vec<u8>> {
@@ -1234,6 +1592,40 @@ mod tests {
     }
 
     #[test]
+    fn recovery_discards_only_tiered_cache_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_dir = dir.path().join("shard_0");
+        let unrelated_dir = dir.path().join("operator-data");
+        fs::create_dir_all(&unrelated_dir).unwrap();
+        fs::write(unrelated_dir.join("data.lux"), b"keep").unwrap();
+
+        {
+            let mut shard = DiskShard::open(dir.path(), 0).unwrap();
+            shard
+                .put(
+                    "key",
+                    &DumpEntry {
+                        key: "key".to_string(),
+                        value: DumpValue::Str(b"value".to_vec()),
+                        ttl_ms: -1,
+                    },
+                )
+                .unwrap();
+        }
+        fs::write(shard_dir.join("data.compact.tmp"), b"stale").unwrap();
+        fs::write(shard_dir.join("wal.lux"), b"journal").unwrap();
+        fs::write(shard_dir.join("keep.txt"), b"keep").unwrap();
+
+        discard_tiered_cache(dir.path()).unwrap();
+
+        assert!(!shard_dir.join("data.lux").exists());
+        assert!(!shard_dir.join("data.compact.tmp").exists());
+        assert_eq!(fs::read(shard_dir.join("wal.lux")).unwrap(), b"journal");
+        assert_eq!(fs::read(shard_dir.join("keep.txt")).unwrap(), b"keep");
+        assert_eq!(fs::read(unrelated_dir.join("data.lux")).unwrap(), b"keep");
+    }
+
+    #[test]
     fn disk_shard_roundtrip_with_checksum() {
         let dir = tempfile::tempdir().unwrap();
         let entry = DumpEntry {
@@ -1301,7 +1693,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut wal = Wal::open(dir.path(), 0).unwrap();
-            assert!(wal.has_checksums);
+            assert_eq!(wal.frame_format, WalFrameFormat::Guarded);
             wal.append_command(&[b"SET", b"key1", b"val1"]).unwrap();
             wal.append_command(&[b"SET", b"key2", b"val2"]).unwrap();
             wal.fsync().unwrap();
@@ -1309,7 +1701,7 @@ mod tests {
 
         {
             let mut wal = Wal::open(dir.path(), 0).unwrap();
-            assert!(wal.has_checksums);
+            assert_eq!(wal.frame_format, WalFrameFormat::Guarded);
             let replay = wal.replay().unwrap();
             let commands = replay.commands;
             assert_eq!(commands.len(), 2);
@@ -1317,6 +1709,86 @@ mod tests {
             assert_eq!(commands[0][1], b"key1");
             assert_eq!(commands[1][1], b"key2");
         }
+    }
+
+    #[test]
+    fn lxw1_journal_remains_replayable_and_checkpointable() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("shard_0");
+        fs::create_dir_all(&wal_dir).unwrap();
+        let mut bytes = WAL_MAGIC_V1.to_vec();
+        Wal::encode_command_frame(
+            WalFrameFormat::Checksummed,
+            &[b"SET", b"legacy", b"value"],
+            &mut bytes,
+        );
+        fs::write(wal_dir.join("wal.lux"), bytes).unwrap();
+
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        assert_eq!(wal.generation, LEGACY_WAL_GENERATION);
+        assert_eq!(wal.header_len, WAL_MAGIC_V1.len() as u64);
+        let checkpoint = wal.checkpoint().unwrap();
+        assert_eq!(wal.replay().unwrap().commands.len(), 1);
+        assert!(wal
+            .replay_from(Some(checkpoint))
+            .unwrap()
+            .commands
+            .is_empty());
+    }
+
+    #[test]
+    fn lxw2_journal_remains_replayable() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("shard_0");
+        fs::create_dir_all(&wal_dir).unwrap();
+        let generation = new_wal_generation();
+        let mut bytes = WAL_MAGIC_V2.to_vec();
+        bytes.extend_from_slice(&generation);
+        Wal::encode_command_frame(
+            WalFrameFormat::Checksummed,
+            &[b"SET", b"legacy-v2", b"value"],
+            &mut bytes,
+        );
+        fs::write(wal_dir.join("wal.lux"), bytes).unwrap();
+
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        assert_eq!(wal.generation, generation);
+        assert_eq!(wal.frame_format, WalFrameFormat::Checksummed);
+        let replay = wal.replay().unwrap();
+        assert_eq!(replay.commands.len(), 1);
+        assert_eq!(replay.commands[0][1], b"legacy-v2");
+    }
+
+    #[test]
+    fn truncated_lxw2_header_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("shard_0");
+        fs::create_dir_all(&wal_dir).unwrap();
+        fs::write(wal_dir.join("wal.lux"), b"LXW2short").unwrap();
+
+        let error = Wal::open(dir.path(), 0).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn new_relative_wal_directory_is_created_durably() {
+        let name = format!(
+            ".lux-relative-wal-test-{}-{}",
+            std::process::id(),
+            u64::from_le_bytes(new_wal_generation()[..8].try_into().unwrap())
+        );
+        let root = PathBuf::from(&name);
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+
+        let wal = Wal::open_named(&root, "global").unwrap();
+        assert!(root.join("global/wal.lux").is_file());
+        drop(wal);
     }
 
     #[test]
@@ -1339,7 +1811,6 @@ mod tests {
                 vec![b"SET".to_vec(), b"k2".to_vec(), b"v2".to_vec()],
             ]
         );
-        assert!(replay.corrupted_frames.is_empty());
     }
 
     #[test]
@@ -1362,6 +1833,57 @@ mod tests {
         let mut wal = Wal::open(dir.path(), 0).unwrap();
         let replay = wal.replay().unwrap();
         assert!(replay.commands.is_empty());
+    }
+
+    #[test]
+    fn guarded_wal_accepts_every_torn_tail_boundary() {
+        let source = tempfile::tempdir().unwrap();
+        {
+            let mut wal = Wal::open(source.path(), 0).unwrap();
+            wal.append_command(&[b"SET", b"key", b"value"]).unwrap();
+        }
+        let complete = fs::read(source.path().join("shard_0/wal.lux")).unwrap();
+        for end in WAL_HEADER_LEN as usize..complete.len() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = dir.path().join("shard_0");
+            fs::create_dir_all(&wal_dir).unwrap();
+            fs::write(wal_dir.join("wal.lux"), &complete[..end]).unwrap();
+            let mut wal = Wal::open(dir.path(), 0).unwrap();
+            assert!(
+                wal.replay().unwrap().commands.is_empty(),
+                "torn boundary {end} replayed a partial mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_wal_rejects_every_single_bit_header_corruption() {
+        let source = tempfile::tempdir().unwrap();
+        {
+            let mut wal = Wal::open(source.path(), 0).unwrap();
+            wal.append_command(&[b"SET", b"key", b"value"]).unwrap();
+            wal.fsync().unwrap();
+        }
+        let complete = fs::read(source.path().join("shard_0/wal.lux")).unwrap();
+
+        for offset in 0..WAL_HEADER_LEN as usize {
+            for bit in 0..8 {
+                let dir = tempfile::tempdir().unwrap();
+                let wal_dir = dir.path().join("shard_0");
+                fs::create_dir_all(&wal_dir).unwrap();
+                let mut corrupted = complete.clone();
+                corrupted[offset] ^= 1 << bit;
+                fs::write(wal_dir.join("wal.lux"), corrupted).unwrap();
+
+                let rejected = match Wal::open(dir.path(), 0) {
+                    Err(error) => error.kind() == io::ErrorKind::InvalidData,
+                    Ok(mut wal) => wal
+                        .replay()
+                        .is_err_and(|error| error.kind() == io::ErrorKind::InvalidData),
+                };
+                assert!(rejected, "header bit {bit} at byte {offset} was accepted");
+            }
+        }
     }
 
     #[test]
@@ -1388,24 +1910,46 @@ mod tests {
             wal.fsync().unwrap();
         }
 
-        // Corrupt the first frame's payload (after magic + frame_len + crc).
+        // Corrupt the first frame's payload (after header + frame_len + crc).
         let wal_path = dir.path().join("shard_0/wal.lux");
         let mut data = fs::read(&wal_path).unwrap();
-        // Flip a byte after magic(4) + frame_len(4) + crc(4) = offset 12.
-        if data.len() > 14 {
-            data[14] ^= 0xFF;
+        let corrupt_offset = WAL_HEADER_LEN as usize + 10;
+        if data.len() > corrupt_offset {
+            data[corrupt_offset] ^= 0xFF;
         }
         fs::write(&wal_path, &data).unwrap();
 
         {
             let mut wal = Wal::open(dir.path(), 0).unwrap();
-            let replay = wal.replay().unwrap();
-            assert_eq!(replay.corrupted_frames.len(), 1);
-            let commands = replay.commands;
-            // First frame corrupted, second should still be valid.
-            assert_eq!(commands.len(), 1);
-            assert_eq!(commands[0][1], b"k2");
+            let error = match wal.replay() {
+                Ok(_) => panic!("a complete corrupt frame must fail recovery"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
+    }
+
+    #[test]
+    fn guarded_wal_detects_corrupted_length_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut wal = Wal::open(dir.path(), 0).unwrap();
+            wal.append_command(&[b"SET", b"k1", b"v1"]).unwrap();
+            wal.append_command(&[b"SET", b"k2", b"v2"]).unwrap();
+            wal.fsync().unwrap();
+        }
+
+        let wal_path = dir.path().join("shard_0/wal.lux");
+        let mut data = fs::read(&wal_path).unwrap();
+        data[WAL_HEADER_LEN as usize + WAL_FRAME_MAGIC.len()] ^= 0x40;
+        fs::write(&wal_path, data).unwrap();
+
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        let error = match wal.replay() {
+            Ok(_) => panic!("a corrupt frame length must fail recovery"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -1414,7 +1958,7 @@ mod tests {
         let mut wal = Wal::open(dir.path(), 0).unwrap();
         wal.append_command(&[b"SET", b"x", b"y"]).unwrap();
         wal.truncate().unwrap();
-        assert!(wal.has_checksums);
+        assert_eq!(wal.frame_format, WalFrameFormat::Guarded);
 
         // After truncate, replay should return empty.
         let commands = wal.replay().unwrap().commands;
@@ -1424,6 +1968,50 @@ mod tests {
         wal.append_command(&[b"SET", b"a", b"b"]).unwrap();
         let commands = wal.replay().unwrap().commands;
         assert_eq!(commands.len(), 1);
+    }
+
+    #[test]
+    fn matching_checkpoint_skips_only_the_included_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        wal.append_command(&[b"INCR", b"included"]).unwrap();
+        let checkpoint = wal.checkpoint().unwrap();
+        wal.append_command(&[b"INCR", b"after-snapshot"]).unwrap();
+
+        let replay = wal.replay_from(Some(checkpoint)).unwrap();
+        assert_eq!(replay.commands.len(), 1);
+        assert_eq!(replay.commands[0][1], b"after-snapshot");
+    }
+
+    #[test]
+    fn rotated_generation_replays_all_new_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        wal.append_command(&[b"INCR", b"included"]).unwrap();
+        let checkpoint = wal.checkpoint().unwrap();
+        wal.truncate().unwrap();
+        assert_ne!(wal.generation, checkpoint.generation);
+        wal.append_command(&[b"INCR", b"after-snapshot"]).unwrap();
+
+        let replay = wal.replay_from(Some(checkpoint)).unwrap();
+        assert_eq!(replay.commands.len(), 1);
+        assert_eq!(replay.commands[0][1], b"after-snapshot");
+
+        drop(wal);
+        let mut reopened = Wal::open(dir.path(), 0).unwrap();
+        assert_eq!(reopened.replay().unwrap().commands.len(), 1);
+    }
+
+    #[test]
+    fn invalid_checkpoint_offset_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        wal.append_command(&[b"SET", b"key", b"value"]).unwrap();
+        let mut checkpoint = wal.checkpoint().unwrap();
+        checkpoint.offset -= 1;
+
+        let error = wal.replay_from(Some(checkpoint)).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -1474,12 +2062,15 @@ mod tests {
             wal.fsync().unwrap();
         }
 
-        // Append garbage (simulates partial frame from crash mid-write).
+        // Append a complete guarded header but no payload (simulates a crash
+        // after the frame header write and before its body reached disk).
         let wal_path = dir.path().join("shard_0/wal.lux");
         let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
-        // Write a frame_len header but no actual payload.
-        file.write_all(&100u32.to_le_bytes()).unwrap();
-        file.write_all(b"partial").unwrap();
+        let frame_len = 100u32;
+        file.write_all(WAL_FRAME_MAGIC).unwrap();
+        file.write_all(&frame_len.to_le_bytes()).unwrap();
+        file.write_all(&(!frame_len).to_le_bytes()).unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
         file.flush().unwrap();
         drop(file);
 
@@ -1565,17 +2156,17 @@ mod tests {
 
         let wal_path = dir.path().join("shard_0/wal.lux");
         let size_before = fs::metadata(&wal_path).unwrap().len();
-        assert_eq!(size_before, 4, "should only have magic header");
+        assert_eq!(size_before, WAL_HEADER_LEN, "should only have WAL header");
 
         wal.append_command(&[b"SET", b"x", b"y"]).unwrap();
         let size_after = fs::metadata(&wal_path).unwrap().len();
 
-        // Frame: 4B frame_len + 4B crc + 4B argc + (4B+3 "SET") + (4B+1 "x") + (4B+1 "y")
+        // Frame: 4B magic + 4B length + 4B length guard + 4B CRC + payload.
         let payload_size: u64 = 4 + 7 + 5 + 5; // argc + 3 args
-        let frame_size = 4 + 4 + payload_size; // frame_len + crc + payload
+        let frame_size = 4 + 4 + 4 + 4 + payload_size;
         assert_eq!(
             size_after,
-            4 + frame_size,
+            WAL_HEADER_LEN + frame_size,
             "file should grow by exactly one frame"
         );
     }
@@ -1701,9 +2292,15 @@ mod tests {
                 .unwrap();
 
             let mut wal = Wal::open(dir.path(), 0).unwrap();
-            let commands = wal.replay().unwrap().commands;
-            prop_assert!(!commands.is_empty(), "valid command should survive garbage");
-            prop_assert_eq!(&commands[0][0], b"SET");
+            match wal.replay() {
+                Ok(replay) => {
+                    prop_assert!(!replay.commands.is_empty(), "valid command should survive an incomplete suffix");
+                    prop_assert_eq!(&replay.commands[0][0], b"SET");
+                }
+                Err(error) => {
+                    prop_assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                }
+            }
         }
     }
 

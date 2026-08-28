@@ -27,7 +27,7 @@ fn journaled_expiry(
     let route: [&[u8]; 2] = [b"PEXPIREAT", key];
     let prepare = store.prepare_journaled(&route)?;
     let exists = store.exists(&[key], now) == 1;
-    let _commit = if exists {
+    let commit = if exists {
         let deadline = expires_at_ms.to_string().into_bytes();
         let command: [&[u8]; 3] = [b"PEXPIREAT", key, &deadline];
         prepare.commit(&command)?
@@ -35,14 +35,17 @@ fn journaled_expiry(
         prepare.commit_batch(&[])?
     };
     if !exists {
+        commit.complete()?;
         return Ok(false);
     }
-    if ttl_ms == 0 {
+    let changed = if ttl_ms == 0 {
         store.del(&[key]);
-        Ok(true)
+        true
     } else {
-        Ok(store.pexpire(key, ttl_ms, now))
-    }
+        store.pexpire(key, ttl_ms, now)
+    };
+    commit.complete()?;
+    Ok(changed)
 }
 
 fn parse_usize_arg(arg: &[u8], out: &mut BytesMut) -> Option<usize> {
@@ -166,7 +169,9 @@ pub fn cmd_rename(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'rename' command");
         return CmdResult::Written;
     }
-    store.try_promote(args[2], now);
+    if !super::promote_keys(store, &args[1..3], out, now) {
+        return CmdResult::Written;
+    }
     match store.rename(args[1], args[2], now) {
         Ok(()) => resp::write_ok(out),
         Err(e) => resp::write_error(out, &e),
@@ -179,7 +184,9 @@ pub fn cmd_renamenx(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
         resp::write_error(out, "ERR wrong number of arguments for 'renamenx' command");
         return CmdResult::Written;
     }
-    store.try_promote(args[2], now);
+    if !super::promote_keys(store, &args[1..3], out, now) {
+        return CmdResult::Written;
+    }
     if store.get(args[2], now).is_some() {
         resp::write_integer(out, 0);
     } else {
@@ -246,7 +253,9 @@ pub fn cmd_copy(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
             return CmdResult::Written;
         }
     }
-    store.try_promote(args[2], now);
+    if !super::promote_keys(store, &args[1..3], out, now) {
+        return CmdResult::Written;
+    }
     match store.copy_key(args[1], args[2], replace, now) {
         Ok(copied) => resp::write_integer(out, if copied { 1 } else { 0 }),
         Err(e) => resp::write_error(out, &e),
@@ -393,14 +402,19 @@ pub fn cmd_persist(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
     } else {
         prepare.commit_batch(&[])
     };
-    let _commit = match commit {
+    let commit = match commit {
         Ok(commit) => commit,
         Err(error) => {
             resp::write_error(out, &format!("ERR WAL append failed: {error}"));
             return CmdResult::Written;
         }
     };
-    resp::write_integer(out, i64::from(has_ttl && store.persist(args[1], now)));
+    let changed = has_ttl && store.persist(args[1], now);
+    if let Err(error) = commit.complete() {
+        resp::write_error(out, &format!("ERR journal apply failed: {error}"));
+        return CmdResult::Written;
+    }
+    resp::write_integer(out, i64::from(changed));
     CmdResult::Written
 }
 

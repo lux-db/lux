@@ -45,10 +45,10 @@ pub struct DurabilityConfig {
 
 impl Default for DurabilityConfig {
     fn default() -> Self {
-        // ServerConfig has historically been persistent by default. Preserve
-        // that contract while adding a WAL to the memory layout.
+        // A successful write is durable by default. Lower-latency policies are
+        // explicit opt-ins because they weaken the acknowledgement guarantee.
         Self {
-            policy: DurabilityPolicy::EverySecond,
+            policy: DurabilityPolicy::AlwaysSync,
             sync_interval: Duration::from_secs(1),
         }
     }

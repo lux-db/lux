@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crate::resp;
 use crate::store::{JournalPlan, Store, StoreValue};
 
-use super::{arg_str, cmd_eq, format_float, parse_i64, parse_u64, CmdResult};
+use super::{arg_str, cmd_eq, format_float, parse_i64, parse_u64, promote_keys, CmdResult};
 
 const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
 type SortedSetPopResult = Option<(Vec<u8>, Vec<(String, f64)>)>;
@@ -871,8 +871,8 @@ pub fn cmd_zunionstore(
         return CmdResult::Written;
     }
     let keys: Vec<&[u8]> = args[3..3 + numkeys].to_vec();
-    for key in &keys {
-        store.try_promote(key, now);
+    if !promote_keys(store, &keys, out, now) {
+        return CmdResult::Written;
     }
     let (weights, aggregate) = match parse_zstore_options(&args[3 + numkeys..], numkeys, out) {
         Some(parsed) => parsed,
@@ -907,8 +907,8 @@ pub fn cmd_zinterstore(
         return CmdResult::Written;
     }
     let keys: Vec<&[u8]> = args[3..3 + numkeys].to_vec();
-    for key in &keys {
-        store.try_promote(key, now);
+    if !promote_keys(store, &keys, out, now) {
+        return CmdResult::Written;
     }
     let (weights, aggregate) = match parse_zstore_options(&args[3 + numkeys..], numkeys, out) {
         Some(parsed) => parsed,
@@ -947,8 +947,8 @@ pub fn cmd_zdiffstore(
         return CmdResult::Written;
     }
     let keys: Vec<&[u8]> = args[3..3 + numkeys].to_vec();
-    for key in &keys {
-        store.try_promote(key, now);
+    if !promote_keys(store, &keys, out, now) {
+        return CmdResult::Written;
     }
     match store.zdiffstore(args[1], &keys, now) {
         Ok(n) => resp::write_integer(out, n),
@@ -1015,8 +1015,8 @@ pub fn cmd_zunion(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
     else {
         return CmdResult::Written;
     };
-    for key in &keys {
-        store.try_promote(key, now);
+    if !promote_keys(store, &keys, out, now) {
+        return CmdResult::Written;
     }
     match store.zunion(&keys, &weights, &aggregate, now) {
         Ok(items) => write_zset_result(out, &items, with_scores),
@@ -1039,8 +1039,8 @@ pub fn cmd_zinter(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
     else {
         return CmdResult::Written;
     };
-    for key in &keys {
-        store.try_promote(key, now);
+    if !promote_keys(store, &keys, out, now) {
+        return CmdResult::Written;
     }
     match store.zinter(&keys, &weights, &aggregate, now) {
         Ok(items) => write_zset_result(out, &items, with_scores),
@@ -1060,8 +1060,8 @@ pub fn cmd_zdiff(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
     else {
         return CmdResult::Written;
     };
-    for key in &keys {
-        store.try_promote(key, now);
+    if !promote_keys(store, &keys, out, now) {
+        return CmdResult::Written;
     }
     match store.zdiff(&keys, now) {
         Ok(items) => write_zset_result(out, &items, with_scores),
@@ -1092,8 +1092,8 @@ pub fn cmd_zintercard(
         return CmdResult::Written;
     }
     let keys: Vec<&[u8]> = args[2..2 + numkeys].to_vec();
-    for key in &keys {
-        store.try_promote(key, now);
+    if !promote_keys(store, &keys, out, now) {
+        return CmdResult::Written;
     }
     let tail = &args[2 + numkeys..];
     let mut limit = 0usize;
@@ -1132,7 +1132,10 @@ pub fn cmd_zrandmember(
         );
         return CmdResult::Written;
     }
-    store.try_promote(args[1], now);
+    if let Err(error) = store.try_promote(args[1], now) {
+        resp::write_error(out, &error);
+        return CmdResult::Written;
+    }
 
     // No count: a single member as a bulk string (or nil).
     if args.len() == 2 {
@@ -1466,7 +1469,7 @@ pub(crate) fn journaled_zmpop(
             || {
                 let mut expected = None;
                 for key in keys {
-                    store.try_promote(key, now);
+                    store.try_promote(key, now)?;
                     let items = store.preview_zpop(key, count, pop_min, now)?;
                     if !items.is_empty() {
                         expected = Some((key.to_vec(), items));
@@ -1585,7 +1588,10 @@ pub fn cmd_zrangestore(
     }
     let dst = args[1];
     let src = args[2];
-    store.try_promote(src, now);
+    if let Err(error) = store.try_promote(src, now) {
+        resp::write_error(out, &error);
+        return CmdResult::Written;
+    }
     let mut reverse = false;
     let mut byscore = false;
     let mut bylex = false;

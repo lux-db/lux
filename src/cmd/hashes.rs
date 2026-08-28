@@ -94,7 +94,10 @@ pub fn cmd_hget(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'hget' command");
         return CmdResult::Written;
     }
-    resp::write_optional_bulk_raw(out, &store.hget(args[1], args[2], now));
+    match store.hget_checked(args[1], args[2], now) {
+        Ok(value) => resp::write_optional_bulk_raw(out, &value),
+        Err(error) => resp::write_error(out, &error),
+    }
     CmdResult::Written
 }
 
@@ -600,14 +603,18 @@ fn cmd_hexpire_generic(
     journal_args.push(nf.into_bytes());
     journal_args.extend(fields.iter().map(|field| field.to_vec()));
     let refs: Vec<&[u8]> = journal_args.iter().map(Vec::as_slice).collect();
-    let _commit = match store.begin_journaled(&refs) {
-        Ok(commit) => commit,
+    let result = match store.commit_journaled_checked(&refs, || {
+        let result = store.hexpire_fields(args[1], &fields, deadline_ms, cond, now);
+        let committed = result.is_ok();
+        (result, committed)
+    }) {
+        Ok(result) => result,
         Err(e) => {
             resp::write_error(out, &format!("ERR WAL append failed: {e}"));
             return CmdResult::Written;
         }
     };
-    match store.hexpire_fields(args[1], &fields, deadline_ms, cond, now) {
+    match result {
         Ok(results) => {
             resp::write_array_header(out, results.len());
             for r in results {
@@ -805,19 +812,23 @@ pub fn cmd_hgetex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
             Some(command)
         }
     };
-    let _commit = if let Some(journal_args) = &journal_args {
+    let result = if let Some(journal_args) = &journal_args {
         let refs: Vec<&[u8]> = journal_args.iter().map(Vec::as_slice).collect();
-        match store.begin_journaled(&refs) {
-            Ok(commit) => Some(commit),
+        match store.commit_journaled_checked(&refs, || {
+            let result = store.hgetex_fields(args[1], &fields, ttl, now);
+            let committed = result.is_ok();
+            (result, committed)
+        }) {
+            Ok(result) => result,
             Err(e) => {
                 resp::write_error(out, &format!("ERR WAL append failed: {e}"));
                 return CmdResult::Written;
             }
         }
     } else {
-        None
+        store.hgetex_fields(args[1], &fields, ttl, now)
     };
-    match store.hgetex_fields(args[1], &fields, ttl, now) {
+    match result {
         Ok(values) => {
             resp::write_array_header(out, values.len());
             for v in &values {

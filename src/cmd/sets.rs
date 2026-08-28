@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::resp;
 use crate::store::{JournalPlan, Store};
 
-use super::{cmd_eq, parse_i64, parse_u64, CmdResult};
+use super::{cmd_eq, parse_i64, parse_u64, promote_keys, CmdResult};
 
 const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
 
@@ -255,6 +255,9 @@ pub fn cmd_sunion(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'sunion' command");
         return CmdResult::Written;
     }
+    if !promote_keys(store, &args[1..], out, now) {
+        return CmdResult::Written;
+    }
     match store.sunion(&args[1..], now) {
         Ok(members) => resp::write_bulk_array(out, &members),
         Err(e) => resp::write_error(out, &e),
@@ -267,6 +270,9 @@ pub fn cmd_sinter(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'sinter' command");
         return CmdResult::Written;
     }
+    if !promote_keys(store, &args[1..], out, now) {
+        return CmdResult::Written;
+    }
     match store.sinter(&args[1..], now) {
         Ok(members) => resp::write_bulk_array(out, &members),
         Err(e) => resp::write_error(out, &e),
@@ -277,6 +283,9 @@ pub fn cmd_sinter(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
 pub fn cmd_sdiff(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 2 {
         resp::write_error(out, "ERR wrong number of arguments for 'sdiff' command");
+        return CmdResult::Written;
+    }
+    if !promote_keys(store, &args[1..], out, now) {
         return CmdResult::Written;
     }
     match store.sdiff(&args[1..], now) {
@@ -299,6 +308,9 @@ pub fn cmd_sunionstore(
         );
         return CmdResult::Written;
     }
+    if !promote_keys(store, &args[1..], out, now) {
+        return CmdResult::Written;
+    }
     match store.sunionstore(args[1], &args[2..], now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
@@ -319,6 +331,9 @@ pub fn cmd_sinterstore(
         );
         return CmdResult::Written;
     }
+    if !promote_keys(store, &args[1..], out, now) {
+        return CmdResult::Written;
+    }
     match store.sinterstore(args[1], &args[2..], now) {
         Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
@@ -337,6 +352,9 @@ pub fn cmd_sdiffstore(
             out,
             "ERR wrong number of arguments for 'sdiffstore' command",
         );
+        return CmdResult::Written;
+    }
+    if !promote_keys(store, &args[1..], out, now) {
         return CmdResult::Written;
     }
     match store.sdiffstore(args[1], &args[2..], now) {
@@ -386,6 +404,9 @@ pub fn cmd_sintercard(
         };
     } else if !rest.is_empty() {
         resp::write_error(out, "ERR syntax error");
+        return CmdResult::Written;
+    }
+    if !promote_keys(store, &args[2..2 + numkeys], out, now) {
         return CmdResult::Written;
     }
     match store.sinter(&args[2..2 + numkeys], now) {

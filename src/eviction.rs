@@ -413,7 +413,7 @@ mod tests {
         drop(store);
 
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&crate::pubsub::Broker::new());
+        restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
         assert!(restored.get(b"evicted", Instant::now()).is_none());
     }
 }

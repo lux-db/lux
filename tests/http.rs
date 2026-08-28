@@ -37,9 +37,12 @@ fn http_health_check() {
     assert!(resp.contains("\"version\""), "version: {resp}");
     let health: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(health["persistence"]["storage_layout"], "memory");
-    assert_eq!(health["persistence"]["durability"], "every_second");
+    assert_eq!(health["persistence"]["durability"], "always_sync");
     assert_eq!(health["persistence"]["journal_enabled"], true);
-    assert_eq!(health["persistence"]["sync_interval_ms"], 1_000);
+    assert_eq!(
+        health["persistence"]["sync_interval_ms"],
+        serde_json::Value::Null
+    );
 }
 
 #[test]
@@ -743,7 +746,7 @@ fn http_vector_search_is_grant_scoped() {
 fn http_auth_sessions_keys_and_revocation_survive_restart() {
     let data_dir = tempfile::tempdir().unwrap();
     let ports = common::free_ports(2);
-    let (resp, _http) = (ports[0], ports[1]);
+    let (resp, http) = (ports[0], ports[1]);
     let first_env = [
         ("LUX_AUTH_ENABLED", "true"),
         ("LUX_STORAGE_MODE", "tiered"),
@@ -753,10 +756,10 @@ fn http_auth_sessions_keys_and_revocation_survive_restart() {
     let auth_only_env = [("LUX_AUTH_ENABLED", "true"), ("LUX_STORAGE_MODE", "tiered")];
 
     let mut child =
-        common::spawn_lux_with_data_dir(resp, 17707, "rootsecret", &first_env, data_dir.path());
+        common::spawn_lux_with_data_dir(resp, http, "rootsecret", &first_env, data_dir.path());
 
     let (status, signup_body) = http_request_with_headers(
-        17707,
+        http,
         "POST",
         "/auth/v1/signup",
         Some(r#"{"email":"persist-auth@example.com","password":"password123"}"#),
@@ -775,7 +778,7 @@ fn http_auth_sessions_keys_and_revocation_survive_restart() {
         .to_string();
     // Write KV as operator before restart to verify tiered-storage data persists.
     let (status, body) = http_request(
-        17707,
+        http,
         "PUT",
         "/v1/kv/persist",
         Some(r#"{"value":"survived"}"#),
@@ -786,21 +789,21 @@ fn http_auth_sessions_keys_and_revocation_survive_restart() {
     common::terminate_child(&mut child);
 
     let mut child =
-        common::spawn_lux_with_data_dir(resp, 17707, "rootsecret", &auth_only_env, data_dir.path());
+        common::spawn_lux_with_data_dir(resp, http, "rootsecret", &auth_only_env, data_dir.path());
 
-    let (status, body) = http_request(17707, "GET", "/auth/v1/user", None, Some(&access_token));
+    let (status, body) = http_request(http, "GET", "/auth/v1/user", None, Some(&access_token));
     assert_eq!(
         status, 200,
         "access token should validate after restart via persisted signing key/session: {body}"
     );
     assert!(body.contains("persist-auth@example.com"), "{body}");
 
-    let (status, body) = http_request(17707, "GET", "/v1/kv/persist", None, Some("rootsecret"));
+    let (status, body) = http_request(http, "GET", "/v1/kv/persist", None, Some("rootsecret"));
     assert_eq!(status, 200, "tiered data should survive restart: {body}");
     assert!(body.contains("survived"), "{body}");
 
     let (status, body) = http_request(
-        17707,
+        http,
         "GET",
         "/auth/v1/admin/users",
         None,
@@ -812,7 +815,7 @@ fn http_auth_sessions_keys_and_revocation_survive_restart() {
     );
 
     let (status, body) = http_request_with_headers(
-        17707,
+        http,
         "POST",
         "/auth/v1/token",
         Some(&format!(
@@ -836,14 +839,14 @@ fn http_auth_sessions_keys_and_revocation_survive_restart() {
         .expect("refresh should return refresh token")
         .to_string();
 
-    let (status, body) = http_request(17707, "GET", "/auth/v1/user", None, Some(&access_token));
+    let (status, body) = http_request(http, "GET", "/auth/v1/user", None, Some(&access_token));
     assert_eq!(
         status, 200,
         "refresh should not immediately revoke in-flight access tokens: {body}"
     );
 
     let (status, body) = http_request_with_headers(
-        17707,
+        http,
         "POST",
         "/auth/v1/token",
         Some(&format!(
@@ -859,7 +862,7 @@ fn http_auth_sessions_keys_and_revocation_survive_restart() {
     );
 
     let (status, body) = http_request(
-        17707,
+        http,
         "POST",
         "/auth/v1/logout",
         Some("{}"),
@@ -870,16 +873,16 @@ fn http_auth_sessions_keys_and_revocation_survive_restart() {
     common::terminate_child(&mut child);
 
     let mut child =
-        common::spawn_lux_with_data_dir(resp, 17707, "rootsecret", &auth_only_env, data_dir.path());
+        common::spawn_lux_with_data_dir(resp, http, "rootsecret", &auth_only_env, data_dir.path());
 
-    let (status, body) = http_request(17707, "GET", "/auth/v1/user", None, Some(&access_token));
+    let (status, body) = http_request(http, "GET", "/auth/v1/user", None, Some(&access_token));
     assert_eq!(
         status, 401,
         "family logout should revoke pre-refresh access token after restart: {body}"
     );
 
     let (status, body) = http_request(
-        17707,
+        http,
         "GET",
         "/auth/v1/user",
         None,
@@ -891,7 +894,7 @@ fn http_auth_sessions_keys_and_revocation_survive_restart() {
     );
 
     let (status, body) = http_request_with_headers(
-        17707,
+        http,
         "POST",
         "/auth/v1/token",
         Some(&format!(

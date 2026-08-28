@@ -77,7 +77,8 @@ struct LuxServer {
 }
 
 impl LuxServer {
-    fn start_tiered(port: u16, maxmemory: &str) -> Self {
+    fn start_tiered(maxmemory: &str) -> Self {
+        let port = common::free_port();
         let tmpdir =
             std::env::temp_dir().join(format!("lux_reliability_{}_{}", std::process::id(), port));
         let _ = std::fs::remove_dir_all(&tmpdir);
@@ -129,7 +130,7 @@ impl Drop for LuxServer {
 
 #[test]
 fn tiered_mixed_datatypes_survive_eviction_snapshot_wal_and_crash() {
-    let mut server = LuxServer::start_tiered(17850, "128kb");
+    let mut server = LuxServer::start_tiered("128kb");
     let mut conn = server.conn();
 
     assert_eq!(send(&mut conn, &["SET", "str", "alive"]), "+OK");
@@ -210,7 +211,7 @@ fn tiered_mixed_datatypes_survive_eviction_snapshot_wal_and_crash() {
 
 #[test]
 fn malformed_resp_storm_does_not_crash_server() {
-    let server = LuxServer::start_tiered(17851, "1mb");
+    let server = LuxServer::start_tiered("1mb");
 
     for i in 0..250 {
         let mut conn = server.conn();
@@ -238,7 +239,7 @@ fn malformed_resp_storm_does_not_crash_server() {
 
 #[test]
 fn malformed_resp_protocol_error_closes_only_bad_connection() {
-    let server = LuxServer::start_tiered(17857, "1mb");
+    let server = LuxServer::start_tiered("1mb");
     let mut bad = server.conn();
     bad.write_all(b"*1048577\r\n").unwrap();
 
@@ -255,8 +256,8 @@ fn malformed_resp_protocol_error_closes_only_bad_connection() {
     assert!(send(&mut good, &["GET", "after_bad_resp"]).contains("ok"));
 }
 
-fn manual_snapshot_command_does_not_double_replay_wal(port: u16, command: &str) {
-    let mut server = LuxServer::start_tiered(port, "1mb");
+fn manual_snapshot_command_does_not_double_replay_wal(command: &str) {
+    let mut server = LuxServer::start_tiered("1mb");
     let mut conn = server.conn();
 
     for _ in 0..10 {
@@ -283,17 +284,17 @@ fn manual_snapshot_command_does_not_double_replay_wal(port: u16, command: &str) 
 
 #[test]
 fn manual_save_truncates_wal_after_successful_snapshot() {
-    manual_snapshot_command_does_not_double_replay_wal(17853, "SAVE");
+    manual_snapshot_command_does_not_double_replay_wal("SAVE");
 }
 
 #[test]
 fn manual_bgsave_truncates_wal_after_successful_snapshot() {
-    manual_snapshot_command_does_not_double_replay_wal(17854, "BGSAVE");
+    manual_snapshot_command_does_not_double_replay_wal("BGSAVE");
 }
 
 #[test]
 fn concurrent_tiered_writers_survive_restart_with_consistent_counter() {
-    let mut server = LuxServer::start_tiered(17852, "256kb");
+    let mut server = LuxServer::start_tiered("256kb");
     let addr = format!("127.0.0.1:{}", server.port);
     let workers = 6;
     let per_worker = 80;

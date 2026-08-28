@@ -53,8 +53,7 @@ impl ShardExecutor {
         {
             self.execute_write_batch(shard_idx, commands, out, now)
         } else {
-            self.execute_read_batch(shard_idx, commands, out, now);
-            Ok(())
+            self.execute_read_batch(shard_idx, commands, out, now)
         }
     }
 
@@ -70,8 +69,7 @@ impl ShardExecutor {
         if access.contains(&PipelineAccess::Write) {
             self.execute_argv_write_batch(shard_idx, commands, access, out, now)
         } else {
-            self.execute_argv_read_batch(shard_idx, commands, out, now);
-            Ok(())
+            self.execute_argv_read_batch(shard_idx, commands, out, now)
         }
     }
 
@@ -89,7 +87,9 @@ impl ShardExecutor {
         for command in commands {
             let args = command.args;
             if tiered {
-                self.store.try_promote(args[1], now);
+                self.store
+                    .try_promote(args[1], now)
+                    .map_err(ShardExecutionError::Command)?;
             }
             if crate::eviction::is_write_command(args[0]) {
                 if let Some(err) = crate::auth::reserved_table_mutation_error(args, &self.store) {
@@ -149,7 +149,9 @@ impl ShardExecutor {
         for command in commands {
             let args = command.argv();
             if tiered {
-                self.store.try_promote(args[1], now);
+                self.store
+                    .try_promote(args[1], now)
+                    .map_err(ShardExecutionError::Command)?;
             }
             if crate::eviction::is_write_command(args[0]) {
                 if let Some(err) = crate::auth::reserved_table_mutation_error(args, &self.store) {
@@ -200,10 +202,12 @@ impl ShardExecutor {
         commands: &[ShardPipelineCommand<'argv, 'data>],
         out: &mut BytesMut,
         now: Instant,
-    ) {
+    ) -> Result<(), ShardExecutionError> {
         if self.store.is_tiered() {
             for command in commands {
-                self.store.try_promote(command.args[1], now);
+                self.store
+                    .try_promote(command.args[1], now)
+                    .map_err(ShardExecutionError::Command)?;
             }
         }
         let shard = self.store.lock_read_shard(shard_idx);
@@ -225,6 +229,7 @@ impl ShardExecutor {
                 }
             }
         }
+        Ok(())
     }
 
     fn execute_argv_read_batch<A: ArgvSlice>(
@@ -233,10 +238,12 @@ impl ShardExecutor {
         commands: &[A],
         out: &mut BytesMut,
         now: Instant,
-    ) {
+    ) -> Result<(), ShardExecutionError> {
         if self.store.is_tiered() {
             for command in commands {
-                self.store.try_promote(command.argv()[1], now);
+                self.store
+                    .try_promote(command.argv()[1], now)
+                    .map_err(ShardExecutionError::Command)?;
             }
         }
         let shard = self.store.lock_read_shard(shard_idx);
@@ -259,6 +266,7 @@ impl ShardExecutor {
                 }
             }
         }
+        Ok(())
     }
 }
 

@@ -149,7 +149,10 @@ fn pipeline_set_ordering_simple_path() {
     let iterations: i64 = 10_000;
     let num_readers = 4;
 
-    let server = LuxServer::builder().shards(2).start();
+    let server = LuxServer::builder()
+        .shards(2)
+        .env("LUX_DURABILITY", "ephemeral")
+        .start();
     let addr = format!("127.0.0.1:{}", server.port());
 
     {
@@ -242,7 +245,10 @@ fn pipeline_mixed_commands_ordering() {
     let iterations: i64 = 10_000;
     let num_readers = 4;
 
-    let server = LuxServer::builder().shards(2).start();
+    let server = LuxServer::builder()
+        .shards(2)
+        .env("LUX_DURABILITY", "ephemeral")
+        .start();
     let addr = format!("127.0.0.1:{}", server.port());
 
     {
@@ -335,7 +341,10 @@ fn pipeline_high_contention_ordering() {
     let num_writers = 4;
     let iterations_per_writer: i64 = 5_000;
 
-    let server = LuxServer::builder().shards(2).start();
+    let server = LuxServer::builder()
+        .shards(2)
+        .env("LUX_DURABILITY", "ephemeral")
+        .start();
     let addr = format!("127.0.0.1:{}", server.port());
 
     for i in 0..num_writers {
@@ -435,7 +444,10 @@ fn pipeline_high_contention_ordering() {
 fn large_memory_pipeline_preserves_response_order() {
     let commands = 160usize;
 
-    let server = LuxServer::builder().shards(16).start();
+    let server = LuxServer::builder()
+        .shards(16)
+        .env("LUX_DURABILITY", "ephemeral")
+        .start();
     let addr = format!("127.0.0.1:{}", server.port());
     let mut conn = TcpStream::connect(&addr).unwrap();
     conn.set_nodelay(true).unwrap();

@@ -70,7 +70,7 @@ fn decrypt_out(store: &Store, raw: Bytes) -> Bytes {
 fn push_list(
     args: &[&[u8]],
     store: &Store,
-    broker: &Broker,
+    _broker: &Broker,
     out: &mut BytesMut,
     now: Instant,
     front: bool,
@@ -112,32 +112,33 @@ fn push_list(
     } else {
         None
     };
-    let _commit = if let Some(journal_args) = &journal_args {
-        let refs: Vec<&[u8]> = journal_args.iter().map(Vec::as_slice).collect();
-        match store.begin_journaled(&refs) {
-            Ok(commit) => Some(commit),
+    let stored_refs: Vec<&[u8]> = stored.iter().map(Vec::as_slice).collect();
+    let res = if let Some(journal_args) = &journal_args {
+        let journal_refs: Vec<&[u8]> = journal_args.iter().map(Vec::as_slice).collect();
+        match store.commit_journaled_checked(&journal_refs, || {
+            let result = if front {
+                store.lpush(args[1], &stored_refs, now)
+            } else {
+                store.rpush(args[1], &stored_refs, now)
+            };
+            let committed = result.is_ok();
+            (result, committed)
+        }) {
+            Ok(result) => result,
             Err(e) => {
                 resp::write_error(out, &format!("ERR WAL append failed: {e}"));
                 return CmdResult::Written;
             }
         }
     } else {
-        None
-    };
-    let refs: Vec<&[u8]> = stored.iter().map(Vec::as_slice).collect();
-    let res = if front {
-        store.lpush(args[1], &refs, now)
-    } else {
-        store.rpush(args[1], &refs, now)
+        if front {
+            store.lpush(args[1], &stored_refs, now)
+        } else {
+            store.rpush(args[1], &stored_refs, now)
+        }
     };
     match res {
-        Ok(n) => {
-            resp::write_integer(out, n);
-            let key_s = arg_str(args[1]);
-            if broker.has_list_waiters(key_s) {
-                broker.drain_list_waiters(key_s, store, now);
-            }
-        }
+        Ok(n) => resp::write_integer(out, n),
         Err(e) => resp::write_error(out, &e),
     }
     CmdResult::Written

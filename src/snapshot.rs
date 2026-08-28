@@ -1,4 +1,6 @@
 use crate::store::{DumpValue, Store};
+use hashbrown::HashMap;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, BufRead, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -13,6 +15,20 @@ const HEADER_V2: &[u8; 4] = b"LUX\x02";
 // downtime and keys that should have expired while down resurrected. V3 subtracts
 // elapsed wall-clock on load so deadlines are honored across restarts.
 const HEADER: &[u8; 4] = b"LUX\x03";
+// V4 prefixes the V3 entry stream with the exact end offset and generation of
+// every WAL represented by the snapshot.
+const HEADER_V4: &[u8; 4] = b"LUX\x04";
+// V5 wraps the checkpoint + entry stream in an exact length and SHA-256 digest,
+// so truncation or bit corruption cannot be mistaken for a smaller valid DB.
+const HEADER_V5: &[u8; 4] = b"LUX\x05";
+// Single-key DUMP/LXRESTORE envelope. The payload remains the V3 entry format
+// for backward compatibility, but new blobs carry an exact length and digest.
+const DUMP_HEADER: &[u8; 4] = b"LXD\x01";
+const SNAPSHOT_DIGEST_LEN: usize = 32;
+const MAX_WAL_CHECKPOINTS: usize = 1024;
+const RESTORE_MARKER: &str = ".lux-restore.pending";
+const RESTORE_MARKER_TMP: &str = ".lux-restore.pending.tmp";
+const RESTORE_STAGED_SNAPSHOT: &str = ".lux-restore.snapshot";
 
 /// Wall-clock now in epoch milliseconds (for absolute TTL deadlines).
 fn now_epoch_ms() -> u64 {
@@ -25,6 +41,18 @@ fn now_epoch_ms() -> u64 {
 fn snapshot_path(store: &Store) -> String {
     let dir = &store.config().data_dir;
     format!("{}/lux.dat", dir.trim_end_matches('/'))
+}
+
+fn snapshot_path_for_config(config: &crate::ServerConfig) -> std::path::PathBuf {
+    Path::new(&config.data_dir).join("lux.dat")
+}
+
+fn restore_marker_path(config: &crate::ServerConfig) -> std::path::PathBuf {
+    Path::new(&config.data_dir).join(RESTORE_MARKER)
+}
+
+fn restore_staged_path(config: &crate::ServerConfig) -> std::path::PathBuf {
+    Path::new(&config.data_dir).join(RESTORE_STAGED_SNAPSHOT)
 }
 
 /// Unix timestamp of the most recent successfully installed snapshot.
@@ -61,6 +89,10 @@ fn write_u32(w: &mut impl Write, v: u32) -> io::Result<()> {
 }
 
 fn write_i64(w: &mut impl Write, v: i64) -> io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
+
+fn write_u64(w: &mut impl Write, v: u64) -> io::Result<()> {
     w.write_all(&v.to_le_bytes())
 }
 
@@ -134,6 +166,12 @@ fn read_i64(r: &mut impl Read) -> io::Result<i64> {
     Ok(i64::from_le_bytes(buf))
 }
 
+fn read_u64(r: &mut impl Read) -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
 fn read_f64(r: &mut impl Read) -> io::Result<f64> {
     let mut buf = [0u8; 8];
     r.read_exact(&mut buf)?;
@@ -145,26 +183,40 @@ fn read_string(r: &mut impl Read) -> io::Result<String> {
     String::from_utf8(raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn save_entries(store: &Store, entries: &[crate::store::DumpEntry]) -> io::Result<usize> {
+fn save_entries(
+    store: &Store,
+    entries: &[crate::store::DumpEntry],
+    checkpoints: &[(String, crate::disk::WalCheckpoint)],
+) -> io::Result<usize> {
     let path = snapshot_path(store);
     if let Some(parent) = Path::new(&path).parent() {
-        fs::create_dir_all(parent)?;
+        crate::disk::create_dir_all_synced(parent)?;
     }
     let tmp = format!("{path}.{}.tmp", std::process::id());
     let file = fs::File::create(&tmp)?;
     let mut w = BufWriter::new(file);
-    save_binary(&mut w, entries, store)?;
+    save_snapshot_binary(&mut w, entries, store, checkpoints)?;
     w.into_inner().map_err(io::Error::other)?.sync_all()?;
     fs::rename(&tmp, &path)?;
+    if let Some(parent) = Path::new(&path).parent() {
+        crate::disk::sync_directory(parent)?;
+    }
     Ok(entries.len())
 }
 
 pub(crate) fn save_and_truncate_wal_consistent(store: &Store) -> io::Result<usize> {
+    if store.is_restoring() {
+        return Err(io::Error::other("database restore is in progress"));
+    }
     store.with_write_barrier(|shards| {
+        if store.is_restoring() {
+            return Err(io::Error::other("database restore is in progress"));
+        }
         let now = Instant::now();
-        let entries = store.dump_all_from_locked_shards(shards, now);
-        let saved = save_entries(store, &entries)?;
-        store.truncate_wal();
+        let checkpoints = store.wal_checkpoints()?;
+        let entries = store.dump_all_from_locked_shards(shards, now)?;
+        let saved = save_entries(store, &entries, &checkpoints)?;
+        store.truncate_wal()?;
         Ok(saved)
     })
 }
@@ -186,38 +238,107 @@ pub fn snapshot_for_backup(store: &Store) -> io::Result<String> {
 /// the process so the standard startup load reconstructs state from the dump.
 /// Used by `POST /v1/restore`.
 pub fn restore_to_disk(store: &Store, dump: &[u8]) -> io::Result<()> {
-    let header_ok = dump.len() >= 4
-        && [HEADER, HEADER_V2, HEADER_V1]
+    validate_restore_dump(store, dump)?;
+
+    store.begin_restore()?;
+    let result = store.with_write_barrier(|_| {
+        stage_restore(store.config(), dump)?;
+        // Keep the marker until the restarted process repeats the purge before
+        // opening any WAL or tiered shard.
+        apply_pending_restore(store.config(), false)
+    });
+    if result.is_err() && !restore_marker_path(store.config()).exists() {
+        store.cancel_restore();
+    }
+    result
+}
+
+fn has_snapshot_header(dump: &[u8]) -> bool {
+    dump.len() >= 4
+        && [HEADER_V5, HEADER_V4, HEADER, HEADER_V2, HEADER_V1]
             .iter()
-            .any(|h| &dump[..4] == *h);
-    if !header_ok {
+            .any(|header| &dump[..4] == *header)
+}
+
+fn validate_restore_dump(store: &Store, dump: &[u8]) -> io::Result<()> {
+    if !has_snapshot_header(dump) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "restore payload is not a lux snapshot",
         ));
     }
 
-    let path = snapshot_path(store);
-    if let Some(parent) = Path::new(&path).parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = format!("{path}.restore.{}.tmp", std::process::id());
-    {
-        let file = fs::File::create(&tmp)?;
-        let mut w = BufWriter::new(file);
-        w.write_all(dump)?;
-        w.into_inner().map_err(io::Error::other)?.sync_all()?;
-    }
-    fs::rename(&tmp, &path)?;
+    validate_restore_reader(store.config(), io::Cursor::new(dump))
+}
 
-    // Drop both legacy shard journals and the authoritative global journal so
-    // startup cannot replay post-backup writes over the restored snapshot. Cold
-    // tiered shards are purged separately when they live elsewhere.
-    let journal_dir = store.config().journal_dir();
+fn validate_restore_reader(
+    config: &crate::ServerConfig,
+    reader: impl Read + Seek,
+) -> io::Result<()> {
+    let mut config = config.clone();
+    config.storage.mode = crate::StorageMode::Memory;
+    config.durability.policy = crate::DurabilityPolicy::Ephemeral;
+    config.save_interval = Duration::ZERO;
+    let validation_store = Store::try_new_with_config(std::sync::Arc::new(config))?;
+    load_from_reader(&validation_store, reader, false).map(|_| ())
+}
+
+fn stage_restore(config: &crate::ServerConfig, dump: &[u8]) -> io::Result<()> {
+    let data_dir = Path::new(&config.data_dir);
+    crate::disk::create_dir_all_synced(data_dir)?;
+    let staged = restore_staged_path(config);
+    let mut file = fs::File::create(&staged)?;
+    file.write_all(dump)?;
+    file.sync_all()?;
+    crate::disk::sync_directory(data_dir)?;
+
+    let marker = restore_marker_path(config);
+    let marker_tmp = data_dir.join(RESTORE_MARKER_TMP);
+    let mut file = fs::File::create(&marker_tmp)?;
+    file.write_all(b"LUX-RESTORE-1")?;
+    file.sync_all()?;
+    fs::rename(&marker_tmp, &marker)?;
+    crate::disk::sync_directory(data_dir)
+}
+
+/// Complete a durably staged restore before Store opens persistence files.
+pub(crate) fn complete_pending_restore(config: &crate::ServerConfig) -> io::Result<()> {
+    apply_pending_restore(config, true)
+}
+
+fn apply_pending_restore(config: &crate::ServerConfig, finalize: bool) -> io::Result<()> {
+    let marker = restore_marker_path(config);
+    let staged = restore_staged_path(config);
+    let data_dir = Path::new(&config.data_dir);
+    if !marker.exists() {
+        // A crash before the marker became durable leaves the old database
+        // authoritative. Discard only the uncommitted staged file.
+        if staged.exists() {
+            fs::remove_file(staged)?;
+            crate::disk::sync_directory(data_dir)?;
+        }
+        let marker_tmp = data_dir.join(RESTORE_MARKER_TMP);
+        if marker_tmp.exists() {
+            fs::remove_file(marker_tmp)?;
+            crate::disk::sync_directory(data_dir)?;
+        }
+        return Ok(());
+    }
+
+    let destination = snapshot_path_for_config(config);
+    if staged.exists() {
+        validate_restore_reader(config, fs::File::open(&staged)?)?;
+        fs::rename(&staged, &destination)?;
+        crate::disk::sync_directory(data_dir)?;
+    } else {
+        validate_restore_reader(config, fs::File::open(&destination)?)?;
+    }
+
+    let journal_dir = config.journal_dir();
     purge_lux_state_dirs(&journal_dir)?;
-    let storage_dir = Path::new(&store.config().storage.dir);
-    if storage_dir != journal_dir {
-        purge_lux_state_dirs(storage_dir)?;
+    if finalize {
+        fs::remove_file(marker)?;
+        crate::disk::sync_directory(data_dir)?;
     }
     Ok(())
 }
@@ -240,6 +361,7 @@ fn purge_lux_state_dirs(root: &Path) -> io::Result<()> {
             fs::remove_dir_all(entry.path())?;
         }
     }
+    crate::disk::sync_directory(root)?;
     Ok(())
 }
 
@@ -249,6 +371,80 @@ fn save_binary(
     store: &Store,
 ) -> io::Result<()> {
     w.write_all(HEADER)?;
+    save_binary_entries(w, entries, store)
+}
+
+fn save_snapshot_binary(
+    w: &mut (impl Write + Seek),
+    entries: &[crate::store::DumpEntry],
+    store: &Store,
+    checkpoints: &[(String, crate::disk::WalCheckpoint)],
+) -> io::Result<()> {
+    let count = u32::try_from(checkpoints.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many WAL checkpoints"))?;
+    w.write_all(HEADER_V5)?;
+    write_u64(w, 0)?;
+    w.write_all(&[0u8; SNAPSHOT_DIGEST_LEN])?;
+
+    let (body_len, digest) = {
+        let mut body = SnapshotDigestWriter::new(w);
+        write_u32(&mut body, count)?;
+        for (name, checkpoint) in checkpoints {
+            write_bytes(&mut body, name.as_bytes())?;
+            body.write_all(&checkpoint.generation)?;
+            write_u64(&mut body, checkpoint.offset)?;
+        }
+        save_binary_entries(&mut body, entries, store)?;
+        body.finish()
+    };
+
+    w.seek(SeekFrom::Start(HEADER_V5.len() as u64))?;
+    write_u64(w, body_len)?;
+    w.write_all(&digest)?;
+    w.seek(SeekFrom::End(0))?;
+    Ok(())
+}
+
+struct SnapshotDigestWriter<'a, W: Write> {
+    inner: &'a mut W,
+    hasher: Sha256,
+    len: u64,
+}
+
+impl<'a, W: Write> SnapshotDigestWriter<'a, W> {
+    fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            len: 0,
+        }
+    }
+
+    fn finish(self) -> (u64, [u8; SNAPSHOT_DIGEST_LEN]) {
+        (self.len, self.hasher.finalize().into())
+    }
+}
+
+impl<W: Write> Write for SnapshotDigestWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        self.len = self.len.checked_add(written as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "snapshot length overflow")
+        })?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn save_binary_entries(
+    w: &mut impl Write,
+    entries: &[crate::store::DumpEntry],
+    store: &Store,
+) -> io::Result<()> {
     for entry in entries {
         let type_byte: u8 = match &entry.value {
             DumpValue::Str(_) => b'S',
@@ -411,13 +607,34 @@ fn load_with_mode(store: &Store, preserve_expired: bool) -> io::Result<usize> {
 
 fn load_from_reader(
     store: &Store,
-    mut file: fs::File,
+    mut file: impl Read + Seek,
     preserve_expired: bool,
 ) -> io::Result<usize> {
     let mut header = [0u8; 4];
     let n = file.read(&mut header)?;
-    if n == 4 && &header == HEADER {
+    if n < header.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot is truncated before its header",
+        ));
+    }
+    if &header == HEADER_V5 {
+        let body_len = read_u64(&mut file)?;
+        let mut expected_digest = [0u8; SNAPSHOT_DIGEST_LEN];
+        file.read_exact(&mut expected_digest)?;
+        verify_snapshot_body(&mut file, body_len, &expected_digest)?;
+        let mut reader = io::BufReader::new(file.take(body_len));
+        let checkpoints = read_wal_checkpoints(&mut reader)?;
+        store.set_recovery_wal_checkpoints(checkpoints);
+        load_binary(store, &mut reader, true, true, preserve_expired)
+    } else if &header == HEADER_V4 {
+        let mut reader = io::BufReader::new(file);
+        let checkpoints = read_wal_checkpoints(&mut reader)?;
+        store.set_recovery_wal_checkpoints(checkpoints);
+        load_binary(store, &mut reader, true, true, preserve_expired)
+    } else if &header == HEADER {
         // V3: absolute-deadline TTLs, stream groups present.
+        store.set_recovery_wal_checkpoints(HashMap::new());
         load_binary(
             store,
             &mut io::BufReader::new(file),
@@ -425,8 +642,9 @@ fn load_from_reader(
             true,
             preserve_expired,
         )
-    } else if n == 4 && &header == HEADER_V2 {
+    } else if &header == HEADER_V2 {
         // V2: relative remaining-ms TTLs (legacy; rebased to now on load).
+        store.set_recovery_wal_checkpoints(HashMap::new());
         load_binary(
             store,
             &mut io::BufReader::new(file),
@@ -434,7 +652,8 @@ fn load_from_reader(
             false,
             preserve_expired,
         )
-    } else if n == 4 && &header == HEADER_V1 {
+    } else if &header == HEADER_V1 {
+        store.set_recovery_wal_checkpoints(HashMap::new());
         load_binary(
             store,
             &mut io::BufReader::new(file),
@@ -443,9 +662,87 @@ fn load_from_reader(
             preserve_expired,
         )
     } else {
+        store.set_recovery_wal_checkpoints(HashMap::new());
         file.seek(SeekFrom::Start(0))?;
         load_legacy(store, file)
     }
+}
+
+fn verify_snapshot_body(
+    file: &mut (impl Read + Seek),
+    body_len: u64,
+    expected_digest: &[u8; SNAPSHOT_DIGEST_LEN],
+) -> io::Result<()> {
+    let body_start = file.stream_position()?;
+    let expected_end = body_start.checked_add(body_len).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "snapshot body length overflow")
+    })?;
+    let file_end = file.seek(SeekFrom::End(0))?;
+    if expected_end != file_end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot body length does not match the file",
+        ));
+    }
+    file.seek(SeekFrom::Start(body_start))?;
+
+    let mut hasher = Sha256::new();
+    let mut remaining = body_len;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let wanted = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..wanted])?;
+        hasher.update(&buffer[..wanted]);
+        remaining -= wanted as u64;
+    }
+    let actual: [u8; SNAPSHOT_DIGEST_LEN] = hasher.finalize().into();
+    if actual != *expected_digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot SHA-256 mismatch",
+        ));
+    }
+    file.seek(SeekFrom::Start(body_start))?;
+    Ok(())
+}
+
+fn read_wal_checkpoints(
+    reader: &mut impl Read,
+) -> io::Result<HashMap<String, crate::disk::WalCheckpoint>> {
+    let count = read_u32(reader)? as usize;
+    if count > MAX_WAL_CHECKPOINTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot WAL checkpoint count exceeds maximum",
+        ));
+    }
+    let mut checkpoints = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let name = read_string(reader)?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot contains an invalid WAL checkpoint name",
+            ));
+        }
+        let mut generation = [0u8; 16];
+        reader.read_exact(&mut generation)?;
+        let checkpoint = crate::disk::WalCheckpoint {
+            generation,
+            offset: read_u64(reader)?,
+        };
+        if checkpoints.insert(name, checkpoint).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot contains duplicate WAL checkpoints",
+            ));
+        }
+    }
+    Ok(checkpoints)
 }
 
 pub(crate) fn load_binary(
@@ -677,7 +974,8 @@ fn read_dump_value(
 /// embedded TTL (ms) WITHOUT loading it, so RESTORE can apply the value under a
 /// caller-chosen key and TTL.
 pub(crate) fn decode_dump_blob_value(store: &Store, blob: &[u8]) -> io::Result<(DumpValue, i64)> {
-    let mut cursor = io::Cursor::new(blob);
+    let payload = verified_dump_payload(blob)?;
+    let mut cursor = io::Cursor::new(payload);
     let mut header = [0u8; 4];
     cursor.read_exact(&mut header)?;
     let stream_groups = if &header == HEADER || &header == HEADER_V2 {
@@ -705,15 +1003,64 @@ pub(crate) fn encode_dump_blob(
     store: &Store,
     entry: &crate::store::DumpEntry,
 ) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    save_binary(&mut buf, std::slice::from_ref(entry), store)?;
-    Ok(buf)
+    let mut payload = Vec::new();
+    save_binary(&mut payload, std::slice::from_ref(entry), store)?;
+    let payload_len = u64::try_from(payload.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "DUMP payload is too large"))?;
+    let digest: [u8; SNAPSHOT_DIGEST_LEN] = Sha256::digest(&payload).into();
+    let mut blob = Vec::with_capacity(DUMP_HEADER.len() + 8 + SNAPSHOT_DIGEST_LEN + payload.len());
+    blob.extend_from_slice(DUMP_HEADER);
+    blob.extend_from_slice(&payload_len.to_le_bytes());
+    blob.extend_from_slice(&digest);
+    blob.extend_from_slice(&payload);
+    Ok(blob)
+}
+
+fn verified_dump_payload(blob: &[u8]) -> io::Result<&[u8]> {
+    if !blob.starts_with(DUMP_HEADER) {
+        // V1-V3 blobs predate the integrity envelope and remain readable.
+        return Ok(blob);
+    }
+    let metadata_len = DUMP_HEADER.len() + 8 + SNAPSHOT_DIGEST_LEN;
+    if blob.len() < metadata_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated DUMP integrity envelope",
+        ));
+    }
+    let payload_len = u64::from_le_bytes(
+        blob[DUMP_HEADER.len()..DUMP_HEADER.len() + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let payload_len = usize::try_from(payload_len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "DUMP payload is too large"))?;
+    let expected_len = metadata_len.checked_add(payload_len).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "DUMP payload length overflow")
+    })?;
+    if blob.len() != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DUMP payload length mismatch",
+        ));
+    }
+    let expected_digest = &blob[DUMP_HEADER.len() + 8..metadata_len];
+    let payload = &blob[metadata_len..];
+    let actual_digest: [u8; SNAPSHOT_DIGEST_LEN] = Sha256::digest(payload).into();
+    if actual_digest.as_slice() != expected_digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DUMP payload SHA-256 mismatch",
+        ));
+    }
+    Ok(payload)
 }
 
 /// Decode a blob produced by `encode_dump_blob` and load its entry into the
 /// store, overwriting any existing key. Replay path for `LXRESTORE`.
 pub(crate) fn decode_dump_blob(store: &Store, blob: &[u8]) -> io::Result<usize> {
-    let mut cursor = io::Cursor::new(blob);
+    let payload = verified_dump_payload(blob)?;
+    let mut cursor = io::Cursor::new(payload);
     let mut header = [0u8; 4];
     cursor.read_exact(&mut header)?;
     if &header == HEADER {
@@ -730,7 +1077,7 @@ pub(crate) fn decode_dump_blob(store: &Store, blob: &[u8]) -> io::Result<usize> 
     }
 }
 
-fn load_legacy(store: &Store, file: fs::File) -> io::Result<usize> {
+fn load_legacy(store: &Store, file: impl Read) -> io::Result<usize> {
     let reader = io::BufReader::new(file);
     let mut count = 0;
     for line in reader.lines() {
@@ -744,29 +1091,40 @@ fn load_legacy(store: &Store, file: fs::File) -> io::Result<usize> {
             || line.chars().nth(1) != Some('\t')
         {
             let parts: Vec<&str> = line.splitn(3, '\t').collect();
-            if parts.len() == 3 {
-                let key = parts[0].to_string();
-                let value = parts[1].to_string();
-                let ttl_ms: i64 = parts[2].parse().unwrap_or(0);
-                let ttl = if ttl_ms > 0 {
-                    Some(Duration::from_millis(ttl_ms as u64))
-                } else {
-                    None
-                };
-                store.load_entry(key, DumpValue::Str(value.into_bytes()), ttl);
-                count += 1;
+            if parts.len() != 3 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed legacy snapshot row",
+                ));
             }
+            let key = parts[0].to_string();
+            let value = parts[1].to_string();
+            let ttl_ms: i64 = parts[2].parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid legacy snapshot TTL")
+            })?;
+            let ttl = if ttl_ms > 0 {
+                Some(Duration::from_millis(ttl_ms as u64))
+            } else {
+                None
+            };
+            store.load_entry(key, DumpValue::Str(value.into_bytes()), ttl);
+            count += 1;
             continue;
         }
 
         let parts: Vec<&str> = line.splitn(4, '\t').collect();
         if parts.len() != 4 {
-            continue;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed typed legacy snapshot row",
+            ));
         }
         let type_char = parts[0];
         let key = parts[1].to_string();
         let raw_value = parts[2];
-        let ttl_ms: i64 = parts[3].parse().unwrap_or(0);
+        let ttl_ms: i64 = parts[3].parse().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid legacy snapshot TTL")
+        })?;
         let ttl = if ttl_ms > 0 {
             Some(Duration::from_millis(ttl_ms as u64))
         } else {
@@ -792,15 +1150,18 @@ fn load_legacy(store: &Store, file: fs::File) -> io::Result<usize> {
                 } else {
                     raw_value
                         .split('\x1f')
-                        .filter_map(|pair| {
+                        .map(|pair| {
                             let kv: Vec<&str> = pair.splitn(2, '\x1e').collect();
                             if kv.len() == 2 {
-                                Some((kv[0].to_string(), kv[1].as_bytes().to_vec()))
+                                Ok((kv[0].to_string(), kv[1].as_bytes().to_vec()))
                             } else {
-                                None
+                                Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "malformed legacy hash field",
+                                ))
                             }
                         })
-                        .collect()
+                        .collect::<io::Result<_>>()?
                 };
                 DumpValue::Hash(pairs, Vec::new())
             }
@@ -818,15 +1179,24 @@ fn load_legacy(store: &Store, file: fs::File) -> io::Result<usize> {
                 } else {
                     raw_value
                         .split('\x1f')
-                        .filter_map(|pair| {
+                        .map(|pair| {
                             let kv: Vec<&str> = pair.splitn(2, '\x1e').collect();
                             if kv.len() == 2 {
-                                Some((kv[0].to_string(), kv[1].parse::<f64>().unwrap_or(0.0)))
+                                let score = kv[1].parse::<f64>().map_err(|_| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "invalid legacy sorted-set score",
+                                    )
+                                })?;
+                                Ok((kv[0].to_string(), score))
                             } else {
-                                None
+                                Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "malformed legacy sorted-set member",
+                                ))
                             }
                         })
-                        .collect()
+                        .collect::<io::Result<_>>()?
                 };
                 DumpValue::SortedSet(members)
             }
@@ -842,24 +1212,36 @@ fn load_legacy(store: &Store, file: fs::File) -> io::Result<usize> {
                 if !entries_raw.is_empty() {
                     for entry_str in entries_raw.split('\x1f') {
                         let parts_e: Vec<&str> = entry_str.split('\x1d').collect();
-                        if !parts_e.is_empty() {
-                            let id = parts_e[0].to_string();
-                            let mut fields = Vec::new();
-                            let mut fi = 1;
-                            while fi + 1 < parts_e.len() {
-                                fields.push((
-                                    parts_e[fi].to_string(),
-                                    parts_e[fi + 1].as_bytes().to_vec(),
-                                ));
-                                fi += 2;
-                            }
-                            entries.push((id, fields));
+                        if parts_e.is_empty()
+                            || parts_e[0].is_empty()
+                            || !(parts_e.len() - 1).is_multiple_of(2)
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "malformed legacy stream entry",
+                            ));
                         }
+                        let id = parts_e[0].to_string();
+                        let mut fields = Vec::new();
+                        let mut fi = 1;
+                        while fi + 1 < parts_e.len() {
+                            fields.push((
+                                parts_e[fi].to_string(),
+                                parts_e[fi + 1].as_bytes().to_vec(),
+                            ));
+                            fi += 2;
+                        }
+                        entries.push((id, fields));
                     }
                 }
                 DumpValue::Stream(entries, last_id_str, Vec::new())
             }
-            _ => continue,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unknown legacy snapshot type",
+                ))
+            }
         };
 
         store.load_entry(key, value, ttl);
@@ -901,7 +1283,7 @@ fn save_to_path(store: &Store, path: &str) -> io::Result<usize> {
         fs::create_dir_all(parent)?;
     }
     let now = Instant::now();
-    let entries = store.dump_all(now);
+    let entries = store.dump_all(now)?;
     let tmp = format!("{path}.tmp");
     let file = fs::File::create(&tmp)?;
     let mut w = BufWriter::new(file);
@@ -927,7 +1309,7 @@ fn save_legacy_to_path(store: &Store, path: &str) -> io::Result<usize> {
         fs::create_dir_all(parent)?;
     }
     let now = Instant::now();
-    let entries = store.dump_all(now);
+    let entries = store.dump_all(now)?;
     let tmp = format!("{path}.tmp");
     let mut file = fs::File::create(&tmp)?;
     for entry in &entries {
@@ -1055,17 +1437,375 @@ mod tests {
 
         let commit = prepared.commit(&command).unwrap();
         store.set(b"snapshot-race", b"durable", None, Instant::now());
-        drop(commit);
+        commit.complete().unwrap();
         done_rx.recv().unwrap().unwrap();
         snapshot_thread.join().unwrap();
 
         let recovered = Store::new_with_config(config);
         assert_eq!(load(&recovered).unwrap(), 1);
-        recovered.replay_wal(&crate::pubsub::Broker::new());
+        recovered.replay_wal(&crate::pubsub::Broker::new()).unwrap();
         assert_eq!(
             recovered.get(b"snapshot-race", Instant::now()).unwrap(),
             &b"durable"[..]
         );
+    }
+
+    #[test]
+    fn tiered_snapshot_read_failure_preserves_the_journal() {
+        let (store, data_dir, _guard) = store_in_temp_dir(crate::StorageMode::Tiered);
+        let key = b"cold-durable";
+        let command: [&[u8]; 3] = [b"SET", key, b"value"];
+        store
+            .commit_journaled(&command, || store.set(key, b"value", None, Instant::now()))
+            .unwrap();
+        assert!(store.evict_key(store.shard_index(key), key));
+
+        let journal_path = Path::new(&store.config().storage.dir).join("global/wal.lux");
+        let journal_before = fs::read(&journal_path).unwrap();
+        let cold_path = fs::read_dir(&store.config().storage.dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("data.lux"))
+            .find(|path| fs::metadata(path).is_ok_and(|metadata| metadata.len() > 8))
+            .expect("evicted key must have a cold data file");
+
+        let mut cold_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&cold_path)
+            .unwrap();
+        cold_file.seek(SeekFrom::Start(8)).unwrap();
+        let mut checksum_byte = [0u8; 1];
+        cold_file.read_exact(&mut checksum_byte).unwrap();
+        cold_file.seek(SeekFrom::Start(8)).unwrap();
+        cold_file.write_all(&[checksum_byte[0] ^ 0xff]).unwrap();
+        cold_file.sync_all().unwrap();
+
+        assert!(store.try_promote(key, Instant::now()).is_err());
+        assert!(
+            store.disk_contains(key),
+            "a failed cold read must retain the authoritative disk index entry"
+        );
+        let cache =
+            std::sync::Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let mut reply = bytes::BytesMut::new();
+        crate::cmd::execute_with_wal(
+            &store,
+            &cache,
+            &crate::pubsub::Broker::new(),
+            &[b"GET", key],
+            &mut reply,
+            Instant::now(),
+        );
+        assert!(
+            String::from_utf8_lossy(&reply).contains("cold storage read failed"),
+            "a corrupt cold key must fail explicitly, not appear missing: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+
+        let error = save_and_truncate_wal_consistent(&store)
+            .expect_err("a corrupt cold entry must abort the snapshot");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!data_dir.join("lux.dat").exists());
+        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+
+        drop(store);
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            storage: crate::StorageConfig {
+                mode: crate::StorageMode::Tiered,
+                dir: data_dir.join("storage").to_string_lossy().into_owned(),
+            },
+            ..Default::default()
+        });
+        let recovered = Store::new_with_config(config);
+        load_for_recovery(&recovered).unwrap();
+        recovered.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        assert_eq!(recovered.get(key, Instant::now()).unwrap(), &b"value"[..]);
+    }
+
+    #[test]
+    fn installed_snapshot_does_not_replay_its_included_journal_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        let command: [&[u8]; 2] = [b"INCR", b"snapshot-counter"];
+        for _ in 0..3 {
+            store
+                .commit_journaled(&command, || {
+                    store.incr(b"snapshot-counter", 1, Instant::now())
+                })
+                .unwrap()
+                .unwrap();
+        }
+
+        // Model a kill after the snapshot rename but before journal rotation:
+        // install the complete snapshot while deliberately leaving its source
+        // frames in place.
+        store
+            .with_write_barrier(|shards| {
+                let checkpoints = store.wal_checkpoints()?;
+                let entries = store.dump_all_from_locked_shards(shards, Instant::now())?;
+                save_entries(&store, &entries, &checkpoints)
+            })
+            .unwrap();
+        drop(store);
+
+        let recovered = Store::new_with_config(config);
+        load_for_recovery(&recovered).unwrap();
+        recovered.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        assert_eq!(
+            recovered.get(b"snapshot-counter", Instant::now()).unwrap(),
+            b"3".as_slice(),
+            "journal frames already represented by the installed snapshot must be skipped"
+        );
+    }
+
+    #[test]
+    fn rotated_journal_replays_only_post_snapshot_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        let command: [&[u8]; 2] = [b"INCR", b"rotated-counter"];
+        for _ in 0..3 {
+            store
+                .commit_journaled(&command, || {
+                    store.incr(b"rotated-counter", 1, Instant::now())
+                })
+                .unwrap()
+                .unwrap();
+        }
+        save_and_truncate_wal_consistent(&store).unwrap();
+        for _ in 0..2 {
+            store
+                .commit_journaled(&command, || {
+                    store.incr(b"rotated-counter", 1, Instant::now())
+                })
+                .unwrap()
+                .unwrap();
+        }
+        drop(store);
+
+        let recovered = Store::new_with_config(config);
+        load_for_recovery(&recovered).unwrap();
+        recovered.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        assert_eq!(
+            recovered.get(b"rotated-counter", Instant::now()).unwrap(),
+            b"5".as_slice()
+        );
+    }
+
+    #[test]
+    fn partially_rotated_journals_recover_each_stream_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            storage: crate::StorageConfig {
+                mode: crate::StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().into_owned(),
+            },
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        {
+            let mut legacy = crate::disk::Wal::open(dir.path(), 0).unwrap();
+            legacy
+                .append_command(&[b"INCR", b"legacy-counter"])
+                .unwrap();
+            legacy
+                .append_command(&[b"INCR", b"legacy-counter"])
+                .unwrap();
+            legacy.fsync().unwrap();
+        }
+
+        let store = Store::new_with_config(config.clone());
+        store.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        let global: [&[u8]; 2] = [b"INCR", b"global-counter"];
+        for _ in 0..3 {
+            store
+                .commit_journaled(&global, || store.incr(b"global-counter", 1, Instant::now()))
+                .unwrap()
+                .unwrap();
+        }
+        store
+            .with_write_barrier(|shards| {
+                let checkpoints = store.wal_checkpoints()?;
+                let entries = store.dump_all_from_locked_shards(shards, Instant::now())?;
+                save_entries(&store, &entries, &checkpoints)
+            })
+            .unwrap();
+        drop(store);
+
+        // Model a crash after only the legacy stream rotated. Its new command
+        // must replay in full, while the unrotated global prefix must be skipped.
+        {
+            let mut legacy = crate::disk::Wal::open(dir.path(), 0).unwrap();
+            legacy.truncate().unwrap();
+            legacy
+                .append_command(&[b"INCR", b"legacy-counter"])
+                .unwrap();
+            legacy.fsync().unwrap();
+        }
+
+        let recovered = Store::new_with_config(config);
+        load_for_recovery(&recovered).unwrap();
+        recovered.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        assert_eq!(
+            recovered.get(b"legacy-counter", Instant::now()).unwrap(),
+            b"3".as_slice()
+        );
+        assert_eq!(
+            recovered.get(b"global-counter", Instant::now()).unwrap(),
+            b"3".as_slice()
+        );
+    }
+
+    #[test]
+    fn malformed_v4_checkpoint_metadata_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-checkpoints.lux");
+        let mut bytes = HEADER_V4.to_vec();
+        bytes.extend_from_slice(&((MAX_WAL_CHECKPOINTS as u32) + 1).to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+        let store = Store::new();
+        let error = load_from_reader(&store, fs::File::open(path).unwrap(), false)
+            .expect_err("oversized checkpoint metadata must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn v5_snapshot_rejects_every_truncation_and_bit_flip_before_loading() {
+        let (store, data_dir, _guard) = store_in_temp_dir(crate::StorageMode::Memory);
+        for (key, value) in [
+            (b"first".as_slice(), b"one".as_slice()),
+            (b"second", b"two"),
+        ] {
+            let command: [&[u8]; 3] = [b"SET", key, value];
+            store
+                .commit_journaled(&command, || store.set(key, value, None, Instant::now()))
+                .unwrap();
+        }
+        save_and_truncate_wal_consistent(&store).unwrap();
+        let snapshot = fs::read(data_dir.join("lux.dat")).unwrap();
+        assert_eq!(&snapshot[..HEADER_V5.len()], HEADER_V5);
+        drop(store);
+
+        let restored = Store::new();
+        assert_eq!(
+            load_from_reader(&restored, io::Cursor::new(&snapshot), false).unwrap(),
+            2
+        );
+        assert_eq!(restored.get(b"first", Instant::now()).unwrap(), &b"one"[..]);
+        assert_eq!(
+            restored.get(b"second", Instant::now()).unwrap(),
+            &b"two"[..]
+        );
+
+        for end in 0..snapshot.len() {
+            let candidate = Store::new();
+            assert!(
+                load_from_reader(&candidate, io::Cursor::new(&snapshot[..end]), false).is_err(),
+                "truncation at byte {end} was accepted"
+            );
+        }
+        for offset in 0..snapshot.len() {
+            let mut corrupted = snapshot.clone();
+            corrupted[offset] ^= 0x01;
+            let candidate = Store::new();
+            assert!(
+                load_from_reader(&candidate, io::Cursor::new(corrupted), false).is_err(),
+                "bit flip at byte {offset} was accepted"
+            );
+            assert!(candidate.get(b"first", Instant::now()).is_none());
+        }
+    }
+
+    #[test]
+    fn encrypted_v5_snapshot_validates_restores_and_reopens() {
+        let (store, data_dir, _guard) = store_in_temp_dir(crate::StorageMode::Memory);
+        store.encryption().init(Some("snapshot-key")).unwrap();
+        let command: [&[u8]; 7] = [
+            b"VSET",
+            b"secret-vector",
+            b"2",
+            b"1.25",
+            b"-2.5",
+            b"META",
+            b"classified",
+        ];
+        store
+            .commit_journaled(&command, || {
+                store.vset(
+                    b"secret-vector",
+                    vec![1.25, -2.5],
+                    Some("classified".to_string()),
+                    None,
+                    true,
+                    Instant::now(),
+                )
+            })
+            .unwrap();
+        save_and_truncate_wal_consistent(&store).unwrap();
+        let snapshot = fs::read(data_dir.join("lux.dat")).unwrap();
+        assert_eq!(&snapshot[..HEADER_V5.len()], HEADER_V5);
+
+        validate_restore_dump(&store, &snapshot).unwrap();
+        let config = store.config().clone();
+        restore_to_disk(&store, &snapshot).unwrap();
+        drop(store);
+
+        complete_pending_restore(&config).unwrap();
+        let restored = Store::try_new_with_config(std::sync::Arc::new(config)).unwrap();
+        assert_eq!(load(&restored).unwrap(), 1);
+        let (vector, metadata) = restored
+            .vget(b"secret-vector", Instant::now())
+            .expect("encrypted vector was not restored");
+        assert_eq!(vector, vec![1.25, -2.5]);
+        assert_eq!(metadata.as_deref(), Some("classified"));
+    }
+
+    #[test]
+    fn checksummed_dump_rejects_every_truncation_and_single_bit_flip() {
+        let store = Store::new();
+        store.set(b"key", b"value", None, Instant::now());
+        let blob = store.dump_key(b"key", Instant::now()).unwrap().unwrap();
+        assert!(blob.starts_with(DUMP_HEADER));
+        let (value, _) = decode_dump_blob_value(&store, &blob).unwrap();
+        assert!(matches!(value, DumpValue::Str(value) if value == b"value"));
+
+        for end in 0..blob.len() {
+            assert!(
+                decode_dump_blob_value(&store, &blob[..end]).is_err(),
+                "DUMP truncation at byte {end} was accepted"
+            );
+        }
+        for offset in 0..blob.len() {
+            for bit in 0..8 {
+                let mut corrupted = blob.clone();
+                corrupted[offset] ^= 1 << bit;
+                assert!(
+                    decode_dump_blob_value(&store, &corrupted).is_err(),
+                    "DUMP bit {bit} at byte {offset} was accepted"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1447,10 +2187,17 @@ mod tests {
     // guard once accepted only V1 and V3, silently rejecting V2 backups.
     #[test]
     fn restore_accepts_all_known_headers_rejects_junk() {
-        for header in [HEADER_V1, HEADER_V2, HEADER] {
+        for header in [HEADER_V1, HEADER_V2, HEADER, HEADER_V4, HEADER_V5] {
             let (store, dir, _g) = store_in_temp_dir(crate::StorageMode::Memory);
             let mut dump = header.to_vec();
-            dump.extend_from_slice(b"trailing-body-bytes");
+            if header == HEADER_V4 {
+                dump.extend_from_slice(&0u32.to_le_bytes());
+            } else if header == HEADER_V5 {
+                let body = 0u32.to_le_bytes();
+                dump.extend_from_slice(&(body.len() as u64).to_le_bytes());
+                dump.extend_from_slice(&Sha256::digest(body));
+                dump.extend_from_slice(&body);
+            }
             restore_to_disk(&store, &dump)
                 .unwrap_or_else(|e| panic!("header {header:?} should restore: {e}"));
             assert!(
@@ -1463,6 +2210,14 @@ mod tests {
         let err = restore_to_disk(&store, b"XXXXnot-a-snapshot")
             .expect_err("junk header must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let (store, _dir, _g) = store_in_temp_dir(crate::StorageMode::Memory);
+        let mut corrupt = HEADER.to_vec();
+        corrupt.extend_from_slice(b"truncated-entry");
+        let err = restore_to_disk(&store, &corrupt)
+            .expect_err("a valid header must not make a corrupt body restorable");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!store.is_restoring());
     }
 
     // Restore must drop only Lux-owned persistence dirs, never sibling files: a
@@ -1479,9 +2234,7 @@ mod tests {
         fs::create_dir_all(journal_dir.join("global")).unwrap();
         fs::write(journal_dir.join("global/wal.lux"), b"stale").unwrap();
 
-        let mut dump = HEADER.to_vec();
-        dump.extend_from_slice(b"body");
-        restore_to_disk(&store, &dump).unwrap();
+        restore_to_disk(&store, HEADER).unwrap();
 
         assert!(!storage_dir.join("shard_0").exists(), "shard_0 purged");
         assert!(!storage_dir.join("shard_1").exists(), "shard_1 purged");
@@ -1498,10 +2251,11 @@ mod tests {
         let (store, _dir, _g) = store_in_temp_dir(crate::StorageMode::Memory);
         let journal_dir = store.config().journal_dir();
         fs::write(journal_dir.join("keep.txt"), b"keep").unwrap();
+        let inactive_storage = Path::new(&store.config().storage.dir);
+        fs::create_dir_all(inactive_storage.join("shard_0")).unwrap();
+        fs::write(inactive_storage.join("shard_0/keep.txt"), b"keep").unwrap();
 
-        let mut dump = HEADER.to_vec();
-        dump.extend_from_slice(b"body");
-        restore_to_disk(&store, &dump).unwrap();
+        restore_to_disk(&store, HEADER).unwrap();
 
         assert!(
             !journal_dir.join("shard_0").exists(),
@@ -1509,6 +2263,167 @@ mod tests {
         );
         assert!(journal_dir.join("keep.txt").exists(), "unrelated file kept");
         assert!(journal_dir.exists(), "journal dir itself kept");
+        assert!(
+            inactive_storage.join("shard_0/keep.txt").exists(),
+            "inactive storage path must not be touched by a memory-layout restore"
+        );
+    }
+
+    #[test]
+    fn pending_restore_finishes_before_persistence_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            storage: crate::StorageConfig {
+                mode: crate::StorageMode::Tiered,
+                dir: dir.path().join("storage").to_string_lossy().into_owned(),
+            },
+            ..Default::default()
+        };
+        crate::disk::create_dir_all_synced(Path::new(&config.data_dir)).unwrap();
+        let old = [HEADER.as_slice(), b"old"].concat();
+        fs::write(snapshot_path_for_config(&config), old).unwrap();
+        let persistence = config.journal_dir();
+        fs::create_dir_all(persistence.join("global")).unwrap();
+        fs::create_dir_all(persistence.join("shard_0")).unwrap();
+        fs::write(persistence.join("global/wal.lux"), b"stale-wal").unwrap();
+        fs::write(persistence.join("shard_0/data.lux"), b"stale-data").unwrap();
+
+        let restored = HEADER.to_vec();
+        stage_restore(&config, &restored).unwrap();
+        // Model a crash after snapshot installation but before stale state was
+        // purged. Startup must finish the pending restore before Store opens it.
+        fs::rename(
+            restore_staged_path(&config),
+            snapshot_path_for_config(&config),
+        )
+        .unwrap();
+        complete_pending_restore(&config).unwrap();
+
+        assert_eq!(
+            fs::read(snapshot_path_for_config(&config)).unwrap(),
+            restored
+        );
+        assert!(!persistence.join("global").exists());
+        assert!(!persistence.join("shard_0").exists());
+        assert!(!restore_marker_path(&config).exists());
+    }
+
+    #[test]
+    fn uncommitted_restore_stage_does_not_replace_current_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            storage: crate::StorageConfig {
+                mode: crate::StorageMode::Memory,
+                dir: dir
+                    .path()
+                    .join("inactive-storage")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+            ..Default::default()
+        };
+        let current = HEADER.to_vec();
+        fs::write(snapshot_path_for_config(&config), &current).unwrap();
+        fs::write(restore_staged_path(&config), HEADER_V4).unwrap();
+
+        complete_pending_restore(&config).unwrap();
+
+        assert_eq!(
+            fs::read(snapshot_path_for_config(&config)).unwrap(),
+            current
+        );
+        assert!(!restore_staged_path(&config).exists());
+    }
+
+    #[test]
+    fn successful_restore_freezes_writes_and_snapshots_until_restart() {
+        let (store, _dir, _g) = store_in_temp_dir(crate::StorageMode::Memory);
+        restore_to_disk(&store, HEADER).unwrap();
+
+        let command: [&[u8]; 3] = [b"SET", b"late-write", b"value"];
+        assert!(
+            store
+                .commit_journaled(&command, || {
+                    store.set(b"late-write", b"value", None, Instant::now())
+                })
+                .is_err(),
+            "a write acknowledged after restore could be lost on restart"
+        );
+        assert!(save_and_truncate_wal_consistent(&store).is_err());
+    }
+
+    #[test]
+    fn ephemeral_write_cannot_cross_the_restore_install_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::Ephemeral,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let store = Arc::new(Store::new_with_config(config));
+        let (prepare_entered_tx, prepare_entered_rx) = std::sync::mpsc::channel();
+        let (release_prepare_tx, release_prepare_rx) = std::sync::mpsc::channel();
+        let writer_store = store.clone();
+        let writer = std::thread::spawn(move || {
+            let route: [&[u8]; 2] = [b"SET", b"racing-write"];
+            writer_store
+                .commit_prepared(
+                    &route,
+                    || {
+                        prepare_entered_tx.send(()).unwrap();
+                        release_prepare_rx.recv().unwrap();
+                        Ok::<_, ()>(crate::store::JournalPlan::command(
+                            route.iter().map(|arg| arg.to_vec()).collect(),
+                            (),
+                        ))
+                    },
+                    |()| {
+                        writer_store.set(b"racing-write", b"value", None, Instant::now());
+                        Ok::<_, ()>(())
+                    },
+                )
+                .unwrap()
+                .unwrap();
+        });
+        prepare_entered_rx.recv().unwrap();
+
+        let restore_store = store.clone();
+        let (restore_done_tx, restore_done_rx) = std::sync::mpsc::channel();
+        let restore = std::thread::spawn(move || {
+            let result = restore_to_disk(&restore_store, HEADER);
+            restore_done_tx.send(result).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !store.is_restoring() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(store.is_restoring(), "restore did not begin");
+        assert!(
+            restore_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "restore crossed a mutation that had already entered preparation"
+        );
+
+        release_prepare_tx.send(()).unwrap();
+        writer.join().unwrap();
+        restore_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("restore did not finish")
+            .unwrap();
+        restore.join().unwrap();
+
+        let late: [&[u8]; 3] = [b"SET", b"late-write", b"value"];
+        assert!(store
+            .commit_journaled(&late, || {
+                store.set(b"late-write", b"value", None, Instant::now())
+            })
+            .is_err());
     }
 
     // Fuzz: arbitrary bytes fed to the binary snapshot loader must never panic

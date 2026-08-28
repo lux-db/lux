@@ -460,6 +460,10 @@ pub fn cmd_geosearchstore(
     }
     let dest = args[1];
     let src = args[2];
+    if let Err(error) = store.try_promote(src, now) {
+        resp::write_error(out, &error);
+        return CmdResult::Written;
+    }
     let mut store_dist = false;
     for arg in &args[3..] {
         if cmd_eq(arg, b"STOREDIST") {
@@ -539,6 +543,12 @@ pub fn cmd_georadius(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Ins
     if let Err(true) = parse_legacy_options(args, 6, &mut params, out) {
         return CmdResult::Written;
     }
+    if let Some(destination) = params.store_key.as_deref() {
+        if let Err(error) = store.try_promote(destination, now) {
+            resp::write_error(out, &error);
+            return CmdResult::Written;
+        }
+    }
 
     match execute_geosearch(store, key, &params, now) {
         Ok(results) => write_results(store, out, &results, &params, now),
@@ -598,6 +608,12 @@ pub fn cmd_georadiusbymember(
 
     if let Err(true) = parse_legacy_options(args, 5, &mut params, out) {
         return CmdResult::Written;
+    }
+    if let Some(destination) = params.store_key.as_deref() {
+        if let Err(error) = store.try_promote(destination, now) {
+            resp::write_error(out, &error);
+            return CmdResult::Written;
+        }
     }
 
     let (lon, lat) = match lookup_member_coords(store, key, args[2], now) {

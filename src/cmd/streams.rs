@@ -5,7 +5,7 @@ use crate::pubsub::Broker;
 use crate::resp;
 use crate::store::{Store, StreamId};
 
-use super::{arg_str, cmd_eq, parse_u64, CmdResult};
+use super::{arg_str, cmd_eq, parse_u64, promote_keys, CmdResult};
 
 fn write_stream_entries(out: &mut BytesMut, entries: &[(StreamId, Vec<(String, Bytes)>)]) {
     resp::write_array_header(out, entries.len());
@@ -164,7 +164,7 @@ pub fn cmd_xadd(
         return CmdResult::Written;
     };
     let refs: Vec<&[u8]> = journal_args.iter().map(Vec::as_slice).collect();
-    let _commit = match prepare.commit(&refs) {
+    let commit = match prepare.commit(&refs) {
         Ok(commit) => commit,
         Err(e) => {
             resp::write_error(out, &format!("ERR WAL append failed: {e}"));
@@ -174,6 +174,10 @@ pub fn cmd_xadd(
     let resolved_id = id.to_string();
     match store.xadd(args[1], &resolved_id, fields, maxlen, now) {
         Ok(id) => {
+            if let Err(error) = commit.complete() {
+                resp::write_error(out, &format!("ERR journal apply failed: {error}"));
+                return CmdResult::Written;
+            }
             resp::write_bulk(out, &id.to_string());
             _broker.wake_stream_waiters(arg_str(args[1]));
         }
@@ -292,6 +296,10 @@ pub fn cmd_xread(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         .iter()
         .map(|k| arg_str(k).to_string())
         .collect();
+    let key_refs: Vec<&[u8]> = keys.iter().map(|key| key.as_bytes()).collect();
+    if !promote_keys(store, &key_refs, out, now) {
+        return CmdResult::Written;
+    }
     let id_strs: Vec<String> = args[i + half..]
         .iter()
         .map(|k| arg_str(k).to_string())
@@ -483,6 +491,10 @@ pub fn cmd_xreadgroup(
         .iter()
         .map(|k| arg_str(k).to_string())
         .collect();
+    let key_refs: Vec<&[u8]> = keys.iter().map(|key| key.as_bytes()).collect();
+    if !promote_keys(store, &key_refs, out, now) {
+        return CmdResult::Written;
+    }
     let id_strs: Vec<String> = args[i + half..]
         .iter()
         .map(|k| arg_str(k).to_string())

@@ -523,7 +523,7 @@ pub(crate) fn bootstrap(
         &["key STR PRIMARY KEY,", "value STR,", "updated_at INT"],
         now,
     )?;
-    if store.get(AUTH_SCHEMA_VERSION_KEY, now).as_deref() != Some(AUTH_SCHEMA_VERSION) {
+    if store.get_checked(AUTH_SCHEMA_VERSION_KEY, now)?.as_deref() != Some(AUTH_SCHEMA_VERSION) {
         let command: [&[u8]; 3] = [b"SET", AUTH_SCHEMA_VERSION_KEY, AUTH_SCHEMA_VERSION];
         store
             .commit_journaled(&command, || {
@@ -2765,8 +2765,8 @@ pub(crate) fn create_table_if_missing(
 /// has already shipped: new projects pick the column up from the CREATE, and
 /// projects created before it get it from here.
 ///
-/// Internal schema upgrades bypass command dispatch, so they cross the same
-/// journal-before-apply boundary explicitly here.
+/// `table_add_column` owns the journal-before-apply boundary so this path and
+/// the public command path share one authoritative recovery record.
 pub(crate) fn add_column_if_missing(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -2786,18 +2786,7 @@ pub(crate) fn add_column_if_missing(
         return Ok(());
     }
 
-    let mut args: Vec<Vec<u8>> = vec![
-        b"TALTER".to_vec(),
-        table.as_bytes().to_vec(),
-        b"ADD".to_vec(),
-    ];
-    args.extend(field_spec.split_whitespace().map(|t| t.as_bytes().to_vec()));
-    let refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
-    store
-        .commit_journaled(&refs, || {
-            tables::table_add_column(store, cache, table, field_spec, now)
-        })
-        .map_err(|error| format!("ERR WAL append failed: {error}"))?
+    tables::table_add_column(store, cache, table, field_spec, now)
 }
 
 pub(crate) fn durable_table_insert(
@@ -3337,6 +3326,7 @@ fn validate_access_claims(
         return Err(error(401, "Unauthorized", "session user mismatch"));
     }
     if access_revoked_after(store, &claims.session_id, now)
+        .map_err(|e| error(500, "Internal Server Error", &e))?
         .map(|revoked_after| claims.iat as u64 <= revoked_after)
         .unwrap_or(false)
     {
@@ -3430,11 +3420,15 @@ fn persist_access_revocation(
     Ok(())
 }
 
-fn access_revoked_after(store: &Store, session_id: &str, now: Instant) -> Option<u64> {
+fn access_revoked_after(
+    store: &Store,
+    session_id: &str,
+    now: Instant,
+) -> Result<Option<u64>, String> {
     let key = access_revoked_after_key(session_id);
     store
-        .get(&key, now)
-        .and_then(|value| std::str::from_utf8(&value).ok()?.parse::<u64>().ok())
+        .get_checked(&key, now)
+        .map(|value| value.and_then(|value| std::str::from_utf8(&value).ok()?.parse::<u64>().ok()))
 }
 
 fn access_revoked_after_key(session_id: &str) -> Vec<u8> {
@@ -3703,14 +3697,17 @@ fn take_oauth_state(
     let prepare = store
         .prepare_journaled(&command)
         .map_err(|error| format!("ERR WAL append failed: {error}"))?;
-    let Some(payload) = store.get(key, now) else {
+    let Some(payload) = store.get_checked(key, now)? else {
         return Ok(None);
     };
-    let _commit = prepare
+    let commit = prepare
         .commit(&command)
         .map_err(|error| format!("ERR WAL append failed: {error}"))?;
     let removed = store.del(&[key]);
     debug_assert_eq!(removed, 1);
+    commit
+        .complete()
+        .map_err(|error| format!("ERR journal apply failed: {error}"))?;
     Ok(Some(payload))
 }
 

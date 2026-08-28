@@ -668,7 +668,7 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 | `LUX_ENABLE_RESP` | `true` | Set to `0` or `false` to disable the RESP listener |
 | `LUX_RESTRICTED` | `false` | Disable `KEYS`, `FLUSHALL`, `FLUSHDB`, and `DEBUG` |
 | `LUX_DATA_DIR` | image: `/data`; binary: `.` | Snapshot and journal root; persistent relative paths are resolved at startup |
-| `LUX_DURABILITY` | `every_second` | Acknowledgement policy: `ephemeral`, `every_second`, or `always_sync` |
+| `LUX_DURABILITY` | `always_sync` | Acknowledgement policy: `ephemeral`, `every_second`, or `always_sync` |
 | `LUX_DURABILITY_SYNC_INTERVAL_MS` | `1000` | WAL sync interval for `every_second` (1–1000 ms); invalid for other policies |
 | `LUX_SAVE_INTERVAL` | `60` | Snapshot interval in seconds (0 to disable) |
 | `LUX_SHARDS` | auto | Next power of two at or above logical CPUs × 16, clamped to 16–1024 |
@@ -845,9 +845,10 @@ partial, divergent, and unsupported behavior.
 Lux is Redis-compatible but not identical. Key differences:
 
 - **No AOF persistence** -- Lux uses snapshots plus a checksummed write-ahead
-  log (WAL) instead of Redis AOF. By default the WAL is fsynced
-  approximately once per second; acknowledged writes since the last successful
-  fsync may be lost on sudden power failure. See [DURABILITY.md](DURABILITY.md).
+  log (WAL) instead of Redis AOF. The default `always_sync` policy fsyncs each
+  mutation before acknowledging it. The opt-in `every_second` policy trades
+  that guarantee for throughput and can lose acknowledged writes since its last
+  successful fsync. See [DURABILITY.md](DURABILITY.md).
 - **No RESP3 protocol** -- RESP2 only
 - **No cluster mode** -- single-node only (use Lux Cloud for managed hosting)
 - **MULTI/EXEC** -- supported with WATCH-based optimistic locking. Commands in a transaction execute sequentially, each acquiring its own shard and durability boundary, so another client can observe intermediate state and a process crash during an unacknowledged EXEC can recover a completed prefix. Redis avoids this via single-threading and transaction-aware AOF framing. Standard client libraries (Redlock, BullMQ, Sidekiq) rely on WATCH for correctness, not EXEC isolation. Full transaction isolation and crash-atomic framing may be added in a future release if there is demand

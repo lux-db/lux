@@ -741,10 +741,14 @@ pub fn cmd_tlist(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         resp::write_error(out, "ERR wrong number of arguments for 'tlist' command");
         return CmdResult::Written;
     }
-    let tables = tables::table_list(store, now);
-    resp::write_array_header(out, tables.len());
-    for t in tables {
-        resp::write_bulk(out, &t);
+    match tables::table_list(store, now) {
+        Ok(tables) => {
+            resp::write_array_header(out, tables.len());
+            for table in tables {
+                resp::write_bulk(out, &table);
+            }
+        }
+        Err(error) => resp::write_error(out, &error),
     }
     CmdResult::Written
 }

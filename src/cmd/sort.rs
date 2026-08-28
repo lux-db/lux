@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::resp;
 use crate::store::Store;
 
-use super::{arg_str, cmd_eq, parse_i64, CmdResult};
+use super::{arg_str, cmd_eq, parse_i64, promote_keys, CmdResult};
 
 const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
 
@@ -97,6 +97,9 @@ pub fn cmd_sort(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         }
     }
 
+    if !promote_keys(store, &[key], out, now) {
+        return CmdResult::Written;
+    }
     let elements = match store.sort_get_elements(key, now) {
         Ok(elems) => elems,
         Err(e) => {
@@ -104,6 +107,32 @@ pub fn cmd_sort(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
             return CmdResult::Written;
         }
     };
+
+    // SORT can dereference dynamic BY/GET keys and optionally overwrite a
+    // separate destination. Resolve and promote every such key before sorting
+    // or producing output so a cold-tier read failure cannot become a missing
+    // lookup or a destructive overwrite.
+    let mut referenced_keys = std::collections::HashSet::<Vec<u8>>::new();
+    if let Some(destination) = store_key {
+        referenced_keys.insert(destination.to_vec());
+    }
+    for elem in &elements {
+        if let Some(pattern) = by.as_deref() {
+            if pattern.contains('*') {
+                referenced_keys.insert(sort_lookup_key(pattern, elem));
+            }
+        }
+        for pattern in &get_patterns {
+            if pattern != "#" {
+                referenced_keys.insert(sort_lookup_key(pattern, elem));
+            }
+        }
+    }
+    let referenced_keys: Vec<Vec<u8>> = referenced_keys.into_iter().collect();
+    let referenced_key_refs: Vec<&[u8]> = referenced_keys.iter().map(Vec::as_slice).collect();
+    if !promote_keys(store, &referenced_key_refs, out, now) {
+        return CmdResult::Written;
+    }
 
     let by_constant = by.as_ref().is_some_and(|p| !p.contains('*'));
     let nosort = by.as_deref() == Some("nosort") || (by_constant && !alpha);
@@ -260,6 +289,14 @@ pub fn cmd_sort(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         }
     }
     CmdResult::Written
+}
+
+fn sort_lookup_key(pattern: &str, elem: &str) -> Vec<u8> {
+    let lookup = pattern.replace('*', elem);
+    lookup
+        .split_once("->")
+        .map_or_else(|| lookup.as_bytes(), |(key, _)| key.as_bytes())
+        .to_vec()
 }
 
 fn resolve_get(store: &Store, pattern: &str, elem: &str, now: Instant) -> String {

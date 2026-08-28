@@ -107,6 +107,112 @@ fn tiered_cold_incr() {
 }
 
 #[test]
+fn tiered_multi_key_commands_promote_every_input_before_mutating() {
+    let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+
+    send(&mut c, &["RPUSH", "sort-source", "3", "1", "2"]);
+    send(&mut c, &["RPUSH", "sort-destination", "old"]);
+    fill_memory(&mut c, 20);
+    let stored = send(
+        &mut c,
+        &["SORT", "sort-source", "STORE", "sort-destination"],
+    );
+    assert!(stored.contains(":3"), "cold SORT source was lost: {stored}");
+    let sorted = send(&mut c, &["LRANGE", "sort-destination", "0", "-1"]);
+    let one = sorted.find("\r\n1\r\n");
+    let two = sorted.find("\r\n2\r\n");
+    let three = sorted.find("\r\n3\r\n");
+    assert!(
+        one.is_some() && two.is_some() && three.is_some() && one < two && two < three,
+        "cold SORT result is incomplete or unordered: {sorted}"
+    );
+
+    send(&mut c, &["SET", "rename-source", "rename-value"]);
+    fill_memory(&mut c, 20);
+    let renamed = send(&mut c, &["RENAME", "rename-source", "rename-destination"]);
+    assert!(renamed.contains("+OK"), "cold RENAME failed: {renamed}");
+    assert!(
+        send(&mut c, &["GET", "rename-destination"]).contains("rename-value"),
+        "cold RENAME lost its source value"
+    );
+
+    send(&mut c, &["SET", "copy-source", "copy-value"]);
+    fill_memory(&mut c, 20);
+    let copied = send(&mut c, &["COPY", "copy-source", "copy-destination"]);
+    assert!(copied.contains(":1"), "cold COPY failed: {copied}");
+    assert!(
+        send(&mut c, &["GET", "copy-destination"]).contains("copy-value"),
+        "cold COPY lost its source value"
+    );
+
+    send(&mut c, &["GEOADD", "geo-source", "0", "0", "origin"]);
+    send(&mut c, &["ZADD", "geo-destination", "1", "old"]);
+    fill_memory(&mut c, 20);
+    let stored = send(
+        &mut c,
+        &[
+            "GEORADIUS",
+            "geo-source",
+            "0",
+            "0",
+            "1",
+            "km",
+            "STORE",
+            "geo-destination",
+        ],
+    );
+    assert!(
+        stored.contains(":1"),
+        "cold GEORADIUS destination was not replaced: {stored}"
+    );
+    let members = send(&mut c, &["ZRANGE", "geo-destination", "0", "-1"]);
+    assert!(
+        members.contains("origin") && !members.contains("old"),
+        "cold GEORADIUS destination retained stale data: {members}"
+    );
+}
+
+#[test]
+fn tiered_table_sequences_and_rows_survive_eviction_and_restart() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    assert!(
+        send(&mut c, &["TCREATE", "accounts", "name STR"]).contains("+OK"),
+        "table creation failed"
+    );
+    assert!(
+        send(&mut c, &["TINSERT", "accounts", "name", "alice"]).contains(":1"),
+        "first row did not receive id 1"
+    );
+
+    // Force the schema, sequence, id set, indexes, and row hash through the
+    // cold tier. A missing promotion used to reset the sequence to zero and
+    // could overwrite row 1 on the next insert.
+    fill_memory(&mut c, 30);
+    let second = send(&mut c, &["TINSERT", "accounts", "name", "bob"]);
+    assert!(
+        second.contains(":2"),
+        "second insert reused an id: {second}"
+    );
+    let rows = send(&mut c, &["TSELECT", "*", "FROM", "accounts"]);
+    assert!(rows.contains("alice"), "eviction lost row 1: {rows}");
+    assert!(rows.contains("bob"), "eviction lost row 2: {rows}");
+    drop(c);
+
+    srv.restart();
+    let mut c = srv.conn();
+    let rows = send(&mut c, &["TSELECT", "*", "FROM", "accounts"]);
+    assert!(rows.contains("alice"), "restart lost row 1: {rows}");
+    assert!(rows.contains("bob"), "restart lost row 2: {rows}");
+    let third = send(&mut c, &["TINSERT", "accounts", "name", "carol"]);
+    assert!(
+        third.contains(":3"),
+        "restart reused a sequence id: {third}"
+    );
+}
+
+#[test]
 fn tiered_del_cold_key() {
     let srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
@@ -213,6 +319,29 @@ fn tiered_wal_crash_recovery() {
 }
 
 #[test]
+fn tiered_cold_relative_mutation_replays_once_without_snapshot() {
+    let mut srv = LuxServer::builder()
+        .tiered()
+        .shards(1)
+        .maxmemory("100kb")
+        .env("LUX_MAXMEMORY_SAMPLES", "128")
+        .start();
+    let mut c = srv.conn();
+    assert_eq!(send(&mut c, &["INCR", "cold-counter"]), ":1\r\n");
+    fill_memory(&mut c, 20);
+    drop(c);
+
+    srv.kill();
+    srv.restart();
+    let mut c = srv.conn();
+    assert_eq!(
+        send(&mut c, &["GET", "cold-counter"]),
+        "$1\r\n1\r\n",
+        "a cold relative mutation must not be applied once from disk and again from WAL"
+    );
+}
+
+#[test]
 fn tiered_wal_overwrite_ordering() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let mut c = srv.conn();
@@ -260,11 +389,43 @@ fn tiered_snapshot_includes_cold() {
 
     srv.restart();
     let mut c = srv.conn();
+    assert_eq!(
+        send(&mut c, &["DBSIZE"]),
+        ":21\r\n",
+        "snapshot entries must not remain duplicated in the cold index"
+    );
     let resp = send(&mut c, &["GET", "snapcold"]);
     assert!(
         resp.contains("value"),
         "cold key should survive snapshot+restart: {resp}"
     );
+}
+
+#[test]
+fn tiered_snapshot_does_not_resurrect_expired_cold_entry() {
+    let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
+    let mut c = srv.conn();
+    assert!(send(&mut c, &["PSETEX", "expires-cold", "3000", "value"]).contains("+OK"));
+    fill_memory(&mut c, 20);
+    assert!(send(&mut c, &["SAVE"]).contains("+OK"));
+    drop(c);
+
+    srv.kill();
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    srv.restart();
+    let mut c = srv.conn();
+    assert_eq!(
+        send(&mut c, &["GET", "expires-cold"]),
+        "$-1\r\n",
+        "an expired snapshot value must not be promoted from a stale cold record"
+    );
+    drop(c);
+
+    // Removing an entry only from the process-local cold index is insufficient:
+    // another restart would rebuild that index from the same stale data file.
+    srv.restart();
+    let mut c = srv.conn();
+    assert_eq!(send(&mut c, &["GET", "expires-cold"]), "$-1\r\n");
 }
 
 #[test]

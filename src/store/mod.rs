@@ -565,6 +565,8 @@ pub struct Store {
     /// Read-only compatibility inputs from the pre-1.0 per-shard WAL layout.
     /// They are replayed before `journal` and truncated with the next snapshot.
     legacy_wals: Box<[(usize, parking_lot::Mutex<crate::disk::Wal>)]>,
+    /// Per-stream WAL positions already represented by the loaded snapshot.
+    recovery_wal_checkpoints: parking_lot::Mutex<HashMap<String, crate::disk::WalCheckpoint>>,
     /// Striped commit gates keep overlapping mutations in journal/apply order
     /// without serializing independent shards behind one global writer lock.
     journal_gates: Box<[parking_lot::ReentrantMutex<()>]>,
@@ -574,8 +576,18 @@ pub struct Store {
     /// recovery finishes.
     recovery_expiry_sentinel: parking_lot::Mutex<Option<Instant>>,
     pub(crate) wal_suppress: std::sync::atomic::AtomicBool,
+    /// Narrower than `wal_suppress`: true only while persisted commands are
+    /// being re-executed. Bootstrap and snapshot loading also suppress writes,
+    /// but must not gain access to replay-only command behavior.
+    replaying_wal: std::sync::atomic::AtomicBool,
+    /// Once persistence enters an uncertain state, reject every later mutation
+    /// until restart rather than acknowledge writes through an unsafe journal.
+    journal_poisoned: std::sync::atomic::AtomicBool,
+    restoring: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     journal_failures_to_inject: AtomicUsize,
+    #[cfg(test)]
+    journal_fsync_failures_to_inject: AtomicUsize,
     /// Set once at runtime startup; sink for typed row deltas feeding reactive
     /// live queries. Absent for embedded/replay-only stores, so emission is a
     /// cheap no-op there.
@@ -599,7 +611,34 @@ pub(crate) struct PreparedRestore {
 /// Keeps the affected mutation domains serialized until the caller finishes
 /// applying the journaled change.
 pub(crate) struct JournalCommitGuard<'a> {
+    store: &'a Store,
     _guards: Vec<parking_lot::ReentrantMutexGuard<'a, ()>>,
+    armed: bool,
+}
+
+impl JournalCommitGuard<'_> {
+    /// Mark the journaled live apply as complete. Dropping an armed guard
+    /// without reaching this point fences later mutations because recovery,
+    /// rather than current memory, owns the authoritative outcome.
+    pub(crate) fn complete(mut self) -> std::io::Result<()> {
+        self.store.ensure_journal_healthy()?;
+        self.armed = false;
+        Ok(())
+    }
+
+    /// Disarm after the exact journal frame was successfully removed. This is
+    /// only valid while the journal lock still excludes concurrent appenders.
+    fn rolled_back(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for JournalCommitGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.store.poison_journal();
+        }
+    }
 }
 
 /// A mutation domain locked for deterministic preparation but not yet durable.
@@ -620,11 +659,14 @@ impl<'a> JournalPrepareGuard<'a> {
         self,
         commands: &[&[&[u8]]],
     ) -> std::io::Result<JournalCommitGuard<'a>> {
-        if !self.bypassed && !commands.is_empty() {
+        let armed = !self.bypassed && !commands.is_empty();
+        if armed {
             self.store.append_journal_commands(commands)?;
         }
         Ok(JournalCommitGuard {
+            store: self.store,
             _guards: self.guards,
+            armed,
         })
     }
 }
@@ -762,11 +804,6 @@ pub fn estimate_entry_memory<K: AsRef<[u8]>>(key: K, value: &StoreValue) -> usiz
 }
 
 impl Store {
-    /// Emit a warning from places that only have access to `self`.
-    fn emit_warn(&self, event: crate::ServerWarnEvent) {
-        crate::emit_warn(&self.config, event);
-    }
-
     /// Emit an error from places that only have access to `self`.
     fn emit_error(&self, event: crate::ServerErrorEvent) {
         crate::emit_error(&self.config, event);
@@ -901,11 +938,17 @@ impl Store {
             disk_shards,
             journal,
             legacy_wals,
+            recovery_wal_checkpoints: parking_lot::Mutex::new(HashMap::new()),
             journal_gates,
             recovery_expiry_sentinel: parking_lot::Mutex::new(None),
             wal_suppress: std::sync::atomic::AtomicBool::new(false),
+            replaying_wal: std::sync::atomic::AtomicBool::new(false),
+            journal_poisoned: std::sync::atomic::AtomicBool::new(false),
+            restoring: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             journal_failures_to_inject: AtomicUsize::new(0),
+            #[cfg(test)]
+            journal_fsync_failures_to_inject: AtomicUsize::new(0),
             row_delta_broker: std::sync::OnceLock::new(),
         })
     }
@@ -923,6 +966,14 @@ impl Store {
         // exact value, rather than elapsed time, identifies staged entries.
         let sentinel = Instant::now() + Duration::from_secs(365 * 24 * 60 * 60);
         *self.recovery_expiry_sentinel.lock() = Some(sentinel);
+        self.recovery_wal_checkpoints.lock().clear();
+    }
+
+    pub(crate) fn set_recovery_wal_checkpoints(
+        &self,
+        checkpoints: HashMap<String, crate::disk::WalCheckpoint>,
+    ) {
+        *self.recovery_wal_checkpoints.lock() = checkpoints;
     }
 
     pub(crate) fn stage_expired_recovery_entry(&self, key: String, value: DumpValue) {
@@ -940,6 +991,7 @@ impl Store {
     }
 
     pub(crate) fn finish_recovery(&self) {
+        self.recovery_wal_checkpoints.lock().clear();
         let Some(sentinel) = self.recovery_expiry_sentinel.lock().take() else {
             return;
         };
@@ -1432,13 +1484,52 @@ impl Store {
     }
 
     pub(crate) fn wal_enabled(&self) -> bool {
-        self.journal.is_some() && !self.wal_suppress.load(Ordering::Relaxed)
+        self.journal.is_some()
+            && !self.wal_suppress.load(Ordering::Relaxed)
+            && !self.journal_poisoned.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn begin_restore(&self) -> std::io::Result<()> {
+        self.restoring
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| std::io::Error::other("database restore is already in progress"))
+    }
+
+    pub(crate) fn cancel_restore(&self) {
+        self.restoring.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn is_restoring(&self) -> bool {
+        self.restoring.load(Ordering::Acquire)
+    }
+
+    fn ensure_not_restoring(&self) -> std::io::Result<()> {
+        if self.is_restoring() {
+            Err(std::io::Error::other("database restore is in progress"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_journal_healthy(&self) -> std::io::Result<()> {
+        if self.journal_poisoned.load(Ordering::Acquire) {
+            Err(std::io::Error::other(
+                "mutation journal is unavailable; restart required",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn poison_journal(&self) {
+        self.journal_poisoned.store(true, Ordering::Release);
     }
 
     /// True while `replay_wal` is re-applying logged commands. Gates internal
     /// replay-only commands (e.g. `LXRESTORE`) so clients can't invoke them.
     pub(crate) fn wal_replaying(&self) -> bool {
-        self.wal_suppress.load(Ordering::Relaxed)
+        self.replaying_wal.load(Ordering::Acquire)
     }
 
     /// Wire the row-delta sink (reactive live queries) at runtime startup.
@@ -1585,37 +1676,54 @@ impl Store {
 
     /// Promote a cold key from disk back to memory. Called before every
     /// command (reads AND writes) to ensure the entry is hot before operating
-    /// on it. Returns true if the key was found on disk and promoted.
+    /// on it. Returns true if the key was found on disk and promoted. A cold
+    /// read failure is surfaced rather than being indistinguishable from a
+    /// missing key.
     /// For writes like HSET/LPUSH, this preserves existing data that would
     /// otherwise be lost if the command created a new empty entry.
-    pub fn try_promote(&self, key: &[u8], now: Instant) -> bool {
+    pub fn try_promote(&self, key: &[u8], now: Instant) -> Result<bool, String> {
         // Keep the disk-to-memory move indivisible with respect to prepared
         // writes. This is reentrant when a caller already owns the key domain.
         let _placement_guard = self.journal_gates[self.journal_gate_index(key)].lock();
         let disk_shards = match &self.disk_shards {
             Some(ds) => ds,
-            None => return false,
+            None => return Ok(false),
         };
         let didx = self.disk_shard_index(key);
         let key_string = std::str::from_utf8(key).unwrap_or_default();
 
         let mut disk = disk_shards[didx].lock();
         if !disk.contains(key_string) {
-            return false;
+            return Ok(false);
         }
 
         let result = match disk.get(key_string, now) {
             Ok(Some((value, ttl))) => Some((value, ttl)),
-            _ => None,
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                // The cold tier is part of the current live state. Once it
+                // cannot be read, any mutation that treats the key as absent
+                // could overwrite or omit existing data. Fence writes until
+                // restart/recovery reconstructs a trustworthy view.
+                self.poison_journal();
+                self.emit_error(crate::ServerErrorEvent::DiskPromotionReadFailed {
+                    key: key_string.to_string(),
+                    error: error.to_string(),
+                });
+                return Err(format!(
+                    "ERR cold storage read failed for key '{}': {error}",
+                    String::from_utf8_lossy(key)
+                ));
+            }
         };
         disk.remove(key_string);
         drop(disk);
 
         if let Some((value, ttl)) = result {
             self.load_entry(key_string.to_string(), value, ttl);
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -1675,8 +1783,63 @@ impl Store {
     where
         F: FnOnce() -> T,
     {
-        let _commit = self.begin_journaled(args)?;
-        Ok(apply())
+        let commit = self.begin_journaled(args)?;
+        let result = apply();
+        commit.complete()?;
+        Ok(result)
+    }
+
+    /// Commit a raw command only when its apply phase succeeds.
+    ///
+    /// A generic command cannot prove success until it runs. Keep the WAL
+    /// locked from append through apply so a rejected command can remove its
+    /// own final frame without truncating a concurrent writer. The mutation
+    /// domain guards also keep snapshots outside this decision window.
+    pub(crate) fn commit_journaled_checked<T, F>(
+        &self,
+        args: &[&[u8]],
+        apply: F,
+    ) -> std::io::Result<T>
+    where
+        F: FnOnce() -> (T, bool),
+    {
+        let prepared = self.prepare_journaled(args)?;
+        if prepared.bypassed {
+            return Ok(apply().0);
+        }
+
+        let Some(journal) = &self.journal else {
+            return Ok(apply().0);
+        };
+        let JournalPrepareGuard {
+            store,
+            guards,
+            bypassed: _,
+        } = prepared;
+        let mut wal = journal.lock();
+        let append_offset = self.append_journal_commands_locked(&mut wal, &[args])?;
+        let commit = JournalCommitGuard {
+            store,
+            _guards: guards,
+            armed: true,
+        };
+        let (result, committed) = apply();
+        if !committed {
+            if let Err(error) = wal.rollback_to(append_offset) {
+                self.poison_journal();
+                self.record_wal_append_error();
+                self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
+                    error: error.to_string(),
+                });
+                return Err(std::io::Error::other(format!(
+                    "failed to remove rejected WAL command: {error}"
+                )));
+            }
+            commit.rolled_back();
+        } else {
+            commit.complete()?;
+        }
+        Ok(result)
     }
 
     /// Commit a resolved multi-effect mutation as one atomic journal append.
@@ -1688,8 +1851,10 @@ impl Store {
     where
         F: FnOnce() -> T,
     {
-        let _commit = self.begin_journaled_batch(commands)?;
-        Ok(apply())
+        let commit = self.begin_journaled_batch(commands)?;
+        let result = apply();
+        commit.complete()?;
+        Ok(result)
     }
 
     pub(crate) fn begin_journaled<'a>(
@@ -1721,10 +1886,12 @@ impl Store {
         &'a self,
         commands: &[&[&[u8]]],
     ) -> std::io::Result<JournalPrepareGuard<'a>> {
+        self.ensure_not_restoring()?;
+        self.ensure_journal_healthy()?;
         let bypassed = self.wal_suppress.load(Ordering::Relaxed)
             || self.journal.is_none()
             || commands.is_empty();
-        let guards = if bypassed {
+        let guards = if self.wal_suppress.load(Ordering::Relaxed) || commands.is_empty() {
             Vec::new()
         } else {
             self.journal_gate_indices(commands)
@@ -1732,6 +1899,8 @@ impl Store {
                 .map(|&index| self.journal_gates[index].lock())
                 .collect()
         };
+        self.ensure_not_restoring()?;
+        self.ensure_journal_healthy()?;
         Ok(JournalPrepareGuard {
             store: self,
             guards,
@@ -1755,30 +1924,23 @@ impl Store {
         Prepare: FnOnce() -> Result<JournalPlan<P>, E>,
         Apply: FnOnce(P) -> Result<T, E>,
     {
-        if self.wal_suppress.load(Ordering::Relaxed) || self.journal.is_none() {
-            return Ok(prepare().and_then(|plan| apply(plan.prepared)));
-        }
-
-        let route = [route_args];
-        let gate_indices = self.journal_gate_indices(&route);
-        let _guards: Vec<_> = gate_indices
-            .iter()
-            .map(|&index| self.journal_gates[index].lock())
-            .collect();
+        let prepared_journal = self.prepare_journaled(route_args)?;
         let plan = match prepare() {
             Ok(plan) => plan,
             Err(error) => return Ok(Err(error)),
         };
-        if !plan.commands.is_empty() {
-            let arg_refs: Vec<Vec<&[u8]>> = plan
-                .commands
-                .iter()
-                .map(|command| command.iter().map(Vec::as_slice).collect())
-                .collect();
-            let command_refs: Vec<&[&[u8]]> = arg_refs.iter().map(Vec::as_slice).collect();
-            self.append_journal_commands(&command_refs)?;
+        let arg_refs: Vec<Vec<&[u8]>> = plan
+            .commands
+            .iter()
+            .map(|command| command.iter().map(Vec::as_slice).collect())
+            .collect();
+        let command_refs: Vec<&[&[u8]]> = arg_refs.iter().map(Vec::as_slice).collect();
+        let commit = prepared_journal.commit_batch(&command_refs)?;
+        let result = apply(plan.prepared);
+        if result.is_ok() {
+            commit.complete()?;
         }
-        Ok(apply(plan.prepared))
+        Ok(result)
     }
 
     fn journal_gate_indices(&self, commands: &[&[&[u8]]]) -> Vec<usize> {
@@ -1874,6 +2036,16 @@ impl Store {
             return Ok(());
         };
 
+        let mut wal = journal.lock();
+        self.append_journal_commands_locked(&mut wal, commands)
+            .map(|_| ())
+    }
+
+    fn append_journal_commands_locked(
+        &self,
+        wal: &mut crate::disk::Wal,
+        commands: &[&[&[u8]]],
+    ) -> std::io::Result<u64> {
         #[cfg(test)]
         if self
             .journal_failures_to_inject
@@ -1890,10 +2062,13 @@ impl Store {
             return Err(error);
         }
 
-        let mut wal = journal.lock();
+        self.ensure_journal_healthy()?;
         let append_offset = wal.end_offset()?;
         if let Err(error) = wal.append_commands(commands.iter().copied()) {
             let rollback_error = wal.rollback_to(append_offset).err();
+            if rollback_error.is_some() {
+                self.poison_journal();
+            }
             self.record_wal_append_error();
             self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
                 error: error.to_string(),
@@ -1906,8 +2081,11 @@ impl Store {
             });
         }
         if self.config.durability.policy.syncs_each_append() {
-            if let Err(error) = wal.fsync() {
+            if let Err(error) = self.sync_journal_locked(wal) {
                 let rollback_error = wal.rollback_to(append_offset).err();
+                if rollback_error.is_some() {
+                    self.poison_journal();
+                }
                 self.record_wal_fsync_error();
                 self.emit_error(crate::ServerErrorEvent::WalFsyncFailed {
                     error: error.to_string(),
@@ -1920,7 +2098,7 @@ impl Store {
                 });
             }
         }
-        Ok(())
+        Ok(append_offset)
     }
 
     #[cfg(test)]
@@ -1929,17 +2107,39 @@ impl Store {
             .store(count, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_journal_fsync_failures(&self, count: usize) {
+        self.journal_fsync_failures_to_inject
+            .store(count, Ordering::Relaxed);
+    }
+
+    fn sync_journal_locked(&self, wal: &mut crate::disk::Wal) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self
+            .journal_fsync_failures_to_inject
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(std::io::Error::other("injected journal fsync failure"));
+        }
+        wal.fsync()
+    }
+
     /// Replay WAL entries by re-executing each command through the normal
     /// command dispatch. Called on startup after snapshot load to recover
     /// writes that happened between the last snapshot and the crash.
     /// WAL logging is suppressed during replay to avoid re-logging.
-    pub fn replay_wal(&self, broker: &crate::pubsub::Broker) {
+    pub fn replay_wal(&self, broker: &crate::pubsub::Broker) -> std::io::Result<()> {
         let journal = match &self.journal {
             Some(journal) => journal,
-            None => return,
+            None => return Ok(()),
         };
+        let checkpoints = self.recovery_wal_checkpoints.lock().clone();
         self.wal_suppress
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.replaying_wal.store(true, Ordering::Release);
         let mut total = 0usize;
         // Every frame observes one logical recovery instant. A PXAT deadline
         // that elapsed during downtime is therefore still visible to later
@@ -1948,61 +2148,91 @@ impl Store {
         let replay_now = Instant::now();
         let wal_cache =
             std::sync::Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
-        let mut replay_one = |source: usize, w: &parking_lot::Mutex<crate::disk::Wal>| {
-            let mut wal = w.lock();
-            match wal.replay() {
-                Ok(replay) => {
-                    let corrupted_count = replay.corrupted_frames.len();
-                    for frame in replay.corrupted_frames {
-                        self.emit_warn(crate::ServerWarnEvent::WalCorruptedFrameSkipped {
-                            shard: source,
-                            stored_crc: frame.stored_crc,
-                            computed_crc: frame.computed_crc,
-                        });
+        let result = (|| -> std::io::Result<()> {
+            let mut replay_one = |name: &str,
+                                  source: usize,
+                                  w: &parking_lot::Mutex<crate::disk::Wal>|
+             -> std::io::Result<()> {
+                let mut wal = w.lock();
+                match wal.replay_from(checkpoints.get(name).copied()) {
+                    Ok(replay) => {
+                        for cmd_args in replay.commands {
+                            let refs: Vec<&[u8]> = cmd_args.iter().map(|a| a.as_slice()).collect();
+                            let mut out = bytes::BytesMut::new();
+                            let result = crate::cmd::execute(
+                                self, &wal_cache, broker, &refs, &mut out, replay_now,
+                            );
+                            if !matches!(result, crate::cmd::CmdResult::Written)
+                                || out.first() == Some(&b'-')
+                            {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!(
+                                        "WAL command failed during recovery: {}",
+                                        String::from_utf8_lossy(&out)
+                                    ),
+                                ));
+                            }
+                            total += 1;
+                        }
+                        Ok(())
                     }
-                    if corrupted_count > 0 {
-                        self.emit_warn(crate::ServerWarnEvent::WalCorruptedFramesSkipped {
+                    Err(e) => {
+                        self.emit_error(crate::ServerErrorEvent::WalReplayFailed {
                             shard: source,
-                            frames: corrupted_count,
+                            error: e.to_string(),
                         });
-                    }
-                    for cmd_args in replay.commands {
-                        let refs: Vec<&[u8]> = cmd_args.iter().map(|a| a.as_slice()).collect();
-                        let mut out = bytes::BytesMut::new();
-                        crate::cmd::execute(self, &wal_cache, broker, &refs, &mut out, replay_now);
-                        total += 1;
+                        Err(e)
                     }
                 }
-                Err(e) => self.emit_error(crate::ServerErrorEvent::WalReplayFailed {
-                    shard: source,
-                    error: e.to_string(),
-                }),
-            }
-        };
+            };
 
-        // Upgrade path: everything in the old per-shard files predates every
-        // frame in the global journal opened for this process.
-        for (source, wal) in &self.legacy_wals {
-            replay_one(*source, wal);
-        }
-        replay_one(0, journal);
-        if total > 0 {
-            crate::emit_info(
-                &self.config,
-                crate::ServerInfoEvent::WalReplayed { commands: total },
-            );
-        }
+            // Upgrade path: everything in the old per-shard files predates every
+            // frame in the global journal opened for this process.
+            for (source, wal) in &self.legacy_wals {
+                replay_one(&format!("shard_{source}"), *source, wal)?;
+            }
+            replay_one("global", 0, journal)?;
+            if total > 0 {
+                crate::emit_info(
+                    &self.config,
+                    crate::ServerInfoEvent::WalReplayed { commands: total },
+                );
+            }
+            Ok(())
+        })();
+        self.replaying_wal.store(false, Ordering::Release);
         self.wal_suppress
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        result
     }
 
-    pub fn truncate_wal(&self) {
+    /// Capture every journal position represented by a snapshot. The caller
+    /// must hold the write barrier so no mutation can cross these offsets.
+    pub(crate) fn wal_checkpoints(
+        &self,
+    ) -> std::io::Result<Vec<(String, crate::disk::WalCheckpoint)>> {
+        let mut checkpoints = Vec::with_capacity(self.legacy_wals.len() + 1);
+        for (source, wal) in &self.legacy_wals {
+            checkpoints.push((format!("shard_{source}"), wal.lock().checkpoint()?));
+        }
+        if let Some(journal) = &self.journal {
+            checkpoints.push(("global".to_string(), journal.lock().checkpoint()?));
+        }
+        Ok(checkpoints)
+    }
+
+    pub fn truncate_wal(&self) -> std::io::Result<()> {
+        let mut first_error = None;
         for (_, w) in &self.legacy_wals {
             let mut wal = w.lock();
             if let Err(e) = wal.truncate() {
                 self.emit_error(crate::ServerErrorEvent::WalTruncateFailed {
                     error: e.to_string(),
                 });
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
             }
         }
         if let Some(journal) = &self.journal {
@@ -2011,7 +2241,17 @@ impl Store {
                 self.emit_error(crate::ServerErrorEvent::WalTruncateFailed {
                     error: e.to_string(),
                 });
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
             }
+        }
+        match first_error {
+            Some(error) => {
+                self.poison_journal();
+                Err(error)
+            }
+            None => Ok(()),
         }
     }
 
@@ -2023,7 +2263,7 @@ impl Store {
         }
     }
 
-    pub fn dump_disk_entries(&self, now: Instant) -> Vec<DumpEntry> {
+    pub fn dump_disk_entries(&self, now: Instant) -> std::io::Result<Vec<DumpEntry>> {
         match &self.disk_shards {
             Some(ds) => {
                 let mut entries = Vec::new();
@@ -2034,13 +2274,14 @@ impl Store {
                         Err(e) => {
                             self.emit_error(crate::ServerErrorEvent::SnapshotDiskDumpFailed {
                                 error: e.to_string(),
-                            })
+                            });
+                            return Err(e);
                         }
                     }
                 }
-                entries
+                Ok(entries)
             }
-            None => Vec::new(),
+            None => Ok(Vec::new()),
         }
     }
 
@@ -2053,7 +2294,12 @@ impl Store {
     pub(crate) fn fsync_wal_checked(&self) -> std::io::Result<()> {
         if let Some(journal) = &self.journal {
             let mut wal = journal.lock();
-            if let Err(e) = wal.fsync() {
+            if let Err(e) = self.sync_journal_locked(&mut wal) {
+                // A periodic sync failure means the configured durability
+                // window can no longer be bounded. Fence subsequent writes
+                // until restart rather than continuing to acknowledge them
+                // through an unhealthy persistence path.
+                self.poison_journal();
                 self.record_wal_fsync_error();
                 self.emit_error(crate::ServerErrorEvent::WalFsyncFailed {
                     error: e.to_string(),
@@ -2363,20 +2609,24 @@ impl Store {
         }
     }
 
-    pub fn get(&self, key: &[u8], now: Instant) -> Option<Bytes> {
+    pub(crate) fn get_checked(&self, key: &[u8], now: Instant) -> Result<Option<Bytes>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         let result = Self::get_from_shard(&shard.data, key, now);
         if result.is_some() {
-            return result;
+            return Ok(result);
         }
         drop(shard);
-        if self.try_promote(key, now) {
+        if self.try_promote(key, now)? {
             let shard = self.shards[idx].read();
-            Self::get_from_shard(&shard.data, key, now)
+            Ok(Self::get_from_shard(&shard.data, key, now))
         } else {
-            None
+            Ok(None)
         }
+    }
+
+    pub fn get(&self, key: &[u8], now: Instant) -> Option<Bytes> {
+        self.get_checked(key, now).ok().flatten()
     }
 
     pub fn get_entry_type(&self, key: &[u8], now: Instant) -> Option<&'static str> {
@@ -2398,7 +2648,7 @@ impl Store {
             return raw;
         }
         drop(shard);
-        if self.try_promote(key, now) {
+        if self.try_promote(key, now).unwrap_or(false) {
             let shard = self.shards[idx].read();
             shard.data.get(key).and_then(|entry| {
                 if entry.is_expired_at(now) {
@@ -2829,25 +3079,6 @@ impl Store {
         }
     }
 
-    pub(crate) fn del_on_shard(&self, shard: &mut Shard, key: &[u8], now: Instant) -> i64 {
-        let Some(entry) = shard.data.remove(key) else {
-            return 0;
-        };
-        self.key_removed();
-        let expired = entry.is_expired_at(now);
-        let vector_dims = match &entry.value {
-            StoreValue::Vector(v) => Some(v.dims),
-            _ => None,
-        };
-        let mem = estimate_entry_memory(key_str(key), &entry.value);
-        shard.used_memory = shard.used_memory.saturating_sub(mem);
-        self.mem_sub(mem);
-        if let Some(dims) = vector_dims {
-            self.remove_vector_indexes(key_str(key), dims);
-        }
-        i64::from(!expired)
-    }
-
     pub fn exists(&self, keys: &[&[u8]], now: Instant) -> i64 {
         if keys.is_empty() {
             return 0;
@@ -2914,6 +3145,7 @@ impl Store {
     }
 
     pub fn incr(&self, key: &[u8], delta: i64, now: Instant) -> Result<i64, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
@@ -2938,57 +3170,6 @@ impl Store {
         let new_value = StoreValue::Str(Bytes::from(new_val.to_string()));
         let mem = estimate_entry_memory(ks, &new_value);
         let old_entry = shard.data.insert(
-            key_bytes(key),
-            Entry {
-                value: new_value,
-                expires_at,
-                lru_clock: self.lru_clock(),
-            },
-        );
-        if let Some(oe) = old_entry {
-            let old_mem = estimate_entry_memory(ks, &oe.value);
-            if mem >= old_mem {
-                self.mem_add(mem - old_mem);
-            } else {
-                self.mem_sub(old_mem - mem);
-            }
-        } else {
-            self.mem_add(mem);
-            self.key_added();
-        }
-        Ok(new_val)
-    }
-
-    /// INCRBY primitive for callers that already hold the correct shard write
-    /// lock. The caller owns shard versioning, WAL logging, and key events.
-    pub(crate) fn incr_on_shard(
-        &self,
-        data: &mut ShardData,
-        key: &[u8],
-        delta: i64,
-        now: Instant,
-    ) -> Result<i64, String> {
-        let ks = key;
-        let (current, expires_at) = match data.get(ks) {
-            Some(e) if !e.is_expired_at(now) => match e.value.string_bytes() {
-                Some(s) => {
-                    let s = std::str::from_utf8(s)
-                        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
-                    let n = s
-                        .parse::<i64>()
-                        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
-                    (n, e.expires_at)
-                }
-                None => return Err(WRONGTYPE.to_string()),
-            },
-            _ => (0, None),
-        };
-        let new_val = current
-            .checked_add(delta)
-            .ok_or_else(|| "ERR increment or decrement would overflow".to_string())?;
-        let new_value = StoreValue::Str(Bytes::from(new_val.to_string()));
-        let mem = estimate_entry_memory(ks, &new_value);
-        let old_entry = data.insert(
             key_bytes(key),
             Entry {
                 value: new_value,
@@ -3152,26 +3333,12 @@ impl Store {
         }
     }
 
+    #[cfg(test)]
     pub fn expire(&self, key: &[u8], seconds: u64, now: Instant) -> bool {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
         if let Some(entry) = shard.data.get_mut(key) {
-            if !entry.is_expired_at(now) {
-                entry.expires_at = Some(now + Duration::from_secs(seconds));
-                return true;
-            }
-        }
-        false
-    }
-
-    pub(crate) fn expire_on_shard(
-        data: &mut ShardData,
-        key: &[u8],
-        seconds: u64,
-        now: Instant,
-    ) -> bool {
-        if let Some(entry) = data.get_mut(key) {
             if !entry.is_expired_at(now) {
                 entry.expires_at = Some(now + Duration::from_secs(seconds));
                 return true;
@@ -3302,10 +3469,13 @@ impl Store {
         let blob = crate::snapshot::encode_dump_blob(self, &entry)
             .map_err(|e| format!("ERR COPY encode failed: {e}"))?;
         let command: [&[u8]; 3] = [b"LXRESTORE", dst, &blob];
-        let _commit = prepare
+        let commit = prepare
             .commit(&command)
             .map_err(|e| format!("ERR WAL append failed: {e}"))?;
         self.load_entry(entry.key, entry.value, ttl);
+        commit
+            .complete()
+            .map_err(|error| format!("ERR journal apply failed: {error}"))?;
         Ok(true)
     }
 
@@ -3469,47 +3639,6 @@ impl Store {
         }
     }
 
-    /// LPUSH variant for callers that already hold the correct shard write
-    /// lock. The caller owns shard versioning, WAL logging, key events, disk
-    /// invalidation, and blocked-list waiter draining.
-    pub(crate) fn lpush_on_shard(
-        &self,
-        shard: &mut Shard,
-        key: &[u8],
-        values: &[&[u8]],
-        now: Instant,
-    ) -> Result<i64, String> {
-        let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
-        let ks = key_bytes(key);
-        let entry = match shard.data.entry(ks) {
-            hashbrown::hash_map::Entry::Occupied(o) => o.into_mut(),
-            hashbrown::hash_map::Entry::Vacant(v) => {
-                self.key_added();
-                v.insert(Entry {
-                    value: StoreValue::List(VecDeque::new()),
-                    expires_at: None,
-                    lru_clock: self.lru_clock(),
-                })
-            }
-        };
-        if entry.is_expired_at(now) {
-            entry.value = StoreValue::List(VecDeque::new());
-            entry.expires_at = None;
-        }
-        match &mut entry.value {
-            StoreValue::List(list) => {
-                for v in values {
-                    list.push_front(Bytes::copy_from_slice(v));
-                }
-                let len = list.len() as i64;
-                shard.used_memory += added_mem;
-                self.mem_add(added_mem);
-                Ok(len)
-            }
-            _ => Err(WRONGTYPE.to_string()),
-        }
-    }
-
     pub fn rpush(&self, key: &[u8], values: &[&[u8]], now: Instant) -> Result<i64, String> {
         let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
         let idx = self.shard_index(key);
@@ -3536,45 +3665,6 @@ impl Store {
                 }
                 let len = list.len() as i64;
                 let _ = entry;
-                shard.used_memory += added_mem;
-                self.mem_add(added_mem);
-                Ok(len)
-            }
-            _ => Err(WRONGTYPE.to_string()),
-        }
-    }
-
-    /// RPUSH variant for callers that already hold the correct shard write
-    /// lock. The caller owns shard versioning, WAL logging, key events, disk
-    /// invalidation, and blocked-list waiter draining.
-    pub(crate) fn rpush_on_shard(
-        &self,
-        shard: &mut Shard,
-        key: &[u8],
-        values: &[&[u8]],
-        now: Instant,
-    ) -> Result<i64, String> {
-        let added_mem: usize = values.iter().map(|v| v.len() + 32).sum();
-        let ks = key_bytes(key);
-        let existed = shard.data.contains_key(&ks);
-        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::List(VecDeque::new()),
-            expires_at: None,
-            lru_clock: self.lru_clock(),
-        });
-        if !existed {
-            self.key_added();
-        }
-        if entry.is_expired_at(now) {
-            entry.value = StoreValue::List(VecDeque::new());
-            entry.expires_at = None;
-        }
-        match &mut entry.value {
-            StoreValue::List(list) => {
-                for v in values {
-                    list.push_back(Bytes::copy_from_slice(v));
-                }
-                let len = list.len() as i64;
                 shard.used_memory += added_mem;
                 self.mem_add(added_mem);
                 Ok(len)
@@ -3703,7 +3793,7 @@ impl Store {
         now: Instant,
     ) -> Result<Option<(Vec<u8>, Vec<Bytes>)>, String> {
         for key in keys {
-            self.try_promote(key, now);
+            self.try_promote(key, now)?;
             let idx = self.shard_index(key);
             let mut shard = self.shards[idx].write();
             match shard.data.get(*key) {
@@ -3748,7 +3838,7 @@ impl Store {
         now: Instant,
     ) -> Result<Option<(Vec<u8>, Vec<Bytes>)>, String> {
         for key in keys {
-            self.try_promote(key, now);
+            self.try_promote(key, now)?;
             let idx = self.shard_index(key);
             let shard = self.shards[idx].read();
             match shard
@@ -3847,48 +3937,10 @@ impl Store {
     }
 
     pub fn sadd(&self, key: &[u8], members: &[&[u8]], now: Instant) -> Result<i64, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
-        let ks = key_bytes(key);
-        let existed = shard.data.contains_key(&ks);
-        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
-            value: StoreValue::Set(SetData::new()),
-            expires_at: None,
-            lru_clock: self.lru_clock(),
-        });
-        if !existed {
-            self.key_added();
-        }
-        if entry.is_expired_at(now) {
-            entry.value = StoreValue::Set(SetData::new());
-            entry.expires_at = None;
-        }
-        match &mut entry.value {
-            StoreValue::Set(set) => {
-                let mut added = 0i64;
-                let mut mem_added = 0usize;
-                for m in members {
-                    if set.insert(key_string(m)) {
-                        mem_added += m.len() + 32;
-                        added += 1;
-                    }
-                }
-                shard.used_memory += mem_added;
-                self.mem_add(mem_added);
-                Ok(added)
-            }
-            _ => Err(WRONGTYPE.to_string()),
-        }
-    }
-
-    pub(crate) fn sadd_on_shard(
-        &self,
-        shard: &mut Shard,
-        key: &[u8],
-        members: &[&[u8]],
-        now: Instant,
-    ) -> Result<i64, String> {
         let ks = key_bytes(key);
         let existed = shard.data.contains_key(&ks);
         let entry = shard.data.entry(ks).or_insert_with(|| Entry {
@@ -3922,6 +3974,7 @@ impl Store {
     }
 
     pub fn srem(&self, key: &[u8], members: &[&[u8]], now: Instant) -> Result<i64, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
@@ -3947,6 +4000,7 @@ impl Store {
     }
 
     pub fn smembers(&self, key: &[u8], now: Instant) -> Result<Vec<String>, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key) {
@@ -4208,7 +4262,7 @@ impl Store {
     }
 
     #[cfg(test)]
-    pub fn dump_all(&self, now: Instant) -> Vec<DumpEntry> {
+    pub fn dump_all(&self, now: Instant) -> std::io::Result<Vec<DumpEntry>> {
         let mut entries = Vec::new();
         for shard in self.shards.iter() {
             let shard = shard.read();
@@ -4227,9 +4281,9 @@ impl Store {
                 });
             }
         }
-        let mut disk_entries = self.dump_disk_entries(now);
+        let mut disk_entries = self.dump_disk_entries(now)?;
         entries.append(&mut disk_entries);
-        entries
+        Ok(entries)
     }
 
     pub(crate) fn with_write_barrier<R>(
@@ -4253,7 +4307,7 @@ impl Store {
         &self,
         shards: &[parking_lot::RwLockWriteGuard<'_, Shard>],
         now: Instant,
-    ) -> Vec<DumpEntry> {
+    ) -> std::io::Result<Vec<DumpEntry>> {
         let mut entries = Vec::new();
         for shard in shards {
             for (key, entry) in shard.data.iter() {
@@ -4271,9 +4325,9 @@ impl Store {
                 });
             }
         }
-        let mut disk_entries = self.dump_disk_entries(now);
+        let mut disk_entries = self.dump_disk_entries(now)?;
         entries.append(&mut disk_entries);
-        entries
+        Ok(entries)
     }
 
     pub fn load_entry(&self, key: String, value: DumpValue, ttl: Option<Duration>) {
@@ -5358,6 +5412,8 @@ impl Store {
         from_left: bool,
         now: Instant,
     ) -> Result<Option<Bytes>, String> {
+        self.try_promote(src, now)?;
+        self.try_promote(dst, now)?;
         let dst_idx = self.shard_index(dst);
         if let Some(entry) = self.shards[dst_idx]
             .read()
@@ -5510,6 +5566,7 @@ impl Store {
         }
     }
 
+    #[cfg(test)]
     pub fn spop(&self, key: &[u8], count: usize, now: Instant) -> Result<Vec<String>, String> {
         if count == 1 {
             return Ok(self.spop_one(key, now).into_iter().collect());
@@ -5576,6 +5633,7 @@ impl Store {
         }
     }
 
+    #[cfg(test)]
     pub fn spop_one(&self, key: &[u8], now: Instant) -> Option<String> {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
@@ -5709,6 +5767,8 @@ impl Store {
         member: &[u8],
         now: Instant,
     ) -> Result<bool, String> {
+        self.try_promote(src, now)?;
+        self.try_promote(dst, now)?;
         let dst_idx = self.shard_index(dst);
         if let Some(entry) = self.shards[dst_idx]
             .read()
@@ -5767,13 +5827,16 @@ impl Store {
         if !sadd.is_empty() {
             commands.push(&sadd);
         }
-        let _commit = prepare
+        let commit = prepare
             .commit_batch(&commands)
             .map_err(|e| format!("ERR WAL append failed: {e}"))?;
         self.del(&[dst]);
         if !members.is_empty() {
             self.sadd(dst, members, now)?;
         }
+        commit
+            .complete()
+            .map_err(|error| format!("ERR journal apply failed: {error}"))?;
         Ok(members.len() as i64)
     }
 
@@ -7434,7 +7497,7 @@ mod tests {
         }
 
         let store = Store::new_with_config(config.clone());
-        store.replay_wal(&crate::pubsub::Broker::new());
+        store.replay_wal(&crate::pubsub::Broker::new()).unwrap();
         assert_eq!(store.get(b"legacy", now()).unwrap(), b"value".as_slice());
 
         let command: [&[u8]; 3] = [b"SET", b"global", b"value"];
@@ -7446,9 +7509,213 @@ mod tests {
 
         assert!(dir.path().join("global/wal.lux").exists());
         let restored = Store::new_with_config(config);
-        restored.replay_wal(&crate::pubsub::Broker::new());
+        restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
         assert_eq!(restored.get(b"legacy", now()).unwrap(), b"value".as_slice());
         assert_eq!(restored.get(b"global", now()).unwrap(), b"value".as_slice());
+    }
+
+    #[test]
+    fn poisoned_journal_rejects_every_later_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        store.poison_journal();
+
+        let command: [&[u8]; 3] = [b"SET", b"unsafe", b"value"];
+        let error = store
+            .commit_journaled(&command, || store.set(b"unsafe", b"value", None, now()))
+            .expect_err("a poisoned journal must fail closed");
+        assert!(error.to_string().contains("restart required"));
+        assert!(store.get(b"unsafe", now()).is_none());
+        assert!(!store.wal_enabled());
+    }
+
+    #[test]
+    fn periodic_fsync_failure_fences_later_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::EverySecond,
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let accepted: [&[u8]; 3] = [b"SET", b"accepted", b"value"];
+        store
+            .commit_journaled(&accepted, || store.set(b"accepted", b"value", None, now()))
+            .unwrap();
+
+        store.inject_journal_fsync_failures(1);
+        let error = store
+            .fsync_wal_checked()
+            .expect_err("the injected periodic sync must fail");
+        assert!(error.to_string().contains("injected journal fsync failure"));
+        assert!(!store.wal_enabled());
+
+        let later: [&[u8]; 3] = [b"SET", b"later", b"value"];
+        let error = store
+            .commit_journaled(&later, || store.set(b"later", b"value", None, now()))
+            .expect_err("writes after a failed periodic sync must fail closed");
+        assert!(error.to_string().contains("restart required"));
+        assert!(store.get(b"later", now()).is_none());
+    }
+
+    #[test]
+    fn failed_prepared_apply_poison_fences_later_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        let route: [&[u8]; 2] = [b"SET", b"planned"];
+        let result: std::io::Result<Result<(), String>> = store.commit_prepared(
+            &route,
+            || {
+                Ok(JournalPlan::command(
+                    vec![b"SET".to_vec(), b"planned".to_vec(), b"value".to_vec()],
+                    (),
+                ))
+            },
+            |()| Err("injected apply failure".to_string()),
+        );
+        assert_eq!(
+            result.unwrap().unwrap_err(),
+            "injected apply failure".to_string()
+        );
+        assert!(!store.wal_enabled());
+
+        let later: [&[u8]; 3] = [b"SET", b"later", b"value"];
+        let error = store
+            .commit_journaled(&later, || store.set(b"later", b"value", None, now()))
+            .expect_err("an indeterminate apply must fence later mutations");
+        assert!(error.to_string().contains("restart required"));
+        assert!(store.get(b"later", now()).is_none());
+        drop(store);
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        assert_eq!(
+            restored.get(b"planned", now()).unwrap(),
+            b"value".as_slice()
+        );
+        assert!(restored.get(b"later", now()).is_none());
+    }
+
+    #[test]
+    fn panicked_prepared_apply_poison_fences_later_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        let route: [&[u8]; 2] = [b"SET", b"planned"];
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: std::io::Result<Result<(), String>> = store.commit_prepared(
+                &route,
+                || {
+                    Ok(JournalPlan::command(
+                        vec![b"SET".to_vec(), b"planned".to_vec(), b"value".to_vec()],
+                        (),
+                    ))
+                },
+                |()| panic!("injected apply panic"),
+            );
+        }));
+        assert!(panic.is_err());
+        assert!(!store.wal_enabled());
+
+        let later: [&[u8]; 3] = [b"SET", b"later", b"value"];
+        assert!(store
+            .commit_journaled(&later, || store.set(b"later", b"value", None, now()))
+            .is_err());
+        drop(store);
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        assert_eq!(
+            restored.get(b"planned", now()).unwrap(),
+            b"value".as_slice()
+        );
+        assert!(restored.get(b"later", now()).is_none());
+    }
+
+    #[test]
+    fn panicked_checked_apply_poison_fences_later_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        let command: [&[u8]; 3] = [b"SET", b"planned", b"value"];
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: std::io::Result<()> =
+                store.commit_journaled_checked(&command, || panic!("injected checked apply panic"));
+        }));
+        assert!(panic.is_err());
+        assert!(!store.wal_enabled());
+
+        let later: [&[u8]; 3] = [b"SET", b"later", b"value"];
+        assert!(store
+            .commit_journaled(&later, || store.set(b"later", b"value", None, now()))
+            .is_err());
+        drop(store);
+
+        let restored = Store::new_with_config(config);
+        restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        assert_eq!(
+            restored.get(b"planned", now()).unwrap(),
+            b"value".as_slice()
+        );
+        assert!(restored.get(b"later", now()).is_none());
+    }
+
+    #[test]
+    fn abandoned_journal_commit_guard_fences_later_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config);
+        let command: [&[u8]; 3] = [b"SET", b"planned", b"value"];
+        let commit = store.begin_journaled(&command).unwrap();
+        drop(commit);
+
+        assert!(!store.wal_enabled());
+        let later: [&[u8]; 3] = [b"SET", b"later", b"value"];
+        let error = store
+            .commit_journaled(&later, || store.set(b"later", b"value", None, now()))
+            .expect_err("an abandoned live apply must fence later mutations");
+        assert!(error.to_string().contains("restart required"));
+        assert!(store.get(b"later", now()).is_none());
     }
 
     #[test]
@@ -7526,11 +7793,11 @@ mod tests {
         assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
         let commit = prepared.commit(&command).unwrap();
         store.set(b"key", b"after", None, now());
-        drop(commit);
+        commit.complete().unwrap();
 
         assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
         worker.join().unwrap();
-        assert!(store.try_promote(b"key", now()));
+        assert!(store.try_promote(b"key", now()).unwrap());
         assert_eq!(store.get(b"key", now()).unwrap(), b"after".as_slice());
     }
 
@@ -7570,9 +7837,12 @@ mod tests {
         assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
         let commit = prepared.commit(&command).unwrap();
         store.set(b"key", b"after", None, now());
-        drop(commit);
+        commit.complete().unwrap();
 
-        assert!(!done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert!(!done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap());
         worker.join().unwrap();
         assert_eq!(store.get(b"key", now()).unwrap(), b"after".as_slice());
     }

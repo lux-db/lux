@@ -13,6 +13,7 @@ impl Store {
         ch: bool,
         now: Instant,
     ) -> Result<i64, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
@@ -156,6 +157,7 @@ impl Store {
     }
 
     pub fn zscore(&self, key: &[u8], member: &[u8], now: Instant) -> Result<Option<f64>, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         Self::zscore_from_shard(&shard.data, key, member, now)
@@ -248,6 +250,7 @@ impl Store {
     }
 
     pub fn zrem(&self, key: &[u8], members: &[&[u8]], now: Instant) -> Result<i64, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
@@ -275,6 +278,7 @@ impl Store {
     }
 
     pub fn zcard(&self, key: &[u8], now: Instant) -> Result<i64, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key) {
@@ -295,6 +299,7 @@ impl Store {
         _with_scores: bool,
         now: Instant,
     ) -> Result<Vec<(String, f64)>, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key) {
@@ -350,6 +355,7 @@ impl Store {
         _with_scores: bool,
         now: Instant,
     ) -> Result<Vec<(String, f64)>, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key) {
@@ -795,11 +801,14 @@ impl Store {
 
         // Journal the resolved replacement before touching the destination.
         // Recovery never needs to re-read the source keys.
-        let _commit = prepare
+        let commit = prepare
             .commit_batch(&commands)
             .map_err(|e| format!("ERR WAL append failed: {e}"))?;
         self.del(&[dst]);
         if entries.is_empty() {
+            commit
+                .complete()
+                .map_err(|e| format!("ERR journal apply failed: {e}"))?;
             return Ok(count);
         }
 
@@ -827,6 +836,10 @@ impl Store {
         }
         shard.used_memory += mem;
         self.mem_add(mem);
+        drop(shard);
+        commit
+            .complete()
+            .map_err(|e| format!("ERR journal apply failed: {e}"))?;
         Ok(count)
     }
 
@@ -945,6 +958,7 @@ impl Store {
         reverse: bool,
         now: Instant,
     ) -> Result<Vec<String>, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key) {

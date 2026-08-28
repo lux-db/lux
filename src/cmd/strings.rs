@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crate::resp;
 use crate::store::{Entry, JournalPlan, SetOptions, Store, StoreValue};
 
-use super::{arg_str, cmd_eq, parse_i64, parse_u64, CmdResult};
+use super::{arg_str, cmd_eq, parse_i64, parse_u64, promote_keys, CmdResult};
 
 const INTEGER_ERR: &str = "ERR value is not an integer or out of range";
 const VALUE_TOO_LARGE_ERR: &str = "ERR string exceeds maximum allowed size";
@@ -480,14 +480,19 @@ pub fn cmd_getex(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         } else {
             prepare.commit_batch(&[])
         };
-        let _commit = match commit {
+        let commit = match commit {
             Ok(commit) => commit,
             Err(error) => {
                 resp::write_error(out, &format!("ERR WAL append failed: {error}"));
                 return CmdResult::Written;
             }
         };
-        store.getex(args[1], ttl, persist, now)
+        let value = store.getex(args[1], ttl, persist, now);
+        if let Err(error) = commit.complete() {
+            resp::write_error(out, &format!("ERR journal apply failed: {error}"));
+            return CmdResult::Written;
+        }
+        value
     };
     match value
         .map(|value| store.decrypt_kv_string_value(args[1], value))
@@ -593,6 +598,9 @@ pub fn cmd_mget(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         resp::write_error(out, "ERR wrong number of arguments for 'mget' command");
         return CmdResult::Written;
     }
+    if !promote_keys(store, &args[1..], out, now) {
+        return CmdResult::Written;
+    }
     resp::write_array_header(out, args.len() - 1);
     for key in &args[1..] {
         match store.get_kv_string(key, now) {
@@ -606,6 +614,10 @@ pub fn cmd_mget(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
 pub fn cmd_mset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
         resp::write_error(out, "ERR wrong number of arguments for 'mset' command");
+        return CmdResult::Written;
+    }
+    let keys: Vec<&[u8]> = args[1..].chunks(2).map(|pair| pair[0]).collect();
+    if !promote_keys(store, &keys, out, now) {
         return CmdResult::Written;
     }
     let prepare = match store.prepare_journaled(args) {
@@ -625,7 +637,7 @@ pub fn cmd_mset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
         .map(|pair| [b"SET".as_slice(), pair[0], pair[1]])
         .collect();
     let refs: Vec<&[&[u8]]> = sets.iter().map(|set| set.as_slice()).collect();
-    let _commit = match prepare.commit_batch(&refs) {
+    let commit = match prepare.commit_batch(&refs) {
         Ok(commit) => commit,
         Err(e) => {
             resp::write_error(out, &format!("ERR WAL append failed: {e}"));
@@ -634,6 +646,10 @@ pub fn cmd_mset(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant)
     };
     for pair in args[1..].chunks(2) {
         store.set(pair[0], pair[1], None, now);
+    }
+    if let Err(error) = commit.complete() {
+        resp::write_error(out, &format!("ERR journal apply failed: {error}"));
+        return CmdResult::Written;
     }
     resp::write_ok(out);
     CmdResult::Written
@@ -645,6 +661,10 @@ pub fn cmd_msetnx(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         return CmdResult::Written;
     }
     let pairs: Vec<(&[u8], &[u8])> = args[1..].chunks(2).map(|c| (c[0], c[1])).collect();
+    let keys: Vec<&[u8]> = pairs.iter().map(|(key, _)| *key).collect();
+    if !promote_keys(store, &keys, out, now) {
+        return CmdResult::Written;
+    }
     let result = store.commit_prepared(
         args,
         || -> Result<JournalPlan<bool>, String> {
@@ -742,6 +762,10 @@ pub fn cmd_lcs(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) 
 
     if (len_only && idx) || (!idx && (with_match_len || min_match_len > 0)) {
         resp::write_error(out, "ERR syntax error");
+        return CmdResult::Written;
+    }
+
+    if !promote_keys(store, &args[1..3], out, now) {
         return CmdResult::Written;
     }
 

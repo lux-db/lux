@@ -33,7 +33,7 @@ mod tables;
 
 use bytes::BytesMut;
 use cmd::CmdResult;
-use command::{Command, CommandKind, CommandOutput, PubSubCommand, SetOption};
+use command::{Command, CommandKind, CommandOutput, PubSubCommand};
 use pubsub::Broker;
 use resp::Parser;
 use shard_exec::{ShardExecutionError, ShardExecutor, ShardPipelineCommand};
@@ -334,18 +334,10 @@ pub enum ServerInfoEvent {
 
 /// Warning runtime events emitted through `ServerConfig::on_warn`.
 ///
-/// Warnings are conditions Lux recovered from, such as skipping corrupted
-/// persisted data or dropping a single failed client connection.
+/// Warnings are conditions Lux recovered from without rejecting startup or a
+/// database mutation.
 #[derive(Clone, Debug)]
 pub enum ServerWarnEvent {
-    /// One checksummed WAL frame failed CRC validation and was skipped.
-    WalCorruptedFrameSkipped {
-        shard: usize,
-        stored_crc: u32,
-        computed_crc: u32,
-    },
-    /// Summary count for corrupted WAL frames skipped during replay.
-    WalCorruptedFramesSkipped { shard: usize, frames: usize },
     /// One checksummed disk entry failed CRC validation during index rebuild.
     DiskCorruptedEntrySkipped { shard: usize, offset: u64 },
     /// One disk entry failed to deserialize during index rebuild.
@@ -379,6 +371,8 @@ pub enum ServerErrorEvent {
     WalTruncateFailed { error: String },
     /// Eviction-to-disk failed; the key remains in memory.
     DiskEvictionWriteFailed { key: String, error: String },
+    /// Promoting a cold key failed; the disk index retains the entry.
+    DiskPromotionReadFailed { key: String, error: String },
     /// Opportunistic compaction on the eviction path failed.
     InlineCompactionFailed { error: String },
     /// Background disk compaction failed.
@@ -932,63 +926,37 @@ impl EmbeddedClient {
                 continue;
             };
 
+            // A typed write must cross its own command-layer journal boundary.
+            // Pre-journaling a whole native batch is unsafe because an earlier
+            // command can fail and prevent later commands from executing even
+            // though their frames are already durable. Read-only runs remain
+            // eligible for same-shard batching.
+            if access == NativePipelineAccess::Write {
+                let out = self.execute_command_output(commands[i].clone()).await?;
+                if collect_outputs {
+                    outputs.push(out);
+                }
+                i += 1;
+                continue;
+            }
+
             let shard_idx = self.runtime.store.shard_for_key(key);
-            let mut has_write = access == NativePipelineAccess::Write;
             let mut batch_end = i + 1;
             while batch_end < commands.len() {
                 let Some((next_key, next_access)) = native_pipeline_access(&commands[batch_end])
                 else {
                     break;
                 };
-                if self.runtime.store.shard_for_key(next_key) != shard_idx {
+                if next_access == NativePipelineAccess::Write
+                    || self.runtime.store.shard_for_key(next_key) != shard_idx
+                {
                     break;
                 }
-                has_write |= next_access == NativePipelineAccess::Write;
                 batch_end += 1;
             }
 
             let batch = &commands[i..batch_end];
-            let pushed_list_keys: Vec<&[u8]> = batch
-                .iter()
-                .filter_map(|command| match command {
-                    Command::LPush { key, .. } | Command::RPush { key, .. } => Some(*key),
-                    _ => None,
-                })
-                .collect();
-            let emit_key_events = self.runtime.broker.has_key_subs();
-            let mut write_argvs = Vec::new();
-            if has_write {
-                if self.runtime.store.wal_enabled() || emit_key_events {
-                    write_argvs.reserve(batch.len());
-                }
-                for command in batch {
-                    if command_is_fast_path_write(command) {
-                        ensure_write_allowed(&self.runtime.store)?;
-                        if self.runtime.store.wal_enabled() || emit_key_events {
-                            write_argvs.push(command.to_owned_argv());
-                        }
-                    }
-                }
-
-                let argv_refs: Vec<Vec<&[u8]>> = write_argvs
-                    .iter()
-                    .map(|argv| argv.iter().map(Vec::as_slice).collect())
-                    .collect();
-                let command_refs: Vec<&[&[u8]]> = argv_refs.iter().map(Vec::as_slice).collect();
-                let _journal_guard = self
-                    .runtime
-                    .store
-                    .begin_journaled_batch(&command_refs)
-                    .map_err(wal_lux_error)?;
-                let mut shard = self.runtime.store.lock_write_shard(shard_idx);
-                shard.version += 1;
-                for command in batch {
-                    let output = self.execute_native_write_on_shard(command, &mut shard, now)?;
-                    if collect_outputs {
-                        outputs.push(output);
-                    }
-                }
-            } else if collect_outputs {
+            if collect_outputs {
                 let shard = self.runtime.store.lock_read_shard(shard_idx);
                 for command in batch {
                     outputs.push(self.execute_native_read_on_shard(command, &shard, now)?);
@@ -999,19 +967,7 @@ impl EmbeddedClient {
                 }
             }
 
-            // The shard lock above must be released before a blocked move can
-            // acquire both its source and destination domains.
-            for key in pushed_list_keys {
-                self.drain_list_waiters(key, now);
-            }
-
             self.runtime.store.add_total_commands(batch.len());
-            if emit_key_events {
-                for argv in &write_argvs {
-                    let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                    fire_key_events(&self.runtime.broker, &refs);
-                }
-            }
 
             i = batch_end;
         }
@@ -1061,295 +1017,6 @@ impl EmbeddedClient {
         }
     }
 
-    fn execute_native_write_on_shard(
-        &self,
-        command: &Command<'_>,
-        shard: &mut store::Shard,
-        now: Instant,
-    ) -> Result<CommandOutput, LuxError> {
-        match command {
-            Command::Get { key } => Ok(optional_bulk_output(
-                Store::get_from_shard(&shard.data, key, now)
-                    .map(|raw| self.runtime.store.decrypt_kv_string_value(key, raw))
-                    .transpose()
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::StrLen { key } => Ok(CommandOutput::Int(
-                Store::get_from_shard(&shard.data, key, now)
-                    .map(|raw| self.runtime.store.decrypt_kv_string_value(key, raw))
-                    .transpose()
-                    .map_err(LuxError::Command)?
-                    .map_or(0, |value| value.len() as i64),
-            )),
-            Command::Exists { keys } if keys.len() == 1 => Ok(CommandOutput::Int(i64::from(
-                Store::exists_on_shard(&shard.data, keys[0], now),
-            ))),
-            Command::HGet { key, field } => Ok(optional_bulk_output(
-                Store::hget_from_shard(&shard.data, key, field, now)
-                    .map(|raw| self.runtime.store.decrypt_hash_field_value(key, field, raw))
-                    .transpose()
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::GeoPos { key, members } => {
-                geopos_output_from_shard(&shard.data, key, members, now)
-            }
-            Command::GeoDist {
-                key,
-                member_a,
-                member_b,
-                unit,
-            } => geodist_output_from_shard(&shard.data, key, member_a, member_b, unit, now),
-            Command::Set {
-                key,
-                value,
-                options,
-            } if can_fast_path_set(options) => {
-                self.runtime
-                    .store
-                    .set_on_shard(&mut shard.data, key, value, None, now);
-                self.runtime.store.remove_from_disk(key);
-                Ok(CommandOutput::Simple("OK"))
-            }
-            Command::GetSet { key, value } => {
-                let old = self
-                    .runtime
-                    .store
-                    .get_set_on_shard(&mut shard.data, key, value, now);
-                self.runtime.store.remove_from_disk(key);
-                Ok(optional_bulk_output(old))
-            }
-            Command::SetNx { key, value } => {
-                let changed = self
-                    .runtime
-                    .store
-                    .set_nx_on_shard(&mut shard.data, key, value, now);
-                if changed {
-                    self.runtime.store.remove_from_disk(key);
-                }
-                Ok(CommandOutput::Int(i64::from(changed)))
-            }
-            Command::SetEx {
-                key,
-                seconds,
-                value,
-            } => {
-                if *seconds == 0 {
-                    return Err(LuxError::Command(
-                        "ERR invalid expire time in 'setex' command".to_string(),
-                    ));
-                }
-                self.runtime.store.set_on_shard(
-                    &mut shard.data,
-                    key,
-                    value,
-                    Some(Duration::from_secs(*seconds)),
-                    now,
-                );
-                self.runtime.store.remove_from_disk(key);
-                Ok(CommandOutput::Simple("OK"))
-            }
-            Command::PSetEx {
-                key,
-                milliseconds,
-                value,
-            } => {
-                if *milliseconds == 0 {
-                    return Err(LuxError::Command(
-                        "ERR invalid expire time in 'psetex' command".to_string(),
-                    ));
-                }
-                let millis = u64::try_from(*milliseconds).map_err(|_| {
-                    LuxError::Command("ERR value is not an integer or out of range".to_string())
-                })?;
-                self.runtime.store.set_on_shard(
-                    &mut shard.data,
-                    key,
-                    value,
-                    Some(Duration::from_millis(millis)),
-                    now,
-                );
-                self.runtime.store.remove_from_disk(key);
-                Ok(CommandOutput::Simple("OK"))
-            }
-            Command::Expire { key, seconds } => Ok(CommandOutput::Int(i64::from(
-                Store::expire_on_shard(&mut shard.data, key, *seconds, now),
-            ))),
-            Command::Append { key, value } => {
-                let len = self.runtime.store.append_on_shard(shard, key, value, now);
-                self.runtime.store.remove_from_disk(key);
-                Ok(CommandOutput::Int(len))
-            }
-            Command::Incr { key } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr_on_shard(&mut shard.data, key, 1, now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::Decr { key } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr_on_shard(&mut shard.data, key, -1, now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::IncrBy { key, increment } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr_on_shard(&mut shard.data, key, *increment, now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::DecrBy { key, decrement } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr_on_shard(&mut shard.data, key, -*decrement, now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::Del { keys } | Command::Unlink { keys } if keys.len() == 1 => Ok(
-                CommandOutput::Int(self.runtime.store.del_on_shard(shard, keys[0], now)),
-            ),
-            Command::LPush { key, values } => {
-                let n = self
-                    .runtime
-                    .store
-                    .lpush_on_shard(shard, key, values, now)
-                    .map_err(LuxError::Command)?;
-                self.runtime.store.remove_from_disk(key);
-                Ok(CommandOutput::Int(n))
-            }
-            Command::RPush { key, values } => {
-                let n = self
-                    .runtime
-                    .store
-                    .rpush_on_shard(shard, key, values, now)
-                    .map_err(LuxError::Command)?;
-                self.runtime.store.remove_from_disk(key);
-                Ok(CommandOutput::Int(n))
-            }
-            Command::LPop { key } => {
-                let value = self.runtime.store.lpop_on_shard(shard, key, now);
-                if value.is_some() {
-                    self.runtime.store.remove_from_disk(key);
-                }
-                Ok(optional_bulk_output(value))
-            }
-            Command::RPop { key } => {
-                let value = self.runtime.store.rpop_on_shard(shard, key, now);
-                if value.is_some() {
-                    self.runtime.store.remove_from_disk(key);
-                }
-                Ok(optional_bulk_output(value))
-            }
-            Command::HSet { key, field, value } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .hset_on_shard(shard, key, &[(*field, *value)], now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::HIncrBy {
-                key,
-                field,
-                increment,
-            } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .hincrby_on_shard(shard, key, field, *increment, now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::SAdd { key, members } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .sadd_on_shard(shard, key, members, now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::SPop { key } => {
-                let mut values = self
-                    .runtime
-                    .store
-                    .spop_on_shard(shard, key, 1, now)
-                    .map_err(LuxError::Command)?;
-                if !values.is_empty() {
-                    self.runtime.store.remove_from_disk(key);
-                }
-                Ok(match values.pop() {
-                    Some(value) => CommandOutput::Bulk(bytes::Bytes::from(value)),
-                    None => CommandOutput::Nil,
-                })
-            }
-            Command::ZAdd { key, score, member } => Ok(CommandOutput::Int(
-                self.runtime
-                    .store
-                    .zadd_on_shard(
-                        shard,
-                        key,
-                        &[(*member, *score)],
-                        false,
-                        false,
-                        false,
-                        false,
-                        false,
-                        now,
-                    )
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::ZIncrBy {
-                key,
-                increment,
-                member,
-            } => Ok(score_output(
-                self.runtime
-                    .store
-                    .zincrby_on_shard(shard, key, member, *increment, now)
-                    .map_err(LuxError::Command)?,
-            )),
-            Command::GeoAdd { key, members } => {
-                if let [member] = members.as_slice() {
-                    crate::geo::validate_coords(member.longitude, member.latitude)
-                        .map_err(LuxError::Command)?;
-                    let scored = [(
-                        member.member,
-                        crate::geo::geohash_encode(member.longitude, member.latitude) as f64,
-                    )];
-                    Ok(CommandOutput::Int(
-                        self.runtime
-                            .store
-                            .zadd_on_shard(
-                                shard, key, &scored, false, false, false, false, false, now,
-                            )
-                            .map_err(LuxError::Command)?,
-                    ))
-                } else {
-                    let mut scored = Vec::with_capacity(members.len());
-                    for member in members {
-                        crate::geo::validate_coords(member.longitude, member.latitude)
-                            .map_err(LuxError::Command)?;
-                        scored.push((
-                            member.member,
-                            crate::geo::geohash_encode(member.longitude, member.latitude) as f64,
-                        ));
-                    }
-                    Ok(CommandOutput::Int(
-                        self.runtime
-                            .store
-                            .zadd_on_shard(
-                                shard, key, &scored, false, false, false, false, false, now,
-                            )
-                            .map_err(LuxError::Command)?,
-                    ))
-                }
-            }
-            Command::XAdd { key, id, fields } => {
-                require_xadd_fields(fields)?;
-                let id = self
-                    .runtime
-                    .store
-                    .xadd_on_shard(shard, key, arg_str(id), xadd_fields(fields), None, now)
-                    .map_err(LuxError::Command)?;
-                self.runtime.broker.wake_stream_waiters(arg_str(key));
-                Ok(CommandOutput::Bulk(bytes::Bytes::from(id.to_string())))
-            }
-            _ => unreachable!("native pipeline write command was classified before dispatch"),
-        }
-    }
-
     fn execute_native_read_on_shard_discard(&self, command: &Command<'_>) -> Result<(), LuxError> {
         match command {
             Command::Get { .. }
@@ -1366,55 +1033,18 @@ impl EmbeddedClient {
         &self,
         command: &Command<'_>,
     ) -> Result<Option<CommandOutput>, LuxError> {
-        // Keep every standalone mutation on the command layer's authoritative
-        // resolved journal boundary. The native write pipeline remains limited
-        // to explicitly classified deterministic batches.
-        if command_is_fast_path_write(command) {
-            return Ok(None);
-        }
-        if matches!(command, Command::Keys { .. } | Command::RandomKey)
+        // Mutations use the command layer's authoritative, state-aware journal
+        // boundary. This fast path is deliberately a read-only whitelist plus
+        // PING/PUBLISH; unknown or newly added variants fall back to the shared
+        // command implementation by default.
+        if self.runtime.store.is_tiered()
+            || matches!(command, Command::Keys { .. } | Command::RandomKey)
             || command_touches_reserved_internal_key(command)
-        {
-            return Ok(None);
-        }
-        if matches!(
-            command,
-            Command::Raw { .. }
-                | Command::SPop { .. }
-                | Command::XAdd { .. }
-                | Command::SetEx { .. }
-                | Command::PSetEx { .. }
-                | Command::Expire { .. }
-                | Command::Persist { .. }
-        ) || matches!(command, Command::Set { options, .. } if !can_fast_path_set(options))
         {
             return Ok(None);
         }
 
         let now = Instant::now();
-        if command_is_fast_path_write(command) {
-            ensure_write_allowed(&self.runtime.store)?;
-        }
-        let mut write_argv = if command_is_fast_path_write(command)
-            && (self.runtime.store.wal_enabled() || self.runtime.broker.has_key_subs())
-            && !matches!(command, Command::MSet { .. })
-        {
-            Some(command.to_owned_argv())
-        } else {
-            None
-        };
-        let _journal_guard = if let Some(argv) = &write_argv {
-            let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-            Some(
-                self.runtime
-                    .store
-                    .begin_journaled(&refs)
-                    .map_err(wal_lux_error)?,
-            )
-        } else {
-            None
-        };
-
         let output = match command {
             Command::Ping => CommandOutput::Simple("PONG"),
             Command::Publish { channel, message } => {
@@ -1426,84 +1056,24 @@ impl EmbeddedClient {
                 )
             }
             Command::DbSize => CommandOutput::Int(self.runtime.store.dbsize(now)),
-            Command::FlushDb | Command::FlushAll => {
-                self.runtime.store.flushdb();
-                CommandOutput::Simple("OK")
-            }
-            Command::Keys { pattern } => string_array(self.runtime.store.keys(pattern, now)),
-            Command::RandomKey => random_key_output(&self.runtime.store, now),
             Command::Get { key } => optional_bulk_output(
                 self.runtime
                     .store
                     .get_kv_string(key, now)
                     .map_err(LuxError::Command)?,
             ),
-            Command::Set {
-                key,
-                value,
-                options,
-            } if can_fast_path_set(options) => {
-                self.runtime.store.set(key, value, None, now);
-                CommandOutput::Simple("OK")
-            }
-            Command::GetSet { key, value } => {
-                optional_bulk_output(self.runtime.store.get_set(key, value, now))
-            }
-            Command::SetNx { key, value } => {
-                CommandOutput::Int(i64::from(self.runtime.store.set_nx(key, value, now)))
-            }
-            Command::SetEx {
-                key,
-                seconds,
-                value,
-            } => {
-                if *seconds == 0 {
-                    return Err(LuxError::Command(
-                        "ERR invalid expire time in 'setex' command".to_string(),
-                    ));
-                }
-                self.runtime
-                    .store
-                    .set(key, value, Some(Duration::from_secs(*seconds)), now);
-                CommandOutput::Simple("OK")
-            }
-            Command::PSetEx {
-                key,
-                milliseconds,
-                value,
-            } => {
-                if *milliseconds == 0 {
-                    return Err(LuxError::Command(
-                        "ERR invalid expire time in 'psetex' command".to_string(),
-                    ));
-                }
-                let millis = u64::try_from(*milliseconds).map_err(|_| {
-                    LuxError::Command("ERR value is not an integer or out of range".to_string())
-                })?;
-                self.runtime
-                    .store
-                    .set(key, value, Some(Duration::from_millis(millis)), now);
-                CommandOutput::Simple("OK")
-            }
-            Command::MGet { keys } => CommandOutput::Array(
-                keys.iter()
+            Command::MGet { keys } => {
+                let values = keys
+                    .iter()
                     .map(|key| {
                         self.runtime
                             .store
                             .get_kv_string(key, now)
                             .map(optional_bulk_output)
-                            .unwrap_or(CommandOutput::Nil)
                     })
-                    .collect(),
-            ),
-            Command::MSet { .. } => {
-                unreachable!("mutations return to the authoritative command path above")
-            }
-            Command::MSetNx { pairs } => {
-                CommandOutput::Int(i64::from(self.runtime.store.msetnx(pairs, now)))
-            }
-            Command::Append { key, value } => {
-                CommandOutput::Int(self.runtime.store.append(key, value, now))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(LuxError::Command)?;
+                CommandOutput::Array(values)
             }
             Command::StrLen { key } => CommandOutput::Int(
                 self.runtime
@@ -1512,99 +1082,15 @@ impl EmbeddedClient {
                     .map_err(LuxError::Command)?
                     .map_or(0, |value| value.len() as i64),
             ),
-            Command::Incr { key } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr(key, 1, now)
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::Decr { key } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr(key, -1, now)
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::IncrBy { key, increment } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr(key, *increment, now)
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::DecrBy { key, decrement } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .incr(key, -*decrement, now)
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::Del { keys } => CommandOutput::Int(self.runtime.store.del(keys)),
-            Command::Unlink { keys } => CommandOutput::Int(self.runtime.store.unlink(keys)),
             Command::Exists { keys } => CommandOutput::Int(self.runtime.store.exists(keys, now)),
-            Command::Expire { key, seconds } => {
-                CommandOutput::Int(i64::from(self.runtime.store.expire(key, *seconds, now)))
-            }
             Command::Ttl { key } => CommandOutput::Int(self.runtime.store.ttl(key, now)),
             Command::PTtl { key } => CommandOutput::Int(self.runtime.store.pttl(key, now)),
-            Command::Persist { key } => {
-                CommandOutput::Int(i64::from(self.runtime.store.persist(key, now)))
-            }
             Command::Type { key } => CommandOutput::Simple(
                 self.runtime
                     .store
                     .get_entry_type(key, now)
                     .unwrap_or("none"),
             ),
-            Command::Rename { key, new_key } => {
-                self.runtime
-                    .store
-                    .rename(key, new_key, now)
-                    .map_err(LuxError::Command)?;
-                CommandOutput::Simple("OK")
-            }
-            Command::RenameNx { key, new_key } => {
-                if self.runtime.store.get(new_key, now).is_some() {
-                    CommandOutput::Int(0)
-                } else {
-                    self.runtime
-                        .store
-                        .rename(key, new_key, now)
-                        .map_err(LuxError::Command)?;
-                    CommandOutput::Int(1)
-                }
-            }
-            Command::LPush { key, values } => {
-                let n = self
-                    .runtime
-                    .store
-                    .lpush(key, values, now)
-                    .map_err(LuxError::Command)?;
-                self.drain_list_waiters(key, now);
-                CommandOutput::Int(n)
-            }
-            Command::RPush { key, values } => {
-                let n = self
-                    .runtime
-                    .store
-                    .rpush(key, values, now)
-                    .map_err(LuxError::Command)?;
-                self.drain_list_waiters(key, now);
-                CommandOutput::Int(n)
-            }
-            Command::LPop { key } => {
-                optional_bulk_output(self.runtime.store.lpop(key, now).map(|raw| {
-                    self.runtime
-                        .store
-                        .decrypt_list_element(raw.clone())
-                        .unwrap_or(raw)
-                }))
-            }
-            Command::RPop { key } => {
-                optional_bulk_output(self.runtime.store.rpop(key, now).map(|raw| {
-                    self.runtime
-                        .store
-                        .decrypt_list_element(raw.clone())
-                        .unwrap_or(raw)
-                }))
-            }
             Command::LLen { key } => CommandOutput::Int(
                 self.runtime
                     .store
@@ -1633,22 +1119,6 @@ impl EmbeddedClient {
                     })
                     .collect(),
             ),
-            Command::HSet { key, field, value } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .hset(key, &[(*field, *value)], now)
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::HIncrBy {
-                key,
-                field,
-                increment,
-            } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .hincrby(key, field, *increment, now)
-                    .map_err(LuxError::Command)?,
-            ),
             Command::HGet { key, field } => {
                 optional_bulk_output(self.runtime.store.hget(key, field, now))
             }
@@ -1659,12 +1129,6 @@ impl EmbeddedClient {
                     .into_iter()
                     .map(optional_bulk_output)
                     .collect(),
-            ),
-            Command::HDel { key, fields } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .hdel(key, fields, now)
-                    .map_err(LuxError::Command)?,
             ),
             Command::HExists { key, field } => CommandOutput::Int(i64::from(
                 self.runtime
@@ -1691,18 +1155,6 @@ impl EmbeddedClient {
                 }
                 CommandOutput::Array(values)
             }
-            Command::SAdd { key, members } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .sadd(key, members, now)
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::SRem { key, members } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .srem(key, members, now)
-                    .map_err(LuxError::Command)?,
-            ),
             Command::SMembers { key } => string_array(
                 self.runtime
                     .store
@@ -1721,17 +1173,6 @@ impl EmbeddedClient {
                     .scard(key, now)
                     .map_err(LuxError::Command)?,
             ),
-            Command::SPop { key } => {
-                let mut values = self
-                    .runtime
-                    .store
-                    .spop(key, 1, now)
-                    .map_err(LuxError::Command)?;
-                match values.pop() {
-                    Some(value) => CommandOutput::Bulk(bytes::Bytes::from(value)),
-                    None => CommandOutput::Nil,
-                }
-            }
             Command::SUnion { keys } => string_array(
                 self.runtime
                     .store
@@ -1750,27 +1191,6 @@ impl EmbeddedClient {
                     .sdiff(keys, now)
                     .map_err(LuxError::Command)?,
             ),
-            Command::ZAdd { key, score, member } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .zadd(
-                        key,
-                        &[(*member, *score)],
-                        false,
-                        false,
-                        false,
-                        false,
-                        false,
-                        now,
-                    )
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::ZRem { key, members } => CommandOutput::Int(
-                self.runtime
-                    .store
-                    .zrem(key, members, now)
-                    .map_err(LuxError::Command)?,
-            ),
             Command::ZCard { key } => CommandOutput::Int(
                 self.runtime
                     .store
@@ -1781,16 +1201,6 @@ impl EmbeddedClient {
                 self.runtime
                     .store
                     .zscore(key, member, now)
-                    .map_err(LuxError::Command)?,
-            ),
-            Command::ZIncrBy {
-                key,
-                increment,
-                member,
-            } => score_output(
-                self.runtime
-                    .store
-                    .zincrby(key, member, *increment, now)
                     .map_err(LuxError::Command)?,
             ),
             Command::ZCount { key, min, max } => {
@@ -1815,38 +1225,6 @@ impl EmbeddedClient {
                     .map_err(LuxError::Command)?,
                 *with_scores,
             ),
-            Command::GeoAdd { key, members } => {
-                if let [member] = members.as_slice() {
-                    crate::geo::validate_coords(member.longitude, member.latitude)
-                        .map_err(LuxError::Command)?;
-                    let scored = [(
-                        member.member,
-                        crate::geo::geohash_encode(member.longitude, member.latitude) as f64,
-                    )];
-                    CommandOutput::Int(
-                        self.runtime
-                            .store
-                            .zadd(key, &scored, false, false, false, false, false, now)
-                            .map_err(LuxError::Command)?,
-                    )
-                } else {
-                    let mut scored = Vec::with_capacity(members.len());
-                    for member in members {
-                        crate::geo::validate_coords(member.longitude, member.latitude)
-                            .map_err(LuxError::Command)?;
-                        scored.push((
-                            member.member,
-                            crate::geo::geohash_encode(member.longitude, member.latitude) as f64,
-                        ));
-                    }
-                    CommandOutput::Int(
-                        self.runtime
-                            .store
-                            .zadd(key, &scored, false, false, false, false, false, now)
-                            .map_err(LuxError::Command)?,
-                    )
-                }
-            }
             Command::GeoPos { key, members } => {
                 let mut values = Vec::with_capacity(members.len());
                 for member in members {
@@ -1882,58 +1260,32 @@ impl EmbeddedClient {
                             "ERR unsupported unit provided. please use M, KM, FT, MI".to_string(),
                         )
                     })?;
-                let Some(score_a) = self
+                let score_a = self
                     .runtime
                     .store
                     .zscore(key, member_a, now)
-                    .map_err(LuxError::Command)?
-                else {
-                    return Ok(Some(CommandOutput::Nil));
-                };
-                let Some(score_b) = self
+                    .map_err(LuxError::Command)?;
+                let score_b = self
                     .runtime
                     .store
                     .zscore(key, member_b, now)
-                    .map_err(LuxError::Command)?
-                else {
-                    return Ok(Some(CommandOutput::Nil));
-                };
-                let (lon_a, lat_a) = crate::geo::geohash_decode(score_a as u64);
-                let (lon_b, lat_b) = crate::geo::geohash_decode(score_b as u64);
-                let distance = unit.from_meters(crate::geo::haversine(lon_a, lat_a, lon_b, lat_b));
-                CommandOutput::Bulk(bytes::Bytes::from(format!("{distance:.4}")))
-            }
-            Command::XAdd { key, id, fields } => {
-                require_xadd_fields(fields)?;
-                let id = self
-                    .runtime
-                    .store
-                    .xadd(key, arg_str(id), xadd_fields(fields), None, now)
                     .map_err(LuxError::Command)?;
-                self.runtime.broker.wake_stream_waiters(arg_str(key));
-                CommandOutput::Bulk(bytes::Bytes::from(id.to_string()))
+                match (score_a, score_b) {
+                    (Some(score_a), Some(score_b)) => {
+                        let (lon_a, lat_a) = crate::geo::geohash_decode(score_a as u64);
+                        let (lon_b, lat_b) = crate::geo::geohash_decode(score_b as u64);
+                        let distance =
+                            unit.from_meters(crate::geo::haversine(lon_a, lat_a, lon_b, lat_b));
+                        CommandOutput::Bulk(bytes::Bytes::from(format!("{distance:.4}")))
+                    }
+                    _ => CommandOutput::Nil,
+                }
             }
-            Command::Set { .. } | Command::Raw { .. } => unreachable!("handled before fast path"),
+            _ => return Ok(None),
         };
 
         self.runtime.store.add_total_commands(1);
-        if let Some(argv) = write_argv.take() {
-            let refs = argv.iter().map(Vec::as_slice).collect::<Vec<_>>();
-            fire_key_events(&self.runtime.broker, &refs);
-        }
         Ok(Some(output))
-    }
-
-    fn drain_list_waiters(&self, key: &[u8], now: Instant) {
-        if !self.runtime.broker.has_list_waiters("") {
-            return;
-        }
-        let key_s = std::str::from_utf8(key).unwrap_or("");
-        if self.runtime.broker.has_list_waiters(key_s) {
-            self.runtime
-                .broker
-                .drain_list_waiters(key_s, &self.runtime.store, now);
-        }
     }
 
     /// Executes a raw Redis command pipeline and returns raw RESP bytes for all replies.
@@ -2367,86 +1719,6 @@ fn zrange_output(items: Vec<(String, f64)>, with_scores: bool) -> CommandOutput 
     CommandOutput::Array(values)
 }
 
-fn random_key_output(store: &Store, now: Instant) -> CommandOutput {
-    for i in 0..store.shard_count() {
-        let shard = store.lock_read_shard(i);
-        if let Some((key, _)) = shard
-            .data
-            .iter()
-            .find(|(_, entry)| !entry.is_expired_at(now))
-        {
-            return CommandOutput::Bulk(bytes::Bytes::from(key.clone()));
-        }
-    }
-    CommandOutput::Nil
-}
-
-fn arg_str(arg: &[u8]) -> &str {
-    std::str::from_utf8(arg).unwrap_or("")
-}
-
-fn xadd_fields(fields: &[(&[u8], &[u8])]) -> Vec<(String, bytes::Bytes)> {
-    fields
-        .iter()
-        .map(|(field, value)| {
-            (
-                arg_str(field).to_string(),
-                bytes::Bytes::copy_from_slice(value),
-            )
-        })
-        .collect()
-}
-
-fn require_xadd_fields(fields: &[(&[u8], &[u8])]) -> Result<(), LuxError> {
-    if fields.is_empty() {
-        return Err(LuxError::Command(
-            "ERR wrong number of arguments for 'xadd' command".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn command_is_fast_path_write(command: &Command<'_>) -> bool {
-    matches!(
-        command,
-        Command::FlushDb
-            | Command::FlushAll
-            | Command::Set { .. }
-            | Command::GetSet { .. }
-            | Command::SetNx { .. }
-            | Command::SetEx { .. }
-            | Command::PSetEx { .. }
-            | Command::MSet { .. }
-            | Command::MSetNx { .. }
-            | Command::Append { .. }
-            | Command::Incr { .. }
-            | Command::Decr { .. }
-            | Command::IncrBy { .. }
-            | Command::DecrBy { .. }
-            | Command::Del { .. }
-            | Command::Unlink { .. }
-            | Command::Expire { .. }
-            | Command::Persist { .. }
-            | Command::Rename { .. }
-            | Command::RenameNx { .. }
-            | Command::LPush { .. }
-            | Command::RPush { .. }
-            | Command::LPop { .. }
-            | Command::RPop { .. }
-            | Command::HSet { .. }
-            | Command::HIncrBy { .. }
-            | Command::HDel { .. }
-            | Command::SAdd { .. }
-            | Command::SRem { .. }
-            | Command::SPop { .. }
-            | Command::ZAdd { .. }
-            | Command::ZRem { .. }
-            | Command::ZIncrBy { .. }
-            | Command::GeoAdd { .. }
-            | Command::XAdd { .. }
-    )
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativePipelineAccess {
     Read,
@@ -2523,20 +1795,6 @@ fn command_touches_reserved_internal_key(command: &Command<'_>) -> bool {
         | Command::SDiff { keys } => keys.iter().any(|key| reserved(key)),
         _ => false,
     }
-}
-
-fn wal_lux_error(error: std::io::Error) -> LuxError {
-    LuxError::Command(format!("ERR WAL append failed: {error}"))
-}
-
-fn ensure_write_allowed(store: &Store) -> Result<(), LuxError> {
-    crate::eviction::evict_if_needed(store).map_err(|e| LuxError::Command(e.to_string()))
-}
-
-fn can_fast_path_set(_options: &[SetOption]) -> bool {
-    // SET may preserve an existing encrypted value and may resolve a condition
-    // or TTL. It must cross the command layer's prepared journal boundary.
-    false
 }
 
 fn parse_score_bound_bytes(input: &[u8], is_max: bool) -> (f64, bool) {
@@ -3023,6 +2281,14 @@ impl Runtime {
         config: ServerConfig,
         background_tasks: &mut JoinSet<()>,
     ) -> std::io::Result<Arc<Self>> {
+        snapshot::complete_pending_restore(&config)?;
+        if config.storage.mode == StorageMode::Tiered && config.durability.policy.is_persistent() {
+            // Tiered files are a derived placement cache. Recovery is driven
+            // solely by the verified snapshot and ordered journal; retaining
+            // the cache would duplicate snapshot keys and replay relative
+            // mutations on top of their already-applied cold values.
+            disk::discard_tiered_cache(std::path::Path::new(&config.storage.dir))?;
+        }
         let config = Arc::new(config);
         let store = Arc::new(Store::try_new_with_config(config.clone())?);
         let schema_cache: SharedSchemaCache =
@@ -3137,7 +2403,7 @@ impl Runtime {
             .wal_suppress
             .store(false, std::sync::atomic::Ordering::Relaxed);
         if runtime.config.durability.policy.is_persistent() {
-            runtime.store.replay_wal(&runtime.broker);
+            runtime.store.replay_wal(&runtime.broker)?;
             runtime.store.finish_recovery();
         }
         if runtime.config.auth.enabled {
@@ -3210,8 +2476,15 @@ impl Runtime {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     let now = Instant::now();
-                    for table in tables::expire_due_rows(&store, &cache, now) {
-                        broker.enqueue_key_event(table.as_bytes(), b"TEXPIRE");
+                    match tables::expire_due_rows(&store, &cache, now) {
+                        Ok(tables) => {
+                            for table in tables {
+                                broker.enqueue_key_event(table.as_bytes(), b"TEXPIRE");
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("table TTL sweep failed; rows retained for retry: {error}");
+                        }
                     }
                 }
             });
@@ -3893,7 +3166,10 @@ impl CommandExecutor {
             }
             let access = cmd::pipeline_access_for_args(args);
             flags.push(access);
-            if access == cmd::PipelineAccess::General {
+            // Writes must cross their per-command authoritative journal
+            // boundary so a rejected command cannot leave a durable frame in a
+            // pre-journaled batch. Only read-only runs use shard batching.
+            if access != cmd::PipelineAccess::Read {
                 all_single_key_rw = false;
             }
         }
@@ -4584,6 +3860,13 @@ async fn handle_block_stream_read(
     timeout: std::time::Duration,
 ) -> std::io::Result<()> {
     let now_pre = Instant::now();
+    for key in keys {
+        if let Err(error) = store.try_promote(key.as_bytes(), now_pre) {
+            let mut out = BytesMut::new();
+            resp::write_error(&mut out, &error);
+            return socket.write_all(&out).await;
+        }
+    }
     let resolved_ids: Vec<String> = id_strs
         .iter()
         .enumerate()
@@ -4628,9 +3911,10 @@ async fn handle_block_stream_read(
             Ok(r) if !r.is_empty() => {
                 write_xread_response(&mut write_buf, &r);
             }
-            _ => {
+            Ok(_) => {
                 resp::write_null_array(&mut write_buf);
             }
+            Err(error) => resp::write_error(&mut write_buf, &error),
         }
     } else {
         resp::write_null_array(&mut write_buf);
@@ -4953,9 +4237,9 @@ mod persistence_config_tests {
     }
 
     #[test]
-    fn default_policy_preserves_persistent_server_behavior() {
+    fn default_policy_durably_acknowledges_each_write() {
         let config = ServerConfig::default();
-        assert_eq!(config.durability.policy, DurabilityPolicy::EverySecond);
+        assert_eq!(config.durability.policy, DurabilityPolicy::AlwaysSync);
         assert_eq!(config.durability.sync_interval, Duration::from_secs(1));
     }
 
@@ -4976,6 +4260,7 @@ mod persistence_config_tests {
         let root = tempfile::tempdir().unwrap();
         for interval in [Duration::ZERO, Duration::from_millis(1_001)] {
             let mut config = persistent_config(root.path(), StorageMode::Memory);
+            config.durability.policy = DurabilityPolicy::EverySecond;
             config.durability.sync_interval = interval;
             let error = resolve_and_validate_persistence(&mut config).unwrap_err();
             assert!(error.to_string().contains("1 to 1000 ms"), "{error}");

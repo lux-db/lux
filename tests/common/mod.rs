@@ -7,10 +7,12 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -60,16 +62,26 @@ pub fn find_lux_binary() -> std::path::PathBuf {
 }
 
 /// Reserve `n` distinct localhost ports by holding listeners on `:0`
-/// simultaneously, then releasing them. Binding all at once guarantees the
-/// ports differ; releasing lets the spawned server claim them.
+/// simultaneously. Ports already issued in this test process are never handed
+/// out again, closing the release-to-bind race between parallel test cases.
 pub fn free_ports(n: usize) -> Vec<u16> {
-    let listeners: Vec<TcpListener> = (0..n)
-        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port"))
-        .collect();
-    listeners
-        .iter()
-        .map(|l| l.local_addr().unwrap().port())
-        .collect()
+    static ISSUED_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    let issued = ISSUED_PORTS.get_or_init(|| Mutex::new(HashSet::new()));
+    loop {
+        let listeners: Vec<TcpListener> = (0..n)
+            .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port"))
+            .collect();
+        let ports: Vec<u16> = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().port())
+            .collect();
+        let mut issued = issued.lock().unwrap();
+        if ports.iter().any(|port| issued.contains(port)) {
+            continue;
+        }
+        issued.extend(ports.iter().copied());
+        return ports;
+    }
 }
 
 pub fn free_port() -> u16 {
@@ -197,6 +209,12 @@ impl LuxServerBuilder {
     /// Use tiered (disk-backed) storage instead of in-memory.
     pub fn tiered(mut self) -> Self {
         self.spec.mode = Mode::Tiered;
+        // Tiered tests that set maxmemory are intended to exercise the cold
+        // path. The production default remains `noeviction`; the test builder
+        // opts into deterministic spill unless a test selected another policy.
+        if self.spec.maxmemory_policy.is_none() {
+            self.spec.maxmemory_policy = Some("allkeys-lru".to_string());
+        }
         self
     }
 

@@ -42,6 +42,7 @@ impl Store {
     }
 
     pub fn hset(&self, key: &[u8], pairs: &[(&[u8], &[u8])], now: Instant) -> Result<i64, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
@@ -105,20 +106,33 @@ impl Store {
     }
 
     pub fn hget(&self, key: &[u8], field: &[u8], now: Instant) -> Option<Bytes> {
+        self.hget_checked(key, field, now).ok().flatten()
+    }
+
+    pub(crate) fn hget_checked(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        now: Instant,
+    ) -> Result<Option<Bytes>, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Hash(map) => map
-                    .get_live(key_str(field), epoch_ms())
-                    .cloned()
-                    .map(|value| self.decrypt_hash_field_value(key, field, value))
-                    .transpose()
-                    .ok()
-                    .flatten(),
-                _ => None,
+                StoreValue::Hash(map) => {
+                    let Some(value) = map.get_live(key_str(field), epoch_ms()).cloned() else {
+                        return Ok(None);
+                    };
+                    self.decrypt_hash_field_value(key, field, value)
+                        .map(Some)
+                        .inspect_err(|_| {
+                            self.poison_journal();
+                        })
+                }
+                _ => Ok(None),
             },
-            _ => None,
+            _ => Ok(None),
         }
     }
 
@@ -158,6 +172,7 @@ impl Store {
     }
 
     pub fn hdel(&self, key: &[u8], fields: &[&[u8]], now: Instant) -> Result<i64, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.version += 1;
@@ -197,6 +212,7 @@ impl Store {
     }
 
     pub fn hgetall(&self, key: &[u8], now: Instant) -> Result<Vec<(String, Bytes)>, String> {
+        self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         let now_ms = epoch_ms();

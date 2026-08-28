@@ -206,6 +206,9 @@ pub fn cmd_bitop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
     }
     let dest = args[2];
     let src_keys: Vec<&[u8]> = args[3..].to_vec();
+    if !super::promote_keys(store, &args[2..], out, now) {
+        return CmdResult::Written;
+    }
     // Refuse if the destination or any source is encrypted: BITOP would either
     // overwrite an encrypted key with a plaintext result or compute over an
     // envelope. Guard before any mutation.
@@ -217,10 +220,6 @@ pub fn cmd_bitop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
             return CmdResult::Written;
         }
     }
-    for key in &src_keys {
-        store.try_promote(key, now);
-    }
-
     if op == "NOT" && src_keys.len() != 1 {
         resp::write_error(out, "ERR BITOP NOT requires one and only one key");
         return CmdResult::Written;
