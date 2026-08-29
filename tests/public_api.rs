@@ -2614,6 +2614,118 @@ async fn run_with_config_returns_after_snapshot_and_wal_replay() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_with_config_refuses_a_missing_journal_beside_a_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage_dir = tmp.path().join("storage");
+    let cfg = lux::ServerConfig {
+        port: 0,
+        shards: 4,
+        data_dir: tmp.path().display().to_string(),
+        save_interval: Duration::ZERO,
+        storage: lux::StorageConfig {
+            mode: lux::StorageMode::Tiered,
+            dir: storage_dir.display().to_string(),
+        },
+        ..Default::default()
+    };
+
+    let handle = lux::run_with_config(cfg.clone()).await.unwrap();
+    let writer = UniversalClient::resp(handle.local_addr().unwrap());
+    assert!(writer.set("snapshot_key", "snapshot_value").await);
+    writer.save().await;
+    assert!(writer.set("journal_key", "journal_value").await);
+    drop(writer);
+    handle.shutdown_and_wait().await.unwrap();
+
+    let journal = storage_dir.join("global/wal.lux");
+    std::fs::remove_file(&journal).unwrap();
+    let error = match lux::run_with_config(cfg.clone()).await {
+        Ok(handle) => {
+            handle.shutdown_and_wait().await.unwrap();
+            panic!("a missing journal beside a snapshot must prevent readiness");
+        }
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        !journal.exists(),
+        "failed startup must not manufacture a replacement journal"
+    );
+
+    std::fs::write(&journal, []).unwrap();
+    let error = match lux::run_with_config(cfg).await {
+        Ok(handle) => {
+            handle.shutdown_and_wait().await.unwrap();
+            panic!("an empty journal beside a snapshot must prevent readiness");
+        }
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        std::fs::metadata(journal).unwrap().len(),
+        0,
+        "failed startup must preserve an empty journal for diagnosis"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_with_config_refuses_an_unbound_replacement_journal() {
+    let target = tempfile::tempdir().unwrap();
+    let target_storage = target.path().join("storage");
+    let target_cfg = lux::ServerConfig {
+        port: 0,
+        shards: 4,
+        data_dir: target.path().display().to_string(),
+        save_interval: Duration::ZERO,
+        storage: lux::StorageConfig {
+            mode: lux::StorageMode::Tiered,
+            dir: target_storage.display().to_string(),
+        },
+        ..Default::default()
+    };
+    let handle = lux::run_with_config(target_cfg.clone()).await.unwrap();
+    let writer = UniversalClient::resp(handle.local_addr().unwrap());
+    assert!(writer.set("snapshot_key", "snapshot_value").await);
+    writer.save().await;
+    assert!(writer.set("journal_key", "journal_value").await);
+    drop(writer);
+    handle.shutdown_and_wait().await.unwrap();
+
+    let donor = tempfile::tempdir().unwrap();
+    let donor_storage = donor.path().join("storage");
+    let donor_cfg = lux::ServerConfig {
+        port: 0,
+        shards: 4,
+        data_dir: donor.path().display().to_string(),
+        save_interval: Duration::ZERO,
+        storage: lux::StorageConfig {
+            mode: lux::StorageMode::Tiered,
+            dir: donor_storage.display().to_string(),
+        },
+        ..Default::default()
+    };
+    let donor_handle = lux::run_with_config(donor_cfg).await.unwrap();
+    donor_handle.shutdown_and_wait().await.unwrap();
+
+    let journal = target_storage.join("global/wal.lux");
+    let replacement = std::fs::read(donor_storage.join("global/wal.lux")).unwrap();
+    std::fs::write(&journal, &replacement).unwrap();
+    let error = match lux::run_with_config(target_cfg).await {
+        Ok(handle) => {
+            handle.shutdown_and_wait().await.unwrap();
+            panic!("an unrelated journal generation must prevent readiness");
+        }
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        std::fs::read(journal).unwrap(),
+        replacement,
+        "failed startup must preserve the substituted journal for diagnosis"
+    );
+}
+
 #[tokio::test]
 async fn run_with_config_reports_http_bind_errors_before_ready() {
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

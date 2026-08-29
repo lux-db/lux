@@ -906,6 +906,7 @@ impl Store {
         };
         let (journal, legacy_wals) = if config.durability.policy.is_persistent() {
             let dir = config.journal_dir();
+            let require_existing_journal = crate::snapshot::requires_existing_journal(&config)?;
             let mut legacy = Vec::new();
             for shard in 0..persistence_shard_count {
                 let path = dir.join(format!("shard_{shard}/wal.lux"));
@@ -916,10 +917,22 @@ impl Store {
                     ));
                 }
             }
+            let global = if require_existing_journal {
+                crate::disk::Wal::open_named_existing(&dir, "global").map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "refusing to create a missing journal beside an existing journal-aware snapshot",
+                        )
+                    } else {
+                        error
+                    }
+                })?
+            } else {
+                crate::disk::Wal::open_named(&dir, "global")?
+            };
             (
-                Some(parking_lot::Mutex::new(crate::disk::Wal::open_named(
-                    &dir, "global",
-                )?)),
+                Some(parking_lot::Mutex::new(global)),
                 legacy.into_boxed_slice(),
             )
         } else {
@@ -2279,11 +2292,25 @@ impl Store {
         Ok(checkpoints)
     }
 
-    pub fn truncate_wal(&self) -> std::io::Result<()> {
+    pub(crate) fn truncate_wal(
+        &self,
+        checkpoints: &[(String, crate::disk::WalCheckpoint)],
+    ) -> std::io::Result<()> {
         let mut first_error = None;
-        for (_, w) in &self.legacy_wals {
+        for (source, w) in &self.legacy_wals {
             let mut wal = w.lock();
-            if let Err(e) = wal.truncate() {
+            let name = format!("shard_{source}");
+            let result = checkpoints
+                .iter()
+                .find(|(checkpoint_name, _)| checkpoint_name == &name)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("snapshot is missing the {name} WAL checkpoint"),
+                    )
+                })
+                .and_then(|(_, checkpoint)| wal.rotate_after(*checkpoint));
+            if let Err(e) = result {
                 self.emit_error(crate::ServerErrorEvent::WalTruncateFailed {
                     error: e.to_string(),
                 });
@@ -2294,7 +2321,17 @@ impl Store {
         }
         if let Some(journal) = &self.journal {
             let mut wal = journal.lock();
-            if let Err(e) = wal.truncate() {
+            let result = checkpoints
+                .iter()
+                .find(|(name, _)| name == "global")
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "snapshot is missing the global WAL checkpoint",
+                    )
+                })
+                .and_then(|(_, checkpoint)| wal.rotate_after(*checkpoint));
+            if let Err(e) = result {
                 self.emit_error(crate::ServerErrorEvent::WalTruncateFailed {
                     error: e.to_string(),
                 });

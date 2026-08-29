@@ -120,6 +120,9 @@ enum WalFrameFormat {
 pub(crate) struct WalCheckpoint {
     pub generation: [u8; WAL_GENERATION_LEN],
     pub offset: u64,
+    /// The only fresh generation that may replace `generation` after the
+    /// snapshot containing this checkpoint is durably installed.
+    pub successor_generation: Option<[u8; WAL_GENERATION_LEN]>,
 }
 
 /// Result of scanning a WAL file for replay.
@@ -133,7 +136,7 @@ pub struct WalReplay {
 
 impl Wal {
     pub fn open(dir: &Path, shard_id: usize) -> io::Result<Self> {
-        Self::open_in(dir.join(format!("shard_{shard_id}")))
+        Self::open_in(dir.join(format!("shard_{shard_id}")), true, None)
     }
 
     /// Open the authoritative, process-wide mutation journal.
@@ -142,6 +145,14 @@ impl Wal {
     /// in-place upgrade. New writes use this named journal so multi-key
     /// mutations have one atomic frame stream and recovery has one total order.
     pub fn open_named(dir: &Path, name: &str) -> io::Result<Self> {
+        Self::open_named_with_create(dir, name, true)
+    }
+
+    pub(crate) fn open_named_existing(dir: &Path, name: &str) -> io::Result<Self> {
+        Self::open_named_with_create(dir, name, false)
+    }
+
+    fn open_named_with_create(dir: &Path, name: &str, create: bool) -> io::Result<Self> {
         if name.is_empty()
             || !name
                 .bytes()
@@ -152,23 +163,59 @@ impl Wal {
                 "invalid WAL name",
             ));
         }
-        Self::open_in(dir.join(name))
+        Self::open_in(dir.join(name), create, None)
     }
 
-    fn open_in(wal_dir: impl AsRef<Path>) -> io::Result<Self> {
+    pub(crate) fn create_named_with_generation(
+        dir: &Path,
+        name: &str,
+        generation: [u8; WAL_GENERATION_LEN],
+    ) -> io::Result<Self> {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid WAL name",
+            ));
+        }
+        if generation == LEGACY_WAL_GENERATION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid zero WAL generation",
+            ));
+        }
+        Self::open_in(dir.join(name), true, Some(generation))
+    }
+
+    fn open_in(
+        wal_dir: impl AsRef<Path>,
+        create: bool,
+        initial_generation: Option<[u8; WAL_GENERATION_LEN]>,
+    ) -> io::Result<Self> {
         let wal_dir = wal_dir.as_ref();
-        create_dir_all_synced(wal_dir)?;
+        if create {
+            create_dir_all_synced(wal_dir)?;
+        }
         let path = wal_dir.join("wal.lux");
         let created = !path.exists();
         let mut file = OpenOptions::new()
-            .create(true)
+            .create(create)
             .read(true)
             .append(true)
             .open(&path)?;
 
         let file_len = file.seek(SeekFrom::End(0))?;
         let (frame_format, header_len, generation) = if file_len == 0 {
-            let generation = new_wal_generation();
+            if !create {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "journal is empty; refusing to initialize it beside an existing snapshot",
+                ));
+            }
+            let generation = initial_generation.unwrap_or_else(new_wal_generation);
             write_wal_header(&mut file, &generation)?;
             file.sync_all()?;
             if created {
@@ -353,6 +400,7 @@ impl Wal {
         Ok(WalCheckpoint {
             generation: self.generation,
             offset: self.end_offset()?,
+            successor_generation: Some(new_wal_generation_except(self.generation)),
         })
     }
 
@@ -389,6 +437,19 @@ impl Wal {
             Some(checkpoint) if checkpoint.generation == self.generation => {
                 self.validate_checkpoint_offset(checkpoint.offset, file_len)?;
                 checkpoint.offset
+            }
+            Some(checkpoint)
+                if checkpoint
+                    .successor_generation
+                    .is_some_and(|generation| generation == self.generation) =>
+            {
+                self.header_len
+            }
+            Some(checkpoint) if checkpoint.successor_generation.is_some() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "journal generation does not match the snapshot checkpoint or its authorized successor",
+                ));
             }
             _ => self.header_len,
         };
@@ -611,8 +672,35 @@ impl Wal {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn truncate(&mut self) -> io::Result<()> {
-        let generation = new_wal_generation();
+        let generation = new_wal_generation_except(self.generation);
+        self.truncate_to(generation)
+    }
+
+    pub(crate) fn rotate_after(&mut self, checkpoint: WalCheckpoint) -> io::Result<()> {
+        if checkpoint.generation != self.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL changed generation before checkpoint rotation",
+            ));
+        }
+        let generation = checkpoint.successor_generation.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "checkpoint has no authorized successor WAL generation",
+            )
+        })?;
+        self.truncate_to(generation)
+    }
+
+    pub(crate) fn truncate_to(&mut self, generation: [u8; WAL_GENERATION_LEN]) -> io::Result<()> {
+        if generation == LEGACY_WAL_GENERATION || generation == self.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "replacement WAL generation must be non-zero and new",
+            ));
+        }
         let tmp = self.path.with_extension(format!(
             "lux.rotate.{}.{}",
             std::process::id(),
@@ -673,6 +761,15 @@ fn new_wal_generation() -> [u8; WAL_GENERATION_LEN] {
         let mut generation = [0u8; WAL_GENERATION_LEN];
         OsRng.fill_bytes(&mut generation);
         if generation != LEGACY_WAL_GENERATION {
+            return generation;
+        }
+    }
+}
+
+fn new_wal_generation_except(current: [u8; WAL_GENERATION_LEN]) -> [u8; WAL_GENERATION_LEN] {
+    loop {
+        let generation = new_wal_generation();
+        if generation != current {
             return generation;
         }
     }
@@ -2056,7 +2153,7 @@ mod tests {
         let mut wal = Wal::open(dir.path(), 0).unwrap();
         wal.append_command(&[b"INCR", b"included"]).unwrap();
         let checkpoint = wal.checkpoint().unwrap();
-        wal.truncate().unwrap();
+        wal.rotate_after(checkpoint).unwrap();
         assert_ne!(wal.generation, checkpoint.generation);
         wal.append_command(&[b"INCR", b"after-snapshot"]).unwrap();
 
@@ -2067,6 +2164,18 @@ mod tests {
         drop(wal);
         let mut reopened = Wal::open(dir.path(), 0).unwrap();
         assert_eq!(reopened.replay().unwrap().commands.len(), 1);
+    }
+
+    #[test]
+    fn unrelated_generation_is_not_a_checkpoint_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        wal.append_command(&[b"INCR", b"included"]).unwrap();
+        let checkpoint = wal.checkpoint().unwrap();
+
+        wal.truncate().unwrap();
+        let error = wal.replay_from(Some(checkpoint)).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

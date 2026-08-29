@@ -300,11 +300,11 @@ configuration interface.
 
 | File or payload | 1.0 status | Compatibility promise | Executable owner |
 |---|---|---|---|
-| `lux.dat` snapshot | Stable | Lux writes snapshot version 3 and reads versions 1, 2, and 3. Every Lux 1.x release must continue reading all three. | snapshot unit tests, `tests/http.rs`, and crash-recovery tests |
+| `lux.dat` snapshot | Stable | Lux writes snapshot version 6 and reads the legacy pre-versioned format plus binary versions 1 through 6. Every Lux 1.x release must keep reading those formats. | snapshot unit tests, `tests/http.rs`, and crash-recovery tests |
 | `DUMP`/`RESTORE` payload | Stable within Lux | Lux 1.x preserves read compatibility for its own payloads. They are not Redis RDB payloads. | `tests/server.rs` |
 | `lux/migrations/*.lux` | Stable | UTF-8 command files with SHA-256 ledger identity; filename/content mismatches fail until explicitly repaired. | migration unit/integration tests and CLI E2E |
 | `lux/config.toml` | Stable | The five documented keys above retain their meaning throughout 1.x; unknown keys/comments survive CLI edits. | CLI config unit tests |
-| WAL (`LXW1`) and tiered data (`LXD1`) | Excluded as interchange formats | They are private restart/recovery files. Durability is guaranteed as documented, but external tools must not parse or copy them independently of the complete data directory. | disk, tiered, reliability, and crash-recovery tests |
+| WAL (`LXW3`, with legacy readers) and tiered data (`LXD1`) | Excluded as interchange formats | They are private restart/recovery files. Durability is guaranteed as documented, but external tools must not parse or copy them independently of the complete data directory. | disk, tiered, reliability, and crash-recovery tests |
 | Encryption envelope/state (`LUXENC2`, `LUXENCSTATE1`) | Excluded as interchange formats | Private authenticated-encryption formats; access them only through Lux commands and complete snapshots. | encryption and corruption tests |
 
 ## Unsupported

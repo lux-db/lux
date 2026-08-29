@@ -123,8 +123,12 @@ Snapshot behavior:
 - Key TTLs are stored as absolute deadlines so remaining time is honored across
   restarts rather than rebased to load time.
 - Each snapshot records the generation and exact included offset of every WAL
-  stream. Recovery skips that prefix if an old generation survived a crash, or
-  replays the complete replacement generation after a successful rotation.
+  stream, plus the one successor generation authorized for the following
+  rotation. Recovery skips the included prefix if the old generation survived
+  a crash, or replays the complete authorized successor after rotation.
+- A missing, empty, or unrelated journal beside a journal-aware snapshot
+  rejects startup without creating or rewriting recovery files. This prevents
+  journal deletion or substitution from looking like a successful rotation.
 
 ## WAL Replay
 
@@ -181,6 +185,8 @@ Restore behavior:
 - Restore writes a new `lux.dat` snapshot atomically.
 - A durable restore marker makes startup finish snapshot installation and stale
   persistence cleanup before opening any WAL or tiered shard after a crash.
+- Startup installs a clean journal bound to the restored snapshot before it
+  removes that marker, so restored state enters the normal strict recovery path.
 - Restore purges only Lux-owned legacy `shard_*` and current `global` journal or
   tiered-storage directories, never the storage parent or unrelated files.
 - After restore, stale WAL or cold tiered data must not overwrite restored

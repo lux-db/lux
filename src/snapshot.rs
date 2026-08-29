@@ -21,6 +21,10 @@ const HEADER_V4: &[u8; 4] = b"LUX\x04";
 // V5 wraps the checkpoint + entry stream in an exact length and SHA-256 digest,
 // so truncation or bit corruption cannot be mistaken for a smaller valid DB.
 const HEADER_V5: &[u8; 4] = b"LUX\x05";
+// V6 additionally binds every checkpoint to the one journal generation that
+// may replace it after the snapshot commit. This distinguishes a legitimate
+// rotation from a deleted or substituted journal.
+const HEADER_V6: &[u8; 4] = b"LUX\x06";
 // Single-key DUMP/LXRESTORE envelope. The payload remains the V3 entry format
 // for backward compatibility, but new blobs carry an exact length and digest.
 const DUMP_HEADER: &[u8; 4] = b"LXD\x01";
@@ -45,6 +49,28 @@ fn snapshot_path(store: &Store) -> String {
 
 fn snapshot_path_for_config(config: &crate::ServerConfig) -> std::path::PathBuf {
     Path::new(&config.data_dir).join("lux.dat")
+}
+
+/// Whether an installed snapshot belongs to a journal-aware format. Opening a
+/// missing journal next to one of these snapshots would manufacture a new,
+/// empty recovery history before the snapshot can be validated.
+pub(crate) fn requires_existing_journal(config: &crate::ServerConfig) -> io::Result<bool> {
+    let path = snapshot_path_for_config(config);
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut header = [0u8; 4];
+    let read = file.read(&mut header)?;
+    if read < header.len() {
+        // The snapshot is corrupt and normal startup will reject it. Refuse to
+        // alter the neighboring journal while reaching that diagnosis.
+        return Ok(true);
+    }
+    Ok([HEADER_V4, HEADER_V5, HEADER_V6]
+        .iter()
+        .any(|known| header == **known))
 }
 
 fn restore_marker_path(config: &crate::ServerConfig) -> std::path::PathBuf {
@@ -216,7 +242,7 @@ pub(crate) fn save_and_truncate_wal_consistent(store: &Store) -> io::Result<usiz
         let checkpoints = store.wal_checkpoints()?;
         let entries = store.dump_all_from_locked_shards(shards, now)?;
         let saved = save_entries(store, &entries, &checkpoints)?;
-        store.truncate_wal()?;
+        store.truncate_wal(&checkpoints)?;
         Ok(saved)
     })
 }
@@ -255,9 +281,11 @@ pub fn restore_to_disk(store: &Store, dump: &[u8]) -> io::Result<()> {
 
 fn has_snapshot_header(dump: &[u8]) -> bool {
     dump.len() >= 4
-        && [HEADER_V5, HEADER_V4, HEADER, HEADER_V2, HEADER_V1]
-            .iter()
-            .any(|header| &dump[..4] == *header)
+        && [
+            HEADER_V6, HEADER_V5, HEADER_V4, HEADER, HEADER_V2, HEADER_V1,
+        ]
+        .iter()
+        .any(|header| &dump[..4] == *header)
 }
 
 fn validate_restore_dump(store: &Store, dump: &[u8]) -> io::Result<()> {
@@ -337,10 +365,44 @@ fn apply_pending_restore(config: &crate::ServerConfig, finalize: bool) -> io::Re
     let journal_dir = config.journal_dir();
     purge_lux_state_dirs(&journal_dir)?;
     if finalize {
+        if config.durability.policy.is_persistent() {
+            install_restored_journal(config)?;
+        }
         fs::remove_file(marker)?;
         crate::disk::sync_directory(data_dir)?;
     }
     Ok(())
+}
+
+fn install_restored_journal(config: &crate::ServerConfig) -> io::Result<()> {
+    let path = snapshot_path_for_config(config);
+    let successor = authorized_global_successor(&path)?;
+    let journal_dir = config.journal_dir();
+    let journal = match successor {
+        Some(generation) => {
+            crate::disk::Wal::create_named_with_generation(&journal_dir, "global", generation)?
+        }
+        None => crate::disk::Wal::open_named(&journal_dir, "global")?,
+    };
+    drop(journal);
+    Ok(())
+}
+
+fn authorized_global_successor(path: &Path) -> io::Result<Option<[u8; 16]>> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; 4];
+    file.read_exact(&mut header)?;
+    if &header != HEADER_V6 {
+        return Ok(None);
+    }
+    let body_len = read_u64(&mut file)?;
+    let mut expected_digest = [0u8; SNAPSHOT_DIGEST_LEN];
+    file.read_exact(&mut expected_digest)?;
+    verify_snapshot_body(&mut file, body_len, &expected_digest)?;
+    let mut reader = io::BufReader::new(file.take(body_len));
+    Ok(read_wal_checkpoints(&mut reader, true)?
+        .remove("global")
+        .and_then(|checkpoint| checkpoint.successor_generation))
 }
 
 /// Remove only Lux-owned persistence directories, leaving the root and any
@@ -382,7 +444,7 @@ fn save_snapshot_binary(
 ) -> io::Result<()> {
     let count = u32::try_from(checkpoints.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many WAL checkpoints"))?;
-    w.write_all(HEADER_V5)?;
+    w.write_all(HEADER_V6)?;
     write_u64(w, 0)?;
     w.write_all(&[0u8; SNAPSHOT_DIGEST_LEN])?;
 
@@ -393,12 +455,18 @@ fn save_snapshot_binary(
             write_bytes(&mut body, name.as_bytes())?;
             body.write_all(&checkpoint.generation)?;
             write_u64(&mut body, checkpoint.offset)?;
+            body.write_all(&checkpoint.successor_generation.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "new snapshots require an authorized successor WAL generation",
+                )
+            })?)?;
         }
         save_binary_entries(&mut body, entries, store)?;
         body.finish()
     };
 
-    w.seek(SeekFrom::Start(HEADER_V5.len() as u64))?;
+    w.seek(SeekFrom::Start(HEADER_V6.len() as u64))?;
     write_u64(w, body_len)?;
     w.write_all(&digest)?;
     w.seek(SeekFrom::End(0))?;
@@ -618,18 +686,27 @@ fn load_from_reader(
             "snapshot is truncated before its header",
         ));
     }
-    if &header == HEADER_V5 {
+    if &header == HEADER_V6 {
         let body_len = read_u64(&mut file)?;
         let mut expected_digest = [0u8; SNAPSHOT_DIGEST_LEN];
         file.read_exact(&mut expected_digest)?;
         verify_snapshot_body(&mut file, body_len, &expected_digest)?;
         let mut reader = io::BufReader::new(file.take(body_len));
-        let checkpoints = read_wal_checkpoints(&mut reader)?;
+        let checkpoints = read_wal_checkpoints(&mut reader, true)?;
+        store.set_recovery_wal_checkpoints(checkpoints);
+        load_binary(store, &mut reader, true, true, preserve_expired)
+    } else if &header == HEADER_V5 {
+        let body_len = read_u64(&mut file)?;
+        let mut expected_digest = [0u8; SNAPSHOT_DIGEST_LEN];
+        file.read_exact(&mut expected_digest)?;
+        verify_snapshot_body(&mut file, body_len, &expected_digest)?;
+        let mut reader = io::BufReader::new(file.take(body_len));
+        let checkpoints = read_wal_checkpoints(&mut reader, false)?;
         store.set_recovery_wal_checkpoints(checkpoints);
         load_binary(store, &mut reader, true, true, preserve_expired)
     } else if &header == HEADER_V4 {
         let mut reader = io::BufReader::new(file);
-        let checkpoints = read_wal_checkpoints(&mut reader)?;
+        let checkpoints = read_wal_checkpoints(&mut reader, false)?;
         store.set_recovery_wal_checkpoints(checkpoints);
         load_binary(store, &mut reader, true, true, preserve_expired)
     } else if &header == HEADER {
@@ -708,6 +785,7 @@ fn verify_snapshot_body(
 
 fn read_wal_checkpoints(
     reader: &mut impl Read,
+    has_successor: bool,
 ) -> io::Result<HashMap<String, crate::disk::WalCheckpoint>> {
     let count = read_u32(reader)? as usize;
     if count > MAX_WAL_CHECKPOINTS {
@@ -729,11 +807,30 @@ fn read_wal_checkpoints(
                 "snapshot contains an invalid WAL checkpoint name",
             ));
         }
-        let mut generation = [0u8; 16];
-        reader.read_exact(&mut generation)?;
+        let mut current_generation = [0u8; 16];
+        reader.read_exact(&mut current_generation)?;
         let checkpoint = crate::disk::WalCheckpoint {
-            generation,
+            generation: current_generation,
             offset: read_u64(reader)?,
+            successor_generation: if has_successor {
+                let mut successor_generation = [0u8; 16];
+                reader.read_exact(&mut successor_generation)?;
+                if successor_generation == [0u8; 16] {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "snapshot contains a zero successor WAL generation",
+                    ));
+                }
+                if successor_generation == current_generation {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "snapshot successor WAL generation repeats its current generation",
+                    ));
+                }
+                Some(successor_generation)
+            } else {
+                None
+            },
         };
         if checkpoints.insert(name, checkpoint).is_some() {
             return Err(io::Error::new(
@@ -1644,11 +1741,12 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
-        store
-            .with_write_barrier(|shards| {
+        let checkpoints = store
+            .with_write_barrier(|shards| -> io::Result<_> {
                 let checkpoints = store.wal_checkpoints()?;
                 let entries = store.dump_all_from_locked_shards(shards, Instant::now())?;
-                save_entries(&store, &entries, &checkpoints)
+                save_entries(&store, &entries, &checkpoints)?;
+                Ok(checkpoints)
             })
             .unwrap();
         drop(store);
@@ -1657,7 +1755,12 @@ mod tests {
         // must replay in full, while the unrotated global prefix must be skipped.
         {
             let mut legacy = crate::disk::Wal::open(dir.path(), 0).unwrap();
-            legacy.truncate().unwrap();
+            let checkpoint = checkpoints
+                .iter()
+                .find(|(name, _)| name == "shard_0")
+                .map(|(_, checkpoint)| *checkpoint)
+                .unwrap();
+            legacy.rotate_after(checkpoint).unwrap();
             legacy
                 .append_command(&[b"INCR", b"legacy-counter"])
                 .unwrap();
@@ -1691,7 +1794,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_snapshot_rejects_every_truncation_and_bit_flip_before_loading() {
+    fn v6_snapshot_rejects_every_truncation_and_bit_flip_before_loading() {
         let (store, data_dir, _guard) = store_in_temp_dir(crate::StorageMode::Memory);
         for (key, value) in [
             (b"first".as_slice(), b"one".as_slice()),
@@ -1704,7 +1807,7 @@ mod tests {
         }
         save_and_truncate_wal_consistent(&store).unwrap();
         let snapshot = fs::read(data_dir.join("lux.dat")).unwrap();
-        assert_eq!(&snapshot[..HEADER_V5.len()], HEADER_V5);
+        assert_eq!(&snapshot[..HEADER_V6.len()], HEADER_V6);
         drop(store);
 
         let restored = Store::new();
@@ -1738,7 +1841,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_v5_snapshot_validates_restores_and_reopens() {
+    fn encrypted_v6_snapshot_validates_restores_and_reopens() {
         let (store, data_dir, _guard) = store_in_temp_dir(crate::StorageMode::Memory);
         store.encryption().init(Some("snapshot-key")).unwrap();
         let command: [&[u8]; 7] = [
@@ -1764,7 +1867,7 @@ mod tests {
             .unwrap();
         save_and_truncate_wal_consistent(&store).unwrap();
         let snapshot = fs::read(data_dir.join("lux.dat")).unwrap();
-        assert_eq!(&snapshot[..HEADER_V5.len()], HEADER_V5);
+        assert_eq!(&snapshot[..HEADER_V6.len()], HEADER_V6);
 
         validate_restore_dump(&store, &snapshot).unwrap();
         let config = store.config().clone();
@@ -1774,6 +1877,7 @@ mod tests {
         complete_pending_restore(&config).unwrap();
         let restored = Store::try_new_with_config(std::sync::Arc::new(config)).unwrap();
         assert_eq!(load(&restored).unwrap(), 1);
+        restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
         let (vector, metadata) = restored
             .vget(b"secret-vector", Instant::now())
             .expect("encrypted vector was not restored");
@@ -2187,12 +2291,14 @@ mod tests {
     // guard once accepted only V1 and V3, silently rejecting V2 backups.
     #[test]
     fn restore_accepts_all_known_headers_rejects_junk() {
-        for header in [HEADER_V1, HEADER_V2, HEADER, HEADER_V4, HEADER_V5] {
+        for header in [
+            HEADER_V1, HEADER_V2, HEADER, HEADER_V4, HEADER_V5, HEADER_V6,
+        ] {
             let (store, dir, _g) = store_in_temp_dir(crate::StorageMode::Memory);
             let mut dump = header.to_vec();
             if header == HEADER_V4 {
                 dump.extend_from_slice(&0u32.to_le_bytes());
-            } else if header == HEADER_V5 {
+            } else if header == HEADER_V5 || header == HEADER_V6 {
                 let body = 0u32.to_le_bytes();
                 dump.extend_from_slice(&(body.len() as u64).to_le_bytes());
                 dump.extend_from_slice(&Sha256::digest(body));
@@ -2304,7 +2410,10 @@ mod tests {
             fs::read(snapshot_path_for_config(&config)).unwrap(),
             restored
         );
-        assert!(!persistence.join("global").exists());
+        assert!(
+            persistence.join("global/wal.lux").exists(),
+            "restore must install a clean journal before removing its marker"
+        );
         assert!(!persistence.join("shard_0").exists());
         assert!(!restore_marker_path(&config).exists());
     }
