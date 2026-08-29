@@ -1844,7 +1844,7 @@ impl Store {
             bypassed: _,
         } = prepared;
         let mut wal = journal.lock();
-        let append_offset = self.append_journal_commands_locked(&mut wal, &[args])?;
+        let append_offset = self.append_journal_commands_locked(&mut wal, &[args], true)?;
         let commit = JournalCommitGuard {
             store,
             _guards: guards,
@@ -2066,7 +2066,7 @@ impl Store {
         };
 
         let mut wal = journal.lock();
-        self.append_journal_commands_locked(&mut wal, commands)
+        self.append_journal_commands_locked(&mut wal, commands, false)
             .map(|_| ())
     }
 
@@ -2074,6 +2074,7 @@ impl Store {
         &self,
         wal: &mut crate::disk::Wal,
         commands: &[&[&[u8]]],
+        checked: bool,
     ) -> std::io::Result<u64> {
         #[cfg(test)]
         if self
@@ -2093,7 +2094,18 @@ impl Store {
 
         self.ensure_journal_healthy()?;
         let append_offset = wal.end_offset()?;
-        if let Err(error) = wal.append_commands(commands.iter().copied()) {
+        let append_result = if checked {
+            let [command] = commands else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "checked journal append requires exactly one command",
+                ));
+            };
+            wal.append_checked_command(command)
+        } else {
+            wal.append_commands(commands.iter().copied())
+        };
+        if let Err(error) = append_result {
             let rollback_error = wal.rollback_to(append_offset).err();
             if rollback_error.is_some() {
                 self.poison_journal();
@@ -2185,7 +2197,8 @@ impl Store {
                 let mut wal = w.lock();
                 match wal.replay_from(checkpoints.get(name).copied()) {
                     Ok(replay) => {
-                        for cmd_args in replay.commands {
+                        let command_count = replay.commands.len();
+                        for (index, cmd_args) in replay.commands.into_iter().enumerate() {
                             let refs: Vec<&[u8]> = cmd_args.iter().map(|a| a.as_slice()).collect();
                             let mut out = bytes::BytesMut::new();
                             let result = crate::cmd::execute(
@@ -2194,10 +2207,25 @@ impl Store {
                             if !matches!(result, crate::cmd::CmdResult::Written)
                                 || out.first() == Some(&b'-')
                             {
+                                if index + 1 == command_count {
+                                    if let Some(offset) = replay.checked_tail_offset {
+                                        // The process stopped after writing a
+                                        // checked command but before its rejected
+                                        // apply could roll the frame back. It is
+                                        // necessarily unacknowledged and safe to
+                                        // remove only because no frame follows it.
+                                        wal.rollback_to(offset)?;
+                                        return Ok(());
+                                    }
+                                }
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
                                     format!(
-                                        "WAL command failed during recovery: {}",
+                                        "WAL command {} failed during recovery: {}",
+                                        cmd_args
+                                            .first()
+                                            .map(|name| String::from_utf8_lossy(name))
+                                            .unwrap_or_else(|| "<empty>".into()),
                                         String::from_utf8_lossy(&out)
                                     ),
                                 ));
@@ -7720,6 +7748,68 @@ mod tests {
             b"value".as_slice()
         );
         assert!(restored.get(b"later", now()).is_none());
+    }
+
+    #[test]
+    fn rejected_checked_tail_is_removed_during_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Store::new_with_config(config.clone());
+        let command: [&[u8]; 3] = [b"RENAME", b"missing", b"destination"];
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: std::io::Result<()> =
+                store.commit_journaled_checked(&command, || panic!("simulated process stop"));
+        }));
+        assert!(panic.is_err());
+        drop(store);
+
+        let restored = Store::new_with_config(config.clone());
+        restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        let later: [&[u8]; 3] = [b"SET", b"later", b"value"];
+        restored
+            .commit_journaled(&later, || restored.set(b"later", b"value", None, now()))
+            .unwrap();
+        drop(restored);
+
+        let reopened = Store::new_with_config(config);
+        reopened.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        assert_eq!(reopened.get(b"later", now()).unwrap(), b"value".as_slice());
+    }
+
+    #[test]
+    fn rejected_checked_command_before_a_later_frame_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        });
+        drop(Store::new_with_config(config.clone()));
+        {
+            let mut wal = crate::disk::Wal::open_named(&config.journal_dir(), "global").unwrap();
+            wal.append_checked_command(&[b"RENAME", b"missing", b"destination"])
+                .unwrap();
+            wal.append_commands([&[b"SET".as_slice(), b"later", b"value"][..]])
+                .unwrap();
+            wal.fsync().unwrap();
+        }
+
+        let restored = Store::new_with_config(config);
+        let error = restored
+            .replay_wal(&crate::pubsub::Broker::new())
+            .expect_err("a rejected checked command is discardable only at the tail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("RENAME"));
     }
 
     #[test]

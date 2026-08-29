@@ -25,6 +25,7 @@ const LEGACY_WAL_GENERATION: [u8; WAL_GENERATION_LEN] = [0; WAL_GENERATION_LEN];
 const MAX_WAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 const DATA_MAGIC: &[u8; 4] = b"LXD1";
 const WAL_BATCH_MARKER: &[u8] = b"\0LUX:BATCH";
+const WAL_CHECKED_MARKER: &[u8] = b"\0LUX:CHECKED";
 
 /// CRC32 (ISO 3309 / ITU-T V.42) computed with a lookup table.
 /// Used to detect corruption in WAL frames and disk entries.
@@ -124,6 +125,10 @@ pub(crate) struct WalCheckpoint {
 /// Result of scanning a WAL file for replay.
 pub struct WalReplay {
     pub commands: Vec<Vec<Vec<u8>>>,
+    /// Start of a final checked-command frame. A checked command is appended
+    /// before its handler can determine whether it succeeds. Recovery may
+    /// remove this frame only when replay rejects it and no later frame exists.
+    pub checked_tail_offset: Option<u64>,
 }
 
 impl Wal {
@@ -304,6 +309,20 @@ impl Wal {
         self.append_encoded_frames(&frame)
     }
 
+    /// Append a command whose handler can still reject it after the write-ahead
+    /// boundary. The wrapper lets recovery distinguish an interrupted rejection
+    /// from corruption, but only while this remains the final complete frame.
+    pub(crate) fn append_checked_command(&mut self, args: &[&[u8]]) -> io::Result<()> {
+        let payload = encode_command_batch(&[args])?;
+        let mut frame = Vec::new();
+        Self::encode_command_frame(
+            self.frame_format,
+            &[WAL_CHECKED_MARKER, &payload],
+            &mut frame,
+        );
+        self.append_encoded_frames(&frame)
+    }
+
     fn append_encoded_frames(&mut self, frames: &[u8]) -> io::Result<()> {
         let pos_before = self.file.stream_position()?;
         if let Err(e) = self.file.write_all(frames).and_then(|_| self.file.flush()) {
@@ -362,6 +381,7 @@ impl Wal {
         if file_len == 0 {
             return Ok(WalReplay {
                 commands: Vec::new(),
+                checked_tail_offset: None,
             });
         }
 
@@ -375,8 +395,18 @@ impl Wal {
         self.file.seek(SeekFrom::Start(replay_offset))?;
 
         let mut commands = Vec::new();
+        let mut checked_tail_offset = None;
 
-        while let Some(payload) = self.read_next_frame_payload(file_len)? {
+        while self.file.stream_position()? < file_len {
+            let frame_start = self.file.stream_position()?;
+            let Some(payload) = self.read_next_frame_payload(file_len)? else {
+                // Guarded frames deliberately tolerate an incomplete final
+                // write. Remove it before accepting new appends, otherwise the
+                // next complete frame would be stranded behind torn bytes.
+                checked_tail_offset = None;
+                self.rollback_to(frame_start)?;
+                break;
+            };
             let payload = payload.as_slice();
 
             let mut cursor = payload;
@@ -408,14 +438,28 @@ impl Wal {
                     "WAL frame contains trailing bytes",
                 ));
             }
+            checked_tail_offset = None;
             if args.len() == 2 && args[0] == WAL_BATCH_MARKER {
                 commands.extend(decode_command_batch(&args[1])?);
+            } else if args.len() == 2 && args[0] == WAL_CHECKED_MARKER {
+                let mut checked = decode_command_batch(&args[1])?;
+                if checked.len() != 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "checked WAL frame must contain exactly one command",
+                    ));
+                }
+                commands.push(checked.pop().unwrap());
+                checked_tail_offset = Some(frame_start);
             } else {
                 commands.push(args);
             }
         }
         self.file.seek(SeekFrom::End(0))?;
-        Ok(WalReplay { commands })
+        Ok(WalReplay {
+            commands,
+            checked_tail_offset,
+        })
     }
 
     fn read_next_frame_payload(&mut self, file_len: u64) -> io::Result<Option<Vec<u8>>> {
@@ -1811,6 +1855,29 @@ mod tests {
                 vec![b"SET".to_vec(), b"k2".to_vec(), b"v2".to_vec()],
             ]
         );
+    }
+
+    #[test]
+    fn checked_wal_frame_marks_only_the_complete_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        wal.append_checked_command(&[b"RENAME", b"missing", b"dst"])
+            .unwrap();
+        let replay = wal.replay().unwrap();
+        assert_eq!(
+            replay.commands,
+            vec![vec![
+                b"RENAME".to_vec(),
+                b"missing".to_vec(),
+                b"dst".to_vec(),
+            ]]
+        );
+        assert!(replay.checked_tail_offset.is_some());
+
+        wal.append_command(&[b"SET", b"later", b"value"]).unwrap();
+        let replay = wal.replay().unwrap();
+        assert_eq!(replay.commands.len(), 2);
+        assert_eq!(replay.checked_tail_offset, None);
     }
 
     #[test]
