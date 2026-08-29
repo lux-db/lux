@@ -15,6 +15,15 @@ credential and RESP requires normal connection authentication.
 - `api_version`: management API version
 - `capabilities`: feature identifiers callers must check before using a feature
 
+## Health
+
+Container orchestrators may call `GET /health/live` and `GET /health/ready`
+without database credentials. Liveness means the recovered engine's HTTP
+listener is serving requests. Readiness also requires the engine to be
+accepting normal traffic, with no restore, shutdown, or poisoned mutation
+journal in progress. The endpoints return only the health state and never
+project data.
+
 ## Migrations
 
 Operator-authenticated HTTP routes:

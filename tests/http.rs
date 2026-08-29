@@ -46,6 +46,20 @@ fn http_health_check() {
 }
 
 #[test]
+fn orchestrator_health_checks_do_not_require_database_credentials() {
+    let server = LuxServer::builder().http().password("secret").start();
+    let http = server.http_port();
+
+    let (status, body) = http_request(http, "GET", "/health/live", None, None);
+    assert_eq!(status, 200, "liveness: {body}");
+    assert_eq!(body, r#"{"status":"live"}"#);
+
+    let (status, body) = http_request(http, "GET", "/health/ready", None, None);
+    assert_eq!(status, 200, "readiness: {body}");
+    assert_eq!(body, r#"{"status":"ready"}"#);
+}
+
+#[test]
 fn http_stays_responsive_while_resp_lua_script_is_busy() {
     let server = LuxServer::builder().http().start();
     let http = server.http_port();

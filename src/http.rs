@@ -253,6 +253,18 @@ async fn handle_request(
         String::from_utf8_lossy(&data[header_end..total_needed]).into_owned()
     };
 
+    // These endpoints intentionally contain no project data and bypass normal
+    // credentials so container orchestrators do not need database secrets.
+    // The HTTP listener is created only after recovery completes, making a
+    // successful liveness response stronger than a bare process check.
+    if method == "GET" && path == "/health/live" {
+        return send_json(socket, 200, "OK", r#"{"status":"live"}"#).await;
+    }
+    if method == "GET" && path == "/health/ready" {
+        let (status, status_text, body) = health_readiness(store);
+        return send_json(socket, status, status_text, &body).await;
+    }
+
     if path.starts_with("/auth/v1") {
         let response = crate::auth::route_http_response(
             &method, &path, &body, &params, &headers, store, cache,
@@ -3333,6 +3345,18 @@ fn persistence_json(store: &Store) -> Value {
     })
 }
 
+fn health_readiness(store: &Store) -> (u16, &'static str, String) {
+    if store.ready_for_traffic() {
+        (200, "OK", r#"{"status":"ready"}"#.to_string())
+    } else {
+        (
+            503,
+            "Service Unavailable",
+            r#"{"status":"not_ready"}"#.to_string(),
+        )
+    }
+}
+
 fn engine_version(store: &Store) -> (u16, &'static str, String) {
     let build_sha = option_env!("LUX_BUILD_SHA").unwrap_or("unknown");
     ok(json!({
@@ -5582,6 +5606,19 @@ mod tests {
             .unwrap()
             .iter()
             .any(|value| value == "migrations.apply"));
+    }
+
+    #[test]
+    fn readiness_tracks_shutdown_state() {
+        let (store, _, _, _) = encrypted_http_fixture();
+        let (status, _, body) = health_readiness(&store);
+        assert_eq!(status, 200);
+        assert_eq!(body, r#"{"status":"ready"}"#);
+
+        store.begin_shutdown();
+        let (status, _, body) = health_readiness(&store);
+        assert_eq!(status, 503);
+        assert_eq!(body, r#"{"status":"not_ready"}"#);
     }
 
     #[test]

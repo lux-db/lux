@@ -1,0 +1,15 @@
+.git
+.github
+.scratch
+.worktrees
+target
+cli
+sdk
+fuzz
+tests
+.workbenches
+*.md
+*.svg
+*.png
+docker-compose.yml
+flake.*

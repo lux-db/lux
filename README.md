@@ -181,13 +181,24 @@ because they already run inside the trusted process boundary.
 
 ```bash
 LUX_PASSWORD="$(openssl rand -hex 32)"
-docker run -d --stop-timeout 35 -p 6379:6379 -v lux-data:/data \
+docker run -d --stop-timeout 35 --read-only --cap-drop ALL \
+  --security-opt no-new-privileges -p 6379:6379 -p 5890:5890 \
+  -v lux-data:/data \
   -e LUX_PASSWORD="$LUX_PASSWORD" ghcr.io/lux-db/lux:latest
 ```
+
+The image runs as numeric user `10001:10001`; `/data` is its only writable
+path. Named volumes are initialized with the correct ownership. Give that user
+write access before using a host bind mount. The image includes a small
+`lux-healthcheck` executable: `live` checks process/listener liveness and
+`ready` additionally requires the engine to be available for normal traffic.
+The unauthenticated `/health/live` and `/health/ready` endpoints expose only
+those states. They are intended for orchestrator probes, not database access.
 
 ### Docker Compose
 
 ```bash
+export LUX_PASSWORD="$(openssl rand -hex 32)"
 docker compose up -d        # start
 docker compose up -d --build  # rebuild & start
 docker compose down         # stop

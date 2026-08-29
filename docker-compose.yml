@@ -6,18 +6,24 @@ services:
     stop_grace_period: 35s
     ports:
       - "6379:6379"
+      - "5890:5890"
     environment:
       - LUX_PORT=6379
+      - LUX_HTTP_PORT=5890
       - LUX_DATA_DIR=/data
       - LUX_DURABILITY=every_second
       - LUX_DURABILITY_SYNC_INTERVAL_MS=1000
-      # - LUX_PASSWORD=changeme
+      - LUX_PASSWORD=${LUX_PASSWORD:?set LUX_PASSWORD before starting Lux}
       # - LUX_SHARDS=16
       # - LUX_SAVE_INTERVAL=300
       # - LUX_RESTRICTED=false
     volumes:
       - lux-data:/data
-    command: ["/lux"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   lux-data:

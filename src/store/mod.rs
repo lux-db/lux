@@ -1742,6 +1742,12 @@ impl Store {
             && !self.journal_poisoned.load(Ordering::Acquire)
     }
 
+    /// Whether this instance can safely accept normal traffic.
+    pub(crate) fn ready_for_traffic(&self) -> bool {
+        self.accepting_mutations.load(Ordering::Acquire)
+            && !self.journal_poisoned.load(Ordering::Acquire)
+    }
+
     pub(crate) fn ensure_journal_healthy(&self) -> std::io::Result<()> {
         if self.journal_poisoned.load(Ordering::Acquire) {
             Err(std::io::Error::other(
