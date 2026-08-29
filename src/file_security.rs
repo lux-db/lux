@@ -137,6 +137,20 @@ pub(crate) fn ensure_private_dir(path: &Path) -> io::Result<()> {
     ensure_dir(path, true)
 }
 
+/// Validate and tighten an existing dedicated Lux state directory without
+/// creating it. Recovery uses this when the presence of the directory itself
+/// is part of the durable-state contract.
+pub(crate) fn ensure_existing_private_dir(path: &Path) -> io::Result<()> {
+    validate_relative_components(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    validate_directory(path, &metadata)?;
+
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+
+    Ok(())
+}
+
 /// Open a persisted engine file without following a final-component symlink.
 /// Existing files are tightened to owner-only access on Unix. Other platforms
 /// fail closed because Rust does not expose a portable owner-only ACL.
@@ -220,6 +234,25 @@ mod tests {
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_private_directory_check_never_creates_state() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let error = ensure_existing_private_dir(&missing).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!missing.exists());
+
+        let existing = root.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_existing_private_dir(&existing).unwrap();
+        assert_eq!(
+            fs::metadata(existing).unwrap().permissions().mode() & 0o777,
+            0o700
         );
     }
 

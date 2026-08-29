@@ -115,11 +115,12 @@ pub(crate) fn required_existing_journals(
     config: &crate::ServerConfig,
 ) -> io::Result<HashSet<String>> {
     let path = snapshot_path_for_config(config);
-    let mut file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
-        Err(error) => return Err(error),
-    };
+    if !crate::file_security::regular_file_exists(&path)? {
+        return Ok(HashSet::new());
+    }
+    let mut file = crate::file_security::open_private_file(&path, |options| {
+        options.read(true);
+    })?;
     let mut header = [0u8; 4];
     let read = file.read(&mut header)?;
     if read < header.len() {
@@ -515,7 +516,9 @@ fn install_restored_journal(config: &crate::ServerConfig) -> io::Result<()> {
 }
 
 fn authorized_global_successor(path: &Path) -> io::Result<Option<[u8; 16]>> {
-    let mut file = fs::File::open(path)?;
+    let mut file = crate::file_security::open_private_file(path, |options| {
+        options.read(true);
+    })?;
     let mut header = [0u8; 4];
     file.read_exact(&mut header)?;
     if &header != HEADER_V6 {
@@ -1705,6 +1708,10 @@ mod tests {
         symlink(&target, dir.path().join("lux.dat")).unwrap();
         let config = Arc::new(crate::ServerConfig {
             data_dir: dir.path().to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::Ephemeral,
+                ..Default::default()
+            },
             ..Default::default()
         });
         let store = Store::new_with_config(config);
@@ -1712,6 +1719,25 @@ mod tests {
         let error = load(&store).unwrap_err();
         assert!(error.to_string().contains("symbolic links"), "{error}");
         assert_eq!(fs::read(target).unwrap(), b"not-a-snapshot");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_aware_probe_rejects_snapshot_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, HEADER_V6).unwrap();
+        symlink(&target, dir.path().join("lux.dat")).unwrap();
+        let config = crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+
+        let error = requires_existing_journal(&config).unwrap_err();
+        assert!(error.to_string().contains("symbolic links"), "{error}");
+        assert_eq!(fs::read(target).unwrap(), HEADER_V6);
     }
 
     #[test]

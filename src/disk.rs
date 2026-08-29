@@ -792,7 +792,10 @@ impl Wal {
             let _ = fs::remove_file(&tmp);
             return Err(error);
         }
-        crate::file_security::ensure_regular_or_missing(&self.path)?;
+        if let Err(error) = crate::file_security::ensure_regular_or_missing(&self.path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
         if let Err(error) = fs::rename(&tmp, &self.path) {
             let _ = fs::remove_file(&tmp);
             return Err(error);
@@ -929,9 +932,16 @@ pub(crate) fn discard_tiered_cache(root: &Path) -> io::Result<()> {
         }
         let shard_dir = entry.path();
         let mut changed = false;
-        for file_name in ["data.lux", "data.compact.tmp"] {
-            let path = shard_dir.join(file_name);
-            match fs::remove_file(&path) {
+        for cache_entry in fs::read_dir(&shard_dir)? {
+            let cache_entry = cache_entry?;
+            let cache_name = cache_entry.file_name();
+            let Some(cache_name) = cache_name.to_str() else {
+                continue;
+            };
+            if cache_name != "data.lux" && !is_compaction_temp(cache_name) {
+                continue;
+            }
+            match fs::remove_file(cache_entry.path()) {
                 Ok(()) => changed = true,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
@@ -942,6 +952,21 @@ pub(crate) fn discard_tiered_cache(root: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn is_compaction_temp(name: &str) -> bool {
+    if name == "data.compact.tmp" {
+        return true;
+    }
+    let Some(suffix) = name.strip_prefix("data.compact.") else {
+        return false;
+    };
+    let mut parts = suffix.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(pid), Some(nonce), None)
+            if pid.parse::<u32>().is_ok() && nonce.parse::<u128>().is_ok()
+    )
 }
 
 fn encode_command_batch(commands: &[&[&[u8]]]) -> io::Result<Vec<u8>> {
@@ -1273,76 +1298,98 @@ impl DiskShard {
     /// dead bytes from overwritten/deleted entries. Always writes v2 format
     /// with magic header and checksummed envelopes (upgrades legacy files).
     pub fn compact(&mut self) -> io::Result<()> {
-        let tmp_path = self.path.with_extension("compact.tmp");
-        let tmp_file = crate::file_security::open_private_file(&tmp_path, |options| {
-            options.create(true).truncate(true).write(true);
-        })?;
-        let mut writer = BufWriter::new(tmp_file);
+        let nonce = new_wal_generation();
+        let tmp_path = self.path.with_extension(format!(
+            "compact.{}.{}",
+            std::process::id(),
+            u128::from_le_bytes(nonce)
+        ));
+        let prepared = (|| -> io::Result<(File, HashMap<String, DiskEntry>, usize)> {
+            let tmp_file = crate::file_security::open_private_file(&tmp_path, |options| {
+                options.create_new(true).read(true).append(true);
+            })?;
+            let mut writer = BufWriter::new(tmp_file);
 
-        // Always write magic header -- compaction upgrades legacy to v2.
-        writer.write_all(DATA_MAGIC)?;
-        let mut new_total: usize = 4; // magic header size
-        let mut new_index = HashMap::new();
+            // Always write magic header -- compaction upgrades legacy to v2.
+            writer.write_all(DATA_MAGIC)?;
+            let mut new_total: usize = 4; // magic header size
+            let mut new_index = HashMap::new();
 
-        let keys: Vec<String> = self.index.keys().cloned().collect();
-        for key in &keys {
-            let de = &self.index[key];
+            let keys: Vec<String> = self.index.keys().cloned().collect();
+            for key in &keys {
+                let de = &self.index[key];
 
-            // Read existing entry and extract the raw entry_data.
-            let mut buf = vec![0u8; de.length as usize];
-            self.data_file.seek(SeekFrom::Start(de.offset))?;
-            self.data_file.read_exact(&mut buf)?;
+                // Read existing entry and extract the raw entry_data.
+                let mut buf = vec![0u8; de.length as usize];
+                self.data_file.seek(SeekFrom::Start(de.offset))?;
+                self.data_file.read_exact(&mut buf)?;
 
-            let entry_data = if self.has_checksums {
-                // Skip the 4B entry_len + 4B crc envelope, re-serialize fresh.
-                buf[8..].to_vec()
-            } else {
-                buf
-            };
+                let entry_data = if self.has_checksums {
+                    // Skip the 4B entry_len + 4B crc envelope, re-serialize fresh.
+                    buf[8..].to_vec()
+                } else {
+                    buf
+                };
 
-            // Write v2 envelope: [4B entry_len][4B crc32][entry_data]
-            let checksum = crc32(&entry_data);
-            let entry_len = entry_data.len() as u32;
-            let total_on_disk = 4 + 4 + entry_data.len();
+                // Write v2 envelope: [4B entry_len][4B crc32][entry_data]
+                let checksum = crc32(&entry_data);
+                let entry_len = entry_data.len() as u32;
+                let total_on_disk = 4 + 4 + entry_data.len();
 
-            let new_offset = new_total as u64;
-            writer.write_all(&entry_len.to_le_bytes())?;
-            writer.write_all(&checksum.to_le_bytes())?;
-            writer.write_all(&entry_data)?;
+                let new_offset = new_total as u64;
+                writer.write_all(&entry_len.to_le_bytes())?;
+                writer.write_all(&checksum.to_le_bytes())?;
+                writer.write_all(&entry_data)?;
 
-            new_index.insert(
-                key.clone(),
-                DiskEntry {
-                    offset: new_offset,
-                    length: total_on_disk as u32,
-                    ttl_ms: de.ttl_ms,
-                    created_at: de.created_at,
-                },
-            );
-            new_total += total_on_disk;
+                new_index.insert(
+                    key.clone(),
+                    DiskEntry {
+                        offset: new_offset,
+                        length: total_on_disk as u32,
+                        ttl_ms: de.ttl_ms,
+                        created_at: de.created_at,
+                    },
+                );
+                new_total += total_on_disk;
+            }
+
+            writer.flush()?;
+            let compacted = writer.into_inner().map_err(io::Error::other)?;
+            compacted.sync_all()?;
+            Ok((compacted, new_index, new_total))
+        })();
+        let (compacted, new_index, new_total) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = crate::file_security::ensure_regular_or_missing(&self.path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(error);
         }
-
-        writer.flush()?;
-        let compacted = writer.into_inner().map_err(io::Error::other)?;
-        compacted.sync_all()?;
-
-        crate::file_security::ensure_regular_or_missing(&self.path)?;
-        fs::rename(&tmp_path, &self.path)?;
-        crate::file_security::verify_installed_file(&self.path, &compacted)?;
+        if let Err(error) = fs::rename(&tmp_path, &self.path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(error);
+        }
+        // The rename is the irreversible switch. Move every live handle and
+        // index to the installed inode before any later durability check can
+        // fail, so a reported directory-fsync error cannot leave this process
+        // writing through the unlinked pre-compaction file.
+        self.data_file = compacted;
+        self.index = new_index;
+        self.total_bytes = new_total;
+        self.dead_bytes = 0;
+        self.has_checksums = true;
+        crate::file_security::verify_installed_file(&self.path, &self.data_file)?;
         sync_directory(self.path.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "data file has no parent directory",
             )
-        })?)?;
-        self.data_file = crate::file_security::open_private_file(&self.path, |options| {
-            options.read(true).append(true);
-        })?;
-        self.index = new_index;
-        self.total_bytes = new_total;
-        self.dead_bytes = 0;
-        self.has_checksums = true;
-        Ok(())
+        })?)
     }
 
     pub fn dump_all(&mut self, now: Instant) -> io::Result<Vec<DumpEntry>> {
@@ -1889,6 +1936,8 @@ mod tests {
                 .unwrap();
         }
         fs::write(shard_dir.join("data.compact.tmp"), b"stale").unwrap();
+        fs::write(shard_dir.join("data.compact.123.456"), b"stale").unwrap();
+        fs::write(shard_dir.join("data.compact.operator-notes"), b"keep").unwrap();
         fs::write(shard_dir.join("wal.lux"), b"journal").unwrap();
         fs::write(shard_dir.join("keep.txt"), b"keep").unwrap();
 
@@ -1896,6 +1945,11 @@ mod tests {
 
         assert!(!shard_dir.join("data.lux").exists());
         assert!(!shard_dir.join("data.compact.tmp").exists());
+        assert!(!shard_dir.join("data.compact.123.456").exists());
+        assert_eq!(
+            fs::read(shard_dir.join("data.compact.operator-notes")).unwrap(),
+            b"keep"
+        );
         assert_eq!(fs::read(shard_dir.join("wal.lux")).unwrap(), b"journal");
         assert_eq!(fs::read(shard_dir.join("keep.txt")).unwrap(), b"keep");
         assert_eq!(fs::read(unrelated_dir.join("data.lux")).unwrap(), b"keep");
@@ -2465,6 +2519,18 @@ mod tests {
         assert!(matches!(val, DumpValue::Str(ref v) if v == b"v1_updated"));
         let (val, _) = ds.get("k2", Instant::now()).unwrap().unwrap();
         assert!(matches!(val, DumpValue::Str(ref v) if v == b"v2"));
+
+        // The installed compacted inode remains the live read/write handle.
+        let entry3 = DumpEntry {
+            key: "k3".to_string(),
+            value: DumpValue::Str(b"v3".to_vec()),
+            ttl_ms: -1,
+        };
+        ds.put("k3", &entry3).unwrap();
+        drop(ds);
+        let mut reopened = DiskShard::open(dir.path(), 0).unwrap();
+        let (val, _) = reopened.get("k3", Instant::now()).unwrap().unwrap();
+        assert!(matches!(val, DumpValue::Str(ref v) if v == b"v3"));
     }
 
     #[test]
