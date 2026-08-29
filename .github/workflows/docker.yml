@@ -13,6 +13,9 @@ permissions:
   contents: read
 
 jobs:
+  supply-chain:
+    uses: ./.github/workflows/supply-chain.yml
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -26,7 +29,7 @@ jobs:
       - run: cargo test --locked --all-targets
 
   build-amd64:
-    needs: test
+    needs: [supply-chain, test]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -65,7 +68,7 @@ jobs:
           path: /tmp/digest-amd64.txt
 
   build-arm64:
-    needs: test
+    needs: [supply-chain, test]
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read

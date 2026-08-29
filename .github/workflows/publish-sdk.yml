@@ -7,7 +7,11 @@ on:
   workflow_dispatch:
 
 jobs:
+  supply-chain:
+    uses: ./.github/workflows/supply-chain.yml
+
   publish:
+    needs: supply-chain
     runs-on: ubuntu-latest
     permissions:
       contents: read

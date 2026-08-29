@@ -9,6 +9,9 @@ permissions:
   contents: read
 
 jobs:
+  supply-chain:
+    uses: ./.github/workflows/supply-chain.yml
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -25,7 +28,7 @@ jobs:
       - run: bash cli/tests/e2e-local.sh
 
   build:
-    needs: test
+    needs: [supply-chain, test]
     strategy:
       matrix:
         include:

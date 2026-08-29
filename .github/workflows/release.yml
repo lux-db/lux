@@ -9,6 +9,9 @@ permissions:
   contents: read
 
 jobs:
+  supply-chain:
+    uses: ./.github/workflows/supply-chain.yml
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -22,7 +25,7 @@ jobs:
       - run: cargo test --locked --all-targets
 
   build:
-    needs: test
+    needs: [supply-chain, test]
     env:
       LUX_BUILD_SHA: ${{ github.sha }}
     strategy:

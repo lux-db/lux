@@ -10,6 +10,9 @@ permissions:
   contents: read
 
 jobs:
+  supply-chain:
+    uses: ./.github/workflows/supply-chain.yml
+
   test:
     runs-on: ubuntu-latest
     steps:
