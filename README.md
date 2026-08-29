@@ -807,7 +807,10 @@ The Tests workflow runs on every pull request and every push to `main`:
 - TypeScript SDK tests and build
 
 Tag-triggered release, CLI-release, and Docker workflows run their own required
-test jobs before publishing artifacts.
+test jobs before publishing artifacts. Binary and CLI releases include SHA-256
+checksum files and GitHub build-provenance attestations. Container releases
+publish per-platform SBOM/provenance metadata plus an attestation for the final
+multi-platform image digest.
 
 ## Public contracts
 

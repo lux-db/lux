@@ -9,15 +9,21 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
       - run: cargo fmt -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
 
   build-amd64:
     needs: test
@@ -26,30 +32,34 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         id: build
         with:
           context: .
           platforms: linux/amd64
-          build-args: LUX_BUILD_SHA=${{ github.sha }}
+          build-args: |
+            LUX_BUILD_SHA=${{ github.sha }}
+            LUX_VERSION=${{ github.ref_name }}
           push: true
+          provenance: mode=max
+          sbom: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:build-amd64
           cache-from: type=gha,scope=docker-amd64
           cache-to: type=gha,mode=max,scope=docker-amd64
 
       - run: echo "${{ steps.build.outputs.digest }}" > /tmp/digest-amd64.txt
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: docker-digest-amd64
           path: /tmp/digest-amd64.txt
@@ -61,30 +71,34 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         id: build
         with:
           context: .
           platforms: linux/arm64
-          build-args: LUX_BUILD_SHA=${{ github.sha }}
+          build-args: |
+            LUX_BUILD_SHA=${{ github.sha }}
+            LUX_VERSION=${{ github.ref_name }}
           push: true
+          provenance: mode=max
+          sbom: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:build-arm64
           cache-from: type=gha,scope=docker-arm64
           cache-to: type=gha,mode=max,scope=docker-arm64
 
       - run: echo "${{ steps.build.outputs.digest }}" > /tmp/digest-arm64.txt
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: docker-digest-arm64
           path: /tmp/digest-arm64.txt
@@ -93,18 +107,20 @@ jobs:
     needs: [build-amd64, build-arm64]
     runs-on: ubuntu-latest
     permissions:
+      attestations: write
       contents: read
+      id-token: write
       packages: write
     steps:
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: meta
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -113,13 +129,14 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: docker-digest-*
           path: /tmp/digests
           merge-multiple: true
 
       - name: Create manifest
+        id: manifest
         run: |
           AMD64_DIGEST=$(cat /tmp/digests/digest-amd64.txt)
           ARM64_DIGEST=$(cat /tmp/digests/digest-arm64.txt)
@@ -129,3 +146,13 @@ jobs:
               "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${AMD64_DIGEST}" \
               "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${ARM64_DIGEST}"
           done
+          FIRST_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n 1)
+          DIGEST=$(docker buildx imagetools inspect "$FIRST_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
