@@ -1004,6 +1004,7 @@ dependencies = [
  "futures-util",
  "hashbrown 0.14.5",
  "jsonwebtoken",
+ "libc",
  "mlua",
  "ordered-float",
  "p256",

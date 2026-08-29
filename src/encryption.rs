@@ -542,7 +542,14 @@ impl EncryptionKeyring {
         state_path: &Path,
         candidates: &[[u8; 32]],
     ) -> Result<(EncryptionState, [u8; 32]), String> {
-        let raw = fs::read(state_path).map_err(|e| format!("ERR ENC state read failed: {e}"))?;
+        use std::io::Read as _;
+        let mut file = crate::file_security::open_private_file(state_path, |options| {
+            options.read(true);
+        })
+        .map_err(|e| format!("ERR ENC state read failed: {e}"))?;
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)
+            .map_err(|e| format!("ERR ENC state read failed: {e}"))?;
         let sealed: SealedState =
             serde_json::from_slice(&raw).map_err(|e| format!("ERR ENC state is invalid: {e}"))?;
         if sealed.version != 1 {
@@ -641,25 +648,27 @@ impl EncryptionKeyring {
         };
         let raw = serde_json::to_vec_pretty(&sealed)
             .map_err(|e| format!("ERR ENC state serialize failed: {e}"))?;
-        if let Some(parent) = state_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("ERR ENC state mkdir failed: {e}"))?;
-        }
         let tmp = state_path.with_extension("enc.tmp");
-        {
+        let file = {
             use std::io::Write;
-            let mut file =
-                fs::File::create(&tmp).map_err(|e| format!("ERR ENC state write failed: {e}"))?;
+            let mut file = crate::file_security::open_private_file(&tmp, |options| {
+                options.create(true).truncate(true).write(true);
+            })
+            .map_err(|e| format!("ERR ENC state write failed: {e}"))?;
             file.write_all(&raw)
                 .map_err(|e| format!("ERR ENC state write failed: {e}"))?;
             file.sync_all()
                 .map_err(|e| format!("ERR ENC state sync failed: {e}"))?;
-        }
+            file
+        };
+        crate::file_security::ensure_regular_or_missing(state_path)
+            .map_err(|e| format!("ERR ENC state replace failed: {e}"))?;
         fs::rename(&tmp, state_path).map_err(|e| format!("ERR ENC state replace failed: {e}"))?;
-        // fsync the directory so the rename itself is durable across a crash.
+        crate::file_security::verify_installed_file(state_path, &file)
+            .map_err(|e| format!("ERR ENC state replace failed: {e}"))?;
         if let Some(parent) = state_path.parent() {
-            if let Ok(dir) = fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+            crate::disk::sync_directory(parent)
+                .map_err(|e| format!("ERR ENC state directory sync failed: {e}"))?;
         }
         Ok(())
     }
@@ -884,7 +893,25 @@ fn generate_secret() -> Vec<u8> {
 }
 
 fn read_seal_key(path: &Path, create: bool) -> Result<[u8; 32], String> {
-    match fs::read(path) {
+    #[cfg(not(unix))]
+    {
+        let _ = (path, create);
+        return Err(
+            "ERR ENC on-disk seal files require Unix owner-only permissions; configure LUX_ENC_SEAL_SECRET"
+                .to_string(),
+        );
+    }
+
+    #[cfg(unix)]
+    match (|| {
+        use std::io::Read as _;
+        let mut file = crate::file_security::open_private_file(path, |options| {
+            options.read(true);
+        })?;
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)?;
+        Ok::<_, std::io::Error>(raw)
+    })() {
         Ok(raw) => {
             let text = String::from_utf8(raw)
                 .map_err(|_| "ERR ENC seal file is not valid UTF-8".to_string())?;
@@ -896,10 +923,6 @@ fn read_seal_key(path: &Path, create: bool) -> Result<[u8; 32], String> {
                 .map_err(|_| "ERR ENC seal file has invalid length".to_string())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("ERR ENC seal mkdir failed: {e}"))?;
-            }
             let mut seal = [0u8; 32];
             OsRng.fill_bytes(&mut seal);
             let encoded = base64::engine::general_purpose::STANDARD.encode(seal);
@@ -914,23 +937,29 @@ fn write_new_seal_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|e| format!("ERR ENC seal create failed: {e}"))?;
+        let mut file = crate::file_security::open_private_file(path, |options| {
+            options.write(true).create_new(true);
+        })
+        .map_err(|e| format!("ERR ENC seal create failed: {e}"))?;
         file.write_all(bytes)
             .map_err(|e| format!("ERR ENC seal write failed: {e}"))?;
         file.write_all(b"\n")
             .map_err(|e| format!("ERR ENC seal write failed: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("ERR ENC seal sync failed: {e}"))?;
+        if let Some(parent) = path.parent() {
+            crate::disk::sync_directory(parent)
+                .map_err(|e| format!("ERR ENC seal directory sync failed: {e}"))?;
+        }
         Ok(())
     }
     #[cfg(not(unix))]
     {
-        fs::write(path, [bytes, b"\n"].concat())
-            .map_err(|e| format!("ERR ENC seal write failed: {e}"))
+        let _ = (path, bytes);
+        Err(
+            "ERR ENC on-disk seal files require Unix owner-only permissions; configure LUX_ENC_SEAL_SECRET"
+                .to_string(),
+        )
     }
 }
 
@@ -1203,6 +1232,21 @@ mod adversarial_tests {
         let ct = ring.encrypt("t", "f", "1", b"persisted").unwrap();
         drop(ring);
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in ["lux.enc", "lux.enc.seal"] {
+                assert_eq!(
+                    std::fs::metadata(dir.path().join(name))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+
         // Reopen from the same dir: state unseals, data decrypts.
         let reopened = EncryptionKeyring::open(&config, &data_dir).unwrap();
         assert!(reopened.has_active_key());
@@ -1219,6 +1263,22 @@ mod adversarial_tests {
             EncryptionKeyring::open(&config, &data_dir).is_err(),
             "wrong seal must not unseal the keyring"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_disk_seal_rejects_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"unchanged").unwrap();
+        symlink(&target, dir.path().join("lux.enc.seal")).unwrap();
+
+        let config = EncryptionConfig::default();
+        let ring = EncryptionKeyring::open(&config, dir.path().to_str().unwrap()).unwrap();
+        assert!(ring.init(Some("k1")).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"unchanged");
     }
 
     #[test]

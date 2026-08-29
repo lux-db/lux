@@ -574,16 +574,19 @@ async fn stream_snapshot(
             }
         };
 
-    let mut file = match tokio::fs::File::open(&path).await {
-        Ok(f) => f,
-        Err(e) => {
-            let body = format!(
-                r#"{{"error":"snapshot open failed: {}"}}"#,
-                escape_json(&e.to_string())
-            );
-            return send_json(socket, 500, "Internal Server Error", &body).await;
-        }
-    };
+    let mut file =
+        match crate::file_security::open_private_file(std::path::Path::new(&path), |options| {
+            options.read(true);
+        }) {
+            Ok(file) => tokio::fs::File::from_std(file),
+            Err(e) => {
+                let body = format!(
+                    r#"{{"error":"snapshot open failed: {}"}}"#,
+                    escape_json(&e.to_string())
+                );
+                return send_json(socket, 500, "Internal Server Error", &body).await;
+            }
+        };
     let len = file.metadata().await?.len();
     let header = format!(
         "HTTP/1.1 200 OK\r\n\

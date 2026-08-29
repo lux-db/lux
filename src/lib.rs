@@ -13,6 +13,7 @@ mod durability;
 mod embedded;
 mod encryption;
 mod eviction;
+mod file_security;
 #[cfg(feature = "fuzzing")]
 pub mod fuzz_api;
 mod geo;
@@ -599,35 +600,28 @@ fn has_persistence_state(dir: &std::path::Path) -> std::io::Result<bool> {
 }
 
 fn verify_writable_directory(path: &std::path::Path, field: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(path).map_err(|error| {
+    crate::file_security::ensure_safe_dir(path).map_err(|error| {
         std::io::Error::new(
             error.kind(),
             format!("cannot create {field} {}: {error}", path.display()),
         )
     })?;
-    if !std::fs::metadata(path)?.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{field} must be a directory: {}", path.display()),
-        ));
-    }
-
     static PROBE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = PROBE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let from = path.join(format!(".lux-write-probe-{}-{id}", std::process::id()));
     let to = path.join(format!(".lux-rename-probe-{}-{id}", std::process::id()));
     let result = (|| {
         use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&from)?;
+        let mut file = crate::file_security::open_private_file(&from, |options| {
+            options.create_new(true).write(true);
+        })?;
         file.write_all(b"lux")?;
         file.sync_all()?;
         std::fs::rename(&from, &to)?;
-        #[cfg(unix)]
-        std::fs::File::open(path)?.sync_all()?;
+        crate::file_security::verify_installed_file(&to, &file)?;
+        crate::disk::sync_directory(path)?;
         std::fs::remove_file(&to)?;
+        crate::disk::sync_directory(path)?;
         Ok::<_, std::io::Error>(())
     })();
     let _ = std::fs::remove_file(&from);

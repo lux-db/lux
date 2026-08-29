@@ -6,13 +6,18 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpStream};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+mod file_security;
+use file_security::{
+    delete_secret_file, ensure_private_dir, random_hex, read_optional_secret_file,
+    write_secret_file,
+};
 
 const DEFAULT_API_URL: &str = "https://api.luxdb.dev";
 
@@ -787,56 +792,29 @@ fn local_state_path() -> PathBuf {
 
 fn load_local_state() -> Option<LocalState> {
     let path = local_state_path();
-    let data = std::fs::read_to_string(&path).ok()?;
-    #[cfg(unix)]
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
-    serde_json::from_str(&data).ok()
+    load_local_state_from(&path).unwrap_or_else(|error| {
+        eprintln!("{} {error}", "Failed to load local Lux state:".red());
+        std::process::exit(1);
+    })
+}
+
+fn load_local_state_from(path: &Path) -> Result<Option<LocalState>, String> {
+    let Some(data) = read_optional_secret_file(path)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&data)
+        .map(Some)
+        .map_err(|error| format!("parse {}: {error}", path.display()))
 }
 
 fn local_state_missing_bind_host() -> bool {
-    std::fs::read_to_string(local_state_path())
-        .ok()
+    read_optional_secret_file(&local_state_path())
+        .unwrap_or_else(|error| {
+            eprintln!("{} {error}", "Failed to load local Lux state:".red());
+            std::process::exit(1);
+        })
         .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
         .is_some_and(|value| value.get("bind_host").is_none())
-}
-
-fn ensure_private_dir(path: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
-    #[cfg(unix)]
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
-    Ok(())
-}
-
-/// Atomically replace a secret-bearing file and force owner-only permissions.
-fn write_secret_file(path: &Path, data: &[u8]) -> Result<(), String> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    let filename = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("lux-secret");
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{filename}.tmp-{}-{nonce}", std::process::id()));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&tmp)
-        .map_err(|e| format!("write {}: {e}", path.display()))?;
-    file.write_all(data)
-        .and_then(|_| file.sync_all())
-        .map_err(|e| format!("write {}: {e}", path.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("replace {}: {e}", path.display()))?;
-    #[cfg(unix)]
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
-    Ok(())
 }
 
 fn save_local_state(state: &LocalState) {
@@ -846,30 +824,6 @@ fn save_local_state(state: &LocalState) {
         eprintln!("{} {e}", "Failed to write lux/.lux-local.json:".red());
         std::process::exit(1);
     });
-}
-
-/// Hex-encode `bytes` of OS randomness. Local-dev keys don't need to be
-/// cryptographic, but should be unguessable; `/dev/urandom` avoids a new crate
-/// dependency (the CLI only targets unix).
-fn random_hex(bytes: usize) -> String {
-    use std::io::Read;
-    let mut buf = vec![0u8; bytes];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_err()
-    {
-        // Fallback: derive from a per-process/time hash. Good enough for a local
-        // dev credential if /dev/urandom is somehow unavailable.
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        std::process::id().hash(&mut h);
-        std::time::SystemTime::now().hash(&mut h);
-        let seed = h.finish().to_le_bytes();
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = seed[i % seed.len()] ^ (i as u8);
-        }
-    }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A stable 64-bit hash of `s` (FNV-free, std-only).
@@ -1298,11 +1252,9 @@ fn profile_dir() -> PathBuf {
 
 fn load_profile_index() -> Result<EnvProfileIndex, String> {
     let path = PathBuf::from(ENV_PROFILE_INDEX);
-    if !path.exists() {
+    let Some(data) = read_optional_secret_file(&path)? else {
         return Ok(EnvProfileIndex::default());
-    }
-    let data =
-        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    };
     serde_json::from_str(&data).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
@@ -1412,9 +1364,9 @@ fn activate_profile(index: &mut EnvProfileIndex, selector: &str) -> Result<EnvPr
     let profile = resolve_profile(index, selector)
         .cloned()
         .ok_or_else(|| format!("profile '{selector}' not found"))?;
-    let content = std::fs::read_to_string(profile_path(&profile))
-        .map_err(|e| format!("read profile '{}': {e}", profile.display_name))?;
-    let existing = std::fs::read_to_string(".env.local").unwrap_or_default();
+    let content = read_optional_secret_file(&profile_path(&profile))?
+        .ok_or_else(|| format!("profile '{}' is missing", profile.display_name))?;
+    let existing = read_optional_secret_file(Path::new(".env.local"))?.unwrap_or_default();
     let merged = merge_managed_env(&existing, &content);
     write_secret_file(Path::new(".env.local"), merged.as_bytes())?;
     index.active = Some(profile.key.clone());
@@ -1443,7 +1395,7 @@ fn refresh_local_profile(state: &LocalState) -> Result<(), String> {
     // Upgrade safely from the old single-file model: preserve any existing Lux
     // target as the active legacy profile instead of silently switching it.
     if index.active.is_none() {
-        let existing = std::fs::read_to_string(".env.local").unwrap_or_default();
+        let existing = read_optional_secret_file(Path::new(".env.local"))?.unwrap_or_default();
         let existing_keys = managed_env_map(&existing);
         if existing_keys.is_empty() {
             activate_profile(&mut index, "local")?;
@@ -2159,18 +2111,28 @@ fn config_path() -> PathBuf {
     let dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".lux");
-    if ensure_private_dir(&dir).is_err() {
-        std::fs::create_dir_all(&dir).ok();
-    }
+    ensure_private_dir(&dir).unwrap_or_else(|error| {
+        eprintln!("{} {error}", "Failed to secure Lux config directory:".red());
+        std::process::exit(1);
+    });
     dir.join("config.json")
 }
 
 fn load_config() -> Option<Config> {
     let path = config_path();
-    let data = std::fs::read_to_string(&path).ok()?;
-    #[cfg(unix)]
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
-    serde_json::from_str(&data).ok()
+    load_config_from(&path).unwrap_or_else(|error| {
+        eprintln!("{} {error}", "Failed to load Lux credentials:".red());
+        std::process::exit(1);
+    })
+}
+
+fn load_config_from(path: &Path) -> Result<Option<Config>, String> {
+    let Some(data) = read_optional_secret_file(path)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&data)
+        .map(Some)
+        .map_err(|error| format!("parse {}: {error}", path.display()))
 }
 
 fn save_config(config: &Config) {
@@ -2184,7 +2146,10 @@ fn save_config(config: &Config) {
 
 fn delete_config() {
     let path = config_path();
-    std::fs::remove_file(path).ok();
+    delete_secret_file(&path).unwrap_or_else(|error| {
+        eprintln!("{} {error}", "Failed to delete Lux credentials:".red());
+        std::process::exit(1);
+    });
 }
 
 fn local_config_path() -> PathBuf {
@@ -2193,60 +2158,56 @@ fn local_config_path() -> PathBuf {
 
 fn load_local_config() -> Option<LocalConfig> {
     let path = local_config_path();
-    let data = std::fs::read_to_string(&path).ok()?;
-    let doc = data.parse::<toml_edit::DocumentMut>().unwrap_or_else(|e| {
-        eprintln!("{} {}: {e}", "Invalid Lux config".red(), path.display());
+    load_local_config_from(&path).unwrap_or_else(|error| {
+        eprintln!("{} {error}", "Failed to load Lux config:".red());
         std::process::exit(1);
-    });
-    let string = |key: &str| -> Option<String> {
-        let item = doc.get(key)?;
-        let value = item.as_str().unwrap_or_else(|| {
-            eprintln!(
-                "{} {} must be a string in {}",
-                "Invalid Lux config:".red(),
-                key,
-                path.display()
-            );
-            std::process::exit(1);
-        });
-        (!value.trim().is_empty()).then(|| value.to_string())
-    };
-    let port = |key: &str| -> Option<u16> {
-        let item = doc.get(key)?;
-        let value = item.as_integer().unwrap_or_else(|| {
-            eprintln!(
-                "{} {} must be an integer in {}",
-                "Invalid Lux config:".red(),
-                key,
-                path.display()
-            );
-            std::process::exit(1);
-        });
-        u16::try_from(value).ok().or_else(|| {
-            eprintln!(
-                "{} {} must be between 0 and 65535 in {}",
-                "Invalid Lux config:".red(),
-                key,
-                path.display()
-            );
-            std::process::exit(1);
-        })
-    };
-    Some(LocalConfig {
-        project_id: string("project_id"),
-        project_name: string("project_name"),
-        local_http_port: port("local_http_port"),
-        local_resp_port: port("local_resp_port"),
-        engine_version: string("engine_version"),
     })
+}
+
+fn load_local_config_from(path: &Path) -> Result<Option<LocalConfig>, String> {
+    let Some(data) = read_optional_secret_file(path)? else {
+        return Ok(None);
+    };
+    let doc = data
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    let string = |key: &str| -> Result<Option<String>, String> {
+        let Some(item) = doc.get(key) else {
+            return Ok(None);
+        };
+        let value = item
+            .as_str()
+            .ok_or_else(|| format!("{key} must be a string in {}", path.display()))?;
+        Ok((!value.trim().is_empty()).then(|| value.to_string()))
+    };
+    let port = |key: &str| -> Result<Option<u16>, String> {
+        let Some(item) = doc.get(key) else {
+            return Ok(None);
+        };
+        let value = item
+            .as_integer()
+            .ok_or_else(|| format!("{key} must be an integer in {}", path.display()))?;
+        u16::try_from(value)
+            .map(Some)
+            .map_err(|_| format!("{key} must be between 0 and 65535 in {}", path.display()))
+    };
+    Ok(Some(LocalConfig {
+        project_id: string("project_id")?,
+        project_name: string("project_name")?,
+        local_http_port: port("local_http_port")?,
+        local_resp_port: port("local_resp_port")?,
+        engine_version: string("engine_version")?,
+    }))
 }
 
 fn save_local_config(config: &LocalConfig) {
     let path = local_config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let existing = read_optional_secret_file(&path)
+        .unwrap_or_else(|e| {
+            eprintln!("{} {e}", "Failed to read lux/config.toml:".red());
+            std::process::exit(1);
+        })
+        .unwrap_or_default();
     let mut doc = existing
         .parse::<toml_edit::DocumentMut>()
         .unwrap_or_else(|e| {
@@ -2277,7 +2238,7 @@ fn save_local_config(config: &LocalConfig) {
             doc.remove("engine_version");
         }
     }
-    std::fs::write(&path, doc.to_string()).unwrap_or_else(|e| {
+    write_secret_file(&path, doc.to_string().as_bytes()).unwrap_or_else(|e| {
         eprintln!("{} {e}", "Failed to write lux/config.toml:".red());
         std::process::exit(1);
     });
@@ -4689,10 +4650,18 @@ pub async fn run() {
                     eprintln!("{} Profile '{}' not found.", "Error:".red(), selector);
                     std::process::exit(1);
                 });
-                let content = std::fs::read_to_string(profile_path(selected)).unwrap_or_else(|e| {
-                    eprintln!("{} {e}", "Failed to read env profile:".red());
-                    std::process::exit(1);
-                });
+                let content = read_optional_secret_file(&profile_path(selected))
+                    .unwrap_or_else(|e| {
+                        eprintln!("{} {e}", "Failed to read env profile:".red());
+                        std::process::exit(1);
+                    })
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "{} profile file is missing",
+                            "Failed to read env profile:".red()
+                        );
+                        std::process::exit(1);
+                    });
                 print!("{content}");
             }
         },
@@ -7734,14 +7703,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn secret_files_are_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("lux-cli-secret-test-{}", random_hex(8)));
+    fn invalid_local_state_is_not_treated_as_missing() {
+        let dir = std::env::temp_dir().join(format!("lux-cli-state-test-{}", random_hex(8)));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("secret.env");
-        write_secret_file(&path, b"LUX_SECRET_KEY=test\n").unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        let path = dir.join("state.json");
+        std::fs::write(&path, b"not json").unwrap();
+
+        assert!(load_local_state_from(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_state_loader_rejects_an_unsafe_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("lux-cli-state-link-{}", random_hex(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        std::fs::write(&target, b"{}").unwrap();
+        let linked = dir.join("state.json");
+        symlink(&target, &linked).unwrap();
+
+        assert!(load_local_state_from(&linked).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

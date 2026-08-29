@@ -6,7 +6,9 @@
 use crate::store::{DumpEntry, DumpValue, StreamGroupDump};
 use rand_core::{OsRng, RngCore};
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+#[cfg(any(test, unix))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -266,14 +268,15 @@ impl Wal {
         let wal_dir = wal_dir.as_ref();
         if create {
             create_dir_all_synced(wal_dir)?;
+            crate::file_security::ensure_private_dir(wal_dir)?;
+        } else {
+            crate::file_security::ensure_existing_private_dir(wal_dir)?;
         }
         let path = wal_dir.join("wal.lux");
         let created = !path.exists();
-        let mut file = OpenOptions::new()
-            .create(create)
-            .read(true)
-            .append(true)
-            .open(&path)?;
+        let mut file = crate::file_security::open_private_file(&path, |options| {
+            options.create(create).read(true).append(true);
+        })?;
 
         let file_len = file.seek(SeekFrom::End(0))?;
         let (frame_format, header_len, generation) = if file_len == 0 {
@@ -774,11 +777,9 @@ impl Wal {
             std::process::id(),
             u128::from_le_bytes(generation)
         ));
-        let mut replacement = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .append(true)
-            .open(&tmp)?;
+        let mut replacement = crate::file_security::open_private_file(&tmp, |options| {
+            options.create_new(true).read(true).append(true);
+        })?;
         if let Err(error) = replacement
             .write_all(&wal_header_bytes(&generation))
             .and_then(|_| replacement.sync_all())
@@ -791,10 +792,12 @@ impl Wal {
             let _ = fs::remove_file(&tmp);
             return Err(error);
         }
+        crate::file_security::ensure_regular_or_missing(&self.path)?;
         if let Err(error) = fs::rename(&tmp, &self.path) {
             let _ = fs::remove_file(&tmp);
             return Err(error);
         }
+        crate::file_security::verify_installed_file(&self.path, &replacement)?;
 
         // Keep writing through the descriptor of the inode that was just
         // installed even if the directory fsync itself reports an error.
@@ -852,7 +855,19 @@ fn new_wal_generation_except(current: [u8; WAL_GENERATION_LEN]) -> [u8; WAL_GENE
 
 #[cfg(unix)]
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsafe state path {}: expected a directory", path.display()),
+        ));
+    }
+    directory.sync_all()
 }
 
 #[cfg(not(unix))]
@@ -869,8 +884,8 @@ pub(crate) fn create_dir_all_synced(path: &Path) -> io::Result<()> {
         absolute = std::env::current_dir()?.join(path);
         &absolute
     };
-    if path.is_dir() {
-        return Ok(());
+    if path.exists() {
+        return crate::file_security::ensure_safe_dir(path);
     }
     let mut missing = Vec::new();
     let mut cursor = path;
@@ -883,7 +898,7 @@ pub(crate) fn create_dir_all_synced(path: &Path) -> io::Result<()> {
             )
         })?;
     }
-    fs::create_dir_all(path)?;
+    crate::file_security::ensure_private_dir(path)?;
     for created in missing.iter().rev() {
         if let Some(parent) = created.parent() {
             sync_directory(parent)?;
@@ -1062,13 +1077,11 @@ impl DiskShard {
     /// index by scanning the existing data file.
     pub fn open(dir: &Path, shard_id: usize) -> io::Result<Self> {
         let shard_dir = dir.join(format!("shard_{shard_id}"));
-        fs::create_dir_all(&shard_dir)?;
+        crate::file_security::ensure_private_dir(&shard_dir)?;
         let path = shard_dir.join("data.lux");
-        let mut data_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)?;
+        let mut data_file = crate::file_security::open_private_file(&path, |options| {
+            options.create(true).read(true).append(true);
+        })?;
 
         let file_len = data_file.seek(SeekFrom::End(0))?;
         let has_checksums = if file_len == 0 {
@@ -1261,7 +1274,9 @@ impl DiskShard {
     /// with magic header and checksummed envelopes (upgrades legacy files).
     pub fn compact(&mut self) -> io::Result<()> {
         let tmp_path = self.path.with_extension("compact.tmp");
-        let tmp_file = File::create(&tmp_path)?;
+        let tmp_file = crate::file_security::open_private_file(&tmp_path, |options| {
+            options.create(true).truncate(true).write(true);
+        })?;
         let mut writer = BufWriter::new(tmp_file);
 
         // Always write magic header -- compaction upgrades legacy to v2.
@@ -1308,13 +1323,21 @@ impl DiskShard {
         }
 
         writer.flush()?;
-        drop(writer);
+        let compacted = writer.into_inner().map_err(io::Error::other)?;
+        compacted.sync_all()?;
 
+        crate::file_security::ensure_regular_or_missing(&self.path)?;
         fs::rename(&tmp_path, &self.path)?;
-        self.data_file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
+        crate::file_security::verify_installed_file(&self.path, &compacted)?;
+        sync_directory(self.path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "data file has no parent directory",
+            )
+        })?)?;
+        self.data_file = crate::file_security::open_private_file(&self.path, |options| {
+            options.read(true).append(true);
+        })?;
         self.index = new_index;
         self.total_bytes = new_total;
         self.dead_bytes = 0;
@@ -1798,6 +1821,43 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_files_are_private_and_symlinks_are_rejected() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let wal = Wal::open(dir.path(), 0).unwrap();
+        let wal_dir = dir.path().join("shard_0");
+        assert_eq!(
+            fs::metadata(&wal_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(wal_dir.join("wal.lux"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(wal);
+
+        let target = dir.path().join("target");
+        fs::write(&target, b"unchanged").unwrap();
+        let linked_dir = dir.path().join("shard_1");
+        fs::create_dir(&linked_dir).unwrap();
+        symlink(&target, linked_dir.join("wal.lux")).unwrap();
+        assert!(Wal::open(dir.path(), 1).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"unchanged");
+        assert_eq!(
+            fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "opening state must not tighten an existing caller-owned root"
+        );
+    }
 
     #[test]
     fn crc32_known_values() {
