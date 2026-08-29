@@ -96,6 +96,10 @@ lux stop                   # stop the engine + Studio
 lux stop --clear           # also delete the local data volume
 ```
 
+`lux stop` sends SIGTERM to the engine and gives its checked durability barrier
+35 seconds to finish before removing the container. Local engine updates use
+the same graceful stop path.
+
 `lux start` refreshes a private `local` env profile containing `LUX_URL`,
 `LUX_PUBLISHABLE_KEY`, `LUX_SECRET_KEY`, and `LUX_DIRECT_URL`. On first setup it
 safely merges those Lux-managed keys into `.env.local`; later starts preserve

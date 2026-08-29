@@ -17,8 +17,34 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
+fn issued_ports() -> &'static Mutex<HashSet<u16>> {
+    static ISSUED_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    ISSUED_PORTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Bind an ephemeral listener and reserve its port in the same registry used by
+/// child-engine allocations. Holding the listener while registering closes the
+/// allocation race in both directions.
+pub fn bind_registered_ephemeral_listener() -> TcpListener {
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        if issued_ports().lock().unwrap().insert(port) {
+            return listener;
+        }
+    }
+}
+
 pub fn lux_command<P: AsRef<std::ffi::OsStr>>(program: P) -> Command {
     Command::new(program)
+}
+
+/// Spawn a child engine only while no test thread is holding temporary port
+/// reservation sockets. Without this boundary, a concurrent process spawn can
+/// inherit a reservation listener before it is dropped.
+pub fn spawn_lux(cmd: &mut Command) -> std::io::Result<Child> {
+    let _ports = issued_ports().lock().unwrap();
+    cmd.spawn()
 }
 
 pub fn terminate_child(child: &mut Child) {
@@ -61,27 +87,40 @@ pub fn find_lux_binary() -> std::path::PathBuf {
     panic!("no lux binary found (build it first)");
 }
 
-/// Reserve `n` distinct localhost ports by holding listeners on `:0`
-/// simultaneously. Ports already issued in this test process are never handed
-/// out again, closing the release-to-bind race between parallel test cases.
+/// Reserve `n` distinct loopback ports for this test process.
+///
+/// Child servers cannot inherit pre-bound sockets, so there is necessarily a
+/// short release-to-bind window. Selecting from a dedicated non-ephemeral test
+/// range prevents the test process's own outbound connections from occupying a
+/// selected server port during that window. The process-wide registry prevents
+/// parallel tests and registered mock listeners from recycling one.
 pub fn free_ports(n: usize) -> Vec<u16> {
-    static ISSUED_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
-    let issued = ISSUED_PORTS.get_or_init(|| Mutex::new(HashSet::new()));
-    loop {
-        let listeners: Vec<TcpListener> = (0..n)
-            .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port"))
-            .collect();
-        let ports: Vec<u16> = listeners
-            .iter()
-            .map(|listener| listener.local_addr().unwrap().port())
-            .collect();
-        let mut issued = issued.lock().unwrap();
-        if ports.iter().any(|port| issued.contains(port)) {
+    const TEST_PORT_START: u16 = 20_000;
+    const TEST_PORT_END: u16 = 30_000;
+
+    let range = usize::from(TEST_PORT_END - TEST_PORT_START);
+    let offset = (std::process::id() as usize * 97) % range;
+    let mut issued = issued_ports().lock().unwrap();
+    let mut listeners = Vec::with_capacity(n);
+    let mut ports = Vec::with_capacity(n);
+
+    for step in 0..range {
+        if ports.len() == n {
+            break;
+        }
+        let port = TEST_PORT_START + ((offset + step) % range) as u16;
+        if issued.contains(&port) {
             continue;
         }
-        issued.extend(ports.iter().copied());
-        return ports;
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            issued.insert(port);
+            ports.push(port);
+            listeners.push(listener);
+        }
     }
+
+    assert_eq!(ports.len(), n, "test server port range exhausted");
+    ports
 }
 
 pub fn free_port() -> u16 {
@@ -337,9 +376,8 @@ impl LuxServer {
             let ports = free_ports(if spec.http { 2 } else { 1 });
             let port = ports[0];
             let http_port = if spec.http { ports[1] } else { 0 };
-            let mut child = build_command(&bin, &spec, dir, port, http_port)
-                .spawn()
-                .expect("spawn lux");
+            let mut command = build_command(&bin, &spec, dir, port, http_port);
+            let mut child = spawn_lux(&mut command).expect("spawn lux");
             let resp_ready = wait_for_resp_ready(port, &mut child);
             let http_ready = !spec.http || wait_for_http_ready(http_port, &mut child);
             if resp_ready && http_ready {
@@ -418,7 +456,7 @@ pub fn spawn_lux_with_data_dir(
     for (key, value) in env {
         cmd.env(key, value);
     }
-    let mut child = cmd.spawn().expect("spawn lux");
+    let mut child = spawn_lux(&mut cmd).expect("spawn lux");
     if !wait_for_http_ready(http_port, &mut child) {
         panic!("lux did not start on http port {http_port}");
     }

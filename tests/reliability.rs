@@ -93,7 +93,8 @@ impl LuxServer {
     }
 
     fn spawn(port: u16, tmpdir: &std::path::Path, maxmemory: &str) -> std::process::Child {
-        common::lux_command(env!("CARGO_BIN_EXE_lux"))
+        let mut command = common::lux_command(env!("CARGO_BIN_EXE_lux"));
+        command
             .env("LUX_PORT", port.to_string())
             .env("LUX_SHARDS", "4")
             .env("LUX_SAVE_INTERVAL", "0")
@@ -103,9 +104,8 @@ impl LuxServer {
             .env("LUX_STORAGE_DIR", tmpdir.join("storage").to_str().unwrap())
             .env("LUX_DATA_DIR", tmpdir.to_str().unwrap())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to start lux")
+            .stderr(std::process::Stdio::null());
+        common::spawn_lux(&mut command).expect("failed to start lux")
     }
 
     fn conn(&self) -> TcpStream {

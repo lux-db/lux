@@ -1062,6 +1062,16 @@ fn docker_output(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Give the engine a SIGTERM grace period before removing its container.
+/// `rm -f` skips the engine's final persistence barrier, and Docker's default
+/// stop timeout is shorter than Lux's default shutdown grace period.
+fn remove_engine_container(name: &str) -> Result<(), String> {
+    if docker_container_state(name).as_deref() == Some("running") {
+        docker_output(&["stop", "--timeout", "35", name])?;
+    }
+    docker_output(&["rm", name]).map(|_| ())
+}
+
 /// Preflight: Docker installed and the daemon reachable.
 fn docker_preflight() -> Result<(), String> {
     docker_output(&["info"]).map(|_| ()).map_err(|_| {
@@ -1235,6 +1245,8 @@ fn run_local_engine_container(state: &LocalState) -> Result<(), String> {
         &http_map,
         "-v",
         &vol_map,
+        "--stop-timeout",
+        "35",
     ];
     for entry in &engine_env {
         run_args.push("-e");
@@ -3198,7 +3210,7 @@ fn update_local_engine(check: bool) -> Result<(), String> {
         return Ok(());
     }
     if existed {
-        docker_output(&["rm", "-f", &state.container])?;
+        remove_engine_container(&state.container)?;
     }
     if was_running {
         run_local_engine_container(&state)?;
@@ -3485,7 +3497,10 @@ pub async fn run() {
 
             // Remove any stale container (stopped, or `--fresh`).
             if docker_container_state(&state.container).is_some() {
-                let _ = docker_output(&["rm", "-f", &state.container]);
+                remove_engine_container(&state.container).unwrap_or_else(|error| {
+                    eprintln!("{} {error}", "Failed to stop local Lux engine:".red());
+                    std::process::exit(1);
+                });
             }
             let volume_existed = docker_volume_exists(&state.volume);
             if fresh && volume_existed {
@@ -3637,7 +3652,10 @@ pub async fn run() {
                 std::process::exit(1);
             });
             if docker_container_state(&state.container).is_some() {
-                let _ = docker_output(&["rm", "-f", &state.container]);
+                remove_engine_container(&state.container).unwrap_or_else(|error| {
+                    eprintln!("{} {error}", "Failed to stop local Lux engine:".red());
+                    std::process::exit(1);
+                });
                 println!("{} Stopped local Lux engine.", "Done.".green());
             } else {
                 println!("{}", "Local Lux engine is not running.".yellow());

@@ -164,6 +164,11 @@ assert_eq!(&waiter.await??.unwrap().1[..], b"job-1");
 handle.shutdown_and_wait().await?;
 ```
 
+`shutdown_and_wait` stops new work, drains accepted requests for up to 30
+seconds, and performs a checked final journal sync. Hosts that need explicit
+clean-versus-forced reporting can use `shutdown_and_wait_detailed` with their
+own timeout.
+
 Native methods like `get`, `set`, `hget`, `zadd`, `publish`, and `blpop` avoid
 RESP encoding/parsing on the hot path. `EmbeddedPipeline` provides the same
 native path for batched common commands. Use
@@ -176,7 +181,7 @@ because they already run inside the trusted process boundary.
 
 ```bash
 LUX_PASSWORD="$(openssl rand -hex 32)"
-docker run -d -p 6379:6379 -v lux-data:/data \
+docker run -d --stop-timeout 35 -p 6379:6379 -v lux-data:/data \
   -e LUX_PASSWORD="$LUX_PASSWORD" ghcr.io/lux-db/lux:latest
 ```
 
@@ -670,6 +675,7 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 | `LUX_DATA_DIR` | image: `/data`; binary: `.` | Snapshot and journal root; persistent relative paths are resolved at startup |
 | `LUX_DURABILITY` | `always_sync` | Acknowledgement policy: `ephemeral`, `every_second`, or `always_sync` |
 | `LUX_DURABILITY_SYNC_INTERVAL_MS` | `1000` | WAL sync interval for `every_second` (1–1000 ms); invalid for other policies |
+| `LUX_SHUTDOWN_TIMEOUT_MS` | `30000` | Grace period for accepted work during SIGINT/SIGTERM shutdown (1–300000 ms) |
 | `LUX_SAVE_INTERVAL` | `60` | Snapshot interval in seconds (0 to disable) |
 | `LUX_SHARDS` | auto | Next power of two at or above logical CPUs × 16, clamped to 16–1024 |
 | `LUX_MAX_ROWS` | (unlimited) | Optional maximum row count returned by an HTTP table query |

@@ -1,10 +1,31 @@
-fn main() -> std::io::Result<()> {
+fn main() -> std::process::ExitCode {
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     runtime.enable_all();
     if let Some(worker_threads) = runtime_threads_from_env() {
         runtime.worker_threads(worker_threads);
     }
-    runtime.build()?.block_on(async_main())
+    let result = match runtime.build() {
+        Ok(runtime) => runtime.block_on(async_main()),
+        Err(error) => {
+            eprintln!("lux: failed to initialize async runtime: {error}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    match result {
+        Ok(lux::ShutdownOutcome::Clean) => std::process::ExitCode::SUCCESS,
+        Ok(lux::ShutdownOutcome::Forced) => {
+            eprintln!("lux: graceful shutdown timed out; remaining work was cancelled");
+            std::process::ExitCode::from(2)
+        }
+        Err(lux::ShutdownError::Persistence(error)) => {
+            eprintln!("lux: final persistence sync failed: {error}");
+            std::process::ExitCode::from(3)
+        }
+        Err(lux::ShutdownError::Runtime(error)) => {
+            eprintln!("lux: {error}");
+            std::process::ExitCode::from(1)
+        }
+    }
 }
 
 fn runtime_threads_from_env() -> Option<usize> {
@@ -75,7 +96,7 @@ fn parse_durability(
     })
 }
 
-async fn async_main() -> std::io::Result<()> {
+async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
     let password = std::env::var("LUX_PASSWORD").unwrap_or_default();
     let restricted = std::env::var("LUX_RESTRICTED").is_ok_and(|v| {
         let v = v.to_ascii_lowercase();
@@ -92,9 +113,9 @@ async fn async_main() -> std::io::Result<()> {
     let storage_mode = parse_storage_mode(std::env::var("LUX_STORAGE_MODE").ok())?;
     let storage_dir_env = std::env::var("LUX_STORAGE_DIR").ok();
     if storage_mode == lux::StorageMode::Memory && storage_dir_env.is_some() {
-        return Err(invalid_config(
-            "LUX_STORAGE_DIR is valid only when LUX_STORAGE_MODE=tiered",
-        ));
+        return Err(
+            invalid_config("LUX_STORAGE_DIR is valid only when LUX_STORAGE_MODE=tiered").into(),
+        );
     }
     let storage_dir =
         storage_dir_env.unwrap_or_else(|| format!("{}/storage", data_dir.trim_end_matches('/')));
@@ -229,13 +250,69 @@ async fn async_main() -> std::io::Result<()> {
         on_error: Some(std::sync::Arc::new(print_error_event)),
     };
 
+    let shutdown_timeout = shutdown_timeout_from_env()?;
+    // Register signal handlers before recovery starts so a signal received
+    // during slow startup is retained and honored at the first safe lifecycle
+    // boundary. Registration failure is fatal rather than silently falling
+    // back to an ungraceful process termination.
+    let signal = shutdown_signal()?;
+    let signal_task = tokio::spawn(signal);
     let handle = lux::run_with_config(config).await?;
     if let Some(addr) = handle.local_addr() {
         println!("lux v{} ready on {}", env!("CARGO_PKG_VERSION"), addr);
     } else {
         println!("lux v{} ready", env!("CARGO_PKG_VERSION"));
     }
-    handle.wait().await
+    handle
+        .wait_or_shutdown(
+            async move {
+                let _ = signal_task.await;
+            },
+            shutdown_timeout,
+        )
+        .await
+}
+
+fn shutdown_timeout_from_env() -> std::io::Result<std::time::Duration> {
+    parse_shutdown_timeout(std::env::var("LUX_SHUTDOWN_TIMEOUT_MS").ok().as_deref())
+}
+
+fn parse_shutdown_timeout(raw: Option<&str>) -> std::io::Result<std::time::Duration> {
+    let Some(raw) = raw else {
+        return Ok(lux::DEFAULT_SHUTDOWN_TIMEOUT);
+    };
+    let millis = raw.parse::<u64>().map_err(|_| {
+        invalid_config("LUX_SHUTDOWN_TIMEOUT_MS must be an integer from 1 to 300000")
+    })?;
+    if !(1..=300_000).contains(&millis) {
+        return Err(invalid_config(
+            "LUX_SHUTDOWN_TIMEOUT_MS must be from 1 to 300000",
+        ));
+    }
+    Ok(std::time::Duration::from_millis(millis))
+}
+
+#[cfg(unix)]
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    Ok(async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            eprintln!("lux: failed while waiting for interrupt signal: {error}");
+        }
+    })
 }
 
 fn encryption_config_from_env() -> std::io::Result<lux::EncryptionConfig> {
@@ -515,7 +592,8 @@ fn print_error_event(event: lux::ServerErrorEvent) {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_seal_value, parse_durability, parse_encryption_keys_json, parse_storage_mode,
+        decode_seal_value, parse_durability, parse_encryption_keys_json, parse_shutdown_timeout,
+        parse_storage_mode,
     };
 
     #[test]
@@ -590,5 +668,20 @@ mod tests {
             parse_durability(Some("always_sync".to_string()), Some("1000".to_string())).is_err()
         );
         assert!(parse_storage_mode(Some("unknown".to_string())).is_err());
+    }
+
+    #[test]
+    fn shutdown_timeout_is_bounded_and_fails_closed() {
+        assert_eq!(
+            parse_shutdown_timeout(None).unwrap(),
+            lux::DEFAULT_SHUTDOWN_TIMEOUT
+        );
+        assert_eq!(
+            parse_shutdown_timeout(Some("2500")).unwrap(),
+            std::time::Duration::from_millis(2_500)
+        );
+        assert!(parse_shutdown_timeout(Some("0")).is_err());
+        assert!(parse_shutdown_timeout(Some("300001")).is_err());
+        assert!(parse_shutdown_timeout(Some("one second")).is_err());
     }
 }

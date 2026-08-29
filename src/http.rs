@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpSocket;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, watch};
+use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::WebSocketStream;
@@ -58,6 +59,17 @@ pub struct HttpServerConfig {
     pub startup_ready: Option<oneshot::Sender<std::io::Result<std::net::SocketAddr>>>,
 }
 
+#[derive(Clone, Copy)]
+struct RequestLimits {
+    max_rows: Option<usize>,
+    max_body: usize,
+}
+
+struct LiveIdentity {
+    principal: Option<crate::auth::AuthPrincipal>,
+    credential: Option<crate::auth::UserCredential>,
+}
+
 /// Start the HTTP API listener and serve requests forever.
 pub async fn start_http_server(
     config: HttpServerConfig,
@@ -65,6 +77,7 @@ pub async fn start_http_server(
     broker: Broker,
     cache: SharedSchemaCache,
     script_engine: Arc<lua::ScriptEngine>,
+    mut shutdown_rx: watch::Receiver<Option<std::time::Duration>>,
 ) -> std::io::Result<()> {
     let addr: std::net::SocketAddr = format!("{}:{}", config.bind_host, config.http_port)
         .parse()
@@ -87,31 +100,47 @@ pub async fn start_http_server(
     if let Some(on_ready) = config.on_ready {
         on_ready(local_addr);
     }
-    let max_rows = config.max_rows;
-    let max_body = config.max_body;
+    let limits = RequestLimits {
+        max_rows: config.max_rows,
+        max_body: config.max_body,
+    };
 
+    let mut connections = JoinSet::new();
     loop {
-        let (socket, _) = listener.accept().await?;
-        let store = store.clone();
-        let broker = broker.clone();
-        let cache = cache.clone();
-        let script_engine = script_engine.clone();
+        tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            joined = connections.join_next(), if !connections.is_empty() => {
+                let _ = joined;
+            }
+            accepted = listener.accept() => {
+                let (socket, _) = accepted?;
+                let store = store.clone();
+                let broker = broker.clone();
+                let cache = cache.clone();
+                let script_engine = script_engine.clone();
+                let connection_shutdown = shutdown_rx.clone();
 
-        tokio::spawn(async move {
-            let mut stream = socket;
-            while let Ok(true) = handle_request(
-                &mut stream,
-                &store,
-                &broker,
-                &cache,
-                &script_engine,
-                max_rows,
-                max_body,
-            )
-            .await
-            {}
-        });
+                connections.spawn(async move {
+                    let mut stream = socket;
+                    let mut connection_shutdown = connection_shutdown;
+                    while let Ok(true) = handle_request(
+                        &mut stream,
+                        &store,
+                        &broker,
+                        &cache,
+                        &script_engine,
+                        limits,
+                        &mut connection_shutdown,
+                    )
+                    .await
+                    {}
+                });
+            }
+        }
     }
+
+    while connections.join_next().await.is_some() {}
+    Ok(())
 }
 
 fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
@@ -127,8 +156,8 @@ async fn handle_request(
     broker: &Broker,
     cache: &SharedSchemaCache,
     script_engine: &Arc<lua::ScriptEngine>,
-    max_rows: Option<usize>,
-    max_body: usize,
+    limits: RequestLimits,
+    shutdown_rx: &mut watch::Receiver<Option<std::time::Duration>>,
 ) -> std::io::Result<bool> {
     // Hard limits to prevent memory exhaustion DoS
     const MAX_HEADER_SIZE: usize = 64 * 1024; // 64 KB headers
@@ -136,8 +165,21 @@ async fn handle_request(
     let mut buf = vec![0u8; 65536];
     let mut data = Vec::new();
 
+    if shutdown_rx.borrow().is_some() {
+        return Ok(false);
+    }
+
     loop {
-        let n = socket.read(&mut buf).await?;
+        // Before the first byte this is an idle connection. Once any request
+        // bytes arrive, finish that request rather than cutting it off midway.
+        let n = if data.is_empty() {
+            tokio::select! {
+                _ = shutdown_rx.changed() => return Ok(false),
+                read = socket.read(&mut buf) => read?,
+            }
+        } else {
+            socket.read(&mut buf).await?
+        };
         if n == 0 {
             return Ok(false);
         }
@@ -163,7 +205,7 @@ async fn handle_request(
         .and_then(|(_, v)| v.trim().parse().ok())
         .unwrap_or(0);
 
-    if content_length > max_body {
+    if content_length > limits.max_body {
         let body = r#"{"error":"request body too large"}"#;
         return send_json(socket, 413, "Payload Too Large", body).await;
     }
@@ -316,8 +358,11 @@ async fn handle_request(
             store.clone(),
             broker.clone(),
             cache.clone(),
-            live_auth_principal(&auth_context),
-            live_user_credential,
+            LiveIdentity {
+                principal: live_auth_principal(&auth_context),
+                credential: live_user_credential,
+            },
+            shutdown_rx.clone(),
         )
         .await;
     }
@@ -390,7 +435,14 @@ async fn handle_request(
                 let scoped = params_with_where(&params, &combined);
                 let da = decrypt_authorized(&auth_context);
                 return stream_table_query(
-                    socket, table, &scoped, prefer, store, cache, max_rows, da,
+                    socket,
+                    table,
+                    &scoped,
+                    prefer,
+                    store,
+                    cache,
+                    limits.max_rows,
+                    da,
                 )
                 .await;
             }
@@ -1179,8 +1231,8 @@ async fn handle_live_upgrade(
     store: Arc<Store>,
     broker: Broker,
     cache: SharedSchemaCache,
-    principal: Option<crate::auth::AuthPrincipal>,
-    user_credential: Option<crate::auth::UserCredential>,
+    identity: LiveIdentity,
+    shutdown_rx: watch::Receiver<Option<std::time::Duration>>,
 ) -> std::io::Result<bool> {
     let Some(key) = header_value(headers, "sec-websocket-key") else {
         return send_json(
@@ -1202,7 +1254,16 @@ async fn handle_live_upgrade(
     socket.write_all(response.as_bytes()).await?;
 
     let ws = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
-    run_live_socket(ws, store, broker, cache, principal, user_credential).await?;
+    run_live_socket(
+        ws,
+        store,
+        broker,
+        cache,
+        identity.principal,
+        identity.credential,
+        shutdown_rx,
+    )
+    .await?;
     Ok(false)
 }
 
@@ -1213,6 +1274,7 @@ async fn run_live_socket<S>(
     cache: SharedSchemaCache,
     principal: Option<crate::auth::AuthPrincipal>,
     user_credential: Option<crate::auth::UserCredential>,
+    mut shutdown_rx: watch::Receiver<Option<std::time::Duration>>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1227,6 +1289,10 @@ where
 
     loop {
         tokio::select! {
+            _ = shutdown_rx.changed() => {
+                let _ = ws.send(WsMessage::Close(None)).await;
+                break;
+            }
             incoming = ws.next() => {
                 let Some(incoming) = incoming else { break; };
                 let incoming = match incoming {

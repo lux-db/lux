@@ -3,6 +3,7 @@ services:
     build: .
     container_name: lux
     restart: unless-stopped
+    stop_grace_period: 35s
     ports:
       - "6379:6379"
     environment:

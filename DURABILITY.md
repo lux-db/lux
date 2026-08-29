@@ -59,7 +59,36 @@ and storage hardware.
   `persistence_err_wal_fsync` counter, and fences subsequent mutations until
   restart. The configured loss bound cannot be promised for writes accepted
   since the last successful sync when the storage device fails.
-- `ServerHandle::shutdown_and_wait` flushes pending WAL data before returning.
+- `ServerHandle::shutdown_and_wait` stops new work, drains accepted requests,
+  and performs a checked final WAL sync before returning.
+
+## Graceful Shutdown
+
+The standalone server handles SIGINT and SIGTERM. It closes its listeners,
+allows accepted requests to finish within the configured grace period, fences
+later mutations, and then synchronizes the authoritative journal. Embedded
+hosts get the same lifecycle through `ServerHandle::shutdown_and_wait`; use
+`shutdown_and_wait_detailed` to choose a grace period and distinguish a clean
+drain from forced cancellation.
+
+`LUX_SHUTDOWN_TIMEOUT_MS` controls the standalone grace period and defaults to
+30,000 ms. The accepted range is 1 through 300,000 ms. A timeout bounds the
+request-drain phase, not unsafe cancellation cleanup: Lux still waits until
+cancelled mutation tasks can no longer race the final persistence barrier.
+
+Standalone exit status distinguishes the result:
+
+- `0`: clean drain and successful final sync.
+- `2`: the drain deadline elapsed, remaining work was cancelled, and the final
+  sync succeeded.
+- `3`: the final persistence sync failed.
+- `1`: configuration or another runtime failure.
+
+Docker Compose and `lux stop` give the engine 35 seconds to honor the default
+30-second shutdown contract before container removal. Operators that override
+`LUX_SHUTDOWN_TIMEOUT_MS` must set their orchestrator termination grace period
+to a longer value. SIGKILL and sudden process, operating-system, or power loss
+remain crash recovery events and do not run the final sync.
 
 Process crash behavior:
 

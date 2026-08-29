@@ -57,6 +57,7 @@ const RUNTIME_CONFIG: &[RuntimeConfig] = &[
     stable("LUX_RUNTIME_THREADS"),
     stable("LUX_SAVE_INTERVAL"),
     stable("LUX_SHARDS"),
+    stable("LUX_SHUTDOWN_TIMEOUT_MS"),
     stable("LUX_STORAGE_DIR"),
     stable("LUX_STORAGE_MODE"),
 ];

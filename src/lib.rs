@@ -57,6 +57,63 @@ pub use encryption::{EncryptionConfig, EncryptionKeyConfig};
 pub use eviction::{parse_eviction_policy, parse_memory_size, EvictionConfig, EvictionPolicy};
 
 const SUB_MODE_BATCH_MAX: usize = 64;
+
+/// Default grace period for work accepted before runtime shutdown begins.
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Result of a requested server shutdown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownOutcome {
+    /// Every accepted request finished inside the grace period.
+    Clean,
+    /// The grace period elapsed and remaining request tasks were cancelled.
+    Forced,
+}
+
+/// Failure returned by the detailed shutdown API.
+#[derive(Debug)]
+pub enum ShutdownError {
+    /// A listener or runtime task failed independently of the final sync.
+    Runtime(std::io::Error),
+    /// The checked final persistence barrier failed.
+    Persistence(std::io::Error),
+}
+
+impl std::fmt::Display for ShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Runtime(error) => write!(f, "server runtime failed: {error}"),
+            Self::Persistence(error) => write!(f, "final persistence sync failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Runtime(error) | Self::Persistence(error) => Some(error),
+        }
+    }
+}
+
+impl From<std::io::Error> for ShutdownError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+impl ShutdownError {
+    fn into_io_error(self) -> std::io::Error {
+        match self {
+            Self::Runtime(error) => error,
+            Self::Persistence(error) => std::io::Error::new(
+                error.kind(),
+                format!("final persistence sync failed: {error}"),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum LuxError {
     Command(String),
@@ -656,8 +713,8 @@ fn validate_encryption_config(config: &ServerConfig) -> std::io::Result<()> {
 pub struct ServerHandle {
     #[allow(dead_code)]
     runtime: Arc<Runtime>,
-    shutdown_tx: watch::Sender<bool>,
-    server_task: JoinHandle<std::io::Result<()>>,
+    shutdown_tx: watch::Sender<Option<Duration>>,
+    server_task: JoinHandle<Result<ShutdownOutcome, ShutdownError>>,
     local_addr: Option<std::net::SocketAddr>,
 }
 
@@ -722,6 +779,7 @@ struct Runtime {
     schema_cache: SharedSchemaCache,
     script_engine: Arc<lua::ScriptEngine>,
     config: Arc<ServerConfig>,
+    accepting_work: std::sync::atomic::AtomicBool,
 }
 
 pub fn default_shard_count() -> usize {
@@ -746,19 +804,76 @@ impl ServerHandle {
     }
 
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_with_timeout(DEFAULT_SHUTDOWN_TIMEOUT);
+    }
+
+    /// Stop accepting new work and request a bounded graceful drain.
+    pub fn shutdown_with_timeout(&self, timeout: Duration) {
+        self.runtime
+            .accepting_work
+            .store(false, std::sync::atomic::Ordering::Release);
+        let _ = self.shutdown_tx.send(Some(timeout));
     }
 
     pub async fn wait(self) -> std::io::Result<()> {
-        match self.server_task.await {
-            Ok(result) => result,
-            Err(e) => Err(std::io::Error::other(format!("server task failed: {e}"))),
+        match self.wait_detailed().await {
+            Ok(ShutdownOutcome::Clean) => Ok(()),
+            Ok(ShutdownOutcome::Forced) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "graceful shutdown timed out; remaining work was cancelled",
+            )),
+            Err(error) => Err(error.into_io_error()),
         }
     }
 
     pub async fn shutdown_and_wait(self) -> std::io::Result<()> {
         self.shutdown();
         self.wait().await
+    }
+
+    /// Request shutdown with a caller-supplied grace period and preserve the
+    /// clean-versus-forced result.
+    pub async fn shutdown_and_wait_detailed(
+        self,
+        timeout: Duration,
+    ) -> Result<ShutdownOutcome, ShutdownError> {
+        self.shutdown_with_timeout(timeout);
+        self.wait_detailed().await
+    }
+
+    /// Wait for runtime termination or an external signal future, whichever
+    /// happens first. Standalone hosts use this without exposing task internals.
+    pub async fn wait_or_shutdown<F>(
+        mut self,
+        signal: F,
+        timeout: Duration,
+    ) -> Result<ShutdownOutcome, ShutdownError>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        tokio::pin!(signal);
+        tokio::select! {
+            joined = &mut self.server_task => join_server_task(joined),
+            () = &mut signal => {
+                self.shutdown_with_timeout(timeout);
+                join_server_task(self.server_task.await)
+            }
+        }
+    }
+
+    async fn wait_detailed(self) -> Result<ShutdownOutcome, ShutdownError> {
+        join_server_task(self.server_task.await)
+    }
+}
+
+fn join_server_task(
+    joined: Result<Result<ShutdownOutcome, ShutdownError>, tokio::task::JoinError>,
+) -> Result<ShutdownOutcome, ShutdownError> {
+    match joined {
+        Ok(result) => result,
+        Err(error) => Err(ShutdownError::Runtime(std::io::Error::other(format!(
+            "server task failed: {error}"
+        )))),
     }
 }
 
@@ -836,6 +951,7 @@ impl EmbeddedClient {
         &self,
         command: command::Command<'_>,
     ) -> Result<CommandOutput, LuxError> {
+        self.ensure_accepting_work()?;
         if let Some(output) = self.execute_command_fast_path(&command).await? {
             return Ok(output);
         }
@@ -865,6 +981,7 @@ impl EmbeddedClient {
         commands: &[Command<'_>],
         collect_outputs: bool,
     ) -> Result<Vec<CommandOutput>, LuxError> {
+        self.ensure_accepting_work()?;
         if self.runtime.store.is_tiered() {
             let mut outputs = if collect_outputs {
                 Vec::with_capacity(commands.len())
@@ -1297,6 +1414,7 @@ impl EmbeddedClient {
     /// let resp = client.pipeline(&vec![vec![b"PING".to_vec()]]).await?;
     /// ```
     pub async fn pipeline(&self, commands: &[Vec<Vec<u8>>]) -> Result<bytes::Bytes, LuxError> {
+        self.ensure_accepting_work()?;
         let mut write_buf = BytesMut::with_capacity(4096);
         let mut session = self.session.lock().await;
         let now = Instant::now();
@@ -1480,6 +1598,7 @@ impl EmbeddedClient {
         timeout: Duration,
         pop_left: bool,
     ) -> Result<Option<(String, bytes::Bytes)>, LuxError> {
+        self.ensure_accepting_work()?;
         if keys.is_empty() {
             return Err(LuxError::InvalidCommand(
                 "blocking list pop requires at least one key".to_string(),
@@ -1536,6 +1655,7 @@ impl EmbeddedClient {
     }
 
     async fn execute_owned(&self, argv: Vec<Vec<u8>>) -> Result<bytes::Bytes, LuxError> {
+        self.ensure_accepting_work()?;
         let mut write_buf = BytesMut::with_capacity(4096);
         let mut session = self.session.lock().await;
         let now = Instant::now();
@@ -1563,6 +1683,20 @@ impl EmbeddedClient {
             )));
         }
         Ok(write_buf.freeze())
+    }
+
+    fn ensure_accepting_work(&self) -> Result<(), LuxError> {
+        if self
+            .runtime
+            .accepting_work
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Ok(())
+        } else {
+            Err(LuxError::Command(
+                "SERVER shutting down; new work is not accepted".to_string(),
+            ))
+        }
     }
 }
 
@@ -2181,7 +2315,7 @@ pub async fn run_with_config(mut config: ServerConfig) -> std::io::Result<Server
     } else {
         None
     };
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(None);
     let (ready_tx, ready_rx) = oneshot::channel();
     let server_task = tokio::spawn(server_main(listener, config, shutdown_rx, ready_tx));
     let runtime =
@@ -2197,20 +2331,22 @@ pub async fn run_with_config(mut config: ServerConfig) -> std::io::Result<Server
 async fn server_main(
     listener: Option<TcpListener>,
     config: ServerConfig,
-    mut shutdown_rx: watch::Receiver<bool>,
+    mut shutdown_rx: watch::Receiver<Option<Duration>>,
     ready_tx: oneshot::Sender<std::io::Result<Arc<Runtime>>>,
-) -> std::io::Result<()> {
+) -> Result<ShutdownOutcome, ShutdownError> {
     let mut background_tasks = JoinSet::new();
     let runtime = match Runtime::start(config, &mut background_tasks).await {
         Ok(runtime) => runtime,
         Err(error) => {
             let ready_error = std::io::Error::new(error.kind(), error.to_string());
             let _ = ready_tx.send(Err(ready_error));
-            return Err(error);
+            return Err(ShutdownError::Runtime(error));
         }
     };
 
-    if let Some(http_startup_rx) = runtime.start_http_if_enabled(&mut background_tasks) {
+    let mut http_task = None;
+    if let Some((http_startup_rx, task)) = runtime.start_http_if_enabled(shutdown_rx.clone()) {
+        http_task = Some(task);
         if let Err(e) = wait_for_startup(
             http_startup_rx,
             "http server startup failed before readiness signal",
@@ -2219,7 +2355,7 @@ async fn server_main(
         {
             let ready_error = std::io::Error::new(e.kind(), e.to_string());
             let _ = ready_tx.send(Err(ready_error));
-            return Err(e);
+            return Err(ShutdownError::Runtime(e));
         }
     }
     let _ = ready_tx.send(Ok(runtime.clone()));
@@ -2227,27 +2363,47 @@ async fn server_main(
     let mut conn_tasks = JoinSet::new();
     // HTTP binds inside its task, so wait for its one-shot before reporting the
     // whole runtime as ready to embedded callers.
-    if !runtime.config.enable_resp {
+    let mut runtime_failure = None;
+    let shutdown_timeout = if !runtime.config.enable_resp {
         let _ = shutdown_rx.changed().await;
+        shutdown_rx.borrow().unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT)
     } else {
         let listener = listener.expect("listener must exist when RESP is enabled");
-        loop {
+        'accept: loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    break;
+                changed = shutdown_rx.changed() => {
+                    let timeout = if changed.is_ok() {
+                        shutdown_rx.borrow().unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT)
+                    } else {
+                        DEFAULT_SHUTDOWN_TIMEOUT
+                    };
+                    break 'accept timeout;
                 }
                 joined = conn_tasks.join_next(), if !conn_tasks.is_empty() => {
                     let _ = joined;
                 }
                 accepted = listener.accept() => {
-                    let (socket, peer) = accepted?;
+                    let (socket, peer) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            runtime_failure = Some(error);
+                            break 'accept DEFAULT_SHUTDOWN_TIMEOUT;
+                        }
+                    };
                     let runtime = runtime.clone();
                     let on_warn = runtime.config.on_warn.clone();
+                    let connection_shutdown = shutdown_rx.clone();
                     socket.set_nodelay(true).ok();
 
                     conn_tasks.spawn(async move {
                         runtime.store.client_connected();
-                        let result = handle_connection(socket, peer, runtime.clone()).await;
+                        let result = handle_connection(
+                            socket,
+                            peer,
+                            runtime.clone(),
+                            connection_shutdown,
+                        )
+                        .await;
                         runtime.store.client_disconnected();
                         if let Err(e) = result {
                             if e.kind() != std::io::ErrorKind::ConnectionReset {
@@ -2263,17 +2419,66 @@ async fn server_main(
                 }
             }
         }
+    };
+
+    runtime
+        .accepting_work
+        .store(false, std::sync::atomic::Ordering::Release);
+
+    // Maintenance may itself mutate durable state. Cancel it before draining
+    // accepted requests, then wait for cancellation so nothing can race the
+    // final persistence barrier.
+    background_tasks.abort_all();
+
+    let drained = tokio::time::timeout(shutdown_timeout, async {
+        while conn_tasks.join_next().await.is_some() {}
+        while background_tasks.join_next().await.is_some() {}
+        if let Some(task) = http_task.as_mut() {
+            let _ = task.await;
+        }
+    })
+    .await
+    .is_ok();
+
+    if !drained {
+        // The grace period is over. Close the mutation boundary before
+        // cancelling work so anything queued behind an in-flight mutation is
+        // rejected when it wakes instead of crossing the final sync later.
+        runtime.store.begin_shutdown();
+        conn_tasks.abort_all();
+        background_tasks.abort_all();
+        if let Some(task) = &http_task {
+            task.abort();
+        }
+
+        // Cancellation is cooperative. Await every owned task even after the
+        // grace period so final sync can never race code still inside a
+        // mutation. The Store-level shutdown fence prevents a waiting task from
+        // starting a new mutation after the barrier.
+        while conn_tasks.join_next().await.is_some() {}
+        while background_tasks.join_next().await.is_some() {}
+        if let Some(task) = http_task.as_mut() {
+            let _ = task.await;
+        }
     }
 
-    conn_tasks.abort_all();
-    while conn_tasks.join_next().await.is_some() {}
+    // A clean drain has no request or maintenance tasks left. Closing the
+    // mutation boundary here also protects against stale embedded clients.
+    runtime.store.begin_shutdown();
+    runtime
+        .store
+        .finalize_shutdown()
+        .map_err(ShutdownError::Persistence)?;
 
-    background_tasks.abort_all();
-    while background_tasks.join_next().await.is_some() {}
+    if let Some(error) = runtime_failure {
+        return Err(ShutdownError::Runtime(error));
+    }
 
-    runtime.store.fsync_wal_checked()?;
-
-    Ok(())
+    Ok(if drained {
+        ShutdownOutcome::Clean
+    } else {
+        ShutdownOutcome::Forced
+    })
 }
 
 impl Runtime {
@@ -2304,6 +2509,7 @@ impl Runtime {
             schema_cache,
             script_engine,
             config,
+            accepting_work: std::sync::atomic::AtomicBool::new(true),
         });
 
         emit_info(
@@ -2527,8 +2733,11 @@ impl Runtime {
 
     fn start_http_if_enabled(
         self: &Arc<Self>,
-        background_tasks: &mut JoinSet<()>,
-    ) -> Option<oneshot::Receiver<std::io::Result<std::net::SocketAddr>>> {
+        shutdown_rx: watch::Receiver<Option<Duration>>,
+    ) -> Option<(
+        oneshot::Receiver<std::io::Result<std::net::SocketAddr>>,
+        JoinHandle<()>,
+    )> {
         if self.config.http_port == 0 {
             return None;
         }
@@ -2546,7 +2755,7 @@ impl Runtime {
                 as Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>
         });
         let on_error = self.config.on_error.clone();
-        background_tasks.spawn(async move {
+        let task = tokio::spawn(async move {
             let http_config = http::HttpServerConfig {
                 bind_host,
                 http_port,
@@ -2561,6 +2770,7 @@ impl Runtime {
                 http_broker,
                 http_cache,
                 http_script_engine,
+                shutdown_rx,
             )
             .await
             {
@@ -2571,7 +2781,7 @@ impl Runtime {
                 }
             }
         });
-        Some(startup_rx)
+        Some((startup_rx, task))
     }
 }
 
@@ -3378,6 +3588,7 @@ async fn handle_connection(
     mut socket: tokio::net::TcpStream,
     _peer: std::net::SocketAddr,
     runtime: Arc<Runtime>,
+    mut shutdown_rx: watch::Receiver<Option<Duration>>,
 ) -> std::io::Result<()> {
     let store = runtime.store.clone();
     let broker = runtime.broker.clone();
@@ -3401,8 +3612,12 @@ async fn handle_connection(
     );
 
     loop {
+        if shutdown_rx.borrow().is_some() {
+            return Ok(());
+        }
         if session.sub_mode {
             tokio::select! {
+                _ = shutdown_rx.changed() => return Ok(()),
                 result = socket.read(&mut read_buf) => {
                     let n = match result {
                         Ok(0) => return Ok(()),
@@ -3615,7 +3830,14 @@ async fn handle_connection(
                 }
             }
         } else {
-            let n = match socket.read(&mut read_buf).await {
+            // A complete read is accepted work and may finish. The next read is
+            // gated by shutdown so a persistent connection cannot start a new
+            // request after the listener closes.
+            let read = tokio::select! {
+                _ = shutdown_rx.changed() => return Ok(()),
+                result = socket.read(&mut read_buf) => result,
+            };
+            let n = match read {
                 Ok(0) => return Ok(()),
                 Ok(n) => n,
                 Err(e) => return Err(e),
@@ -4310,6 +4532,154 @@ mod persistence_config_tests {
         assert_ne!(
             error.to_string(),
             "server startup failed before readiness signal"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn persistent_embedded_config(root: &std::path::Path) -> ServerConfig {
+        ServerConfig {
+            enable_resp: false,
+            data_dir: root.to_string_lossy().into_owned(),
+            durability: DurabilityConfig {
+                policy: DurabilityPolicy::EverySecond,
+                sync_interval: Duration::from_secs(1),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_shutdown_syncs_acknowledged_every_second_write() {
+        let root = tempfile::tempdir().unwrap();
+        let config = persistent_embedded_config(root.path());
+        let handle = run_with_config(config.clone()).await.unwrap();
+        handle
+            .client()
+            .execute_value("SET", &["shutdown:key", "value"])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            handle
+                .shutdown_and_wait_detailed(Duration::from_secs(2))
+                .await
+                .unwrap(),
+            ShutdownOutcome::Clean
+        );
+
+        let restarted = run_with_config(config).await.unwrap();
+        assert_eq!(
+            restarted
+                .client()
+                .execute_value("GET", &["shutdown:key"])
+                .await
+                .unwrap(),
+            EmbeddedValue::Bulk(bytes::Bytes::from_static(b"value"))
+        );
+        restarted.shutdown_and_wait().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_rejects_new_embedded_work() {
+        let root = tempfile::tempdir().unwrap();
+        let handle = run_with_config(ServerConfig {
+            enable_resp: false,
+            data_dir: root.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let client = handle.client();
+
+        handle.shutdown_with_timeout(Duration::from_secs(2));
+        let error = client.execute("PING", &[]).await.unwrap_err();
+        assert!(error.to_string().contains("shutting down"), "{error}");
+        handle.wait().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_timeout_reports_forced_shutdown() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let handle = run_with_config(ServerConfig {
+            port: 0,
+            http_port: 0,
+            data_dir: root.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut connection = tokio::net::TcpStream::connect(handle.local_addr().unwrap())
+            .await
+            .unwrap();
+        connection
+            .write_all(b"*3\r\n$5\r\nBLPOP\r\n$5\r\nnever\r\n$2\r\n10\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        assert_eq!(
+            handle
+                .shutdown_and_wait_detailed(Duration::from_millis(50))
+                .await
+                .unwrap(),
+            ShutdownOutcome::Forced
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_http_connection_does_not_block_clean_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let http_port = free_port();
+        let handle = run_with_config(ServerConfig {
+            enable_resp: false,
+            http_port,
+            data_dir: root.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let _connection = tokio::net::TcpStream::connect(("127.0.0.1", http_port))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            handle
+                .shutdown_and_wait_detailed(Duration::from_secs(1))
+                .await
+                .unwrap(),
+            ShutdownOutcome::Clean
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_sync_failure_is_not_reported_as_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let handle = run_with_config(persistent_embedded_config(root.path()))
+            .await
+            .unwrap();
+        handle.runtime().store.inject_journal_fsync_failures(1);
+
+        let error = handle
+            .shutdown_and_wait_detailed(Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ShutdownError::Persistence(_)),
+            "unexpected shutdown error: {error}"
         );
     }
 }

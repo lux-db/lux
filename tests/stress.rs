@@ -134,7 +134,7 @@ impl LuxServer {
                 .env("LUX_MAXMEMORY", "256kb")
                 .env("LUX_MAXMEMORY_POLICY", "allkeys-lru");
         }
-        command.spawn().expect("failed to start lux")
+        common::spawn_lux(&mut command).expect("failed to start lux")
     }
 
     fn conn(&self) -> TcpStream {

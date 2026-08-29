@@ -5,7 +5,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,11 +18,21 @@ struct PushServer {
     child: Child,
     dir: std::path::PathBuf,
     keep_dir: bool,
+    log_path: std::path::PathBuf,
 }
 
 impl Drop for PushServer {
     fn drop(&mut self) {
+        let panicking = std::thread::panicking();
+        let status = panicking.then(|| self.child.try_wait().ok().flatten());
         common::terminate_child(&mut self.child);
+        if panicking {
+            eprintln!(
+                "push test engine status before cleanup: {:?}\npush test engine log:\n{}",
+                status.flatten(),
+                std::fs::read_to_string(&self.log_path).unwrap_or_default()
+            );
+        }
         if !self.keep_dir {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
@@ -37,6 +47,8 @@ fn free_port_pair() -> (u16, u16) {
 fn start(dir: &std::path::Path, resp_port: u16, http_port: u16, keep_dir: bool) -> PushServer {
     let bin = common::find_lux_binary();
     std::fs::create_dir_all(dir).unwrap();
+    let log_path = dir.join("engine.log");
+    let log = std::fs::File::create(&log_path).unwrap();
     let mut cmd = common::lux_command(&bin);
     cmd.env("LUX_PORT", resp_port.to_string())
         .env("LUX_HTTP_PORT", http_port.to_string())
@@ -55,15 +67,19 @@ fn start(dir: &std::path::Path, resp_port: u16, http_port: u16, keep_dir: bool) 
         // Integration delivery uses a loopback mock push service. Production
         // defaults reject private and non-HTTPS Web Push endpoints.
         .env("LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS", "1")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let child = cmd.spawn().expect("spawn lux");
-    let server = PushServer {
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    let child = common::spawn_lux(&mut cmd).expect("spawn lux");
+    let mut server = PushServer {
         child,
         dir: dir.to_path_buf(),
         keep_dir,
+        log_path,
     };
     for _ in 0..160 {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            panic!("lux exited during startup ({status}) on RESP {resp_port}, HTTP {http_port}");
+        }
         if TcpStream::connect(("127.0.0.1", http_port)).is_ok()
             && TcpStream::connect(("127.0.0.1", resp_port)).is_ok()
         {
@@ -201,7 +217,7 @@ impl MockApns {
     }
 
     fn start_with_reason(status: u16, reason: &str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = common::bind_registered_ephemeral_listener();
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let reqs = requests.clone();
@@ -1009,6 +1025,8 @@ fn push_registry_survives_restart() {
 fn start_no_auth(dir: &std::path::Path, resp_port: u16, http_port: u16) -> PushServer {
     let bin = common::find_lux_binary();
     std::fs::create_dir_all(dir).unwrap();
+    let log_path = dir.join("engine.log");
+    let log = std::fs::File::create(&log_path).unwrap();
     let mut cmd = common::lux_command(&bin);
     cmd.env("LUX_PORT", resp_port.to_string())
         .env("LUX_HTTP_PORT", http_port.to_string())
@@ -1021,15 +1039,19 @@ fn start_no_auth(dir: &std::path::Path, resp_port: u16, http_port: u16) -> PushS
         .env("LUX_ENCRYPTION_KEY_ID", "push-integration")
         .env("LUX_ENCRYPTION_KEY", "push-integration-secret")
         .env("LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS", "1")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let child = cmd.spawn().expect("spawn lux");
-    let server = PushServer {
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    let child = common::spawn_lux(&mut cmd).expect("spawn lux");
+    let mut server = PushServer {
         child,
         dir: dir.to_path_buf(),
         keep_dir: false,
+        log_path,
     };
     for _ in 0..160 {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            panic!("lux exited during startup ({status}) on RESP {resp_port}, HTTP {http_port}");
+        }
         if TcpStream::connect(("127.0.0.1", http_port)).is_ok()
             && TcpStream::connect(("127.0.0.1", resp_port)).is_ok()
         {

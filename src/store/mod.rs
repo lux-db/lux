@@ -583,6 +583,10 @@ pub struct Store {
     /// Once persistence enters an uncertain state, reject every later mutation
     /// until restart rather than acknowledge writes through an unsafe journal.
     journal_poisoned: std::sync::atomic::AtomicBool,
+    /// Cleared when runtime shutdown begins. Mutation preparation checks this
+    /// both before and after acquiring its journal domains, which turns the
+    /// final shutdown sync into a real fence rather than a best-effort flush.
+    accepting_mutations: std::sync::atomic::AtomicBool,
     restoring: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     journal_failures_to_inject: AtomicUsize,
@@ -944,6 +948,7 @@ impl Store {
             wal_suppress: std::sync::atomic::AtomicBool::new(false),
             replaying_wal: std::sync::atomic::AtomicBool::new(false),
             journal_poisoned: std::sync::atomic::AtomicBool::new(false),
+            accepting_mutations: std::sync::atomic::AtomicBool::new(true),
             restoring: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             journal_failures_to_inject: AtomicUsize::new(0),
@@ -1522,6 +1527,28 @@ impl Store {
         }
     }
 
+    pub(crate) fn begin_shutdown(&self) {
+        self.accepting_mutations.store(false, Ordering::Release);
+    }
+
+    fn ensure_accepting_mutations(&self) -> std::io::Result<()> {
+        if self.accepting_mutations.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "database is shutting down; mutations are no longer accepted",
+            ))
+        }
+    }
+
+    /// Wait for every mutation domain to leave its journal/apply section, then
+    /// force the authoritative journal to stable storage. A mutation that was
+    /// still waiting for a domain when shutdown began fails its second
+    /// `ensure_accepting_mutations` check and cannot cross this barrier later.
+    pub(crate) fn finalize_shutdown(&self) -> std::io::Result<()> {
+        self.with_write_barrier(|_| self.fsync_wal_checked())
+    }
+
     fn poison_journal(&self) {
         self.journal_poisoned.store(true, Ordering::Release);
     }
@@ -1886,6 +1913,7 @@ impl Store {
         &'a self,
         commands: &[&[&[u8]]],
     ) -> std::io::Result<JournalPrepareGuard<'a>> {
+        self.ensure_accepting_mutations()?;
         self.ensure_not_restoring()?;
         self.ensure_journal_healthy()?;
         let bypassed = self.wal_suppress.load(Ordering::Relaxed)
@@ -1899,6 +1927,7 @@ impl Store {
                 .map(|&index| self.journal_gates[index].lock())
                 .collect()
         };
+        self.ensure_accepting_mutations()?;
         self.ensure_not_restoring()?;
         self.ensure_journal_healthy()?;
         Ok(JournalPrepareGuard {
@@ -7845,5 +7874,91 @@ mod tests {
             .unwrap());
         worker.join().unwrap();
         assert_eq!(store.get(b"key", now()).unwrap(), b"after".as_slice());
+    }
+
+    #[test]
+    fn shutdown_barrier_waits_for_inflight_mutation_and_syncs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::EverySecond,
+                sync_interval: Duration::from_secs(1),
+            },
+            ..crate::ServerConfig::default()
+        });
+        let store = Arc::new(Store::new_with_config(config.clone()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let command: [&[u8]; 3] = [b"SET", b"shutdown:key", b"value"];
+        let worker_store = store.clone();
+        let worker = std::thread::spawn(move || {
+            let apply_store = worker_store.clone();
+            worker_store.commit_journaled(&command, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                apply_store.set(b"shutdown:key", b"value", None, now());
+            })
+        });
+
+        entered_rx.recv().unwrap();
+        store.begin_shutdown();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let final_store = store.clone();
+        let finalizer = std::thread::spawn(move || {
+            done_tx.send(final_store.finalize_shutdown()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        release_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        finalizer.join().unwrap();
+
+        let rejected: [&[u8]; 3] = [b"SET", b"shutdown:late", b"lost"];
+        assert!(store
+            .commit_journaled(&rejected, || {
+                store.set(b"shutdown:late", b"lost", None, now())
+            })
+            .is_err());
+        drop(store);
+
+        let recovered = Store::new_with_config(config);
+        recovered.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        assert_eq!(
+            recovered.get(b"shutdown:key", now()).unwrap(),
+            b"value".as_slice()
+        );
+        assert!(recovered.get(b"shutdown:late", now()).is_none());
+    }
+
+    #[test]
+    fn mutation_waiting_for_a_domain_is_rechecked_after_shutdown() {
+        let store = Arc::new(Store::new());
+        let command: [&[u8]; 3] = [b"SET", b"same-key", b"value"];
+        let held = store.prepare_journaled(&command).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiting_store = store.clone();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = waiting_store.prepare_journaled(&command).map(drop);
+            done_tx.send(result).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        store.begin_shutdown();
+        drop(held);
+
+        let error = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("shutting down"), "{error}");
+        waiter.join().unwrap();
     }
 }
