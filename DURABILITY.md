@@ -126,9 +126,11 @@ Snapshot behavior:
   stream, plus the one successor generation authorized for the following
   rotation. Recovery skips the included prefix if the old generation survived
   a crash, or replays the complete authorized successor after rotation.
-- A missing, empty, or unrelated journal beside a journal-aware snapshot
-  rejects startup without creating or rewriting recovery files. This prevents
-  journal deletion or substitution from looking like a successful rotation.
+- A missing, empty, or unrelated journal recorded by a snapshot rejects startup
+  without creating or rewriting recovery files. Pre-global snapshots may create
+  the global journal only when they never recorded one. This prevents journal
+  deletion or substitution from looking like a successful rotation while
+  preserving the one-way upgrade from legacy per-shard journals.
 
 ## WAL Replay
 

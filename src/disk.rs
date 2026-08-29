@@ -125,6 +125,67 @@ pub(crate) struct WalCheckpoint {
     pub successor_generation: Option<[u8; WAL_GENERATION_LEN]>,
 }
 
+impl WalCheckpoint {
+    /// Create a checkpoint for a snapshot produced without an active journal.
+    /// The generations still bind a later persistent restore to one exact
+    /// journal, while the ephemeral source remains journal-free.
+    pub(crate) fn detached() -> Self {
+        let generation = new_wal_generation();
+        Self {
+            generation,
+            offset: WAL_HEADER_LEN,
+            successor_generation: Some(new_wal_generation_except(generation)),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod fault_injection {
+    use std::cell::Cell;
+    use std::io;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Point {
+        BeforeRotateRename,
+        AfterRotateRename,
+    }
+
+    thread_local! {
+        static POINT: Cell<Option<Point>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            POINT.set(None);
+        }
+    }
+
+    pub(crate) fn inject(point: Point) -> Guard {
+        POINT.with(|slot| {
+            assert!(
+                slot.replace(Some(point)).is_none(),
+                "fault already injected"
+            );
+        });
+        Guard
+    }
+
+    pub(crate) fn check(point: Point) -> io::Result<()> {
+        POINT.with(|slot| {
+            if slot.get() == Some(point) {
+                slot.set(None);
+                Err(io::Error::other(format!(
+                    "injected journal rotation failure at {point:?}"
+                )))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
 /// Result of scanning a WAL file for replay.
 pub struct WalReplay {
     pub commands: Vec<Vec<Vec<u8>>>,
@@ -187,7 +248,14 @@ impl Wal {
                 "invalid zero WAL generation",
             ));
         }
-        Self::open_in(dir.join(name), true, Some(generation))
+        let wal = Self::open_in(dir.join(name), true, Some(generation))?;
+        if wal.generation != generation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "existing WAL generation does not match the requested generation",
+            ));
+        }
+        Ok(wal)
     }
 
     fn open_in(
@@ -718,6 +786,11 @@ impl Wal {
             let _ = fs::remove_file(&tmp);
             return Err(error);
         }
+        #[cfg(test)]
+        if let Err(error) = fault_injection::check(fault_injection::Point::BeforeRotateRename) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
         if let Err(error) = fs::rename(&tmp, &self.path) {
             let _ = fs::remove_file(&tmp);
             return Err(error);
@@ -729,6 +802,8 @@ impl Wal {
         self.frame_format = WalFrameFormat::Guarded;
         self.header_len = WAL_HEADER_LEN;
         self.generation = generation;
+        #[cfg(test)]
+        fault_injection::check(fault_injection::Point::AfterRotateRename)?;
         sync_directory(
             self.path
                 .parent()
@@ -2176,6 +2251,110 @@ mod tests {
         wal.truncate().unwrap();
         let error = wal.replay_from(Some(checkpoint)).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn create_with_generation_refuses_an_existing_different_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_generation = [1; WAL_GENERATION_LEN];
+        let requested_generation = [2; WAL_GENERATION_LEN];
+        drop(Wal::create_named_with_generation(dir.path(), "global", first_generation).unwrap());
+
+        let error = Wal::create_named_with_generation(dir.path(), "global", requested_generation)
+            .err()
+            .expect("an existing different journal must not satisfy an exact-generation create");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut reopened = Wal::open_named_existing(dir.path(), "global").unwrap();
+        assert_eq!(reopened.generation, first_generation);
+        assert!(reopened.replay().unwrap().commands.is_empty());
+    }
+
+    #[test]
+    fn exact_generation_create_rejects_invalid_identity_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let generation = [1; WAL_GENERATION_LEN];
+
+        for name in ["", "bad/name", "bad name"] {
+            let error = Wal::create_named_with_generation(dir.path(), name, generation)
+                .err()
+                .expect("an invalid WAL name must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+
+        let error = Wal::create_named_with_generation(dir.path(), "global", LEGACY_WAL_GENERATION)
+            .err()
+            .expect("a zero generation must never identify a new journal");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!dir.path().join("global").exists());
+    }
+
+    #[test]
+    fn named_journal_open_rejects_invalid_names_in_both_modes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for name in ["", "bad/name", "bad name"] {
+            let create_error = Wal::open_named(dir.path(), name)
+                .err()
+                .expect("an invalid new WAL name must be rejected");
+            assert_eq!(create_error.kind(), io::ErrorKind::InvalidInput);
+
+            let existing_error = Wal::open_named_existing(dir.path(), name)
+                .err()
+                .expect("an invalid existing WAL name must be rejected");
+            assert_eq!(existing_error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn existing_empty_journal_is_never_initialized_during_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("global");
+        fs::create_dir_all(&wal_dir).unwrap();
+        fs::write(wal_dir.join("wal.lux"), []).unwrap();
+
+        let error = Wal::open_named_existing(dir.path(), "global")
+            .err()
+            .expect("an empty existing journal must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::metadata(wal_dir.join("wal.lux")).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn rotation_rejects_every_unauthorized_generation_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open_named(dir.path(), "global").unwrap();
+        wal.append_command(&[b"SET", b"preserved", b"value"])
+            .unwrap();
+        let checkpoint = wal.checkpoint().unwrap();
+        let original_generation = wal.generation;
+
+        let mut wrong_current = checkpoint;
+        wrong_current.generation = [9; WAL_GENERATION_LEN];
+        let error = wal.rotate_after(wrong_current).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut missing_successor = checkpoint;
+        missing_successor.successor_generation = None;
+        let error = wal.rotate_after(missing_successor).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        for replacement in [LEGACY_WAL_GENERATION, original_generation] {
+            let mut invalid_successor = checkpoint;
+            invalid_successor.successor_generation = Some(replacement);
+            let error = wal.rotate_after(invalid_successor).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+
+        assert_eq!(wal.generation, original_generation);
+        assert_eq!(
+            wal.replay().unwrap().commands,
+            vec![vec![
+                b"SET".to_vec(),
+                b"preserved".to_vec(),
+                b"value".to_vec()
+            ]]
+        );
     }
 
     #[test]

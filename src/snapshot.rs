@@ -1,5 +1,5 @@
 use crate::store::{DumpValue, Store};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, BufRead, BufWriter, Read, Seek, SeekFrom, Write};
@@ -34,6 +34,61 @@ const RESTORE_MARKER: &str = ".lux-restore.pending";
 const RESTORE_MARKER_TMP: &str = ".lux-restore.pending.tmp";
 const RESTORE_STAGED_SNAPSHOT: &str = ".lux-restore.snapshot";
 
+#[cfg(test)]
+mod fault_injection {
+    use std::cell::Cell;
+    use std::io;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum Point {
+        BeforeSnapshotRename,
+        AfterSnapshotRename,
+        BeforeRestoreMarkerRename,
+        AfterRestoreMarkerRename,
+        BeforeRestoreSnapshotRename,
+        AfterRestoreSnapshotRename,
+        BeforeJournalInstall,
+        AfterJournalInstall,
+        BeforeMarkerRemove,
+        AfterMarkerRemove,
+    }
+
+    thread_local! {
+        static POINT: Cell<Option<Point>> = const { Cell::new(None) };
+    }
+
+    pub(super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            POINT.set(None);
+        }
+    }
+
+    pub(super) fn inject(point: Point) -> Guard {
+        POINT.with(|slot| {
+            assert!(
+                slot.replace(Some(point)).is_none(),
+                "fault already injected"
+            );
+        });
+        Guard
+    }
+
+    pub(super) fn check(point: Point) -> io::Result<()> {
+        POINT.with(|slot| {
+            if slot.get() == Some(point) {
+                slot.set(None);
+                Err(io::Error::other(format!(
+                    "injected snapshot failure at {point:?}"
+                )))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
 /// Wall-clock now in epoch milliseconds (for absolute TTL deadlines).
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -51,26 +106,42 @@ fn snapshot_path_for_config(config: &crate::ServerConfig) -> std::path::PathBuf 
     Path::new(&config.data_dir).join("lux.dat")
 }
 
-/// Whether an installed snapshot belongs to a journal-aware format. Opening a
-/// missing journal next to one of these snapshots would manufacture a new,
-/// empty recovery history before the snapshot can be validated.
-pub(crate) fn requires_existing_journal(config: &crate::ServerConfig) -> io::Result<bool> {
+/// Journal names whose generations are represented by the installed snapshot.
+/// Startup must open these files without creating them: manufacturing an empty
+/// replacement would erase the only evidence of post-snapshot writes. Older
+/// snapshots without a global checkpoint may still create the global journal
+/// as part of the one-way upgrade from per-shard journals.
+pub(crate) fn required_existing_journals(
+    config: &crate::ServerConfig,
+) -> io::Result<HashSet<String>> {
     let path = snapshot_path_for_config(config);
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
         Err(error) => return Err(error),
     };
     let mut header = [0u8; 4];
     let read = file.read(&mut header)?;
     if read < header.len() {
-        // The snapshot is corrupt and normal startup will reject it. Refuse to
-        // alter the neighboring journal while reaching that diagnosis.
-        return Ok(true);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot is truncated before its header",
+        ));
     }
-    Ok([HEADER_V4, HEADER_V5, HEADER_V6]
-        .iter()
-        .any(|known| header == **known))
+
+    let checkpoints = if &header == HEADER_V6 || &header == HEADER_V5 {
+        let body_len = read_u64(&mut file)?;
+        let mut expected_digest = [0u8; SNAPSHOT_DIGEST_LEN];
+        file.read_exact(&mut expected_digest)?;
+        verify_snapshot_body(&mut file, body_len, &expected_digest)?;
+        let mut reader = io::BufReader::new(file.take(body_len));
+        read_wal_checkpoints(&mut reader, &header == HEADER_V6)?
+    } else if &header == HEADER_V4 {
+        read_wal_checkpoints(&mut io::BufReader::new(file), false)?
+    } else {
+        return Ok(HashSet::new());
+    };
+    Ok(checkpoints.into_keys().collect())
 }
 
 fn restore_marker_path(config: &crate::ServerConfig) -> std::path::PathBuf {
@@ -223,7 +294,17 @@ fn save_entries(
     let mut w = BufWriter::new(file);
     save_snapshot_binary(&mut w, entries, store, checkpoints)?;
     w.into_inner().map_err(io::Error::other)?.sync_all()?;
-    fs::rename(&tmp, &path)?;
+    #[cfg(test)]
+    if let Err(error) = fault_injection::check(fault_injection::Point::BeforeSnapshotRename) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    #[cfg(test)]
+    fault_injection::check(fault_injection::Point::AfterSnapshotRename)?;
     if let Some(parent) = Path::new(&path).parent() {
         crate::disk::sync_directory(parent)?;
     }
@@ -239,7 +320,10 @@ pub(crate) fn save_and_truncate_wal_consistent(store: &Store) -> io::Result<usiz
             return Err(io::Error::other("database restore is in progress"));
         }
         let now = Instant::now();
-        let checkpoints = store.wal_checkpoints()?;
+        let mut checkpoints = store.wal_checkpoints()?;
+        if checkpoints.is_empty() {
+            checkpoints.push(("global".to_string(), crate::disk::WalCheckpoint::detached()));
+        }
         let entries = store.dump_all_from_locked_shards(shards, now)?;
         let saved = save_entries(store, &entries, &checkpoints)?;
         store.truncate_wal(&checkpoints)?;
@@ -325,7 +409,11 @@ fn stage_restore(config: &crate::ServerConfig, dump: &[u8]) -> io::Result<()> {
     let mut file = fs::File::create(&marker_tmp)?;
     file.write_all(b"LUX-RESTORE-1")?;
     file.sync_all()?;
+    #[cfg(test)]
+    fault_injection::check(fault_injection::Point::BeforeRestoreMarkerRename)?;
     fs::rename(&marker_tmp, &marker)?;
+    #[cfg(test)]
+    fault_injection::check(fault_injection::Point::AfterRestoreMarkerRename)?;
     crate::disk::sync_directory(data_dir)
 }
 
@@ -356,7 +444,11 @@ fn apply_pending_restore(config: &crate::ServerConfig, finalize: bool) -> io::Re
     let destination = snapshot_path_for_config(config);
     if staged.exists() {
         validate_restore_reader(config, fs::File::open(&staged)?)?;
+        #[cfg(test)]
+        fault_injection::check(fault_injection::Point::BeforeRestoreSnapshotRename)?;
         fs::rename(&staged, &destination)?;
+        #[cfg(test)]
+        fault_injection::check(fault_injection::Point::AfterRestoreSnapshotRename)?;
         crate::disk::sync_directory(data_dir)?;
     } else {
         validate_restore_reader(config, fs::File::open(&destination)?)?;
@@ -366,9 +458,17 @@ fn apply_pending_restore(config: &crate::ServerConfig, finalize: bool) -> io::Re
     purge_lux_state_dirs(&journal_dir)?;
     if finalize {
         if config.durability.policy.is_persistent() {
+            #[cfg(test)]
+            fault_injection::check(fault_injection::Point::BeforeJournalInstall)?;
             install_restored_journal(config)?;
+            #[cfg(test)]
+            fault_injection::check(fault_injection::Point::AfterJournalInstall)?;
         }
+        #[cfg(test)]
+        fault_injection::check(fault_injection::Point::BeforeMarkerRemove)?;
         fs::remove_file(marker)?;
+        #[cfg(test)]
+        fault_injection::check(fault_injection::Point::AfterMarkerRemove)?;
         crate::disk::sync_directory(data_dir)?;
     }
     Ok(())
@@ -838,6 +938,12 @@ fn read_wal_checkpoints(
                 "snapshot contains duplicate WAL checkpoints",
             ));
         }
+    }
+    if has_successor && !checkpoints.contains_key("global") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "journal-bound snapshot is missing the global WAL checkpoint",
+        ));
     }
     Ok(checkpoints)
 }
@@ -1780,6 +1886,336 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum SaveFailurePoint {
+        Snapshot(fault_injection::Point),
+        Journal(crate::disk::fault_injection::Point),
+    }
+
+    fn commit_counter(store: &Store, key: &[u8], count: usize) {
+        let command: [&[u8]; 2] = [b"INCR", key];
+        for _ in 0..count {
+            store
+                .commit_journaled(&command, || store.incr(key, 1, Instant::now()))
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    fn assert_counter_recovers(config: Arc<crate::ServerConfig>, key: &[u8], expected: &[u8]) {
+        let recovered = Store::try_new_with_config(config).unwrap();
+        load_for_recovery(&recovered).unwrap();
+        recovered.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        assert_eq!(recovered.get(key, Instant::now()).unwrap(), expected);
+    }
+
+    #[test]
+    fn every_snapshot_and_rotation_failure_state_recovers_exactly() {
+        let cases = [
+            SaveFailurePoint::Snapshot(fault_injection::Point::BeforeSnapshotRename),
+            SaveFailurePoint::Snapshot(fault_injection::Point::AfterSnapshotRename),
+            SaveFailurePoint::Journal(crate::disk::fault_injection::Point::BeforeRotateRename),
+            SaveFailurePoint::Journal(crate::disk::fault_injection::Point::AfterRotateRename),
+        ];
+
+        for (index, point) in cases.into_iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = Arc::new(crate::ServerConfig {
+                data_dir: dir.path().to_string_lossy().into_owned(),
+                durability: crate::DurabilityConfig {
+                    policy: crate::DurabilityPolicy::AlwaysSync,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let store = Store::try_new_with_config(config.clone()).unwrap();
+            let key = format!("failure-state-{index}");
+            commit_counter(&store, key.as_bytes(), 3);
+            save_and_truncate_wal_consistent(&store).unwrap();
+            commit_counter(&store, key.as_bytes(), 2);
+
+            let result = match point {
+                SaveFailurePoint::Snapshot(point) => {
+                    let _fault = fault_injection::inject(point);
+                    save_and_truncate_wal_consistent(&store)
+                }
+                SaveFailurePoint::Journal(point) => {
+                    let _fault = crate::disk::fault_injection::inject(point);
+                    save_and_truncate_wal_consistent(&store)
+                }
+            };
+            assert!(result.is_err(), "fault {point:?} did not interrupt SAVE");
+
+            let late_command: [&[u8]; 2] = [b"INCR", key.as_bytes()];
+            let late_write = store.commit_journaled(&late_command, || {
+                store.incr(key.as_bytes(), 1, Instant::now())
+            });
+            let expected = match point {
+                SaveFailurePoint::Snapshot(_) => {
+                    late_write
+                        .expect("snapshot installation failures leave the journal writable")
+                        .unwrap();
+                    b"6".as_slice()
+                }
+                SaveFailurePoint::Journal(_) => {
+                    assert!(
+                        late_write.is_err(),
+                        "a failed journal rotation must fence later writes"
+                    );
+                    b"5".as_slice()
+                }
+            };
+
+            drop(store);
+            assert_counter_recovers(config, key.as_bytes(), expected);
+        }
+    }
+
+    #[test]
+    fn failed_snapshot_rename_cleans_its_temporary_file() {
+        let (store, data_dir, _guard) = store_in_temp_dir(crate::StorageMode::Memory);
+        commit_counter(&store, b"tmp-cleanup", 1);
+        let _fault = fault_injection::inject(fault_injection::Point::BeforeSnapshotRename);
+        assert!(save_and_truncate_wal_consistent(&store).is_err());
+        let leftovers: Vec<_> = fs::read_dir(data_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "failed SAVE left {leftovers:?}");
+    }
+
+    #[test]
+    fn operating_system_snapshot_rename_failure_cleans_its_temporary_file() {
+        let (store, data_dir, _guard) = store_in_temp_dir(crate::StorageMode::Memory);
+        commit_counter(&store, b"rename-cleanup", 1);
+        fs::create_dir(data_dir.join("lux.dat")).unwrap();
+
+        let error = save_and_truncate_wal_consistent(&store)
+            .expect_err("renaming a snapshot over a directory must fail");
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        let leftovers: Vec<_> = fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "failed SAVE left {leftovers:?}");
+        assert!(data_dir.join("lux.dat").is_dir());
+    }
+
+    #[test]
+    fn truncated_snapshot_header_blocks_journal_initialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        fs::write(dir.path().join("lux.dat"), b"LUX").unwrap();
+
+        let error = required_existing_journals(&config)
+            .expect_err("a corrupt snapshot must fail before journal initialization");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_open_errors_propagate_before_journal_creation() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        symlink("lux.dat", dir.path().join("lux.dat")).unwrap();
+
+        let error = required_existing_journals(&config)
+            .expect_err("an unreadable snapshot path must not be treated as absent");
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    fn legacy_snapshot_with_checkpoints(
+        header: &[u8; 4],
+        checkpoints: &[(String, crate::disk::WalCheckpoint)],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        write_u32(&mut body, checkpoints.len() as u32).unwrap();
+        for (name, checkpoint) in checkpoints {
+            write_bytes(&mut body, name.as_bytes()).unwrap();
+            body.extend_from_slice(&checkpoint.generation);
+            write_u64(&mut body, checkpoint.offset).unwrap();
+        }
+
+        if header == HEADER_V4 {
+            [header.as_slice(), body.as_slice()].concat()
+        } else {
+            let mut snapshot = header.to_vec();
+            snapshot.extend_from_slice(&(body.len() as u64).to_le_bytes());
+            snapshot.extend_from_slice(&Sha256::digest(&body));
+            snapshot.extend_from_slice(&body);
+            snapshot
+        }
+    }
+
+    #[test]
+    fn legacy_snapshot_inventory_distinguishes_pre_global_formats() {
+        let unbound_dir = tempfile::tempdir().unwrap();
+        let unbound_config = crate::ServerConfig {
+            data_dir: unbound_dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        fs::write(unbound_dir.path().join("lux.dat"), HEADER).unwrap();
+        assert!(required_existing_journals(&unbound_config)
+            .unwrap()
+            .is_empty());
+
+        let checkpoint = crate::disk::WalCheckpoint {
+            generation: [1; 16],
+            offset: 42,
+            successor_generation: None,
+        };
+        for header in [HEADER_V4, HEADER_V5] {
+            for (checkpoints, expected) in [
+                (Vec::new(), Vec::new()),
+                (vec![("shard_0".to_string(), checkpoint)], vec!["shard_0"]),
+                (vec![("global".to_string(), checkpoint)], vec!["global"]),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let config = crate::ServerConfig {
+                    data_dir: dir.path().to_string_lossy().into_owned(),
+                    ..Default::default()
+                };
+                fs::write(
+                    dir.path().join("lux.dat"),
+                    legacy_snapshot_with_checkpoints(header, &checkpoints),
+                )
+                .unwrap();
+
+                let actual = required_existing_journals(&config).unwrap();
+                assert_eq!(actual.len(), expected.len());
+                for name in expected {
+                    assert!(actual.contains(name));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pre_global_snapshot_upgrades_without_losing_legacy_journal_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut legacy = crate::disk::Wal::open(&config.journal_dir(), 0).unwrap();
+        let checkpoint = legacy.checkpoint().unwrap();
+        legacy
+            .append_command(&[b"SET", b"legacy-upgrade", b"preserved"])
+            .unwrap();
+        legacy.fsync().unwrap();
+        drop(legacy);
+        fs::write(
+            dir.path().join("lux.dat"),
+            legacy_snapshot_with_checkpoints(HEADER_V4, &[("shard_0".to_string(), checkpoint)]),
+        )
+        .unwrap();
+
+        let store = Store::try_new_with_config(config.clone()).unwrap();
+        assert_eq!(load_for_recovery(&store).unwrap(), 0);
+        store.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        assert_eq!(
+            store.get(b"legacy-upgrade", Instant::now()).unwrap(),
+            b"preserved".as_slice()
+        );
+        assert!(config.journal_dir().join("global/wal.lux").is_file());
+    }
+
+    #[test]
+    fn missing_checkpointed_legacy_journal_fails_before_global_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let checkpoint = crate::disk::WalCheckpoint {
+            generation: [1; 16],
+            offset: 42,
+            successor_generation: None,
+        };
+        fs::write(
+            dir.path().join("lux.dat"),
+            legacy_snapshot_with_checkpoints(HEADER_V4, &[("shard_0".to_string(), checkpoint)]),
+        )
+        .unwrap();
+
+        let error = Store::try_new_with_config(config.clone())
+            .err()
+            .expect("a snapshot-recorded legacy journal must not be ignored");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!config.journal_dir().join("global").exists());
+    }
+
+    #[test]
+    fn v6_writer_requires_an_authorized_successor_generation() {
+        let (store, _data_dir, _guard) = store_in_temp_dir(crate::StorageMode::Memory);
+        let checkpoint = crate::disk::WalCheckpoint {
+            generation: [1; 16],
+            offset: 0,
+            successor_generation: None,
+        };
+        let mut output = io::Cursor::new(Vec::new());
+
+        let error = save_snapshot_binary(
+            &mut output,
+            &[],
+            &store,
+            &[("global".to_string(), checkpoint)],
+        )
+        .expect_err("V6 must not serialize an unbound checkpoint");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn v6_reader_rejects_zero_and_repeated_successor_generations() {
+        let current = [1; 16];
+        for successor in [[0; 16], current] {
+            let mut body = Vec::new();
+            write_u32(&mut body, 1).unwrap();
+            write_bytes(&mut body, b"global").unwrap();
+            body.extend_from_slice(&current);
+            write_u64(&mut body, 0).unwrap();
+            body.extend_from_slice(&successor);
+
+            let error = read_wal_checkpoints(&mut io::Cursor::new(body), true)
+                .expect_err("an invalid successor generation must fail closed");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn legacy_checkpoint_reader_preserves_the_unbound_format() {
+        let current = [1; 16];
+        let mut body = Vec::new();
+        write_u32(&mut body, 1).unwrap();
+        write_bytes(&mut body, b"global").unwrap();
+        body.extend_from_slice(&current);
+        write_u64(&mut body, 42).unwrap();
+
+        let checkpoints = read_wal_checkpoints(&mut io::Cursor::new(body), false).unwrap();
+        let checkpoint = checkpoints.get("global").unwrap();
+        assert_eq!(checkpoint.generation, current);
+        assert_eq!(checkpoint.offset, 42);
+        assert_eq!(checkpoint.successor_generation, None);
+    }
+
     #[test]
     fn malformed_v4_checkpoint_metadata_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
@@ -2291,14 +2727,12 @@ mod tests {
     // guard once accepted only V1 and V3, silently rejecting V2 backups.
     #[test]
     fn restore_accepts_all_known_headers_rejects_junk() {
-        for header in [
-            HEADER_V1, HEADER_V2, HEADER, HEADER_V4, HEADER_V5, HEADER_V6,
-        ] {
+        for header in [HEADER_V1, HEADER_V2, HEADER, HEADER_V4, HEADER_V5] {
             let (store, dir, _g) = store_in_temp_dir(crate::StorageMode::Memory);
             let mut dump = header.to_vec();
             if header == HEADER_V4 {
                 dump.extend_from_slice(&0u32.to_le_bytes());
-            } else if header == HEADER_V5 || header == HEADER_V6 {
+            } else if header == HEADER_V5 {
                 let body = 0u32.to_le_bytes();
                 dump.extend_from_slice(&(body.len() as u64).to_le_bytes());
                 dump.extend_from_slice(&Sha256::digest(body));
@@ -2324,6 +2758,205 @@ mod tests {
             .expect_err("a valid header must not make a corrupt body restorable");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(!store.is_restoring());
+    }
+
+    fn restored_v6_snapshot() -> Vec<u8> {
+        let (source, data_dir, _guard) = store_in_temp_dir(crate::StorageMode::Memory);
+        let command: [&[u8]; 3] = [b"SET", b"restored-key", b"restored-value"];
+        source
+            .commit_journaled(&command, || {
+                source.set(b"restored-key", b"restored-value", None, Instant::now())
+            })
+            .unwrap();
+        save_and_truncate_wal_consistent(&source).unwrap();
+        fs::read(data_dir.join("lux.dat")).unwrap()
+    }
+
+    #[test]
+    fn v6_restore_failure_boundaries_retry_to_exact_state() {
+        let points = [
+            fault_injection::Point::BeforeRestoreMarkerRename,
+            fault_injection::Point::AfterRestoreMarkerRename,
+            fault_injection::Point::BeforeRestoreSnapshotRename,
+            fault_injection::Point::AfterRestoreSnapshotRename,
+            fault_injection::Point::BeforeJournalInstall,
+            fault_injection::Point::AfterJournalInstall,
+            fault_injection::Point::BeforeMarkerRemove,
+            fault_injection::Point::AfterMarkerRemove,
+        ];
+        let dump = restored_v6_snapshot();
+
+        for point in points {
+            let dir = tempfile::tempdir().unwrap();
+            let config = Arc::new(crate::ServerConfig {
+                data_dir: dir.path().to_string_lossy().into_owned(),
+                durability: crate::DurabilityConfig {
+                    policy: crate::DurabilityPolicy::AlwaysSync,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let store = Store::try_new_with_config(config.clone()).unwrap();
+            let stale: [&[u8]; 3] = [b"SET", b"stale-key", b"stale-value"];
+            store
+                .commit_journaled(&stale, || {
+                    store.set(b"stale-key", b"stale-value", None, Instant::now())
+                })
+                .unwrap();
+
+            let interrupted = match point {
+                fault_injection::Point::BeforeRestoreMarkerRename
+                | fault_injection::Point::AfterRestoreMarkerRename
+                | fault_injection::Point::BeforeRestoreSnapshotRename
+                | fault_injection::Point::AfterRestoreSnapshotRename => {
+                    let _fault = fault_injection::inject(point);
+                    restore_to_disk(&store, &dump)
+                }
+                _ => {
+                    restore_to_disk(&store, &dump).unwrap();
+                    let _fault = fault_injection::inject(point);
+                    complete_pending_restore(&config)
+                }
+            };
+            assert!(
+                interrupted.is_err(),
+                "fault {point:?} did not interrupt restore"
+            );
+            drop(store);
+
+            complete_pending_restore(&config).unwrap();
+            let recovered = Store::try_new_with_config(config).unwrap();
+            let loaded = load_for_recovery(&recovered).unwrap();
+            recovered.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+            if point == fault_injection::Point::BeforeRestoreMarkerRename {
+                assert_eq!(loaded, 0, "the uncommitted restore loaded a snapshot");
+                assert_eq!(
+                    recovered.get(b"stale-key", Instant::now()).unwrap(),
+                    b"stale-value".as_slice(),
+                    "a restore interrupted before its commit marker lost old state"
+                );
+                assert!(recovered.get(b"restored-key", Instant::now()).is_none());
+                continue;
+            }
+
+            assert_eq!(loaded, 1, "fault {point:?} did not finish the restore");
+            assert_eq!(
+                recovered.get(b"restored-key", Instant::now()).unwrap(),
+                b"restored-value".as_slice()
+            );
+            assert!(recovered.get(b"stale-key", Instant::now()).is_none());
+        }
+    }
+
+    #[test]
+    fn rolled_back_unsynced_restore_marker_preserves_old_state() {
+        let dump = restored_v6_snapshot();
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let store = Store::try_new_with_config(config.clone()).unwrap();
+        let stale: [&[u8]; 3] = [b"SET", b"old-state", b"preserved"];
+        store
+            .commit_journaled(&stale, || {
+                store.set(b"old-state", b"preserved", None, Instant::now())
+            })
+            .unwrap();
+
+        let _fault = fault_injection::inject(fault_injection::Point::AfterRestoreMarkerRename);
+        assert!(restore_to_disk(&store, &dump).is_err());
+        fs::rename(
+            restore_marker_path(&config),
+            Path::new(&config.data_dir).join(RESTORE_MARKER_TMP),
+        )
+        .unwrap();
+        drop(store);
+
+        complete_pending_restore(&config).unwrap();
+        let recovered = Store::try_new_with_config(config).unwrap();
+        assert_eq!(load_for_recovery(&recovered).unwrap(), 0);
+        recovered.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        assert_eq!(
+            recovered.get(b"old-state", Instant::now()).unwrap(),
+            b"preserved".as_slice()
+        );
+        assert!(recovered.get(b"restored-key", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn ephemeral_snapshot_restores_into_one_bound_persistent_journal() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_config = Arc::new(crate::ServerConfig {
+            data_dir: source_dir.path().to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::Ephemeral,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let source = Store::try_new_with_config(source_config).unwrap();
+        source.set(b"ephemeral-backup", b"value", None, Instant::now());
+        save_and_truncate_wal_consistent(&source).unwrap();
+        let dump = fs::read(source_dir.path().join("lux.dat")).unwrap();
+        assert_eq!(&dump[..HEADER_V6.len()], HEADER_V6);
+        drop(source);
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_config = Arc::new(crate::ServerConfig {
+            data_dir: target_dir.path().to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let target = Store::try_new_with_config(target_config.clone()).unwrap();
+        restore_to_disk(&target, &dump).unwrap();
+        drop(target);
+        complete_pending_restore(&target_config).unwrap();
+
+        let recovered = Store::try_new_with_config(target_config.clone()).unwrap();
+        assert_eq!(load_for_recovery(&recovered).unwrap(), 1);
+        recovered.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        assert_eq!(
+            recovered.get(b"ephemeral-backup", Instant::now()).unwrap(),
+            b"value".as_slice()
+        );
+        drop(recovered);
+
+        let donor_dir = tempfile::tempdir().unwrap();
+        drop(crate::disk::Wal::open_named(donor_dir.path(), "global").unwrap());
+        fs::copy(
+            donor_dir.path().join("global/wal.lux"),
+            target_config.journal_dir().join("global/wal.lux"),
+        )
+        .unwrap();
+        let rejected = Store::try_new_with_config(target_config).unwrap();
+        load_for_recovery(&rejected).unwrap();
+        assert!(
+            rejected.replay_wal(&crate::pubsub::Broker::new()).is_err(),
+            "the restored snapshot must reject an unrelated journal generation"
+        );
+    }
+
+    #[test]
+    fn v6_snapshot_without_a_global_checkpoint_fails_closed() {
+        let body = 0u32.to_le_bytes();
+        let mut dump = HEADER_V6.to_vec();
+        dump.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        dump.extend_from_slice(&Sha256::digest(body));
+        dump.extend_from_slice(&body);
+
+        let (store, _dir, _guard) = store_in_temp_dir(crate::StorageMode::Memory);
+        let error = validate_restore_dump(&store, &dump)
+            .expect_err("V6 must never silently degrade to an unbound journal");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("global WAL checkpoint"));
     }
 
     // Restore must drop only Lux-owned persistence dirs, never sibling files: a

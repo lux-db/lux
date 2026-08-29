@@ -4860,7 +4860,7 @@ mod tests {
         // PEXPIRE intentionally installs a later absolute deadline.
         exec_wal(&store, &[b"APPEND", b"preserved", b"-suffix"]);
         exec_wal(&store, &[b"SET", b"revived", b"new"]);
-        exec_wal(&store, &[b"PEXPIRE", b"retimed", b"5000"]);
+        exec_wal(&store, &[b"PEXPIRE", b"retimed", b"60000"]);
         store.fsync_wal();
         std::thread::sleep(Duration::from_millis(140));
 
