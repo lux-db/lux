@@ -54,6 +54,51 @@ SHA-256.
 
 RESP parity is available under `LUX MIGRATE LIST|PLAN|APPLY|REPAIR`.
 
+## Snapshot and restore
+
+Full-instance backup and restore use the strongest configured management
+credential. An engine with a password requires the operator password. A
+project-key-only engine requires a secret key. A bare loopback engine with no
+configured credential remains accessible to its local operator.
+
+`GET /v1/snapshot` creates a consistent current-format snapshot and streams it
+as `application/octet-stream`. The response includes:
+
+- `X-Lux-Snapshot-SHA256`: SHA-256 of the exact streamed bytes
+- `X-Lux-Snapshot-Format`: binary snapshot format version
+
+`POST /v1/restore` accepts a Lux snapshot as `application/octet-stream` and an
+optional `X-Lux-Snapshot-SHA256` header. It validates and stages the complete
+snapshot without changing the running database. Success is `202 Accepted`:
+
+```json
+{
+  "staged": true,
+  "restart_required": true,
+  "restore_id": "...",
+  "source_bytes": 1234,
+  "staged_bytes": 1250,
+  "entries": 42,
+  "source_format": 5,
+  "format": 6,
+  "source_sha256": "...",
+  "sha256": "..."
+}
+```
+
+`GET /v1/restore` reports whether a validated restore is pending and returns
+the restore id, source and staged checksums, byte lengths, and format versions.
+Clients must compare `source_sha256` before treating a lost `POST` response or
+`409 Conflict` as an idempotent retry.
+
+The host must then gracefully restart Lux. Startup revalidates the staged
+artifact, preserves the complete current state as a rollback, atomically
+installs the replacement, and creates only the successor journal authorized by
+that snapshot. The request handler never exits the process. A second staging
+request returns `409 Conflict` while one is pending; malformed, truncated, or
+checksum-mismatched payloads return `400 Bad Request`; insufficient staging
+space returns `507 Insufficient Storage`.
+
 ## Push configuration
 
 The operator-only configuration surface never returns provider secrets:

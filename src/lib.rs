@@ -27,6 +27,7 @@ mod migrations;
 mod pubsub;
 mod push;
 mod resp;
+mod restore;
 mod shard_exec;
 mod snapshot;
 mod store;
@@ -2540,7 +2541,7 @@ impl Runtime {
         persistence_locks: Vec<std::fs::File>,
         background_tasks: &mut JoinSet<()>,
     ) -> std::io::Result<Arc<Self>> {
-        snapshot::complete_pending_restore(&config)?;
+        restore::commit_pending_restore(&config)?;
         if config.storage.mode == StorageMode::Tiered && config.durability.policy.is_persistent() {
             // Tiered files are a derived placement cache. Recovery is driven
             // solely by the verified snapshot and ordered journal; retaining

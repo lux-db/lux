@@ -204,13 +204,18 @@ async fn handle_request(
         .and_then(|l| l.split_once(':'))
         .and_then(|(_, v)| v.trim().parse().ok())
         .unwrap_or(0);
+    let (method, full_path, headers) = parse_http_head(&header_str);
+    drop(header_str);
 
     if content_length > limits.max_body {
         let body = r#"{"error":"request body too large"}"#;
         return send_json(socket, 413, "Payload Too Large", body).await;
     }
 
-    let total_needed = header_end + content_length;
+    let Some(total_needed) = header_end.checked_add(content_length) else {
+        let body = r#"{"error":"request body size overflow"}"#;
+        return send_json(socket, 413, "Payload Too Large", body).await;
+    };
     while data.len() < total_needed {
         let n = socket.read(&mut buf).await?;
         if n == 0 {
@@ -218,16 +223,16 @@ async fn handle_request(
         }
         data.extend_from_slice(&buf[..n]);
     }
-
-    let request = String::from_utf8_lossy(&data);
-
-    let (method, full_path, headers, body) = parse_http_request(&request);
+    if data.len() < total_needed {
+        let body = r#"{"error":"request body is shorter than Content-Length"}"#;
+        return send_json(socket, 400, "Bad Request", body).await;
+    }
 
     if method == "OPTIONS" {
         let response = "HTTP/1.1 204 No Content\r\n\
              Access-Control-Allow-Origin: *\r\n\
              Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
-             Access-Control-Allow-Headers: Authorization, Content-Type, Prefer, apikey\r\n\
+             Access-Control-Allow-Headers: Authorization, Content-Type, Prefer, apikey, X-Lux-Snapshot-SHA256\r\n\
              Content-Length: 0\r\n\r\n"
             .to_string();
         socket.write_all(response.as_bytes()).await?;
@@ -239,6 +244,14 @@ async fn handle_request(
         None => (full_path.clone(), String::new()),
     };
     let params = parse_query_string(&query_string);
+    let is_restore = method == "POST" && matches!(path.as_str(), "/v1/restore" | "/restore");
+    // Restore is the only binary request surface. Do not lossy-decode and copy
+    // a potentially large snapshot merely to parse the HTTP head.
+    let body = if is_restore {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&data[header_end..total_needed]).into_owned()
+    };
 
     if path.starts_with("/auth/v1") {
         let response = crate::auth::route_http_response(
@@ -371,28 +384,108 @@ async fn handle_request(
     // the full response string in memory first.
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
-    // Full-instance restore. The raw request body is a lux.dat dump; read it
-    // straight from the buffer to avoid the lossy String conversion. Operator-
-    // only. On success the process exits so the container restart reloads from
-    // the restored dump via the standard startup path.
-    if method == "POST" && matches!(segments.as_slice(), ["v1", "restore"] | ["restore"]) {
-        let password_set = !store.config().password.is_empty();
-        if password_set && !matches!(auth_context, HttpAuthContext::Operator) {
-            let body = r#"{"error":"restore requires operator credentials"}"#;
+    if method == "GET" && matches!(segments.as_slice(), ["v1", "restore"] | ["restore"]) {
+        if !snapshot_management_authorized(store, cache, &auth_context) {
+            let body = r#"{"error":"restore status requires management credentials"}"#;
             return send_json(socket, 403, "Forbidden", body).await;
         }
-        let end = (header_end + content_length).min(data.len());
-        let dump = &data[header_end..end];
-        match crate::snapshot::restore_to_disk(store, dump) {
-            Ok(()) => {
-                let _ = send_json(socket, 200, "OK", r#"{"restored":true}"#).await;
-                let _ = socket.flush().await;
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                std::process::exit(0);
+        let restore_store = store.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::restore::pending_restore_status(&restore_store)
+        })
+        .await
+        {
+            Ok(Ok(Some(pending))) => {
+                let body = json!({
+                    "pending": true,
+                    "restart_required": true,
+                    "restore_id": pending.id,
+                    "source_bytes": pending.source_len,
+                    "staged_bytes": pending.payload_len,
+                    "source_format": pending.source_format,
+                    "format": pending.format,
+                    "source_sha256": pending.source_sha256,
+                    "sha256": pending.sha256,
+                })
+                .to_string();
+                return send_json(socket, 200, "OK", &body).await;
+            }
+            Ok(Ok(None)) => {
+                return send_json(socket, 200, "OK", r#"{"pending":false}"#).await;
+            }
+            Ok(Err(error)) => {
+                let body = format!(
+                    r#"{{"error":"restore status failed: {}"}}"#,
+                    escape_json(&error.to_string())
+                );
+                return send_json(socket, 500, "Internal Server Error", &body).await;
+            }
+            Err(error) => {
+                let body = format!(
+                    r#"{{"error":"restore status task failed: {}"}}"#,
+                    escape_json(&error.to_string())
+                );
+                return send_json(socket, 500, "Internal Server Error", &body).await;
+            }
+        }
+    }
+
+    // Full-instance restore. Validation and staging do not mutate the running
+    // database. The host must gracefully restart the engine; startup then
+    // preserves the old state before atomically committing the replacement.
+    if is_restore {
+        if !snapshot_management_authorized(store, cache, &auth_context) {
+            let body = r#"{"error":"restore requires management credentials"}"#;
+            return send_json(socket, 403, "Forbidden", body).await;
+        }
+        let checksum = headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("x-lux-snapshot-sha256"))
+            .map(|(_, value)| value.clone());
+        let restore_store = store.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::restore::stage_restore(
+                &restore_store,
+                &data[header_end..total_needed],
+                checksum.as_deref(),
+            )
+        })
+        .await
+        {
+            Ok(Ok(staged)) => {
+                let body = json!({
+                    "staged": true,
+                    "restart_required": true,
+                    "restore_id": staged.id,
+                    "source_bytes": staged.source_len,
+                    "staged_bytes": staged.payload_len,
+                    "entries": staged.entries,
+                    "source_format": staged.source_format,
+                    "format": staged.format,
+                    "source_sha256": staged.source_sha256,
+                    "sha256": staged.sha256,
+                })
+                .to_string();
+                return send_json(socket, 202, "Accepted", &body).await;
+            }
+            Ok(Err(e)) => {
+                let (status, status_text) = match e.kind() {
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => {
+                        (400, "Bad Request")
+                    }
+                    std::io::ErrorKind::AlreadyExists => (409, "Conflict"),
+                    std::io::ErrorKind::StorageFull => (507, "Insufficient Storage"),
+                    _ => (500, "Internal Server Error"),
+                };
+                let body = format!(
+                    r#"{{"error":"restore failed: {}"}}"#,
+                    escape_json(&e.to_string())
+                );
+                return send_json(socket, status, status_text, &body).await;
             }
             Err(e) => {
                 let body = format!(
-                    r#"{{"error":"restore failed: {}"}}"#,
+                    r#"{{"error":"restore task failed: {}"}}"#,
                     escape_json(&e.to_string())
                 );
                 return send_json(socket, 500, "Internal Server Error", &body).await;
@@ -405,10 +498,10 @@ async fn handle_request(
             ["v1", "snapshot"] | ["snapshot"] => {
                 // Full-instance backup. Streams a consistent dump out over HTTP
                 // so the control plane never needs a shell in the container.
-                // Operator-only when a password is set (it exposes all data).
-                let password_set = !store.config().password.is_empty();
-                if password_set && !matches!(auth_context, HttpAuthContext::Operator) {
-                    let body = r#"{"error":"snapshot requires operator credentials"}"#;
+                // This exposes all data, so only the strongest configured
+                // management credential may use it.
+                if !snapshot_management_authorized(store, cache, &auth_context) {
+                    let body = r#"{"error":"snapshot requires management credentials"}"#;
                     return send_json(socket, 403, "Forbidden", body).await;
                 }
                 return stream_snapshot(socket, store).await;
@@ -541,6 +634,20 @@ async fn handle_request(
     send_json(socket, status, status_text, &result).await
 }
 
+fn snapshot_management_authorized(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    context: &HttpAuthContext,
+) -> bool {
+    if !store.config().password.is_empty() {
+        matches!(context, HttpAuthContext::Operator)
+    } else if crate::auth::project_keys_configured(store, cache) {
+        matches!(context, HttpAuthContext::Secret)
+    } else {
+        true
+    }
+}
+
 /// Stream a table query response using chunked transfer encoding.
 /// Writes rows directly to the socket as they come out of table_select,
 /// without ever building the full JSON string in memory.
@@ -553,47 +660,52 @@ async fn stream_snapshot(
     store: &Arc<Store>,
 ) -> std::io::Result<bool> {
     let store = store.clone();
-    let path =
-        match tokio::task::spawn_blocking(move || crate::snapshot::snapshot_for_backup(&store))
-            .await
-        {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => {
-                let body = format!(
-                    r#"{{"error":"snapshot failed: {}"}}"#,
-                    escape_json(&e.to_string())
-                );
-                return send_json(socket, 500, "Internal Server Error", &body).await;
-            }
-            Err(e) => {
-                let body = format!(
-                    r#"{{"error":"snapshot task panicked: {}"}}"#,
-                    escape_json(&e.to_string())
-                );
-                return send_json(socket, 500, "Internal Server Error", &body).await;
-            }
-        };
+    let artifact = match tokio::task::spawn_blocking(move || {
+        crate::snapshot::snapshot_for_backup_artifact(&store)
+    })
+    .await
+    {
+        Ok(Ok(artifact)) => artifact,
+        Ok(Err(e)) => {
+            let body = format!(
+                r#"{{"error":"snapshot failed: {}"}}"#,
+                escape_json(&e.to_string())
+            );
+            return send_json(socket, 500, "Internal Server Error", &body).await;
+        }
+        Err(e) => {
+            let body = format!(
+                r#"{{"error":"snapshot task panicked: {}"}}"#,
+                escape_json(&e.to_string())
+            );
+            return send_json(socket, 500, "Internal Server Error", &body).await;
+        }
+    };
 
-    let mut file =
-        match crate::file_security::open_private_file(std::path::Path::new(&path), |options| {
-            options.read(true);
-        }) {
-            Ok(file) => tokio::fs::File::from_std(file),
-            Err(e) => {
-                let body = format!(
-                    r#"{{"error":"snapshot open failed: {}"}}"#,
-                    escape_json(&e.to_string())
-                );
-                return send_json(socket, 500, "Internal Server Error", &body).await;
-            }
-        };
+    let sha256 = artifact.sha256_hex();
+    let format = artifact.format.version();
+    let expected_len = artifact.len;
+    let mut file = tokio::fs::File::from_std(artifact.file);
     let len = file.metadata().await?.len();
+    if len != expected_len {
+        return send_json(
+            socket,
+            500,
+            "Internal Server Error",
+            r#"{"error":"snapshot changed before it could be streamed"}"#,
+        )
+        .await;
+    }
     let header = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/octet-stream\r\n\
          Content-Disposition: attachment; filename=\"lux.dat\"\r\n\
          Access-Control-Allow-Origin: *\r\n\
-         Content-Length: {len}\r\n\r\n"
+         Access-Control-Expose-Headers: X-Lux-Snapshot-SHA256, X-Lux-Snapshot-Format\r\n\
+         X-Lux-Snapshot-SHA256: {}\r\n\
+         X-Lux-Snapshot-Format: {}\r\n\
+         Content-Length: {len}\r\n\r\n",
+        sha256, format
     );
     socket.write_all(header.as_bytes()).await?;
     tokio::io::copy(&mut file, socket).await?;
@@ -803,12 +915,8 @@ async fn send_auth_response(
     Ok(true)
 }
 
-fn parse_http_request(raw: &str) -> (String, String, Vec<(String, String)>, String) {
-    let parts: Vec<&str> = raw.splitn(2, "\r\n\r\n").collect();
-    let header_section = parts[0];
-    let body = parts.get(1).unwrap_or(&"").to_string();
-
-    let mut lines = header_section.lines();
+fn parse_http_head(raw: &str) -> (String, String, Vec<(String, String)>) {
+    let mut lines = raw.lines();
     let request_line = lines.next().unwrap_or("");
     let mut tokens = request_line.split_whitespace();
     let method = tokens.next().unwrap_or("GET").to_string();
@@ -821,7 +929,7 @@ fn parse_http_request(raw: &str) -> (String, String, Vec<(String, String)>, Stri
         }
     }
 
-    (method, path, headers, body)
+    (method, path, headers)
 }
 
 fn parse_query_string(qs: &str) -> Vec<(String, String)> {
@@ -5004,6 +5112,7 @@ fn escape_json(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::tables::JoinType;
+    use sha2::{Digest, Sha256};
 
     #[tokio::test]
     async fn snapshot_stream_serves_the_securely_opened_installed_file() {
@@ -5037,6 +5146,16 @@ mod tests {
             .unwrap();
 
         assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let headers = String::from_utf8(response[..body_start].to_vec()).unwrap();
+        let checksum = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("X-Lux-Snapshot-SHA256: ").map(str::trim))
+            .expect("snapshot checksum header");
+        assert_eq!(
+            checksum,
+            format!("{:x}", Sha256::digest(&response[body_start..]))
+        );
+        assert!(headers.contains("X-Lux-Snapshot-Format: 6\r\n"));
         assert!(response[body_start..].starts_with(b"LUX\x06"));
     }
 

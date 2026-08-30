@@ -64,6 +64,11 @@ enum Commands {
         #[arg(long, help = "Also delete the local data volume (fresh DB next start)")]
         clear: bool,
     },
+    /// Restore the local engine from a Lux snapshot, preserving the current state as a rollback.
+    Restore {
+        #[arg(value_name = "SNAPSHOT")]
+        file: PathBuf,
+    },
     /// Open Lux Studio (local web UI) against the running local engine.
     Studio {
         #[arg(long, help = "Don't open a browser window")]
@@ -1519,6 +1524,45 @@ fn wait_for_local_ready(state: &LocalState) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     false
+}
+
+async fn pending_local_restore(state: &LocalState) -> Result<serde_json::Value, String> {
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/restore", state.lux_url()))
+        .header("Authorization", format!("Bearer {}", state.password))
+        .send()
+        .await
+        .map_err(|error| format!("could not read restore status: {error}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("invalid restore status response: {error}"))?;
+    if !status.is_success() {
+        return Err(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("the engine rejected the restore status request")
+            .to_string());
+    }
+    Ok(body)
+}
+
+fn restore_confirmation_matches(confirmation: &serde_json::Value, source_sha256: &str) -> bool {
+    let accepted = confirmation.get("staged").and_then(|value| value.as_bool()) == Some(true)
+        || confirmation
+            .get("pending")
+            .and_then(|value| value.as_bool())
+            == Some(true);
+    accepted
+        && confirmation
+            .get("restart_required")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        && confirmation
+            .get("source_sha256")
+            .and_then(|value| value.as_str())
+            .is_some_and(|checksum| checksum.eq_ignore_ascii_case(source_sha256))
 }
 
 /// Poll until the Studio container's HTTP port accepts connections (nginx up).
@@ -3632,6 +3676,129 @@ pub async fn run() {
                 let _ = docker_output(&["volume", "rm", &state.volume]);
                 println!("{} Cleared data volume {}.", "Done.".green(), state.volume);
             }
+        }
+
+        Commands::Restore { file } => {
+            if let Err(error) = docker_preflight() {
+                eprintln!("{} {error}", "Error:".red());
+                std::process::exit(1);
+            }
+            let state = load_local_state().unwrap_or_else(|| {
+                eprintln!(
+                    "{} No local engine found. Start it first with {}.",
+                    "Error:".red(),
+                    "lux start".cyan()
+                );
+                std::process::exit(1);
+            });
+            if docker_container_state(&state.container).as_deref() != Some("running") {
+                eprintln!(
+                    "{} The local engine must be running so it can validate and stage the snapshot.",
+                    "Error:".red()
+                );
+                std::process::exit(1);
+            }
+            let snapshot = std::fs::read(&file).unwrap_or_else(|error| {
+                eprintln!(
+                    "{} Could not read {}: {error}",
+                    "Error:".red(),
+                    file.display()
+                );
+                std::process::exit(1);
+            });
+            let source_sha256 = sha256_bytes(&snapshot);
+            println!(
+                "{} Validating and staging {}...",
+                "...".dimmed(),
+                file.display()
+            );
+            let response = reqwest::Client::new()
+                .post(format!("{}/v1/restore", state.lux_url()))
+                .header("Authorization", format!("Bearer {}", state.password))
+                .header("Content-Type", "application/octet-stream")
+                .header("X-Lux-Snapshot-SHA256", &source_sha256)
+                .body(snapshot)
+                .send()
+                .await;
+            let confirmation = match response {
+                Ok(response) => {
+                    let status = response.status();
+                    let parsed = response.json::<serde_json::Value>().await;
+                    match (status.as_u16(), parsed) {
+                        (202, Ok(body)) if restore_confirmation_matches(&body, &source_sha256) => {
+                            body
+                        }
+                        // A lost/malformed success response or an idempotent retry
+                        // is safe only when the engine reports this exact source.
+                        (202 | 409, _) => {
+                            pending_local_restore(&state).await.unwrap_or_else(|error| {
+                                eprintln!("{} {error}", "Restore failed:".red());
+                                std::process::exit(1);
+                            })
+                        }
+                        (_, Ok(body)) => {
+                            let message = body
+                                .get("error")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("the engine rejected the snapshot");
+                            eprintln!("{} {message}", "Restore failed:".red());
+                            std::process::exit(1);
+                        }
+                        (_, Err(error)) => {
+                            eprintln!("{} Invalid restore response: {error}", "Error:".red());
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(request_error) => {
+                    pending_local_restore(&state)
+                        .await
+                        .unwrap_or_else(|status_error| {
+                            eprintln!(
+                                "{} Staging response was lost ({request_error}); {status_error}",
+                                "Restore failed:".red()
+                            );
+                            std::process::exit(1);
+                        })
+                }
+            };
+            if !restore_confirmation_matches(&confirmation, &source_sha256) {
+                eprintln!(
+                    "{} Engine does not have this exact snapshot staged; the running database was not restarted.",
+                    "Restore failed:".red()
+                );
+                std::process::exit(1);
+            }
+
+            println!(
+                "{} Snapshot staged. Restarting the local engine...",
+                "Done.".green()
+            );
+            remove_engine_container(&state.container).unwrap_or_else(|error| {
+                eprintln!("{} {error}", "Failed to stop local Lux engine:".red());
+                std::process::exit(1);
+            });
+            run_local_engine_container(&state).unwrap_or_else(|error| {
+                eprintln!("{} {error}", "Failed to restart local Lux engine:".red());
+                std::process::exit(1);
+            });
+            if !wait_for_local_ready(&state) {
+                eprintln!(
+                    "{} Restore did not become ready. The pre-restore state is retained; inspect {}.",
+                    "Error:".red(),
+                    format!("docker logs {}", state.container).cyan()
+                );
+                std::process::exit(1);
+            }
+            refresh_local_profile(&state).unwrap_or_else(|error| {
+                eprintln!("{} {error}", "Failed to refresh local env profile:".red());
+                std::process::exit(1);
+            });
+            println!(
+                "{} Local snapshot restored and rollback state retained.",
+                "Done.".green()
+            );
+            print_connection_block(&state);
         }
 
         Commands::Login { token } => {
@@ -6937,6 +7104,11 @@ fn sha256_hash(content: &str) -> String {
     format!("{digest:x}")
 }
 
+fn sha256_bytes(content: &[u8]) -> String {
+    let digest = Sha256::digest(content);
+    format!("{digest:x}")
+}
+
 fn legacy_djb2_hash(content: &str) -> String {
     let mut hash: u64 = 5381;
     for byte in content.bytes() {
@@ -7827,6 +7999,39 @@ engine_version = "1.0.0"
             } => assert_eq!(c.project.as_deref(), Some("dialog")),
             _ => panic!("expected Migrate::Run"),
         }
+    }
+
+    #[test]
+    fn restore_is_an_explicit_local_snapshot_command() {
+        let cli =
+            Cli::try_parse_from(["lux", "restore", "backups/lux.dat"]).expect("restore parses");
+        match cli.command {
+            Commands::Restore { file } => {
+                assert_eq!(file, PathBuf::from("backups/lux.dat"));
+            }
+            _ => panic!("expected Restore"),
+        }
+    }
+
+    #[test]
+    fn restore_reconciliation_requires_the_exact_source_checksum() {
+        let accepted = serde_json::json!({
+            "staged": true,
+            "restart_required": true,
+            "source_sha256": "aabbcc",
+        });
+        let pending = serde_json::json!({
+            "pending": true,
+            "restart_required": true,
+            "source_sha256": "AABBCC",
+        });
+        assert!(restore_confirmation_matches(&accepted, "aabbcc"));
+        assert!(restore_confirmation_matches(&pending, "aabbcc"));
+        assert!(!restore_confirmation_matches(&pending, "different"));
+        assert!(!restore_confirmation_matches(
+            &serde_json::json!({"pending": false}),
+            "aabbcc"
+        ));
     }
 
     #[test]

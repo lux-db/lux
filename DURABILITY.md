@@ -199,21 +199,30 @@ across a crash boundary.
 
 Restore behavior:
 
-- Restore fully validates Lux snapshots in the current and older binary formats
-  before committing them for installation.
-- Restore writes a new `lux.dat` snapshot atomically.
-- A durable restore marker makes startup finish snapshot installation and stale
-  persistence cleanup before opening any WAL or tiered shard after a crash.
-- Startup installs a clean journal bound to the restored snapshot before it
-  removes that marker, so restored state enters the normal strict recovery path.
-- Restore purges only Lux-owned legacy `shard_*` and current `global` journal or
-  tiered-storage directories, never the storage parent or unrelated files.
-- After restore, stale WAL or cold tiered data must not overwrite restored
-  state on restart.
-- Once a restore is accepted, writes and snapshots are rejected until the
-  process restarts into the restored state.
-- Operators should restart the process after restore so startup rebuilds state
-  from the restored snapshot.
+- The HTTP request validates the complete payload, optional transport SHA-256,
+  encryption compatibility, format compatibility, and required free space
+  before publishing a pending restore.
+- Supported older snapshots are rewritten into the current checksummed format
+  with a new, explicitly authorized successor journal. The staged artifact is
+  read back and hashed before the request returns `202 Accepted`.
+- Staging does not mutate or freeze the running database. Writes and snapshots
+  continue normally until the operator performs a graceful restart.
+- A pending restore is bound to the exact data directory, journal directory,
+  storage layout, and native-encryption state/seal paths that staged it.
+  Changing any of them rejects startup before existing state moves.
+- Startup moves the current snapshot and complete journal/tiered state into
+  `restore-backups/<restore-id>` on the same filesystems before installing the
+  replacement. Persisted native-encryption state and any local seal are copied
+  into that rollback as verified private files. Unrelated files in a
+  tiered-storage root are never moved.
+- The backup marker, snapshot installation, successor-journal installation,
+  and pending-marker removal are each durable and idempotent. A crash at any
+  boundary resumes the same restore on the next startup.
+- Startup validates the staged artifact again before moving old state and after
+  installing it. Corruption fails closed while the pre-restore backup remains
+  recoverable.
+- Restore requires a persistent durability policy. Ephemeral instances have no
+  durable state boundary on which a transactional restore can rely.
 
 ## Tiered Storage
 
@@ -255,11 +264,14 @@ Backup:
 
 Restore:
 
-1. Stop writes.
-2. POST the snapshot to the operator restore endpoint or place `lux.dat`
-   according to deployment tooling.
-3. Restart Lux.
-4. Verify startup logs, `INFO`, and application-level invariants.
+1. Record the snapshot SHA-256 and POST it to the authenticated restore endpoint
+   using `X-Lux-Snapshot-SHA256`. A `202` response means staged, not installed.
+2. Gracefully restart Lux. Do not kill the process: shutdown must finish its
+   normal durability barrier before startup captures the rollback state.
+3. Wait for normal readiness, then verify `INFO` and application invariants.
+4. Keep the pre-restore backup until the replacement has been independently
+   verified. Local Docker users can run `lux restore <snapshot>` to perform the
+   staging, graceful restart, and readiness check as one operation.
 
 Upgrade:
 

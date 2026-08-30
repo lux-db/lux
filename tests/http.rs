@@ -130,8 +130,7 @@ fn http_restore_requires_operator_and_validates_payload() {
     let (status, _) = http_request(http, "POST", "/v1/restore", Some("garbage"), None);
     assert_eq!(status, 401, "restore must require auth");
 
-    // Operator with a non-snapshot body is rejected before anything is touched
-    // (and crucially before the success path, which exits the process).
+    // Operator with a non-snapshot body is rejected before anything is staged.
     let (status, body) = http_request(
         http,
         "POST",
@@ -139,11 +138,35 @@ fn http_restore_requires_operator_and_validates_payload() {
         Some("not-a-lux-dump"),
         Some("operator-secret"),
     );
-    assert_eq!(status, 500, "invalid payload rejected: {body}");
+    assert_eq!(status, 400, "invalid payload rejected: {body}");
     assert!(
-        body.contains("not a lux snapshot"),
+        body.contains("not a supported Lux snapshot"),
         "payload validation message: {body}"
     );
+
+    // A complete historical snapshot is canonicalized and staged, but the
+    // request never terminates the process or mutates the live Store.
+    let (status, body) = http_request(
+        http,
+        "POST",
+        "/v1/restore",
+        Some("LUX\u{3}"),
+        Some("operator-secret"),
+    );
+    assert_eq!(status, 202, "valid snapshot staging: {body}");
+    let confirmation: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(confirmation["staged"], true);
+    assert_eq!(confirmation["restart_required"], true);
+    assert_eq!(confirmation["source_format"], 3);
+    assert_eq!(confirmation["format"], 6);
+
+    let (status, body) = http_request(http, "GET", "/v1/restore", None, Some("operator-secret"));
+    assert_eq!(status, 200, "restore status: {body}");
+    let pending: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(pending["pending"], true);
+    assert_eq!(pending["restart_required"], true);
+    assert_eq!(pending["restore_id"], confirmation["restore_id"]);
+    assert_eq!(pending["source_sha256"], confirmation["source_sha256"]);
 }
 
 #[test]
@@ -163,16 +186,56 @@ fn http_admin_endpoints_open_when_no_password_set() {
     );
     assert!(body.starts_with("LUX"), "snapshot header: {body:?}");
 
-    // Restore reaches payload validation (500), not an operator 403/401 wall.
+    // Restore reaches payload validation (400), not an operator 403/401 wall.
     let (status, body) = http_request(http, "POST", "/v1/restore", Some("not-a-dump"), None);
     assert_eq!(
-        status, 500,
+        status, 400,
         "no-password restore should reach validation: {body}"
     );
     assert!(
-        body.contains("not a lux snapshot"),
+        body.contains("not a supported Lux snapshot"),
         "validation msg: {body}"
     );
+}
+
+#[test]
+fn http_snapshot_management_accepts_a_secret_key_when_no_password_exists() {
+    let secret = "lux_sec_restore_management_test";
+    let server = LuxServer::builder()
+        .http()
+        .env("LUX_AUTH_ENABLED", "true")
+        .env("LUX_AUTH_SECRET_KEY", secret)
+        .start();
+    let http = server.http_port();
+
+    let (status, _) = http_request(http, "GET", "/v1/snapshot", None, None);
+    assert_eq!(status, 401);
+    let (status, body) = http_request(http, "GET", "/v1/snapshot", None, Some(secret));
+    assert_eq!(status, 200, "secret-key snapshot: {body}");
+
+    let (status, body) = http_request(
+        http,
+        "POST",
+        "/v1/restore",
+        Some("not-a-dump"),
+        Some(secret),
+    );
+    assert_eq!(status, 400, "secret key did not reach validation: {body}");
+}
+
+#[test]
+fn http_rejects_a_short_restore_body_instead_of_staging_a_prefix() {
+    let server = LuxServer::builder().http().start();
+    let mut stream = TcpStream::connect(("127.0.0.1", server.http_port())).unwrap();
+    stream
+        .write_all(
+            b"POST /v1/restore HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\nLUX\x03",
+        )
+        .unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let response = read_all(&mut stream);
+    assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    assert!(response.contains("shorter than Content-Length"));
 }
 
 #[test]

@@ -36,6 +36,7 @@ lux init                                      # scaffold lux/config.toml and lux
 lux start                                     # run a local engine + Studio in Docker
 lux studio                                    # open Lux Studio (local web UI)
 lux stop                                      # stop the local engine + Studio
+lux restore ./lux.dat                         # transactionally restore the local engine
 lux login                                     # authenticate
 lux logout                                    # clear credentials
 lux link my-app                               # associate this repo with a cloud project
@@ -94,11 +95,19 @@ lux status                 # show local engine status
 lux env export local       # print the local profile when explicitly needed
 lux stop                   # stop the engine + Studio
 lux stop --clear           # also delete the local data volume
+lux restore ./lux.dat      # validate, stage, gracefully restart, and verify readiness
 ```
 
 `lux stop` sends SIGTERM to the engine and gives its checked durability barrier
 35 seconds to finish before removing the container. Local engine updates use
 the same graceful stop path.
+
+`lux restore` accepts snapshots produced by current or older Lux engines. The
+running database remains available while the engine validates and stages the
+file. The CLI verifies the source checksum echoed by the engine, gracefully
+recreates the same container against the same volume, and waits for readiness.
+Startup preserves the full pre-restore state inside the volume before it
+commits the replacement; a failed restore never silently deletes that rollback.
 
 `lux start` refreshes a private `local` env profile containing `LUX_URL`,
 `LUX_PUBLISHABLE_KEY`, `LUX_SECRET_KEY`, and `LUX_DIRECT_URL`. On first setup it

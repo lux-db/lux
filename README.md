@@ -344,6 +344,7 @@ lux start                              # run a local engine + Studio (web UI) in
 lux start --bind 0.0.0.0               # explicitly expose local ports on the network
 lux studio                             # open Lux Studio against the local engine
 lux stop                               # stop the local engine + Studio
+lux restore ./lux.dat                  # transactionally restore the local engine
 lux login                              # authenticate with a lux_ token
 lux link my-app                        # associate this repo with a cloud project
 lux target                             # show local, linked-cloud, and app-env targets

@@ -658,7 +658,6 @@ pub struct Store {
     /// both before and after acquiring its journal domains, which turns the
     /// final shutdown sync into a real fence rather than a best-effort flush.
     accepting_mutations: std::sync::atomic::AtomicBool,
-    restoring: std::sync::atomic::AtomicBool,
     /// Serializes every operation that installs a snapshot or restore image.
     snapshot_gate: parking_lot::Mutex<()>,
     background_save_tx:
@@ -1057,7 +1056,6 @@ impl Store {
             replaying_wal: std::sync::atomic::AtomicBool::new(false),
             journal_poisoned: std::sync::atomic::AtomicBool::new(false),
             accepting_mutations: std::sync::atomic::AtomicBool::new(true),
-            restoring: std::sync::atomic::AtomicBool::new(false),
             snapshot_gate: parking_lot::Mutex::new(()),
             background_save_tx: std::sync::OnceLock::new(),
             background_save_stopping: std::sync::atomic::AtomicBool::new(false),
@@ -1744,29 +1742,6 @@ impl Store {
             && !self.journal_poisoned.load(Ordering::Acquire)
     }
 
-    pub(crate) fn begin_restore(&self) -> std::io::Result<()> {
-        self.restoring
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| ())
-            .map_err(|_| std::io::Error::other("database restore is already in progress"))
-    }
-
-    pub(crate) fn cancel_restore(&self) {
-        self.restoring.store(false, Ordering::Release);
-    }
-
-    pub(crate) fn is_restoring(&self) -> bool {
-        self.restoring.load(Ordering::Acquire)
-    }
-
-    fn ensure_not_restoring(&self) -> std::io::Result<()> {
-        if self.is_restoring() {
-            Err(std::io::Error::other("database restore is in progress"))
-        } else {
-            Ok(())
-        }
-    }
-
     pub(crate) fn ensure_journal_healthy(&self) -> std::io::Result<()> {
         if self.journal_poisoned.load(Ordering::Acquire) {
             Err(std::io::Error::other(
@@ -2164,7 +2139,6 @@ impl Store {
         commands: &[&[&[u8]]],
     ) -> std::io::Result<JournalPrepareGuard<'a>> {
         self.ensure_accepting_mutations()?;
-        self.ensure_not_restoring()?;
         self.ensure_journal_healthy()?;
         let bypassed = self.wal_suppress.load(Ordering::Relaxed)
             || self.journal.is_none()
@@ -2178,7 +2152,6 @@ impl Store {
                 .collect()
         };
         self.ensure_accepting_mutations()?;
-        self.ensure_not_restoring()?;
         self.ensure_journal_healthy()?;
         Ok(JournalPrepareGuard {
             store: self,

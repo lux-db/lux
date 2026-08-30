@@ -1,12 +1,12 @@
 //! Process-level tests for the public durability policy.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 
 mod common;
-use common::{send, LuxServer};
+use common::{read_all, send, LuxServer};
 
 fn restore_snapshot(port: u16, dump: &[u8]) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -20,9 +20,7 @@ fn restore_snapshot(port: u16, dump: &[u8]) -> String {
     stream.write_all(headers.as_bytes()).unwrap();
     stream.write_all(dump).unwrap();
 
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).unwrap();
-    String::from_utf8_lossy(&response).into_owned()
+    read_all(&mut stream)
 }
 
 #[test]
@@ -99,7 +97,7 @@ fn memory_restore_cannot_replay_stale_post_snapshot_writes() {
     thread::sleep(Duration::from_millis(1_100));
 
     let response = restore_snapshot(server.http_port(), &snapshot);
-    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.starts_with("HTTP/1.1 202"), "{response}");
     server.restart();
 
     let mut connection = server.conn();
