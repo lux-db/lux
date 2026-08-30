@@ -1,5 +1,6 @@
 use crate::store::{DumpValue, Store};
 use hashbrown::{HashMap, HashSet};
+use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, BufRead, BufWriter, Read, Seek, SeekFrom, Write};
@@ -161,10 +162,14 @@ fn restore_staged_path(config: &crate::ServerConfig) -> std::path::PathBuf {
 /// completed a save yet.
 pub(crate) fn last_save_unix_seconds(store: &Store) -> io::Result<Option<u64>> {
     let path = snapshot_path(store);
-    if !crate::file_security::regular_file_exists(Path::new(&path))? {
-        return Ok(None);
-    }
-    let modified = fs::symlink_metadata(path)?.modified()?;
+    let file = match crate::file_security::open_private_file(Path::new(&path), |options| {
+        options.read(true);
+    }) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let modified = file.metadata()?.modified()?;
     Ok(Some(
         modified
             .duration_since(std::time::UNIX_EPOCH)
@@ -290,9 +295,15 @@ fn save_entries(
     if let Some(parent) = Path::new(&path).parent() {
         crate::disk::create_dir_all_synced(parent)?;
     }
-    let tmp = format!("{path}.{}.tmp", std::process::id());
+    let mut nonce = [0u8; 16];
+    OsRng.fill_bytes(&mut nonce);
+    let nonce = nonce
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let tmp = format!("{path}.{}.{nonce}.tmp", std::process::id());
     let file = crate::file_security::open_private_file(Path::new(&tmp), |options| {
-        options.create(true).truncate(true).write(true);
+        options.create_new(true).write(true);
     })?;
     let mut w = BufWriter::new(file);
     save_snapshot_binary(&mut w, entries, store, checkpoints)?;
@@ -303,7 +314,10 @@ fn save_entries(
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
-    crate::file_security::ensure_regular_or_missing(Path::new(&path))?;
+    if let Err(error) = crate::file_security::ensure_regular_or_missing(Path::new(&path)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
     if let Err(error) = fs::rename(&tmp, &path) {
         let _ = fs::remove_file(&tmp);
         return Err(error);
@@ -1640,6 +1654,22 @@ mod tests {
     }
 
     #[test]
+    fn last_save_time_only_reports_an_installed_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        let store = Store::new_with_config(config);
+
+        assert_eq!(last_save_unix_seconds(&store).unwrap(), None);
+        store.set(b"saved", b"value", None, Instant::now());
+        save_and_truncate_wal_consistent(&store).unwrap();
+
+        assert!(last_save_unix_seconds(&store).unwrap().is_some());
+    }
+
+    #[test]
     fn snapshot_waits_for_in_flight_journal_commit_before_truncating() {
         let dir = tempfile::tempdir().unwrap();
         let config = Arc::new(crate::ServerConfig {
@@ -1735,7 +1765,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = requires_existing_journal(&config).unwrap_err();
+        let error = required_existing_journals(&config).unwrap_err();
         assert!(error.to_string().contains("symbolic links"), "{error}");
         assert_eq!(fs::read(target).unwrap(), HEADER_V6);
     }

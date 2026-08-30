@@ -157,6 +157,54 @@ impl PersistStateError {
     }
 }
 
+#[cfg(test)]
+mod persistence_fault_injection {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Point {
+        BeforeWrite,
+        BeforeRename,
+        AfterRename,
+        BeforeDirectorySync,
+    }
+
+    thread_local! {
+        static POINT: Cell<Option<Point>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            POINT.set(None);
+        }
+    }
+
+    pub(crate) fn inject(point: Point) -> Guard {
+        POINT.with(|slot| {
+            assert!(
+                slot.replace(Some(point)).is_none(),
+                "persistence fault already injected"
+            );
+        });
+        Guard
+    }
+
+    pub(crate) fn check(point: Point) -> Result<(), String> {
+        POINT.with(|slot| {
+            if slot.get() == Some(point) {
+                slot.set(None);
+                Err(format!(
+                    "injected encryption persistence failure at {point:?}"
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
 impl EncryptionKeyring {
     pub(crate) fn open(config: &EncryptionConfig, data_dir: &str) -> Result<Self, String> {
         let state_path = resolve_path(config.state_path.as_deref(), data_dir, "lux.enc");
@@ -723,6 +771,8 @@ impl EncryptionKeyring {
         let tmp = state_path.with_extension(format!("enc.tmp.{}", hex(&tmp_nonce)));
         let staged = (|| -> Result<fs::File, String> {
             use std::io::Write;
+            #[cfg(test)]
+            persistence_fault_injection::check(persistence_fault_injection::Point::BeforeWrite)?;
             let mut file = crate::file_security::open_private_file(&tmp, |options| {
                 options.create_new(true).write(true);
             })
@@ -746,16 +796,31 @@ impl EncryptionKeyring {
                 "ERR ENC state replace failed: {error}"
             )));
         }
-        if let Err(error) = fs::rename(&tmp, state_path) {
+        #[cfg(test)]
+        let rename_result =
+            persistence_fault_injection::check(persistence_fault_injection::Point::BeforeRename)
+                .map_err(std::io::Error::other)
+                .and_then(|_| fs::rename(&tmp, state_path));
+        #[cfg(not(test))]
+        let rename_result = fs::rename(&tmp, state_path);
+        if let Err(error) = rename_result {
             let _ = fs::remove_file(&tmp);
             return Err(PersistStateError::before_install(format!(
                 "ERR ENC state replace failed: {error}"
             )));
         }
+        #[cfg(test)]
+        persistence_fault_injection::check(persistence_fault_injection::Point::AfterRename)
+            .map_err(PersistStateError::after_install)?;
         crate::file_security::verify_installed_file(state_path, &file).map_err(|e| {
             PersistStateError::after_install(format!("ERR ENC state replace failed: {e}"))
         })?;
         if let Some(parent) = state_path.parent() {
+            #[cfg(test)]
+            persistence_fault_injection::check(
+                persistence_fault_injection::Point::BeforeDirectorySync,
+            )
+            .map_err(PersistStateError::after_install)?;
             crate::disk::sync_directory(parent).map_err(|e| {
                 PersistStateError::after_install(format!(
                     "ERR ENC state directory sync failed: {e}"
@@ -1407,6 +1472,41 @@ mod adversarial_tests {
                 .to_string_lossy()
                 .starts_with("lux.enc.tmp.")
         }));
+    }
+
+    #[test]
+    fn keyring_state_matches_the_installed_file_at_every_persistence_boundary() {
+        use super::persistence_fault_injection::{self, Point};
+
+        for (point, installed) in [
+            (Point::BeforeWrite, false),
+            (Point::BeforeRename, false),
+            (Point::AfterRename, true),
+            (Point::BeforeDirectorySync, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let data_dir = dir.path().to_string_lossy().to_string();
+            let config = EncryptionConfig::default();
+            let ring = EncryptionKeyring::open(&config, &data_dir).unwrap();
+            ring.init(Some("k1")).unwrap();
+
+            let _fault = persistence_fault_injection::inject(point);
+            let error = ring.rotate(Some("k2")).unwrap_err();
+            assert!(error.contains("injected encryption persistence failure"));
+            let expected = if installed { "k2" } else { "k1" };
+            assert_eq!(ring.status().active_key_id.as_deref(), Some(expected));
+            drop(ring);
+
+            let reopened = EncryptionKeyring::open(&config, &data_dir).unwrap();
+            assert_eq!(reopened.status().active_key_id.as_deref(), Some(expected));
+            assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("lux.enc.tmp.")
+            }));
+        }
     }
 
     #[test]

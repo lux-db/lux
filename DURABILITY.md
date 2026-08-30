@@ -22,6 +22,13 @@ Storage layout and durability are independent:
 - `tiered` adds disk-backed cold storage. Its WAL remains in the tiered storage
   directory so existing deployments keep their current recovery files.
 
+A persistent runtime holds an exclusive advisory lock on each configured state
+root for its lifetime. Starting a second Lux runtime against the same data or
+tiered-storage directory fails before recovery, preventing concurrent writers
+from corrupting snapshots, journals, or tiered files. The backing filesystem
+must preserve POSIX advisory-lock semantics; use Docker named volumes rather
+than macOS host bind mounts when relying on cross-container exclusion.
+
 Persistent startup loads the snapshot, replays valid legacy per-shard WAL files
 from pre-1.0 versions, then replays the ordered journal and rebuilds tiered
 indexes as needed. New writes use only the ordered journal. Lux refuses to start

@@ -48,6 +48,7 @@ fn validate_relative_components(path: &Path) -> io::Result<()> {
         return Ok(());
     }
     let mut current = PathBuf::new();
+    let mut inspect_existing = true;
     for component in path.components() {
         match component {
             Component::CurDir => continue,
@@ -57,10 +58,14 @@ fn validate_relative_components(path: &Path) -> io::Result<()> {
             }
             Component::RootDir | Component::Prefix(_) => continue,
         }
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) => validate_directory(&current, &metadata)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-            Err(error) => return Err(error),
+        if inspect_existing {
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) => validate_directory(&current, &metadata)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    inspect_existing = false;
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
     Ok(())
@@ -211,6 +216,48 @@ pub(crate) fn verify_installed_file(path: &Path, file: &File) -> io::Result<()> 
     Ok(())
 }
 
+/// Hold an exclusive advisory lock for a persistent state directory.
+///
+/// The lock file is never removed: unlinking a live lock file would let a
+/// second process lock a different inode under the same name. Dropping the
+/// returned handle releases the lock.
+pub(crate) fn lock_state_dir(path: &Path) -> io::Result<File> {
+    ensure_safe_dir(path)?;
+    let lock_path = path.join(".lux.lock");
+    let file = open_private_file(&lock_path, |options| {
+        options.create(true).read(true).write(true);
+    })?;
+
+    #[cfg(not(unix))]
+    return Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "persistent state locking is unsupported on this platform",
+    ));
+
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+
+        // SAFETY: flock only reads the valid descriptor and integer flags.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            let kind = if error.kind() == io::ErrorKind::WouldBlock {
+                io::ErrorKind::AlreadyExists
+            } else {
+                error.kind()
+            };
+            return Err(io::Error::new(
+                kind,
+                format!(
+                    "persistent state directory {} is already in use or cannot be locked: {error}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(file)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +327,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn regular_file_probes_reject_unexpected_types_and_tighten_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        assert!(!regular_file_exists(&missing).unwrap());
+        ensure_regular_or_missing(&missing).unwrap();
+
+        let path = root.path().join("state.lux");
+        fs::write(&path, b"state").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(regular_file_exists(&path).unwrap());
+        open_private_file(&path, |options| {
+            options.read(true);
+        })
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let directory = root.path().join("not-a-file");
+        fs::create_dir(&directory).unwrap();
+        assert!(regular_file_exists(&directory).is_err());
+        assert!(ensure_regular_or_missing(&directory).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_by_others_directory_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("unsafe");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = ensure_safe_dir(&directory).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("writable by another user"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn replaced_path_is_rejected_after_open() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("state.lux");
@@ -291,6 +378,33 @@ mod tests {
         fs::write(&path, b"replacement").unwrap();
 
         assert!(verify_installed_file(&path, &file).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_file_verification_rejects_non_files_on_either_side() {
+        let root = tempfile::tempdir().unwrap();
+        let directory_handle = File::open(root.path()).unwrap();
+        assert!(verify_installed_file(root.path(), &directory_handle).is_err());
+
+        let source = root.path().join("source");
+        fs::write(&source, b"state").unwrap();
+        let source_handle = File::open(&source).unwrap();
+        let destination = root.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+        assert!(verify_installed_file(&destination, &source_handle).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_directory_lock_is_exclusive_until_its_handle_drops() {
+        let root = tempfile::tempdir().unwrap();
+        let first = lock_state_dir(root.path()).unwrap();
+        let error = lock_state_dir(root.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+
+        drop(first);
+        lock_state_dir(root.path()).unwrap();
     }
 
     #[cfg(unix)]
@@ -309,5 +423,13 @@ mod tests {
         symlink(&target, root.path().join("linked")).unwrap();
 
         assert!(ensure_safe_dir(&relative.join("linked").join("state")).is_err());
+    }
+
+    #[test]
+    fn parent_traversal_is_rejected_even_after_a_missing_component() {
+        let path = Path::new("missing-state-dir").join("..").join("escape");
+        let error = ensure_safe_dir(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("parent traversal"));
     }
 }

@@ -7729,6 +7729,68 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn credential_loader_distinguishes_missing_invalid_and_valid_state() {
+        let dir = std::env::temp_dir().join(format!("lux-cli-config-test-{}", random_hex(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        assert!(load_config_from(&path).unwrap().is_none());
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(load_config_from(&path).is_err());
+        std::fs::write(
+            &path,
+            br#"{"token":"test-token","api_url":"https://api.example.test"}"#,
+        )
+        .unwrap();
+        let config = load_config_from(&path).unwrap().unwrap();
+        assert_eq!(config.token, "test-token");
+        assert_eq!(config.api_url, "https://api.example.test");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_config_loader_validates_every_supported_field() {
+        let dir = std::env::temp_dir().join(format!("lux-cli-local-config-{}", random_hex(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        assert!(load_local_config_from(&path).unwrap().is_none());
+        std::fs::write(
+            &path,
+            br#"project_id = "project-id"
+project_name = "Project"
+local_http_port = 5890
+local_resp_port = 6379
+engine_version = "1.0.0"
+"#,
+        )
+        .unwrap();
+        let config = load_local_config_from(&path).unwrap().unwrap();
+        assert_eq!(config.project_id.as_deref(), Some("project-id"));
+        assert_eq!(config.project_name.as_deref(), Some("Project"));
+        assert_eq!(config.local_http_port, Some(5890));
+        assert_eq!(config.local_resp_port, Some(6379));
+        assert_eq!(config.engine_version.as_deref(), Some("1.0.0"));
+
+        for invalid in [
+            "project_id = 1\n",
+            "local_http_port = \"5890\"\n",
+            "local_resp_port = -1\n",
+            "local_http_port = 65536\n",
+            "not valid toml =\n",
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(
+                load_local_config_from(&path).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn bare_migrate_defaults_to_run() {
         let cli = Cli::try_parse_from(["lux", "migrate"]).expect("bare migrate parses");

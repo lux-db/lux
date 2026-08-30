@@ -17,6 +17,13 @@ The default production model is:
   directories.
 - Back up snapshots and WAL-related data to storage with access controls.
 
+Official Lux binaries target Unix platforms. Persisted engine files and CLI
+credential files are opened without following final-component symbolic links
+and are restricted to the owning user. Dedicated engine state directories are
+restricted to the owning user as well. Lux refuses unsafe file types,
+directories writable by other users, ownership mismatches, and a persistent
+directory already locked by another Lux process.
+
 Lux refuses to bind a non-loopback listener without authentication configured,
 so an unauthenticated instance is reachable only from localhost. Do not expose
 unauthenticated Lux ports directly to the public internet.

@@ -5006,6 +5006,41 @@ mod tests {
     use crate::tables::JoinType;
 
     #[tokio::test]
+    async fn snapshot_stream_serves_the_securely_opened_installed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        let store = Arc::new(Store::new_with_config(config));
+        store.set(b"backup", b"value", None, Instant::now());
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).await.unwrap();
+            response
+        });
+        let (mut socket, _) = listener.accept().await.unwrap();
+
+        assert!(stream_snapshot(&mut socket, &store).await.unwrap());
+        drop(socket);
+        let response = client.await.unwrap();
+        let body_start = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .unwrap();
+
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response[body_start..].starts_with(b"LUX\x06"));
+    }
+
+    #[tokio::test]
     async fn failed_ivm_live_snapshot_reclaims_receivers() {
         let (store, broker, cache) = membership_fixture();
         let principal = match user_ctx("alice") {

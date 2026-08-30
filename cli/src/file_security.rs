@@ -52,6 +52,7 @@ fn validate_relative_directories(path: &Path) -> Result<(), String> {
         return Ok(());
     }
     let mut current = PathBuf::new();
+    let mut inspect_existing = true;
     for component in path.components() {
         match component {
             Component::CurDir => continue,
@@ -64,10 +65,14 @@ fn validate_relative_directories(path: &Path) -> Result<(), String> {
             }
             Component::RootDir | Component::Prefix(_) => continue,
         }
-        match std::fs::symlink_metadata(&current) {
-            Ok(metadata) => validate_directory(&current, &metadata)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(error) => return Err(format!("inspect {}: {error}", current.display())),
+        if inspect_existing {
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) => validate_directory(&current, &metadata)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    inspect_existing = false;
+                }
+                Err(error) => return Err(format!("inspect {}: {error}", current.display())),
+            }
         }
     }
     Ok(())
@@ -274,6 +279,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn private_directories_are_created_and_tightened() {
+        let root = std::env::temp_dir().join(format!("lux-cli-dir-test-{}", random_hex(8)));
+        let private = root.join("private");
+        ensure_private_dir(&private).unwrap();
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&private).unwrap();
+        assert_eq!(
+            std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_writable_directories_are_rejected() {
+        let root = std::env::temp_dir().join(format!("lux-cli-unsafe-dir-{}", random_hex(8)));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = ensure_safe_dir(&root).unwrap_err();
+        assert!(error.contains("writable by another user"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn secret_files_are_owner_only_and_atomic() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -298,6 +335,30 @@ mod tests {
             "LUX_SECRET_KEY=replaced\n"
         );
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        delete_secret_file(&path).unwrap();
+        assert!(!path.exists());
+        delete_secret_file(&path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_reads_distinguish_missing_state_and_tighten_existing_files() {
+        let dir = std::env::temp_dir().join(format!("lux-cli-read-test-{}", random_hex(8)));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("secret.env");
+        assert_eq!(read_optional_secret_file(&path).unwrap(), None);
+
+        std::fs::write(&path, b"secret\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(
+            read_optional_secret_file(&path).unwrap().as_deref(),
+            Some("secret\n")
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -320,7 +381,9 @@ mod tests {
 
         let unexpected = dir.join("directory.env");
         std::fs::create_dir(&unexpected).unwrap();
+        assert!(read_optional_secret_file(&unexpected).is_err());
         assert!(write_secret_file(&unexpected, b"replacement").is_err());
+        assert!(delete_secret_file(&unexpected).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -337,6 +400,13 @@ mod tests {
 
         assert!(ensure_safe_dir(&root.join("lux").join("profiles")).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parent_traversal_is_rejected_even_after_a_missing_component() {
+        let path = Path::new("missing-profile-dir").join("..").join("escape");
+        let error = ensure_safe_dir(&path).unwrap_err();
+        assert!(error.contains("parent traversal"), "{error}");
     }
 
     #[test]
