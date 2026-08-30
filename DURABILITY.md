@@ -238,6 +238,17 @@ Tiered mode expectations:
   Corruption encountered by a running command is an explicit error and fences
   later mutations until restart.
 - Rebuilt tiered indexes must describe only valid entries.
+- Compaction validates each indexed source record before copying it, writes and
+  syncs a same-directory staging file, and never publishes a partial or
+  re-checksummed corrupt generation.
+- Before replacement, the current data file receives a second durable name.
+  That previous generation remains available until the replacement rename and
+  containing-directory sync complete. Startup restores it if the canonical
+  name is missing, and removes stale compaction files only after validating the
+  canonical generation.
+- A staging write or disk-full failure leaves the canonical generation
+  unchanged. After publication, the live file handle and in-memory index switch
+  together so later writes cannot land on an unlinked old file.
 
 ## Failure Modes That Must Be Bounded
 
@@ -250,6 +261,7 @@ Lux treats these as part of the durability failure surface:
 - Partial WAL frames.
 - Corrupted snapshot length fields.
 - Corrupted tiered data records.
+- Interrupted or disk-full tiered compaction at every publication boundary.
 - Restore with invalid payload.
 - Restore with stale pre-restore WAL and tiered files.
 

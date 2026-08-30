@@ -26,6 +26,7 @@ const WAL_FRAME_MAGIC: &[u8; 4] = b"LXF1";
 const LEGACY_WAL_GENERATION: [u8; WAL_GENERATION_LEN] = [0; WAL_GENERATION_LEN];
 const MAX_WAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 const DATA_MAGIC: &[u8; 4] = b"LXD1";
+const COMPACTION_BACKUP_NAME: &str = "data.prev";
 const WAL_BATCH_MARKER: &[u8] = b"\0LUX:BATCH";
 const WAL_CHECKED_MARKER: &[u8] = b"\0LUX:CHECKED";
 
@@ -150,8 +151,13 @@ pub(crate) mod fault_injection {
     pub(crate) enum Point {
         BeforeRotateRename,
         AfterRotateRename,
+        AfterCompactStagingCreated,
+        AfterCompactStagingSynced,
+        AfterCompactBackupSynced,
         BeforeCompactRename,
         BeforeCompactDirectorySync,
+        BeforeCompactBackupCleanup,
+        BeforeCompactCleanupSync,
     }
 
     thread_local! {
@@ -180,9 +186,10 @@ pub(crate) mod fault_injection {
         POINT.with(|slot| {
             if slot.get() == Some(point) {
                 slot.set(None);
-                Err(io::Error::other(format!(
-                    "injected journal rotation failure at {point:?}"
-                )))
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("injected persistence failure at {point:?}"),
+                ))
             } else {
                 Ok(())
             }
@@ -984,7 +991,10 @@ pub(crate) fn discard_tiered_cache(root: &Path) -> io::Result<()> {
             let Some(cache_name) = cache_name.to_str() else {
                 continue;
             };
-            if cache_name != "data.lux" && !is_compaction_temp(cache_name) {
+            if cache_name != "data.lux"
+                && cache_name != COMPACTION_BACKUP_NAME
+                && !is_compaction_temp(cache_name)
+            {
                 continue;
             }
             match fs::remove_file(cache_entry.path()) {
@@ -1064,6 +1074,7 @@ fn decode_command_batch(mut input: &[u8]) -> io::Result<Vec<Vec<Vec<u8>>>> {
 /// In-memory metadata for a cold entry on disk. The actual data lives in the
 /// data file at `offset`. We track `created_at` so TTL can be correctly
 /// decremented while the entry sits on disk.
+#[derive(Clone)]
 struct DiskEntry {
     offset: u64,
     length: u32,
@@ -1118,6 +1129,9 @@ pub struct DiskShard {
     has_checksums: bool,
     /// Corruption/parse details found during the last startup rebuild.
     rebuild_report: DiskRebuildReport,
+    /// False when startup had to reject or trim bytes. Draining the public
+    /// report must not make that generation eligible for compaction.
+    compaction_safe: bool,
 }
 
 /// Corruption details collected while rebuilding a disk shard index.
@@ -1148,16 +1162,42 @@ impl DiskShard {
     /// index by scanning the existing data file.
     pub fn open(dir: &Path, shard_id: usize) -> io::Result<Self> {
         let shard_dir = dir.join(format!("shard_{shard_id}"));
+        create_dir_all_synced(&shard_dir)?;
         crate::file_security::ensure_private_dir(&shard_dir)?;
         let path = shard_dir.join("data.lux");
+        let backup_path = shard_dir.join(COMPACTION_BACKUP_NAME);
+        let target_exists = crate::file_security::regular_file_exists(&path)?;
+        let backup_exists = crate::file_security::regular_file_exists(&backup_path)?;
+
+        if !target_exists && backup_exists {
+            fs::rename(&backup_path, &path)?;
+            sync_directory(&shard_dir)?;
+        } else if !target_exists && Self::has_compaction_temp(&shard_dir)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tiered data file is missing beside an interrupted compaction",
+            ));
+        }
+
+        let created = !crate::file_security::regular_file_exists(&path)?;
         let mut data_file = crate::file_security::open_private_file(&path, |options| {
             options.create(true).read(true).append(true);
         })?;
 
-        let file_len = data_file.seek(SeekFrom::End(0))?;
+        let mut file_len = data_file.seek(SeekFrom::End(0))?;
         let has_checksums = if file_len == 0 {
+            if backup_exists {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tiered canonical generation is empty; previous generation preserved",
+                ));
+            }
             data_file.write_all(DATA_MAGIC)?;
-            data_file.flush()?;
+            data_file.sync_all()?;
+            file_len = DATA_MAGIC.len() as u64;
+            if created {
+                sync_directory(&shard_dir)?;
+            }
             true
         } else {
             data_file.seek(SeekFrom::Start(0))?;
@@ -1179,9 +1219,86 @@ impl DiskShard {
             total_bytes: 0,
             has_checksums,
             rebuild_report: DiskRebuildReport::default(),
+            compaction_safe: false,
         };
         ds.rebuild_index()?;
+        if ds.total_bytes as u64 != file_len {
+            if backup_exists {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tiered canonical generation is incomplete; previous generation preserved",
+                ));
+            }
+            let valid_bytes = ds.total_bytes as u64;
+            ds.data_file.set_len(valid_bytes)?;
+            ds.data_file.sync_all()?;
+            ds.data_file.seek(SeekFrom::End(0))?;
+            ds.rebuild_report.parse_errors.push(DiskEntryParseError {
+                offset: valid_bytes,
+                error: format!(
+                    "discarded {} trailing bytes from an incomplete tiered record",
+                    file_len - valid_bytes
+                ),
+            });
+            file_len = valid_bytes;
+        }
+        debug_assert_eq!(ds.total_bytes as u64, file_len);
+        ds.compaction_safe = ds.rebuild_report.corrupted_entries.is_empty()
+            && ds.rebuild_report.parse_errors.is_empty();
+        if ds.rebuild_report.corrupted_entries.is_empty()
+            && ds.rebuild_report.parse_errors.is_empty()
+        {
+            Self::remove_compaction_artifacts(&shard_dir)?;
+        }
         Ok(ds)
+    }
+
+    fn has_compaction_temp(shard_dir: &Path) -> io::Result<bool> {
+        for entry in fs::read_dir(shard_dir)? {
+            let entry = entry?;
+            if entry.file_name().to_str().is_some_and(is_compaction_temp) {
+                crate::file_security::ensure_regular_or_missing(&entry.path())?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn remove_compaction_artifacts(shard_dir: &Path) -> io::Result<()> {
+        let mut artifacts = Vec::new();
+        let mut has_backup = false;
+        for entry in fs::read_dir(shard_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name != COMPACTION_BACKUP_NAME && !is_compaction_temp(name) {
+                continue;
+            }
+            crate::file_security::ensure_regular_or_missing(&entry.path())?;
+            has_backup |= name == COMPACTION_BACKUP_NAME;
+            artifacts.push(entry.path());
+        }
+        if artifacts.is_empty() {
+            return Ok(());
+        }
+
+        // A backup means the visible canonical name may have come from a
+        // rename whose directory sync was interrupted. Make that name durable
+        // before removing its previous generation, and validate every cleanup
+        // target before unlinking any of them.
+        if has_backup {
+            sync_directory(shard_dir)?;
+        }
+        for artifact in artifacts {
+            match fs::remove_file(artifact) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        sync_directory(shard_dir)
     }
 
     /// Drain corruption details captured by `rebuild_index`.
@@ -1244,7 +1361,7 @@ impl DiskShard {
         key: &str,
         now: Instant,
     ) -> io::Result<Option<(DumpValue, Option<Duration>)>> {
-        let de = match self.index.get(key) {
+        let de = match self.index.get(key).cloned() {
             Some(de) => de,
             None => return Ok(None),
         };
@@ -1255,21 +1372,42 @@ impl DiskShard {
             return Ok(None);
         }
 
-        let offset = de.offset;
-        let length = de.length as usize;
         let remaining = de.remaining_ttl_ms(now);
+        let (_, value, _) = self.read_indexed_entry(key, &de)?;
+        let ttl = if remaining > 0 {
+            Some(Duration::from_millis(remaining as u64))
+        } else {
+            None
+        };
+        Ok(Some((value, ttl)))
+    }
 
-        let mut buf = vec![0u8; length];
-        let mut reader = &self.data_file;
-        reader.seek(SeekFrom::Start(offset))?;
-        reader.read_exact(&mut buf)?;
+    /// Read and validate the complete indexed record before returning it or
+    /// copying it into a replacement generation.
+    fn read_indexed_entry(
+        &mut self,
+        key: &str,
+        entry: &DiskEntry,
+    ) -> io::Result<(Vec<u8>, DumpValue, i64)> {
+        let mut buf = vec![0u8; entry.length as usize];
+        self.data_file.seek(SeekFrom::Start(entry.offset))?;
+        self.data_file.read_exact(&mut buf)?;
 
         let entry_data = if self.has_checksums {
-            // Envelope: [4B entry_len][4B crc32][entry_data...]
             if buf.len() < 8 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "disk entry too short for checksum envelope",
+                ));
+            }
+            let declared_length = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if declared_length != buf.len() - 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "disk entry length mismatch for key '{key}' (declared={declared_length} actual={})",
+                        buf.len() - 8
+                    ),
                 ));
             }
             let stored_crc = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
@@ -1284,19 +1422,23 @@ impl DiskShard {
                     ),
                 ));
             }
-            data
+            let payload_len = buf.len() - 8;
+            buf.copy_within(8.., 0);
+            buf.truncate(payload_len);
+            buf
         } else {
-            &buf[..]
+            buf
         };
 
-        let mut cursor = entry_data;
-        let (_key, value, _ttl_ms) = read_single_entry(&mut cursor)?;
-        let ttl = if remaining > 0 {
-            Some(Duration::from_millis(remaining as u64))
-        } else {
-            None
-        };
-        Ok(Some((value, ttl)))
+        let mut cursor = entry_data.as_slice();
+        let (stored_key, value, ttl_ms) = read_single_entry(&mut cursor)?;
+        if stored_key != key || !cursor.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("disk index does not match the complete record for key '{key}'"),
+            ));
+        }
+        Ok((entry_data, value, ttl_ms))
     }
 
     pub fn remove(&mut self, key: &str) {
@@ -1339,110 +1481,188 @@ impl DiskShard {
         (self.total_bytes > 64 * 1024 && ratio > 0.3) || self.dead_bytes > 100 * 1024 * 1024
     }
 
-    /// Rewrite the data file keeping only live entries. Creates a new file,
-    /// copies live data, then atomic-renames over the old file. Reclaims all
-    /// dead bytes from overwritten/deleted entries. Always writes v2 format
-    /// with magic header and checksummed envelopes (upgrades legacy files).
+    /// Rewrite the data file while retaining a durably-linked previous
+    /// generation until the replacement name itself is durable. Reclaims dead
+    /// bytes and upgrades legacy files to the checksummed format.
     pub fn compact(&mut self) -> io::Result<()> {
+        self.compact_inner(None)
+    }
+
+    #[cfg(test)]
+    fn compact_with_write_limit(&mut self, bytes: usize) -> io::Result<()> {
+        self.compact_inner(Some(bytes))
+    }
+
+    fn compact_inner(&mut self, write_limit: Option<usize>) -> io::Result<()> {
+        if !self.compaction_safe {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "refusing to compact a tiered shard that opened with rejected records",
+            ));
+        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "tiered data path has no parent directory",
+                )
+            })?
+            .to_path_buf();
+        crate::file_security::verify_installed_file(&self.path, &self.data_file)?;
+        Self::remove_compaction_artifacts(&parent)?;
+
         let nonce = new_wal_generation();
         let tmp_path = self.path.with_extension(format!(
             "compact.{}.{}",
             std::process::id(),
             u128::from_le_bytes(nonce)
         ));
-        let prepared = (|| -> io::Result<(File, HashMap<String, DiskEntry>, usize)> {
-            let tmp_file = crate::file_security::open_private_file(&tmp_path, |options| {
+        let backup_path = parent.join(COMPACTION_BACKUP_NAME);
+        let mut published = false;
+        let mut write_budget = write_limit;
+
+        let result = (|| -> io::Result<()> {
+            let mut compacted = crate::file_security::open_private_file(&tmp_path, |options| {
                 options.create_new(true).read(true).append(true);
             })?;
-            let mut writer = BufWriter::new(tmp_file);
+            #[cfg(test)]
+            fault_injection::check(fault_injection::Point::AfterCompactStagingCreated)?;
 
-            // Always write magic header -- compaction upgrades legacy to v2.
-            writer.write_all(DATA_MAGIC)?;
-            let mut new_total: usize = 4; // magic header size
+            let mut new_total = DATA_MAGIC.len();
             let mut new_index = HashMap::new();
+            {
+                let mut writer = BufWriter::new(&mut compacted);
+                Self::write_compaction_bytes(&mut writer, DATA_MAGIC, &mut write_budget)?;
 
-            let keys: Vec<String> = self.index.keys().cloned().collect();
-            for key in &keys {
-                let de = &self.index[key];
+                let mut keys: Vec<String> = self.index.keys().cloned().collect();
+                keys.sort_unstable();
+                for key in keys {
+                    let old_entry = self.index.get(&key).cloned().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "tiered index changed")
+                    })?;
+                    let (entry_data, _, stored_ttl_ms) =
+                        self.read_indexed_entry(&key, &old_entry)?;
+                    let checksum = crc32(&entry_data);
+                    let entry_len = u32::try_from(entry_data.len()).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "tiered entry is too large")
+                    })?;
+                    let total_on_disk = 8usize.checked_add(entry_data.len()).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "tiered size overflow")
+                    })?;
+                    let new_offset = u64::try_from(new_total).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "tiered offset overflow")
+                    })?;
 
-                // Read existing entry and extract the raw entry_data.
-                let mut buf = vec![0u8; de.length as usize];
-                self.data_file.seek(SeekFrom::Start(de.offset))?;
-                self.data_file.read_exact(&mut buf)?;
+                    Self::write_compaction_bytes(
+                        &mut writer,
+                        &entry_len.to_le_bytes(),
+                        &mut write_budget,
+                    )?;
+                    Self::write_compaction_bytes(
+                        &mut writer,
+                        &checksum.to_le_bytes(),
+                        &mut write_budget,
+                    )?;
+                    Self::write_compaction_bytes(&mut writer, &entry_data, &mut write_budget)?;
 
-                let entry_data = if self.has_checksums {
-                    // Skip the 4B entry_len + 4B crc envelope, re-serialize fresh.
-                    buf[8..].to_vec()
-                } else {
-                    buf
-                };
-
-                // Write v2 envelope: [4B entry_len][4B crc32][entry_data]
-                let checksum = crc32(&entry_data);
-                let entry_len = entry_data.len() as u32;
-                let total_on_disk = 4 + 4 + entry_data.len();
-
-                let new_offset = new_total as u64;
-                writer.write_all(&entry_len.to_le_bytes())?;
-                writer.write_all(&checksum.to_le_bytes())?;
-                writer.write_all(&entry_data)?;
-
-                new_index.insert(
-                    key.clone(),
-                    DiskEntry {
-                        offset: new_offset,
-                        length: total_on_disk as u32,
-                        ttl_ms: de.ttl_ms,
-                        created_at: de.created_at,
-                    },
-                );
-                new_total += total_on_disk;
+                    new_index.insert(
+                        key,
+                        DiskEntry {
+                            offset: new_offset,
+                            length: u32::try_from(total_on_disk).map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "tiered entry is too large",
+                                )
+                            })?,
+                            ttl_ms: stored_ttl_ms,
+                            created_at: old_entry.created_at,
+                        },
+                    );
+                    new_total = new_total.checked_add(total_on_disk).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "tiered size overflow")
+                    })?;
+                }
+                writer.flush()?;
             }
 
-            writer.flush()?;
-            let compacted = writer.into_inner().map_err(io::Error::other)?;
             compacted.sync_all()?;
-            Ok((compacted, new_index, new_total))
-        })();
-        let (compacted, new_index, new_total) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(error);
-            }
-        };
+            #[cfg(test)]
+            fault_injection::check(fault_injection::Point::AfterCompactStagingSynced)?;
 
-        if let Err(error) = crate::file_security::ensure_regular_or_missing(&self.path) {
-            let _ = fs::remove_file(&tmp_path);
+            crate::file_security::verify_installed_file(&self.path, &self.data_file)?;
+            crate::file_security::ensure_regular_or_missing(&backup_path)?;
+            fs::hard_link(&self.path, &backup_path)?;
+            crate::file_security::verify_installed_file(&backup_path, &self.data_file)?;
+            sync_directory(&parent)?;
+            #[cfg(test)]
+            fault_injection::check(fault_injection::Point::AfterCompactBackupSynced)?;
+            #[cfg(test)]
+            fault_injection::check(fault_injection::Point::BeforeCompactRename)?;
+
+            fs::rename(&tmp_path, &self.path)?;
+            published = true;
+
+            // From this point onward the visible path names the replacement.
+            // Publish its matching handle and index before any later operation
+            // can fail, so subsequent appends never target the old inode.
+            self.data_file = compacted;
+            self.index = new_index;
+            self.total_bytes = new_total;
+            self.dead_bytes = 0;
+            self.has_checksums = true;
+            self.compaction_safe = true;
+            crate::file_security::verify_installed_file(&self.path, &self.data_file)?;
+
+            #[cfg(test)]
+            fault_injection::check(fault_injection::Point::BeforeCompactDirectorySync)?;
+            sync_directory(&parent)?;
+
+            #[cfg(test)]
+            fault_injection::check(fault_injection::Point::BeforeCompactBackupCleanup)?;
+            fs::remove_file(&backup_path)?;
+            #[cfg(test)]
+            fault_injection::check(fault_injection::Point::BeforeCompactCleanupSync)?;
+            sync_directory(&parent)
+        })();
+
+        if let Err(error) = result {
+            // An interruption models process death in the crash-boundary tests,
+            // so preserve the namespace exactly as it stood. Other failures
+            // before publication can safely remove only staging/backup names;
+            // the canonical generation is still installed and open.
+            if !published && error.kind() != io::ErrorKind::Interrupted {
+                if let Err(cleanup_error) = Self::remove_compaction_artifacts(&parent) {
+                    return Err(io::Error::other(format!(
+                        "tiered compaction failed: {error}; cleanup failed: {cleanup_error}"
+                    )));
+                }
+            }
             return Err(error);
         }
-        #[cfg(test)]
-        let rename_result = fault_injection::check(fault_injection::Point::BeforeCompactRename)
-            .and_then(|_| fs::rename(&tmp_path, &self.path));
-        #[cfg(not(test))]
-        let rename_result = fs::rename(&tmp_path, &self.path);
-        if let Err(error) = rename_result {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(error);
+        Ok(())
+    }
+
+    fn write_compaction_bytes(
+        writer: &mut BufWriter<&mut File>,
+        bytes: &[u8],
+        remaining: &mut Option<usize>,
+    ) -> io::Result<()> {
+        let Some(budget) = remaining else {
+            return writer.write_all(bytes);
+        };
+        let writable = bytes.len().min(*budget);
+        writer.write_all(&bytes[..writable])?;
+        *budget -= writable;
+        if writable != bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "injected tiered compaction storage exhaustion",
+            ));
         }
-        // The rename is the irreversible switch. Move every live handle and
-        // index to the installed inode before any later durability check can
-        // fail, so a reported directory-fsync error cannot leave this process
-        // writing through the unlinked pre-compaction file.
-        self.data_file = compacted;
-        self.index = new_index;
-        self.total_bytes = new_total;
-        self.dead_bytes = 0;
-        self.has_checksums = true;
-        crate::file_security::verify_installed_file(&self.path, &self.data_file)?;
-        #[cfg(test)]
-        fault_injection::check(fault_injection::Point::BeforeCompactDirectorySync)?;
-        sync_directory(self.path.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "data file has no parent directory",
-            )
-        })?)
+        Ok(())
     }
 
     pub fn dump_all(&mut self, now: Instant) -> io::Result<Vec<DumpEntry>> {
@@ -1988,6 +2208,7 @@ mod tests {
                 )
                 .unwrap();
         }
+        fs::write(shard_dir.join(COMPACTION_BACKUP_NAME), b"stale").unwrap();
         fs::write(shard_dir.join("data.compact.tmp"), b"stale").unwrap();
         fs::write(shard_dir.join("data.compact.123.456"), b"stale").unwrap();
         fs::write(shard_dir.join("data.compact.operator-notes"), b"keep").unwrap();
@@ -1997,6 +2218,7 @@ mod tests {
         discard_tiered_cache(dir.path()).unwrap();
 
         assert!(!shard_dir.join("data.lux").exists());
+        assert!(!shard_dir.join(COMPACTION_BACKUP_NAME).exists());
         assert!(!shard_dir.join("data.compact.tmp").exists());
         assert!(!shard_dir.join("data.compact.123.456").exists());
         assert_eq!(
@@ -2699,6 +2921,48 @@ mod tests {
             .collect()
     }
 
+    fn compaction_artifacts(shard_dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(shard_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == COMPACTION_BACKUP_NAME || is_compaction_temp(name))
+            })
+            .collect()
+    }
+
+    fn compaction_fixture(dir: &Path) -> DiskShard {
+        let mut shard = DiskShard::open(dir, 0).unwrap();
+        for (key, value) in [("keep", "one"), ("other", "two"), ("keep", "latest")] {
+            shard
+                .put(
+                    key,
+                    &DumpEntry {
+                        key: key.to_string(),
+                        value: DumpValue::Str(value.as_bytes().to_vec()),
+                        ttl_ms: -1,
+                    },
+                )
+                .unwrap();
+        }
+        assert!(shard.dead_bytes > 0);
+        shard
+    }
+
+    fn assert_compaction_fixture(shard: &mut DiskShard) {
+        assert!(matches!(
+            shard.get("keep", Instant::now()).unwrap(),
+            Some((DumpValue::Str(value), None)) if value == b"latest"
+        ));
+        assert!(matches!(
+            shard.get("other", Instant::now()).unwrap(),
+            Some((DumpValue::Str(value), None)) if value == b"two"
+        ));
+    }
+
     #[test]
     fn failed_compaction_preparation_removes_its_temporary_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -2744,7 +3008,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_compaction_rename_removes_its_temporary_file() {
+    fn interrupted_compaction_preserves_then_cleans_recovery_artifacts() {
         let dir = tempfile::tempdir().unwrap();
         let mut shard = DiskShard::open(dir.path(), 0).unwrap();
         let entry = DumpEntry {
@@ -2755,10 +3019,19 @@ mod tests {
         shard.put("preserved", &entry).unwrap();
 
         let _fault = fault_injection::inject(fault_injection::Point::BeforeCompactRename);
-        assert!(shard.compact().is_err());
-        assert!(compaction_temps(&dir.path().join("shard_0")).is_empty());
+        let error = shard.compact().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!compaction_artifacts(&dir.path().join("shard_0")).is_empty());
         assert!(matches!(
             shard.get("preserved", Instant::now()).unwrap(),
+            Some((DumpValue::Str(value), None)) if value == b"value"
+        ));
+
+        drop(shard);
+        let mut reopened = DiskShard::open(dir.path(), 0).unwrap();
+        assert!(compaction_artifacts(&dir.path().join("shard_0")).is_empty());
+        assert!(matches!(
+            reopened.get("preserved", Instant::now()).unwrap(),
             Some((DumpValue::Str(value), None)) if value == b"value"
         ));
     }
@@ -2776,6 +3049,10 @@ mod tests {
 
         let _fault = fault_injection::inject(fault_injection::Point::BeforeCompactDirectorySync);
         assert!(shard.compact().is_err());
+        assert!(dir
+            .path()
+            .join(format!("shard_0/{COMPACTION_BACKUP_NAME}"))
+            .exists());
 
         let second = DumpEntry {
             key: "second".to_string(),
@@ -2786,6 +3063,7 @@ mod tests {
         drop(shard);
 
         let mut reopened = DiskShard::open(dir.path(), 0).unwrap();
+        assert!(compaction_artifacts(&dir.path().join("shard_0")).is_empty());
         assert!(matches!(
             reopened.get("first", Instant::now()).unwrap(),
             Some((DumpValue::Str(value), None)) if value == b"one"
@@ -2794,6 +3072,170 @@ mod tests {
             reopened.get("second", Instant::now()).unwrap(),
             Some((DumpValue::Str(value), None)) if value == b"two"
         ));
+    }
+
+    #[test]
+    fn every_compaction_interruption_reopens_a_complete_generation() {
+        for point in [
+            fault_injection::Point::AfterCompactStagingCreated,
+            fault_injection::Point::AfterCompactStagingSynced,
+            fault_injection::Point::AfterCompactBackupSynced,
+            fault_injection::Point::BeforeCompactRename,
+            fault_injection::Point::BeforeCompactDirectorySync,
+            fault_injection::Point::BeforeCompactBackupCleanup,
+            fault_injection::Point::BeforeCompactCleanupSync,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut shard = compaction_fixture(dir.path());
+            let _fault = fault_injection::inject(point);
+            let error = shard.compact().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{point:?}");
+            drop(shard);
+
+            let mut reopened = DiskShard::open(dir.path(), 0).unwrap();
+            assert!(
+                reopened.rebuild_report.corrupted_entries.is_empty(),
+                "{point:?}"
+            );
+            assert!(reopened.rebuild_report.parse_errors.is_empty(), "{point:?}");
+            assert_compaction_fixture(&mut reopened);
+            assert!(
+                compaction_artifacts(&dir.path().join("shard_0")).is_empty(),
+                "{point:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_canonical_generation_recovers_the_durable_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut shard = compaction_fixture(dir.path());
+        let _fault = fault_injection::inject(fault_injection::Point::BeforeCompactDirectorySync);
+        shard.compact().unwrap_err();
+        drop(shard);
+
+        let shard_dir = dir.path().join("shard_0");
+        fs::remove_file(shard_dir.join("data.lux")).unwrap();
+        let mut reopened = DiskShard::open(dir.path(), 0).unwrap();
+        assert_compaction_fixture(&mut reopened);
+        assert!(shard_dir.join("data.lux").exists());
+        assert!(compaction_artifacts(&shard_dir).is_empty());
+    }
+
+    #[test]
+    fn incomplete_staging_is_not_promoted_when_canonical_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut shard = compaction_fixture(dir.path());
+        let _fault = fault_injection::inject(fault_injection::Point::AfterCompactStagingCreated);
+        shard.compact().unwrap_err();
+        drop(shard);
+
+        let shard_dir = dir.path().join("shard_0");
+        fs::remove_file(shard_dir.join("data.lux")).unwrap();
+        let error = DiskShard::open(dir.path(), 0).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!shard_dir.join("data.lux").exists());
+        assert!(!compaction_temps(&shard_dir).is_empty());
+    }
+
+    #[test]
+    fn storage_exhaustion_preserves_the_canonical_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut shard = compaction_fixture(dir.path());
+        let data_path = dir.path().join("shard_0/data.lux");
+        let before = fs::read(&data_path).unwrap();
+
+        let error = shard.compact_with_write_limit(7).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(fs::read(&data_path).unwrap(), before);
+        assert!(compaction_artifacts(&dir.path().join("shard_0")).is_empty());
+        assert_compaction_fixture(&mut shard);
+    }
+
+    #[test]
+    fn compaction_refuses_to_publish_corrupt_source_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut shard = compaction_fixture(dir.path());
+        let data_path = dir.path().join("shard_0/data.lux");
+        let corrupt_at = shard.index["keep"].offset + 8;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&data_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(corrupt_at)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xff;
+        file.seek(SeekFrom::Start(corrupt_at)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let corrupted = fs::read(&data_path).unwrap();
+
+        let error = shard.compact().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&data_path).unwrap(), corrupted);
+        assert!(compaction_artifacts(&dir.path().join("shard_0")).is_empty());
+    }
+
+    #[test]
+    fn rejected_rebuild_never_cleans_the_previous_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut shard = compaction_fixture(dir.path());
+        let _fault = fault_injection::inject(fault_injection::Point::BeforeCompactDirectorySync);
+        shard.compact().unwrap_err();
+        drop(shard);
+
+        let shard_dir = dir.path().join("shard_0");
+        let data_path = shard_dir.join("data.lux");
+        let backup_path = shard_dir.join(COMPACTION_BACKUP_NAME);
+        let backup = fs::read(&backup_path).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&data_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(DATA_MAGIC.len() as u64 + 8))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xff;
+        file.seek(SeekFrom::Start(DATA_MAGIC.len() as u64 + 8))
+            .unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut reopened = DiskShard::open(dir.path(), 0).unwrap();
+        assert!(!reopened.take_rebuild_report().corrupted_entries.is_empty());
+        assert_eq!(fs::read(&backup_path).unwrap(), backup);
+        let error = reopened.compact().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(backup_path).unwrap(), backup);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_cleanup_target_cannot_partially_remove_the_backup() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut shard = compaction_fixture(dir.path());
+        let _fault = fault_injection::inject(fault_injection::Point::BeforeCompactDirectorySync);
+        shard.compact().unwrap_err();
+        drop(shard);
+
+        let shard_dir = dir.path().join("shard_0");
+        let backup_path = shard_dir.join(COMPACTION_BACKUP_NAME);
+        let backup = fs::read(&backup_path).unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, b"untouched").unwrap();
+        symlink(&outside, shard_dir.join("data.compact.123.456")).unwrap();
+
+        assert!(DiskShard::open(dir.path(), 0).is_err());
+        assert_eq!(fs::read(backup_path).unwrap(), backup);
+        assert_eq!(fs::read(outside).unwrap(), b"untouched");
     }
 
     #[test]
