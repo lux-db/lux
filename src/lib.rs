@@ -791,6 +791,7 @@ struct Runtime {
     script_engine: Arc<lua::ScriptEngine>,
     config: Arc<ServerConfig>,
     accepting_work: std::sync::atomic::AtomicBool,
+    snapshot_worker: parking_lot::Mutex<Option<snapshot::SnapshotWorker>>,
     /// Open descriptors hold the advisory locks for every persistent root.
     /// Shutdown releases them after the final persistence barrier even when a
     /// stale embedded client keeps the otherwise-fenced runtime alive.
@@ -800,6 +801,20 @@ struct Runtime {
 impl Runtime {
     fn release_persistence_locks(&self) {
         self.persistence_locks.lock().take();
+    }
+
+    fn request_snapshot_shutdown(&self) {
+        if let Some(worker) = self.snapshot_worker.lock().as_ref() {
+            worker.request_shutdown(&self.store);
+        }
+    }
+
+    fn join_snapshot_worker(&self) -> std::io::Result<()> {
+        if let Some(mut worker) = self.snapshot_worker.lock().take() {
+            worker.join()
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -2453,13 +2468,15 @@ async fn server_main(
     runtime
         .accepting_work
         .store(false, std::sync::atomic::Ordering::Release);
+    let shutdown_started = Instant::now();
+    runtime.request_snapshot_shutdown();
 
     // Maintenance may itself mutate durable state. Cancel it before draining
     // accepted requests, then wait for cancellation so nothing can race the
     // final persistence barrier.
     background_tasks.abort_all();
 
-    let drained = tokio::time::timeout(shutdown_timeout, async {
+    let mut drained = tokio::time::timeout(shutdown_timeout, async {
         while conn_tasks.join_next().await.is_some() {}
         while background_tasks.join_next().await.is_some() {}
         if let Some(task) = http_task.as_mut() {
@@ -2491,6 +2508,11 @@ async fn server_main(
         }
     }
 
+    let snapshot_worker_error = runtime.join_snapshot_worker().err();
+    if shutdown_started.elapsed() > shutdown_timeout {
+        drained = false;
+    }
+
     // A clean drain has no request or maintenance tasks left. Closing the
     // mutation boundary here also protects against stale embedded clients.
     runtime.store.begin_shutdown();
@@ -2498,6 +2520,9 @@ async fn server_main(
     runtime.release_persistence_locks();
     final_sync.map_err(ShutdownError::Persistence)?;
 
+    if let Some(error) = snapshot_worker_error {
+        return Err(ShutdownError::Runtime(error));
+    }
     if let Some(error) = runtime_failure {
         return Err(ShutdownError::Runtime(error));
     }
@@ -2539,6 +2564,7 @@ impl Runtime {
             script_engine,
             config,
             accepting_work: std::sync::atomic::AtomicBool::new(true),
+            snapshot_worker: parking_lot::Mutex::new(None),
             persistence_locks: parking_lot::Mutex::new(Some(persistence_locks)),
         });
 
@@ -2682,9 +2708,8 @@ impl Runtime {
             eprintln!("push scope migration skipped: {e}");
         }
 
-        if runtime.config.durability.policy.is_persistent() {
-            background_tasks.spawn(snapshot::background_save_loop(runtime.store.clone()));
-        }
+        let snapshot_worker = snapshot::start_background_save_worker(runtime.store.clone())?;
+        *runtime.snapshot_worker.lock() = Some(snapshot_worker);
 
         {
             let store = runtime.store.clone();
@@ -4600,6 +4625,20 @@ mod persistence_config_tests {
 mod shutdown_tests {
     use super::*;
 
+    async fn wait_for_background_save(store: &Store) -> store::SnapshotStatus {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = store.snapshot_status();
+                if !status.phase.in_progress() && status.last_status != "none" {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background save did not finish")
+    }
+
     fn free_port() -> u16 {
         std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -4741,6 +4780,236 @@ mod shutdown_tests {
             matches!(error, ShutdownError::Persistence(_)),
             "unexpected shutdown error: {error}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bgsave_is_single_flight_and_retains_post_capture_mutations() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = persistent_embedded_config(root.path());
+        config.save_interval = Duration::ZERO;
+        let handle = run_with_config(config.clone()).await.unwrap();
+        let client = handle.client();
+        client
+            .execute_value("SET", &["counter", "10"])
+            .await
+            .unwrap();
+
+        let captured = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        handle.runtime().store.set_snapshot_after_capture_hook({
+            let captured = captured.clone();
+            let release = release.clone();
+            Arc::new(move || {
+                captured.wait();
+                release.wait();
+            })
+        });
+
+        assert_eq!(
+            client.execute_value("BGSAVE", &[]).await.unwrap(),
+            EmbeddedValue::Simple("Background saving started".to_string())
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || captured.wait()),
+        )
+        .await
+        .expect("snapshot did not reach the post-capture boundary")
+        .unwrap();
+
+        for expected in 11..=110 {
+            assert_eq!(
+                client.execute_value("INCR", &["counter"]).await.unwrap(),
+                EmbeddedValue::Int(expected)
+            );
+        }
+        assert_eq!(
+            client.execute_value("PING", &[]).await.unwrap(),
+            EmbeddedValue::Simple("PONG".to_string())
+        );
+        let busy = client.execute_value("BGSAVE", &[]).await.unwrap_err();
+        assert!(busy.to_string().contains("already in progress"), "{busy}");
+
+        let info = client
+            .execute_value("INFO", &["persistence"])
+            .await
+            .unwrap();
+        let EmbeddedValue::Bulk(info) = info else {
+            panic!("expected INFO bulk response");
+        };
+        let info = String::from_utf8_lossy(&info);
+        assert!(info.contains("rdb_bgsave_in_progress:1\r\n"), "{info}");
+        assert!(
+            info.contains("lux_current_bgsave_phase:capturing\r\n"),
+            "{info}"
+        );
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        let status = wait_for_background_save(&handle.runtime().store).await;
+        assert_eq!(status.last_status, "ok");
+        assert_eq!(status.last_keys, 1);
+        assert!(snapshot::last_save_unix_seconds(&handle.runtime().store)
+            .unwrap()
+            .is_some());
+
+        handle.shutdown_and_wait().await.unwrap();
+        let restarted = run_with_config(config).await.unwrap();
+        let client = restarted.client();
+        assert_eq!(
+            client.execute_value("GET", &["counter"]).await.unwrap(),
+            EmbeddedValue::Bulk(bytes::Bytes::from_static(b"110"))
+        );
+        restarted.shutdown_and_wait().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bgsave_failure_is_observable_and_does_not_advance_lastsave() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = persistent_embedded_config(root.path());
+        config.save_interval = Duration::ZERO;
+        let handle = run_with_config(config).await.unwrap();
+        handle
+            .client()
+            .execute_value("SET", &["preserved", "snapshot"])
+            .await
+            .unwrap();
+        handle.client().execute_value("SAVE", &[]).await.unwrap();
+        let installed_before = std::fs::read(root.path().join("lux.dat")).unwrap();
+        let lastsave_before = handle
+            .client()
+            .execute_value("LASTSAVE", &[])
+            .await
+            .unwrap();
+        handle.runtime().store.inject_snapshot_failures(1);
+
+        handle.client().execute_value("BGSAVE", &[]).await.unwrap();
+        let status = wait_for_background_save(&handle.runtime().store).await;
+        assert_eq!(status.last_status, "err");
+        assert!(status.last_error.is_some());
+        assert_eq!(
+            std::fs::read(root.path().join("lux.dat")).unwrap(),
+            installed_before,
+            "a failed BGSAVE replaced the installed snapshot"
+        );
+
+        let info = handle
+            .client()
+            .execute_value("INFO", &["persistence"])
+            .await
+            .unwrap();
+        let EmbeddedValue::Bulk(info) = info else {
+            panic!("expected INFO bulk response");
+        };
+        let info = String::from_utf8_lossy(&info);
+        assert!(info.contains("rdb_last_bgsave_status:err\r\n"), "{info}");
+        assert!(info.contains("lux_last_bgsave_error:"), "{info}");
+        assert!(!info.contains("lux_last_bgsave_error:\r\n"), "{info}");
+        assert_eq!(
+            handle
+                .client()
+                .execute_value("LASTSAVE", &[])
+                .await
+                .unwrap(),
+            lastsave_before
+        );
+        handle.shutdown_and_wait().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_waits_for_an_active_snapshot_before_final_sync() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = persistent_embedded_config(root.path());
+        config.save_interval = Duration::ZERO;
+        let handle = run_with_config(config.clone()).await.unwrap();
+        handle
+            .client()
+            .execute_value("SET", &["before_shutdown", "durable"])
+            .await
+            .unwrap();
+
+        let captured = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        handle.runtime().store.set_snapshot_after_capture_hook({
+            let captured = captured.clone();
+            let release = release.clone();
+            Arc::new(move || {
+                captured.wait();
+                release.wait();
+            })
+        });
+        handle.client().execute_value("BGSAVE", &[]).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || captured.wait()),
+        )
+        .await
+        .expect("snapshot did not reach the post-capture boundary")
+        .unwrap();
+
+        let shutdown = tokio::spawn(async move {
+            handle
+                .shutdown_and_wait_detailed(Duration::from_secs(2))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown returned while the snapshot thread was still active"
+        );
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        assert_eq!(shutdown.await.unwrap().unwrap(), ShutdownOutcome::Clean);
+
+        let restarted = run_with_config(config).await.unwrap();
+        assert_eq!(
+            restarted
+                .client()
+                .execute_value("GET", &["before_shutdown"])
+                .await
+                .unwrap(),
+            EmbeddedValue::Bulk(bytes::Bytes::from_static(b"durable"))
+        );
+        restarted.shutdown_and_wait().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduled_snapshots_use_the_background_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = persistent_embedded_config(root.path());
+        config.save_interval = Duration::from_millis(25);
+        let handle = run_with_config(config.clone()).await.unwrap();
+        handle
+            .client()
+            .execute_value("SET", &["scheduled", "durable"])
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = handle.runtime().store.snapshot_status();
+                if status.last_status == "ok" && status.last_keys == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduled snapshot did not complete");
+        handle.shutdown_and_wait().await.unwrap();
+
+        let restarted = run_with_config(config).await.unwrap();
+        assert_eq!(
+            restarted
+                .client()
+                .execute_value("GET", &["scheduled"])
+                .await
+                .unwrap(),
+            EmbeddedValue::Bulk(bytes::Bytes::from_static(b"durable"))
+        );
+        restarted.shutdown_and_wait().await.unwrap();
     }
 }
 

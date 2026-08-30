@@ -108,7 +108,16 @@ fn drain_deadline_exits_with_forced_status() {
     connection
         .write_all(&resp_cmd(&["BLPOP", "never", "10"]))
         .unwrap();
-    thread::sleep(Duration::from_millis(25));
+    let mut probe = connect(port);
+    let mut blocked = false;
+    for _ in 0..100 {
+        if send(&mut probe, &["INFO", "clients"]).contains("blocked_list_waiters:1") {
+            blocked = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(blocked, "BLPOP was not registered before shutdown");
 
     sigterm(&child);
     let status = wait_bounded(&mut child);

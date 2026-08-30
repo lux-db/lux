@@ -365,17 +365,7 @@ impl Wal {
         }
 
         match format {
-            WalFrameFormat::Guarded => {
-                let frame_len = payload.len() as u32;
-                let mut checksum_data = Vec::with_capacity(4 + payload.len());
-                checksum_data.extend_from_slice(&frame_len.to_le_bytes());
-                checksum_data.extend_from_slice(&payload);
-                out.extend_from_slice(WAL_FRAME_MAGIC);
-                out.extend_from_slice(&frame_len.to_le_bytes());
-                out.extend_from_slice(&(!frame_len).to_le_bytes());
-                out.extend_from_slice(&crc32(&checksum_data).to_le_bytes());
-                out.extend_from_slice(&payload);
-            }
+            WalFrameFormat::Guarded => Self::encode_guarded_payload(&payload, out),
             WalFrameFormat::Checksummed => {
                 let checksum = crc32(&payload);
                 let frame_len = (4 + payload.len()) as u32;
@@ -388,6 +378,18 @@ impl Wal {
                 out.extend_from_slice(&payload);
             }
         }
+    }
+
+    fn encode_guarded_payload(payload: &[u8], out: &mut Vec<u8>) {
+        let frame_len = payload.len() as u32;
+        let mut checksum_data = Vec::with_capacity(4 + payload.len());
+        checksum_data.extend_from_slice(&frame_len.to_le_bytes());
+        checksum_data.extend_from_slice(payload);
+        out.extend_from_slice(WAL_FRAME_MAGIC);
+        out.extend_from_slice(&frame_len.to_le_bytes());
+        out.extend_from_slice(&(!frame_len).to_le_bytes());
+        out.extend_from_slice(&crc32(&checksum_data).to_le_bytes());
+        out.extend_from_slice(payload);
     }
 
     /// Append a command to the WAL. Builds the entire frame in memory and
@@ -764,10 +766,37 @@ impl Wal {
                 "checkpoint has no authorized successor WAL generation",
             )
         })?;
-        self.truncate_to(generation)
+        let result = (|| {
+            let file_len = self.file.seek(SeekFrom::End(0))?;
+            // `checkpoint` was captured from this live handle after fsync and
+            // is bound to its random generation above. Recovery validates
+            // untrusted on-disk offsets by scanning frame boundaries; doing
+            // that again here would hold the append lock for the entire old
+            // WAL instead of only the post-snapshot suffix.
+            if checkpoint.offset < self.header_len || checkpoint.offset > file_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snapshot WAL checkpoint is outside the journal",
+                ));
+            }
+            self.replace_with(generation, Some((checkpoint.offset, file_len)))
+        })();
+        if result.is_err() {
+            let _ = self.file.seek(SeekFrom::End(0));
+        }
+        result
     }
 
+    #[cfg(test)]
     pub(crate) fn truncate_to(&mut self, generation: [u8; WAL_GENERATION_LEN]) -> io::Result<()> {
+        self.replace_with(generation, None)
+    }
+
+    fn replace_with(
+        &mut self,
+        generation: [u8; WAL_GENERATION_LEN],
+        retained_range: Option<(u64, u64)>,
+    ) -> io::Result<()> {
         if generation == LEGACY_WAL_GENERATION || generation == self.generation {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -782,10 +811,25 @@ impl Wal {
         let mut replacement = crate::file_security::open_private_file(&tmp, |options| {
             options.create_new(true).read(true).append(true);
         })?;
-        if let Err(error) = replacement
-            .write_all(&wal_header_bytes(&generation))
-            .and_then(|_| replacement.sync_all())
-        {
+        let write_replacement = (|| {
+            replacement.write_all(&wal_header_bytes(&generation))?;
+            if let Some((offset, file_len)) = retained_range {
+                self.file.seek(SeekFrom::Start(offset))?;
+                while self.file.stream_position()? < file_len {
+                    let payload = self.read_next_frame_payload(file_len)?.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "WAL ends inside a frame after the snapshot checkpoint",
+                        )
+                    })?;
+                    let mut frame = Vec::with_capacity(payload.len() + 16);
+                    Self::encode_guarded_payload(&payload, &mut frame);
+                    replacement.write_all(&frame)?;
+                }
+            }
+            replacement.sync_all()
+        })();
+        if let Err(error) = write_replacement {
             let _ = fs::remove_file(&tmp);
             return Err(error);
         }
@@ -2073,6 +2117,15 @@ mod tests {
             .unwrap()
             .commands
             .is_empty());
+        wal.append_command(&[b"SET", b"after-checkpoint", b"retained"])
+            .unwrap();
+        wal.rotate_after(checkpoint).unwrap();
+        let replay = wal.replay_from(Some(checkpoint)).unwrap();
+        assert_eq!(replay.commands.len(), 1);
+        assert_eq!(replay.commands[0][1], b"after-checkpoint");
+        drop(wal);
+        let mut reopened = Wal::open(dir.path(), 0).unwrap();
+        assert_eq!(reopened.replay().unwrap().commands.len(), 1);
     }
 
     #[test]
@@ -2343,6 +2396,36 @@ mod tests {
         let replay = wal.replay_from(Some(checkpoint)).unwrap();
         assert_eq!(replay.commands.len(), 1);
         assert_eq!(replay.commands[0][1], b"after-snapshot");
+    }
+
+    #[test]
+    fn checkpoint_rotation_retains_every_post_capture_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        wal.append_command(&[b"INCR", b"included"]).unwrap();
+        let checkpoint = wal.checkpoint().unwrap();
+        wal.append_command(&[b"SET", b"after-snapshot", b"one"])
+            .unwrap();
+        wal.append_commands([
+            &[b"INCR".as_slice(), b"batched-a".as_slice()][..],
+            &[b"INCR".as_slice(), b"batched-b".as_slice()][..],
+        ])
+        .unwrap();
+
+        wal.rotate_after(checkpoint).unwrap();
+        let replay = wal.replay_from(Some(checkpoint)).unwrap();
+        assert_eq!(replay.commands.len(), 3);
+        assert_eq!(replay.commands[0][1], b"after-snapshot");
+        assert_eq!(replay.commands[1][1], b"batched-a");
+        assert_eq!(replay.commands[2][1], b"batched-b");
+
+        drop(wal);
+        let mut reopened = Wal::open(dir.path(), 0).unwrap();
+        let replay = reopened.replay_from(Some(checkpoint)).unwrap();
+        assert_eq!(replay.commands.len(), 3);
+        assert_eq!(replay.commands[0][1], b"after-snapshot");
+        assert_eq!(replay.commands[1][1], b"batched-a");
+        assert_eq!(replay.commands[2][1], b"batched-b");
     }
 
     #[test]

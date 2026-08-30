@@ -1572,7 +1572,17 @@ fn hash_field_ttl_survives_snapshot() {
         &mut c,
         &["HPEXPIREAT", "h", "99999999999999", "FIELDS", "1", "f1"],
     );
-    send(&mut c, &["BGSAVE"]); // snapshot + WAL truncate
+    send(&mut c, &["BGSAVE"]);
+    let mut completed = false;
+    for _ in 0..200 {
+        let info = send(&mut c, &["INFO", "persistence"]);
+        if info.contains("rdb_bgsave_in_progress:0") && info.contains("rdb_last_bgsave_status:ok") {
+            completed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(completed, "BGSAVE did not finish before restart");
     drop(c);
     srv.kill();
     srv.restart(); // loads from the snapshot (WAL was truncated)

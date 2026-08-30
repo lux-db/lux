@@ -271,6 +271,20 @@ fn manual_snapshot_command_does_not_double_replay_wal(command: &str) {
         snapshot.contains("OK") || snapshot.contains("Background saving started"),
         "{command} failed: {snapshot}"
     );
+    if command == "BGSAVE" {
+        let mut completed = false;
+        for _ in 0..200 {
+            let info = send(&mut conn, &["INFO", "persistence"]);
+            if info.contains("rdb_bgsave_in_progress:0")
+                && info.contains("rdb_last_bgsave_status:ok")
+            {
+                completed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(completed, "BGSAVE did not complete before the crash test");
+    }
     drop(conn);
 
     server.crash_and_restart("1mb");

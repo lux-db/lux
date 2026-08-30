@@ -150,11 +150,18 @@ fn save_commands_report_real_completion_and_lastsave_time() {
 
     let save = send(&mut conn, &["BGSAVE"]);
     assert!(
-        save.starts_with("+OK") && save.contains("synchronously"),
-        "BGSAVE must disclose synchronous completion: {save:?}"
+        save.contains("Background saving started"),
+        "BGSAVE must acknowledge the accepted background job: {save:?}"
     );
 
-    let lastsave = send(&mut conn, &["LASTSAVE"]);
+    let mut lastsave = send(&mut conn, &["LASTSAVE"]);
+    for _ in 0..100 {
+        if lastsave.trim() != ":0" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        lastsave = send(&mut conn, &["LASTSAVE"]);
+    }
     let timestamp: u64 = lastsave
         .trim()
         .strip_prefix(':')

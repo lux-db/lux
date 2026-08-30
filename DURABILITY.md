@@ -121,8 +121,18 @@ Snapshot behavior:
 
 - Manual `SAVE` writes a consistent snapshot and rotates WAL generations only
   after the snapshot succeeds.
-- `BGSAVE` currently uses the same synchronous save path as `SAVE`; it does not
-  yet provide Redis-compatible background execution.
+- `BGSAVE` queues one save on a dedicated worker and returns immediately. A
+  second request fails while a manual or scheduled background save is active;
+  requests are never accumulated in an unbounded queue.
+- The worker fences mutations while it captures a consistent logical image and
+  WAL offsets. Snapshot file I/O happens after that fence is released, so
+  post-capture writes continue. Rotation later holds the journal append lock
+  while it retains those writes in the authorized successor generation.
+- `INFO persistence` reports background-save progress, phase, duration, result,
+  key count, and the most recent error. `LASTSAVE` advances only after the
+  snapshot file is atomically installed.
+- Graceful shutdown stops new background requests and joins an active snapshot
+  worker before the final journal sync and data-directory lock release.
 - Snapshot files use a binary format with explicit type tags and length fields.
 - Snapshot loading must reject invalid lengths and container counts before large
   allocation.

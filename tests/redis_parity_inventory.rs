@@ -22,7 +22,7 @@ const INVENTORY: &[CommandInventory] = &[
     excluded("ASKING", "cluster mode is out of scope"),
     supported("AUTH"),
     missing("BGREWRITEAOF", "Lux uses snapshot + WAL, not Redis AOF"),
-    partial("BGSAVE", "runs the save synchronously"),
+    supported("BGSAVE"),
     supported("BITFIELD"),
     supported("BITFIELD_RO"),
     supported("BITCOUNT"),

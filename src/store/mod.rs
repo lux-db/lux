@@ -544,6 +544,77 @@ impl StoreMetrics {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackgroundSavePhase {
+    Idle,
+    Queued,
+    Capturing,
+    Writing,
+    Committing,
+    Rotating,
+}
+
+impl BackgroundSavePhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Queued => "queued",
+            Self::Capturing => "capturing",
+            Self::Writing => "writing",
+            Self::Committing => "committing",
+            Self::Rotating => "rotating",
+        }
+    }
+
+    pub(crate) fn in_progress(self) -> bool {
+        self != Self::Idle
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SnapshotStatus {
+    pub(crate) phase: BackgroundSavePhase,
+    started_at: Option<Instant>,
+    pub(crate) last_duration_ms: u64,
+    pub(crate) last_keys: usize,
+    pub(crate) last_status: &'static str,
+    pub(crate) last_error: Option<String>,
+}
+
+impl Default for SnapshotStatus {
+    fn default() -> Self {
+        Self {
+            phase: BackgroundSavePhase::Idle,
+            started_at: None,
+            last_duration_ms: 0,
+            last_keys: 0,
+            last_status: "none",
+            last_error: None,
+        }
+    }
+}
+
+impl SnapshotStatus {
+    pub(crate) fn current_duration_seconds(&self) -> u64 {
+        if self.phase.in_progress() {
+            self.started_at
+                .map_or(0, |started| started.elapsed().as_secs())
+        } else {
+            0
+        }
+    }
+}
+
+fn sanitize_info_value(value: &str) -> String {
+    value.replace(['\r', '\n'], " ")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackgroundSaveRequestError {
+    Busy,
+    Unavailable,
+}
+
 pub struct Store {
     config: Arc<crate::ServerConfig>,
     encryption: crate::encryption::EncryptionKeyring,
@@ -588,10 +659,20 @@ pub struct Store {
     /// final shutdown sync into a real fence rather than a best-effort flush.
     accepting_mutations: std::sync::atomic::AtomicBool,
     restoring: std::sync::atomic::AtomicBool,
+    /// Serializes every operation that installs a snapshot or restore image.
+    snapshot_gate: parking_lot::Mutex<()>,
+    background_save_tx:
+        std::sync::OnceLock<std::sync::mpsc::SyncSender<crate::snapshot::SnapshotWorkerMessage>>,
+    background_save_stopping: std::sync::atomic::AtomicBool,
+    snapshot_status: parking_lot::Mutex<SnapshotStatus>,
     #[cfg(test)]
     journal_failures_to_inject: AtomicUsize,
     #[cfg(test)]
     journal_fsync_failures_to_inject: AtomicUsize,
+    #[cfg(test)]
+    snapshot_failures_to_inject: AtomicUsize,
+    #[cfg(test)]
+    snapshot_after_capture_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
     /// Set once at runtime startup; sink for typed row deltas feeding reactive
     /// live queries. Absent for embedded/replay-only stores, so emission is a
     /// cheap no-op there.
@@ -977,16 +1058,158 @@ impl Store {
             journal_poisoned: std::sync::atomic::AtomicBool::new(false),
             accepting_mutations: std::sync::atomic::AtomicBool::new(true),
             restoring: std::sync::atomic::AtomicBool::new(false),
+            snapshot_gate: parking_lot::Mutex::new(()),
+            background_save_tx: std::sync::OnceLock::new(),
+            background_save_stopping: std::sync::atomic::AtomicBool::new(false),
+            snapshot_status: parking_lot::Mutex::new(SnapshotStatus::default()),
             #[cfg(test)]
             journal_failures_to_inject: AtomicUsize::new(0),
             #[cfg(test)]
             journal_fsync_failures_to_inject: AtomicUsize::new(0),
+            #[cfg(test)]
+            snapshot_failures_to_inject: AtomicUsize::new(0),
+            #[cfg(test)]
+            snapshot_after_capture_hook: parking_lot::Mutex::new(None),
             row_delta_broker: std::sync::OnceLock::new(),
         })
     }
 
     pub fn config(&self) -> &crate::ServerConfig {
         &self.config
+    }
+
+    pub(crate) fn snapshot_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.snapshot_gate.lock()
+    }
+
+    pub(crate) fn install_background_save_sender(
+        &self,
+        sender: std::sync::mpsc::SyncSender<crate::snapshot::SnapshotWorkerMessage>,
+    ) -> std::io::Result<()> {
+        self.background_save_tx.set(sender).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "background snapshot worker is already installed",
+            )
+        })
+    }
+
+    pub(crate) fn request_background_save(&self) -> Result<(), BackgroundSaveRequestError> {
+        if self.background_save_stopping.load(Ordering::Acquire) {
+            return Err(BackgroundSaveRequestError::Unavailable);
+        }
+        let Some(sender) = self.background_save_tx.get() else {
+            return Err(BackgroundSaveRequestError::Unavailable);
+        };
+        let mut status = self.snapshot_status.lock();
+        if self.background_save_stopping.load(Ordering::Acquire) {
+            return Err(BackgroundSaveRequestError::Unavailable);
+        }
+        if status.phase.in_progress() {
+            return Err(BackgroundSaveRequestError::Busy);
+        }
+        status.phase = BackgroundSavePhase::Queued;
+        status.started_at = Some(Instant::now());
+        match sender.try_send(crate::snapshot::SnapshotWorkerMessage::Save) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                status.phase = BackgroundSavePhase::Idle;
+                status.started_at = None;
+                Err(BackgroundSaveRequestError::Busy)
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                status.phase = BackgroundSavePhase::Idle;
+                status.started_at = None;
+                Err(BackgroundSaveRequestError::Unavailable)
+            }
+        }
+    }
+
+    pub(crate) fn begin_scheduled_background_save(&self) -> bool {
+        let mut status = self.snapshot_status.lock();
+        if self.background_save_stopping.load(Ordering::Acquire) || status.phase.in_progress() {
+            return false;
+        }
+        status.phase = BackgroundSavePhase::Queued;
+        status.started_at = Some(Instant::now());
+        true
+    }
+
+    pub(crate) fn set_background_save_phase(&self, phase: BackgroundSavePhase) {
+        let mut status = self.snapshot_status.lock();
+        status.phase = phase;
+        if phase == BackgroundSavePhase::Idle {
+            status.started_at = None;
+        }
+    }
+
+    pub(crate) fn finish_background_save(
+        &self,
+        result: &std::io::Result<usize>,
+        duration: Duration,
+    ) {
+        let mut status = self.snapshot_status.lock();
+        status.phase = BackgroundSavePhase::Idle;
+        status.started_at = None;
+        status.last_duration_ms = duration.as_millis().min(u64::MAX as u128) as u64;
+        match result {
+            Ok(keys) => {
+                status.last_keys = *keys;
+                status.last_status = "ok";
+                status.last_error = None;
+            }
+            Err(error) => {
+                status.last_status = "err";
+                status.last_error = Some(sanitize_info_value(&error.to_string()));
+            }
+        }
+    }
+
+    pub(crate) fn snapshot_status(&self) -> SnapshotStatus {
+        self.snapshot_status.lock().clone()
+    }
+
+    pub(crate) fn stop_background_saves(&self) {
+        let _status = self.snapshot_status.lock();
+        self.background_save_stopping.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_snapshot_after_capture_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) {
+        *self.snapshot_after_capture_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_snapshot_after_capture_hook(&self) {
+        if let Some(hook) = self.snapshot_after_capture_hook.lock().clone() {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_snapshot_failures(&self, count: usize) {
+        self.snapshot_failures_to_inject
+            .store(count, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_snapshot_before_install_if_injected(&self) -> std::io::Result<()> {
+        if self
+            .snapshot_failures_to_inject
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            Err(std::io::Error::other(
+                "injected snapshot failure before install",
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn encryption(&self) -> &crate::encryption::EncryptionKeyring {
@@ -1544,7 +1767,7 @@ impl Store {
         }
     }
 
-    fn ensure_journal_healthy(&self) -> std::io::Result<()> {
+    pub(crate) fn ensure_journal_healthy(&self) -> std::io::Result<()> {
         if self.journal_poisoned.load(Ordering::Acquire) {
             Err(std::io::Error::other(
                 "mutation journal is unavailable; restart required",

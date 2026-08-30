@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::pubsub::Broker;
 use crate::resp;
-use crate::store::{JournalPlan, Store};
+use crate::store::{BackgroundSaveRequestError, JournalPlan, Store};
 
 use super::{arg_str, cmd_eq, is_restricted, CmdResult};
 
@@ -168,12 +168,14 @@ pub fn cmd_save(_args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instan
 }
 
 pub fn cmd_bgsave(_args: &[&[u8]], store: &Store, out: &mut BytesMut, _now: Instant) -> CmdResult {
-    match crate::snapshot::save_and_truncate_wal_consistent(store) {
-        Ok(n) => resp::write_simple(
-            out,
-            &format!("OK ({n} keys saved synchronously; background save is not supported)"),
-        ),
-        Err(e) => resp::write_error(out, &format!("ERR snapshot failed: {e}")),
+    match store.request_background_save() {
+        Ok(()) => resp::write_simple(out, "Background saving started"),
+        Err(BackgroundSaveRequestError::Busy) => {
+            resp::write_error(out, "ERR Background save already in progress")
+        }
+        Err(BackgroundSaveRequestError::Unavailable) => {
+            resp::write_error(out, "ERR background snapshot worker unavailable")
+        }
     }
     CmdResult::Written
 }
@@ -456,6 +458,11 @@ pub fn cmd_debug(_args: &[&[u8]], _store: &Store, out: &mut BytesMut, _now: Inst
 
 fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> String {
     let key_event_stats = broker.key_event_stats();
+    let snapshot = store.snapshot_status();
+    let last_save = crate::snapshot::last_save_unix_seconds(store)
+        .ok()
+        .flatten()
+        .unwrap_or(0);
     let restricted = is_restricted(store);
     let powered_by = if restricted {
         "\r\npowered_by:LuxDB Cloud (luxdb.dev)"
@@ -498,6 +505,15 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
          persistence_err_wal_append:{}\r\n\
          persistence_err_wal_fsync:{}\r\n\
          persistence_err_disk_write:{}\r\n\
+         rdb_bgsave_in_progress:{}\r\n\
+         rdb_current_bgsave_time_sec:{}\r\n\
+         rdb_last_bgsave_status:{}\r\n\
+         rdb_last_bgsave_time_sec:{}\r\n\
+         rdb_last_save_time:{}\r\n\
+         lux_current_bgsave_phase:{}\r\n\
+         lux_last_bgsave_time_ms:{}\r\n\
+         lux_last_bgsave_keys:{}\r\n\
+         lux_last_bgsave_error:{}\r\n\
          \r\n\
          # Keyspace\r\n\
          db0:keys={},expires=0,avg_ttl=0\r\n\
@@ -535,6 +551,15 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
         store.persistence_wal_append_errors(),
         store.persistence_wal_fsync_errors(),
         store.persistence_disk_write_errors(),
+        usize::from(snapshot.phase.in_progress()),
+        snapshot.current_duration_seconds(),
+        snapshot.last_status,
+        snapshot.last_duration_ms / 1_000,
+        last_save,
+        snapshot.phase.as_str(),
+        snapshot.last_duration_ms,
+        snapshot.last_keys,
+        snapshot.last_error.as_deref().unwrap_or(""),
         store.dbsize(now),
         store.dbsize(now),
         store.tracked_key_count(),

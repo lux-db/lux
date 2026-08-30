@@ -1,11 +1,12 @@
-use crate::store::{DumpValue, Store};
+use crate::store::{BackgroundSavePhase, DumpValue, Store};
 use hashbrown::{HashMap, HashSet};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, BufRead, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 const HEADER_V1: &[u8; 4] = b"LUX\x01";
@@ -286,11 +287,13 @@ fn read_string(r: &mut impl Read) -> io::Result<String> {
     String::from_utf8(raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn save_entries(
+fn save_entries_observed(
     store: &Store,
     entries: &[crate::store::DumpEntry],
     checkpoints: &[(String, crate::disk::WalCheckpoint)],
+    on_phase: &dyn Fn(BackgroundSavePhase),
 ) -> io::Result<usize> {
+    on_phase(BackgroundSavePhase::Writing);
     let path = snapshot_path(store);
     if let Some(parent) = Path::new(&path).parent() {
         crate::disk::create_dir_all_synced(parent)?;
@@ -305,15 +308,30 @@ fn save_entries(
     let file = crate::file_security::open_private_file(Path::new(&tmp), |options| {
         options.create_new(true).write(true);
     })?;
-    let mut w = BufWriter::new(file);
-    save_snapshot_binary(&mut w, entries, store, checkpoints)?;
-    let file = w.into_inner().map_err(io::Error::other)?;
-    file.sync_all()?;
+    let file = match (|| {
+        let mut writer = BufWriter::new(file);
+        save_snapshot_binary(&mut writer, entries, store, checkpoints)?;
+        let file = writer.into_inner().map_err(io::Error::other)?;
+        file.sync_all()?;
+        Ok::<_, io::Error>(file)
+    })() {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+    };
+    #[cfg(test)]
+    if let Err(error) = store.fail_snapshot_before_install_if_injected() {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
     #[cfg(test)]
     if let Err(error) = fault_injection::check(fault_injection::Point::BeforeSnapshotRename) {
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
+    on_phase(BackgroundSavePhase::Committing);
     if let Err(error) = crate::file_security::ensure_regular_or_missing(Path::new(&path)) {
         let _ = fs::remove_file(&tmp);
         return Err(error);
@@ -331,11 +349,25 @@ fn save_entries(
     Ok(entries.len())
 }
 
-pub(crate) fn save_and_truncate_wal_consistent(store: &Store) -> io::Result<usize> {
+#[cfg(test)]
+fn save_entries(
+    store: &Store,
+    entries: &[crate::store::DumpEntry],
+    checkpoints: &[(String, crate::disk::WalCheckpoint)],
+) -> io::Result<usize> {
+    save_entries_observed(store, entries, checkpoints, &|_| {})
+}
+
+fn save_and_truncate_wal_observed(
+    store: &Store,
+    on_phase: &dyn Fn(BackgroundSavePhase),
+) -> io::Result<usize> {
+    let _snapshot_guard = store.snapshot_guard();
     if store.is_restoring() {
         return Err(io::Error::other("database restore is in progress"));
     }
-    store.with_write_barrier(|shards| {
+    on_phase(BackgroundSavePhase::Capturing);
+    let (entries, checkpoints) = store.with_write_barrier(|shards| {
         if store.is_restoring() {
             return Err(io::Error::other("database restore is in progress"));
         }
@@ -345,10 +377,25 @@ pub(crate) fn save_and_truncate_wal_consistent(store: &Store) -> io::Result<usiz
             checkpoints.push(("global".to_string(), crate::disk::WalCheckpoint::detached()));
         }
         let entries = store.dump_all_from_locked_shards(shards, now)?;
-        let saved = save_entries(store, &entries, &checkpoints)?;
-        store.truncate_wal(&checkpoints)?;
-        Ok(saved)
-    })
+        store.ensure_journal_healthy()?;
+        Ok::<_, io::Error>((entries, checkpoints))
+    })?;
+
+    #[cfg(test)]
+    store.run_snapshot_after_capture_hook();
+
+    let saved = save_entries_observed(store, &entries, &checkpoints, on_phase)?;
+    // A mutation can fail and poison the journal while snapshot bytes are
+    // being written. Leave the old journal untouched in that case so restart
+    // recovery, rather than an uncertain in-process state, remains authoritative.
+    store.ensure_journal_healthy()?;
+    on_phase(BackgroundSavePhase::Rotating);
+    store.truncate_wal(&checkpoints)?;
+    Ok(saved)
+}
+
+pub(crate) fn save_and_truncate_wal_consistent(store: &Store) -> io::Result<usize> {
+    save_and_truncate_wal_observed(store, &|_| {})
 }
 
 /// Produce a consistent on-disk snapshot for an out-of-band backup and return
@@ -370,6 +417,7 @@ pub fn snapshot_for_backup(store: &Store) -> io::Result<String> {
 pub fn restore_to_disk(store: &Store, dump: &[u8]) -> io::Result<()> {
     validate_restore_dump(store, dump)?;
 
+    let _snapshot_guard = store.snapshot_guard();
     store.begin_restore()?;
     let result = store.with_write_barrier(|_| {
         stage_restore(store.config(), dump)?;
@@ -1498,29 +1546,129 @@ fn load_legacy(store: &Store, file: impl Read) -> io::Result<usize> {
     Ok(count)
 }
 
-pub async fn background_save_loop(store: Arc<Store>) {
-    let interval = snapshot_interval(&store);
-    if interval.is_zero() {
-        return;
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SnapshotWorkerMessage {
+    Save,
+    Wake,
+}
+
+pub(crate) struct SnapshotWorker {
+    sender: mpsc::SyncSender<SnapshotWorkerMessage>,
+    stopping: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SnapshotWorker {
+    pub(crate) fn request_shutdown(&self, store: &Store) {
+        store.stop_background_saves();
+        self.stopping.store(true, Ordering::Release);
+        let _ = self.sender.try_send(SnapshotWorkerMessage::Wake);
     }
+
+    pub(crate) fn join(&mut self) -> io::Result<()> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        thread
+            .join()
+            .map_err(|_| io::Error::other("background snapshot worker panicked"))
+    }
+}
+
+impl Drop for SnapshotWorker {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        let _ = self.sender.try_send(SnapshotWorkerMessage::Wake);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub(crate) fn start_background_save_worker(store: Arc<Store>) -> io::Result<SnapshotWorker> {
+    // The status transition plus a single queue slot provides strict
+    // single-flight behavior without accumulating stale save requests.
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let stopping = Arc::new(AtomicBool::new(false));
+    let thread_stopping = stopping.clone();
+    let thread_store = store.clone();
+    let thread = std::thread::Builder::new()
+        .name("lux-snapshot".to_string())
+        .spawn(move || background_save_worker(thread_store, receiver, thread_stopping))?;
+
+    if let Err(error) = store.install_background_save_sender(sender.clone()) {
+        stopping.store(true, Ordering::Release);
+        let _ = sender.try_send(SnapshotWorkerMessage::Wake);
+        let _ = thread.join();
+        return Err(error);
+    }
+
+    Ok(SnapshotWorker {
+        sender,
+        stopping,
+        thread: Some(thread),
+    })
+}
+
+fn background_save_worker(
+    store: Arc<Store>,
+    receiver: mpsc::Receiver<SnapshotWorkerMessage>,
+    stopping: Arc<AtomicBool>,
+) {
+    let interval = snapshot_interval(&store);
+    let scheduled = store.config().durability.policy.is_persistent() && !interval.is_zero();
+
     loop {
-        tokio::time::sleep(interval).await;
-        match save_and_truncate_wal_consistent(&store) {
-            Ok(n) => {
-                crate::emit_info(
-                    store.config(),
-                    crate::ServerInfoEvent::SnapshotSaved { keys: n },
-                );
+        let message = if stopping.load(Ordering::Acquire) {
+            receiver.try_recv().ok()
+        } else if scheduled {
+            match receiver.recv_timeout(interval) {
+                Ok(message) => Some(message),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Some(if store.begin_scheduled_background_save() {
+                        SnapshotWorkerMessage::Save
+                    } else {
+                        SnapshotWorkerMessage::Wake
+                    })
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => None,
             }
-            Err(e) => {
-                crate::emit_error(
-                    store.config(),
-                    crate::ServerErrorEvent::SnapshotSaveFailed {
-                        error: e.to_string(),
-                        path: snapshot_path(&store),
-                    },
-                );
+        } else {
+            receiver.recv().ok()
+        };
+        let Some(message) = message else {
+            store.set_background_save_phase(BackgroundSavePhase::Idle);
+            break;
+        };
+        match message {
+            SnapshotWorkerMessage::Wake => {
+                if stopping.load(Ordering::Acquire) {
+                    store.set_background_save_phase(BackgroundSavePhase::Idle);
+                    break;
+                }
+                continue;
             }
+            SnapshotWorkerMessage::Save => {}
+        }
+
+        let started = Instant::now();
+        let result = save_and_truncate_wal_observed(&store, &|phase| {
+            store.set_background_save_phase(phase);
+        });
+        store.finish_background_save(&result, started.elapsed());
+
+        match result {
+            Ok(keys) => crate::emit_info(
+                store.config(),
+                crate::ServerInfoEvent::SnapshotSaved { keys },
+            ),
+            Err(error) => crate::emit_error(
+                store.config(),
+                crate::ServerErrorEvent::SnapshotSaveFailed {
+                    error: error.to_string(),
+                    path: snapshot_path(&store),
+                },
+            ),
         }
     }
 }
