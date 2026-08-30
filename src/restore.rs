@@ -320,7 +320,10 @@ fn available_space(path: &Path) -> io::Result<u64> {
     } else {
         stats.f_frsize
     };
-    Ok(u64::from(stats.f_bavail).saturating_mul(block_size))
+    // libc exposes this field as different unsigned widths across Unix targets.
+    #[allow(clippy::useless_conversion)]
+    let available_blocks = u64::from(stats.f_bavail);
+    Ok(available_blocks.saturating_mul(block_size))
 }
 
 #[cfg(not(unix))]
