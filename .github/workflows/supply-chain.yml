@@ -28,10 +28,10 @@ jobs:
         run: cargo install cargo-deny --version 0.20.2 --locked
 
       - name: Check Engine advisories and licenses
-        run: cargo deny --manifest-path Cargo.toml check advisories licenses
+        run: cargo deny --locked --manifest-path Cargo.toml check advisories licenses
 
       - name: Check CLI advisories and licenses
-        run: cargo deny --manifest-path cli/Cargo.toml check advisories licenses
+        run: cargo deny --locked --manifest-path cli/Cargo.toml --config cli/deny.toml check advisories licenses
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:

@@ -20,9 +20,9 @@ credential and RESP requires normal connection authentication.
 Container orchestrators may call `GET /health/live` and `GET /health/ready`
 without database credentials. Liveness means the recovered engine's HTTP
 listener is serving requests. Readiness also requires the engine to be
-accepting normal traffic, with no restore, shutdown, or poisoned mutation
-journal in progress. The endpoints return only the health state and never
-project data.
+accepting normal traffic and its mutation journal to be healthy. A staged
+restore is committed before the HTTP listener starts. The endpoints return
+only the health state and never project data.
 
 ## Migrations
 

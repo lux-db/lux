@@ -13,18 +13,12 @@ db-path = "target/cargo-deny/advisory-dbs"
 unmaintained = "workspace"
 unsound = "all"
 yanked = "deny"
-ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "Lux verifies Apple RS256 identity tokens but never performs RSA private-key operations in production. No fixed rsa release exists. Review or remove this exception by 2026-09-30." },
-    { crate = "spin@0.9.8", reason = "The yanked crate is a transitive implementation detail of rsa 0.9.10. It is covered by the same no-private-RSA-operations boundary and must be reviewed or removed by 2026-09-30." },
-]
 
 [licenses]
 confidence-threshold = 0.93
 unused-allowed-license = "warn"
 allow = [
     "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
     "CDLA-Permissive-2.0",
@@ -32,4 +26,8 @@ allow = [
     "MIT",
     "Unicode-3.0",
     "Unlicense",
+]
+exceptions = [
+    { crate = "colored@3.1.1", allow = ["MPL-2.0"] },
+    { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
 ]
