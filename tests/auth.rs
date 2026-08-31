@@ -1,6 +1,6 @@
 mod common;
 use common::{send_and_read, LuxServer};
-use std::io::Write;
+use std::io::{Read, Write};
 
 // Raw-KV access to the internal `_t:` namespace (where auth rows live --
 // password hashes, the JWT signing key, OAuth secrets) is reserved, for reads
@@ -387,6 +387,24 @@ fn revoking_a_key_takes_effect_immediately() {
         .expect("key id in response")
         .to_string();
 
+    // Keep one authenticated RESP connection open across the revocation. The
+    // connection must not retain blanket access for the rest of its lifetime.
+    let mut established = server.conn();
+    let response = send_and_read(&mut established, &["AUTH", &minted]);
+    assert!(
+        response.starts_with("+OK"),
+        "establish RESP session: {response}"
+    );
+    let mut blocked = server.conn();
+    let response = send_and_read(&mut blocked, &["AUTH", &minted]);
+    assert!(
+        response.starts_with("+OK"),
+        "establish blocked RESP session: {response}"
+    );
+    blocked
+        .write_all(&common::resp_cmd(&["BLPOP", "never-arrives", "0"]))
+        .unwrap();
+
     // It works, which also warms the resolution cache.
     for _ in 0..3 {
         let (status, _) = common::http_request(port, "GET", "/v1/dbsize", None, Some(&minted));
@@ -405,6 +423,26 @@ fn revoking_a_key_takes_effect_immediately() {
     // Immediately, not after the cache TTL expires.
     let (status, _) = common::http_request(port, "GET", "/v1/dbsize", None, Some(&minted));
     assert_eq!(status, 401, "revoked key must stop working at once");
+
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    let mut terminal = [0u8; 512];
+    match established.read(&mut terminal) {
+        Ok(0) => {}
+        Ok(n) => assert!(
+            String::from_utf8_lossy(&terminal[..n]).contains("NOAUTH"),
+            "established RESP session must receive a revocation terminal: {:?}",
+            String::from_utf8_lossy(&terminal[..n])
+        ),
+        Err(error) => panic!("established RESP session did not terminate in time: {error}"),
+    }
+    match blocked.read(&mut terminal) {
+        Ok(0) => {}
+        Ok(n) => panic!(
+            "blocked RESP session emitted unexpected data after revocation: {:?}",
+            String::from_utf8_lossy(&terminal[..n])
+        ),
+        Err(error) => panic!("blocked RESP session survived revocation: {error}"),
+    }
 
     let mut conn = server.conn();
     let resp = send_and_read(&mut conn, &["AUTH", &minted]);
@@ -493,6 +531,71 @@ fn publishable_with_end_user_token_reads_and_writes_per_grants() {
         "publishable+jwt must read its own row: {status} {body}"
     );
 
+    let bearer_only = [format!("Authorization: Bearer {jwt}")];
+    let bearer_only: Vec<&str> = bearer_only.iter().map(String::as_str).collect();
+    let (status, body) = common::http_request_with_headers(
+        port,
+        "GET",
+        "/v1/tables/cursors",
+        None,
+        None,
+        &bearer_only,
+    );
+    assert!(
+        status < 400 && body.contains("c1"),
+        "a user JWT may stand alone and remains grant-scoped: {status} {body}"
+    );
+
+    let invalid_project = [
+        "apikey: lux_pub_not_the_project".to_string(),
+        format!("Authorization: Bearer {jwt}"),
+    ];
+    let invalid_project: Vec<&str> = invalid_project.iter().map(String::as_str).collect();
+    let (status, body) = common::http_request_with_headers(
+        port,
+        "GET",
+        "/v1/tables/cursors",
+        None,
+        None,
+        &invalid_project,
+    );
+    assert_eq!(
+        status, 401,
+        "an invalid explicit project key must not fall through to its companion JWT: {body}"
+    );
+
+    let (status, body) = common::http_request_with_headers(
+        port,
+        "GET",
+        "/auth/v1/user",
+        None,
+        None,
+        &invalid_project,
+    );
+    assert_eq!(
+        status, 401,
+        "the Auth API must reject an invalid explicit project key before accepting its companion JWT: {body}"
+    );
+
+    let (status, body) =
+        common::http_request_with_headers(port, "GET", "/v1/future-surface", None, None, &browser);
+    assert_eq!(
+        status, 403,
+        "an unclassified HTTP route must remain project-private: {body}"
+    );
+    let (status, body) = common::http_request_with_headers(
+        port,
+        "GET",
+        "/auth/v1/future-surface",
+        None,
+        None,
+        &browser,
+    );
+    assert_eq!(
+        status, 404,
+        "an unclassified Auth route must be unreachable: {body}"
+    );
+
     // The grant predicate still binds: someone else's row is refused.
     let (status, body) = common::http_request_with_headers(
         port,
@@ -513,5 +616,186 @@ fn publishable_with_end_user_token_reads_and_writes_per_grants() {
     assert!(
         status >= 400,
         "end-user principal must not reach secret-key routes: {status} {body}"
+    );
+}
+
+#[test]
+fn joined_http_reads_require_every_grant_and_bind_aliases() {
+    let server = keyed_server();
+    let port = server.http_port();
+    let exec = |command: &str| {
+        let (status, body) = common::http_request(
+            port,
+            "POST",
+            "/v1/exec",
+            Some(&format!(r#"{{"command":{command}}}"#)),
+            Some(SECRET),
+        );
+        assert!(
+            status < 400 && !body.contains("error"),
+            "{command}: {status} {body}"
+        );
+    };
+    exec(
+        r#"["TCREATE","messages","id STR PRIMARY KEY,","owner_id STR,","profile_id STR,","body STR"]"#,
+    );
+    exec(r#"["TCREATE","profiles","id STR PRIMARY KEY,","owner_id STR,","name STR"]"#);
+    exec(r#"["GRANT","read","ON","messages","WHERE","owner_id","=","auth.uid()"]"#);
+
+    let signup = |email: &str| {
+        let (status, body) = common::http_request_with_headers(
+            port,
+            "POST",
+            "/auth/v1/signup",
+            Some(&format!(
+                r#"{{"email":"{email}","password":"hunter2hunter2"}}"#
+            )),
+            None,
+            &[&format!("apikey: {PUBLISHABLE}")],
+        );
+        assert_eq!(status, 200, "signup {email}: {body}");
+        let field = |key: &str| {
+            body.split(&format!("\"{key}\":\""))
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_default()
+                .to_string()
+        };
+        (field("access_token"), field("id"))
+    };
+    let (jwt_one, user_one) = signup("join-one@example.com");
+    let (_, user_two) = signup("join-two@example.com");
+
+    exec(&format!(
+        r#"["TINSERT","profiles","id","p1","owner_id","{user_one}","name","own-profile"]"#
+    ));
+    exec(&format!(
+        r#"["TINSERT","profiles","id","p2","owner_id","{user_two}","name","other-profile"]"#
+    ));
+    exec(&format!(
+        r#"["TINSERT","messages","id","m0","owner_id","{user_one}","profile_id","p2","body","cross-message"]"#
+    ));
+    exec(&format!(
+        r#"["TINSERT","messages","id","m1","owner_id","{user_one}","profile_id","p1","body","own-message"]"#
+    ));
+
+    let headers = [
+        format!("apikey: {PUBLISHABLE}"),
+        format!("Authorization: Bearer {jwt_one}"),
+    ];
+    let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let path = "/v1/tables/messages?join=profiles:p:on(profile_id=id)";
+    let (status, body) = common::http_request_with_headers(port, "GET", path, None, None, &headers);
+    assert_eq!(
+        status, 403,
+        "a base-table grant must not authorize an ungranted join: {body}"
+    );
+
+    exec(r#"["GRANT","read","ON","profiles","WHERE","owner_id","=","auth.uid()"]"#);
+    let (status, body) = common::http_request_with_headers(port, "GET", path, None, None, &headers);
+    assert_eq!(status, 200, "fully granted join: {body}");
+    assert!(
+        body.contains("own-profile"),
+        "own joined row missing: {body}"
+    );
+    assert!(
+        !body.contains("other-profile") && !body.contains("cross-message"),
+        "joined grant must bind to the joined alias, not a same-named base column: {body}"
+    );
+
+    let limited = format!("{path}&limit=1");
+    let (status, body) =
+        common::http_request_with_headers(port, "GET", &limited, None, None, &headers);
+    assert_eq!(status, 200, "limited fully granted join: {body}");
+    assert!(
+        body.contains("own-profile"),
+        "LIMIT must apply after joined grant filters discard earlier rows: {body}"
+    );
+}
+
+#[test]
+fn claim_values_cannot_inject_http_grant_filters() {
+    let server = keyed_server();
+    let port = server.http_port();
+    let exec = |command: &str| {
+        let (status, body) = common::http_request(
+            port,
+            "POST",
+            "/v1/exec",
+            Some(&format!(r#"{{"command":{command}}}"#)),
+            Some(SECRET),
+        );
+        assert!(
+            status < 400 && !body.contains("error"),
+            "{command}: {status} {body}"
+        );
+    };
+    exec(r#"["TCREATE","email_rows","id STR PRIMARY KEY,","email STR,","body STR"]"#);
+    exec(r#"["GRANT","read,","write","ON","email_rows","WHERE","email","=","auth.email"]"#);
+
+    let malicious_email = "attacker or id != never";
+    let (status, signup) = common::http_request_with_headers(
+        port,
+        "POST",
+        "/auth/v1/signup",
+        Some(&format!(
+            r#"{{"email":"{malicious_email}","password":"hunter2hunter2"}}"#
+        )),
+        None,
+        &[&format!("apikey: {PUBLISHABLE}")],
+    );
+    assert_eq!(status, 200, "signup: {signup}");
+    let jwt = signup
+        .split("\"access_token\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("access token");
+
+    exec(&format!(
+        r#"["TINSERT","email_rows","id","mine","email","{malicious_email}","body","allowed"]"#
+    ));
+    exec(
+        r#"["TINSERT","email_rows","id","victim","email","victim@example.com","body","must-not-leak"]"#,
+    );
+    let headers = [
+        format!("apikey: {PUBLISHABLE}"),
+        format!("Authorization: Bearer {jwt}"),
+    ];
+    let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let (status, body) = common::http_request_with_headers(
+        port,
+        "GET",
+        "/v1/tables/email_rows",
+        None,
+        None,
+        &headers,
+    );
+    assert_eq!(status, 200, "grant-scoped read: {body}");
+    assert!(body.contains("allowed"), "exact claim row missing: {body}");
+    assert!(
+        !body.contains("must-not-leak"),
+        "claim text must remain a value, not become WHERE syntax: {body}"
+    );
+
+    let (status, body) = common::http_request_with_headers(
+        port,
+        "PATCH",
+        "/v1/tables/email_rows?where=id+%21%3D+none",
+        Some(r#"{"body":"user-updated"}"#),
+        None,
+        &headers,
+    );
+    assert_eq!(status, 200, "grant-scoped update: {body}");
+    assert!(
+        body.contains("mine") && !body.contains("victim"),
+        "claim text must remain a value in write filters: {body}"
+    );
+
+    let (status, body) =
+        common::http_request(port, "GET", "/v1/tables/email_rows", None, Some(SECRET));
+    assert_eq!(status, 200, "secret verification read: {body}");
+    assert!(
+        body.contains("user-updated") && body.contains("must-not-leak"),
+        "the scoped update must change only the exact claim row: {body}"
     );
 }

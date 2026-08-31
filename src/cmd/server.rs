@@ -56,6 +56,7 @@ pub fn cmd_hello(
     };
 
     let mut authenticated = false;
+    let mut secret_credential = None;
     let mut i = 2;
     while i < args.len() {
         if cmd_eq(args[i], b"AUTH") {
@@ -67,11 +68,18 @@ pub fn cmd_hello(
                 return CmdResult::Written;
             }
             let presented = arg_str(args[i + 2]);
-            let no_credentials = store.config().password.is_empty()
-                && !crate::auth::project_keys_configured(store, cache);
-            if no_credentials {
-                resp::write_error(out, "ERR Client sent AUTH, but no password is set");
-                return CmdResult::Written;
+            if store.config().password.is_empty() {
+                match crate::auth::project_keys_configured(store, cache) {
+                    Ok(false) => {
+                        resp::write_error(out, "ERR Client sent AUTH, but no password is set");
+                        return CmdResult::Written;
+                    }
+                    Err(error) => {
+                        resp::write_error(out, &format!("ERR auth state unavailable: {error}"));
+                        return CmdResult::Written;
+                    }
+                    Ok(true) => {}
+                }
             }
             match crate::auth::resolve_credential(
                 presented,
@@ -80,8 +88,12 @@ pub fn cmd_hello(
                 store,
                 cache,
             ) {
-                Ok(crate::auth::Credential::Operator | crate::auth::Credential::Secret) => {
+                Ok(crate::auth::Credential::Operator) => {
                     authenticated = true;
+                }
+                Ok(crate::auth::Credential::Secret(credential)) => {
+                    authenticated = true;
+                    secret_credential = Some(credential);
                 }
                 Err(error) => {
                     resp::write_error(out, &format!("WRONGPASS {error}"));
@@ -123,7 +135,9 @@ pub fn cmd_hello(
     resp::write_array_header(out, 0);
 
     if authenticated {
-        return CmdResult::Authenticated;
+        return CmdResult::Authenticated {
+            secret: secret_credential,
+        };
     }
     CmdResult::Written
 }
@@ -210,16 +224,29 @@ pub fn cmd_auth(
     // browser-embedded and must never reach this protocol, so the resolver
     // rejects it for `Surface::Resp` and we surface that reason verbatim.
     let presented = arg_str(args[1]);
-    let no_credentials =
-        store.config().password.is_empty() && !crate::auth::project_keys_configured(store, cache);
-    if no_credentials {
-        resp::write_error(out, "ERR Client sent AUTH, but no password is set");
-        return CmdResult::Written;
+    if store.config().password.is_empty() {
+        match crate::auth::project_keys_configured(store, cache) {
+            Ok(false) => {
+                resp::write_error(out, "ERR Client sent AUTH, but no password is set");
+                return CmdResult::Written;
+            }
+            Err(error) => {
+                resp::write_error(out, &format!("ERR auth state unavailable: {error}"));
+                return CmdResult::Written;
+            }
+            Ok(true) => {}
+        }
     }
     match crate::auth::resolve_credential(presented, "", crate::auth::Surface::Resp, store, cache) {
-        Ok(crate::auth::Credential::Operator | crate::auth::Credential::Secret) => {
+        Ok(crate::auth::Credential::Operator) => {
             resp::write_ok(out);
-            CmdResult::Authenticated
+            CmdResult::Authenticated { secret: None }
+        }
+        Ok(crate::auth::Credential::Secret(credential)) => {
+            resp::write_ok(out);
+            CmdResult::Authenticated {
+                secret: Some(credential),
+            }
         }
         Err(e) => {
             resp::write_error(out, &format!("WRONGPASS {e}"));

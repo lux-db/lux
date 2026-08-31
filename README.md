@@ -564,6 +564,21 @@ An engine is credential-gated once it has a password *or* project keys.
 Publishable keys never reach RESP and, on HTTP, reach only `/auth/v1/*` until a
 signed-in user's JWT accompanies them; grants then decide which rows.
 
+| Credential | Auth API | HTTP data | RESP | `.live()` |
+| --- | --- | --- | --- | --- |
+| Operator password | Full access | Full access | Full access | Full access |
+| Secret key | Admin + app auth | Full access | Full access | Full access |
+| Publishable key | App auth only | No access alone | Never | No access alone |
+| Publishable key + user JWT | App auth + own session | Grant-scoped | Never | Grant-scoped |
+| User JWT alone | Own session | Grant-scoped | Never | Grant-scoped |
+| Anonymous | Public auth metadata only | Denied when gated | Denied when gated | Denied when gated |
+| Open local (no configured credentials) | Setup/app auth | Open | Open | Open |
+
+Unknown routes are project-private until explicitly classified. A joined query
+requires a read grant on every table it names. Revoked user sessions and secret
+keys are revalidated on long-lived connections rather than remaining valid for
+the life of the socket.
+
 ```bash
 LUX_HTTP_PORT=5890 \
 LUX_AUTH_ENABLED=true \

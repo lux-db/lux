@@ -4351,6 +4351,65 @@ fn parse_where_condition(args: &[&str], i: &mut usize) -> Result<WhereClause, St
     Ok(WhereClause::single(field, op, value))
 }
 
+/// Tokenize a textual WHERE fragment while preserving quoted values. Grant
+/// predicates and HTTP filters share this parser so a value containing spaces
+/// or query keywords is never reinterpreted as syntax at another entry point.
+pub(crate) fn tokenize_where(s: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut building = false;
+    let mut in_quote = false;
+    let mut chars = s.chars().peekable();
+    while let Some(character) = chars.next() {
+        if in_quote {
+            match character {
+                '\\' => match chars.next() {
+                    Some('\'') => current.push('\''),
+                    Some('\\') => current.push('\\'),
+                    Some(other) => {
+                        current.push('\\');
+                        current.push(other);
+                    }
+                    None => return Err("unterminated escape in where value".to_string()),
+                },
+                '\'' => in_quote = false,
+                _ => current.push(character),
+            }
+        } else if character == '\'' && !building {
+            in_quote = true;
+            building = true;
+        } else if matches!(character, '=' | '<' | '>')
+            || (character == '!' && chars.peek() == Some(&'='))
+        {
+            if building {
+                tokens.push(std::mem::take(&mut current));
+                building = false;
+            }
+            let mut operator = String::from(character);
+            if matches!(character, '!' | '<' | '>') && chars.peek() == Some(&'=') {
+                chars.next();
+                operator.push('=');
+            }
+            tokens.push(operator);
+        } else if character.is_whitespace() {
+            if building {
+                tokens.push(std::mem::take(&mut current));
+                building = false;
+            }
+        } else {
+            current.push(character);
+            building = true;
+        }
+    }
+    if in_quote {
+        return Err("unterminated quote in where value".to_string());
+    }
+    if building {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
 /// Parse WHERE conditions from command args (`field op value [AND ...]`).
 fn parse_where_conditions(args: &[&str]) -> Result<Vec<WhereClause>, String> {
     let mut conditions = Vec::new();
@@ -4748,7 +4807,7 @@ pub fn table_count_filtered(
         table.to_string(),
         "WHERE".to_string(),
     ];
-    toks.extend(filter.split_whitespace().map(ToString::to_string));
+    toks.extend(tokenize_where(filter)?);
     let refs: Vec<&str> = toks.iter().map(|s| s.as_str()).collect();
     let plan = parse_select(&refs)?;
     match table_select(store, cache, &plan, now)? {
@@ -4820,7 +4879,7 @@ pub fn table_get_filtered_pk(
     ];
     if !filter.trim().is_empty() {
         toks.push("AND".to_string());
-        toks.extend(filter.split_whitespace().map(ToString::to_string));
+        toks.extend(tokenize_where(filter)?);
     }
     let refs: Vec<&str> = toks.iter().map(|s| s.as_str()).collect();
     let mut plan = parse_select(&refs)?;

@@ -1,13 +1,9 @@
 //! Row-level access grants (the GRANT language).
 //!
-//! A grant is a *contract*: `GRANT read, write ON messages WHERE user_id =
-//! auth.uid()` means a token user may query `messages`, but only for rows their
-//! query already restricts to `user_id = <their uid>`. It is NOT a filter that
-//! gets silently AND'ed in. On every request the server resolves the grant
-//! predicate against the principal and checks that the client's query
-//! **satisfies** it (contains the grant's conditions). If it does, the query
-//! runs as written; if not, it's rejected. The client must explicitly scope its
-//! query to what it's entitled to.
+//! A grant is an enforced row filter: `GRANT read, write ON messages WHERE
+//! user_id = auth.uid()` means a token user may only read or mutate rows whose
+//! `user_id` matches their principal. The engine injects the resolved predicate
+//! at the query boundary; clients do not have to repeat it.
 //!
 //! Scopes: `read` (SELECT and `.live()`) and `write` (INSERT/UPDATE/DELETE).
 //! No grant for a (table, scope) => deny-by-default. Operator / service key
@@ -315,8 +311,9 @@ fn parse_subquery(tokens: &[&str], mut i: usize) -> Result<(Subquery, usize), St
         .get(i)
         .ok_or_else(|| "ERR grant subquery expects a table after FROM".to_string())?
         .to_string();
-    if table.to_ascii_lowercase().starts_with("auth.") {
-        return Err("ERR grant subquery may not read reserved 'auth.*' tables".to_string());
+    let lower_table = table.to_ascii_lowercase();
+    if lower_table.starts_with("auth.") || lower_table.starts_with("push.") {
+        return Err("ERR grant subquery may not read reserved system tables".to_string());
     }
     i += 1;
 
@@ -423,10 +420,9 @@ pub fn parse_revoke(tokens: &[&str]) -> Result<(String, Vec<Scope>), String> {
     Ok((table, scopes))
 }
 
-/// Serialize a predicate to canonical text for storage / display. The output is
-/// whitespace-separable so `load_grant_predicate` can re-tokenize it with
-/// `split_whitespace()` and parse back an identical predicate (every token,
-/// including parens, is space-delimited).
+/// Serialize a predicate to canonical text for storage / display. Literal
+/// operands are quoted so spaces, operators, and keywords remain data when the
+/// stored predicate is parsed again.
 pub fn predicate_to_string(pred: &Predicate) -> String {
     pred.clauses()
         .map(|conditions| {
@@ -444,7 +440,10 @@ fn operand_to_string(operand: &Operand) -> String {
     match operand {
         Operand::AuthUid => "auth.uid()".to_string(),
         Operand::AuthClaim(name) => format!("auth.{name}"),
-        Operand::Literal(v) => v.clone(),
+        Operand::Literal(value) => {
+            let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
+            format!("'{escaped}'")
+        }
     }
 }
 
@@ -837,9 +836,9 @@ mod tests {
             s,
             "workspace_id IN ( SELECT workspace_id FROM members WHERE user_id = auth.uid() )"
         );
-        // The stored string re-tokenizes (split_whitespace) and parses identically.
-        let toks: Vec<&str> = s.split_whitespace().collect();
-        let reparsed = parse_predicate(&toks).unwrap();
+        let tokens = crate::tables::tokenize_where(&s).unwrap();
+        let token_refs = tokens.iter().map(String::as_str).collect::<Vec<_>>();
+        let reparsed = parse_predicate(&token_refs).unwrap();
         assert_eq!(reparsed, g.predicate);
     }
 
@@ -915,8 +914,9 @@ mod tests {
             s,
             "id = auth.uid() OR id IN ( SELECT user_id FROM members WHERE team_id IN ( SELECT team_id FROM members WHERE user_id = auth.uid() ) )"
         );
-        let toks: Vec<&str> = s.split_whitespace().collect();
-        let reparsed = parse_predicate(&toks).unwrap();
+        let tokens = crate::tables::tokenize_where(&s).unwrap();
+        let token_refs = tokens.iter().map(String::as_str).collect::<Vec<_>>();
+        let reparsed = parse_predicate(&token_refs).unwrap();
         assert_eq!(reparsed, g.predicate);
         assert_eq!(g.predicate.conditions.len(), 1);
         assert_eq!(g.predicate.alternatives.len(), 1);
@@ -931,8 +931,9 @@ mod tests {
         .unwrap();
         let s = predicate_to_string(&g.predicate);
         assert_eq!(s, "a IN ( SELECT x FROM t WHERE y IN ( SELECT z FROM u ) )");
-        let toks: Vec<&str> = s.split_whitespace().collect();
-        let reparsed = parse_predicate(&toks).unwrap();
+        let tokens = crate::tables::tokenize_where(&s).unwrap();
+        let token_refs = tokens.iter().map(String::as_str).collect::<Vec<_>>();
+        let reparsed = parse_predicate(&token_refs).unwrap();
         assert_eq!(reparsed, g.predicate);
         match &g.predicate.conditions[0] {
             Condition::InSubquery { subquery, .. } => {

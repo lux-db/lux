@@ -31,7 +31,9 @@ use crate::tables::SharedSchemaCache;
 pub enum CmdResult {
     Written,
     Quit,
-    Authenticated,
+    Authenticated {
+        secret: Option<crate::auth::SecretCredential>,
+    },
     Subscribe {
         channels: Vec<String>,
     },

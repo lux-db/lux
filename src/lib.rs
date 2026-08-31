@@ -2957,6 +2957,7 @@ fn handle_tx_cmd(
     tx_queue: &mut Vec<Vec<Vec<u8>>>,
     watched: &mut Vec<(String, usize, u64)>,
     authenticated: &mut bool,
+    secret_credential: &mut Option<crate::auth::SecretCredential>,
     store: &Arc<Store>,
     broker: &Broker,
     script_engine: &lua::ScriptEngine,
@@ -3018,8 +3019,9 @@ fn handle_tx_cmd(
                                 "ERR QUIT is not allowed inside a transaction",
                             );
                         }
-                        CmdResult::Authenticated => {
+                        CmdResult::Authenticated { secret } => {
                             *authenticated = true;
+                            *secret_credential = secret;
                         }
                         CmdResult::Subscribe { .. }
                         | CmdResult::PSubscribe { .. }
@@ -3173,6 +3175,7 @@ fn is_blocking_cmd(cmd: &[u8]) -> bool {
 
 pub(crate) struct CommandSession {
     authenticated: bool,
+    secret_credential: Option<crate::auth::SecretCredential>,
     client_name: Option<String>,
     in_multi: bool,
     tx_queue: Vec<Vec<Vec<u8>>>,
@@ -3188,6 +3191,7 @@ impl CommandSession {
     pub(crate) fn new(require_auth: bool) -> Self {
         Self {
             authenticated: !require_auth,
+            secret_credential: None,
             client_name: None,
             in_multi: false,
             tx_queue: Vec::new(),
@@ -3339,6 +3343,7 @@ impl CommandExecutor {
             &mut session.tx_queue,
             &mut session.watched,
             &mut session.authenticated,
+            &mut session.secret_credential,
             &self.store,
             &self.broker,
             &self.script_engine,
@@ -3514,6 +3519,7 @@ impl CommandExecutor {
                     &mut session.tx_queue,
                     &mut session.watched,
                     &mut session.authenticated,
+                    &mut session.secret_credential,
                     &self.store,
                     &self.broker,
                     &self.script_engine,
@@ -3594,8 +3600,9 @@ impl CommandExecutor {
                 resp::write_ok(write_buf);
                 Some(CmdResult::Quit)
             }
-            CmdResult::Authenticated => {
+            CmdResult::Authenticated { secret } => {
                 session.authenticated = true;
+                session.secret_credential = secret;
                 None
             }
             CmdResult::Subscribe { channels } => {
@@ -3697,6 +3704,37 @@ fn write_shard_execution_error(write_buf: &mut BytesMut, err: ShardExecutionErro
     }
 }
 
+async fn await_resp_blocking_action<F>(
+    future: F,
+    credential: Option<&crate::auth::SecretCredential>,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> std::io::Result<bool>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    let Some(credential) = credential else {
+        future.await?;
+        return Ok(false);
+    };
+    tokio::pin!(future);
+    let mut auth_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    auth_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            result = &mut future => {
+                result?;
+                return Ok(false);
+            }
+            _ = auth_tick.tick() => {
+                if crate::auth::revalidate_secret_credential(credential, store, cache).is_err() {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+}
+
 async fn handle_connection(
     mut socket: tokio::net::TcpStream,
     _peer: std::net::SocketAddr,
@@ -3713,16 +3751,17 @@ async fn handle_connection(
     // per connection rather than per command: `require_auth` is fixed at startup,
     // so without this a key-only engine (no LUX_PASSWORD) would leave RESP wide
     // open, and keys minted at runtime would never start gating it.
-    let mut session = CommandSession::new(
-        runtime.config.require_auth
-            || crate::auth::project_keys_configured(&runtime.store, &runtime.schema_cache),
-    );
+    let keys_require_auth =
+        crate::auth::project_keys_configured(&runtime.store, &runtime.schema_cache).unwrap_or(true);
+    let mut session = CommandSession::new(runtime.config.require_auth || keys_require_auth);
     let executor = CommandExecutor::new(
         runtime.store.clone(),
         runtime.broker.clone(),
         runtime.script_engine.clone(),
         runtime.schema_cache.clone(),
     );
+    let mut auth_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    auth_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         if shutdown_rx.borrow().is_some() {
@@ -3731,6 +3770,20 @@ async fn handle_connection(
         if session.sub_mode {
             tokio::select! {
                 _ = shutdown_rx.changed() => return Ok(()),
+                _ = auth_tick.tick(), if session.secret_credential.is_some() => {
+                    if session.secret_credential.as_ref().is_some_and(|credential| {
+                        crate::auth::revalidate_secret_credential(
+                            credential,
+                            &runtime.store,
+                            &runtime.schema_cache,
+                        )
+                        .is_err()
+                    }) {
+                        resp::write_error(&mut write_buf, "NOAUTH secret key is revoked or unavailable");
+                        socket.write_all(&write_buf).await?;
+                        return Ok(());
+                    }
+                }
                 result = socket.read(&mut read_buf) => {
                     let n = match result {
                         Ok(0) => return Ok(()),
@@ -3948,6 +4001,21 @@ async fn handle_connection(
             // request after the listener closes.
             let read = tokio::select! {
                 _ = shutdown_rx.changed() => return Ok(()),
+                _ = auth_tick.tick(), if session.secret_credential.is_some() => {
+                    if session.secret_credential.as_ref().is_some_and(|credential| {
+                        crate::auth::revalidate_secret_credential(
+                            credential,
+                            &runtime.store,
+                            &runtime.schema_cache,
+                        )
+                        .is_err()
+                    }) {
+                        resp::write_error(&mut write_buf, "NOAUTH secret key is revoked or unavailable");
+                        socket.write_all(&write_buf).await?;
+                        return Ok(());
+                    }
+                    continue;
+                }
                 result = socket.read(&mut read_buf) => result,
             };
             let n = match read {
@@ -4016,8 +4084,23 @@ async fn handle_connection(
                         timeout,
                         pop_left,
                     } => {
-                        handle_block_pop(&mut socket, &store, &broker, &keys, timeout, pop_left)
-                            .await?;
+                        if await_resp_blocking_action(
+                            handle_block_pop(
+                                &mut socket,
+                                &store,
+                                &broker,
+                                &keys,
+                                timeout,
+                                pop_left,
+                            ),
+                            session.secret_credential.as_ref(),
+                            &runtime.store,
+                            &runtime.schema_cache,
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
                     }
                     CmdResult::BlockMove {
                         src,
@@ -4026,17 +4109,25 @@ async fn handle_connection(
                         dst_left,
                         timeout,
                     } => {
-                        handle_block_move(
-                            &mut socket,
-                            &store,
-                            &broker,
-                            &src,
-                            &dst,
-                            src_left,
-                            dst_left,
-                            timeout,
+                        if await_resp_blocking_action(
+                            handle_block_move(
+                                &mut socket,
+                                &store,
+                                &broker,
+                                &src,
+                                &dst,
+                                src_left,
+                                dst_left,
+                                timeout,
+                            ),
+                            session.secret_credential.as_ref(),
+                            &runtime.store,
+                            &runtime.schema_cache,
                         )
-                        .await?;
+                        .await?
+                        {
+                            return Ok(());
+                        }
                     }
                     CmdResult::BlockStreamRead {
                         keys,
@@ -4046,34 +4137,42 @@ async fn handle_connection(
                         noack,
                         timeout,
                     } => {
-                        handle_block_stream_read(
-                            &mut socket,
-                            &store,
-                            &broker,
-                            &keys,
-                            &ids,
-                            group,
-                            count,
-                            noack,
-                            timeout,
+                        if await_resp_blocking_action(
+                            handle_block_stream_read(
+                                &mut socket,
+                                &store,
+                                &broker,
+                                &keys,
+                                &ids,
+                                group,
+                                count,
+                                noack,
+                                timeout,
+                            ),
+                            session.secret_credential.as_ref(),
+                            &runtime.store,
+                            &runtime.schema_cache,
                         )
-                        .await?;
+                        .await?
+                        {
+                            return Ok(());
+                        }
                     }
                     CmdResult::BlockZPop {
                         keys,
                         timeout,
                         pop_min,
                     } => {
-                        handle_block_zpop(&mut socket, &store, &keys, timeout, pop_min).await?;
-                    }
-                    CmdResult::BlockListMPop {
-                        keys,
-                        pop_left,
-                        count,
-                        timeout,
-                    } => {
-                        handle_block_lmpop(&mut socket, &store, &keys, pop_left, count, timeout)
-                            .await?;
+                        if await_resp_blocking_action(
+                            handle_block_zpop(&mut socket, &store, &keys, timeout, pop_min),
+                            session.secret_credential.as_ref(),
+                            &runtime.store,
+                            &runtime.schema_cache,
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
                     }
                     CmdResult::BlockZMPop {
                         keys,
@@ -4081,10 +4180,42 @@ async fn handle_connection(
                         count,
                         timeout,
                     } => {
-                        handle_block_zmpop(&mut socket, &store, &keys, pop_min, count, timeout)
-                            .await?;
+                        if await_resp_blocking_action(
+                            handle_block_zmpop(&mut socket, &store, &keys, pop_min, count, timeout),
+                            session.secret_credential.as_ref(),
+                            &runtime.store,
+                            &runtime.schema_cache,
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
                     }
-                    _ => {}
+                    CmdResult::BlockListMPop {
+                        keys,
+                        pop_left,
+                        count,
+                        timeout,
+                    } => {
+                        if await_resp_blocking_action(
+                            handle_block_lmpop(
+                                &mut socket,
+                                &store,
+                                &keys,
+                                pop_left,
+                                count,
+                                timeout,
+                            ),
+                            session.secret_credential.as_ref(),
+                            &runtime.store,
+                            &runtime.schema_cache,
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
+                    }
+                    _ => continue,
                 }
             }
         }
@@ -4524,6 +4655,7 @@ mod tx_tests {
             let mut tx_queue = Vec::new();
             let mut watched = Vec::new();
             let mut authenticated = true;
+            let mut secret_credential = None;
             let mut out = BytesMut::new();
             let args: [&[u8]; 2] = [command.as_bytes(), b"chan"];
 
@@ -4534,6 +4666,7 @@ mod tx_tests {
                 &mut tx_queue,
                 &mut watched,
                 &mut authenticated,
+                &mut secret_credential,
                 &store,
                 &broker,
                 &script_engine,

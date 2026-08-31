@@ -171,9 +171,16 @@ pub(crate) fn eval_json_path_condition(
     path: &str,
     cond: &WhereClause,
 ) -> bool {
-    let raw = match row.iter().find(|(k, _)| k == root) {
-        Some((_, v)) => v.as_str(),
-        None => return cond.op == CmpOp::IsNotValid,
+    let raw = row
+        .iter()
+        .find(|(k, _)| k == root)
+        .map(|(_, value)| value.as_str());
+    eval_json_path_text(raw, path, cond)
+}
+
+fn eval_json_path_text(raw: Option<&str>, path: &str, cond: &WhereClause) -> bool {
+    let Some(raw) = raw else {
+        return cond.op == CmpOp::IsNotValid;
     };
     let parsed: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
@@ -1155,20 +1162,26 @@ fn table_select_once(
     let table_alias = plan.alias.as_deref().unwrap_or(&plan.table);
 
     // Resolve the WHERE conditions - strip table alias prefix if present
-    let conditions: Vec<WhereClause> = plan
-        .conditions
-        .iter()
-        .map(|c| {
-            let field = strip_alias(&c.field, table_alias);
-            WhereClause {
-                field,
-                op: c.op.clone(),
-                value: c.value.clone(),
-                values: c.values.clone(),
-                or_clauses: c.or_clauses.clone(),
-            }
-        })
-        .collect();
+    // A joined WHERE is evaluated only after every row has been qualified and
+    // joined. Applying it to the base scan first can bind `joined.owner` to a
+    // same-named base column and incorrectly discard or admit rows.
+    let conditions: Vec<WhereClause> = if plan.joins.is_empty() {
+        plan.conditions
+            .iter()
+            .map(|c| {
+                let field = strip_alias(&c.field, table_alias);
+                WhereClause {
+                    field,
+                    op: c.op.clone(),
+                    value: c.value.clone(),
+                    values: c.values.clone(),
+                    or_clauses: c.or_clauses.clone(),
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Validate WHERE columns
     for cond in &conditions {
@@ -1408,14 +1421,19 @@ fn table_select_once(
         };
 
     // ---- Hash Joins ----
+    // A join may stop at LIMIT only when it is the sole join and no post-join
+    // filter can discard an early row. Otherwise truncating here can return too
+    // few rows even though later matching rows exist.
+    let join_limit = (plan.joins.len() == 1 && plan.conditions.is_empty())
+        .then_some(plan.limit)
+        .flatten();
     for join in &plan.joins {
-        // Pass the limit so the join can stop early once satisfied
         rows = hash_join(
             store,
             cache,
             rows,
             join,
-            plan.limit,
+            join_limit,
             plan.offset,
             now,
             plan.decrypt_authorized,
@@ -2802,10 +2820,33 @@ fn joined_row_matches_condition(row: &[(String, String)], cond: &WhereClause) ->
             .iter()
             .any(|clause| joined_row_matches_condition(row, clause));
     }
-    let val = row
-        .iter()
-        .find(|(k, _)| k == &cond.field || k.ends_with(&format!(".{}", bare_col(&cond.field))))
-        .map(|(_, v)| v.as_str());
+    let val = if cond.field.contains('.') {
+        // Qualified fields must match exactly. If there are additional path
+        // segments, resolve them inside the longest matching qualified JSON
+        // column (`alias.metadata.team`). Never fall back to another table's
+        // same-named column.
+        if let Some((_, value)) = row.iter().find(|(key, _)| key == &cond.field) {
+            Some(value.as_str())
+        } else {
+            let mut matched_json = None;
+            for (index, _) in cond.field.match_indices('.').rev() {
+                let root = &cond.field[..index];
+                let path = &cond.field[index + 1..];
+                if let Some((_, value)) = row.iter().find(|(key, _)| key == root) {
+                    matched_json = Some((value.as_str(), path));
+                    break;
+                }
+            }
+            if let Some((raw, path)) = matched_json {
+                return eval_json_path_text(Some(raw), path, cond);
+            }
+            None
+        }
+    } else {
+        row.iter()
+            .find(|(key, _)| key == &cond.field || key.ends_with(&format!(".{}", cond.field)))
+            .map(|(_, value)| value.as_str())
+    };
     match val {
         None => matches!(cond.op, CmpOp::Ne | CmpOp::IsNull),
         Some(v) => match cond.op {

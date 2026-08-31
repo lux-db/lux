@@ -33,6 +33,8 @@ enum HttpAuthContext {
     User(crate::auth::AuthPrincipal),
 }
 
+type HttpRouteError = (u16, &'static str, String);
+
 /// Whether this caller may see decrypted values of ENCRYPTED columns. The
 /// operator and real authenticated users can; anonymous (signInAnonymously)
 /// principals cannot (encrypted columns are omitted from their reads).
@@ -67,7 +69,8 @@ struct RequestLimits {
 
 struct LiveIdentity {
     principal: Option<crate::auth::AuthPrincipal>,
-    credential: Option<crate::auth::UserCredential>,
+    user_credential: Option<crate::auth::UserCredential>,
+    secret_credential: Option<crate::auth::SecretCredential>,
 }
 
 /// Start the HTTP API listener and serve requests forever.
@@ -347,9 +350,17 @@ async fn handle_request(
     } else {
         None
     };
+    let live_secret_credential = if path == "/live" {
+        match &credential {
+            crate::auth::Credential::Secret(credential) => Some(credential.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let auth_context = match credential {
         crate::auth::Credential::Operator => HttpAuthContext::Operator,
-        crate::auth::Credential::Secret => HttpAuthContext::Secret,
+        crate::auth::Credential::Secret(_) => HttpAuthContext::Secret,
         crate::auth::Credential::Publishable => HttpAuthContext::Publishable,
         crate::auth::Credential::User(credential) => HttpAuthContext::User(credential.principal),
         crate::auth::Credential::Anonymous => HttpAuthContext::Anonymous,
@@ -357,7 +368,14 @@ async fn handle_request(
 
     // An engine is credential-gated once it has either a password or project
     // keys. Before that (a bare local engine) it stays open, as it always has.
-    if !password.is_empty() || crate::auth::project_keys_configured(store, cache) {
+    let project_keys_configured = match crate::auth::project_keys_configured(store, cache) {
+        Ok(configured) => configured,
+        Err(e) => {
+            let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
+            return send_json(socket, 503, "Service Unavailable", &body).await;
+        }
+    };
+    if !password.is_empty() || project_keys_configured {
         let permitted = match &auth_context {
             HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::User(_) => true,
             // A publishable key identifies the project, not a person. It reaches
@@ -385,7 +403,8 @@ async fn handle_request(
             cache.clone(),
             LiveIdentity {
                 principal: live_auth_principal(&auth_context),
-                credential: live_user_credential,
+                user_credential: live_user_credential,
+                secret_credential: live_secret_credential,
             },
             shutdown_rx.clone(),
         )
@@ -519,25 +538,24 @@ async fn handle_request(
                 return stream_snapshot(socket, store).await;
             }
             ["v1", "tables", table] => {
-                let filter = match enforce_table_read(store, cache, &auth_context, table) {
-                    Ok(f) => f,
+                let scoped = match scope_table_query_read(
+                    store,
+                    cache,
+                    &auth_context,
+                    table,
+                    &params,
+                    limits.max_rows,
+                ) {
+                    Ok(params) => params,
                     Err((status, status_text, body)) => {
                         return send_json(socket, status, status_text, &body).await;
                     }
                 };
-                if let Some(err) = crate::auth::reserved_table_access_error(table) {
-                    let body = format!(r#"{{"error":"{}"}}"#, escape_json(&err));
-                    return send_json(socket, 403, "Forbidden", &body).await;
-                }
                 let prefer = headers
                     .iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case("prefer"))
                     .map(|(_, v)| v.as_str())
                     .unwrap_or("");
-                // Inject the grant filter (RLS USING) into the query's WHERE.
-                let where_clause = get_param(&params, "where").unwrap_or("");
-                let combined = combine_where(where_clause, filter.as_deref().unwrap_or(""));
-                let scoped = params_with_where(&params, &combined);
                 let da = decrypt_authorized(&auth_context);
                 return stream_table_query(
                     socket,
@@ -653,7 +671,7 @@ fn snapshot_management_authorized(
 ) -> bool {
     if !store.config().password.is_empty() {
         matches!(context, HttpAuthContext::Operator)
-    } else if crate::auth::project_keys_configured(store, cache) {
+    } else if crate::auth::project_keys_configured(store, cache).unwrap_or(true) {
         matches!(context, HttpAuthContext::Secret)
     } else {
         true
@@ -1048,6 +1066,110 @@ fn enforce_table_read(
     }
 }
 
+/// Scope a complete SELECT plan, including every joined table. Parsing once
+/// before injection gives us the exact aliases; parsing again in the query path
+/// applies the generated WHERE fragment through the normal typed query engine.
+fn scope_table_query_read(
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    auth: &HttpAuthContext,
+    table: &str,
+    params: &[(String, String)],
+    max_rows: Option<usize>,
+) -> Result<Vec<(String, String)>, HttpRouteError> {
+    if let Some(error) = crate::auth::reserved_table_access_error(table) {
+        return Err((
+            403,
+            "Forbidden",
+            format!(r#"{{"error":"{}"}}"#, escape_json(&error)),
+        ));
+    }
+    if !store.config().auth.enabled {
+        return Ok(params.to_vec());
+    }
+    let principal = match auth {
+        HttpAuthContext::Operator | HttpAuthContext::Secret => return Ok(params.to_vec()),
+        HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
+            return Err((
+                401,
+                "Unauthorized",
+                r#"{"error":"unauthorized"}"#.to_string(),
+            ))
+        }
+        HttpAuthContext::User(principal) => principal,
+    };
+    let (_, plan) = parse_http_table_query(params, table, max_rows).map_err(|error| {
+        let status = if error.contains("reserved") { 403 } else { 400 };
+        let status_text = if status == 403 {
+            "Forbidden"
+        } else {
+            "Bad Request"
+        };
+        (
+            status,
+            status_text,
+            format!(r#"{{"error":"{}"}}"#, escape_json(&error)),
+        )
+    })?;
+
+    let now = Instant::now();
+    let joined = !plan.joins.is_empty();
+    let base_qualifier = plan.alias.as_deref().unwrap_or(&plan.table);
+    let mut filters = Vec::with_capacity(plan.joins.len() + 1);
+    let base_filter = if joined {
+        crate::auth::read_filter_qualified(
+            store,
+            cache,
+            principal,
+            &plan.table,
+            base_qualifier,
+            now,
+        )
+    } else {
+        crate::auth::read_filter(store, cache, principal, &plan.table, now)
+    }
+    .map_err(|error| {
+        (
+            403,
+            "Forbidden",
+            format!(r#"{{"error":"{}"}}"#, escape_json(&error)),
+        )
+    })?;
+    if !base_filter.trim().is_empty() {
+        filters.push(base_filter);
+    }
+    for join in &plan.joins {
+        let filter = crate::auth::read_filter_qualified(
+            store,
+            cache,
+            principal,
+            &join.table,
+            &join.alias,
+            now,
+        )
+        .map_err(|error| {
+            (
+                403,
+                "Forbidden",
+                format!(r#"{{"error":"{}"}}"#, escape_json(&error)),
+            )
+        })?;
+        if !filter.trim().is_empty() {
+            filters.push(filter);
+        }
+    }
+
+    if filters.is_empty() {
+        return Ok(params.to_vec());
+    }
+    let grant_filter = filters.join(" AND ");
+    let user_filter = get_param(params, "where").unwrap_or("");
+    Ok(params_with_where(
+        params,
+        &combine_where(user_filter, &grant_filter),
+    ))
+}
+
 /// Enforce a write grant on an INSERT: the row being written must satisfy the
 /// table's write grant (WITH CHECK). Operators bypass; anonymous is rejected;
 /// auth-disabled instances are open.
@@ -1270,6 +1392,12 @@ struct LiveTableJoin {
     right_col: String,
 }
 
+fn valid_query_alias(alias: &str) -> bool {
+    let mut characters = alias.chars();
+    matches!(characters.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
 #[derive(Clone)]
 struct LiveTableNearSpec {
     field: String,
@@ -1382,16 +1510,7 @@ async fn handle_live_upgrade(
     socket.write_all(response.as_bytes()).await?;
 
     let ws = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
-    run_live_socket(
-        ws,
-        store,
-        broker,
-        cache,
-        identity.principal,
-        identity.credential,
-        shutdown_rx,
-    )
-    .await?;
+    run_live_socket(ws, store, broker, cache, identity, shutdown_rx).await?;
     Ok(false)
 }
 
@@ -1400,8 +1519,7 @@ async fn run_live_socket<S>(
     store: Arc<Store>,
     broker: Broker,
     cache: SharedSchemaCache,
-    principal: Option<crate::auth::AuthPrincipal>,
-    user_credential: Option<crate::auth::UserCredential>,
+    identity: LiveIdentity,
     mut shutdown_rx: watch::Receiver<Option<std::time::Duration>>,
 ) -> std::io::Result<()>
 where
@@ -1435,7 +1553,7 @@ where
                             &broker,
                             &store,
                             &cache,
-                            principal.as_ref(),
+                            identity.principal.as_ref(),
                             &text,
                         ).await?;
                     }
@@ -1450,13 +1568,17 @@ where
                 drain_live_subscription_events(&mut ws, &mut subscriptions, &store, &cache).await?;
                 drain_live_row_deltas(&mut ws, &mut subscriptions, &store, &cache).await?;
             }
-            _ = auth_tick.tick(), if user_credential.is_some() => {
-                if let Some(credential) = user_credential.as_ref() {
-                    if crate::auth::revalidate_user_credential(credential, &store, &cache).is_err() {
-                        send_live_json(&mut ws, json!({"type":"live.error","error":{"code":"AUTH_REVOKED","message":"live authorization is no longer valid"}})).await?;
-                        let _ = ws.send(WsMessage::Close(None)).await;
-                        break;
-                    }
+            _ = auth_tick.tick(), if identity.user_credential.is_some() || identity.secret_credential.is_some() => {
+                let user_valid = identity.user_credential.as_ref().is_none_or(|credential| {
+                    crate::auth::revalidate_user_credential(credential, &store, &cache).is_ok()
+                });
+                let secret_valid = identity.secret_credential.as_ref().is_none_or(|credential| {
+                    crate::auth::revalidate_secret_credential(credential, &store, &cache).is_ok()
+                });
+                if !user_valid || !secret_valid {
+                    send_live_json(&mut ws, json!({"type":"live.error","error":{"code":"AUTH_REVOKED","message":"live authorization is no longer valid"}})).await?;
+                    let _ = ws.send(WsMessage::Close(None)).await;
+                    break;
                 }
             }
         }
@@ -1609,6 +1731,11 @@ async fn build_live_subscription(
         if let Some(err) = crate::auth::reserved_table_access_error(&table_spec.table) {
             return Err(live_error("FORBIDDEN", &err));
         }
+        for join in &table_spec.joins {
+            if let Some(err) = crate::auth::reserved_table_access_error(&join.table) {
+                return Err(live_error("FORBIDDEN", &err));
+            }
+        }
         // Enforce the READ grant as RLS USING: resolve the grant filter and AND
         // its conditions into the subscription's own WHERE. Because both the
         // initial snapshot and every streamed diff re-run `fetch_live_table_rows`
@@ -1621,7 +1748,7 @@ async fn build_live_subscription(
                 // while the socket remains open.
                 crate::auth::read_filter(store, cache, p, &table_spec.table, Instant::now())
                     .map_err(|e| live_error("FORBIDDEN", &e))?;
-                table_spec.auth_dependencies = crate::auth::read_filter_dependencies(
+                let mut auth_dependencies = crate::auth::read_filter_dependencies(
                     store,
                     cache,
                     p,
@@ -1629,6 +1756,24 @@ async fn build_live_subscription(
                     Instant::now(),
                 )
                 .map_err(|e| live_error("FORBIDDEN", &e))?;
+                for join in &table_spec.joins {
+                    crate::auth::read_filter(store, cache, p, &join.table, Instant::now())
+                        .map_err(|e| live_error("FORBIDDEN", &e))?;
+                    for dependency in crate::auth::read_filter_dependencies(
+                        store,
+                        cache,
+                        p,
+                        &join.table,
+                        Instant::now(),
+                    )
+                    .map_err(|e| live_error("FORBIDDEN", &e))?
+                    {
+                        if !auth_dependencies.iter().any(|table| table == &dependency) {
+                            auth_dependencies.push(dependency);
+                        }
+                    }
+                }
+                table_spec.auth_dependencies = auth_dependencies;
                 table_spec.principal = Some(p.clone());
             }
         }
@@ -2128,10 +2273,17 @@ fn parse_live_table_spec(spec: &Value) -> Result<LiveTableSpec, Value> {
                     ))
                 }
             };
+            let alias = required_str(join, "alias")?;
+            if !valid_query_alias(alias) {
+                return Err(live_error(
+                    "INVALID_SPEC",
+                    "table join alias must be an identifier",
+                ));
+            }
             joins.push(LiveTableJoin {
                 join_type,
                 table: required_str(join, "table")?.to_string(),
-                alias: required_str(join, "alias")?.to_string(),
+                alias: alias.to_string(),
                 left_col: required_str(join, "onLeft")?.to_string(),
                 right_col: required_str(join, "onRight")?.to_string(),
             });
@@ -2290,13 +2442,46 @@ fn live_table_where_tokens(
 ) -> Result<Option<Vec<String>>, Value> {
     let mut tokens = live_where_conditions_to_tokens(&spec.where_conditions);
     if let Some(principal) = &spec.principal {
-        let grant = crate::auth::read_filter(store, cache, principal, &spec.table, Instant::now())
+        let now = Instant::now();
+        let joined = !spec.joins.is_empty();
+        let mut grants = Vec::with_capacity(spec.joins.len() + 1);
+        let base = if joined {
+            crate::auth::read_filter_qualified(
+                store,
+                cache,
+                principal,
+                &spec.table,
+                &spec.table,
+                now,
+            )
+        } else {
+            crate::auth::read_filter(store, cache, principal, &spec.table, now)
+        }
+        .map_err(|e| live_error("FORBIDDEN", &e))?;
+        if !base.trim().is_empty() {
+            grants.push(base);
+        }
+        for join in &spec.joins {
+            let grant = crate::auth::read_filter_qualified(
+                store,
+                cache,
+                principal,
+                &join.table,
+                &join.alias,
+                now,
+            )
             .map_err(|e| live_error("FORBIDDEN", &e))?;
-        if !grant.trim().is_empty() {
+            if !grant.trim().is_empty() {
+                grants.push(grant);
+            }
+        }
+        if !grants.is_empty() {
             if !tokens.is_empty() {
                 tokens.push("AND".to_string());
             }
-            tokens.extend(tokenize_where(&grant).map_err(|e| live_error("FORBIDDEN", &e))?);
+            tokens.extend(
+                tokenize_where(&grants.join(" AND ")).map_err(|e| live_error("FORBIDDEN", &e))?,
+            );
         }
     }
     Ok(Some(tokens))
@@ -2613,66 +2798,7 @@ fn parse_http_where_tokens(where_clause: &str) -> Result<Vec<String>, String> {
 /// literal backslash. (A value that must contain a raw operator char should be
 /// single-quoted, the same rule as values with spaces.)
 fn tokenize_where(s: &str) -> Result<Vec<String>, String> {
-    let mut tokens = Vec::new();
-    let mut cur = String::new();
-    let mut building = false;
-    let mut in_quote = false;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if in_quote {
-            match c {
-                '\\' => match chars.next() {
-                    Some('\'') => cur.push('\''),
-                    Some('\\') => cur.push('\\'),
-                    Some(other) => {
-                        cur.push('\\');
-                        cur.push(other);
-                    }
-                    None => return Err("unterminated escape in where value".to_string()),
-                },
-                '\'' => in_quote = false,
-                _ => cur.push(c),
-            }
-        } else if c == '\'' && !building {
-            // A quote only opens at a token boundary, so a mid-token apostrophe
-            // stays literal (`O'Brien` is one token). This keeps unquoted values
-            // that worked before working; only whitespace values need quoting.
-            in_quote = true;
-            building = true;
-        } else if matches!(c, '=' | '<' | '>') || (c == '!' && chars.peek() == Some(&'=')) {
-            // A comparison operator at any position ends the current token (the
-            // field/value) and becomes its own token, so `col=value`,
-            // `col>=value`, `col != value` all tokenize uniformly.
-            if building {
-                tokens.push(std::mem::take(&mut cur));
-                building = false;
-            }
-            let mut op = String::from(c);
-            if c == '!' {
-                chars.next(); // consume '=' (peeked above)
-                op.push('=');
-            } else if (c == '<' || c == '>') && chars.peek() == Some(&'=') {
-                chars.next();
-                op.push('=');
-            }
-            tokens.push(op);
-        } else if c.is_whitespace() {
-            if building {
-                tokens.push(std::mem::take(&mut cur));
-                building = false;
-            }
-        } else {
-            cur.push(c);
-            building = true;
-        }
-    }
-    if in_quote {
-        return Err("unterminated quote in where value".to_string());
-    }
-    if building {
-        tokens.push(cur);
-    }
-    Ok(tokens)
+    crate::tables::tokenize_where(s)
 }
 
 fn parse_http_join_tokens(join_clause: &str) -> Result<Vec<String>, String> {
@@ -2708,6 +2834,9 @@ fn parse_http_join_tokens(join_clause: &str) -> Result<Vec<String>, String> {
         return Err(
             "invalid join parameter, table, alias, and join columns are required".to_string(),
         );
+    }
+    if !valid_query_alias(alias) {
+        return Err("invalid join parameter, alias must be an identifier".to_string());
     }
 
     let right_col = if right.contains('.') {
@@ -3052,13 +3181,10 @@ fn route_request_with_auth(
         ("GET", ["tables"]) => ok(exec_json(store, broker, cache, script_engine, &["TLIST"])),
         ("POST", ["tables"]) => route_table_create(body, store, broker, cache, script_engine),
         ("GET", ["tables", table]) => {
-            let filter = match enforce_table_read(store, cache, auth, table) {
-                Ok(f) => f,
+            let scoped = match scope_table_query_read(store, cache, auth, table, params, None) {
+                Ok(params) => params,
                 Err(resp) => return resp,
             };
-            let where_clause = get_param(params, "where").unwrap_or("");
-            let combined = combine_where(where_clause, filter.as_deref().unwrap_or(""));
-            let scoped = params_with_where(params, &combined);
             route_table_query(
                 table,
                 &scoped,
@@ -3300,43 +3426,24 @@ fn route_request_with_auth(
 /// data routes (`/tables/{table}` GET/POST/PATCH/DELETE) deliberately return
 /// `false` here so the generic gate defers to the inline grant check.
 fn route_requires_project_access(method: &str, base: &[&str]) -> bool {
-    matches!(
+    // This is an allowlist of the only routes a user principal may reach. The
+    // default is project-private, so adding a new route without classifying it
+    // cannot expose it to an end-user token.
+    !matches!(
         (method, base),
-        ("POST", ["exec"])
-            | ("GET", ["migrations"])
-            | ("POST", ["migrations", "plan"])
-            | ("POST", ["migrations", "apply"])
-            | ("POST", ["migrations", "repair"])
-            | ("GET", ["dbsize"])
-            | ("GET", ["keys"])
-            | ("GET", ["keys", _])
-            | ("GET", ["kv", ..])
-            | ("GET", ["get", _])
-            | ("GET", ["hgetall", _])
-            | ("PUT", ["kv", _])
-            | ("DELETE", ["kv", _])
-            | ("POST", ["kv", ..])
-            | ("POST", ["set", _])
-            | ("POST", ["del", _])
-            | ("POST", ["incr", _])
-            | ("POST", ["decr", _])
-            | ("GET", ["tables"])
-            | ("POST", ["tables"])
-            | ("GET", ["ts", ..])
-            | ("POST", ["ts", _])
-            | ("GET", ["vectors", ..])
-            | ("POST", ["vectors", ..])
-            | ("DELETE", ["vectors", _])
-            | ("POST", ["push", "send"])
-            | ("POST", ["push", "credentials"])
-            | ("GET", ["push", "config"])
-            | ("PUT", ["push", "config", "apns"])
-            | ("DELETE", ["push", "config", "apns"])
-            | ("POST", ["push", "config", "vapid"])
-            | ("DELETE", ["push", "config", "vapid"])
-            | ("GET", ["push", "admin", "devices"])
-            | ("GET", ["push", "admin", "outbox"])
-            | ("GET", ["push", "admin", "stats"])
+        ("GET", ["version"])
+            | ("GET", ["ping"])
+            | ("GET", ["tables", _])
+            | ("GET", ["tables", _, _])
+            | ("POST", ["tables", _])
+            | ("PATCH", ["tables", _])
+            | ("PATCH", ["tables", _, _])
+            | ("DELETE", ["tables", _])
+            | ("POST", ["push", "devices"])
+            | ("GET", ["push", "devices"])
+            | ("DELETE", ["push", "devices"])
+            | ("DELETE", ["push", "devices", _])
+            | ("GET", ["push", "vapid"])
     )
 }
 
@@ -5597,6 +5704,15 @@ mod tests {
     }
 
     #[test]
+    fn unknown_http_routes_default_to_project_private() {
+        assert!(route_requires_project_access("GET", &["future-surface"]));
+        assert!(route_requires_project_access(
+            "POST",
+            &["future-surface", "action"]
+        ));
+    }
+
+    #[test]
     fn migration_http_contract_executes_and_is_idempotent() {
         let (store, broker, cache, script_engine) = encrypted_http_fixture();
         let body = json!({
@@ -5719,6 +5835,32 @@ mod tests {
         assert_eq!(plan.joins[0].left_col, "user_id");
         assert_eq!(plan.joins[0].right_col, "u.id");
         assert_eq!(plan.limit, Some(25));
+    }
+
+    #[test]
+    fn query_parsers_reject_join_alias_syntax() {
+        let params = vec![(
+            "join".to_string(),
+            "users:u=attacker:on(user_id=id)".to_string(),
+        )];
+        assert!(parse_http_table_query(&params, "orders", None)
+            .unwrap_err()
+            .contains("alias must be an identifier"));
+
+        let spec = json!({
+            "table": "orders",
+            "joins": [{
+                "table": "users",
+                "alias": "u OR owner_id = attacker",
+                "onLeft": "user_id",
+                "onRight": "id"
+            }]
+        });
+        let error = match parse_live_table_spec(&spec) {
+            Ok(_) => panic!("live join alias syntax was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error["code"], "INVALID_SPEC");
     }
 
     #[test]

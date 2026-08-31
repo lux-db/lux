@@ -401,6 +401,99 @@ async fn live_user_socket_closes_after_session_logout() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_join_requires_every_table_grant_and_scopes_aliases() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux_with_env(
+        resp_port,
+        http_port,
+        Some("rootsecret"),
+        &[("LUX_AUTH_ENABLED", "true")],
+    );
+    let exec = |command: &str| {
+        let (status, body) = http_json_request(
+            http_port,
+            "POST",
+            "/v1/exec",
+            &format!(r#"{{"command":{command}}}"#),
+            Some("rootsecret"),
+        );
+        assert_eq!(status, 200, "{command}: {body}");
+    };
+    exec(
+        r#"["TCREATE","live_messages","id STR PRIMARY KEY,","owner_id STR,","profile_id STR,","body STR"]"#,
+    );
+    exec(r#"["TCREATE","live_profiles","id STR PRIMARY KEY,","owner_id STR,","name STR"]"#);
+    exec(r#"["GRANT","read","ON","live_messages","WHERE","owner_id","=","auth.uid()"]"#);
+
+    let signup = |email: &str| {
+        let (status, body) = http_json_request(
+            http_port,
+            "POST",
+            "/auth/v1/signup",
+            &format!(r#"{{"email":"{email}","password":"password123"}}"#),
+            None,
+        );
+        assert_eq!(status, 200, "signup: {body}");
+        (
+            body["access_token"].as_str().unwrap().to_string(),
+            body["user"]["id"].as_str().unwrap().to_string(),
+        )
+    };
+    let (access_token, user_one) = signup("live-join-one@example.com");
+    let (_, user_two) = signup("live-join-two@example.com");
+    exec(&format!(
+        r#"["TINSERT","live_profiles","id","p1","owner_id","{user_one}","name","own-profile"]"#
+    ));
+    exec(&format!(
+        r#"["TINSERT","live_profiles","id","p2","owner_id","{user_two}","name","other-profile"]"#
+    ));
+    exec(&format!(
+        r#"["TINSERT","live_messages","id","m1","owner_id","{user_one}","profile_id","p1","body","own-message"]"#
+    ));
+    exec(&format!(
+        r#"["TINSERT","live_messages","id","m2","owner_id","{user_one}","profile_id","p2","body","cross-message"]"#
+    ));
+
+    let mut ws = connect_live(http_port, Some(&access_token)).await;
+    let spec = json!({
+        "kind":"table",
+        "table":"live_messages",
+        "joins":[{
+            "table":"live_profiles",
+            "alias":"p",
+            "onLeft":"profile_id",
+            "onRight":"id"
+        }]
+    });
+    send_json(
+        &mut ws,
+        json!({"type":"live.subscribe","id":"missing-grant","spec":spec.clone()}),
+    )
+    .await;
+    let denied = recv_json(&mut ws).await;
+    assert_eq!(denied["type"], "live.error", "ungranted join: {denied}");
+
+    exec(r#"["GRANT","read","ON","live_profiles","WHERE","owner_id","=","auth.uid()"]"#);
+    send_json(
+        &mut ws,
+        json!({"type":"live.subscribe","id":"joined","spec":spec}),
+    )
+    .await;
+    assert_eq!(recv_json(&mut ws).await["type"], "live.subscribed");
+    let snapshot = recv_live_event(&mut ws, "joined").await;
+    let encoded = snapshot.to_string();
+    assert!(
+        encoded.contains("own-profile"),
+        "own join missing: {encoded}"
+    );
+    assert!(
+        !encoded.contains("other-profile") && !encoded.contains("cross-message"),
+        "joined grant must bind to its alias: {encoded}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_websocket_delivers_key_and_pubsub_events() {
     let resp_port = free_port();
     let http_port = free_port();
@@ -1325,6 +1418,67 @@ async fn live_websocket_accepts_secret_key() {
         .await
         .expect("secret key should authenticate the /live handshake");
     assert_live_subscribes(&mut ws).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_secret_socket_closes_after_key_revocation() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let _server = start_lux_with_env(
+        resp_port,
+        http_port,
+        None,
+        &[
+            ("LUX_AUTH_ENABLED", "1"),
+            ("LUX_AUTH_SECRET_KEY", "lux_sec_livebootstrap"),
+        ],
+    );
+
+    let (status, created) = http_json_request(
+        http_port,
+        "POST",
+        "/auth/v1/admin/keys",
+        r#"{"kind":"secret","name":"live-session"}"#,
+        Some("lux_sec_livebootstrap"),
+    );
+    assert_eq!(status, 200, "create key: {created}");
+    let plain_key = created["plain_key"].as_str().expect("plain key");
+    let key_id = created["key"]["id"].as_str().expect("key id");
+
+    let mut ws = connect_live_query(http_port, &format!("apikey={plain_key}"))
+        .await
+        .expect("secret key handshake");
+    assert_live_subscribes(&mut ws).await;
+
+    let (status, revoked) = http_json_request(
+        http_port,
+        "DELETE",
+        &format!("/auth/v1/admin/keys/{key_id}"),
+        "",
+        Some("lux_sec_livebootstrap"),
+    );
+    assert_eq!(status, 200, "revoke key: {revoked}");
+
+    let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let message: Value = serde_json::from_str(&text).unwrap();
+                    if message["type"] == "live.error" {
+                        return message;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => return json!({"type":"closed"}),
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("websocket error before revocation terminal: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("live secret socket did not terminate within the revalidation bound");
+    if terminal["type"] == "live.error" {
+        assert_eq!(terminal["error"]["code"], "AUTH_REVOKED");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

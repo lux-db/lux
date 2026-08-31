@@ -42,14 +42,79 @@ fn api_key_cache_is_isolated_per_store() {
     .unwrap();
 
     assert_eq!(
-        lookup_api_key(raw_key, &store_a, &cache_a).unwrap(),
+        lookup_api_key(raw_key, &store_a, &cache_a)
+            .unwrap()
+            .map(|resolved| resolved.kind),
         Some(ApiKeyKind::Secret)
     );
     assert_eq!(
-        lookup_api_key(raw_key, &store_b, &cache_b).unwrap(),
+        lookup_api_key(raw_key, &store_b, &cache_b)
+            .unwrap()
+            .map(|resolved| resolved.kind),
         None,
         "a cache hit from store A must not authenticate against store B"
     );
+}
+
+#[test]
+fn project_key_storage_errors_never_look_like_open_local() {
+    let mut config = ServerConfig::default();
+    config.auth.enabled = true;
+    let store = Store::new_with_config(Arc::new(config));
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    assert!(!project_keys_configured(&store, &cache).unwrap());
+
+    store.del(&[b"_t:auth.keys:schema"]);
+    let cold_cache = Arc::new(RwLock::new(SchemaCache::new()));
+    assert!(
+        project_keys_configured(&store, &cold_cache).is_err(),
+        "an unreadable auth.keys table must fail closed"
+    );
+}
+
+#[test]
+fn auth_routes_are_private_until_explicitly_classified() {
+    assert_eq!(
+        auth_route_access("POST", &["signup"]),
+        Some(AuthRouteAccess::Project)
+    );
+    assert_eq!(
+        auth_route_access("GET", &["admin", "users"]),
+        Some(AuthRouteAccess::Secret)
+    );
+    assert_eq!(auth_route_access("GET", &["future-route"]), None);
+}
+
+#[test]
+fn grant_definitions_cannot_target_reserved_tables() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    let outer = crate::grants::parse_grant(&["read", "ON", "auth.users"]).unwrap();
+    assert!(put_grant(&store, &cache, &outer, now)
+        .unwrap_err()
+        .contains("managed"));
+
+    let nested = crate::grants::Grant {
+        table: "messages".to_string(),
+        scopes: vec![crate::grants::Scope::Read],
+        predicate: crate::grants::Predicate {
+            conditions: vec![crate::grants::Condition::InSubquery {
+                column: "owner_id".to_string(),
+                negated: false,
+                subquery: crate::grants::Subquery {
+                    projected: "subject_id".to_string(),
+                    table: "push.devices".to_string(),
+                    inner: crate::grants::Predicate::default(),
+                },
+            }],
+            alternatives: Vec::new(),
+        },
+    };
+    assert!(put_grant(&store, &cache, &nested, now)
+        .unwrap_err()
+        .contains("managed"));
 }
 
 #[test]
@@ -178,11 +243,11 @@ fn read_grant_enforced_end_to_end() {
     // Read grant resolves to a filter scoping the query to the caller's
     // own rows (RLS USING) -- the caller's uid is substituted for auth.uid().
     let filter = read_filter(&store, &cache, &p, "messages", now).unwrap();
-    assert_eq!(filter, "user_id = 123abc");
+    assert_eq!(filter, "user_id = '123abc'");
     // A different principal gets a filter scoped to *their* uid, never others'.
     let other = principal("999zzz");
     let other_filter = read_filter(&store, &cache, &other, "messages", now).unwrap();
-    assert_eq!(other_filter, "user_id = 999zzz");
+    assert_eq!(other_filter, "user_id = '999zzz'");
     // No grant on another table -> deny-by-default (Err, not an open filter).
     assert!(read_filter(&store, &cache, &p, "secrets", now).is_err());
 }
@@ -221,7 +286,7 @@ fn write_grant_with_check_end_to_end() {
     // UPDATE/DELETE: the write grant resolves to a filter that scopes the
     // statement to the caller's own rows (RLS USING).
     let filter = write_filter(&store, &cache, &p, "messages", now).unwrap();
-    assert_eq!(filter, "user_id = 123abc");
+    assert_eq!(filter, "user_id = '123abc'");
     // No write grant on another table -> deny-by-default (Err).
     assert!(write_filter(&store, &cache, &p, "other", now).is_err());
 }
@@ -506,10 +571,10 @@ fn repeated_profile_read_grants_accumulate_as_alternatives() {
     );
 
     let alice_filter = read_filter(&store, &cache, &principal("alice"), "profiles", now).unwrap();
-    assert_eq!(alice_filter, "id IN ( alice )");
+    assert_eq!(alice_filter, "id IN ( 'alice' )");
     assert_eq!(
         write_filter(&store, &cache, &principal("alice"), "profiles", now).unwrap(),
-        "id = alice"
+        "id = 'alice'"
     );
 
     crate::tables::table_insert(
@@ -603,7 +668,7 @@ fn repeated_read_grants_on_different_columns_render_or_alternatives() {
     );
 
     let filter = read_filter(&store, &cache, &principal("alice"), "invites", now).unwrap();
-    assert_eq!(filter, "team_id IN ( team-a ) OR email = u@x.dev");
+    assert_eq!(filter, "team_id IN ( 'team-a' ) OR email = 'u@x.dev'");
 }
 
 // ── RLS auto-filter (USING) coverage ──
@@ -683,7 +748,7 @@ fn multi_condition_grant_renders_and_chain() {
     );
     let p = principal("u1");
     let filter = read_filter(&store, &cache, &p, "messages", now).unwrap();
-    assert_eq!(filter, "user_id = u1 AND room = general");
+    assert_eq!(filter, "user_id = 'u1' AND room = 'general'");
 }
 
 #[test]
@@ -700,7 +765,7 @@ fn grant_resolves_non_uid_claims() {
     );
     let p = principal("u1");
     let filter = read_filter(&store, &cache, &p, "audit", now).unwrap();
-    assert_eq!(filter, "owner = u@x.dev");
+    assert_eq!(filter, "owner = 'u@x.dev'");
 }
 
 fn encrypted_test_store() -> Store {
@@ -1520,9 +1585,10 @@ fn read_grant_on_encrypted_searchable_column_filters_through_blind_index() {
 
     let p = principal("u1");
     let filter = read_filter(&store, &cache, &p, "messages", now).unwrap();
-    assert_eq!(filter, "owner_email = u@x.dev");
+    assert_eq!(filter, "owner_email = 'u@x.dev'");
     let mut tokens = vec!["*", "FROM", "messages", "WHERE"];
-    tokens.extend(filter.split_whitespace());
+    let filter_tokens = crate::tables::tokenize_where(&filter).unwrap();
+    tokens.extend(filter_tokens.iter().map(String::as_str));
     let plan = crate::tables::parse_select(&tokens).unwrap();
     let rows = selected_rows(crate::tables::table_select(&store, &cache, &plan, now).unwrap());
     assert_eq!(rows.len(), 1);
@@ -1584,7 +1650,7 @@ fn read_and_write_grants_are_independent_scopes() {
     let p = principal("u1");
     assert_eq!(
         read_filter(&store, &cache, &p, "feed", now).unwrap(),
-        "user_id = u1"
+        "user_id = 'u1'"
     );
     // No write grant -> writes denied even though reads are allowed.
     assert!(write_filter(&store, &cache, &p, "feed", now).is_err());
@@ -1607,7 +1673,32 @@ fn comparison_operators_round_trip_into_filter() {
     let p = principal("u1");
     assert_eq!(
         read_filter(&store, &cache, &p, "events", now).unwrap(),
-        "priority >= 5"
+        "priority >= '5'"
+    );
+}
+
+#[test]
+fn literal_grant_values_round_trip_as_data() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let now = Instant::now();
+    grant(
+        &store,
+        &cache,
+        &[
+            "read",
+            "ON",
+            "events",
+            "WHERE",
+            "label",
+            "=",
+            "attacker's OR id != victim",
+        ],
+        now,
+    );
+    assert_eq!(
+        read_filter(&store, &cache, &principal("u1"), "events", now).unwrap(),
+        "label = 'attacker\\'s OR id != victim'"
     );
 }
 
@@ -3405,7 +3496,10 @@ async fn oauth_provider_config_and_authorize_redirect_are_core_owned() {
                 "http://app.test/welcome".to_string(),
             ),
         ],
-        &[("host".to_string(), "localhost:17777".to_string())],
+        &[
+            ("host".to_string(), "localhost:17777".to_string()),
+            ("apikey".to_string(), "lux_sec_test".to_string()),
+        ],
         &store,
         &cache,
     )
@@ -3451,7 +3545,10 @@ async fn oauth_provider_config_and_authorize_redirect_are_core_owned() {
             ),
             ("flow".to_string(), "code".to_string()),
         ],
-        &[("host".to_string(), "localhost:17777".to_string())],
+        &[
+            ("host".to_string(), "localhost:17777".to_string()),
+            ("apikey".to_string(), "lux_sec_test".to_string()),
+        ],
         &store,
         &cache,
     )
@@ -3475,7 +3572,10 @@ async fn oauth_provider_config_and_authorize_redirect_are_core_owned() {
             ),
             ("code_challenge_method".to_string(), "S256".to_string()),
         ],
-        &[("host".to_string(), "localhost:17777".to_string())],
+        &[
+            ("host".to_string(), "localhost:17777".to_string()),
+            ("apikey".to_string(), "lux_sec_test".to_string()),
+        ],
         &store,
         &cache,
     )

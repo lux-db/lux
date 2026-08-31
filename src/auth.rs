@@ -629,6 +629,11 @@ pub(crate) async fn route_http_response(
         }
     };
 
+    if let Err(response) = authorize_auth_route(method, base, headers, store, cache) {
+        let (status, status_text, body) = response;
+        return AuthHttpResponse::json(status, status_text, body);
+    }
+
     match (method, base) {
         ("GET", ["authorize"]) => oauth_authorize(params, headers, store, cache),
         ("GET", ["callback", provider]) => {
@@ -780,6 +785,10 @@ pub(crate) fn route_http(
         ["auth", "v1", rest @ ..] => rest,
         _ => return error(404, "Not Found", "not found"),
     };
+
+    if let Err(response) = authorize_auth_route(method, base, headers, store, cache) {
+        return response;
+    }
 
     match (method, base) {
         ("GET", ["health"]) => {
@@ -3004,12 +3013,19 @@ pub(crate) enum Credential {
     /// Browser-safe project key. Reaches auth; reaches data only when an
     /// end-user token rides along and supplies a principal.
     Publishable,
-    /// Server-side project key: full project access.
-    Secret,
+    /// Server-side project key: full project access. The session retains only
+    /// the key hash so long-lived protocols can revalidate it without keeping
+    /// the plaintext credential in memory.
+    Secret(SecretCredential),
     /// End-user access token: subject to grants.
     User(Box<UserCredential>),
     /// `LUX_PASSWORD`. Break-glass and control-plane operations.
     Operator,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SecretCredential {
+    key_hash: String,
 }
 
 /// Turn a presented credential into an identity, for any surface.
@@ -3040,8 +3056,8 @@ pub(crate) fn resolve_credential(
     }
 
     if !presented.is_empty() {
-        if let Some(kind) = lookup_api_key(presented, store, cache)? {
-            return match (kind, surface) {
+        if let Some(resolved) = lookup_api_key(presented, store, cache)? {
+            return match (resolved.kind, surface) {
                 (ApiKeyKind::Publishable, Surface::Resp) => Err(
                     "publishable keys cannot use the RESP protocol; use a secret key".to_string(),
                 ),
@@ -3053,9 +3069,19 @@ pub(crate) fn resolve_credential(
                         None => Ok(Credential::Publishable),
                     }
                 }
-                (ApiKeyKind::Secret, _) => Ok(Credential::Secret),
+                (ApiKeyKind::Secret, _) => Ok(Credential::Secret(SecretCredential {
+                    key_hash: resolved.key_hash,
+                })),
             };
         }
+    }
+
+    // When `user_token` is present, `presented` came from an explicit project
+    // credential slot (`apikey` header/query parameter). A bad project key must
+    // not disappear merely because the companion bearer happens to be a valid
+    // user token.
+    if !user_token.is_empty() && !presented.is_empty() {
+        return Err("invalid project key".to_string());
     }
 
     // No project key matched. An end-user token can still stand on its own.
@@ -3096,20 +3122,98 @@ fn presented_key(headers: &[(String, String)]) -> &str {
         .unwrap_or("")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthRouteAccess {
+    Public,
+    Project,
+    User,
+    Secret,
+}
+
+/// Classify every Auth API route before dispatch. There is deliberately no
+/// wildcard fallback: adding a handler without adding it here leaves the route
+/// unreachable rather than accidentally public.
+fn auth_route_access(method: &str, base: &[&str]) -> Option<AuthRouteAccess> {
+    match (method, base) {
+        ("GET", ["health"]) | ("GET", [".well-known", "jwks.json"]) => {
+            Some(AuthRouteAccess::Public)
+        }
+        ("GET", ["callback", _]) | ("POST", ["callback", _]) => Some(AuthRouteAccess::Public),
+        ("GET", ["authorize"])
+        | ("POST", ["signup"])
+        | ("POST", ["signin", "anonymous"])
+        | ("POST", ["signin", "apple", "nonce"])
+        | ("POST", ["signin", "apple"])
+        | ("POST", ["token"])
+        | ("POST", ["recover"])
+        | ("POST", ["verify"]) => Some(AuthRouteAccess::Project),
+        ("GET", ["user"]) | ("PUT" | "PATCH", ["user"]) | ("POST", ["logout"]) => {
+            Some(AuthRouteAccess::User)
+        }
+        ("GET", ["admin", "users"])
+        | ("GET", ["admin", "users", _])
+        | ("POST", ["admin", "users"])
+        | ("PATCH", ["admin", "users", _])
+        | ("DELETE", ["admin", "users", _])
+        | ("GET", ["admin", "keys"])
+        | ("POST", ["admin", "keys"])
+        | ("DELETE", ["admin", "keys", _])
+        | ("GET", ["admin", "providers"])
+        | ("GET", ["admin", "settings"])
+        | ("PATCH", ["admin", "settings"])
+        | ("POST" | "PUT", ["admin", "providers", _]) => Some(AuthRouteAccess::Secret),
+        _ => None,
+    }
+}
+
+fn authorize_auth_route(
+    method: &str,
+    base: &[&str],
+    headers: &[(String, String)],
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> Result<(), (u16, &'static str, String)> {
+    match auth_route_access(method, base) {
+        Some(AuthRouteAccess::Public) => Ok(()),
+        Some(AuthRouteAccess::Project) => require_publishable_or_secret(headers, store, cache),
+        Some(AuthRouteAccess::Secret) => require_secret(headers, store, cache),
+        Some(AuthRouteAccess::User) => {
+            // A user JWT may stand alone. If the caller also supplied an
+            // explicit project key, however, validate that key instead of
+            // silently ignoring a bad one.
+            let explicit = header_value(headers, "apikey").unwrap_or("");
+            if explicit.is_empty() {
+                return Ok(());
+            }
+            match resolve_credential(explicit, "", Surface::AuthApi, store, cache) {
+                Ok(Credential::Publishable | Credential::Secret(_) | Credential::Operator) => {
+                    Ok(())
+                }
+                Ok(_) => Err(error(401, "Unauthorized", "invalid project key")),
+                Err(e) => Err(error(401, "Unauthorized", &e)),
+            }
+        }
+        None => Err(error(404, "Not Found", "not found")),
+    }
+}
+
 fn require_publishable_or_secret(
     headers: &[(String, String)],
     store: &Store,
     cache: &SharedSchemaCache,
 ) -> Result<(), (u16, &'static str, String)> {
     match resolve_credential(presented_key(headers), "", Surface::AuthApi, store, cache) {
-        Ok(Credential::Publishable | Credential::Secret | Credential::Operator) => Ok(()),
+        Ok(Credential::Publishable | Credential::Secret(_) | Credential::Operator) => Ok(()),
         // An engine with no keys configured yet is still open, as before.
-        Ok(_) if no_project_keys_configured(store, cache) => Ok(()),
-        Ok(_) => Err(error(
-            401,
-            "Unauthorized",
-            "missing or invalid auth api key",
-        )),
+        Ok(_) => match no_project_keys_configured(store, cache) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(error(
+                401,
+                "Unauthorized",
+                "missing or invalid auth api key",
+            )),
+            Err(e) => Err(error(503, "Service Unavailable", &e)),
+        },
         Err(e) => Err(error(401, "Unauthorized", &e)),
     }
 }
@@ -3120,9 +3224,14 @@ fn require_secret(
     cache: &SharedSchemaCache,
 ) -> Result<(), (u16, &'static str, String)> {
     match resolve_credential(presented_key(headers), "", Surface::AuthApi, store, cache) {
-        Ok(Credential::Secret | Credential::Operator) => Ok(()),
+        Ok(Credential::Secret(_) | Credential::Operator) => Ok(()),
         _ => Err(error(401, "Unauthorized", "secret key required")),
     }
+}
+
+struct ResolvedApiKey {
+    kind: ApiKeyKind,
+    key_hash: String,
 }
 
 /// Resolve a raw key string to its kind, or `None` if unknown or revoked. The
@@ -3132,22 +3241,48 @@ fn lookup_api_key(
     key: &str,
     store: &Store,
     cache: &SharedSchemaCache,
-) -> Result<Option<ApiKeyKind>, String> {
+) -> Result<Option<ResolvedApiKey>, String> {
     if key.is_empty() {
         return Ok(None);
     }
     let hash = hash_secret(key);
 
+    lookup_api_key_hash(&hash, store, cache).map(|resolved| {
+        resolved.map(|kind| ResolvedApiKey {
+            kind,
+            key_hash: hash,
+        })
+    })
+}
+
+/// Revalidate a secret credential retained by a long-lived RESP or realtime
+/// session. Only the hash is retained by the session; cache invalidation makes
+/// an in-process revocation immediate and the cache TTL bounds external changes.
+pub(crate) fn revalidate_secret_credential(
+    credential: &SecretCredential,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> Result<(), String> {
+    match lookup_api_key_hash(&credential.key_hash, store, cache)? {
+        Some(ApiKeyKind::Secret) => Ok(()),
+        _ => Err("secret key is revoked or unknown".to_string()),
+    }
+}
+
+fn lookup_api_key_hash(
+    hash: &str,
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> Result<Option<ApiKeyKind>, String> {
     // HTTP authenticates per request, so an uncached lookup puts a hash plus a
     // table read on the hot path (measured at roughly +5us/req against the
     // password memcmp). Cache the resolution briefly. Misses are cached too, so
     // a client looping with a bad key cannot turn into a read storm.
-    if let Some(kind) = cached_api_key(store, &hash) {
+    if let Some(kind) = cached_api_key(store, hash) {
         return Ok(kind);
     }
-
     let resolved =
-        match find_row_by_field(store, cache, KEYS_TABLE, "key_hash", &hash, Instant::now())? {
+        match find_row_by_field(store, cache, KEYS_TABLE, "key_hash", hash, Instant::now())? {
             Some(row)
                 if row
                     .get("revoked_at")
@@ -3163,7 +3298,7 @@ fn lookup_api_key(
             },
             None => None,
         };
-    store_cached_api_key(store, hash, resolved);
+    store_cached_api_key(store, hash.to_string(), resolved);
     Ok(resolved)
 }
 
@@ -3204,17 +3339,23 @@ pub(crate) fn invalidate_api_key_cache(store: &Store) {
 }
 
 /// Whether this engine has project keys, i.e. whether key-based auth is in play.
-pub(crate) fn project_keys_configured(store: &Store, cache: &SharedSchemaCache) -> bool {
-    !no_project_keys_configured(store, cache)
+pub(crate) fn project_keys_configured(
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> Result<bool, String> {
+    no_project_keys_configured(store, cache).map(|unconfigured| !unconfigured)
 }
 
-fn no_project_keys_configured(store: &Store, cache: &SharedSchemaCache) -> bool {
+fn no_project_keys_configured(store: &Store, cache: &SharedSchemaCache) -> Result<bool, String> {
+    if !store.config().auth.enabled {
+        return Ok(true);
+    }
     if store.config().auth.initial_publishable_key.is_some()
         || store.config().auth.initial_secret_key.is_some()
     {
-        return false;
+        return Ok(false);
     }
-    tables::table_count(store, cache, KEYS_TABLE, Instant::now()).unwrap_or(0) == 0
+    tables::table_count(store, cache, KEYS_TABLE, Instant::now()).map(|count| count == 0)
 }
 
 fn sign_access_token(
@@ -4934,6 +5075,7 @@ pub(crate) fn put_grant(
     grant: &crate::grants::Grant,
     now: Instant,
 ) -> Result<(), String> {
+    validate_grant_reserved_tables(&grant.table, &grant.predicate)?;
     ensure_grants_table(store, cache, now)?;
     let created = unix_seconds().to_string();
     for scope in &grant.scopes {
@@ -4962,6 +5104,23 @@ pub(crate) fn put_grant(
             ],
             now,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_grant_reserved_tables(
+    table: &str,
+    predicate: &crate::grants::Predicate,
+) -> Result<(), String> {
+    if let Some(error) = reserved_table_access_error(table) {
+        return Err(error);
+    }
+    for clause in predicate.clauses() {
+        for condition in clause {
+            if let crate::grants::Condition::InSubquery { subquery, .. } = condition {
+                validate_grant_reserved_tables(&subquery.table, &subquery.inner)?;
+            }
+        }
     }
     Ok(())
 }
@@ -5099,8 +5258,13 @@ fn load_grant_predicate(
     match row {
         Some(row) => {
             let pred_str = row.get("predicate").cloned().unwrap_or_default();
-            let toks: Vec<&str> = pred_str.split_whitespace().collect();
-            Ok(Some(crate::grants::parse_predicate(&toks)?))
+            let tokens = tables::tokenize_where(&pred_str)?;
+            let token_refs = tokens.iter().map(String::as_str).collect::<Vec<_>>();
+            let predicate = crate::grants::parse_predicate(&token_refs)?;
+            // Treat restored or manually corrupted legacy grants exactly like a
+            // newly defined grant: reserved-table references fail closed.
+            validate_grant_reserved_tables(table, &predicate)?;
+            Ok(Some(predicate))
         }
         None => Ok(None),
     }
@@ -5256,19 +5420,38 @@ fn collect_resolved_subquery_tables(
 ///   render an always-false, type-agnostic contradiction `col IS NULL AND col
 ///   IS NOT NULL` so the query matches nothing.
 /// - empty negated set (`NOT IN ( )` matches everything): omit it.
-fn render_enforced_clause(conds: &[crate::grants::EnforcedCondition]) -> String {
+fn quote_where_value(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("'{escaped}'")
+}
+
+fn qualified_grant_column(column: &str, qualifier: Option<&str>) -> String {
+    match qualifier {
+        Some(qualifier) => format!("{qualifier}.{column}"),
+        None => column.to_string(),
+    }
+}
+
+fn render_enforced_clause(
+    conds: &[crate::grants::EnforcedCondition],
+    qualifier: Option<&str>,
+) -> String {
     use crate::grants::EnforcedCondition;
     let mut parts: Vec<String> = Vec::new();
     for c in conds {
         match c {
-            EnforcedCondition::Cmp(rc) => {
-                parts.push(format!("{} {} {}", rc.column, rc.op, rc.value))
-            }
+            EnforcedCondition::Cmp(rc) => parts.push(format!(
+                "{} {} {}",
+                qualified_grant_column(&rc.column, qualifier),
+                rc.op,
+                quote_where_value(&rc.value)
+            )),
             EnforcedCondition::InSet {
                 column,
                 negated,
                 values,
             } => {
+                let column = qualified_grant_column(column, qualifier);
                 if values.is_empty() {
                     if !negated {
                         parts.push(format!("{column} IS NULL AND {column} IS NOT NULL"));
@@ -5276,7 +5459,12 @@ fn render_enforced_clause(conds: &[crate::grants::EnforcedCondition]) -> String 
                     // empty NOT IN matches all rows -> nothing to add
                 } else {
                     let kw = if *negated { "NOT IN" } else { "IN" };
-                    parts.push(format!("{column} {kw} ( {} )", values.join(" ")));
+                    let values = values
+                        .iter()
+                        .map(|value| quote_where_value(value))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    parts.push(format!("{column} {kw} ( {values} )"));
                 }
             }
         }
@@ -5286,10 +5474,11 @@ fn render_enforced_clause(conds: &[crate::grants::EnforcedCondition]) -> String 
 
 fn render_enforced_or_clauses(
     clauses: &[Vec<crate::grants::EnforcedCondition>],
+    qualifier: Option<&str>,
 ) -> Result<String, String> {
     use crate::grants::EnforcedCondition;
     if let Some(cond) = collapse_same_column_or_clauses(clauses) {
-        return Ok(render_enforced_clause(&[cond]));
+        return Ok(render_enforced_clause(&[cond], qualifier));
     }
     let mut branches = Vec::new();
     for clause in clauses {
@@ -5301,13 +5490,19 @@ fn render_enforced_or_clauses(
         for condition in clause {
             match condition {
                 EnforcedCondition::Cmp(rc) => {
-                    parts.push(format!("{} {} {}", rc.column, rc.op, rc.value));
+                    parts.push(format!(
+                        "{} {} {}",
+                        qualified_grant_column(&rc.column, qualifier),
+                        rc.op,
+                        quote_where_value(&rc.value)
+                    ));
                 }
                 EnforcedCondition::InSet {
                     column,
                     negated,
                     values,
                 } => {
+                    let column = qualified_grant_column(column, qualifier);
                     if values.is_empty() {
                         if *negated {
                             continue;
@@ -5316,7 +5511,12 @@ fn render_enforced_or_clauses(
                         break;
                     }
                     let kw = if *negated { "NOT IN" } else { "IN" };
-                    parts.push(format!("{column} {kw} ( {} )", values.join(" ")));
+                    let values = values
+                        .iter()
+                        .map(|value| quote_where_value(value))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    parts.push(format!("{column} {kw} ( {values} )"));
                 }
             }
         }
@@ -5345,6 +5545,7 @@ fn render_enforced_or_clauses(
         else {
             return Ok(String::new());
         };
+        let first_column = qualified_grant_column(first_column, qualifier);
         return Ok(format!(
             "{first_column} IS NULL AND {first_column} IS NOT NULL"
         ));
@@ -5399,11 +5600,12 @@ fn collapse_same_column_or_clauses(
 
 fn render_enforced_clauses(
     clauses: &[Vec<crate::grants::EnforcedCondition>],
+    qualifier: Option<&str>,
 ) -> Result<String, String> {
     if clauses.len() == 1 {
-        return Ok(render_enforced_clause(&clauses[0]));
+        return Ok(render_enforced_clause(&clauses[0], qualifier));
     }
-    render_enforced_or_clauses(clauses)
+    render_enforced_or_clauses(clauses, qualifier)
 }
 
 /// Resolve + execute the grant for `(table, scope)` into enforced conditions.
@@ -5446,7 +5648,32 @@ pub(crate) fn read_filter(
     else {
         return Err(format!("no read access to '{table}'"));
     };
-    render_enforced_clauses(&conds)
+    render_enforced_clauses(&conds, None)
+}
+
+/// Resolve a READ grant and qualify its outer columns for a joined query. The
+/// qualifier is the exact table alias stored in joined rows, so a predicate for
+/// one table cannot accidentally bind to a same-named column on another.
+pub(crate) fn read_filter_qualified(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    principal: &AuthPrincipal,
+    table: &str,
+    qualifier: &str,
+    now: Instant,
+) -> Result<String, String> {
+    let Some(conds) = enforced_conds(
+        store,
+        cache,
+        principal,
+        table,
+        crate::grants::Scope::Read,
+        now,
+    )?
+    else {
+        return Err(format!("no read access to '{table}'"));
+    };
+    render_enforced_clauses(&conds, Some(qualifier))
 }
 
 /// Like `read_filter`, but returns the resolved conditions as structured tuples
@@ -5590,7 +5817,7 @@ pub(crate) fn write_filter(
     else {
         return Err(format!("no write access to '{table}'"));
     };
-    render_enforced_clauses(&conds)
+    render_enforced_clauses(&conds, None)
 }
 
 fn find_rows_by_field(
