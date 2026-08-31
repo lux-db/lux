@@ -397,6 +397,12 @@ fn save_and_truncate_wal_observed(
     store: &Store,
     on_phase: &dyn Fn(BackgroundSavePhase),
 ) -> io::Result<usize> {
+    if store.config().auth.enabled && store.auth_secret_storage_degraded() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Auth secret storage is degraded; its in-memory state cannot be exported and will be discarded on restart; configure Lux encryption before restarting",
+        ));
+    }
     let _snapshot_guard = store.snapshot_guard();
     on_phase(BackgroundSavePhase::Capturing);
     let (entries, checkpoints) = store.with_write_barrier(|shards| {

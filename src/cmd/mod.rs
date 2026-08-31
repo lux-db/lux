@@ -4900,7 +4900,12 @@ mod tests {
         exec_wal(&store, &[b"SET", b"revived", b"new"]);
         exec_wal(&store, &[b"PEXPIRE", b"retimed", b"60000"]);
         store.fsync_wal();
-        std::thread::sleep(Duration::from_millis(2200));
+        let remaining_ms = store.pttl(b"preserved", Instant::now());
+        assert!(
+            remaining_ms > 0,
+            "snapshot fixture expired before its post-snapshot mutations completed"
+        );
+        std::thread::sleep(Duration::from_millis(remaining_ms as u64 + 25));
 
         let restored = journal_test_store(dir.path());
         restored.begin_recovery();

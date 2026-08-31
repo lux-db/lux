@@ -43,6 +43,8 @@ fn http_health_check() {
         health["persistence"]["sync_interval_ms"],
         serde_json::Value::Null
     );
+    assert_eq!(health["auth"]["enabled"], false);
+    assert_eq!(health["auth"]["secret_storage"]["status"], "disabled");
 }
 
 #[test]
@@ -278,6 +280,28 @@ fn http_auth_routes_are_disabled_unless_enabled() {
 }
 
 #[test]
+fn ephemeral_auth_health_is_degraded_and_snapshot_export_is_blocked() {
+    let server = LuxServer::builder()
+        .http()
+        .password("rootsecret")
+        .env("LUX_AUTH_ENABLED", "true")
+        .env("LUX_DURABILITY", "ephemeral")
+        .env("LUX_ENC_AUTO_INIT", "0")
+        .start();
+    let http = server.http_port();
+
+    let (status, body) = http_request(http, "GET", "/auth/v1/health", None, None);
+    assert_eq!(status, 200, "{body}");
+    let health: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(health["result"], "degraded");
+    assert_eq!(health["secret_storage"]["snapshots_allowed"], false);
+
+    let (status, body) = http_request(http, "GET", "/v1/snapshot", None, Some("rootsecret"));
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("restart"), "{body}");
+}
+
+#[test]
 fn http_auth_signup_login_user_logout_and_admin_routes() {
     let server = LuxServer::builder()
         .http()
@@ -288,6 +312,12 @@ fn http_auth_signup_login_user_logout_and_admin_routes() {
 
     let (status, health) = http_request(http, "GET", "/auth/v1/health", None, None);
     assert_eq!(status, 200, "health: {health}");
+    let health: serde_json::Value = serde_json::from_str(&health).unwrap();
+    assert_eq!(health["result"], "ok");
+    assert_eq!(health["secret_storage"]["status"], "ready");
+    assert_eq!(health["secret_storage"]["mode"], "encrypted");
+    assert_eq!(health["secret_storage"]["persistent"], true);
+    assert_eq!(health["secret_storage"]["snapshots_allowed"], true);
 
     let (status, signup_body) = http_request(
         http,

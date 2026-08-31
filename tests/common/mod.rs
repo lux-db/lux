@@ -425,6 +425,16 @@ fn build_command(bin: &Path, spec: &Spec, dir: &Path, port: u16, http_port: u16)
             cmd.env("LUX_PASSWORD", password);
         }
     }
+    // Auth signing/provider material is persistent in this harness. Give auth
+    // integration tests a real managed keyring unless a test explicitly sets
+    // encryption behavior itself.
+    if auth_test_needs_managed_keyring(
+        spec.env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    ) {
+        cmd.env("LUX_ENC_AUTO_INIT", "1");
+    }
     for (key, value) in &spec.env {
         cmd.env(key, value);
     }
@@ -453,6 +463,9 @@ pub fn spawn_lux_with_data_dir(
     if !password.is_empty() {
         cmd.env("LUX_PASSWORD", password);
     }
+    if auth_test_needs_managed_keyring(env.iter().copied()) {
+        cmd.env("LUX_ENC_AUTO_INIT", "1");
+    }
     for (key, value) in env {
         cmd.env(key, value);
     }
@@ -461,6 +474,29 @@ pub fn spawn_lux_with_data_dir(
         panic!("lux did not start on http port {http_port}");
     }
     child
+}
+
+/// Persistent Auth test servers should exercise real encrypted storage. An
+/// explicit encryption variable always wins so negative configuration tests
+/// can still disable or replace automatic initialization.
+pub fn auth_test_needs_managed_keyring<'a>(
+    env: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> bool {
+    let mut auth_enabled = false;
+    let mut encryption_configured = false;
+    for (key, value) in env {
+        if key == "LUX_AUTH_ENABLED" && matches!(value.to_ascii_lowercase().as_str(), "1" | "true")
+        {
+            auth_enabled = true;
+        }
+        if matches!(
+            key,
+            "LUX_ENC_AUTO_INIT" | "LUX_ENCRYPTION_KEY" | "LUX_ENCRYPTION_KEYS"
+        ) {
+            encryption_configured = true;
+        }
+    }
+    auth_enabled && !encryption_configured
 }
 
 /// Poll until the RESP port answers PING, bailing early if the child dies.

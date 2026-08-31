@@ -774,6 +774,9 @@ fn stage_add_to_index(
     value: &str,
     pk: &str,
 ) -> Result<(), String> {
+    if crate::auth::is_auth_secret_storage_field(table, &field.name) {
+        return Ok(());
+    }
     if field.encrypted {
         if field.searchable {
             for index_value in searchable_index_values(store, table, field, value)? {
@@ -2599,6 +2602,9 @@ fn add_to_index(
     pk_str: &str,
     now: Instant,
 ) -> Result<(), String> {
+    if crate::auth::is_auth_secret_storage_field(table, &field.name) {
+        return Ok(());
+    }
     if field.encrypted {
         if !field.searchable {
             return Ok(());
@@ -2666,6 +2672,19 @@ fn add_to_index(
         FieldType::Json | FieldType::Array => {}
     }
     Ok(())
+}
+
+/// Remove value-bearing string indexes for a field before a security migration
+/// checkpoint. The caller is responsible for checkpointing immediately after
+/// this in-memory cleanup so a crash repeats the operation from its durable
+/// pending marker.
+pub(crate) fn purge_string_field_indexes(store: &Store, table: &str, field: &str, now: Instant) {
+    let pattern = idx_str_key(table, field, "*");
+    let keys = store.keys(pattern.as_bytes(), now);
+    let refs = keys.iter().map(String::as_bytes).collect::<Vec<_>>();
+    if !refs.is_empty() {
+        store.del(&refs);
+    }
 }
 
 fn remove_from_index(

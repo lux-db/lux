@@ -528,6 +528,11 @@ fn print_info_event(event: lux::ServerInfoEvent) {
 
 fn print_warn_event(event: lux::ServerWarnEvent) {
     match event {
+        lux::ServerWarnEvent::AuthSecretStorageDegraded => {
+            eprintln!(
+                "auth: development-only plaintext memory mode; this Auth state cannot be exported and will be discarded on restart; configure Lux encryption before restarting or using persistent durability"
+            );
+        }
         lux::ServerWarnEvent::DiskCorruptedEntrySkipped { offset, .. } => {
             eprintln!("disk: corrupted entry at offset {offset} (crc mismatch), skipping");
         }

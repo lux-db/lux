@@ -718,6 +718,736 @@ fn encrypted_test_store() -> Store {
     }))
 }
 
+fn assert_auth_secret_is_sealed(stored: &str, plaintext: &str) {
+    assert!(stored.starts_with("luxsealed:"), "not sealed: {stored}");
+    assert!(
+        !stored.contains(plaintext),
+        "auth secret envelope leaked plaintext"
+    );
+}
+
+#[test]
+fn auth_secret_storage_health_distinguishes_every_operating_state() {
+    let disabled = Store::new();
+    let disabled_health = secret_storage_health(&disabled);
+    assert_eq!(disabled_health.status, AuthSecretStorageStatus::Disabled);
+
+    let degraded = Store::new_with_config(Arc::new(ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        ..ServerConfig::default()
+    }));
+    let degraded_health = secret_storage_health(&degraded);
+    assert_eq!(degraded_health.status, AuthSecretStorageStatus::Degraded);
+    assert_eq!(degraded_health.mode, "ephemeral_plaintext");
+    assert!(!degraded_health.persistent);
+    assert!(!degraded_health.snapshots_allowed);
+
+    let ready = Store::new_with_config(Arc::new(ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        encryption: crate::EncryptionConfig {
+            active_key_id: Some("health-key".to_string()),
+            keys: vec![crate::EncryptionKeyConfig {
+                id: "health-key".to_string(),
+                secret: b"health-encryption-key".to_vec(),
+                decrypt_only: false,
+            }],
+            ..Default::default()
+        },
+        ..ServerConfig::default()
+    }));
+    let ready_health = secret_storage_health(&ready);
+    assert_eq!(ready_health.status, AuthSecretStorageStatus::Ready);
+    assert_eq!(ready_health.mode, "encrypted");
+    assert!(ready_health.snapshots_allowed);
+    let ready_json = health_json(&ready).to_string();
+    assert!(!ready_json.contains("health-key"), "{ready_json}");
+
+    let root = tempfile::tempdir().unwrap();
+    let locked = Store::new_with_config(Arc::new(ServerConfig {
+        data_dir: root.path().to_string_lossy().to_string(),
+        durability: DurabilityConfig {
+            policy: DurabilityPolicy::EverySecond,
+            ..DurabilityConfig::default()
+        },
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        ..ServerConfig::default()
+    }));
+    let locked_health = secret_storage_health(&locked);
+    assert_eq!(locked_health.status, AuthSecretStorageStatus::Locked);
+    assert_eq!(locked_health.mode, "unavailable");
+    assert!(locked_health.persistent);
+    assert!(!locked_health.snapshots_allowed);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    let (status, _, body) = route_http("GET", "/auth/v1/health", "", &[], &[], &locked, &cache);
+    assert_eq!(status, 503, "{body}");
+    let health: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(health["result"], "locked");
+    assert_eq!(health["secret_storage"]["status"], "locked");
+}
+
+#[test]
+fn auth_health_marks_ephemeral_plaintext_as_degraded() {
+    let store = Store::new_with_config(Arc::new(ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        ..ServerConfig::default()
+    }));
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+
+    let (status, _, body) = route_http("GET", "/auth/v1/health", "", &[], &[], &store, &cache);
+    assert_eq!(status, 200, "{body}");
+    let health: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(health["result"], "degraded");
+    assert_eq!(health["secret_storage"]["status"], "degraded");
+    assert_eq!(health["secret_storage"]["mode"], "ephemeral_plaintext");
+    assert_eq!(health["secret_storage"]["snapshots_allowed"], false);
+}
+
+#[test]
+fn signing_oauth_and_email_secrets_share_one_envelope_boundary() {
+    let store = encrypted_test_store();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+    let now = Instant::now();
+
+    let signing = find_row_by_field(&store, &cache, SIGNING_KEYS_TABLE, "active", "true", now)
+        .unwrap()
+        .unwrap();
+    let stored_signing_key = signing.get("private_key_encrypted").unwrap();
+    assert_auth_secret_is_sealed(stored_signing_key, "BEGIN PRIVATE KEY");
+    assert!(store
+        .keys(b"_t:auth.signing_keys:idx:private_key_encrypted:*", now)
+        .is_empty());
+    assert!(active_signing_key(&store, &cache, now)
+        .unwrap()
+        .unwrap()
+        .private_key
+        .contains("BEGIN PRIVATE KEY"));
+
+    let (status, _, body) = admin_upsert_provider(
+        "google",
+        r#"{"client_id":"google-client","client_secret":"google-secret","redirect_uri":"https://app.example/auth/callback","enabled":true}"#,
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("google-secret"), "{body}");
+    let google = find_row_by_field(&store, &cache, PROVIDERS_TABLE, "provider", "google", now)
+        .unwrap()
+        .unwrap();
+    let stored_google_secret = google.get("client_secret").unwrap().clone();
+    assert_auth_secret_is_sealed(&stored_google_secret, "google-secret");
+    assert!(store
+        .keys(b"_t:auth.providers:idx:client_secret:*", now)
+        .is_empty());
+    assert_eq!(
+        oauth_provider_config(&store, &cache, "google", now)
+            .unwrap()
+            .unwrap()
+            .client_secret,
+        "google-secret"
+    );
+    let (status, _, body) = admin_upsert_provider(
+        "google",
+        r#"{"client_id":"google-client","redirect_uri":"https://app.example/auth/callback","enabled":true,"scopes":["openid","email"]}"#,
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "{body}");
+    let google = find_row_by_field(&store, &cache, PROVIDERS_TABLE, "provider", "google", now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        google.get("client_secret"),
+        Some(&stored_google_secret),
+        "omitting a provider secret must preserve its existing envelope"
+    );
+    assert_eq!(
+        oauth_provider_config(&store, &cache, "google", now)
+            .unwrap()
+            .unwrap()
+            .client_secret,
+        "google-secret"
+    );
+
+    let (status, _, body) = admin_update_settings(
+        r#"{"email_provider":"postmark","email_from":"auth@app.example","email_postmark_server_token":"postmark-secret"}"#,
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("postmark-secret"), "{body}");
+    let email = find_row_by_field(
+        &store,
+        &cache,
+        SETTINGS_TABLE,
+        "key",
+        secrets::EMAIL_POSTMARK_TOKEN_KEY,
+        now,
+    )
+    .unwrap()
+    .unwrap();
+    let stored_email_secret = email.get("value").unwrap().clone();
+    assert_auth_secret_is_sealed(&stored_email_secret, "postmark-secret");
+    assert!(store.keys(b"_t:auth.settings:idx:value:*", now).is_empty());
+    assert_eq!(
+        auth_settings(&store, &cache, now)
+            .unwrap()
+            .email_postmark_server_token
+            .as_deref(),
+        Some("postmark-secret")
+    );
+    let (status, _, body) =
+        admin_update_settings(r#"{"email_from":"new-auth@app.example"}"#, &store, &cache);
+    assert_eq!(status, 200, "{body}");
+    let email = find_row_by_field(
+        &store,
+        &cache,
+        SETTINGS_TABLE,
+        "key",
+        secrets::EMAIL_POSTMARK_TOKEN_KEY,
+        now,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        email.get("value"),
+        Some(&stored_email_secret),
+        "omitting an email token must preserve its existing envelope"
+    );
+    assert_eq!(
+        auth_settings(&store, &cache, now)
+            .unwrap()
+            .email_postmark_server_token
+            .as_deref(),
+        Some("postmark-secret")
+    );
+
+    assert!(secrets::open(
+        &store,
+        PROVIDERS_TABLE,
+        "client_secret",
+        "github",
+        &stored_google_secret,
+    )
+    .is_err());
+}
+
+#[test]
+fn plaintext_auth_secret_migration_is_complete_and_idempotent() {
+    let store = encrypted_test_store();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    let now = Instant::now();
+
+    durable_table_insert(
+        &store,
+        &cache,
+        SIGNING_KEYS_TABLE,
+        &[
+            ("id", "legacy-signing"),
+            ("kid", "legacy-kid"),
+            ("algorithm", "ES256"),
+            ("private_key_encrypted", "legacy-signing-secret"),
+            ("active", "true"),
+        ],
+        now,
+    )
+    .unwrap();
+    durable_table_insert(
+        &store,
+        &cache,
+        PROVIDERS_TABLE,
+        &[
+            ("provider", "github"),
+            ("enabled", "true"),
+            ("client_secret", "legacy-oauth-secret"),
+        ],
+        now,
+    )
+    .unwrap();
+    durable_table_insert(
+        &store,
+        &cache,
+        SETTINGS_TABLE,
+        &[
+            ("key", secrets::EMAIL_POSTMARK_TOKEN_KEY),
+            ("value", "legacy-email-secret"),
+        ],
+        now,
+    )
+    .unwrap();
+
+    secrets::migrate_storage(&store, &cache, now).unwrap();
+    secrets::migrate_storage(&store, &cache, now).unwrap();
+
+    let signing = find_row_by_field(
+        &store,
+        &cache,
+        SIGNING_KEYS_TABLE,
+        "id",
+        "legacy-signing",
+        now,
+    )
+    .unwrap()
+    .unwrap();
+    assert_auth_secret_is_sealed(
+        signing.get("private_key_encrypted").unwrap(),
+        "legacy-signing-secret",
+    );
+    let provider = find_row_by_field(&store, &cache, PROVIDERS_TABLE, "provider", "github", now)
+        .unwrap()
+        .unwrap();
+    assert_auth_secret_is_sealed(
+        provider.get("client_secret").unwrap(),
+        "legacy-oauth-secret",
+    );
+    let email = find_row_by_field(
+        &store,
+        &cache,
+        SETTINGS_TABLE,
+        "key",
+        secrets::EMAIL_POSTMARK_TOKEN_KEY,
+        now,
+    )
+    .unwrap()
+    .unwrap();
+    assert_auth_secret_is_sealed(email.get("value").unwrap(), "legacy-email-secret");
+}
+
+#[test]
+fn persistent_auth_refuses_to_create_signing_material_without_encryption() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new_with_config(Arc::new(ServerConfig {
+        data_dir: dir.path().to_string_lossy().to_string(),
+        durability: DurabilityConfig {
+            policy: DurabilityPolicy::EverySecond,
+            ..DurabilityConfig::default()
+        },
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        ..ServerConfig::default()
+    }));
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    let error = bootstrap_runtime(&store, &cache, &store.config().auth).unwrap_err();
+    assert!(error.contains("persistent auth secrets require"), "{error}");
+    assert!(
+        active_signing_key(&store, &cache, Instant::now())
+            .unwrap()
+            .is_none(),
+        "a failed seal must not persist plaintext signing material"
+    );
+}
+
+#[test]
+fn corrupt_auth_secret_envelope_is_not_rewrapped_as_plaintext() {
+    let store = encrypted_test_store();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    let now = Instant::now();
+    durable_table_insert(
+        &store,
+        &cache,
+        PROVIDERS_TABLE,
+        &[
+            ("provider", "google"),
+            ("enabled", "true"),
+            ("client_secret", "luxsealed:not-valid-base64"),
+        ],
+        now,
+    )
+    .unwrap();
+
+    let error = secrets::migrate_storage(&store, &cache, now).unwrap_err();
+    assert!(error.contains("sealed value"), "{error}");
+    let row = find_row_by_field(&store, &cache, PROVIDERS_TABLE, "provider", "google", now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.get("client_secret").map(String::as_str),
+        Some("luxsealed:not-valid-base64")
+    );
+}
+
+fn persisted_files_contain(path: &std::path::Path, needle: &[u8]) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            persisted_files_contain(&path, needle)
+        } else {
+            std::fs::read(path)
+                .ok()
+                .is_some_and(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+        }
+    })
+}
+
+#[test]
+fn new_auth_secrets_never_reach_persistent_files_as_plaintext() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new_with_config(Arc::new(ServerConfig {
+        data_dir: dir.path().to_string_lossy().to_string(),
+        durability: DurabilityConfig {
+            policy: DurabilityPolicy::EverySecond,
+            ..DurabilityConfig::default()
+        },
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        encryption: crate::EncryptionConfig {
+            active_key_id: Some("auth-persist".to_string()),
+            keys: vec![crate::EncryptionKeyConfig {
+                id: "auth-persist".to_string(),
+                secret: b"auth-persistence-encryption-key".to_vec(),
+                decrypt_only: false,
+            }],
+            ..Default::default()
+        },
+        ..ServerConfig::default()
+    }));
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+    let (status, _, body) = admin_upsert_provider(
+        "github",
+        r#"{"client_id":"github-client","client_secret":"persisted-oauth-secret","redirect_uri":"https://app.example/auth/callback"}"#,
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, _, body) = admin_update_settings(
+        r#"{"email_provider":"postmark","email_from":"auth@app.example","email_postmark_server_token":"persisted-email-secret"}"#,
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "{body}");
+    store.fsync_wal();
+    crate::snapshot::save_and_truncate_wal_consistent(&store).unwrap();
+
+    for secret in [
+        b"persisted-oauth-secret".as_slice(),
+        b"persisted-email-secret".as_slice(),
+        b"BEGIN PRIVATE KEY".as_slice(),
+    ] {
+        assert!(
+            !persisted_files_contain(dir.path(), secret),
+            "plaintext auth secret reached persistent storage"
+        );
+    }
+}
+
+#[test]
+fn plaintext_auth_secret_migration_survives_repeated_wal_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ServerConfig {
+        data_dir: dir.path().to_string_lossy().to_string(),
+        durability: DurabilityConfig {
+            policy: DurabilityPolicy::EverySecond,
+            ..DurabilityConfig::default()
+        },
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        encryption: crate::EncryptionConfig {
+            active_key_id: Some("auth-migration".to_string()),
+            keys: vec![crate::EncryptionKeyConfig {
+                id: "auth-migration".to_string(),
+                secret: b"auth-migration-encryption-key".to_vec(),
+                decrypt_only: false,
+            }],
+            ..Default::default()
+        },
+        ..ServerConfig::default()
+    });
+    let legacy_signing = generate_es256_signing_key().unwrap();
+
+    {
+        let store = Store::new_with_config(config.clone());
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        let now = Instant::now();
+        durable_table_insert(
+            &store,
+            &cache,
+            SIGNING_KEYS_TABLE,
+            &[
+                ("id", "legacy-signing"),
+                ("kid", legacy_signing.kid.as_str()),
+                ("algorithm", legacy_signing.algorithm.as_str()),
+                ("public_jwk", legacy_signing.public_jwk.as_str()),
+                ("private_key_encrypted", legacy_signing.private_key.as_str()),
+                ("active", "true"),
+            ],
+            now,
+        )
+        .unwrap();
+        durable_table_insert(
+            &store,
+            &cache,
+            PROVIDERS_TABLE,
+            &[
+                ("provider", "google"),
+                ("enabled", "true"),
+                ("client_secret", "legacy-replay-oauth-secret"),
+            ],
+            now,
+        )
+        .unwrap();
+        store.fsync_wal();
+    }
+
+    {
+        let store = Store::new_with_config(config.clone());
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        store.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        let migration = bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+        assert!(migration.secret_history_checkpoint_required);
+        store.fsync_wal();
+    }
+
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    store.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+    let migration = bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+    assert!(
+        migration.secret_history_checkpoint_required,
+        "a crash after row migration must preserve the pending checkpoint requirement"
+    );
+    let now = Instant::now();
+    let signing = find_row_by_field(
+        &store,
+        &cache,
+        SIGNING_KEYS_TABLE,
+        "id",
+        "legacy-signing",
+        now,
+    )
+    .unwrap()
+    .unwrap();
+    assert_auth_secret_is_sealed(
+        signing.get("private_key_encrypted").unwrap(),
+        "BEGIN PRIVATE KEY",
+    );
+    assert_eq!(
+        active_signing_key(&store, &cache, now)
+            .unwrap()
+            .unwrap()
+            .private_key,
+        legacy_signing.private_key
+    );
+    let provider = find_row_by_field(&store, &cache, PROVIDERS_TABLE, "provider", "google", now)
+        .unwrap()
+        .unwrap();
+    assert_auth_secret_is_sealed(
+        provider.get("client_secret").unwrap(),
+        "legacy-replay-oauth-secret",
+    );
+    assert_eq!(
+        oauth_provider_config(&store, &cache, "google", now)
+            .unwrap()
+            .unwrap()
+            .client_secret,
+        "legacy-replay-oauth-secret"
+    );
+}
+
+#[tokio::test]
+async fn runtime_migration_removes_plaintext_history_before_readiness() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let config = ServerConfig {
+        data_dir: root.to_string_lossy().to_string(),
+        enable_resp: false,
+        durability: DurabilityConfig {
+            policy: DurabilityPolicy::AlwaysSync,
+            ..DurabilityConfig::default()
+        },
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        encryption: crate::EncryptionConfig {
+            active_key_id: Some("auth-upgrade".to_string()),
+            keys: vec![crate::EncryptionKeyConfig {
+                id: "auth-upgrade".to_string(),
+                secret: b"auth-upgrade-encryption-key".to_vec(),
+                decrypt_only: false,
+            }],
+            ..Default::default()
+        },
+        ..ServerConfig::default()
+    };
+
+    {
+        let store = Store::new_with_config(Arc::new(config.clone()));
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        durable_table_insert(
+            &store,
+            &cache,
+            PROVIDERS_TABLE,
+            &[
+                ("provider", "google"),
+                ("enabled", "true"),
+                ("client_secret", "legacy-live-history-secret"),
+            ],
+            Instant::now(),
+        )
+        .unwrap();
+        store.fsync_wal();
+    }
+    assert!(persisted_files_contain(
+        &root,
+        b"legacy-live-history-secret"
+    ));
+
+    let handle = crate::run_with_config(config.clone()).await.unwrap();
+    assert!(
+        !persisted_files_contain(&root, b"legacy-live-history-secret"),
+        "the Engine reached readiness while its live persistence files still contained a migrated plaintext secret"
+    );
+    assert_eq!(
+        oauth_provider_config(
+            &handle.runtime.store,
+            &handle.runtime.schema_cache,
+            "google",
+            Instant::now(),
+        )
+        .unwrap()
+        .unwrap()
+        .client_secret,
+        "legacy-live-history-secret"
+    );
+    handle.shutdown_and_wait().await.unwrap();
+
+    let restarted = crate::run_with_config(config).await.unwrap();
+    assert_eq!(
+        oauth_provider_config(
+            &restarted.runtime.store,
+            &restarted.runtime.schema_cache,
+            "google",
+            Instant::now(),
+        )
+        .unwrap()
+        .unwrap()
+        .client_secret,
+        "legacy-live-history-secret"
+    );
+    assert!(!persisted_files_contain(
+        &root,
+        b"legacy-live-history-secret"
+    ));
+    restarted.shutdown_and_wait().await.unwrap();
+}
+
+#[test]
+fn auth_secrets_survive_rewrap_and_prior_key_retirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ServerConfig {
+        data_dir: dir.path().to_string_lossy().to_string(),
+        durability: DurabilityConfig {
+            policy: DurabilityPolicy::AlwaysSync,
+            ..DurabilityConfig::default()
+        },
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        encryption: crate::EncryptionConfig {
+            active_key_id: Some("auth-k1".to_string()),
+            keys: vec![crate::EncryptionKeyConfig {
+                id: "auth-k1".to_string(),
+                secret: b"auth-rotation-initial-key".to_vec(),
+                decrypt_only: false,
+            }],
+            ..Default::default()
+        },
+        ..ServerConfig::default()
+    });
+
+    {
+        let store = Store::new_with_config(config.clone());
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+        let (status, _, body) = admin_upsert_provider(
+            "google",
+            r#"{"client_id":"rotation-client","client_secret":"rotation-oauth-secret","redirect_uri":"https://app.example/auth/callback","enabled":true}"#,
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "{body}");
+        let (status, _, body) = admin_update_settings(
+            r#"{"email_provider":"postmark","email_from":"auth@app.example","email_postmark_server_token":"rotation-email-secret"}"#,
+            &store,
+            &cache,
+        );
+        assert_eq!(status, 200, "{body}");
+
+        store.encryption().rotate(Some("auth-k2")).unwrap();
+        assert!(store.enc_rewrap_all().unwrap() >= 3);
+        store.enc_retire_key("auth-k1").unwrap();
+        assert!(active_signing_key(&store, &cache, Instant::now())
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            oauth_provider_config(&store, &cache, "google", Instant::now())
+                .unwrap()
+                .unwrap()
+                .client_secret,
+            "rotation-oauth-secret"
+        );
+    }
+
+    let restored = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&restored, &cache, &restored.config().auth).unwrap();
+    crate::snapshot::load(&restored).unwrap();
+    restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+    bootstrap_runtime(&restored, &cache, &restored.config().auth).unwrap();
+    assert!(active_signing_key(&restored, &cache, Instant::now())
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        oauth_provider_config(&restored, &cache, "google", Instant::now())
+            .unwrap()
+            .unwrap()
+            .client_secret,
+        "rotation-oauth-secret"
+    );
+    assert_eq!(
+        auth_settings(&restored, &cache, Instant::now())
+            .unwrap()
+            .email_postmark_server_token
+            .as_deref(),
+        Some("rotation-email-secret")
+    );
+}
+
 fn selected_rows(result: crate::tables::SelectResult) -> Vec<Vec<(String, String)>> {
     match result {
         crate::tables::SelectResult::Rows(rows) => rows,
@@ -2341,6 +3071,19 @@ fn auth_users_survive_wal_replay() {
             mode: crate::StorageMode::Tiered,
             dir: temp.path().to_string_lossy().to_string(),
         },
+        durability: crate::DurabilityConfig {
+            policy: crate::DurabilityPolicy::EverySecond,
+            ..Default::default()
+        },
+        encryption: crate::EncryptionConfig {
+            active_key_id: Some("auth-wal".to_string()),
+            keys: vec![crate::EncryptionKeyConfig {
+                id: "auth-wal".to_string(),
+                secret: b"auth-wal-secret".to_vec(),
+                decrypt_only: false,
+            }],
+            ..Default::default()
+        },
         ..crate::ServerConfig::default()
     });
 
@@ -2538,20 +3281,37 @@ fn apple_private_key_seals_and_unseals_with_active_key() {
         !sealed.contains("MOCKAPPLEP8"),
         "sealed key leaked plaintext"
     );
-    assert_eq!(unseal_apple_private_key(&store, &sealed).unwrap(), p8);
+    assert_eq!(
+        secrets::open(
+            &store,
+            PROVIDERS_TABLE,
+            "apple_private_key",
+            "apple",
+            &sealed,
+        )
+        .unwrap(),
+        p8
+    );
 }
 
 #[test]
-fn apple_private_key_refuses_plaintext_storage_without_key() {
+fn apple_private_key_plaintext_exception_is_ephemeral_only() {
     let store = Store::new();
     let p8 = "-----BEGIN PRIVATE KEY-----\nNOKEY\n-----END PRIVATE KEY-----\n";
-    if store.encryption().has_active_key() {
-        let stored = seal_apple_private_key(&store, p8).unwrap();
-        assert!(stored.starts_with("luxsealed:"), "{stored}");
-        assert_eq!(unseal_apple_private_key(&store, &stored).unwrap(), p8);
-    } else {
-        assert!(seal_apple_private_key(&store, p8).is_err());
-    }
+    assert!(!store.config().durability.policy.is_persistent());
+    let stored = seal_apple_private_key(&store, p8).unwrap();
+    assert_eq!(stored, p8);
+    assert_eq!(
+        secrets::open(
+            &store,
+            PROVIDERS_TABLE,
+            "apple_private_key",
+            "apple",
+            &stored,
+        )
+        .unwrap(),
+        p8
+    );
 }
 
 #[test]
@@ -2576,7 +3336,7 @@ fn legacy_plaintext_apple_private_key_is_migrated() {
     )
     .unwrap();
 
-    migrate_apple_private_key_storage(&store, &cache, Instant::now()).unwrap();
+    secrets::migrate_storage(&store, &cache, Instant::now()).unwrap();
     let row = find_row_by_field(
         &store,
         &cache,
@@ -2591,13 +3351,20 @@ fn legacy_plaintext_apple_private_key_is_migrated() {
     assert!(stored.starts_with("luxsealed:"));
     assert!(!stored.contains("BEGIN PRIVATE KEY"));
     assert_eq!(
-        unseal_apple_private_key(&store, stored).unwrap(),
+        secrets::open(
+            &store,
+            PROVIDERS_TABLE,
+            "apple_private_key",
+            "apple",
+            stored,
+        )
+        .unwrap(),
         apple_test_ec_key().private_pem
     );
 }
 
 #[test]
-fn legacy_plaintext_apple_private_key_is_preserved_without_keyring() {
+fn legacy_plaintext_apple_private_key_remains_in_ephemeral_memory_without_keyring() {
     let store = Store::new();
     if store.encryption().has_active_key() {
         return;
@@ -2619,7 +3386,7 @@ fn legacy_plaintext_apple_private_key_is_preserved_without_keyring() {
         Instant::now(),
     )
     .unwrap();
-    assert!(migrate_apple_private_key_storage(&store, &cache, Instant::now()).is_err());
+    secrets::migrate_storage(&store, &cache, Instant::now()).unwrap();
     let row = find_row_by_field(
         &store,
         &cache,

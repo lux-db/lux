@@ -24,6 +24,39 @@ accepting normal traffic and its mutation journal to be healthy. A staged
 restore is committed before the HTTP listener starts. The endpoints return
 only the health state and never project data.
 
+## Auth secret storage
+
+Auth JWT signing private keys, OAuth client secrets, Apple `.p8` keys, and
+self-hosted email delivery tokens pass through one Engine-owned secret boundary.
+Values are stored as versioned `luxsealed:` envelopes bound to their table,
+field, and primary key, so moving ciphertext to a different credential slot
+does not make it decryptable. Admin responses and direct Auth-table reads expose
+only presence metadata or `<redacted>` markers.
+
+When an active encryption key exists, startup migrates legacy plaintext fields
+with individual journaled updates. Completed fields remain valid if a later
+field fails, and the next startup resumes the remaining work. An existing
+envelope is opened and authenticated during migration; malformed ciphertext is
+never reinterpreted or wrapped as plaintext. A durable pending marker survives
+crashes between the row updates and the final checkpoint. The Engine does not
+reach listener readiness until that checkpoint has replaced its live plaintext
+snapshot or journal history. Operators should retain a pre-upgrade backup until
+the migration is verified. Rolling back to an Engine release that predates
+auth-secret envelopes requires restoring that backup. After the upgrade is
+accepted, rotate any external backup history that may still contain the legacy
+plaintext values. Envelope version `LUXENC2` fixes the algorithm suite to
+ChaCha20-Poly1305 key wrapping and value encryption and records the writer key
+ID for rotation.
+
+Both `GET /v1` (under `auth.secret_storage`) and `GET /auth/v1/health` report a
+secret-free storage status: `disabled`, `ready`, `degraded`, or `locked`.
+Persistent Auth in `locked` state fails before listener readiness with recovery
+guidance. An ephemeral Engine without a key is allowed only as visibly degraded
+development mode; it emits a warning and refuses snapshots so plaintext
+in-memory credentials cannot be exported accidentally. To enter `ready`,
+configure encryption before restarting; the existing in-memory Auth state is
+discarded.
+
 ## Migrations
 
 Operator-authenticated HTTP routes:

@@ -265,71 +265,18 @@ pub(super) fn migrate_provider_apple_columns(
     Ok(())
 }
 
-pub(super) fn migrate_apple_private_key_storage(
-    store: &Store,
-    cache: &SharedSchemaCache,
-    now: Instant,
-) -> Result<(), String> {
-    let Some(row) = find_row_by_field(store, cache, PROVIDERS_TABLE, "provider", "apple", now)?
-    else {
-        return Ok(());
-    };
-    let Some(stored) = row.get("apple_private_key").filter(|value| {
-        !value.is_empty()
-            && !crate::encryption::EncryptionKeyring::is_encrypted_value(value.as_bytes())
-    }) else {
-        return Ok(());
-    };
-    if !store.encryption().has_active_key() {
-        return Err(
-            "ERR legacy Apple private key requires an active Lux encryption key for migration"
-                .to_string(),
-        );
-    }
-    let replacement = seal_apple_private_key(store, stored)?;
-    durable_table_update_where(
-        store,
-        cache,
-        PROVIDERS_TABLE,
-        &[("apple_private_key", replacement.as_str())],
-        &["provider", "=", "apple"],
-        now,
-    )?;
-    Ok(())
-}
-
-// Apple's .p8 is stored in the plain `apple_private_key` STR column only after
-// envelope encryption. Native-only Apple auth does not need a keyring, but web
-// Apple auth fails closed rather than persisting signing material in plaintext.
+// Apple's .p8 uses the same versioned, location-bound auth-secret envelope as
+// signing keys, OAuth client secrets, and self-hosted email credentials.
 const APPLE_KEY_AAD_PK: &str = "apple";
 
 pub(super) fn seal_apple_private_key(store: &Store, p8: &str) -> Result<String, String> {
-    if p8.is_empty() {
-        return Ok(String::new());
-    }
-    if !store.encryption().has_active_key() {
-        return Err("ERR Apple web sign-in requires an active Lux encryption key".to_string());
-    }
-    let sealed = store.encryption().seal(
+    super::secrets::seal(
+        store,
         PROVIDERS_TABLE,
         "apple_private_key",
         APPLE_KEY_AAD_PK,
-        p8.as_bytes(),
-    )?;
-    String::from_utf8(sealed).map_err(|e| format!("ERR apple private key seal failed: {e}"))
-}
-
-pub(super) fn unseal_apple_private_key(store: &Store, stored: &str) -> Result<String, String> {
-    if !crate::encryption::EncryptionKeyring::is_encrypted_value(stored.as_bytes()) {
-        return Err("ERR refusing to load an unencrypted Apple private key".to_string());
-    }
-    let plain = store.encryption().unseal(
-        PROVIDERS_TABLE,
-        "apple_private_key",
-        APPLE_KEY_AAD_PK,
-        stored.as_bytes(),
-    )?;
-    String::from_utf8(plain).map_err(|e| format!("ERR apple private key not utf-8: {e}"))
+        p8,
+    )
 }
 
 fn valid_apple_web_redirect_uri(value: &str) -> bool {

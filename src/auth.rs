@@ -26,14 +26,15 @@ use crate::{AuthConfig, AuthManagedEmailConfig};
 mod apple;
 use apple::{
     admin_upsert_apple_provider, exchange_apple_code, issue_apple_native_nonce,
-    migrate_apple_private_key_storage, migrate_provider_apple_columns, mint_apple_client_secret,
-    parse_apple_callback_name, signin_apple, unseal_apple_private_key,
+    migrate_provider_apple_columns, mint_apple_client_secret, parse_apple_callback_name,
+    signin_apple,
 };
 #[cfg(test)]
 use apple::{
     seal_apple_private_key, seed_apple_jwks_for_test, sha256_hex, verify_apple_id_token,
     APPLE_ISSUER,
 };
+mod secrets;
 
 pub(crate) const USERS_TABLE: &str = "auth.users";
 pub(crate) const IDENTITIES_TABLE: &str = "auth.identities";
@@ -59,7 +60,7 @@ pub(crate) enum ApiKeyKind {
     Secret,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct SigningKey {
     kid: String,
     algorithm: String,
@@ -67,7 +68,7 @@ struct SigningKey {
     private_key: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct AuthSettings {
     email_confirmation_required: bool,
     flow_token_ttl: Duration,
@@ -91,7 +92,7 @@ struct FlowTokenInsert<'a> {
     metadata: Value,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct EffectiveEmailDelivery {
     provider: String,
     from: Option<String>,
@@ -203,6 +204,57 @@ pub(crate) struct UserCredential {
     claims: AccessClaims,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthSecretStorageStatus {
+    Disabled,
+    Ready,
+    Degraded,
+    Locked,
+}
+
+impl AuthSecretStorageStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Ready => "ready",
+            Self::Degraded => "degraded",
+            Self::Locked => "locked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthSecretStorageHealth {
+    pub status: AuthSecretStorageStatus,
+    pub mode: &'static str,
+    pub persistent: bool,
+    pub snapshots_allowed: bool,
+    pub message: Option<&'static str>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AuthRuntimeBootstrap {
+    pub(crate) secret_history_checkpoint_required: bool,
+}
+
+pub(crate) fn secret_storage_health(store: &Store) -> AuthSecretStorageHealth {
+    secrets::health(store)
+}
+
+pub(crate) fn health_json(store: &Store) -> Value {
+    let health = secret_storage_health(store);
+    json!({
+        "enabled": store.config().auth.enabled,
+        "secret_storage": {
+            "status": health.status.as_str(),
+            "mode": health.mode,
+            "persistent": health.persistent,
+            "snapshots_allowed": health.snapshots_allowed,
+            "message": health.message,
+        }
+    })
+}
+
 pub(crate) fn is_reserved_auth_table(table: &str) -> bool {
     table.starts_with("auth.")
 }
@@ -211,6 +263,19 @@ pub(crate) fn is_reserved_auth_table(table: &str) -> bool {
 /// access is blocked and sensitive columns are redacted on operator reads.
 pub(crate) fn is_reserved_system_table(table: &str) -> bool {
     table.starts_with("auth.") || table.starts_with("push.")
+}
+
+/// Auth credentials use their own location-bound envelope and must never be
+/// copied into value-bearing table-index keys. These internal tables are read
+/// by primary key or non-secret identity fields instead.
+pub(crate) fn is_auth_secret_storage_field(table: &str, field: &str) -> bool {
+    matches!(
+        (table, field),
+        (SIGNING_KEYS_TABLE, "private_key_encrypted")
+            | (PROVIDERS_TABLE, "client_secret")
+            | (PROVIDERS_TABLE, "apple_private_key")
+            | (SETTINGS_TABLE, "value")
+    )
 }
 
 pub(crate) fn reserved_table_mutation_error(args: &[&[u8]], store: &Store) -> Option<String> {
@@ -486,8 +551,8 @@ pub(crate) fn bootstrap(
             "scopes STR,",
             "created_at INT,",
             "updated_at INT,",
-            // Apple Sign In key material. `apple_private_key` holds the .p8, sealed
-            // with the encryption keyring when one is active (see seal_apple_private_key).
+            // Apple Sign In key material. `apple_private_key` holds the .p8 in
+            // the shared, location-bound auth-secret envelope.
             "apple_team_id STR,",
             "apple_key_id STR,",
             "apple_services_id STR,",
@@ -497,7 +562,6 @@ pub(crate) fn bootstrap(
         now,
     )?;
     migrate_provider_apple_columns(store, cache, now)?;
-    migrate_apple_private_key_storage(store, cache, now)?;
     create_table_if_missing(
         store,
         cache,
@@ -626,8 +690,9 @@ pub(crate) fn bootstrap_runtime(
     store: &Store,
     cache: &SharedSchemaCache,
     config: &AuthConfig,
-) -> Result<(), String> {
+) -> Result<AuthRuntimeBootstrap, String> {
     let now = Instant::now();
+    let migration = secrets::migrate_storage(store, cache, now)?;
     ensure_signing_key(store, cache, now)?;
     ensure_auth_setting(
         store,
@@ -671,7 +736,22 @@ pub(crate) fn bootstrap_runtime(
     if let Some(key) = config.initial_secret_key.as_deref() {
         ensure_api_key(store, cache, key, ApiKeyKind::Secret, "initial_secret", now)?;
     }
-    Ok(())
+    store.set_auth_secret_storage_degraded(
+        !store.config().durability.policy.is_persistent() && !store.encryption().has_active_key(),
+    );
+    if !migration.checkpoint_required && store.encryption().has_active_key() {
+        secrets::mark_storage_current(store, cache, now)?;
+    }
+    Ok(AuthRuntimeBootstrap {
+        secret_history_checkpoint_required: migration.checkpoint_required,
+    })
+}
+
+pub(crate) fn mark_secret_storage_checkpoint_complete(
+    store: &Store,
+    cache: &SharedSchemaCache,
+) -> Result<(), String> {
+    secrets::mark_storage_current(store, cache, Instant::now())
 }
 
 pub(crate) fn route_http(
@@ -695,7 +775,30 @@ pub(crate) fn route_http(
     };
 
     match (method, base) {
-        ("GET", ["health"]) => ok(json!({"result":"ok"})),
+        ("GET", ["health"]) => {
+            let health = secret_storage_health(store);
+            let result = if health.status == AuthSecretStorageStatus::Ready {
+                "ok"
+            } else {
+                health.status.as_str()
+            };
+            let body = json!({
+                "result": result,
+                "secret_storage": {
+                    "status": health.status.as_str(),
+                    "mode": health.mode,
+                    "persistent": health.persistent,
+                    "snapshots_allowed": health.snapshots_allowed,
+                    "message": health.message,
+                }
+            })
+            .to_string();
+            if health.status == AuthSecretStorageStatus::Locked {
+                (503, "Service Unavailable", body)
+            } else {
+                (200, "OK", body)
+            }
+        }
         ("GET", [".well-known", "jwks.json"]) => jwks(store, cache),
         ("POST", ["signup"]) => {
             if let Err(response) = require_publishable_or_secret(headers, store, cache) {
@@ -2135,7 +2238,16 @@ fn admin_upsert_provider(
                     .unwrap_or("")
                     .to_string()
             } else {
-                client_secret.to_string()
+                match secrets::seal(
+                    store,
+                    PROVIDERS_TABLE,
+                    "client_secret",
+                    &provider,
+                    client_secret,
+                ) {
+                    Ok(secret) => secret,
+                    Err(message) => return error(400, "Bad Request", &message),
+                }
             };
             match durable_table_update_where(
                 store,
@@ -2164,6 +2276,16 @@ fn admin_upsert_provider(
             if client_secret.is_empty() {
                 return error(400, "Bad Request", "missing client_secret");
             }
+            let client_secret = match secrets::seal(
+                store,
+                PROVIDERS_TABLE,
+                "client_secret",
+                &provider,
+                client_secret,
+            ) {
+                Ok(secret) => secret,
+                Err(message) => return error(400, "Bad Request", &message),
+            };
             match durable_table_insert(
                 store,
                 cache,
@@ -2172,7 +2294,7 @@ fn admin_upsert_provider(
                     ("provider", provider.as_str()),
                     ("enabled", enabled.as_str()),
                     ("client_id", client_id),
-                    ("client_secret", client_secret),
+                    ("client_secret", client_secret.as_str()),
                     ("redirect_uri", redirect_uri),
                     ("scopes", scopes.as_str()),
                     ("created_at", now_sec.as_str()),
@@ -2829,17 +2951,25 @@ fn ensure_signing_key(
         return Ok(());
     }
     let key = generate_es256_signing_key()?;
+    let id = random_id("sgn");
+    let private_key = secrets::seal(
+        store,
+        SIGNING_KEYS_TABLE,
+        "private_key_encrypted",
+        &id,
+        &key.private_key,
+    )?;
     let now_sec = unix_seconds().to_string();
     durable_table_insert(
         store,
         cache,
         SIGNING_KEYS_TABLE,
         &[
-            ("id", random_id("sgn").as_str()),
+            ("id", id.as_str()),
             ("kid", key.kid.as_str()),
             ("algorithm", key.algorithm.as_str()),
             ("public_jwk", key.public_jwk.as_str()),
-            ("private_key_encrypted", key.private_key.as_str()),
+            ("private_key_encrypted", private_key.as_str()),
             ("active", "true"),
             ("created_at", now_sec.as_str()),
         ],
@@ -3475,7 +3605,7 @@ fn active_signing_key(
     now: Instant,
 ) -> Result<Option<SigningKey>, String> {
     let row = find_row_by_field(store, cache, SIGNING_KEYS_TABLE, "active", "true", now)?;
-    Ok(row.map(signing_key_from_row))
+    row.map(|row| signing_key_from_row(store, row)).transpose()
 }
 
 fn signing_key_by_kid(
@@ -3485,11 +3615,16 @@ fn signing_key_by_kid(
     now: Instant,
 ) -> Result<Option<SigningKey>, String> {
     let row = find_row_by_field(store, cache, SIGNING_KEYS_TABLE, "kid", kid, now)?;
-    Ok(row.map(signing_key_from_row))
+    row.map(|row| signing_key_from_row(store, row)).transpose()
 }
 
-fn signing_key_from_row(row: HashMap<String, String>) -> SigningKey {
-    SigningKey {
+fn signing_key_from_row(store: &Store, row: HashMap<String, String>) -> Result<SigningKey, String> {
+    let id = row.get("id").map(String::as_str).unwrap_or("");
+    let stored = row
+        .get("private_key_encrypted")
+        .map(String::as_str)
+        .unwrap_or("");
+    Ok(SigningKey {
         kid: row.get("kid").cloned().unwrap_or_default(),
         algorithm: row
             .get("algorithm")
@@ -3497,11 +3632,14 @@ fn signing_key_from_row(row: HashMap<String, String>) -> SigningKey {
             .filter(|algorithm| !algorithm.is_empty())
             .unwrap_or_else(|| "HS256".to_string()),
         public_jwk: row.get("public_jwk").cloned().unwrap_or_default(),
-        private_key: row
-            .get("private_key_encrypted")
-            .cloned()
-            .unwrap_or_default(),
-    }
+        private_key: secrets::open(
+            store,
+            SIGNING_KEYS_TABLE,
+            "private_key_encrypted",
+            id,
+            stored,
+        )?,
+    })
 }
 
 fn user_json(
@@ -3554,7 +3692,7 @@ fn key_map_json(row: &HashMap<String, String>) -> Value {
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct OAuthProviderConfig {
     provider: String,
     enabled: bool,
@@ -3631,14 +3769,26 @@ fn oauth_provider_config(
         return Ok(None);
     };
     let apple_private_key = match row.get("apple_private_key") {
-        Some(stored) if !stored.is_empty() => unseal_apple_private_key(store, stored)?,
+        Some(stored) if !stored.is_empty() => secrets::open(
+            store,
+            PROVIDERS_TABLE,
+            "apple_private_key",
+            provider,
+            stored,
+        )?,
+        _ => String::new(),
+    };
+    let client_secret = match row.get("client_secret") {
+        Some(stored) if !stored.is_empty() => {
+            secrets::open(store, PROVIDERS_TABLE, "client_secret", provider, stored)?
+        }
         _ => String::new(),
     };
     Ok(Some(OAuthProviderConfig {
         provider: row.get("provider").cloned().unwrap_or_default(),
         enabled: parse_bool(row.get("enabled")),
         client_id: row.get("client_id").cloned().unwrap_or_default(),
-        client_secret: row.get("client_secret").cloned().unwrap_or_default(),
+        client_secret,
         redirect_uri: row.get("redirect_uri").cloned().unwrap_or_default(),
         scopes: row
             .get("scopes")
@@ -4391,6 +4541,11 @@ fn ensure_auth_setting(
     if find_row_by_field(store, cache, SETTINGS_TABLE, "key", key, now)?.is_some() {
         return Ok(());
     }
+    let stored_value = if key == secrets::EMAIL_POSTMARK_TOKEN_KEY {
+        secrets::seal(store, SETTINGS_TABLE, "value", key, value)?
+    } else {
+        value.to_string()
+    };
     let now_sec = unix_seconds().to_string();
     durable_table_insert(
         store,
@@ -4398,7 +4553,7 @@ fn ensure_auth_setting(
         SETTINGS_TABLE,
         &[
             ("key", key),
-            ("value", value),
+            ("value", stored_value.as_str()),
             ("updated_at", now_sec.as_str()),
         ],
         now,
@@ -4414,12 +4569,20 @@ fn set_auth_setting(
     now: Instant,
 ) -> Result<(), String> {
     if find_row_by_field(store, cache, SETTINGS_TABLE, "key", key, now)?.is_some() {
+        let stored_value = if key == secrets::EMAIL_POSTMARK_TOKEN_KEY {
+            secrets::seal(store, SETTINGS_TABLE, "value", key, value)?
+        } else {
+            value.to_string()
+        };
         let now_sec = unix_seconds().to_string();
         durable_table_update_where(
             store,
             cache,
             SETTINGS_TABLE,
-            &[("value", value), ("updated_at", now_sec.as_str())],
+            &[
+                ("value", stored_value.as_str()),
+                ("updated_at", now_sec.as_str()),
+            ],
             &["key", "=", key],
             now,
         )?;
@@ -4498,10 +4661,15 @@ fn auth_setting_value(
     key: &str,
     now: Instant,
 ) -> Result<Option<String>, String> {
-    Ok(
-        find_row_by_field(store, cache, SETTINGS_TABLE, "key", key, now)?
-            .and_then(|row| row.get("value").cloned()),
-    )
+    let value = find_row_by_field(store, cache, SETTINGS_TABLE, "key", key, now)?
+        .and_then(|row| row.get("value").cloned());
+    if key == secrets::EMAIL_POSTMARK_TOKEN_KEY {
+        value
+            .map(|stored| secrets::open(store, SETTINGS_TABLE, "value", key, &stored))
+            .transpose()
+    } else {
+        Ok(value)
+    }
 }
 
 fn parse_setting_bool(value: &str) -> bool {

@@ -65,6 +65,9 @@ fn start_lux_with_env(
     if let Some(password) = password {
         cmd.env("LUX_PASSWORD", password);
     }
+    if common::auth_test_needs_managed_keyring(extra_env.iter().copied()) {
+        cmd.env("LUX_ENC_AUTO_INIT", "1");
+    }
     for (key, value) in extra_env {
         cmd.env(key, value);
     }

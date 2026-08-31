@@ -679,11 +679,16 @@ async fn stream_snapshot(
     {
         Ok(Ok(artifact)) => artifact,
         Ok(Err(e)) => {
+            let (status, status_text) = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                (409, "Conflict")
+            } else {
+                (500, "Internal Server Error")
+            };
             let body = format!(
                 r#"{{"error":"snapshot failed: {}"}}"#,
                 escape_json(&e.to_string())
             );
-            return send_json(socket, 500, "Internal Server Error", &body).await;
+            return send_json(socket, status, status_text, &body).await;
         }
         Err(e) => {
             let body = format!(
@@ -3365,7 +3370,8 @@ fn engine_version(store: &Store) -> (u16, &'static str, String) {
         "api_version": crate::migrations::API_VERSION,
         "studio_api": crate::migrations::STUDIO_API_VERSION,
         "capabilities": crate::migrations::CAPABILITIES,
-        "persistence": persistence_json(store)
+        "persistence": persistence_json(store),
+        "auth": crate::auth::health_json(store)
     })
     .to_string())
 }
@@ -3376,7 +3382,8 @@ fn engine_root(store: &Store) -> (u16, &'static str, String) {
         "version": env!("CARGO_PKG_VERSION"),
         "studio_api": crate::migrations::STUDIO_API_VERSION,
         "capabilities": crate::migrations::CAPABILITIES,
-        "persistence": persistence_json(store)
+        "persistence": persistence_json(store),
+        "auth": crate::auth::health_json(store)
     })
     .to_string())
 }
@@ -5642,6 +5649,8 @@ mod tests {
         assert_eq!(parsed["persistence"]["storage_layout"], "memory");
         assert_eq!(parsed["persistence"]["durability"], "ephemeral");
         assert_eq!(parsed["persistence"]["journal_enabled"], false);
+        assert_eq!(parsed["auth"]["enabled"], false);
+        assert_eq!(parsed["auth"]["secret_storage"]["status"], "disabled");
         assert!(parsed["capabilities"]
             .as_array()
             .unwrap()
@@ -5674,6 +5683,8 @@ mod tests {
         assert_eq!(parsed["persistence"]["storage_layout"], "memory");
         assert_eq!(parsed["persistence"]["durability"], "ephemeral");
         assert_eq!(parsed["persistence"]["journal_enabled"], false);
+        assert_eq!(parsed["auth"]["enabled"], false);
+        assert_eq!(parsed["auth"]["secret_storage"]["status"], "disabled");
         let capabilities = parsed["capabilities"].as_array().unwrap();
         for required in [
             "engine.exec",

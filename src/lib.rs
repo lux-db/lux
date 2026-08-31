@@ -397,6 +397,9 @@ pub enum ServerInfoEvent {
 /// database mutation.
 #[derive(Clone, Debug)]
 pub enum ServerWarnEvent {
+    /// Auth is explicitly running in development-only plaintext memory because
+    /// durability is ephemeral and no encryption key is active.
+    AuthSecretStorageDegraded,
     /// One checksummed disk entry failed CRC validation during index rebuild.
     DiskCorruptedEntrySkipped { shard: usize, offset: u64 },
     /// One disk entry failed to deserialize during index rebuild.
@@ -717,9 +720,37 @@ fn validate_encryption_config(config: &ServerConfig) -> std::io::Result<()> {
         auto_init: false,
         ..config.encryption.clone()
     };
-    crate::encryption::EncryptionKeyring::open(&validation, &config.data_dir)
-        .map(|_| ())
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+    let keyring = crate::encryption::EncryptionKeyring::open(&validation, &config.data_dir)
+        .map_err(|error| {
+            let guidance = if error.contains("ENC state could not be unsealed") {
+                " Check LUX_ENC_SEAL_KEY; during seal rotation, include the prior seal in LUX_ENC_SEAL_KEY_PREVIOUS."
+            } else {
+                ""
+            };
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{error}{guidance}"),
+            )
+        })?;
+
+    if config.auth.enabled && config.durability.policy.is_persistent() {
+        if config.encryption.auto_init
+            && config.encryption.state_path.as_deref() == Some("")
+            && !keyring.has_active_key()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Auth secret storage is locked: persistent Auth cannot auto-initialize an ephemeral keyring; remove the empty LUX_ENC_STATE_PATH or supply LUX_ENCRYPTION_KEY/LUX_ENCRYPTION_KEYS",
+            ));
+        }
+        if !keyring.has_active_key() && !config.encryption.auto_init {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Auth secret storage is locked: persistent Auth requires a usable Lux encryption key; set LUX_ENC_AUTO_INIT=1 (and LUX_ENC_SEAL_KEY in production) or supply LUX_ENCRYPTION_KEY/LUX_ENCRYPTION_KEYS. During data-key rotation, retain prior keys until ENC REWRAP completes",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub struct ServerHandle {
@@ -2579,6 +2610,11 @@ impl Runtime {
                     .then(|| runtime.config.durability.sync_interval.as_millis() as u64),
             },
         );
+        if auth::secret_storage_health(&runtime.store).status
+            == auth::AuthSecretStorageStatus::Degraded
+        {
+            emit_warn(&runtime.config, ServerWarnEvent::AuthSecretStorageDegraded);
+        }
 
         if runtime.config.storage.mode == StorageMode::Tiered {
             emit_info(
@@ -2690,13 +2726,34 @@ impl Runtime {
                 .store
                 .wal_suppress
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            if let Err(e) =
-                auth::bootstrap_runtime(&runtime.store, &runtime.schema_cache, &runtime.config.auth)
-            {
-                return Err(std::io::Error::new(
+            let auth_bootstrap = auth::bootstrap_runtime(
+                &runtime.store,
+                &runtime.schema_cache,
+                &runtime.config.auth,
+            )
+            .map_err(|e| {
+                std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("auth runtime bootstrap failed: {e}"),
-                ));
+                )
+            })?;
+            if auth_bootstrap.secret_history_checkpoint_required {
+                snapshot::save_and_truncate_wal_consistent(&runtime.store).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("auth secret migration checkpoint failed before readiness: {e}"),
+                    )
+                })?;
+                auth::mark_secret_storage_checkpoint_complete(
+                    &runtime.store,
+                    &runtime.schema_cache,
+                )
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("auth secret migration finalization failed: {e}"),
+                    )
+                })?;
             }
         }
 
@@ -5011,6 +5068,166 @@ mod shutdown_tests {
             EmbeddedValue::Bulk(bytes::Bytes::from_static(b"durable"))
         );
         restarted.shutdown_and_wait().await.unwrap();
+    }
+
+    #[test]
+    fn persistent_auth_requires_a_recoverable_encryption_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = persistent_embedded_config(root.path());
+        config.auth.enabled = true;
+
+        let error = validate_encryption_config(&config).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("persistent Auth requires"), "{message}");
+        assert!(message.contains("LUX_ENC_AUTO_INIT"), "{message}");
+        assert!(message.contains("ENC REWRAP"), "{message}");
+
+        config.encryption.auto_init = true;
+        assert!(validate_encryption_config(&config).is_ok());
+
+        config.encryption.state_path = Some(String::new());
+        let error = validate_encryption_config(&config).unwrap_err();
+        assert!(error.to_string().contains("ephemeral keyring"), "{error}");
+    }
+
+    #[test]
+    fn seal_rotation_failure_names_the_previous_seal_recovery_path() {
+        let root = tempfile::tempdir().unwrap();
+        let old_seal = [7u8; 32];
+        let initial = EncryptionConfig {
+            auto_init: true,
+            seal_secret: Some(old_seal),
+            ..Default::default()
+        };
+        crate::encryption::EncryptionKeyring::open(&initial, root.path().to_str().unwrap())
+            .unwrap();
+
+        let mut config = persistent_embedded_config(root.path());
+        config.auth.enabled = true;
+        config.encryption.seal_secret = Some([8u8; 32]);
+        let error = validate_encryption_config(&config).unwrap_err();
+        assert!(
+            error.to_string().contains("LUX_ENC_SEAL_KEY_PREVIOUS"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ephemeral_auth_warns_and_refuses_plaintext_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let config = ServerConfig {
+            data_dir: root.path().to_string_lossy().into_owned(),
+            enable_resp: false,
+            durability: DurabilityConfig {
+                policy: DurabilityPolicy::Ephemeral,
+                ..DurabilityConfig::default()
+            },
+            auth: AuthConfig {
+                enabled: true,
+                ..AuthConfig::default()
+            },
+            on_warn: Some(std::sync::Arc::new(move |event| {
+                captured.lock().unwrap().push(event);
+            })),
+            ..ServerConfig::default()
+        };
+
+        let handle = run_with_config(config).await.unwrap();
+        assert_eq!(
+            auth::secret_storage_health(&handle.runtime.store).status,
+            auth::AuthSecretStorageStatus::Degraded
+        );
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, ServerWarnEvent::AuthSecretStorageDegraded)));
+        let error = snapshot::save_and_truncate_wal_consistent(&handle.runtime.store).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("restart"));
+
+        handle
+            .runtime
+            .store
+            .encryption()
+            .init(Some("late-auth-key"))
+            .unwrap();
+        assert!(handle.runtime.store.encryption().has_active_key());
+        assert_eq!(
+            auth::secret_storage_health(&handle.runtime.store).status,
+            auth::AuthSecretStorageStatus::Degraded,
+            "initializing encryption cannot retroactively migrate Auth rows"
+        );
+        let error = snapshot::save_and_truncate_wal_consistent(&handle.runtime.store).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("restart"));
+        handle.shutdown_and_wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_auth_missing_key_fails_before_readiness() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = persistent_embedded_config(root.path());
+        config.enable_resp = false;
+        config.auth.enabled = true;
+        let error = match run_with_config(config).await {
+            Ok(handle) => {
+                handle.shutdown_and_wait().await.unwrap();
+                panic!("persistent Auth unexpectedly reached readiness")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("Auth secret storage is locked"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_prior_data_key_fails_restart_with_rotation_guidance() {
+        fn configure_key(config: &mut ServerConfig, id: &str, secret: &[u8]) {
+            config.encryption = EncryptionConfig {
+                active_key_id: Some(id.to_string()),
+                keys: vec![EncryptionKeyConfig {
+                    id: id.to_string(),
+                    secret: secret.to_vec(),
+                    decrypt_only: false,
+                }],
+                ..Default::default()
+            };
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let mut first = persistent_embedded_config(root.path());
+        first.enable_resp = false;
+        first.save_interval = Duration::ZERO;
+        first.auth.enabled = true;
+        configure_key(&mut first, "original", b"original-auth-data-key");
+        let handle = run_with_config(first).await.unwrap();
+        handle.shutdown_and_wait().await.unwrap();
+
+        let mut rotated = persistent_embedded_config(root.path());
+        rotated.enable_resp = false;
+        rotated.save_interval = Duration::ZERO;
+        rotated.auth.enabled = true;
+        configure_key(&mut rotated, "replacement", b"replacement-auth-data-key");
+        let error = match run_with_config(rotated).await {
+            Ok(handle) => {
+                handle.shutdown_and_wait().await.unwrap();
+                panic!("restart unexpectedly discarded the prior data-key requirement")
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("auth secret storage is locked"),
+            "{message}"
+        );
+        assert!(message.contains("retain prior data keys"), "{message}");
+        assert!(message.contains("ENC REWRAP"), "{message}");
     }
 }
 

@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 mod hashes;
@@ -618,6 +618,10 @@ pub(crate) enum BackgroundSaveRequestError {
 pub struct Store {
     config: Arc<crate::ServerConfig>,
     encryption: crate::encryption::EncryptionKeyring,
+    /// True when Auth bootstrapped without encryption under the explicit
+    /// ephemeral development exception. Initializing a key later does not make
+    /// existing plaintext rows safe; bootstrap migration must clear this flag.
+    auth_secret_storage_degraded: AtomicBool,
     /// Short-lived API-key resolutions belong to this engine instance. Keeping
     /// this on `Store` prevents one embedded server from authenticating against
     /// another server's `auth.keys` table.
@@ -1542,6 +1546,9 @@ impl Store {
         let encryption =
             crate::encryption::EncryptionKeyring::open(&config.encryption, &config.data_dir)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let auth_secret_storage_degraded = config.auth.enabled
+            && !config.durability.policy.is_persistent()
+            && !encryption.has_active_key();
         let n = config.shards;
         let shards: Vec<RwLock<Shard>> = (0..n)
             .map(|_| {
@@ -1625,6 +1632,7 @@ impl Store {
         Ok(Self {
             config,
             encryption,
+            auth_secret_storage_degraded: AtomicBool::new(auth_secret_storage_degraded),
             api_key_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             shards: shards.into_boxed_slice(),
             metrics: StoreMetrics::new(),
@@ -1801,6 +1809,15 @@ impl Store {
 
     pub(crate) fn encryption(&self) -> &crate::encryption::EncryptionKeyring {
         &self.encryption
+    }
+
+    pub(crate) fn auth_secret_storage_degraded(&self) -> bool {
+        self.auth_secret_storage_degraded.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_auth_secret_storage_degraded(&self, degraded: bool) {
+        self.auth_secret_storage_degraded
+            .store(degraded, Ordering::Release);
     }
 
     pub(crate) fn begin_recovery(&self) {

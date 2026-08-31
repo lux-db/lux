@@ -569,8 +569,31 @@ LUX_HTTP_PORT=5890 \
 LUX_AUTH_ENABLED=true \
 LUX_AUTH_PUBLISHABLE_KEY=lux_pub_local \
 LUX_AUTH_SECRET_KEY=lux_sec_local \
+LUX_ENC_AUTO_INIT=1 \
+LUX_DATA_DIR="$PWD/.lux-data" \
 ./target/release/lux
 ```
+
+Lux stores JWT signing private keys, Google/GitHub client secrets, Apple `.p8`
+keys, and self-hosted email delivery tokens in the same versioned,
+location-bound encryption envelope used by `ENC`. Persistent Auth refuses a
+new plaintext secret when no active encryption key exists. `lux start`
+auto-initializes its local keyring; production deployments should additionally
+inject `LUX_ENC_SEAL_KEY` (base64 for exactly 32 bytes) from a secret manager so
+the keyring seal is not stored beside the data it protects. Existing plaintext
+Auth secrets are migrated one field at a time through journaled mutations; the
+migration is crash-resumable and listener readiness waits for a final
+checkpoint that removes plaintext values from the live snapshot and journal.
+Secret material is never returned through admin or table APIs.
+
+`GET /v1` and `GET /auth/v1/health` expose secret-free Auth storage status:
+`disabled`, `ready`, `degraded`, or `locked`. Persistent Auth never reaches
+readiness while locked; startup explains how to initialize or rotate the
+required key material. Ephemeral Auth without a key is an explicit
+development-only `degraded` mode: Lux emits a warning, keeps secrets only in
+plaintext memory, and refuses snapshot export until encryption is configured
+before the Engine restarts. The existing in-memory Auth state is deliberately
+not exportable and is discarded on restart.
 
 Auth creates reserved tables under the `auth` namespace:
 

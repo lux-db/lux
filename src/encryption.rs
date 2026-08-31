@@ -430,6 +430,10 @@ impl EncryptionKeyring {
         raw.starts_with(ENVELOPE_MAGIC) || decode_sealed_value(raw).is_ok()
     }
 
+    pub(crate) fn has_encrypted_value_prefix(raw: &[u8]) -> bool {
+        raw.starts_with(ENVELOPE_MAGIC) || raw.starts_with(SEALED_VALUE_PREFIX)
+    }
+
     pub(crate) fn envelope_decryptable_by_any(envelope: &[u8], key_ids: &HashSet<String>) -> bool {
         let envelope = decode_sealed_value(envelope)
             .map(|sealed| sealed.3)
@@ -1571,6 +1575,13 @@ mod adversarial_tests {
                 .unwrap_err(),
             "ERR sealed value location mismatch"
         );
+    }
+
+    #[test]
+    fn malformed_sealed_prefix_is_not_a_user_value_envelope() {
+        let value = b"luxsealed:not-valid-base64";
+        assert!(EncryptionKeyring::has_encrypted_value_prefix(value));
+        assert!(!EncryptionKeyring::is_encrypted_value(value));
     }
 
     // ---- seal sourcing: env seal, file->env migration, rotation ----

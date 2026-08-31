@@ -367,7 +367,9 @@ fn prepare_candidate_runtime(store: &Store) -> io::Result<()> {
     }
     let cache = Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
     crate::auth::bootstrap(store, &cache, &store.config().auth)
-        .and_then(|()| crate::auth::bootstrap_runtime(store, &cache, &store.config().auth))
+        .and_then(|()| {
+            crate::auth::bootstrap_runtime(store, &cache, &store.config().auth).map(|_| ())
+        })
         .map_err(|error| invalid_data(format!("restore auth compatibility failed: {error}")))
 }
 
@@ -1066,10 +1068,23 @@ mod tests {
 
     #[test]
     fn incompatible_target_auth_bootstrap_fails_before_publish() {
+        fn enable_auth_encryption(config: &mut ServerConfig) {
+            config.encryption = crate::EncryptionConfig {
+                active_key_id: Some("restore-auth".to_string()),
+                keys: vec![crate::EncryptionKeyConfig {
+                    id: "restore-auth".to_string(),
+                    secret: b"restore-auth-test-key".to_vec(),
+                    decrypt_only: false,
+                }],
+                ..Default::default()
+            };
+        }
+
         let source_dir = tempfile::tempdir().unwrap();
         let mut source_config = (*config(source_dir.path(), StorageMode::Memory)).clone();
         source_config.auth.enabled = true;
         source_config.auth.initial_publishable_key = Some("lux_shared__source_key".to_string());
+        enable_auth_encryption(&mut source_config);
         let source = Store::try_new_with_config(Arc::new(source_config)).unwrap();
         bootstrap_auth(&source);
         snapshot::save_and_truncate_wal_consistent(&source).unwrap();
@@ -1079,6 +1094,7 @@ mod tests {
         let mut target_config = (*config(target_dir.path(), StorageMode::Memory)).clone();
         target_config.auth.enabled = true;
         target_config.auth.initial_publishable_key = Some("lux_shared__target_key".to_string());
+        enable_auth_encryption(&mut target_config);
         let target_config = Arc::new(target_config);
         let target = Store::try_new_with_config(target_config.clone()).unwrap();
         bootstrap_auth(&target);
