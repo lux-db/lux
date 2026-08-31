@@ -582,11 +582,19 @@ async fn handle_request(
                 }
                 let now = std::time::Instant::now();
                 let scope = filter.as_deref().unwrap_or("");
-                let body =
-                    match crate::tables::table_count_filtered(store, cache, table, scope, now) {
-                        Ok(n) => format!(r#"{{"result":{n}}}"#),
-                        Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
-                    };
+                let body = match with_execution_read(store, || {
+                    crate::tables::table_count_filtered(store, cache, table, scope, now)
+                }) {
+                    Err(error) => {
+                        let body = format!(
+                            r#"{{"error":"database unavailable: {}"}}"#,
+                            escape_json(&error.to_string())
+                        );
+                        return send_json(socket, 503, "Service Unavailable", &body).await;
+                    }
+                    Ok(Ok(n)) => format!(r#"{{"result":{n}}}"#),
+                    Ok(Err(e)) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                };
                 return send_json(socket, 200, "OK", &body).await;
             }
             ["v1", "tables", table, "schema"] => {
@@ -602,15 +610,26 @@ async fn handle_request(
                     return send_json(socket, 403, "Forbidden", &body).await;
                 }
                 let now = std::time::Instant::now();
-                let body = match crate::tables::table_schema(store, cache, table, now) {
-                    Ok(fields) => {
-                        let items: Vec<String> = fields
-                            .iter()
-                            .map(|f| format!(r#""{}""#, escape_json(f)))
-                            .collect();
-                        format!(r#"{{"result":[{}]}}"#, items.join(","))
+                let body = match with_execution_read(store, || {
+                    crate::tables::table_schema(store, cache, table, now)
+                }) {
+                    Err(error) => {
+                        let body = format!(
+                            r#"{{"error":"database unavailable: {}"}}"#,
+                            escape_json(&error.to_string())
+                        );
+                        return send_json(socket, 503, "Service Unavailable", &body).await;
                     }
-                    Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                    Ok(result) => match result {
+                        Ok(fields) => {
+                            let items: Vec<String> = fields
+                                .iter()
+                                .map(|f| format!(r#""{}""#, escape_json(f)))
+                                .collect();
+                            format!(r#"{{"result":[{}]}}"#, items.join(","))
+                        }
+                        Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                    },
                 };
                 return send_json(socket, 200, "OK", &body).await;
             }
@@ -628,23 +647,34 @@ async fn handle_request(
                 let now = std::time::Instant::now();
                 let scope = filter.as_deref().unwrap_or("");
                 // Keyed by the raw PK string, so int, UUID, and string PKs all work.
-                let body = match crate::tables::table_get_filtered_pk(
-                    store,
-                    cache,
-                    table,
-                    id,
-                    scope,
-                    now,
-                    decrypt_authorized(&auth_context),
-                ) {
-                    // A row that exists but is out of grant scope reads as
-                    // not-found, so we don't leak that it exists.
-                    Ok(Some(row)) => row_to_json_object(
-                        &row,
-                        &render_columns(store, cache, table, Instant::now()),
-                    ),
-                    Ok(None) => r#"{"error":"row not found"}"#.to_string(),
-                    Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                let body = match with_execution_read(store, || {
+                    crate::tables::table_get_filtered_pk(
+                        store,
+                        cache,
+                        table,
+                        id,
+                        scope,
+                        now,
+                        decrypt_authorized(&auth_context),
+                    )
+                }) {
+                    Err(error) => {
+                        let body = format!(
+                            r#"{{"error":"database unavailable: {}"}}"#,
+                            escape_json(&error.to_string())
+                        );
+                        return send_json(socket, 503, "Service Unavailable", &body).await;
+                    }
+                    Ok(result) => match result {
+                        // A row that exists but is out of grant scope reads as
+                        // not-found, so we don't leak that it exists.
+                        Ok(Some(row)) => row_to_json_object(
+                            &row,
+                            &render_columns(store, cache, table, Instant::now()),
+                        ),
+                        Ok(None) => r#"{"error":"row not found"}"#.to_string(),
+                        Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                    },
                 };
                 return send_json(socket, 200, "OK", &body).await;
             }
@@ -658,8 +688,19 @@ async fn handle_request(
         cache,
         script_engine,
     };
-    let (status, status_text, result) =
-        route_request_with_auth(&method, &path, &body, &params, deps, &auth_context);
+    let routed = match with_execution_read(store, || {
+        route_request_with_auth(&method, &path, &body, &params, deps, &auth_context)
+    }) {
+        Ok(routed) => routed,
+        Err(error) => {
+            let body = format!(
+                r#"{{"error":"database unavailable: {}"}}"#,
+                escape_json(&error.to_string())
+            );
+            return send_json(socket, 503, "Service Unavailable", &body).await;
+        }
+    };
+    let (status, status_text, result) = routed;
 
     send_json(socket, status, status_text, &result).await
 }
@@ -773,7 +814,18 @@ async fn stream_table_query(
     let has_where = parsed.has_where;
     let offset = parsed.offset;
     let count_exact = prefer.contains("count=exact");
-    let result = crate::tables::table_select(store, cache, &plan, now);
+    let result = match with_execution_read(store, || {
+        crate::tables::table_select(store, cache, &plan, now)
+    }) {
+        Ok(result) => result,
+        Err(error) => {
+            let body = format!(
+                r#"{{"error":"database unavailable: {}"}}"#,
+                escape_json(&error.to_string())
+            );
+            return send_json(socket, 503, "Service Unavailable", &body).await;
+        }
+    };
 
     match result {
         Err(e) => {
@@ -1624,7 +1676,16 @@ where
 
     if msg_type == "live.unsubscribe" {
         if !id.is_empty() {
-            stop_live_subscription(broker, subscriptions, &id);
+            if let Err(error) =
+                with_execution_read(store, || stop_live_subscription(broker, subscriptions, &id))
+            {
+                send_live_json(
+                    ws,
+                    json!({"type":"live.error","id":id,"error":{"code":"UNAVAILABLE","message":error.to_string()}}),
+                )
+                .await?;
+                return Ok(());
+            }
             send_live_json(ws, json!({"type":"live.unsubscribed","id":id})).await?;
         }
         return Ok(());
@@ -1640,13 +1701,19 @@ where
         return Ok(());
     }
 
-    stop_live_subscription(broker, subscriptions, &id);
     let Some(spec) = parsed.get("spec").or_else(|| parsed.get("query")) else {
         send_live_json(ws, json!({"type":"live.error","id":id,"error":{"code":"MISSING_SPEC","message":"live.subscribe requires spec"}})).await?;
         return Ok(());
     };
 
-    match build_live_subscription(spec, broker, store, cache, principal).await {
+    let subscription = match with_execution_read(store, || {
+        stop_live_subscription(broker, subscriptions, &id);
+        build_live_subscription(spec, broker, store, cache, principal)
+    }) {
+        Ok(subscription) => subscription,
+        Err(error) => Err(live_error("UNAVAILABLE", &error.to_string())),
+    };
+    match subscription {
         Ok((subscription, initial_events)) => {
             subscriptions.insert(id.clone(), subscription);
             send_live_json(ws, json!({"type":"live.subscribed","id":id})).await?;
@@ -1662,7 +1729,7 @@ where
     Ok(())
 }
 
-async fn build_live_subscription(
+fn build_live_subscription(
     spec: &Value,
     broker: &Broker,
     store: &Arc<Store>,
@@ -3011,6 +3078,11 @@ struct RouteDeps<'a> {
     broker: &'a Broker,
     cache: &'a SharedSchemaCache,
     script_engine: &'a Arc<lua::ScriptEngine>,
+}
+
+fn with_execution_read<T>(store: &Store, operation: impl FnOnce() -> T) -> std::io::Result<T> {
+    let _guard = store.execution_read_guard()?;
+    Ok(operation())
 }
 
 fn route_request_with_auth(
@@ -5305,8 +5377,7 @@ mod tests {
             &store,
             &cache,
             Some(&principal),
-        )
-        .await;
+        );
 
         assert!(result.is_err());
         assert!(broker.key_event_loop_started());

@@ -104,8 +104,7 @@ Process crash behavior:
 - A single logical mutation whose resolved recovery form contains multiple
   commands is stored in one checksummed frame, so a torn frame replays every
   effect or none of them. This applies to commands such as cross-key moves and
-  replacements; it does not make a `MULTI`/`EXEC` queue one crash-atomic
-  mutation.
+  replacements and to the successful mutation effects of one `MULTI`/`EXEC`.
 - Any complete WAL frame with a corrupt boundary marker, length guard,
   checksum, argument encoding, or batch encoding rejects startup. Lux never
   skips a complete damaged mutation and continues with a partial history.
@@ -164,9 +163,10 @@ Replay behavior:
   different primary key, timestamp, or default.
 - Table writes log their own resolved command from the table layer (so HTTP
   table writes, which bypass the RESP command path, are still durable).
-- `MULTI`/`EXEC` commands cross individual durability boundaries in queue order.
-  A complete `EXEC` response means every successful queued mutation is durable;
-  a crash before that response may recover a completed prefix.
+- A `MULTI`/`EXEC` queue contributes one checked WAL batch containing every
+  successful mutation effect in command order. A complete response means that
+  batch crossed the configured durability boundary; a torn final batch replays
+  none of the transaction.
 - Commands denied by restricted mode or the script sandbox never execute, so
   they create no replay gaps.
 
@@ -189,11 +189,13 @@ content.
   subscription commands are denied inside scripts to avoid mid-script
   persistence or event-loop hazards.
 
-Known limitation: a script's effects are logged per write, not as one atomic
-batch. A crash before the script response can recover a completed prefix. Once
-the client receives a successful script response, every effect is durable. The
-effects that recover are individually correct; the script is not all-or-nothing
-across a crash boundary.
+Known limitation: outside a transaction, a script's effects are logged per
+write, not as one atomic batch. A crash before the script response can recover a
+completed prefix. Once the client receives a successful script response, every
+effect is durable. The effects that recover are individually correct; the
+script is not all-or-nothing across a crash boundary. A script executed inside
+`MULTI`/`EXEC` is the exception: its successful effects are included in the
+transaction's single WAL batch.
 
 ## Restore
 

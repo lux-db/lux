@@ -919,7 +919,13 @@ Lux is Redis-compatible but not identical. Key differences:
   successful fsync. See [DURABILITY.md](DURABILITY.md).
 - **No RESP3 protocol** -- RESP2 only
 - **No cluster mode** -- single-node only (use Lux Cloud for managed hosting)
-- **MULTI/EXEC** -- supported with WATCH-based optimistic locking. Commands in a transaction execute sequentially, each acquiring its own shard and durability boundary, so another client can observe intermediate state and a process crash during an unacknowledged EXEC can recover a completed prefix. Redis avoids this via single-threading and transaction-aware AOF framing. Standard client libraries (Redlock, BullMQ, Sidekiq) rely on WATCH for correctness, not EXEC isolation. Full transaction isolation and crash-atomic framing may be added in a future release if there is demand
+- **MULTI/EXEC** -- supported with WATCH-based optimistic locking. EXEC is
+  isolated across RESP, embedded, HTTP, live-query, and snapshot surfaces, and
+  its successful mutations are committed in one checksummed WAL frame. Other
+  clients observe the state before or after the transaction, never a prefix;
+  crash recovery likewise replays all successful queued mutations or none.
+  Queue-time errors abort EXEC, while runtime command errors remain in the
+  result array without rolling back other successful commands
 - **Pipeline ordering** -- per-client command order is preserved. Consecutive same-shard commands are batched for performance
 
 ## Architecture

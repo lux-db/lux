@@ -805,6 +805,7 @@ pub struct EmbeddedMessage {
 }
 
 pub struct EmbeddedSubscription {
+    store: Arc<Store>,
     broker: Option<Broker>,
     receiver: Option<broadcast::Receiver<pubsub::Message>>,
     kind: EmbeddedSubscriptionKind,
@@ -1071,6 +1072,11 @@ impl EmbeddedClient {
                 .iter()
                 .all(|command| matches!(command, Command::Publish { .. }))
         {
+            let _execution_guard = self
+                .runtime
+                .store
+                .execution_read_guard()
+                .map_err(|error| LuxError::Command(format!("database unavailable: {error}")))?;
             for command in commands {
                 if let Command::Publish { channel, message } = command {
                     let channel = std::str::from_utf8(channel).unwrap_or("");
@@ -1094,6 +1100,10 @@ impl EmbeddedClient {
             let Some((key, access)) = native_pipeline_access(&commands[i]) else {
                 if !collect_outputs {
                     if let Command::Publish { channel, message } = &commands[i] {
+                        let _execution_guard =
+                            self.runtime.store.execution_read_guard().map_err(|error| {
+                                LuxError::Command(format!("database unavailable: {error}"))
+                            })?;
                         let channel = std::str::from_utf8(channel).unwrap_or("");
                         self.runtime
                             .broker
@@ -1142,6 +1152,10 @@ impl EmbeddedClient {
 
             let batch = &commands[i..batch_end];
             if collect_outputs {
+                let _execution_guard =
+                    self.runtime.store.execution_read_guard().map_err(|error| {
+                        LuxError::Command(format!("database unavailable: {error}"))
+                    })?;
                 let shard = self.runtime.store.lock_read_shard(shard_idx);
                 for command in batch {
                     outputs.push(self.execute_native_read_on_shard(command, &shard, now)?);
@@ -1230,6 +1244,11 @@ impl EmbeddedClient {
         }
 
         let now = Instant::now();
+        let _execution_guard = self
+            .runtime
+            .store
+            .execution_read_guard()
+            .map_err(|error| LuxError::Command(format!("database unavailable: {error}")))?;
         let output = match command {
             Command::Ping => CommandOutput::Simple("PONG"),
             Command::Publish { channel, message } => {
@@ -1589,7 +1608,9 @@ impl EmbeddedClient {
     /// let mut sub = client.subscribe("events");
     /// ```
     pub fn subscribe(&self, channel: &str) -> EmbeddedSubscription {
+        let _execution_guard = self.runtime.store.execution_barrier_guard();
         EmbeddedSubscription::new(
+            self.runtime.store.clone(),
             self.runtime.broker.clone(),
             self.runtime.broker.subscribe(channel),
             EmbeddedSubscriptionKind::Channel(channel.to_string()),
@@ -1605,7 +1626,9 @@ impl EmbeddedClient {
     /// let mut sub = client.psubscribe("events:*");
     /// ```
     pub fn psubscribe(&self, pattern: &str) -> EmbeddedSubscription {
+        let _execution_guard = self.runtime.store.execution_barrier_guard();
         EmbeddedSubscription::new(
+            self.runtime.store.clone(),
             self.runtime.broker.clone(),
             self.runtime.broker.psubscribe(pattern),
             EmbeddedSubscriptionKind::Pattern(pattern.to_string()),
@@ -1621,7 +1644,9 @@ impl EmbeddedClient {
     /// let mut sub = client.ksubscribe("key:*");
     /// ```
     pub fn ksubscribe(&self, pattern: &str) -> EmbeddedSubscription {
+        let _execution_guard = self.runtime.store.execution_barrier_guard();
         EmbeddedSubscription::new(
+            self.runtime.store.clone(),
             self.runtime.broker.clone(),
             self.runtime.broker.ksubscribe(pattern),
             EmbeddedSubscriptionKind::KeyPattern(pattern.to_string()),
@@ -2046,11 +2071,13 @@ fn format_geo_coord(v: f64) -> String {
 
 impl EmbeddedSubscription {
     fn new(
+        store: Arc<Store>,
         broker: Broker,
         receiver: broadcast::Receiver<pubsub::Message>,
         kind: EmbeddedSubscriptionKind,
     ) -> Self {
         Self {
+            store,
             broker: Some(broker),
             receiver: Some(receiver),
             kind,
@@ -2085,6 +2112,7 @@ impl EmbeddedSubscription {
     }
 
     fn close_inner(&mut self) {
+        let _execution_guard = self.store.execution_barrier_guard();
         self.receiver.take();
         if let Some(broker) = self.broker.as_ref() {
             match &self.kind {
@@ -2993,6 +3021,17 @@ fn handle_tx_cmd(
                 "EXECABORT Transaction discarded because of previous errors.",
             );
         } else {
+            let mut transaction = match store.begin_exec_transaction() {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    resp::write_error(write_buf, &format!("ERR transaction unavailable: {error}"));
+                    *in_multi = false;
+                    *tx_error = false;
+                    tx_queue.clear();
+                    watched.clear();
+                    return true;
+                }
+            };
             let mut aborted = false;
             for (_, shard_idx, version) in watched.iter() {
                 if store.shard_version(*shard_idx) != *version {
@@ -3004,18 +3043,27 @@ fn handle_tx_cmd(
                 resp::write_null_array(write_buf);
             } else {
                 let queue = std::mem::take(tx_queue);
-                resp::write_array_header(write_buf, queue.len());
-                for owned_args in &queue {
+                let mut transaction_out = BytesMut::new();
+                let mut deferred_publishes = Vec::new();
+                resp::write_array_header(&mut transaction_out, queue.len());
+                for (command_index, owned_args) in queue.iter().enumerate() {
                     let refs: Vec<&[u8]> = owned_args.iter().map(|v| v.as_slice()).collect();
                     let cmd_result = {
                         let _guard = store.script_read_guard();
-                        cmd::execute_with_wal(store, schema_cache, broker, &refs, write_buf, now)
+                        cmd::execute_with_wal(
+                            store,
+                            schema_cache,
+                            broker,
+                            &refs,
+                            &mut transaction_out,
+                            now,
+                        )
                     };
                     match cmd_result {
                         CmdResult::Written => {}
                         CmdResult::Quit => {
                             resp::write_error(
-                                write_buf,
+                                &mut transaction_out,
                                 "ERR QUIT is not allowed inside a transaction",
                             );
                         }
@@ -3028,13 +3076,14 @@ fn handle_tx_cmd(
                         | CmdResult::KSubscribe { .. }
                         | CmdResult::KUnsubscribe { .. } => {
                             resp::write_error(
-                                write_buf,
+                                &mut transaction_out,
                                 "ERR Command 'subscribe' not allowed inside a transaction",
                             );
                         }
                         CmdResult::Publish { channel, message } => {
-                            let count = broker.publish(&channel, message);
-                            resp::write_integer(write_buf, count);
+                            let count = broker.publish_subscriber_count(&channel);
+                            resp::write_integer(&mut transaction_out, count);
+                            deferred_publishes.push((channel, message));
                         }
                         CmdResult::BlockPop { .. }
                         | CmdResult::BlockMove { .. }
@@ -3043,13 +3092,13 @@ fn handle_tx_cmd(
                         | CmdResult::BlockZMPop { .. }
                         | CmdResult::BlockZPop { .. } => {
                             resp::write_error(
-                                write_buf,
+                                &mut transaction_out,
                                 "ERR blocking commands not allowed inside a transaction",
                             );
                         }
                         CmdResult::Eval { script, keys, argv } => {
                             handle_eval(
-                                write_buf,
+                                &mut transaction_out,
                                 store,
                                 broker,
                                 script_engine,
@@ -3060,7 +3109,37 @@ fn handle_tx_cmd(
                             );
                         }
                         CmdResult::ScriptOp => {
-                            handle_script_op(write_buf, script_engine, &refs);
+                            handle_script_op(&mut transaction_out, script_engine, &refs);
+                        }
+                    }
+                    store.exec_command_applied(command_index);
+                }
+
+                let committed_effects = match transaction.commit() {
+                    Ok(effects) => {
+                        write_buf.extend_from_slice(&transaction_out);
+                        for owned_args in &effects.key_events {
+                            let refs: Vec<&[u8]> = owned_args.iter().map(Vec::as_slice).collect();
+                            fire_key_events(broker, &refs);
+                        }
+                        for (channel, message) in deferred_publishes {
+                            broker.publish(&channel, message);
+                        }
+                        Some(effects)
+                    }
+                    Err(error) => {
+                        resp::write_error(write_buf, &format!("ERR WAL append failed: {error}"));
+                        None
+                    }
+                };
+                drop(transaction);
+
+                // Blocked list clients are allowed to consume committed values
+                // only after the exclusive EXEC boundary has been released.
+                if let Some(effects) = committed_effects {
+                    for key in effects.list_wake_keys {
+                        if broker.has_list_waiters(&key) {
+                            broker.drain_list_waiters(&key, store, now);
                         }
                     }
                 }
@@ -3095,6 +3174,13 @@ fn handle_tx_cmd(
                 "ERR wrong number of arguments for 'watch' command",
             );
         } else {
+            let _execution_guard = match store.execution_read_guard() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    resp::write_error(write_buf, &format!("ERR database unavailable: {error}"));
+                    return true;
+                }
+            };
             for key_bytes in &args[1..] {
                 let key = std::str::from_utf8(key_bytes).unwrap_or("").to_string();
                 let shard_idx = store.shard_for_key(key_bytes);
@@ -3117,13 +3203,15 @@ fn handle_tx_cmd(
             || cmd_eq_fast(args[0], b"PUNSUBSCRIBE")
             || cmd_eq_fast(args[0], b"KSUB")
             || cmd_eq_fast(args[0], b"KUNSUB")
+            || cmd_eq_fast(args[0], b"SAVE")
+            || cmd_eq_fast(args[0], b"BGSAVE")
         {
             resp::write_error(
                 write_buf,
                 &format!(
                     "ERR Command '{}' not allowed inside a transaction",
                     std::str::from_utf8(args[0])
-                        .unwrap_or("subscribe")
+                        .unwrap_or("command")
                         .to_lowercase()
                 ),
             );
@@ -3354,6 +3442,14 @@ impl CommandExecutor {
             return None;
         }
 
+        let _execution_guard = match self.store.execution_read_guard() {
+            Ok(guard) => guard,
+            Err(error) => {
+                resp::write_error(write_buf, &format!("ERR database unavailable: {error}"));
+                return None;
+            }
+        };
+
         if args[0].eq_ignore_ascii_case(b"CLIENT") {
             write_client_response(args, session, write_buf);
             return None;
@@ -3428,6 +3524,13 @@ impl CommandExecutor {
                 args.len() >= 3 && cmd_eq_fast(args[0], b"PUBLISH")
             })
         {
+            let _execution_guard = match self.store.execution_read_guard() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    resp::write_error(write_buf, &format!("ERR database unavailable: {error}"));
+                    return None;
+                }
+            };
             for command in commands {
                 let args = command.argv();
                 let channel = String::from_utf8_lossy(args[1]).into_owned();
@@ -3445,6 +3548,13 @@ impl CommandExecutor {
                 !args.is_empty() && is_script_gate_bypass_command(args[0])
             })
         {
+            let _execution_guard = match self.store.execution_read_guard() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    resp::write_error(write_buf, &format!("ERR database unavailable: {error}"));
+                    return None;
+                }
+            };
             for command in commands {
                 let args = command.argv();
                 if args[0].eq_ignore_ascii_case(b"CLIENT") {
@@ -3530,6 +3640,14 @@ impl CommandExecutor {
                     continue;
                 }
 
+                let _execution_guard = match self.store.execution_read_guard() {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        resp::write_error(write_buf, &format!("ERR database unavailable: {error}"));
+                        continue;
+                    }
+                };
+
                 let cmd_result = {
                     let _guard = self.store.script_read_guard();
                     cmd::execute_with_wal(
@@ -3551,6 +3669,13 @@ impl CommandExecutor {
         }
 
         let mut shards: Vec<u32> = Vec::with_capacity(cmd_count);
+        let _execution_guard = match self.store.execution_read_guard() {
+            Ok(guard) => guard,
+            Err(error) => {
+                resp::write_error(write_buf, &format!("ERR database unavailable: {error}"));
+                return None;
+            }
+        };
         for (idx, command) in commands.iter().enumerate() {
             let args = command.argv();
             shards.push(self.store.shard_for_key(args[1]) as u32);
@@ -3809,6 +3934,7 @@ async fn handle_connection(
                             }
                         };
                         if args.is_empty() { continue; }
+                        let _execution_guard = store.execution_barrier_guard();
                         if cmd_eq_fast(args[0], b"SUBSCRIBE") {
                             for ch_bytes in &args[1..] {
                                 let ch = std::str::from_utf8(ch_bytes).unwrap_or("").to_string();
@@ -4616,17 +4742,31 @@ fn handle_script_op(out: &mut BytesMut, script_engine: &lua::ScriptEngine, args:
 mod tx_tests {
     use super::*;
 
-    fn test_executor() -> (CommandExecutor, CommandSession) {
-        let store = Arc::new(Store::new());
-        let broker = Broker::new();
+    fn executor_for(store: Arc<Store>, broker: Broker) -> CommandExecutor {
         let schema_cache: SharedSchemaCache =
             Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
-        let executor = CommandExecutor::new(
+        CommandExecutor::new(
             store,
             broker,
             Arc::new(lua::ScriptEngine::new()),
             schema_cache,
-        );
+        )
+    }
+
+    fn execute(
+        executor: &CommandExecutor,
+        session: &mut CommandSession,
+        args: &[&[u8]],
+    ) -> BytesMut {
+        let mut out = BytesMut::new();
+        executor.execute_command(args, session, &mut out, Instant::now());
+        out
+    }
+
+    fn test_executor() -> (CommandExecutor, CommandSession) {
+        let store = Arc::new(Store::new());
+        let broker = Broker::new();
+        let executor = executor_for(store, broker);
         (executor, CommandSession::new(false))
     }
 
@@ -4649,7 +4789,14 @@ mod tx_tests {
         let schema_cache: SharedSchemaCache =
             Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
 
-        for command in ["SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE"] {
+        for command in [
+            "SUBSCRIBE",
+            "UNSUBSCRIBE",
+            "PSUBSCRIBE",
+            "PUNSUBSCRIBE",
+            "SAVE",
+            "BGSAVE",
+        ] {
             let mut in_multi = true;
             let mut tx_error = false;
             let mut tx_queue = Vec::new();
@@ -4686,6 +4833,438 @@ mod tx_tests {
             assert!(tx_error, "{command} should mark the transaction dirty");
             assert!(tx_queue.is_empty(), "{command} should not be queued");
         }
+    }
+
+    #[test]
+    fn exec_hides_intermediate_state_from_other_clients() {
+        let store = Arc::new(Store::new());
+        let broker = Broker::new();
+        store.set(b"left", b"before", None, Instant::now());
+        store.set(b"right", b"before", None, Instant::now());
+
+        let reached_midpoint = Arc::new(std::sync::Barrier::new(2));
+        let release_transaction = Arc::new(std::sync::Barrier::new(2));
+        store.set_exec_after_command_hook(Some({
+            let reached_midpoint = reached_midpoint.clone();
+            let release_transaction = release_transaction.clone();
+            Arc::new(move |index| {
+                if index == 0 {
+                    reached_midpoint.wait();
+                    release_transaction.wait();
+                }
+            })
+        }));
+
+        let writer_store = store.clone();
+        let writer_broker = broker.clone();
+        let writer = std::thread::spawn(move || {
+            let executor = executor_for(writer_store, writer_broker);
+            let mut session = CommandSession::new(false);
+            execute(&executor, &mut session, &[b"MULTI"]);
+            execute(&executor, &mut session, &[b"SET", b"left", b"after"]);
+            execute(&executor, &mut session, &[b"SET", b"right", b"after"]);
+            execute(&executor, &mut session, &[b"EXEC"])
+        });
+
+        reached_midpoint.wait();
+        let reader_store = store.clone();
+        let reader_broker = broker.clone();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let executor = executor_for(reader_store, reader_broker);
+            let mut session = CommandSession::new(false);
+            let out = execute(&executor, &mut session, &[b"MGET", b"left", b"right"]);
+            read_tx.send(out).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            matches!(
+                read_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "reader observed the transaction before EXEC committed"
+        );
+        release_transaction.wait();
+
+        let exec_out = writer.join().unwrap();
+        assert!(String::from_utf8_lossy(&exec_out).starts_with("*2\r\n"));
+        let read_out = read_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        reader.join().unwrap();
+        assert_eq!(&read_out[..], b"*2\r\n$5\r\nafter\r\n$5\r\nafter\r\n");
+        store.set_exec_after_command_hook(None);
+    }
+
+    #[test]
+    fn active_expiry_waits_for_exec_to_finish() {
+        let store = Arc::new(Store::new());
+        let broker = Broker::new();
+        let started = Instant::now();
+        store.set(
+            b"expired",
+            b"value",
+            Some(Duration::from_millis(1)),
+            started,
+        );
+
+        let reached_midpoint = Arc::new(std::sync::Barrier::new(2));
+        let release_transaction = Arc::new(std::sync::Barrier::new(2));
+        store.set_exec_after_command_hook(Some({
+            let reached_midpoint = reached_midpoint.clone();
+            let release_transaction = release_transaction.clone();
+            Arc::new(move |index| {
+                if index == 0 {
+                    reached_midpoint.wait();
+                    release_transaction.wait();
+                }
+            })
+        }));
+
+        let writer = std::thread::spawn({
+            let store = store.clone();
+            let broker = broker.clone();
+            move || {
+                let executor = executor_for(store, broker);
+                let mut session = CommandSession::new(false);
+                execute(&executor, &mut session, &[b"MULTI"]);
+                execute(&executor, &mut session, &[b"SET", b"first", b"one"]);
+                execute(&executor, &mut session, &[b"SET", b"last", b"two"]);
+                execute(&executor, &mut session, &[b"EXEC"])
+            }
+        });
+
+        reached_midpoint.wait();
+        let (expired_tx, expired_rx) = std::sync::mpsc::channel();
+        let expiry = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                store.expire_sweep(started + Duration::from_secs(1));
+                expired_tx.send(()).unwrap();
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            matches!(
+                expired_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "active expiry crossed the EXEC boundary"
+        );
+
+        release_transaction.wait();
+        writer.join().unwrap();
+        expired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        expiry.join().unwrap();
+        assert!(store
+            .get(b"expired", started + Duration::from_secs(1))
+            .is_none());
+        assert_eq!(store.get(b"first", Instant::now()).unwrap(), b"one"[..]);
+        assert_eq!(store.get(b"last", Instant::now()).unwrap(), b"two"[..]);
+        store.set_exec_after_command_hook(None);
+    }
+
+    #[test]
+    fn exec_runtime_error_keeps_other_successful_commands() {
+        let (executor, mut session) = test_executor();
+        execute(&executor, &mut session, &[b"SET", b"typed", b"string"]);
+        execute(&executor, &mut session, &[b"MULTI"]);
+        execute(&executor, &mut session, &[b"SET", b"first", b"one"]);
+        execute(&executor, &mut session, &[b"LPUSH", b"typed", b"value"]);
+        execute(&executor, &mut session, &[b"SET", b"last", b"two"]);
+        let out = execute(&executor, &mut session, &[b"EXEC"]);
+        let response = String::from_utf8_lossy(&out);
+        assert!(response.starts_with("*3\r\n"), "{response}");
+        assert!(response.contains("WRONGTYPE"), "{response}");
+        assert_eq!(
+            &execute(&executor, &mut session, &[b"MGET", b"first", b"last"])[..],
+            b"*2\r\n$3\r\none\r\n$3\r\ntwo\r\n"
+        );
+    }
+
+    #[test]
+    fn exec_defers_publish_until_the_transaction_commits() {
+        let store = Arc::new(Store::new());
+        let broker = Broker::new();
+        let mut receiver = broker.subscribe("events");
+        let reached_publish = Arc::new(std::sync::Barrier::new(2));
+        let release_transaction = Arc::new(std::sync::Barrier::new(2));
+        store.set_exec_after_command_hook(Some({
+            let reached_publish = reached_publish.clone();
+            let release_transaction = release_transaction.clone();
+            Arc::new(move |index| {
+                if index == 1 {
+                    reached_publish.wait();
+                    release_transaction.wait();
+                }
+            })
+        }));
+
+        let writer = std::thread::spawn({
+            let store = store.clone();
+            let broker = broker.clone();
+            move || {
+                let executor = executor_for(store, broker);
+                let mut session = CommandSession::new(false);
+                execute(&executor, &mut session, &[b"MULTI"]);
+                execute(&executor, &mut session, &[b"SET", b"first", b"one"]);
+                execute(
+                    &executor,
+                    &mut session,
+                    &[b"PUBLISH", b"events", b"committed"],
+                );
+                execute(&executor, &mut session, &[b"SET", b"last", b"two"]);
+                execute(&executor, &mut session, &[b"EXEC"])
+            }
+        });
+
+        reached_publish.wait();
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "PUBLISH escaped before the transaction committed"
+        );
+        release_transaction.wait();
+        let out = writer.join().unwrap();
+        assert!(String::from_utf8_lossy(&out).contains(":1\r\n"));
+        let message = receiver
+            .try_recv()
+            .expect("committed publish was not delivered");
+        assert_eq!(message.payload, bytes::Bytes::from_static(b"committed"));
+        store.set_exec_after_command_hook(None);
+    }
+
+    #[test]
+    fn list_waiter_registered_mid_exec_receives_committed_push() {
+        let store = Arc::new(Store::new());
+        let broker = Broker::new();
+        let reached_push = Arc::new(std::sync::Barrier::new(2));
+        let release_transaction = Arc::new(std::sync::Barrier::new(2));
+        store.set_exec_after_command_hook(Some({
+            let reached_push = reached_push.clone();
+            let release_transaction = release_transaction.clone();
+            Arc::new(move |index| {
+                if index == 0 {
+                    reached_push.wait();
+                    release_transaction.wait();
+                }
+            })
+        }));
+
+        let writer = std::thread::spawn({
+            let store = store.clone();
+            let broker = broker.clone();
+            move || {
+                let executor = executor_for(store, broker);
+                let mut session = CommandSession::new(false);
+                execute(&executor, &mut session, &[b"MULTI"]);
+                execute(&executor, &mut session, &[b"LPUSH", b"jobs", b"ready"]);
+                execute(&executor, &mut session, &[b"EXEC"])
+            }
+        });
+
+        reached_push.wait();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        broker.register_list_waiter(
+            "jobs",
+            pubsub::BlockedPopRequest {
+                tx,
+                pop_left: false,
+                destination: None,
+                waiter_id: broker.next_waiter_id(),
+            },
+        );
+        assert!(rx.try_recv().is_err(), "list value escaped before commit");
+
+        release_transaction.wait();
+        writer.join().unwrap();
+        let (key, value) = rx
+            .blocking_recv()
+            .expect("committed push was not delivered");
+        assert_eq!(key, "jobs");
+        assert_eq!(value, bytes::Bytes::from_static(b"ready"));
+        store.set_exec_after_command_hook(None);
+    }
+
+    fn persistent_executor(
+        root: &std::path::Path,
+    ) -> (Arc<crate::ServerConfig>, Arc<Store>, CommandExecutor) {
+        let config = Arc::new(crate::ServerConfig {
+            data_dir: root.to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let store = Arc::new(Store::new_with_config(config.clone()));
+        let executor = executor_for(store.clone(), Broker::new());
+        (config, store, executor)
+    }
+
+    #[test]
+    fn snapshot_waits_for_exec_and_captures_the_committed_state() {
+        let root = tempfile::tempdir().unwrap();
+        let (config, store, setup_executor) = persistent_executor(root.path());
+        drop(setup_executor);
+
+        let reached_midpoint = Arc::new(std::sync::Barrier::new(2));
+        let release_transaction = Arc::new(std::sync::Barrier::new(2));
+        store.set_exec_after_command_hook(Some({
+            let reached_midpoint = reached_midpoint.clone();
+            let release_transaction = release_transaction.clone();
+            Arc::new(move |index| {
+                if index == 0 {
+                    reached_midpoint.wait();
+                    release_transaction.wait();
+                }
+            })
+        }));
+
+        let writer = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                let executor = executor_for(store, Broker::new());
+                let mut session = CommandSession::new(false);
+                execute(&executor, &mut session, &[b"MULTI"]);
+                execute(&executor, &mut session, &[b"SET", b"first", b"one"]);
+                execute(&executor, &mut session, &[b"SET", b"last", b"two"]);
+                execute(&executor, &mut session, &[b"EXEC"])
+            }
+        });
+
+        reached_midpoint.wait();
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+        let snapshot = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                snapshot_tx
+                    .send(crate::snapshot::save_and_truncate_wal_consistent(&store))
+                    .unwrap();
+            }
+        });
+        assert!(
+            snapshot_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "snapshot captured an intermediate EXEC state"
+        );
+
+        release_transaction.wait();
+        let output = writer.join().unwrap();
+        assert!(String::from_utf8_lossy(&output).starts_with("*2\r\n"));
+        snapshot_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        snapshot.join().unwrap();
+        store.set_exec_after_command_hook(None);
+        drop(store);
+
+        let recovered = Store::new_with_config(config);
+        crate::snapshot::load(&recovered).unwrap();
+        recovered.replay_wal(&Broker::new()).unwrap();
+        assert_eq!(recovered.get(b"first", Instant::now()).unwrap(), b"one"[..]);
+        assert_eq!(recovered.get(b"last", Instant::now()).unwrap(), b"two"[..]);
+    }
+
+    #[test]
+    fn failed_exec_wal_append_fails_closed_without_recovering_a_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let (config, store, executor) = persistent_executor(root.path());
+        let mut session = CommandSession::new(false);
+        execute(&executor, &mut session, &[b"MULTI"]);
+        execute(&executor, &mut session, &[b"SET", b"first", b"one"]);
+        execute(&executor, &mut session, &[b"SET", b"last", b"two"]);
+        store.inject_journal_failures(1);
+        let out = execute(&executor, &mut session, &[b"EXEC"]);
+        assert!(
+            String::from_utf8_lossy(&out).contains("WAL append failed"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+        let out = execute(&executor, &mut session, &[b"GET", b"first"]);
+        assert!(
+            String::from_utf8_lossy(&out).contains("database unavailable"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+
+        drop(executor);
+        drop(store);
+        let recovered = Store::new_with_config(config);
+        recovered.replay_wal(&Broker::new()).unwrap();
+        assert!(recovered.get(b"first", Instant::now()).is_none());
+        assert!(recovered.get(b"last", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn truncated_exec_frame_recovers_none_of_the_transaction() {
+        let root = tempfile::tempdir().unwrap();
+        let (config, store, executor) = persistent_executor(root.path());
+        let mut session = CommandSession::new(false);
+        execute(&executor, &mut session, &[b"SET", b"baseline", b"safe"]);
+        let wal_path = config.journal_dir().join("global/wal.lux");
+        let baseline_len = std::fs::metadata(&wal_path).unwrap().len();
+
+        execute(&executor, &mut session, &[b"MULTI"]);
+        execute(&executor, &mut session, &[b"SET", b"first", b"one"]);
+        execute(&executor, &mut session, &[b"SET", b"second", b"two"]);
+        execute(&executor, &mut session, &[b"SET", b"third", b"three"]);
+        let out = execute(&executor, &mut session, &[b"EXEC"]);
+        assert!(String::from_utf8_lossy(&out).starts_with("*3\r\n"));
+        let committed_len = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(committed_len > baseline_len);
+        drop(executor);
+        drop(store);
+
+        let full = Store::new_with_config(config.clone());
+        full.replay_wal(&Broker::new()).unwrap();
+        assert_eq!(full.get(b"first", Instant::now()).unwrap(), b"one"[..]);
+        assert_eq!(full.get(b"third", Instant::now()).unwrap(), b"three"[..]);
+        drop(full);
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        file.set_len(baseline_len + (committed_len - baseline_len) / 2)
+            .unwrap();
+        drop(file);
+
+        let truncated = Store::new_with_config(config);
+        truncated.replay_wal(&Broker::new()).unwrap();
+        assert_eq!(
+            truncated.get(b"baseline", Instant::now()).unwrap(),
+            b"safe"[..]
+        );
+        assert!(truncated.get(b"first", Instant::now()).is_none());
+        assert!(truncated.get(b"second", Instant::now()).is_none());
+        assert!(truncated.get(b"third", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn exec_runtime_error_recovery_replays_only_successful_commands() {
+        let root = tempfile::tempdir().unwrap();
+        let (config, store, executor) = persistent_executor(root.path());
+        let mut session = CommandSession::new(false);
+        execute(&executor, &mut session, &[b"SET", b"typed", b"string"]);
+        execute(&executor, &mut session, &[b"MULTI"]);
+        execute(&executor, &mut session, &[b"SET", b"first", b"one"]);
+        execute(&executor, &mut session, &[b"LPUSH", b"typed", b"value"]);
+        execute(&executor, &mut session, &[b"SET", b"last", b"two"]);
+        let out = execute(&executor, &mut session, &[b"EXEC"]);
+        assert!(String::from_utf8_lossy(&out).contains("WRONGTYPE"));
+        drop(executor);
+        drop(store);
+
+        let recovered = Store::new_with_config(config);
+        recovered.replay_wal(&Broker::new()).unwrap();
+        assert_eq!(
+            recovered.get(b"typed", Instant::now()).unwrap(),
+            b"string"[..]
+        );
+        assert_eq!(recovered.get(b"first", Instant::now()).unwrap(), b"one"[..]);
+        assert_eq!(recovered.get(b"last", Instant::now()).unwrap(), b"two"[..]);
     }
 }
 

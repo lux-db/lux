@@ -477,6 +477,27 @@ impl Broker {
         count
     }
 
+    /// Return the delivery count a publish would report without sending it.
+    /// EXEC uses this while its exclusive execution boundary is held, then
+    /// releases the actual message only after the transaction's WAL frame is
+    /// durable.
+    pub(crate) fn publish_subscriber_count(&self, channel: &str) -> i64 {
+        let exact = self
+            .channels
+            .read()
+            .get(channel)
+            .map(|tx| tx.receiver_count() as i64)
+            .unwrap_or(0);
+        let patterns = self
+            .pattern_subs
+            .read()
+            .iter()
+            .filter(|(pattern, tx)| glob_match(pattern, channel) && tx.receiver_count() > 0)
+            .map(|(_, tx)| tx.receiver_count() as i64)
+            .sum::<i64>();
+        exact + patterns
+    }
+
     /// PUBSUB CHANNELS: active channels (those with at least one subscriber),
     /// optionally filtered by a glob `pattern`.
     pub fn pubsub_channels(&self, pattern: Option<&str>) -> Vec<String> {

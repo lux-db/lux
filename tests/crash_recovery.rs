@@ -873,8 +873,8 @@ fn crash_during_multi_exec() {
     // Write some baseline data.
     send(&mut c, &["SET", "before_tx", "safe"]);
 
-    // Each command crosses its own durability boundary during EXEC. Waiting for
-    // the complete EXEC response therefore acknowledges every queued write.
+    // EXEC commits its successful writes in one checksummed WAL frame. Waiting
+    // for the complete response acknowledges the whole frame.
     send(&mut c, &["MULTI"]);
     send(&mut c, &["SET", "tx_key1", "tx_val1"]);
     send(&mut c, &["SET", "tx_key2", "tx_val2"]);
@@ -901,6 +901,60 @@ fn crash_during_multi_exec() {
         assert!(
             resp.contains(expected),
             "acknowledged EXEC write '{key}' was lost: {resp}"
+        );
+    }
+}
+
+#[test]
+fn mid_exec_kills_recover_the_whole_transaction_or_none_of_it() {
+    let mut srv = LuxServer::builder()
+        .env("LUX_DURABILITY", "always_sync")
+        .start();
+    let mut baseline = srv.conn();
+    assert_eq!(
+        send(&mut baseline, &["SET", "tx-survivor", "safe"]),
+        "+OK\r\n"
+    );
+    drop(baseline);
+
+    // Cut across queueing, execution, WAL append, fsync, and response windows.
+    // No response is trusted here: after each hard kill, recovery must expose
+    // either every key from that EXEC or none of them.
+    for (round, delay_ms) in [0, 1, 3, 8].into_iter().enumerate() {
+        let keys: Vec<String> = (0..512)
+            .map(|index| format!("kill-exec:{round}:{index}"))
+            .collect();
+        let mut payload = resp_cmd(&["MULTI"]);
+        for key in &keys {
+            payload.extend_from_slice(&resp_cmd(&["SET", key, "value"]));
+        }
+        payload.extend_from_slice(&resp_cmd(&["EXEC"]));
+
+        let mut writer = srv.conn();
+        writer.write_all(&payload).unwrap();
+        thread::sleep(Duration::from_millis(delay_ms));
+        srv.kill();
+        drop(writer);
+        srv.restart();
+
+        let mut conn = srv.conn();
+        assert!(
+            send(&mut conn, &["GET", "tx-survivor"]).contains("safe"),
+            "baseline key was lost after round {round}"
+        );
+        let mut exists_args = Vec::with_capacity(keys.len() + 1);
+        exists_args.push("EXISTS");
+        exists_args.extend(keys.iter().map(String::as_str));
+        let response = send(&mut conn, &exists_args);
+        let recovered = response
+            .trim()
+            .strip_prefix(':')
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("unexpected EXISTS response: {response:?}"));
+        assert!(
+            recovered == 0 || recovered == keys.len(),
+            "recovered a partial EXEC after round {round}: {recovered}/{} keys",
+            keys.len()
         );
     }
 }

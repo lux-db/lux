@@ -2960,29 +2960,33 @@ pub fn execute_with_wal(
                     CmdResult::Written
                 }
             };
-            if matches!(result, CmdResult::Written)
-                && out.get(output_start) != Some(&b'-')
-                && args.len() >= 2
-                && (cmd_eq(args[0], b"LPUSH") || cmd_eq(args[0], b"RPUSH"))
-                && broker.has_list_waiters(arg_str(args[1]))
-            {
-                // Wake only after the outer journal/apply boundary has closed.
-                // Draining from inside the list handler would recursively append
-                // the blocked pop while the generic writer still owns the WAL.
-                broker.drain_list_waiters(arg_str(args[1]), store, now);
+            if matches!(result, CmdResult::Written) && out.get(output_start) != Some(&b'-') {
+                store.defer_exec_key_event(args);
+                if args.len() >= 2
+                    && (cmd_eq(args[0], b"LPUSH") || cmd_eq(args[0], b"RPUSH"))
+                    && !store.defer_exec_list_wake(arg_str(args[1]))
+                    && broker.has_list_waiters(arg_str(args[1]))
+                {
+                    // Wake only after the outer journal/apply boundary has closed.
+                    // Draining from inside the list handler would recursively append
+                    // the blocked pop while the generic writer still owns the WAL.
+                    broker.drain_list_waiters(arg_str(args[1]), store, now);
+                }
             }
             return result;
         }
     }
     let output_start = out.len();
     let result = execute(store, cache, broker, args, out, now);
-    if matches!(result, CmdResult::Written)
-        && out.get(output_start) != Some(&b'-')
-        && args.len() >= 2
-        && (cmd_eq(args[0], b"LPUSH") || cmd_eq(args[0], b"RPUSH"))
-        && broker.has_list_waiters(arg_str(args[1]))
-    {
-        broker.drain_list_waiters(arg_str(args[1]), store, now);
+    if matches!(result, CmdResult::Written) && out.get(output_start) != Some(&b'-') {
+        store.defer_exec_key_event(args);
+        if args.len() >= 2
+            && (cmd_eq(args[0], b"LPUSH") || cmd_eq(args[0], b"RPUSH"))
+            && !store.defer_exec_list_wake(arg_str(args[1]))
+            && broker.has_list_waiters(arg_str(args[1]))
+        {
+            broker.drain_list_waiters(arg_str(args[1]), store, now);
+        }
     }
     result
 }
@@ -4890,6 +4894,10 @@ mod tests {
     fn recovery_does_not_resurrect_expired_snapshot_keys() {
         let dir = tempfile::tempdir().unwrap();
         let store = journal_test_store(dir.path());
+        // Leave enough headroom for this test to keep its setup ordering even
+        // when the full suite is saturating the test runner. The former 80 ms
+        // deadline could elapse before PEXPIRE ran, turning this into a timing
+        // flake rather than a recovery assertion.
         for key in [b"preserved".as_slice(), b"revived", b"retimed"] {
             exec_wal(&store, &[b"PSETEX", key, b"2000", b"old"]);
         }

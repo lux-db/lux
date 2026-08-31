@@ -1614,6 +1614,9 @@ pub fn expire_due_rows(
     cache: &SharedSchemaCache,
     now: Instant,
 ) -> Result<Vec<String>, String> {
+    let _execution_guard = store
+        .execution_read_guard()
+        .map_err(|error| format!("ERR database unavailable: {error}"))?;
     let key = ttl_index_key();
     let now_ms = current_epoch_ms() as f64;
     let due = store.zrangebyscore(
@@ -3620,6 +3623,9 @@ pub fn table_get_by_pk_str(
     decrypt_authorized: bool,
     now: Instant,
 ) -> Result<Option<Vec<(String, String)>>, String> {
+    let _execution_guard = store
+        .execution_read_guard()
+        .map_err(|error| format!("ERR database unavailable: {error}"))?;
     let schema = load_schema(store, cache, table, now)?;
     let Some(mut row) = get_row(store, table, &schema, pk_str, now, decrypt_authorized)? else {
         return Ok(None);
@@ -4783,6 +4789,9 @@ pub fn table_count(
     table: &str,
     now: Instant,
 ) -> Result<i64, String> {
+    let _execution_guard = store
+        .execution_read_guard()
+        .map_err(|error| format!("ERR database unavailable: {error}"))?;
     let _ = load_schema(store, cache, table, now)?;
     let ikey = ids_key(table);
     store.zcard(ikey.as_bytes(), now)
@@ -4856,6 +4865,9 @@ pub fn table_get_filtered_pk(
     now: Instant,
     decrypt_authorized: bool,
 ) -> Result<Option<Vec<(String, String)>>, String> {
+    let _execution_guard = store
+        .execution_read_guard()
+        .map_err(|error| format!("ERR database unavailable: {error}"))?;
     // Full-access with no row filter: direct PK fetch, no plan. When the caller
     // isn't decrypt-authorized we fall through to the plan path so encrypted
     // columns get gated even on an unconditional grant.
@@ -4896,6 +4908,9 @@ pub fn table_schema(
     table: &str,
     now: Instant,
 ) -> Result<Vec<String>, String> {
+    let _execution_guard = store
+        .execution_read_guard()
+        .map_err(|error| format!("ERR database unavailable: {error}"))?;
     let schema = load_schema(store, cache, table, now)?;
     let mut result = Vec::new();
     for field in &schema {
@@ -5523,7 +5538,10 @@ mod tests {
         let error = table_insert_many_returning(&store, &cache, "events", &rows, n)
             .expect_err("the interruption must happen before live publication");
         assert!(error.contains("injected interruption"), "{error}");
-        assert_eq!(table_count(&store, &cache, "events", n).unwrap(), 0);
+        let read_error = table_count(&store, &cache, "events", n)
+            .expect_err("a poisoned journal must fence data-bearing reads");
+        assert!(read_error.contains("database unavailable"), "{read_error}");
+        assert_eq!(store.zcard(ids_key("events").as_bytes(), n).unwrap(), 0);
         drop(store);
 
         let restored = Store::new_with_config(config);

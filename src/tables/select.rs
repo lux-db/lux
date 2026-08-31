@@ -1144,6 +1144,9 @@ pub fn table_select(
     plan: &SelectPlan,
     now: Instant,
 ) -> Result<SelectResult, String> {
+    let _execution_guard = store
+        .execution_read_guard()
+        .map_err(|error| format!("ERR database unavailable: {error}"))?;
     let version = store.stable_table_read_version();
     let result = table_select_once(store, cache, plan, now);
     if store.table_read_version_is_current(version) {

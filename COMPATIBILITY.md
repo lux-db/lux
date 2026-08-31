@@ -224,12 +224,15 @@ Known differences:
   unsupported errors (they exist for Redis Cluster, which Lux does not run). Use
   `PUBLISH`/`SUBSCRIBE`. `PUBSUB CHANNELS`/`NUMSUB`/`NUMPAT` are supported.
 - **Transactions**: `MULTI`/`EXEC` is supported with WATCH-based optimistic
-  concurrency. Lux commands in an EXEC execute sequentially and may be observed
-  between steps by other clients. Each mutating command also crosses its own
-  durability boundary, so a process crash during EXEC can recover a completed
-  prefix of an EXEC whose response was never acknowledged. Redis avoids both
-  differences through its single-threaded execution and transaction-aware AOF
-  framing.
+  concurrency. Queued commands execute sequentially behind one isolation
+  boundary: other RESP, embedded, HTTP, live-query, and snapshot readers see
+  either the state before EXEC or the committed state after it. Successful
+  mutations are persisted in one checksummed WAL frame, so crash recovery
+  replays all of them or none. Queue-time errors discard the transaction;
+  runtime command errors are returned in the EXEC array and do not roll back
+  other successful commands, matching Redis semantics. Persistence commands
+  (`SAVE`/`BGSAVE`), blocking commands, and subscription commands are rejected
+  inside MULTI.
 - **Concurrency**: Lux is sharded and concurrent. Commands touching different
   shards can execute in parallel.
 - **Restricted mode**: Lux may reject scan-heavy or administrative commands

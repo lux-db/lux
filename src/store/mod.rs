@@ -12,7 +12,10 @@ mod hashes;
 mod sorted_sets;
 mod streams;
 mod timeseries;
+mod transactions;
 mod vectors;
+
+pub(crate) use transactions::ExecutionReadGuard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId {
@@ -615,6 +618,9 @@ pub(crate) enum BackgroundSaveRequestError {
     Unavailable,
 }
 
+#[cfg(test)]
+type ExecAfterCommandHook = Arc<dyn Fn(usize) + Send + Sync + 'static>;
+
 pub struct Store {
     config: Arc<crate::ServerConfig>,
     encryption: crate::encryption::EncryptionKeyring,
@@ -642,6 +648,10 @@ pub struct Store {
     legacy_wals: Box<[(usize, parking_lot::Mutex<crate::disk::Wal>)]>,
     /// Per-stream WAL positions already represented by the loaded snapshot.
     recovery_wal_checkpoints: parking_lot::Mutex<HashMap<String, crate::disk::WalCheckpoint>>,
+    /// Readers and ordinary mutations share this gate. EXEC owns it exclusively
+    /// from its WATCH check through WAL commit, so no surface can observe a
+    /// prefix of the queued commands.
+    execution_gate: RwLock<()>,
     /// Striped commit gates keep overlapping mutations in journal/apply order
     /// without serializing independent shards behind one global writer lock.
     journal_gates: Box<[parking_lot::ReentrantMutex<()>]>,
@@ -687,6 +697,8 @@ pub struct Store {
     #[cfg(test)]
     table_read_after_first_row_hook:
         parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
+    #[cfg(test)]
+    exec_after_command_hook: parking_lot::Mutex<Option<ExecAfterCommandHook>>,
     /// Set once at runtime startup; sink for typed row deltas feeding reactive
     /// live queries. Absent for embedded/replay-only stores, so emission is a
     /// cheap no-op there.
@@ -711,8 +723,10 @@ pub(crate) struct PreparedRestore {
 /// applying the journaled change.
 pub(crate) struct JournalCommitGuard<'a> {
     store: &'a Store,
+    _execution_guard: ExecutionReadGuard<'a>,
     _table_guard: Option<parking_lot::ReentrantMutexGuard<'a, ()>>,
     _guards: Vec<parking_lot::ReentrantMutexGuard<'a, ()>>,
+    transaction_checkpoint: Option<usize>,
     armed: bool,
 }
 
@@ -729,6 +743,9 @@ impl JournalCommitGuard<'_> {
     /// Disarm after the exact journal frame was successfully removed. This is
     /// only valid while the journal lock still excludes concurrent appenders.
     fn rolled_back(mut self) {
+        if let Some(checkpoint) = self.transaction_checkpoint {
+            self.store.truncate_active_exec(checkpoint);
+        }
         self.armed = false;
     }
 }
@@ -746,6 +763,7 @@ impl Drop for JournalCommitGuard<'_> {
 /// phase; dropping it after validation fails is intentionally a no-op.
 pub(crate) struct JournalPrepareGuard<'a> {
     store: &'a Store,
+    _execution_guard: ExecutionReadGuard<'a>,
     table_guard: Option<parking_lot::ReentrantMutexGuard<'a, ()>>,
     guards: Vec<parking_lot::ReentrantMutexGuard<'a, ()>>,
     bypassed: bool,
@@ -761,13 +779,20 @@ impl<'a> JournalPrepareGuard<'a> {
         commands: &[&[&[u8]]],
     ) -> std::io::Result<JournalCommitGuard<'a>> {
         let armed = !self.bypassed && !commands.is_empty();
+        let transaction_checkpoint = if armed {
+            self.store.active_exec_command_len()
+        } else {
+            None
+        };
         if armed {
             self.store.append_journal_commands(commands)?;
         }
         Ok(JournalCommitGuard {
             store: self.store,
+            _execution_guard: self._execution_guard,
             _table_guard: self.table_guard,
             _guards: self.guards,
+            transaction_checkpoint,
             armed,
         })
     }
@@ -1643,6 +1668,7 @@ impl Store {
             journal,
             legacy_wals,
             recovery_wal_checkpoints: parking_lot::Mutex::new(HashMap::new()),
+            execution_gate: RwLock::new(()),
             journal_gates,
             table_mutation_gate: parking_lot::ReentrantMutex::new(()),
             table_publication: AtomicU64::new(0),
@@ -1665,6 +1691,8 @@ impl Store {
             snapshot_after_capture_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
             table_read_after_first_row_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            exec_after_command_hook: parking_lot::Mutex::new(None),
             row_delta_broker: std::sync::OnceLock::new(),
         })
     }
@@ -2425,6 +2453,16 @@ impl Store {
         if !broker.has_any_row_delta_subs() {
             return;
         }
+        if self.defer_exec_row_delta(table, pk) {
+            return;
+        }
+        self.publish_row_delta(table, pk);
+    }
+
+    fn publish_row_delta(&self, table: &str, pk: &str) {
+        let Some(broker) = self.row_delta_broker.get() else {
+            return;
+        };
         broker.publish_row_delta(crate::pubsub::RowDelta {
             table: table.to_string(),
             pk: pk.to_string(),
@@ -2715,11 +2753,23 @@ impl Store {
             return Ok(apply().0);
         }
 
+        if self.in_exec_transaction() {
+            let commit = prepared.commit(args)?;
+            let (result, committed) = apply();
+            if committed {
+                commit.complete()?;
+            } else {
+                commit.rolled_back();
+            }
+            return Ok(result);
+        }
+
         let Some(journal) = &self.journal else {
             return Ok(apply().0);
         };
         let JournalPrepareGuard {
             store,
+            _execution_guard,
             table_guard,
             guards,
             bypassed: _,
@@ -2728,8 +2778,10 @@ impl Store {
         let append_offset = self.append_journal_commands_locked(&mut wal, &[args], true)?;
         let commit = JournalCommitGuard {
             store,
+            _execution_guard,
             _table_guard: table_guard,
             _guards: guards,
+            transaction_checkpoint: None,
             armed: true,
         };
         let (result, committed) = apply();
@@ -2797,6 +2849,7 @@ impl Store {
     ) -> std::io::Result<JournalPrepareGuard<'a>> {
         self.ensure_accepting_mutations()?;
         self.ensure_journal_healthy()?;
+        let execution_guard = self.execution_read_guard()?;
         let bypassed = self.wal_suppress.load(Ordering::Relaxed)
             || self.journal.is_none()
             || commands.is_empty();
@@ -2819,6 +2872,7 @@ impl Store {
         self.ensure_journal_healthy()?;
         Ok(JournalPrepareGuard {
             store: self,
+            _execution_guard: execution_guard,
             table_guard,
             guards,
             bypassed,
@@ -2969,6 +3023,13 @@ impl Store {
     }
 
     fn append_journal_commands(&self, commands: &[&[&[u8]]]) -> std::io::Result<()> {
+        if self.buffer_exec_journal_commands(commands) {
+            return Ok(());
+        }
+        self.append_journal_commands_physical(commands)
+    }
+
+    fn append_journal_commands_physical(&self, commands: &[&[&[u8]]]) -> std::io::Result<()> {
         let Some(journal) = &self.journal else {
             return Ok(());
         };
@@ -5279,6 +5340,7 @@ impl Store {
         &self,
         f: impl FnOnce(&mut [parking_lot::RwLockWriteGuard<'_, Shard>]) -> R,
     ) -> R {
+        let _execution_guard = self.enter_execution_read();
         let _table_guard = self.table_mutation_gate.lock();
         // Mutations acquire their journal domain before they append and keep it
         // through the state change. Take every domain in the same order before
@@ -6861,6 +6923,12 @@ impl Store {
     }
 
     pub fn expire_sweep(&self, now: Instant) {
+        // Active expiry is a logical mutation even though an expired value is
+        // already invisible to reads. Keep it outside an EXEC boundary so it
+        // cannot race a queued command that revives or replaces the same key.
+        let Ok(_execution_guard) = self.execution_read_guard() else {
+            return;
+        };
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
