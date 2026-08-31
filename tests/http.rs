@@ -965,17 +965,21 @@ fn http_auth_sessions_keys_and_revocation_survive_restart() {
     );
     assert_eq!(
         status, 401,
-        "old refresh token should be revoked after rotation: {body}"
+        "old refresh token reuse should be rejected after rotation: {body}"
     );
+    assert!(body.contains("reuse detected"), "{body}");
 
     let (status, body) = http_request(
         http,
-        "POST",
-        "/auth/v1/logout",
-        Some("{}"),
+        "GET",
+        "/auth/v1/user",
+        None,
         Some(&rotated_access_token),
     );
-    assert_eq!(status, 200, "logout after restart: {body}");
+    assert_eq!(
+        status, 401,
+        "reuse should revoke the newly issued access token: {body}"
+    );
 
     common::terminate_child(&mut child);
 
@@ -985,7 +989,7 @@ fn http_auth_sessions_keys_and_revocation_survive_restart() {
     let (status, body) = http_request(http, "GET", "/auth/v1/user", None, Some(&access_token));
     assert_eq!(
         status, 401,
-        "family logout should revoke pre-refresh access token after restart: {body}"
+        "family reuse revocation should survive restart for the original access token: {body}"
     );
 
     let (status, body) = http_request(
@@ -997,7 +1001,7 @@ fn http_auth_sessions_keys_and_revocation_survive_restart() {
     );
     assert_eq!(
         status, 401,
-        "family logout should revoke rotated access token after restart: {body}"
+        "family reuse revocation should survive restart for the rotated access token: {body}"
     );
 
     let (status, body) = http_request_with_headers(

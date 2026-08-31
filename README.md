@@ -586,6 +586,15 @@ migration is crash-resumable and listener readiness waits for a final
 checkpoint that removes plaintext values from the live snapshot and journal.
 Secret material is never returned through admin or table APIs.
 
+Refresh tokens rotate on every successful exchange. The rotation is a single
+durable compare-and-swap: concurrent presentations have one winner, and reuse
+of a consumed token revokes the complete sign-in family, including access
+tokens minted before or during the rotation. Refresh tokens issued by older
+Lux versions remain valid and move to the signed generation format on first
+use. The TypeScript SDK coalesces concurrent refresh calls and coordinates
+persisted browser sessions across tabs when the Web Locks API is available;
+custom clients should single-flight refresh work.
+
 `GET /v1` and `GET /auth/v1/health` expose secret-free Auth storage status:
 `disabled`, `ready`, `degraded`, or `locked`. Persistent Auth never reaches
 readiness while locked; startup explains how to initialize or rotate the

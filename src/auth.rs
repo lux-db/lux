@@ -34,6 +34,7 @@ use apple::{
     seal_apple_private_key, seed_apple_jwks_for_test, sha256_hex, verify_apple_id_token,
     APPLE_ISSUER,
 };
+mod refresh;
 mod secrets;
 
 pub(crate) const USERS_TABLE: &str = "auth.users";
@@ -47,7 +48,7 @@ pub(crate) const FLOW_TOKENS_TABLE: &str = "auth.flow_tokens";
 pub(crate) const SETTINGS_TABLE: &str = "auth.settings";
 
 const AUTH_SCHEMA_VERSION_KEY: &[u8] = b"_auth:schema_version";
-const AUTH_SCHEMA_VERSION: &[u8] = b"3";
+const AUTH_SCHEMA_VERSION: &[u8] = b"4";
 const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
 const OAUTH_CALLBACK_BODY_LIMIT: usize = 64 * 1024;
 const POSTMARK_EMAIL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -406,7 +407,7 @@ fn bare_auth_field(field: &str) -> &str {
 fn sensitive_auth_fields(table: &str) -> &'static [&'static str] {
     match table {
         USERS_TABLE => &["encrypted_password"],
-        SESSIONS_TABLE => &["refresh_token_hash"],
+        SESSIONS_TABLE => &["refresh_token_hash", "legacy_refresh_token_hash"],
         KEYS_TABLE => &["key_hash"],
         SIGNING_KEYS_TABLE => &["private_key_encrypted"],
         PROVIDERS_TABLE => &["client_secret", "apple_private_key"],
@@ -483,15 +484,21 @@ pub(crate) fn bootstrap(
             "user_id UUID,",
             "refresh_token_hash STR UNIQUE,",
             "refresh_token_family STR,",
+            "refresh_generation INT,",
+            "legacy_refresh_token_hash STR,",
             "user_agent STR,",
             "ip STR,",
             "expires_at INT,",
             "revoked_at INT,",
+            "access_revoked_at INT,",
+            "refresh_rotated_at INT,",
+            "refresh_reuse_detected_at INT,",
             "created_at INT,",
             "updated_at INT",
         ],
         now,
     )?;
+    refresh::migrate_columns(store, cache, now)?;
     create_table_if_missing(
         store,
         cache,
@@ -1116,7 +1123,7 @@ fn token(
 
     match grant_type {
         "password" => password_grant(&parsed, headers, store, cache),
-        "refresh_token" => refresh_token_grant(&parsed, headers, store, cache),
+        "refresh_token" => refresh::grant(&parsed, headers, store, cache),
         "authorization_code" | "pkce" => authorization_code_grant(&parsed, headers, store, cache),
         _ => error(400, "Bad Request", "unsupported grant_type"),
     }
@@ -1196,93 +1203,6 @@ fn password_grant(
         return error(500, "Internal Server Error", "auth user row is missing id");
     };
     issue_session_response(store, cache, headers, user_id, &email, now)
-}
-
-fn refresh_token_grant(
-    parsed: &Value,
-    headers: &[(String, String)],
-    store: &Store,
-    cache: &SharedSchemaCache,
-) -> (u16, &'static str, String) {
-    let refresh_token = match required_string(parsed, "refresh_token") {
-        Ok(refresh_token) => refresh_token,
-        Err(response) => return response,
-    };
-    let now = Instant::now();
-    let token_hash = hash_secret(refresh_token);
-    let Some(session) = find_row_by_field(
-        store,
-        cache,
-        SESSIONS_TABLE,
-        "refresh_token_hash",
-        &token_hash,
-        now,
-    )
-    .ok()
-    .flatten() else {
-        return error(401, "Unauthorized", "invalid refresh token");
-    };
-    if session
-        .get("revoked_at")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-    {
-        return error(401, "Unauthorized", "refresh token revoked");
-    }
-    let expires_at = session
-        .get("expires_at")
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    if expires_at <= unix_seconds() {
-        return error(401, "Unauthorized", "refresh token expired");
-    }
-    let Some(user_id) = session.get("user_id") else {
-        return error(
-            500,
-            "Internal Server Error",
-            "session row is missing user_id",
-        );
-    };
-    let Some(user) = find_row_by_field(store, cache, USERS_TABLE, "id", user_id, now)
-        .ok()
-        .flatten()
-    else {
-        return error(401, "Unauthorized", "user not found");
-    };
-    if let Err(response) = validate_user_active(&user, unix_seconds()) {
-        return response;
-    }
-    let email = user.get("email").cloned().unwrap_or_default();
-    let now_sec = unix_seconds().to_string();
-    if let Err(e) = durable_table_update_where(
-        store,
-        cache,
-        SESSIONS_TABLE,
-        &[
-            ("revoked_at", now_sec.as_str()),
-            ("updated_at", now_sec.as_str()),
-        ],
-        &[
-            "id",
-            "=",
-            session.get("id").map(String::as_str).unwrap_or(""),
-        ],
-        now,
-    ) {
-        return error(400, "Bad Request", &e);
-    }
-    issue_session_response_with_family(
-        store,
-        cache,
-        headers,
-        user_id,
-        &email,
-        session
-            .get("refresh_token_family")
-            .map(String::as_str)
-            .unwrap_or_else(|| session.get("id").map(String::as_str).unwrap_or("")),
-        now,
-    )
 }
 
 fn authorization_code_grant(
@@ -1430,26 +1350,26 @@ fn issue_session_response(
     email: &str,
     now: Instant,
 ) -> (u16, &'static str, String) {
-    issue_session_response_with_family(store, cache, headers, user_id, email, "", now)
-}
-
-fn issue_session_response_with_family(
-    store: &Store,
-    cache: &SharedSchemaCache,
-    headers: &[(String, String)],
-    user_id: &str,
-    email: &str,
-    refresh_token_family: &str,
-    now: Instant,
-) -> (u16, &'static str, String) {
     let now_sec = unix_seconds();
-    let refresh_token = random_token(32);
-    let refresh_hash = hash_secret(&refresh_token);
     let session_id = random_id("ses");
-    let refresh_token_family = if refresh_token_family.is_empty() {
-        session_id.as_str()
-    } else {
-        refresh_token_family
+    let refresh_token_family = session_id.as_str();
+    let refresh_generation = 1u64;
+    let refresh_token = match refresh::sign(
+        store,
+        cache,
+        user_id,
+        &session_id,
+        refresh_token_family,
+        refresh_generation,
+        now_sec,
+    ) {
+        Ok(token) => token,
+        Err(e) => return error(500, "Internal Server Error", &e),
+    };
+    let refresh_hash = hash_secret(&refresh_token);
+    let access_token = match sign_access_token(store, cache, user_id, email, &session_id) {
+        Ok(token) => token,
+        Err(e) => return error(500, "Internal Server Error", &e),
     };
     let expires_at = now_sec + store.config().auth.refresh_token_ttl.as_secs();
     let user_agent = header_value(headers, "user-agent")
@@ -1465,6 +1385,7 @@ fn issue_session_response_with_family(
             ("user_id", user_id),
             ("refresh_token_hash", refresh_hash.as_str()),
             ("refresh_token_family", refresh_token_family),
+            ("refresh_generation", &refresh_generation.to_string()),
             ("user_agent", user_agent.as_str()),
             ("ip", ""),
             ("expires_at", &expires_at.to_string()),
@@ -1483,11 +1404,6 @@ fn issue_session_response_with_family(
         &["id", "=", user_id],
         now,
     );
-
-    let access_token = match sign_access_token(store, cache, user_id, email, &session_id) {
-        Ok(token) => token,
-        Err(e) => return error(500, "Internal Server Error", &e),
-    };
 
     ok(json!({
         "access_token": access_token,
@@ -1597,24 +1513,25 @@ fn logout(
     let now = Instant::now();
     let now_sec = unix_seconds().to_string();
     if let Ok(claims) = claims_from_bearer(headers, store, cache) {
-        let _ = revoke_session_family_access(store, cache, &claims.session_id, &now_sec, now);
-        return ok(json!({"result":"OK"}));
+        return match refresh::revoke_family(store, cache, &claims.session_id, &now_sec, now, false)
+        {
+            Ok(()) => ok(json!({"result":"OK"})),
+            Err(e) => error(500, "Internal Server Error", &e),
+        };
     }
 
     if let Ok(parsed) = serde_json::from_str::<Value>(body) {
         if let Some(refresh_token) = parsed.get("refresh_token").and_then(Value::as_str) {
-            let token_hash = hash_secret(refresh_token);
-            if let Ok(Some(session)) = find_row_by_field(
-                store,
-                cache,
-                SESSIONS_TABLE,
-                "refresh_token_hash",
-                &token_hash,
-                now,
-            ) {
-                if let Some(session_id) = session.get("id") {
-                    let _ = revoke_session_family_access(store, cache, session_id, &now_sec, now);
+            match refresh::session_id_for_token(refresh_token, store, cache, now) {
+                Ok(Some(session_id)) => {
+                    if let Err(e) =
+                        refresh::revoke_family(store, cache, &session_id, &now_sec, now, false)
+                    {
+                        return error(500, "Internal Server Error", &e);
+                    }
                 }
+                Ok(None) => {}
+                Err(e) => return error(500, "Internal Server Error", &e),
             }
             return ok(json!({"result":"OK"}));
         }
@@ -3327,6 +3244,14 @@ fn sign_access_token(
         exp: exp as usize,
         is_anonymous,
     };
+    encode_auth_claims(store, cache, &claims)
+}
+
+fn encode_auth_claims<T: Serialize>(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    claims: &T,
+) -> Result<String, String> {
     let signing_key = active_signing_key(store, cache, Instant::now())?
         .ok_or_else(|| "missing active auth signing key".to_string())?;
     match signing_key.algorithm.as_str() {
@@ -3335,7 +3260,7 @@ fn sign_access_token(
             header.kid = Some(signing_key.kid);
             let key = EncodingKey::from_ec_pem(signing_key.private_key.as_bytes())
                 .map_err(|e| e.to_string())?;
-            encode(&header, &claims, &key).map_err(|e| e.to_string())
+            encode(&header, claims, &key).map_err(|e| e.to_string())
         }
         _ => {
             let mut header = Header::new(Algorithm::HS256);
@@ -3344,7 +3269,7 @@ fn sign_access_token(
             }
             encode(
                 &header,
-                &claims,
+                claims,
                 &EncodingKey::from_secret(signing_key.private_key.as_bytes()),
             )
             .map_err(|e| e.to_string())
@@ -3455,8 +3380,15 @@ fn validate_access_claims(
     if session.get("user_id").map(String::as_str) != Some(claims.sub.as_str()) {
         return Err(error(401, "Unauthorized", "session user mismatch"));
     }
-    if access_revoked_after(store, &claims.session_id, now)
-        .map_err(|e| error(500, "Internal Server Error", &e))?
+    let persisted_revocation = session
+        .get("access_revoked_at")
+        .and_then(|value| value.parse::<u64>().ok());
+    let legacy_revocation = access_revoked_after(store, &claims.session_id, now)
+        .map_err(|e| error(500, "Internal Server Error", &e))?;
+    if persisted_revocation
+        .into_iter()
+        .chain(legacy_revocation)
+        .max()
         .map(|revoked_after| claims.iat as u64 <= revoked_after)
         .unwrap_or(false)
     {
@@ -3478,48 +3410,18 @@ fn validate_access_claims(
     Ok(claims)
 }
 
-fn revoke_session_family_access(
+fn access_revoked_after(
     store: &Store,
-    cache: &SharedSchemaCache,
     session_id: &str,
-    now_sec: &str,
     now: Instant,
-) -> Result<(), String> {
-    let Some(session) = find_row_by_field(store, cache, SESSIONS_TABLE, "id", session_id, now)?
-    else {
-        return Ok(());
-    };
-    let family = session
-        .get("refresh_token_family")
-        .map(String::as_str)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(session_id);
-    let sessions = find_rows_by_field(
-        store,
-        cache,
-        SESSIONS_TABLE,
-        "refresh_token_family",
-        family,
-        now,
-    )?;
-
-    for session in sessions {
-        if let Some(id) = session.get("id") {
-            persist_access_revocation(store, id, now_sec, now)?;
-        }
-    }
-
-    durable_table_update_where(
-        store,
-        cache,
-        SESSIONS_TABLE,
-        &[("revoked_at", now_sec), ("updated_at", now_sec)],
-        &["refresh_token_family", "=", family],
-        now,
-    )?;
-    Ok(())
+) -> Result<Option<u64>, String> {
+    let key = access_revoked_after_key(session_id);
+    store
+        .get_checked(&key, now)
+        .map(|value| value.and_then(|value| std::str::from_utf8(&value).ok()?.parse::<u64>().ok()))
 }
 
+#[cfg(test)]
 fn persist_access_revocation(
     store: &Store,
     session_id: &str,
@@ -3532,10 +3434,10 @@ fn persist_access_revocation(
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0);
-    let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
-    let deadline_ms = now_ms.saturating_add(ttl_ms);
-    let deadline = deadline_ms.to_string();
-    let args: [&[u8]; 5] = [
+    let deadline = now_ms
+        .saturating_add(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX))
+        .to_string();
+    let command: [&[u8]; 5] = [
         b"SET",
         &key,
         revoked_after.as_bytes(),
@@ -3543,22 +3445,11 @@ fn persist_access_revocation(
         deadline.as_bytes(),
     ];
     store
-        .commit_journaled(&args, || {
+        .commit_journaled(&command, || {
             store.set(&key, revoked_after.as_bytes(), Some(ttl), now)
         })
         .map_err(|error| format!("ERR WAL append failed: {error}"))?;
     Ok(())
-}
-
-fn access_revoked_after(
-    store: &Store,
-    session_id: &str,
-    now: Instant,
-) -> Result<Option<u64>, String> {
-    let key = access_revoked_after_key(session_id);
-    store
-        .get_checked(&key, now)
-        .map(|value| value.and_then(|value| std::str::from_utf8(&value).ok()?.parse::<u64>().ok()))
 }
 
 fn access_revoked_after_key(session_id: &str) -> Vec<u8> {

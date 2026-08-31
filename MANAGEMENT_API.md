@@ -57,6 +57,20 @@ in-memory credentials cannot be exported accidentally. To enter `ready`,
 configure encryption before restarting; the existing in-memory Auth state is
 discarded.
 
+## Refresh-token rotation
+
+Refresh tokens are single-use bearer credentials. Rotation advances the signed
+generation and stored token hash in one durable conditional table mutation. Of
+concurrent uses, exactly one can advance the session; a valid older generation
+is treated as reuse and revokes every session and access token in that sign-in
+family. The TypeScript SDK coalesces refreshes within a JavaScript realm and,
+when available, uses the browser Web Locks API plus persisted-session
+reconciliation to coordinate tabs. Custom clients must provide equivalent
+single-flight behavior. `auth.sessions` records rotation and reuse timestamps
+without storing bearer tokens, and direct table reads redact both current and
+legacy refresh-token hashes. Tokens issued by older Engine versions migrate to
+the generation model on their first successful refresh.
+
 ## Migrations
 
 Operator-authenticated HTTP routes:

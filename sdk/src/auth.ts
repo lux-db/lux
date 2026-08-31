@@ -48,10 +48,15 @@ export interface LuxAuthSessionRow {
 	user_id: string;
 	refresh_token_hash: string;
 	refresh_token_family?: string;
+	refresh_generation?: number | null;
+	legacy_refresh_token_hash?: string;
 	user_agent?: string;
 	ip?: string;
 	expires_at?: number | null;
 	revoked_at?: number | null;
+	access_revoked_at?: number | null;
+	refresh_rotated_at?: number | null;
+	refresh_reuse_detected_at?: number | null;
 	created_at?: number | null;
 	updated_at?: number | null;
 }
@@ -386,6 +391,14 @@ export interface LuxAuthSubscription {
 	unsubscribe(): void;
 }
 
+type RefreshResult = LuxResult<LuxAuthSessionResult>;
+
+// One JavaScript realm can contain several Lux clients that share a session
+// (for example, independently-created browser or server helpers). Coalesce by
+// endpoint, storage identity, and bearer token so only one request can present
+// that token. Browser tabs are coordinated separately with the Web Locks API.
+const realmRefreshes = new Map<string, Promise<RefreshResult>>();
+
 export class LuxAuthClient {
 	readonly admin: LuxAuthAdminClient;
 	private httpUrl?: string;
@@ -401,6 +414,7 @@ export class LuxAuthClient {
 	private loadedSession = false;
 	private storedSessionRaw: string | null = null;
 	private refreshTimer: ReturnType<typeof setTimeout> | null = null;
+	private refreshAdoptions = new WeakMap<Promise<RefreshResult>, Promise<RefreshResult>>();
 	private listeners = new Set<LuxAuthStateChangeCallback>();
 	private broadcastChannel?: {
 		postMessage(message: unknown): void;
@@ -739,18 +753,91 @@ export class LuxAuthClient {
 		});
 	}
 
-	async refreshSession(refreshToken: string): Promise<LuxResult<LuxAuthSessionResult>> {
+	refreshSession(refreshToken: string): Promise<LuxResult<LuxAuthSessionResult>> {
+		const coordinationKey = `${this.httpUrl ?? ''}\u0000${this.storageKey}\u0000${refreshToken}`;
+		let pending = realmRefreshes.get(coordinationKey);
+		if (!pending) {
+			const created = this.refreshSessionCoordinated(refreshToken);
+			pending = created;
+			realmRefreshes.set(coordinationKey, created);
+			void created.then(
+				() => this.clearRealmRefresh(coordinationKey, created),
+				() => this.clearRealmRefresh(coordinationKey, created),
+			);
+		}
+		let adopted = this.refreshAdoptions.get(pending);
+		if (!adopted) {
+			adopted = this.adoptRefreshResult(pending);
+			this.refreshAdoptions.set(pending, adopted);
+		}
+		return adopted;
+	}
+
+	private clearRealmRefresh(coordinationKey: string, pending: Promise<RefreshResult>): void {
+		if (realmRefreshes.get(coordinationKey) === pending) {
+			realmRefreshes.delete(coordinationKey);
+		}
+	}
+
+	private async adoptRefreshResult(pending: Promise<RefreshResult>): Promise<RefreshResult> {
+		const result = await pending;
+		if (result.error || !result.data.session) return result;
+		if (this.currentSession === result.data.session) return result;
 		try {
-			const session = await this.requestRaw<LuxAuthSession>('/auth/v1/token', {
+			await this.saveSession(result.data.session, 'TOKEN_REFRESHED');
+			return ok({ session: this.currentSession!, user: this.currentSession!.user });
+		} catch (error) {
+			return err('LUX_AUTH_REFRESH_ERROR', 'Failed to persist refreshed auth session', toLuxError(error));
+		}
+	}
+
+	private async refreshSessionCoordinated(refreshToken: string): Promise<RefreshResult> {
+		const locks = typeof globalThis === 'undefined'
+			? undefined
+			: (globalThis as any).navigator?.locks;
+		if (this.persistSession && this.storage && typeof locks?.request === 'function') {
+			try {
+				return await locks.request(
+					`lux-auth-refresh:${this.httpUrl ?? ''}:${this.storageKey}`,
+					{ mode: 'exclusive' },
+					async () => {
+						const replacement = await this.readReplacementSession(refreshToken);
+						const result = replacement
+							? ok({ session: replacement, user: replacement.user })
+							: await this.requestRefreshSession(refreshToken);
+						return this.adoptRefreshResult(Promise.resolve(result));
+					},
+				);
+			} catch (error) {
+				return err('LUX_AUTH_REFRESH_ERROR', 'Failed to coordinate auth session refresh', toLuxError(error));
+			}
+		}
+		return this.adoptRefreshResult(this.requestRefreshSession(refreshToken));
+	}
+
+	private async readReplacementSession(refreshToken: string): Promise<LuxAuthSession | null> {
+		if (!this.storage) return null;
+		const raw = await this.storage.getItem(this.storageKey);
+		if (!raw) return null;
+		try {
+			const session = normalizeSession(JSON.parse(raw));
+			return session.refresh_token !== refreshToken ? session : null;
+		} catch {
+			return null;
+		}
+	}
+
+	private async requestRefreshSession(refreshToken: string): Promise<RefreshResult> {
+		try {
+			const session = normalizeSession(await this.requestRaw<LuxAuthSession>('/auth/v1/token', {
 				method: 'POST',
 				body: JSON.stringify({
 					grant_type: 'refresh_token',
 					refresh_token: refreshToken,
 				}),
 				apiKey: true,
-			});
-			await this.saveSession(normalizeSession(session), 'TOKEN_REFRESHED');
-			return ok({ session: this.currentSession!, user: this.currentSession!.user });
+			}));
+			return ok({ session, user: session.user });
 		} catch (error) {
 			return err('LUX_AUTH_REFRESH_ERROR', 'Failed to refresh auth session', toLuxError(error));
 		}

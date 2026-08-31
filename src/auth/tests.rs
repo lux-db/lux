@@ -1912,6 +1912,38 @@ fn direct_auth_table_reads_redact_sensitive_values() {
         "joined password hash leaked: {joined_users}"
     );
 
+    let session = find_row_by_field(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        "user_id",
+        user_id,
+        Instant::now(),
+    )
+    .unwrap()
+    .unwrap();
+    durable_table_update_where(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        &[("legacy_refresh_token_hash", "legacy-refresh-hash")],
+        &["id", "=", &session["id"]],
+        Instant::now(),
+    )
+    .unwrap();
+    let mut sessions = bytes::BytesMut::new();
+    crate::cmd::execute(
+        &store,
+        &cache,
+        &broker,
+        &[b"TSELECT", b"*", b"FROM", b"auth.sessions"],
+        &mut sessions,
+        Instant::now(),
+    );
+    let sessions = std::str::from_utf8(&sessions).unwrap();
+    assert!(sessions.matches("<redacted>").count() >= 2, "{sessions}");
+    assert!(!sessions.contains("legacy-refresh-hash"), "{sessions}");
+
     let mut signing_keys = bytes::BytesMut::new();
     crate::cmd::execute(
         &store,
@@ -2054,6 +2086,519 @@ fn signup_and_password_grant_issue_tokens() {
     let token_json: Value = serde_json::from_str(&token_body).unwrap();
     assert!(token_json.get("access_token").is_some(), "{token_body}");
     assert!(token_json.get("refresh_token").is_some(), "{token_body}");
+}
+
+fn refresh_rotation_test_store() -> (Arc<Store>, SharedSchemaCache) {
+    let config = Arc::new(crate::ServerConfig {
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        ..crate::ServerConfig::default()
+    });
+    let store = Arc::new(Store::new_with_config(config));
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+    (store, cache)
+}
+
+fn signup_refresh_token(store: &Store, cache: &SharedSchemaCache, email: &str) -> Value {
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/signup",
+        &json!({"email":email,"password":"password123"}).to_string(),
+        &[],
+        &[],
+        store,
+        cache,
+    );
+    assert_eq!(status, 200, "signup failed: {body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+fn rotate_refresh_token(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    refresh_token: &str,
+    user_agent: &str,
+) -> (u16, Value) {
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/token",
+        &json!({"grant_type":"refresh_token","refresh_token":refresh_token}).to_string(),
+        &[],
+        &[("user-agent".to_string(), user_agent.to_string())],
+        store,
+        cache,
+    );
+    let parsed = serde_json::from_str(&body).unwrap_or_else(|_| json!({"body": body}));
+    (status, parsed)
+}
+
+#[test]
+fn refresh_rotation_updates_one_session_and_reuse_revokes_access() {
+    let (store, cache) = refresh_rotation_test_store();
+    let signup = signup_refresh_token(&store, &cache, "rotate@example.com");
+    let first_refresh = signup["refresh_token"].as_str().unwrap();
+    assert_eq!(first_refresh.matches('.').count(), 2);
+    let first_hash = hash_secret(first_refresh);
+    let initial = find_row_by_field(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        "refresh_token_hash",
+        &first_hash,
+        Instant::now(),
+    )
+    .unwrap()
+    .unwrap();
+    let family = initial["refresh_token_family"].clone();
+    assert_eq!(
+        initial.get("refresh_generation").map(String::as_str),
+        Some("1")
+    );
+
+    let (status, rotated) = rotate_refresh_token(&store, &cache, first_refresh, "second-client");
+    assert_eq!(status, 200, "{rotated}");
+    let next_refresh = rotated["refresh_token"].as_str().unwrap();
+    let rotated_access = rotated["access_token"].as_str().unwrap();
+    let family_rows = find_rows_by_field(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        "refresh_token_family",
+        &family,
+        Instant::now(),
+    )
+    .unwrap();
+    assert_eq!(
+        family_rows.len(),
+        1,
+        "new rotations must not grow a session chain"
+    );
+    assert_eq!(
+        family_rows[0].get("refresh_generation").map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        family_rows[0].get("user_agent").map(String::as_str),
+        Some("second-client")
+    );
+
+    let (status, replay) = rotate_refresh_token(&store, &cache, first_refresh, "replay");
+    assert_eq!(status, 401, "{replay}");
+    assert!(replay.to_string().contains("reuse detected"), "{replay}");
+    assert!(claims_from_access_token(rotated_access, &store, &cache).is_err());
+    let (status, body) = rotate_refresh_token(&store, &cache, next_refresh, "winner");
+    assert_eq!(status, 401, "{body}");
+}
+
+#[test]
+fn invalid_structured_refresh_tokens_cannot_revoke_a_session() {
+    let (store, cache) = refresh_rotation_test_store();
+    let signup = signup_refresh_token(&store, &cache, "forged@example.com");
+    let refresh = signup["refresh_token"].as_str().unwrap();
+    let access = signup["access_token"].as_str().unwrap();
+
+    let (status, _) = rotate_refresh_token(&store, &cache, access, "wrong-token-type");
+    assert_eq!(status, 401);
+    let mut forged = refresh.as_bytes().to_vec();
+    let last = forged.len() - 1;
+    forged[last] = if forged[last] == b'a' { b'b' } else { b'a' };
+    let forged = String::from_utf8(forged).unwrap();
+    let (status, _) = rotate_refresh_token(&store, &cache, &forged, "attacker");
+    assert_eq!(status, 401);
+
+    let (status, body) = rotate_refresh_token(&store, &cache, refresh, "real-client");
+    assert_eq!(status, 200, "{body}");
+}
+
+#[test]
+fn expired_signed_refresh_token_can_still_log_out_its_family() {
+    let (store, cache) = refresh_rotation_test_store();
+    let signup = signup_refresh_token(&store, &cache, "expired-logout@example.com");
+    let issued = signup["refresh_token"].as_str().unwrap();
+    let session = find_row_by_field(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        "refresh_token_hash",
+        &hash_secret(issued),
+        Instant::now(),
+    )
+    .unwrap()
+    .unwrap();
+    let expired = super::refresh::sign(
+        &store,
+        &cache,
+        &session["user_id"],
+        &session["id"],
+        &session["refresh_token_family"],
+        1,
+        1,
+    )
+    .unwrap();
+    durable_table_update_where(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        &[
+            ("refresh_token_hash", &hash_secret(&expired)),
+            ("expires_at", "1"),
+        ],
+        &["id", "=", &session["id"]],
+        Instant::now(),
+    )
+    .unwrap();
+
+    let (status, _, body) = route_http(
+        "POST",
+        "/auth/v1/logout",
+        &json!({"refresh_token":expired}).to_string(),
+        &[],
+        &[],
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        claims_from_access_token(signup["access_token"].as_str().unwrap(), &store, &cache).is_err()
+    );
+}
+
+#[test]
+fn legacy_opaque_refresh_token_migrates_once_and_detects_reuse() {
+    let (store, cache) = refresh_rotation_test_store();
+    let signup = signup_refresh_token(&store, &cache, "legacy@example.com");
+    let issued = signup["refresh_token"].as_str().unwrap();
+    let issued_hash = hash_secret(issued);
+    let session = find_row_by_field(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        "refresh_token_hash",
+        &issued_hash,
+        Instant::now(),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = session["id"].clone();
+    let legacy = random_token(32);
+    let legacy_hash = hash_secret(&legacy);
+    durable_table_update_where(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        &[
+            ("refresh_token_hash", &legacy_hash),
+            ("refresh_generation", "0"),
+            ("revoked_at", "0"),
+        ],
+        &["id", "=", &session_id],
+        Instant::now(),
+    )
+    .unwrap();
+
+    let (status, rotated) = rotate_refresh_token(&store, &cache, &legacy, "legacy-client");
+    assert_eq!(status, 200, "{rotated}");
+    let next = rotated["refresh_token"].as_str().unwrap();
+    let migrated = find_row_by_field(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        "id",
+        &session_id,
+        Instant::now(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        migrated.get("legacy_refresh_token_hash"),
+        Some(&legacy_hash)
+    );
+    assert_eq!(
+        migrated.get("refresh_generation").map(String::as_str),
+        Some("1")
+    );
+
+    let (status, body) = rotate_refresh_token(&store, &cache, &legacy, "legacy-replay");
+    assert_eq!(status, 401, "{body}");
+    assert!(body.to_string().contains("reuse detected"), "{body}");
+    let (status, body) = rotate_refresh_token(&store, &cache, next, "legacy-client");
+    assert_eq!(status, 401, "{body}");
+}
+
+#[test]
+fn consumed_legacy_session_row_revokes_its_active_family_successor() {
+    let (store, cache) = refresh_rotation_test_store();
+    let signup = signup_refresh_token(&store, &cache, "legacy-chain@example.com");
+    let current_refresh = signup["refresh_token"].as_str().unwrap();
+    let current_hash = hash_secret(current_refresh);
+    let current = find_row_by_field(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        "refresh_token_hash",
+        &current_hash,
+        Instant::now(),
+    )
+    .unwrap()
+    .unwrap();
+    let old_token = random_token(32);
+    let old_hash = hash_secret(&old_token);
+    let now = unix_seconds().to_string();
+    let expires = unix_seconds().saturating_add(3600).to_string();
+    let old_session_id = "legacy-consumed-session";
+    durable_table_insert(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        &[
+            ("id", old_session_id),
+            ("user_id", &current["user_id"]),
+            ("refresh_token_hash", &old_hash),
+            ("refresh_token_family", &current["refresh_token_family"]),
+            ("expires_at", &expires),
+            ("revoked_at", &now),
+            ("created_at", &now),
+            ("updated_at", &now),
+        ],
+        Instant::now(),
+    )
+    .unwrap();
+    let old_access = sign_access_token(
+        &store,
+        &cache,
+        &current["user_id"],
+        "legacy-chain@example.com",
+        old_session_id,
+    )
+    .unwrap();
+
+    let (status, body) = rotate_refresh_token(&store, &cache, &old_token, "legacy-replay");
+    assert_eq!(status, 401, "{body}");
+    assert!(body.to_string().contains("reuse detected"), "{body}");
+    assert!(claims_from_access_token(&old_access, &store, &cache).is_err());
+    assert!(
+        claims_from_access_token(signup["access_token"].as_str().unwrap(), &store, &cache).is_err()
+    );
+    let (status, body) = rotate_refresh_token(&store, &cache, current_refresh, "current-client");
+    assert_eq!(status, 401, "{body}");
+}
+
+#[test]
+fn expired_refresh_token_cannot_rotate_or_mark_reuse() {
+    let (store, cache) = refresh_rotation_test_store();
+    let signup = signup_refresh_token(&store, &cache, "expired@example.com");
+    let refresh = signup["refresh_token"].as_str().unwrap();
+    let hash = hash_secret(refresh);
+    let session = find_row_by_field(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        "refresh_token_hash",
+        &hash,
+        Instant::now(),
+    )
+    .unwrap()
+    .unwrap();
+    durable_table_update_where(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        &[("expires_at", "1")],
+        &["id", "=", &session["id"]],
+        Instant::now(),
+    )
+    .unwrap();
+
+    let (status, body) = rotate_refresh_token(&store, &cache, refresh, "expired-client");
+    assert_eq!(status, 401, "{body}");
+    assert!(body.to_string().contains("expired"), "{body}");
+    let session = find_row_by_field(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        "id",
+        &session["id"],
+        Instant::now(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!row_field_is_set(&session, "refresh_reuse_detected_at"));
+}
+
+#[test]
+fn concurrent_refresh_has_one_winner_and_revokes_the_winner_on_reuse() {
+    let (store, cache) = refresh_rotation_test_store();
+    let signup = signup_refresh_token(&store, &cache, "race@example.com");
+    let refresh = Arc::new(signup["refresh_token"].as_str().unwrap().to_string());
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let mut threads = Vec::new();
+    for client in 0..8 {
+        let store = store.clone();
+        let cache = cache.clone();
+        let refresh = refresh.clone();
+        let barrier = barrier.clone();
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            rotate_refresh_token(&store, &cache, &refresh, &format!("race-{client}"))
+        }));
+    }
+    let responses = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|(status, _)| *status == 200)
+            .count(),
+        1,
+        "exactly one rotation may commit: {responses:?}"
+    );
+    assert!(responses
+        .iter()
+        .filter(|(status, _)| *status == 401)
+        .all(|(_, body)| body.to_string().contains("reuse detected")));
+    let winner = responses.iter().find(|(status, _)| *status == 200).unwrap();
+    let access = winner.1["access_token"].as_str().unwrap();
+    assert!(claims_from_access_token(access, &store, &cache).is_err());
+}
+
+#[test]
+fn refresh_rotation_does_not_advance_when_wal_append_or_fsync_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ServerConfig {
+        data_dir: dir.path().to_string_lossy().to_string(),
+        durability: DurabilityConfig {
+            policy: DurabilityPolicy::AlwaysSync,
+            ..DurabilityConfig::default()
+        },
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        encryption: crate::EncryptionConfig {
+            active_key_id: Some("refresh-test".to_string()),
+            keys: vec![crate::EncryptionKeyConfig {
+                id: "refresh-test".to_string(),
+                secret: b"refresh-rotation-test-key".to_vec(),
+                decrypt_only: false,
+            }],
+            ..Default::default()
+        },
+        ..ServerConfig::default()
+    });
+    let store = Store::new_with_config(config);
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+    let signup = signup_refresh_token(&store, &cache, "wal-refresh@example.com");
+    let first = signup["refresh_token"].as_str().unwrap();
+
+    store.inject_journal_failures(1);
+    let (status, body) = rotate_refresh_token(&store, &cache, first, "append-failure");
+    assert_eq!(status, 500, "{body}");
+    let (status, recovered) = rotate_refresh_token(&store, &cache, first, "append-retry");
+    assert_eq!(status, 200, "{recovered}");
+    let second = recovered["refresh_token"].as_str().unwrap();
+
+    store.inject_journal_fsync_failures(1);
+    let (status, body) = rotate_refresh_token(&store, &cache, second, "fsync-failure");
+    assert_eq!(status, 500, "{body}");
+    let (status, recovered) = rotate_refresh_token(&store, &cache, second, "fsync-retry");
+    assert_eq!(status, 200, "{recovered}");
+}
+
+#[test]
+fn interrupted_refresh_rotation_replays_fail_closed_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ServerConfig {
+        data_dir: dir.path().to_string_lossy().to_string(),
+        durability: DurabilityConfig {
+            policy: DurabilityPolicy::AlwaysSync,
+            ..DurabilityConfig::default()
+        },
+        auth: AuthConfig {
+            enabled: true,
+            ..AuthConfig::default()
+        },
+        encryption: crate::EncryptionConfig {
+            active_key_id: Some("refresh-crash".to_string()),
+            keys: vec![crate::EncryptionKeyConfig {
+                id: "refresh-crash".to_string(),
+                secret: b"refresh-crash-test-key".to_vec(),
+                decrypt_only: false,
+            }],
+            ..Default::default()
+        },
+        ..ServerConfig::default()
+    });
+    let (refresh, access) = {
+        let store = Store::new_with_config(config.clone());
+        let cache = Arc::new(RwLock::new(SchemaCache::new()));
+        bootstrap(&store, &cache, &store.config().auth).unwrap();
+        bootstrap_runtime(&store, &cache, &store.config().auth).unwrap();
+        let signup = signup_refresh_token(&store, &cache, "crash-refresh@example.com");
+        let refresh = signup["refresh_token"].as_str().unwrap().to_string();
+        let access = signup["access_token"].as_str().unwrap().to_string();
+        crate::tables::fail_next_table_mutation_after_journal();
+        let (status, body) = rotate_refresh_token(&store, &cache, &refresh, "crash-window");
+        assert_eq!(status, 500, "{body}");
+        (refresh, access)
+    };
+
+    let restored = Store::new_with_config(config);
+    restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&restored, &cache, &restored.config().auth).unwrap();
+    bootstrap_runtime(&restored, &cache, &restored.config().auth).unwrap();
+    let (status, body) = rotate_refresh_token(&restored, &cache, &refresh, "after-restart");
+    assert_eq!(status, 401, "{body}");
+    assert!(body.to_string().contains("reuse detected"), "{body}");
+    assert!(claims_from_access_token(&access, &restored, &cache).is_err());
+}
+
+#[test]
+fn refresh_schema_upgrade_is_idempotent() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    create_table_if_missing(
+        &store,
+        &cache,
+        SESSIONS_TABLE,
+        &[
+            "id STR PRIMARY KEY,",
+            "user_id UUID,",
+            "refresh_token_hash STR UNIQUE,",
+            "refresh_token_family STR,",
+            "expires_at INT,",
+            "revoked_at INT",
+        ],
+        Instant::now(),
+    )
+    .unwrap();
+    bootstrap(&store, &cache, &AuthConfig::default()).unwrap();
+    bootstrap(&store, &cache, &AuthConfig::default()).unwrap();
+    let schema = tables::table_schema(&store, &cache, SESSIONS_TABLE, Instant::now()).unwrap();
+    for field in [
+        "refresh_generation",
+        "legacy_refresh_token_hash",
+        "access_revoked_at",
+        "refresh_rotated_at",
+        "refresh_reuse_detected_at",
+    ] {
+        assert_eq!(
+            schema
+                .iter()
+                .filter(|definition| definition.split_whitespace().next() == Some(field))
+                .count(),
+            1,
+            "{field} must be added exactly once"
+        );
+    }
 }
 
 fn flow_token_for_email(

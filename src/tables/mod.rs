@@ -628,7 +628,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn fail_next_table_mutation_after_journal() {
+pub(crate) fn fail_next_table_mutation_after_journal() {
     FAIL_TABLE_MUTATION_AFTER_JOURNAL.with(|fault| fault.set(true));
 }
 

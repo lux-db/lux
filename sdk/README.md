@@ -16,7 +16,10 @@ Use a publishable key in browser code. The browser client persists auth sessions
 in the shared `lux-auth-session` cookie by default.
 Like Supabase's SSR client, `createBrowserClient` returns a singleton in browser
 environments, broadcasts auth changes across tabs, and recovers the cookie-backed
-session when the document becomes visible.
+session when the document becomes visible. Refresh calls are coalesced within a
+JavaScript realm. In browsers that support the Web Locks API, tabs also serialize
+refresh work and adopt a session another tab has already rotated rather than
+replaying its consumed refresh token.
 
 ```ts
 import { createBrowserClient } from "@luxdb/sdk/browser";

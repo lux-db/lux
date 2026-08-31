@@ -248,6 +248,191 @@ describe('LuxAuthClient session state', () => {
 		});
 	});
 
+	test('coalesces concurrent refreshes across clients in one JavaScript realm', async () => {
+		let release!: () => void;
+		const responseGate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let requests = 0;
+		const fetchImpl = async () => {
+			requests += 1;
+			await responseGate;
+			return new Response(JSON.stringify(session({
+				access_token: 'next-access-token',
+				refresh_token: 'next-refresh-token',
+			})), { status: 200 });
+		};
+		const firstStorage = memoryStorage();
+		const secondStorage = memoryStorage();
+		const first = new LuxAuthClient({
+			httpUrl: 'http://localhost:3957/v1/project',
+			fetch: fetchImpl as typeof fetch,
+			persistSession: true,
+			autoRefreshToken: false,
+			storage: firstStorage,
+			storageKey: 'lux.refresh.single-flight',
+		});
+		const second = new LuxAuthClient({
+			httpUrl: 'http://localhost:3957/v1/project',
+			fetch: fetchImpl as typeof fetch,
+			persistSession: true,
+			autoRefreshToken: false,
+			storage: secondStorage,
+			storageKey: 'lux.refresh.single-flight',
+		});
+		const firstEvents: string[] = [];
+		first.onAuthStateChange((event) => firstEvents.push(event));
+
+		const pending = [
+			first.refreshSession('refresh-token'),
+			second.refreshSession('refresh-token'),
+			first.refreshSession('refresh-token'),
+		];
+		expect(requests).toBe(1);
+		release();
+		const results = await Promise.all(pending);
+
+		expect(results.every((result) => result.error === null)).toBe(true);
+		expect(results.map((result) => result.data?.session?.refresh_token)).toEqual([
+			'next-refresh-token',
+			'next-refresh-token',
+			'next-refresh-token',
+		]);
+		expect(JSON.parse(firstStorage.data.get('lux.refresh.single-flight')!).refresh_token)
+			.toBe('next-refresh-token');
+		expect(JSON.parse(secondStorage.data.get('lux.refresh.single-flight')!).refresh_token)
+			.toBe('next-refresh-token');
+		expect(firstEvents.filter((event) => event === 'TOKEN_REFRESHED')).toHaveLength(1);
+	});
+
+	test('a browser refresh lock adopts a session rotated by another tab', async () => {
+		const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+		const lockRequests: Array<{ name: string; mode: string | undefined }> = [];
+		Object.defineProperty(globalThis, 'navigator', {
+			configurable: true,
+			value: {
+				locks: {
+					request: async (
+						name: string,
+						options: { mode?: string },
+						callback: () => Promise<unknown>,
+					) => {
+						lockRequests.push({ name, mode: options.mode });
+						return callback();
+					},
+				},
+			},
+		});
+
+		try {
+			const storageKey = 'lux.refresh.tabs';
+			const storage = memoryStorage({
+				[storageKey]: JSON.stringify(session({
+					access_token: 'other-tab-access-token',
+					refresh_token: 'other-tab-refresh-token',
+				})),
+			});
+			let requests = 0;
+			const auth = new LuxAuthClient({
+				httpUrl: 'http://localhost:3957/v1/project',
+				fetch: (async () => {
+					requests += 1;
+					throw new Error('the consumed token must not be presented');
+				}) as typeof fetch,
+				persistSession: true,
+				autoRefreshToken: false,
+				storage,
+				storageKey,
+			});
+
+			const result = await auth.refreshSession('refresh-token');
+
+			expect(result.error).toBeNull();
+			expect(result.data?.session?.refresh_token).toBe('other-tab-refresh-token');
+			expect(requests).toBe(0);
+			expect(lockRequests).toEqual([{
+				name: 'lux-auth-refresh:http://localhost:3957/v1/project:lux.refresh.tabs',
+				mode: 'exclusive',
+			}]);
+		} finally {
+			if (originalNavigator) Object.defineProperty(globalThis, 'navigator', originalNavigator);
+			else delete (globalThis as { navigator?: unknown }).navigator;
+		}
+	});
+
+	test('persists a rotated session before releasing the browser refresh lock', async () => {
+		const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+		const storageKey = 'lux.refresh.lock-boundary';
+		const storage = memoryStorage({
+			[storageKey]: JSON.stringify(session()),
+		});
+		let tokenAtLockRelease: string | undefined;
+		Object.defineProperty(globalThis, 'navigator', {
+			configurable: true,
+			value: {
+				locks: {
+					request: async (
+						_name: string,
+						_options: { mode?: string },
+						callback: () => Promise<unknown>,
+					) => {
+						const result = await callback();
+						tokenAtLockRelease = JSON.parse(storage.data.get(storageKey)!).refresh_token;
+						return result;
+					},
+				},
+			},
+		});
+
+		try {
+			const auth = new LuxAuthClient({
+				httpUrl: 'http://localhost:3957/v1/project',
+				fetch: (async () => new Response(JSON.stringify(session({
+					access_token: 'next-access-token',
+					refresh_token: 'next-refresh-token',
+				})), { status: 200 })) as typeof fetch,
+				persistSession: true,
+				autoRefreshToken: false,
+				storage,
+				storageKey,
+			});
+
+			const result = await auth.refreshSession('refresh-token');
+
+			expect(result.error).toBeNull();
+			expect(tokenAtLockRelease).toBe('next-refresh-token');
+		} finally {
+			if (originalNavigator) Object.defineProperty(globalThis, 'navigator', originalNavigator);
+			else delete (globalThis as { navigator?: unknown }).navigator;
+		}
+	});
+
+	test('allows a refresh retry after a failed single-flight request settles', async () => {
+		let requests = 0;
+		const auth = new LuxAuthClient({
+			httpUrl: 'http://localhost:3957/v1/project',
+			fetch: (async () => {
+				requests += 1;
+				if (requests === 1) {
+					return new Response(JSON.stringify({ error: 'transient failure' }), { status: 503 });
+				}
+				return new Response(JSON.stringify(session({
+					refresh_token: 'retry-refresh-token',
+				})), { status: 200 });
+			}) as typeof fetch,
+			persistSession: false,
+			autoRefreshToken: false,
+			storageKey: 'lux.refresh.retry',
+		});
+
+		const failed = await auth.refreshSession('refresh-token');
+		const retried = await auth.refreshSession('refresh-token');
+
+		expect(failed.error?.code).toBe('LUX_AUTH_REFRESH_ERROR');
+		expect(retried.data?.session?.refresh_token).toBe('retry-refresh-token');
+		expect(requests).toBe(2);
+	});
+
 	test('native Apple sign-in requests a nonce and stores the exchanged session', async () => {
 		const storage = memoryStorage();
 		const calls: Array<{ url: string; headers: Record<string, string>; body: unknown }> = [];
