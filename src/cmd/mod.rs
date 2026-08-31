@@ -1965,16 +1965,20 @@ pub fn execute(
         return CmdResult::Written;
     }
 
-    if args.len() > 1 {
-        if let Err(error) = store.try_promote(args[1], now) {
-            resp::write_error(out, &error);
+    if crate::eviction::is_write_command(cmd) {
+        if let Err(e) = crate::eviction::evict_if_needed(store) {
+            resp::write_error(out, &e);
             return CmdResult::Written;
         }
     }
 
-    if crate::eviction::is_write_command(cmd) {
-        if let Err(e) = crate::eviction::evict_if_needed(store) {
-            resp::write_error(out, &e);
+    // Evict before promoting the target of a write. Promoting first allowed
+    // memory pressure to spill that same key again before the mutation ran;
+    // the mutation then created a second hot value which a later promotion
+    // overwrote with the stale cold copy.
+    if args.len() > 1 {
+        if let Err(error) = store.try_promote(args[1], now) {
+            resp::write_error(out, &error);
             return CmdResult::Written;
         }
     }
@@ -4410,6 +4414,37 @@ mod tests {
     }
 
     #[test]
+    fn tiered_write_does_not_re_evict_a_promoted_target_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(Arc::new(ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            storage: StorageConfig {
+                mode: StorageMode::Tiered,
+                dir: dir.path().to_string_lossy().to_string(),
+            },
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::EverySecond,
+                ..Default::default()
+            },
+            eviction: crate::EvictionConfig {
+                max_memory: 1,
+                policy: crate::EvictionPolicy::AllKeysLru,
+                sample_size: 5,
+            },
+            ..ServerConfig::default()
+        }));
+        let now = Instant::now();
+
+        store.lpush(b"list", &[b"a", b"b", b"c"], now).unwrap();
+        assert!(store.evict_key(store.shard_for_key(b"list"), b"list"));
+        assert!(store.disk_contains(b"list"));
+
+        assert_eq!(exec_str(&store, &[b"LPUSH", b"list", b"d"]), ":4\r\n");
+        assert_eq!(exec_str(&store, &[b"LLEN", b"list"]), ":4\r\n");
+        assert!(!store.disk_contains(b"list"));
+    }
+
+    #[test]
     fn journal_failure_prevents_generic_and_resolved_mutations() {
         let dir = tempfile::tempdir().unwrap();
         let store = journal_test_store(dir.path());
@@ -4854,7 +4889,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = journal_test_store(dir.path());
         for key in [b"preserved".as_slice(), b"revived", b"retimed"] {
-            exec_wal(&store, &[b"PSETEX", key, b"80", b"old"]);
+            exec_wal(&store, &[b"PSETEX", key, b"2000", b"old"]);
         }
         crate::snapshot::save_and_truncate_wal_consistent(&store).unwrap();
 
@@ -4865,7 +4900,7 @@ mod tests {
         exec_wal(&store, &[b"SET", b"revived", b"new"]);
         exec_wal(&store, &[b"PEXPIRE", b"retimed", b"60000"]);
         store.fsync_wal();
-        std::thread::sleep(Duration::from_millis(140));
+        std::thread::sleep(Duration::from_millis(2200));
 
         let restored = journal_test_store(dir.path());
         restored.begin_recovery();

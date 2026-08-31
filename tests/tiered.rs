@@ -88,9 +88,12 @@ fn tiered_cold_list_mutation() {
     let mut c = srv.conn();
     send(&mut c, &["LPUSH", "l", "a", "b", "c"]);
     fill_memory(&mut c, 20);
-    send(&mut c, &["LPUSH", "l", "d"]);
+    let pushed = send(&mut c, &["LPUSH", "l", "d"]);
+    assert!(pushed.contains(":4"), "LPUSH should return 4: {pushed}");
     let resp = send(&mut c, &["LLEN", "l"]);
     assert!(resp.contains(":4"), "LLEN should be 4: {resp}");
+    let values = send(&mut c, &["LRANGE", "l", "0", "-1"]);
+    assert!(values.contains("d"), "LPUSH value was lost: {values}");
 }
 
 #[test]
