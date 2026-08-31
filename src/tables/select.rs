@@ -1137,6 +1137,20 @@ pub fn table_select(
     plan: &SelectPlan,
     now: Instant,
 ) -> Result<SelectResult, String> {
+    let version = store.stable_table_read_version();
+    let result = table_select_once(store, cache, plan, now);
+    if store.table_read_version_is_current(version) {
+        return result;
+    }
+    store.with_consistent_table_read(|| table_select_once(store, cache, plan, now))
+}
+
+fn table_select_once(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    plan: &SelectPlan,
+    now: Instant,
+) -> Result<SelectResult, String> {
     let schema = load_schema(store, cache, &plan.table, now)?;
     let table_alias = plan.alias.as_deref().unwrap_or(&plan.table);
 
@@ -1381,6 +1395,10 @@ pub fn table_select(
             for pk in scan.row_ids {
                 if let Some(row) = process(pk)? {
                     rows.push(row);
+                    #[cfg(test)]
+                    if rows.len() == 1 {
+                        store.run_table_read_after_first_row_hook();
+                    }
                     if rows.len() == limit {
                         break;
                     }
@@ -2895,8 +2913,25 @@ pub(crate) fn scan_matching_pks(
     )?
     .row_ids;
 
+    // Index intersections use hash sets internally. Mutation RETURNING order
+    // must not inherit their randomized iteration order, so restore the table's
+    // canonical ids-set order (score, then primary key) before evaluating rows.
+    let ids = ids_key(table);
+    let mut ordered_ids = Vec::with_capacity(row_ids.len());
+    for pk in row_ids {
+        let score = store
+            .zscore(ids.as_bytes(), pk.as_bytes(), now)?
+            .unwrap_or(f64::INFINITY);
+        ordered_ids.push((pk, score));
+    }
+    ordered_ids.sort_by(|(left_pk, left_score), (right_pk, right_score)| {
+        left_score
+            .total_cmp(right_score)
+            .then_with(|| left_pk.cmp(right_pk))
+    });
+
     let mut matched = Vec::new();
-    for pk_str in row_ids {
+    for (pk_str, _) in ordered_ids {
         // Internal WHERE re-check: needs plaintext regardless of caller.
         let Some(row) = get_row(store, table, &schema, &pk_str, now, true)? else {
             continue;

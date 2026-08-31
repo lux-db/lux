@@ -2676,6 +2676,9 @@ pub fn execute(
             if cmd_eq(cmd, b"TROWSET") {
                 return tables::cmd_trowset(args, store, cache, out, now);
             }
+            if cmd_eq(cmd, b"TROWDEL") {
+                return tables::cmd_trowdel(args, store, cache, out, now);
+            }
             if cmd_eq(cmd, b"TUPSERT") {
                 return tables::cmd_tupsert(args, store, cache, out, now);
             }
@@ -4906,6 +4909,15 @@ mod tests {
             row_images, 2,
             "insert and update must each appear exactly once"
         );
+    }
+
+    #[test]
+    fn resolved_table_journal_commands_are_not_client_callable() {
+        let store = Store::new();
+        for command in [b"TROWSET".as_slice(), b"TROWDEL".as_slice()] {
+            let response = exec_str(&store, &[command, b"items", b"1"]);
+            assert!(response.contains("unknown command"), "{response}");
+        }
     }
 
     #[test]

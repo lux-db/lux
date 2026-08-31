@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicU32, AtomicUsize};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 mod hashes;
@@ -645,6 +645,10 @@ pub struct Store {
     /// table write is moving from its resolved journal record to one atomic
     /// multi-shard publication.
     table_mutation_gate: parking_lot::ReentrantMutex<()>,
+    /// Even while table state is stable and odd while one validated table
+    /// batch is being published. Multi-key readers retry when this changes,
+    /// preventing a scan from combining rows from opposite sides of a commit.
+    table_publication: AtomicU64,
     /// Exact sentinel used only while replaying post-snapshot mutations. It
     /// keeps snapshot entries whose wall-clock TTL elapsed during downtime
     /// visible to TTL-preserving journal commands without reviving them after
@@ -676,6 +680,9 @@ pub struct Store {
     snapshot_failures_to_inject: AtomicUsize,
     #[cfg(test)]
     snapshot_after_capture_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
+    #[cfg(test)]
+    table_read_after_first_row_hook:
+        parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
     /// Set once at runtime startup; sink for typed row deltas feeding reactive
     /// live queries. Absent for embedded/replay-only stores, so emission is a
     /// cheap no-op there.
@@ -833,6 +840,7 @@ enum TableBatchOp {
     SetString(Vec<u8>, Vec<u8>),
     HashSet(Vec<u8>, Vec<(String, Vec<u8>)>),
     HashDelete(Vec<u8>, Vec<String>),
+    HashDeleteIfValue(Vec<u8>, String, Vec<u8>),
     SetAdd(Vec<u8>, String),
     SetRemove(Vec<u8>, String),
     SortedSetAdd(Vec<u8>, String, f64),
@@ -849,6 +857,17 @@ pub(crate) struct AtomicTableBatch<'a> {
     now: Instant,
     kinds: BTreeMap<Vec<u8>, TableEntryKind>,
     operations: Vec<TableBatchOp>,
+}
+
+struct TablePublication<'a> {
+    store: &'a Store,
+}
+
+impl Drop for TablePublication<'_> {
+    fn drop(&mut self) {
+        let previous = self.store.table_publication.fetch_add(1, Ordering::Release);
+        debug_assert_eq!(previous & 1, 1);
+    }
 }
 
 impl<'a> AtomicTableBatch<'a> {
@@ -922,6 +941,21 @@ impl<'a> AtomicTableBatch<'a> {
         self.operations.push(TableBatchOp::HashDelete(
             key.as_bytes().to_vec(),
             fields_to_delete.to_vec(),
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn hash_delete_if_value(
+        &mut self,
+        key: &str,
+        field: &str,
+        expected: &[u8],
+    ) -> Result<(), String> {
+        self.require_kind(key.as_bytes(), TableEntryKind::Hash)?;
+        self.operations.push(TableBatchOp::HashDeleteIfValue(
+            key.as_bytes().to_vec(),
+            field.to_string(),
+            expected.to_vec(),
         ));
         Ok(())
     }
@@ -1017,6 +1051,7 @@ impl<'a> AtomicTableBatch<'a> {
             shard_positions[*shard_index] = shards.len();
             shards.push(store.shards[*shard_index].write());
         }
+        let _publication = store.begin_table_publication();
         let mut memory_deltas = vec![0isize; store.shards.len()];
         let mut key_delta = 0isize;
         let mut vector_before = Vec::new();
@@ -1047,6 +1082,7 @@ impl<'a> AtomicTableBatch<'a> {
                 TableBatchOp::SetString(key, _)
                 | TableBatchOp::HashSet(key, _)
                 | TableBatchOp::HashDelete(key, _)
+                | TableBatchOp::HashDeleteIfValue(key, _, _)
                 | TableBatchOp::SetAdd(key, _)
                 | TableBatchOp::SetRemove(key, _)
                 | TableBatchOp::SortedSetAdd(key, _, _)
@@ -1127,6 +1163,37 @@ impl<'a> AtomicTableBatch<'a> {
                                 fields.expiries.remove(&field);
                             }
                             remove_key = fields.fields.is_empty();
+                        }
+                    }
+                    if remove_key {
+                        shard.data.remove(&key);
+                        memory_deltas[shard_index] -= (key.len() + 64) as isize;
+                        key_delta -= 1;
+                    }
+                }
+                TableBatchOp::HashDeleteIfValue(key, field, expected) => {
+                    let mut remove_key = false;
+                    if let Some(entry) = shard.data.get_mut(&key) {
+                        if !entry.is_expired_at(self.now) {
+                            let StoreValue::Hash(fields) = &mut entry.value else {
+                                unreachable!(
+                                    "table hash type was validated before journal publication"
+                                )
+                            };
+                            if fields
+                                .fields
+                                .get(&field)
+                                .is_some_and(|value| value.as_ref() == expected.as_slice())
+                            {
+                                let value = fields
+                                    .fields
+                                    .remove(&field)
+                                    .expect("the conditional hash field was just observed");
+                                memory_deltas[shard_index] -=
+                                    (field.len() + value.len() + 64) as isize;
+                                fields.expiries.remove(&field);
+                                remove_key = fields.fields.is_empty();
+                            }
                         }
                     }
                     if remove_key {
@@ -1570,6 +1637,7 @@ impl Store {
             recovery_wal_checkpoints: parking_lot::Mutex::new(HashMap::new()),
             journal_gates,
             table_mutation_gate: parking_lot::ReentrantMutex::new(()),
+            table_publication: AtomicU64::new(0),
             recovery_expiry_sentinel: parking_lot::Mutex::new(None),
             wal_suppress: std::sync::atomic::AtomicBool::new(false),
             replaying_wal: std::sync::atomic::AtomicBool::new(false),
@@ -1587,6 +1655,8 @@ impl Store {
             snapshot_failures_to_inject: AtomicUsize::new(0),
             #[cfg(test)]
             snapshot_after_capture_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            table_read_after_first_row_hook: parking_lot::Mutex::new(None),
             row_delta_broker: std::sync::OnceLock::new(),
         })
     }
@@ -2360,6 +2430,47 @@ impl Store {
         self.shards[idx].write()
     }
 
+    fn begin_table_publication(&self) -> TablePublication<'_> {
+        let previous = self.table_publication.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(previous & 1, 0);
+        TablePublication { store: self }
+    }
+
+    pub(crate) fn stable_table_read_version(&self) -> u64 {
+        loop {
+            let version = self.table_publication.load(Ordering::Acquire);
+            if version & 1 == 0 {
+                return version;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    pub(crate) fn table_read_version_is_current(&self, version: u64) -> bool {
+        self.table_publication.load(Ordering::Acquire) == version
+    }
+
+    pub(crate) fn with_consistent_table_read<T>(&self, read: impl FnOnce() -> T) -> T {
+        let _guard = self.table_mutation_gate.lock();
+        read()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_table_read_after_first_row_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) {
+        *self.table_read_after_first_row_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_table_read_after_first_row_hook(&self) {
+        let hook = self.table_read_after_first_row_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// Evict a key from memory. In tiered mode, the entry is serialized to
     /// the disk shard BEFORE being removed from memory. If the disk write
     /// fails, the entry stays in memory (no silent data loss).
@@ -2703,6 +2814,7 @@ impl Store {
         };
         let table_command = command.eq_ignore_ascii_case(b"TCREATE")
             || command.eq_ignore_ascii_case(b"TROWSET")
+            || command.eq_ignore_ascii_case(b"TROWDEL")
             || command.eq_ignore_ascii_case(b"TDELETE")
             || command.eq_ignore_ascii_case(b"TDROP")
             || command.eq_ignore_ascii_case(b"TALTER")
@@ -2809,6 +2921,7 @@ impl Store {
         }
         if cmd.eq_ignore_ascii_case(b"TCREATE")
             || cmd.eq_ignore_ascii_case(b"TROWSET")
+            || cmd.eq_ignore_ascii_case(b"TROWDEL")
             || cmd.eq_ignore_ascii_case(b"TDELETE")
             || cmd.eq_ignore_ascii_case(b"TDROP")
             || cmd.eq_ignore_ascii_case(b"TALTER")

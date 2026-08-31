@@ -258,11 +258,8 @@ pub fn cmd_trowset(
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
-    if !store
-        .wal_suppress
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        resp::write_error(out, "ERR TROWSET is internal to WAL replay");
+    if !store.wal_replaying() {
+        resp::write_error(out, "ERR unknown command 'TROWSET'");
         return CmdResult::Written;
     }
     if args.len() < 3 || !(args.len() - 3).is_multiple_of(2) {
@@ -280,6 +277,28 @@ pub fn cmd_trowset(
     match tables::table_apply_wal_row(store, cache, table, pk, &raw_pairs, now) {
         Ok(()) => resp::write_ok(out),
         Err(e) => resp::write_error(out, &e),
+    }
+    CmdResult::Written
+}
+
+pub fn cmd_trowdel(
+    args: &[&[u8]],
+    store: &Store,
+    cache: &SharedSchemaCache,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
+    if !store.wal_replaying() {
+        resp::write_error(out, "ERR unknown command 'TROWDEL'");
+        return CmdResult::Written;
+    }
+    if args.len() != 3 {
+        resp::write_error(out, "ERR usage: TROWDEL <table> <pk>");
+        return CmdResult::Written;
+    }
+    match tables::table_apply_wal_delete(store, cache, arg_str(args[1]), arg_str(args[2]), now) {
+        Ok(()) => resp::write_ok(out),
+        Err(error) => resp::write_error(out, &error),
     }
     CmdResult::Written
 }

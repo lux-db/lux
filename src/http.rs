@@ -4208,18 +4208,9 @@ fn route_table_insert(
             rows_in.push(json_obj_to_pairs(obj));
         }
         let result = if is_upsert {
-            rows_in
-                .iter()
-                .map(|pairs| {
-                    let fv: Vec<(&str, &str)> = pairs
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.as_str()))
-                        .collect();
-                    crate::tables::table_upsert_returning_ttl(
-                        store, cache, table, &fv, conflict, ttl, now,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()
+            crate::tables::table_upsert_many_returning_ttl(
+                store, cache, table, &rows_in, conflict, ttl, now,
+            )
         } else {
             crate::tables::table_insert_many_returning_ttl(store, cache, table, &rows_in, ttl, now)
         };
@@ -5381,6 +5372,56 @@ mod tests {
         assert!(body.contains(r#""id":1"#), "{body}");
         assert!(body.contains(r#""body":"edited""#), "{body}");
         assert!(body.contains(r#""created_at":null"#), "{body}");
+    }
+
+    #[test]
+    fn bulk_upsert_route_rejects_the_whole_array_on_a_late_constraint_failure() {
+        let store = Arc::new(Store::new());
+        let cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let broker = Broker::new();
+        let now = Instant::now();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "accounts",
+            &["id INT PRIMARY KEY,", "email STR UNIQUE"],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "accounts",
+            &[("id", "1"), ("email", "original@example.com")],
+            now,
+        )
+        .unwrap();
+
+        let params = vec![("upsert".to_string(), "true".to_string())];
+        let (status, _, body) = route_table_insert(
+            "accounts",
+            &params,
+            r#"[
+                {"id":1,"email":"shared@example.com"},
+                {"id":2,"email":"shared@example.com"}
+            ]"#,
+            &store,
+            &broker,
+            &cache,
+            &HttpAuthContext::Operator,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("unique constraint"), "{body}");
+        let first = crate::tables::table_get(&store, &cache, "accounts", 1, now).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .find(|(field, _)| field == "email")
+                .map(|(_, value)| value.as_str()),
+            Some("original@example.com")
+        );
+        assert!(crate::tables::table_get(&store, &cache, "accounts", 2, now).is_err());
     }
 
     fn encrypted_http_fixture() -> (

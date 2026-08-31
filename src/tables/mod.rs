@@ -600,11 +600,24 @@ fn raw_row_journal_command(table: &str, pk: &str, row: &[(String, Vec<u8>)]) -> 
 /// record is published. The journal guard serializes table writers while the
 /// batch holds a validated, infallible row-and-index operation plan. Once
 /// durable, every affected key changes under one affected-shard write barrier.
+type StoredTableRow = Vec<(String, Vec<u8>)>;
+type ReturnedTableRow = Vec<(String, String)>;
+
 struct TableMutation<'a> {
     store: &'a Store,
     journal: JournalPrepareGuard<'a>,
     batch: AtomicTableBatch<'a>,
     row_deltas: std::collections::BTreeSet<(String, String)>,
+    sequence_values: std::collections::HashMap<String, i64>,
+    inserted_rows: std::collections::HashSet<(String, String)>,
+    deleted_rows: std::collections::HashSet<(String, String)>,
+    planned_deletes: std::collections::HashSet<(String, String)>,
+    unique_claims: std::collections::HashMap<(String, String, String), String>,
+    unique_releases: std::collections::HashSet<(String, String, String, String)>,
+    partition_claims: std::collections::HashMap<(String, String, String, String), String>,
+    partition_releases: std::collections::HashSet<(String, String, String, String, String)>,
+    upsert_targets: std::collections::HashSet<String>,
+    resolved_rows: std::collections::BTreeMap<(String, String), Option<StoredTableRow>>,
 }
 
 #[cfg(test)]
@@ -629,6 +642,16 @@ impl<'a> TableMutation<'a> {
             journal,
             batch: AtomicTableBatch::new(store, now),
             row_deltas: std::collections::BTreeSet::new(),
+            sequence_values: std::collections::HashMap::new(),
+            inserted_rows: std::collections::HashSet::new(),
+            deleted_rows: std::collections::HashSet::new(),
+            planned_deletes: std::collections::HashSet::new(),
+            unique_claims: std::collections::HashMap::new(),
+            unique_releases: std::collections::HashSet::new(),
+            partition_claims: std::collections::HashMap::new(),
+            partition_releases: std::collections::HashSet::new(),
+            upsert_targets: std::collections::HashSet::new(),
+            resolved_rows: std::collections::BTreeMap::new(),
         })
     }
 
@@ -637,10 +660,20 @@ impl<'a> TableMutation<'a> {
     }
 
     fn publish(self, command: &[&[u8]]) -> Result<(), String> {
+        let command = command.iter().map(|arg| arg.to_vec()).collect::<Vec<_>>();
+        self.publish_commands(&[command])
+    }
+
+    fn publish_commands(self, commands: &[Vec<Vec<u8>>]) -> Result<(), String> {
         let store = self.store;
+        let arg_refs = commands
+            .iter()
+            .map(|command| command.iter().map(Vec::as_slice).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let command_refs = arg_refs.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let commit = self
             .journal
-            .commit(command)
+            .commit_batch(&command_refs)
             .map_err(|error| format!("ERR WAL append failed: {error}"))?;
         #[cfg(test)]
         if FAIL_TABLE_MUTATION_AFTER_JOURNAL.with(|fault| fault.replace(false)) {
@@ -655,6 +688,81 @@ impl<'a> TableMutation<'a> {
         commit
             .complete()
             .map_err(|error| format!("ERR journal apply failed: {error}"))
+    }
+
+    fn record_row(&mut self, table: &str, pk: &str, mut row: Vec<(String, Vec<u8>)>) {
+        row.sort_by(|left, right| left.0.cmp(&right.0));
+        self.resolved_rows
+            .insert((table.to_string(), pk.to_string()), Some(row));
+    }
+
+    fn record_delete(&mut self, table: &str, pk: &str) {
+        self.resolved_rows
+            .insert((table.to_string(), pk.to_string()), None);
+    }
+
+    fn record_field_removal(
+        &mut self,
+        table: &str,
+        pk: &str,
+        field: &str,
+        now: Instant,
+    ) -> Result<(), String> {
+        let identity = (table.to_string(), pk.to_string());
+        let mut row = match self.resolved_rows.get(&identity) {
+            Some(Some(row)) => row.clone(),
+            Some(None) => return Ok(()),
+            None => self
+                .store
+                .hgetall(row_key_for_pk(table, pk).as_bytes(), now)?
+                .into_iter()
+                .map(|(name, value)| (name, value.to_vec()))
+                .collect(),
+        };
+        row.retain(|(name, _)| name != field);
+        self.record_row(table, pk, row);
+        Ok(())
+    }
+
+    fn publish_resolved(self) -> Result<(), String> {
+        let commands = self
+            .resolved_rows
+            .iter()
+            .map(|((table, pk), row)| match row {
+                Some(row) => raw_row_journal_command(table, pk, row),
+                None => vec![
+                    b"TROWDEL".to_vec(),
+                    table.as_bytes().to_vec(),
+                    pk.as_bytes().to_vec(),
+                ],
+            })
+            .collect::<Vec<_>>();
+        self.publish_commands(&commands)
+    }
+
+    fn current_sequence(&mut self, key: &str, now: Instant) -> Result<i64, String> {
+        if let Some(value) = self.sequence_values.get(key) {
+            return Ok(*value);
+        }
+        let value = current_sequence(self.store, key, now)?;
+        self.sequence_values.insert(key.to_string(), value);
+        Ok(value)
+    }
+
+    fn allocate_sequence(&mut self, key: String, now: Instant) -> Result<i64, String> {
+        let next = self.current_sequence(&key, now)?.saturating_add(1);
+        self.sequence_values.insert(key.clone(), next);
+        self.batch.set_string(&key, next.to_string().into_bytes())?;
+        Ok(next)
+    }
+
+    fn bump_sequence(&mut self, key: String, value: i64, now: Instant) -> Result<(), String> {
+        if value > self.current_sequence(&key, now)? {
+            self.sequence_values.insert(key.clone(), value);
+            self.batch
+                .set_string(&key, value.to_string().into_bytes())?;
+        }
+        Ok(())
     }
 }
 
@@ -786,11 +894,15 @@ fn stage_remove_unique(
     table: &str,
     field: &FieldDef,
     value: &str,
+    pk: &str,
 ) -> Result<(), String> {
-    let fields = searchable_index_values(store, table, field, value)?;
-    mutation
-        .batch
-        .hash_delete(&uniq_key(table, &field.name), &fields)
+    let key = uniq_key(table, &field.name);
+    for index_value in searchable_index_values(store, table, field, value)? {
+        mutation
+            .batch
+            .hash_delete_if_value(&key, &index_value, pk.as_bytes())?;
+    }
+    Ok(())
 }
 
 fn stage_bump_sequence(
@@ -800,12 +912,8 @@ fn stage_bump_sequence(
     value: i64,
     now: Instant,
 ) -> Result<(), String> {
-    if value > current_sequence(store, &key, now)? {
-        mutation
-            .batch
-            .set_string(&key, value.to_string().into_bytes())?;
-    }
-    Ok(())
+    debug_assert!(std::ptr::eq(mutation.store, store));
+    mutation.bump_sequence(key, value, now)
 }
 
 fn stage_clear_row_ttl(
@@ -839,7 +947,30 @@ pub(crate) fn table_apply_wal_row(
             if let Some(old_val) = old_map.get(&field.name) {
                 remove_from_index(store, table, field, old_val, pk_str, now)?;
                 if field.unique {
-                    remove_unique_entries(store, table, field, old_val, now)?;
+                    remove_unique_entries(store, table, field, old_val, pk_str, now)?;
+                }
+            }
+        }
+        for path in &load_path_indexes(store, cache, table, now)? {
+            let Some((root, rest)) = path.path.split_once('.') else {
+                continue;
+            };
+            if schema
+                .iter()
+                .any(|field| field.name == root && field.encrypted)
+            {
+                continue;
+            }
+            if let Some(raw) = old_map.get(root) {
+                if let Some(value) = extract_json_scalar(raw, rest) {
+                    remove_from_index(
+                        store,
+                        table,
+                        &synthetic_path_fielddef(path),
+                        &value,
+                        pk_str,
+                        now,
+                    )?;
                 }
             }
         }
@@ -982,8 +1113,68 @@ pub(crate) fn table_apply_wal_row(
         store.hdel(rk.as_bytes(), &[HIDDEN_TTL_FIELD], now)?;
     }
 
+    // TROWSET is a complete resolved row image, not a merge. Replacing the hash
+    // is what makes replay preserve field removal (for example SET NULL).
+    store.del(&[rk.as_bytes()]);
     let pair_refs: Vec<(&[u8], &[u8])> = raw_pairs.iter().map(|(k, v)| (*k, *v)).collect();
     store.hset(rk.as_bytes(), &pair_refs, now)?;
+    Ok(())
+}
+
+pub(crate) fn table_apply_wal_delete(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    now: Instant,
+) -> Result<(), String> {
+    let schema = load_schema(store, cache, table, now)?;
+    let Some(old_row) = get_row_including_expired(store, table, &schema, pk_str, now)? else {
+        return Ok(());
+    };
+    let old_map = old_row
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    for field in &schema {
+        if let Some(value) = old_map.get(&field.name) {
+            remove_from_index(store, table, field, value, pk_str, now)?;
+            if field.unique {
+                remove_unique_entries(store, table, field, value, pk_str, now)?;
+            }
+        } else if matches!(field.field_type, FieldType::Vector(_)) {
+            store.del(&[table_vector_key(table, &field.name, pk_str).as_bytes()]);
+        }
+    }
+    for path in &load_path_indexes(store, cache, table, now)? {
+        let Some((root, rest)) = path.path.split_once('.') else {
+            continue;
+        };
+        if schema
+            .iter()
+            .any(|field| field.name == root && field.encrypted)
+        {
+            continue;
+        }
+        if let Some(raw) = old_map.get(root) {
+            if let Some(value) = extract_json_scalar(raw, rest) {
+                remove_from_index(
+                    store,
+                    table,
+                    &synthetic_path_fielddef(path),
+                    &value,
+                    pk_str,
+                    now,
+                )?;
+            }
+        }
+    }
+    store.zrem(ids_key(table).as_bytes(), &[pk_str.as_bytes()], now)?;
+    store.zrem(
+        ttl_index_key().as_bytes(),
+        &[ttl_member(table, pk_str).as_bytes()],
+        now,
+    )?;
+    store.del(&[row_key_for_pk(table, pk_str).as_bytes()]);
     Ok(())
 }
 
@@ -1140,11 +1331,17 @@ fn remove_unique_entries(
     table: &str,
     field: &FieldDef,
     value: &str,
+    pk: &str,
     now: Instant,
 ) -> Result<(), String> {
     let ukey = uniq_key(table, &field.name);
     for index_value in searchable_index_values(store, table, field, value)? {
-        store.hdel(ukey.as_bytes(), &[index_value.as_bytes()], now)?;
+        let holds_pk = store
+            .hget_checked(ukey.as_bytes(), index_value.as_bytes(), now)?
+            .is_some_and(|holder| holder.as_ref() == pk.as_bytes());
+        if holds_pk {
+            store.hdel(ukey.as_bytes(), &[index_value.as_bytes()], now)?;
+        }
     }
     Ok(())
 }
@@ -1166,6 +1363,64 @@ fn unique_holder_for_value(
         }
     }
     Ok(None)
+}
+
+fn claim_unique_value(
+    mutation: &mut TableMutation<'_>,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field: &FieldDef,
+    value: &str,
+    pk: &str,
+    now: Instant,
+) -> Result<(), String> {
+    if !field.unique {
+        return Ok(());
+    }
+    let ukey = uniq_key(table, &field.name);
+    for index_value in searchable_index_values(mutation.store, table, field, value)? {
+        let claim = (table.to_string(), field.name.clone(), index_value.clone());
+        if let Some(existing) = mutation.unique_claims.get(&claim) {
+            if existing != pk {
+                return Err(format!(
+                    "ERR unique constraint violation on column '{}': value '{}' already exists",
+                    field.name, value
+                ));
+            }
+            continue;
+        }
+
+        if let Some(holder) =
+            mutation
+                .store
+                .hget_checked(ukey.as_bytes(), index_value.as_bytes(), now)?
+        {
+            let holder = String::from_utf8_lossy(&holder).to_string();
+            if holder != pk {
+                let release = (
+                    table.to_string(),
+                    field.name.clone(),
+                    index_value.clone(),
+                    holder.clone(),
+                );
+                let absent = mutation
+                    .deleted_rows
+                    .contains(&(table.to_string(), holder.clone()))
+                    || mutation.unique_releases.contains(&release)
+                    || stage_purge_if_expired(mutation, cache, table, &holder, now)?;
+                if !absent
+                    && uniq_holder_holds_value(mutation.store, table, field, &holder, value, now)?
+                {
+                    return Err(format!(
+                        "ERR unique constraint violation on column '{}': value '{}' already exists",
+                        field.name, value
+                    ));
+                }
+            }
+        }
+        mutation.unique_claims.insert(claim, pk.to_string());
+    }
+    Ok(())
 }
 
 fn referenced_value_exists(
@@ -1199,28 +1454,141 @@ fn referenced_value_exists(
     )
 }
 
-/// If the row at `pk` exists but has expired, physically remove it (full delete
-/// bookkeeping) so a fresh insert/upsert can take its place; this closes the
-/// sub-sweep-interval window where an expired-but-not-yet-swept row would still
-/// occupy its key. Returns true if the row is now absent (never existed, or was
-/// just purged), false if a live (non-expired) row is present.
-fn purge_if_expired(
-    store: &Store,
+fn staged_row_holds_value(
+    mutation: &TableMutation<'_>,
+    table: &str,
+    field: &FieldDef,
+    pk: &str,
+    value: &str,
+) -> Result<Option<bool>, String> {
+    let Some(row) = mutation
+        .resolved_rows
+        .get(&(table.to_string(), pk.to_string()))
+    else {
+        return Ok(None);
+    };
+    let Some(row) = row else {
+        return Ok(Some(false));
+    };
+    let Some((_, raw)) = row.iter().find(|(name, _)| name == &field.name) else {
+        return Ok(Some(false));
+    };
+    Ok(Some(
+        decode_stored_value(mutation.store, table, field, pk, raw)? == value,
+    ))
+}
+
+fn staged_reference_exists(
+    mutation: &TableMutation<'_>,
+    cache: &SharedSchemaCache,
+    reference: &ForeignKey,
+    value: &str,
+    now: Instant,
+) -> Result<bool, String> {
+    let schema = load_schema(mutation.store, cache, &reference.table, now)?;
+    let primary_key = pk_column_name(&schema);
+    if reference.column == primary_key {
+        return match mutation
+            .resolved_rows
+            .get(&(reference.table.clone(), value.to_string()))
+        {
+            Some(row) => Ok(row.is_some()),
+            None => referenced_value_exists(mutation.store, cache, reference, value, now),
+        };
+    }
+
+    let field = schema
+        .iter()
+        .find(|field| field.name == reference.column)
+        .ok_or_else(|| {
+            format!(
+                "ERR referenced column '{}.{}' does not exist",
+                reference.table, reference.column
+            )
+        })?;
+    for index_value in searchable_index_values(mutation.store, &reference.table, field, value)? {
+        let claim = (
+            reference.table.clone(),
+            reference.column.clone(),
+            index_value.clone(),
+        );
+        if let Some(holder) = mutation.unique_claims.get(&claim) {
+            return Ok(
+                staged_row_holds_value(mutation, &reference.table, field, holder, value)?
+                    .unwrap_or(true),
+            );
+        }
+    }
+
+    let Some(holder) =
+        unique_holder_for_value(mutation.store, &reference.table, field, value, now)?
+    else {
+        return Ok(false);
+    };
+    if let Some(holds_value) =
+        staged_row_holds_value(mutation, &reference.table, field, &holder, value)?
+    {
+        return Ok(holds_value);
+    }
+    for index_value in searchable_index_values(mutation.store, &reference.table, field, value)? {
+        if mutation.unique_releases.contains(&(
+            reference.table.clone(),
+            reference.column.clone(),
+            index_value,
+            holder.clone(),
+        )) {
+            return Ok(false);
+        }
+    }
+    referenced_value_exists(mutation.store, cache, reference, value, now)
+}
+
+fn staged_primary_key_exists(
+    mutation: &TableMutation<'_>,
+    cache: &SharedSchemaCache,
+    table: &str,
+    value: &str,
+    now: Instant,
+) -> Result<bool, String> {
+    if let Some(row) = mutation
+        .resolved_rows
+        .get(&(table.to_string(), value.to_string()))
+    {
+        return Ok(row.is_some());
+    }
+    let schema = load_schema(mutation.store, cache, table, now)?;
+    Ok(get_row(mutation.store, table, &schema, value, now, true)?.is_some())
+}
+
+fn stage_purge_if_expired(
+    mutation: &mut TableMutation<'_>,
     cache: &SharedSchemaCache,
     table: &str,
     pk: &str,
     now: Instant,
 ) -> Result<bool, String> {
+    let identity = (table.to_string(), pk.to_string());
+    if mutation.deleted_rows.contains(&identity) {
+        return Ok(true);
+    }
     let rk = row_key_for_pk(table, pk);
-    let pairs = store.hgetall(rk.as_bytes(), now)?;
+    let pairs = mutation.store.hgetall(rk.as_bytes(), now)?;
     if pairs.is_empty() {
         return Ok(true);
     }
-    if row_map_expired(&pairs) {
-        table_delete_inner(store, cache, table, pk, now, 0)?;
-        return Ok(true);
+    if !row_map_expired(&pairs) {
+        return Ok(false);
     }
-    Ok(false)
+    stage_delete_inner(
+        cache,
+        table,
+        pk,
+        now,
+        0,
+        &mut std::collections::HashSet::new(),
+        mutation,
+    )?;
+    Ok(true)
 }
 
 /// True if a raw row-hash field map carries an expired `\0ttl` deadline.
@@ -2167,29 +2535,6 @@ fn current_sequence(store: &Store, key: &str, now: Instant) -> Result<i64, Strin
         .map_err(|_| format!("ERR table sequence '{}' is corrupt", key))
 }
 
-/// Resolve an auto-increment value without mutating the counter. Callers hold
-/// the table's journal preparation gate until the resolved row is appended,
-/// then advance the counter while applying that row.
-fn peek_next_id(store: &Store, table: &str, now: Instant) -> Result<i64, String> {
-    Ok(current_sequence(store, &seq_key(table), now)?.saturating_add(1))
-}
-
-fn peek_next_scoped_id(
-    store: &Store,
-    table: &str,
-    field: &str,
-    partition_col: &str,
-    partition_val: &str,
-    now: Instant,
-) -> Result<i64, String> {
-    Ok(current_sequence(
-        store,
-        &scoped_seq_key(table, field, partition_col, partition_val),
-        now,
-    )?
-    .saturating_add(1))
-}
-
 /// Advance an INT auto-increment counter so it is at least `id`. Called whenever a
 /// row lands with an explicit numeric PK so a later auto-generated id never
 /// collides. The seq counter is derived state, so crash recovery rebuilds it from
@@ -2577,12 +2922,11 @@ pub fn table_insert_returning_ttl(
     ttl: Option<TtlOp>,
     now: Instant,
 ) -> Result<Vec<(String, String)>, String> {
-    let schema = load_schema(store, cache, table, now)?;
-    let pk_str = table_insert_pk(store, cache, table, field_values, ttl, now)?;
-    let mut row = get_row(store, table, &schema, &pk_str, now, true)?
-        .ok_or_else(|| format!("ERR inserted row not found in table '{}'", table))?;
-    row.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(row)
+    let route: [&[u8]; 2] = [b"TROWSET", table.as_bytes()];
+    let mut mutation = TableMutation::prepare(store, &route, now)?;
+    let staged = stage_table_insert(store, cache, table, field_values, ttl, now, &mut mutation)?;
+    mutation.publish_resolved()?;
+    Ok(staged.row)
 }
 
 /// Insert multiple rows, returning the inserted rows. Production callers use
@@ -2607,13 +2951,53 @@ pub fn table_insert_many_returning_ttl(
     ttl: Option<TtlOp>,
     now: Instant,
 ) -> Result<Vec<Vec<(String, String)>>, String> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let route: [&[u8]; 2] = [b"TROWSET", table.as_bytes()];
+    let mut mutation = TableMutation::prepare(store, &route, now)?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let fv: Vec<(&str, &str)> = row.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        out.push(table_insert_returning_ttl(
-            store, cache, table, &fv, ttl, now,
-        )?);
+        let staged = stage_table_insert(store, cache, table, &fv, ttl, now, &mut mutation)?;
+        out.push(staged.row);
     }
+    mutation.publish_resolved()?;
+    Ok(out)
+}
+
+pub fn table_upsert_many_returning_ttl(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    rows: &[Vec<(String, String)>],
+    conflict_col: Option<&str>,
+    ttl: Option<TtlOp>,
+    now: Instant,
+) -> Result<Vec<Vec<(String, String)>>, String> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let route: [&[u8]; 2] = [b"TROWSET", table.as_bytes()];
+    let mut mutation = TableMutation::prepare(store, &route, now)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let field_values = row
+            .iter()
+            .map(|(field, value)| (field.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let staged = stage_table_upsert(
+            cache,
+            table,
+            &field_values,
+            conflict_col,
+            ttl,
+            now,
+            &mut mutation,
+        )?;
+        out.push(staged.row);
+    }
+    mutation.publish_resolved()?;
     Ok(out)
 }
 
@@ -2662,10 +3046,33 @@ pub fn table_upsert_returning_ttl(
     ttl: Option<TtlOp>,
     now: Instant,
 ) -> Result<Vec<(String, String)>, String> {
+    let route: [&[u8]; 2] = [b"TROWSET", table.as_bytes()];
+    let mut mutation = TableMutation::prepare(store, &route, now)?;
+    let staged = stage_table_upsert(
+        cache,
+        table,
+        field_values,
+        conflict_col,
+        ttl,
+        now,
+        &mut mutation,
+    )?;
+    mutation.publish_resolved()?;
+    Ok(staged.row)
+}
+
+fn stage_table_upsert(
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    conflict_col: Option<&str>,
+    ttl: Option<TtlOp>,
+    now: Instant,
+    mutation: &mut TableMutation<'_>,
+) -> Result<StagedTableRow, String> {
+    let store = mutation.store;
     let field_values = normalized_field_values(field_values);
     let field_values = field_values.as_slice();
-    let route: [&[u8]; 2] = [b"TROWSET", table.as_bytes()];
-    let mutation = TableMutation::prepare(store, &route, now)?;
     let schema = load_schema(store, cache, table, now)?;
     let pk_name = schema
         .iter()
@@ -2680,19 +3087,7 @@ pub fn table_upsert_returning_ttl(
             .map(|(_, v)| *v)
         else {
             // No value to conflict on -> behaves as a plain insert.
-            let pk = table_insert_pk_with_mutation(
-                store,
-                cache,
-                table,
-                field_values,
-                ttl,
-                now,
-                mutation,
-            )?;
-            let mut row = get_row(store, table, &schema, &pk, now, true)?
-                .ok_or_else(|| format!("ERR inserted row not found in table '{}'", table))?;
-            row.sort_by(|left, right| left.0.cmp(&right.0));
-            return Ok(row);
+            return stage_table_insert(store, cache, table, field_values, ttl, now, mutation);
         };
         conflict_values.push((conflict.as_str(), cval));
     }
@@ -2707,14 +3102,25 @@ pub fn table_upsert_returning_ttl(
         }
     }
 
+    let target = std::iter::once(table)
+        .chain(
+            conflict_values
+                .iter()
+                .flat_map(|(field, value)| [*field, *value]),
+        )
+        .collect::<Vec<_>>()
+        .join("\0");
+    if !mutation.upsert_targets.insert(target) {
+        return Err("ERR duplicate upsert target in one bulk operation".to_string());
+    }
+
     let existing_pk: Option<String> = if conflicts.len() == 1 {
         let conflict = conflicts[0].as_str();
         let cval = conflict_values[0].1;
         let conflict_is_pk = schema.iter().any(|f| f.primary_key && f.name == conflict)
             || (pk_name.is_none() && conflict == "id");
         if conflict_is_pk {
-            // An expired row is purged and treated as absent (-> insert branch).
-            if purge_if_expired(store, cache, table, cval, now)? {
+            if stage_purge_if_expired(mutation, cache, table, cval, now)? {
                 None
             } else {
                 Some(cval.to_string())
@@ -2729,7 +3135,7 @@ pub fn table_upsert_returning_ttl(
                 .transpose()?
                 .flatten()
             {
-                Some(pk) if !purge_if_expired(store, cache, table, &pk, now)? => Some(pk),
+                Some(pk) if !stage_purge_if_expired(mutation, cache, table, &pk, now)? => Some(pk),
                 Some(_) => find_row_by_fields(store, table, &schema, &[(conflict, cval)], now)?,
                 None => find_row_by_fields(store, table, &schema, &[(conflict, cval)], now)?,
             }
@@ -2749,30 +3155,14 @@ pub fn table_upsert_returning_ttl(
             // It also accepts an empty field list for a TTL-only refresh, avoiding a
             // synthetic no-op write to the immutable conflict/primary-key column.
             if !updates.is_empty() || ttl.is_some() {
-                table_update_by_pk_str_with_mutation(
-                    cache, table, &pk, &updates, ttl, now, mutation,
-                )?;
+                return stage_table_update(cache, table, &pk, &updates, ttl, now, mutation);
             }
             let mut row = get_row(store, table, &schema, &pk, now, true)?
                 .ok_or_else(|| format!("ERR upserted row not found in table '{}'", table))?;
             row.sort_by(|a, b| a.0.cmp(&b.0));
-            Ok(row)
+            Ok(StagedTableRow { pk, row })
         }
-        None => {
-            let pk = table_insert_pk_with_mutation(
-                store,
-                cache,
-                table,
-                field_values,
-                ttl,
-                now,
-                mutation,
-            )?;
-            let mut row = get_row(store, table, &schema, &pk, now, true)?
-                .ok_or_else(|| format!("ERR inserted row not found in table '{}'", table))?;
-            row.sort_by(|left, right| left.0.cmp(&right.0));
-            Ok(row)
-        }
+        None => stage_table_insert(store, cache, table, field_values, ttl, now, mutation),
     }
 }
 
@@ -2786,19 +3176,27 @@ fn table_insert_pk(
     now: Instant,
 ) -> Result<String, String> {
     let route: [&[u8]; 2] = [b"TROWSET", table.as_bytes()];
-    let mutation = TableMutation::prepare(store, &route, now)?;
-    table_insert_pk_with_mutation(store, cache, table, field_values, ttl, now, mutation)
+    let mut mutation = TableMutation::prepare(store, &route, now)?;
+    let staged = stage_table_insert(store, cache, table, field_values, ttl, now, &mut mutation)?;
+    let pk = staged.pk.clone();
+    mutation.publish_resolved()?;
+    Ok(pk)
 }
 
-fn table_insert_pk_with_mutation(
+struct StagedTableRow {
+    pk: String,
+    row: ReturnedTableRow,
+}
+
+fn stage_table_insert(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
     field_values: &[(&str, &str)],
     ttl: Option<TtlOp>,
     now: Instant,
-    mut mutation: TableMutation<'_>,
-) -> Result<String, String> {
+    mutation: &mut TableMutation<'_>,
+) -> Result<StagedTableRow, String> {
     let schema = load_schema(store, cache, table, now)?;
 
     // A table with no declared PK stores rows under an implicit auto-increment
@@ -2851,9 +3249,12 @@ fn table_insert_pk_with_mutation(
                 .parse::<i64>()
                 .map_err(|_| format!("ERR invalid int '{}'", value))?;
         } else {
-            let next =
-                peek_next_scoped_id(store, table, &field.name, partition_col, partition_val, now)?
-                    .to_string();
+            let next = mutation
+                .allocate_sequence(
+                    scoped_seq_key(table, &field.name, partition_col, partition_val),
+                    now,
+                )?
+                .to_string();
             generated_sequences.push((field.name.clone(), next));
         }
     }
@@ -2863,6 +3264,28 @@ fn table_insert_pk_with_mutation(
 
     // Determine the PK column (if any) and its value
     let pk_field = schema.iter().find(|f| f.primary_key);
+    let pk_str: String = if let Some(pk) = pk_field {
+        match provided.get(pk.name.as_str()) {
+            Some(pk_val) => pk_val.to_string(),
+            None if pk.field_type == FieldType::Int => {
+                mutation.allocate_sequence(seq_key(table), now)?.to_string()
+            }
+            None if pk.field_type == FieldType::Uuid => generate_uuid_v7(),
+            None if pk.default_value.is_some() => {
+                resolve_default(pk.default_value.as_deref().unwrap_or(""))
+            }
+            None => {
+                return Err(format!(
+                    "ERR primary key column '{}' must be provided",
+                    pk.name
+                ));
+            }
+        }
+    } else if let Some(id) = provided.get("id") {
+        id.to_string()
+    } else {
+        mutation.allocate_sequence(seq_key(table), now)?.to_string()
+    };
 
     // --- Constraint validation pass ---
     for field in &schema {
@@ -2901,17 +3324,7 @@ fn table_insert_pk_with_mutation(
                     field.name, value
                 )
             })?;
-            let ref_schema = load_schema(store, cache, ref_table, now)?;
-            if get_row(
-                store,
-                ref_table,
-                &ref_schema,
-                &ref_id.to_string(),
-                now,
-                true,
-            )?
-            .is_none()
-            {
+            if !staged_primary_key_exists(mutation, cache, ref_table, &ref_id.to_string(), now)? {
                 return Err(format!(
                     "ERR foreign key violation: {}={} not found in table '{}'",
                     field.name, value, ref_table
@@ -2921,7 +3334,7 @@ fn table_insert_pk_with_mutation(
 
         // Explicit FK check
         if let Some(fk) = &field.references {
-            if !referenced_value_exists(store, cache, fk, value, now)? {
+            if !staged_reference_exists(mutation, cache, fk, value, now)? {
                 return Err(format!(
                     "ERR foreign key violation: {}.{}='{}' not found in table '{}'",
                     table, field.name, value, fk.table
@@ -2934,46 +3347,44 @@ fn table_insert_pk_with_mutation(
         // expired row is freed by purging it; a stale index entry (holder row gone
         // or no longer carrying this value, e.g. from a partial update) is dropped
         // and the insert is allowed -- never a false "duplicate".
-        if field.unique {
-            let ukey = uniq_key(table, &field.name);
-            for index_value in searchable_index_values(store, table, field, value)? {
-                if let Some(holder) =
-                    store.hget_checked(ukey.as_bytes(), index_value.as_bytes(), now)?
-                {
-                    let holder_pk = String::from_utf8_lossy(&holder).to_string();
-                    let absent = purge_if_expired(store, cache, table, &holder_pk, now)?;
-                    if !absent
-                        && uniq_holder_holds_value(store, table, field, &holder_pk, value, now)?
-                    {
-                        return Err(format!(
-                            "ERR unique constraint violation on column '{}': value '{}' already exists",
-                            field.name, value
-                        ));
-                    }
-                    // A stale entry does not block the insert. The staged unique
-                    // index write below replaces it in the same atomic batch.
-                }
-            }
-        }
+        claim_unique_value(mutation, cache, table, field, value, &pk_str, now)?;
 
         if let Some(partition_col) = field.sequence_partition.as_deref() {
             let Some(partition_val) = provided.get(partition_col).copied() else {
                 continue;
             };
-            if let Some(existing_pk) = find_row_by_fields(
+            let claim = (
+                table.to_string(),
+                field.name.clone(),
+                partition_val.to_string(),
+                value.to_string(),
+            );
+            if let Some(existing_pk) = mutation.partition_claims.get(&claim) {
+                if existing_pk != &pk_str {
+                    return Err(format!(
+                        "ERR unique constraint violation on columns '{}', '{}'",
+                        partition_col, field.name
+                    ));
+                }
+            } else if let Some(existing_pk) = find_row_by_fields(
                 store,
                 table,
                 &schema,
                 &[(partition_col, partition_val), (&field.name, value)],
                 now,
             )? {
-                if !purge_if_expired(store, cache, table, &existing_pk, now)? {
+                if !mutation
+                    .deleted_rows
+                    .contains(&(table.to_string(), existing_pk.clone()))
+                    && !stage_purge_if_expired(mutation, cache, table, &existing_pk, now)?
+                {
                     return Err(format!(
                         "ERR unique constraint violation on columns '{}', '{}'",
                         partition_col, field.name
                     ));
                 }
             }
+            mutation.partition_claims.insert(claim, pk_str.clone());
         }
     }
 
@@ -2982,45 +3393,18 @@ fn table_insert_pk_with_mutation(
     // For tables with a user-defined PK the pk_str is the PK value.
     // For tables without a PK the pk_str is the auto-increment seq as a string.
     // This unifies the key scheme so get_all_row_ids / get_row always work correctly.
-    let pk_str: String = if let Some(pk) = pk_field {
-        match provided.get(pk.name.as_str()) {
-            Some(pk_val) => pk_val.to_string(),
-            None if pk.field_type == FieldType::Int => {
-                // Auto-increment INT PK
-                peek_next_id(store, table, now)?.to_string()
-            }
-            None if pk.field_type == FieldType::Uuid => {
-                // Auto-generate a UUIDv7 PK (Supabase-style id default).
-                generate_uuid_v7()
-            }
-            None if pk.default_value.is_some() => {
-                // Honor an explicit DEFAULT on the PK (e.g. uuid()/now()).
-                resolve_default(pk.default_value.as_deref().unwrap_or(""))
-            }
-            None => {
-                return Err(format!(
-                    "ERR primary key column '{}' must be provided",
-                    pk.name
-                ));
-            }
-        }
-    } else if let Some(id) = provided.get("id") {
-        // An explicit value for the implicit primary key follows the same
-        // uniqueness rule as a declared primary key. WAL replay uses TROWSET and
-        // does not pass through this insert path.
-        id.to_string()
-    } else {
-        peek_next_id(store, table, now)?.to_string()
-    };
-
     // All primary-key sources—explicit, sequence-generated, UUID-generated, or
     // DEFAULT-generated—must pass the same final collision check.
-    if !purge_if_expired(store, cache, table, &pk_str, now)? {
+    let identity = (table.to_string(), pk_str.clone());
+    if mutation.inserted_rows.contains(&identity)
+        || !stage_purge_if_expired(mutation, cache, table, &pk_str, now)?
+    {
         return Err(format!(
             "ERR primary key violation: '{}' already exists",
             pk_str
         ));
     }
+    mutation.inserted_rows.insert(identity);
 
     let rk = row_key_for_pk(table, &pk_str);
 
@@ -3060,22 +3444,19 @@ fn table_insert_pk_with_mutation(
         pairs_owned.push((String::from("\u{0}ttl"), deadline.to_string().into_bytes()));
     }
 
-    let journal_command = raw_row_journal_command(table, &pk_str, &pairs_owned);
-    let journal_refs: Vec<&[u8]> = journal_command.iter().map(Vec::as_slice).collect();
-
     // Track this row in the ids sorted set.
     // Member = pk_str, score = numeric pk if possible, else a monotonic counter.
     let score: f64 = match pk_str.parse::<f64>() {
         Ok(score) => score,
         // For non-numeric PKs (UUID, STR), use a separate insert counter for ordering.
-        Err(_) => peek_next_id(store, &format!("{}__order", table), now)? as f64,
+        Err(_) => mutation.allocate_sequence(seq_key(&format!("{}__order", table)), now)? as f64,
     };
     if let Ok(id) = pk_str.parse::<i64>() {
-        stage_bump_sequence(&mut mutation, store, seq_key(table), id, now)?;
+        stage_bump_sequence(mutation, store, seq_key(table), id, now)?;
     }
     if pk_str.parse::<f64>().is_err() {
         stage_bump_sequence(
-            &mut mutation,
+            mutation,
             store,
             seq_key(&format!("{}__order", table)),
             score as i64,
@@ -3097,7 +3478,7 @@ fn table_insert_pk_with_mutation(
         };
         if let Ok(value) = value.parse::<i64>() {
             stage_bump_sequence(
-                &mut mutation,
+                mutation,
                 store,
                 scoped_seq_key(table, &field.name, partition_col, partition),
                 value,
@@ -3114,10 +3495,10 @@ fn table_insert_pk_with_mutation(
             .copied()
             .or_else(|| field.primary_key.then_some(pk_str.as_str()));
         if let Some(value) = value {
-            stage_add_to_index(&mut mutation, store, table, field, value, &pk_str)?;
+            stage_add_to_index(mutation, store, table, field, value, &pk_str)?;
 
             if field.unique {
-                stage_set_unique(&mut mutation, store, table, field, value, &pk_str)?;
+                stage_set_unique(mutation, store, table, field, value, &pk_str)?;
             }
         }
     }
@@ -3131,7 +3512,7 @@ fn table_insert_pk_with_mutation(
             if let Some(raw) = provided.get(root).copied() {
                 if let Some(scalar) = extract_json_scalar(raw, rest) {
                     stage_add_to_index(
-                        &mut mutation,
+                        mutation,
                         store,
                         table,
                         &synthetic_path_fielddef(pi),
@@ -3151,9 +3532,23 @@ fn table_insert_pk_with_mutation(
     }
 
     mutation.batch.hash_set(&rk, &pairs_owned)?;
+    mutation.record_row(table, &pk_str, pairs_owned.clone());
     mutation.row_changed(table, &pk_str);
-    mutation.publish(&journal_refs)?;
-    Ok(pk_str)
+
+    let mut row = Vec::with_capacity(schema.len() + usize::from(!has_explicit_pk));
+    if !has_explicit_pk {
+        row.push(("id".to_string(), pk_str.clone()));
+    }
+    for field in &schema {
+        if let Some(value) = provided.get(field.name.as_str()) {
+            row.push((field.name.clone(), (*value).to_string()));
+        } else if field.primary_key {
+            row.push((field.name.clone(), pk_str.clone()));
+        }
+    }
+    row.sort_by(|left, right| left.0.cmp(&right.0));
+
+    Ok(StagedTableRow { pk: pk_str, row })
 }
 
 /// Test convenience: fetch a row by integer id, full-access. Production reads go
@@ -3262,6 +3657,19 @@ fn table_update_by_pk_str_with_mutation(
     now: Instant,
     mut mutation: TableMutation<'_>,
 ) -> Result<(), String> {
+    stage_table_update(cache, table, pk_str, field_values, ttl, now, &mut mutation)?;
+    mutation.publish_resolved()
+}
+
+fn stage_table_update(
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    field_values: &[(&str, &str)],
+    ttl: Option<TtlOp>,
+    now: Instant,
+    mutation: &mut TableMutation<'_>,
+) -> Result<StagedTableRow, String> {
     let store = mutation.store;
     let field_values = normalized_field_values(field_values);
     let field_values = field_values.as_slice();
@@ -3290,8 +3698,7 @@ fn table_update_by_pk_str_with_mutation(
         validate_value(field, fval)?;
 
         if let FieldType::Ref(ref ref_table) = field.field_type {
-            let ref_schema = load_schema(store, cache, ref_table, now)?;
-            if get_row(store, ref_table, &ref_schema, fval, now, true)?.is_none() {
+            if !staged_primary_key_exists(mutation, cache, ref_table, fval, now)? {
                 return Err(format!(
                     "ERR foreign key violation: {}={} not found in table '{}'",
                     fname, fval, ref_table
@@ -3300,7 +3707,7 @@ fn table_update_by_pk_str_with_mutation(
         }
 
         if let Some(fk) = &field.references {
-            if !referenced_value_exists(store, cache, fk, fval, now)? {
+            if !staged_reference_exists(mutation, cache, fk, fval, now)? {
                 return Err(format!(
                     "ERR foreign key violation: {}.{}='{}' not found in table '{}'",
                     table, field.name, fval, fk.table
@@ -3308,21 +3715,7 @@ fn table_update_by_pk_str_with_mutation(
             }
         }
 
-        if field.unique {
-            if let Some(existing_pk) = unique_holder_for_value(store, table, field, fval, now)? {
-                if existing_pk != pk_str {
-                    let absent = purge_if_expired(store, cache, table, &existing_pk, now)?;
-                    if !absent
-                        && uniq_holder_holds_value(store, table, field, &existing_pk, fval, now)?
-                    {
-                        return Err(format!(
-                            "ERR unique constraint violation on field '{}'",
-                            field.name
-                        ));
-                    }
-                }
-            }
-        }
+        claim_unique_value(mutation, cache, table, field, fval, pk_str, now)?;
     }
 
     let mut final_values = old_map.clone();
@@ -3352,31 +3745,55 @@ fn table_update_by_pk_str_with_mutation(
                 sequence_field.name, partition_column
             )
         })?;
-        for candidate_pk in get_all_row_ids(store, table, now)? {
-            if candidate_pk == pk_str {
-                continue;
-            }
-            let Some(candidate) = get_row(store, table, &schema, &candidate_pk, now, true)? else {
-                continue;
-            };
-            if candidate
-                .iter()
-                .any(|(field, value)| field == partition_column && value == partition_value)
-                && candidate
-                    .iter()
-                    .any(|(field, value)| field == &sequence_field.name && value == sequence_value)
-            {
+        let claim = (
+            table.to_string(),
+            sequence_field.name.clone(),
+            partition_value.clone(),
+            sequence_value.clone(),
+        );
+        if let Some(existing_pk) = mutation.partition_claims.get(&claim) {
+            if existing_pk != pk_str {
                 return Err(format!(
                     "ERR unique constraint violation on columns '{}', '{}'",
                     partition_column, sequence_field.name
                 ));
             }
+        } else {
+            for candidate_pk in get_all_row_ids(store, table, now)? {
+                if candidate_pk == pk_str {
+                    continue;
+                }
+                let Some(candidate) = get_row(store, table, &schema, &candidate_pk, now, true)?
+                else {
+                    continue;
+                };
+                let holds_value = candidate
+                    .iter()
+                    .any(|(field, value)| field == partition_column && value == partition_value)
+                    && candidate.iter().any(|(field, value)| {
+                        field == &sequence_field.name && value == sequence_value
+                    });
+                let released = mutation.partition_releases.contains(&(
+                    table.to_string(),
+                    sequence_field.name.clone(),
+                    partition_value.clone(),
+                    sequence_value.clone(),
+                    candidate_pk.clone(),
+                ));
+                if holds_value && !released {
+                    return Err(format!(
+                        "ERR unique constraint violation on columns '{}', '{}'",
+                        partition_column, sequence_field.name
+                    ));
+                }
+            }
         }
+        mutation.partition_claims.insert(claim, pk_str.to_string());
         let sequence_value = sequence_value
             .parse::<i64>()
             .map_err(|_| format!("ERR invalid int '{}'", sequence_value))?;
         stage_bump_sequence(
-            &mut mutation,
+            mutation,
             store,
             scoped_seq_key(
                 table,
@@ -3422,22 +3839,20 @@ fn table_update_by_pk_str_with_mutation(
             .and_then(|value| value.parse::<u64>().ok()),
     };
     let final_raw: Vec<(String, Vec<u8>)> = final_raw.into_iter().collect();
-    let journal_command = raw_row_journal_command(table, pk_str, &final_raw);
-    let journal_refs: Vec<&[u8]> = journal_command.iter().map(Vec::as_slice).collect();
 
     for (fname, fval) in field_values {
         let field = schema.iter().find(|f| f.name == *fname).unwrap();
 
         if let Some(old_val) = old_map.get(*fname) {
-            stage_remove_from_index(&mut mutation, store, table, field, old_val, pk_str)?;
+            stage_remove_from_index(mutation, store, table, field, old_val, pk_str)?;
             if field.unique {
-                stage_remove_unique(&mut mutation, store, table, field, old_val)?;
+                stage_remove_unique(mutation, store, table, field, old_val, pk_str)?;
             }
         }
 
-        stage_add_to_index(&mut mutation, store, table, field, fval, pk_str)?;
+        stage_add_to_index(mutation, store, table, field, fval, pk_str)?;
         if field.unique {
-            stage_set_unique(&mut mutation, store, table, field, fval, pk_str)?;
+            stage_set_unique(mutation, store, table, field, fval, pk_str)?;
         }
     }
 
@@ -3459,22 +3874,16 @@ fn table_update_by_pk_str_with_mutation(
         let synthetic = synthetic_path_fielddef(pi);
         if let Some(old_raw) = old_map.get(root) {
             if let Some(old_scalar) = extract_json_scalar(old_raw, rest) {
-                stage_remove_from_index(
-                    &mut mutation,
-                    store,
-                    table,
-                    &synthetic,
-                    &old_scalar,
-                    pk_str,
-                )?;
+                stage_remove_from_index(mutation, store, table, &synthetic, &old_scalar, pk_str)?;
             }
         }
         if let Some(new_scalar) = extract_json_scalar(new_raw, rest) {
-            stage_add_to_index(&mut mutation, store, table, &synthetic, &new_scalar, pk_str)?;
+            stage_add_to_index(mutation, store, table, &synthetic, &new_scalar, pk_str)?;
         }
     }
 
     mutation.batch.hash_set(&rk, &final_raw)?;
+    mutation.record_row(table, pk_str, final_raw.clone());
 
     match ttl {
         Some(TtlOp::Set(_)) => {
@@ -3484,12 +3893,17 @@ fn table_update_by_pk_str_with_mutation(
                 .batch
                 .sorted_set_add(ttl_index_key(), &member, deadline as f64)?;
         }
-        Some(TtlOp::Clear) => stage_clear_row_ttl(&mut mutation, table, pk_str)?,
+        Some(TtlOp::Clear) => stage_clear_row_ttl(mutation, table, pk_str)?,
         None => {}
     }
 
     mutation.row_changed(table, pk_str);
-    mutation.publish(&journal_refs)
+    let mut row = final_values.into_iter().collect::<Vec<_>>();
+    row.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(StagedTableRow {
+        pk: pk_str.to_string(),
+        row,
+    })
 }
 
 #[cfg(test)]
@@ -3505,6 +3919,7 @@ pub fn table_delete(
 
 const CASCADE_DEPTH_LIMIT: usize = 16;
 
+#[cfg(test)]
 fn table_delete_inner(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -3538,18 +3953,7 @@ fn stage_and_publish_delete(
         &mut mutation,
     )?;
 
-    let schema = load_schema(mutation.store, cache, table, now)?;
-    let pk_column = pk_column_name(&schema);
-    let command: [&[u8]; 7] = [
-        b"TDELETE",
-        b"FROM",
-        table.as_bytes(),
-        b"WHERE",
-        pk_column.as_bytes(),
-        b"=",
-        pk_str.as_bytes(),
-    ];
-    mutation.publish(&command)
+    mutation.publish_resolved()
 }
 
 fn stage_delete_inner(
@@ -3568,9 +3972,11 @@ fn stage_delete_inner(
             CASCADE_DEPTH_LIMIT
         ));
     }
-    if !visited.insert((table.to_string(), pk_str.to_string())) {
+    let identity = (table.to_string(), pk_str.to_string());
+    if mutation.deleted_rows.contains(&identity) || !visited.insert(identity.clone()) {
         return Ok(());
     }
+    mutation.deleted_rows.insert(identity);
     let schema = load_schema(store, cache, table, now)?;
     let rk = row_key_for_pk(table, pk_str);
 
@@ -3606,7 +4012,11 @@ fn stage_delete_inner(
                         now,
                     )?;
                     for (referencing_id, _) in refs {
-                        if visited.contains(&(other_table.clone(), referencing_id.clone())) {
+                        let identity = (other_table.clone(), referencing_id.clone());
+                        if visited.contains(&identity)
+                            || mutation.deleted_rows.contains(&identity)
+                            || mutation.planned_deletes.contains(&identity)
+                        {
                             continue;
                         }
                         let holds_reference = get_row(
@@ -3679,7 +4089,10 @@ fn stage_delete_inner(
                 };
 
                 referencing_ids.retain(|referencing_id| {
-                    !visited.contains(&(other_table.clone(), referencing_id.clone()))
+                    let identity = (other_table.clone(), referencing_id.clone());
+                    !visited.contains(&identity)
+                        && !mutation.deleted_rows.contains(&identity)
+                        && !mutation.planned_deletes.contains(&identity)
                 });
 
                 if referencing_ids.is_empty() {
@@ -3727,6 +4140,7 @@ fn stage_delete_inner(
                                     other_table,
                                     field,
                                     referenced_value,
+                                    ref_id_str,
                                 )?;
                             }
                             stage_remove_from_index(
@@ -3736,6 +4150,12 @@ fn stage_delete_inner(
                                 field,
                                 referenced_value,
                                 ref_id_str.as_str(),
+                            )?;
+                            mutation.record_field_removal(
+                                other_table,
+                                ref_id_str,
+                                &field.name,
+                                now,
                             )?;
                             mutation.row_changed(other_table, ref_id_str);
                         }
@@ -3749,7 +4169,7 @@ fn stage_delete_inner(
         if let Some(val) = row_map.get(&field.name) {
             stage_remove_from_index(mutation, store, table, field, val, pk_str)?;
             if field.unique {
-                stage_remove_unique(mutation, store, table, field, val)?;
+                stage_remove_unique(mutation, store, table, field, val, pk_str)?;
             }
         }
         // A VECTOR column stores its embedding in a side key with its own ANN
@@ -3792,6 +4212,7 @@ fn stage_delete_inner(
         .sorted_set_remove(ttl_index_key(), &ttl_member(table, pk_str))?;
 
     mutation.batch.delete_hash(&rk)?;
+    mutation.record_delete(table, pk_str);
 
     // Reactive live queries: hint that this pk changed. Cascaded child deletes
     // emit too (every real row removal is a live-query change).
@@ -3994,8 +4415,8 @@ pub fn table_update_where_ttl(
     now: Instant,
 ) -> Result<i64, String> {
     Ok(
-        table_update_where_pks(store, cache, table, field_values, where_args, ttl, now)?
-            .1
+        table_update_where_rows(store, cache, table, field_values, where_args, ttl, now)?
+            .matched
             .len() as i64,
     )
 }
@@ -4024,13 +4445,16 @@ pub fn table_update_where_returning_ttl(
     ttl: Option<TtlOp>,
     now: Instant,
 ) -> Result<Vec<Vec<(String, String)>>, String> {
-    let (schema, pks) =
-        table_update_where_pks(store, cache, table, field_values, where_args, ttl, now)?;
-    rows_for_pks(store, table, &schema, &pks, now, true)
+    Ok(table_update_where_rows(store, cache, table, field_values, where_args, ttl, now)?.rows)
 }
 
-/// Apply an UPDATE, returning (schema, primary keys of the updated rows).
-fn table_update_where_pks(
+struct BulkUpdateResult {
+    matched: Vec<String>,
+    rows: Vec<ReturnedTableRow>,
+}
+
+/// Apply one predicate UPDATE and return its stable precomputed result rows.
+fn table_update_where_rows(
     store: &Store,
     cache: &SharedSchemaCache,
     table: &str,
@@ -4038,9 +4462,13 @@ fn table_update_where_pks(
     where_args: &[&str],
     ttl: Option<TtlOp>,
     now: Instant,
-) -> Result<(Vec<FieldDef>, Vec<String>), String> {
+) -> Result<BulkUpdateResult, String> {
     let conditions = parse_where_conditions(where_args)?;
+    let route: [&[u8]; 2] = [b"TROWSET", table.as_bytes()];
+    let mut mutation = TableMutation::prepare(store, &route, now)?;
     let (schema, matched) = scan_matching_pks(store, cache, table, &conditions, now)?;
+    let normalized = normalized_field_values(field_values);
+    let field_values = normalized.as_slice();
 
     // Validate fields to update exist.
     for (fname, _) in field_values {
@@ -4050,13 +4478,71 @@ fn table_update_where_pks(
             .ok_or_else(|| format!("ERR unknown field '{}'", fname))?;
     }
 
-    // The matched PKs come from the table's own index, so they are valid for any
-    // PK type; update each by its raw PK string. The TTL op rides into the leaf so
-    // it is applied and WAL-logged atomically with the row update (replay-safe).
-    for pk_str in &matched {
-        table_update_by_pk_str(store, cache, table, pk_str, field_values, ttl, now)?;
+    // Predeclare values released by this same operation. This makes uniqueness
+    // checks evaluate the final set rather than rejecting a valid atomic swap.
+    for pk in &matched {
+        let old_row = get_row(store, table, &schema, pk, now, true)?
+            .ok_or_else(|| format!("ERR row '{}' not found in table '{}'", pk, table))?;
+        let old = old_row
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        for (field_name, new_value) in field_values {
+            let field = schema
+                .iter()
+                .find(|candidate| candidate.name == *field_name)
+                .expect("updated fields were validated above");
+            if field.unique {
+                if let Some(old_value) = old.get(*field_name) {
+                    if old_value != new_value {
+                        for index_value in searchable_index_values(store, table, field, old_value)?
+                        {
+                            mutation.unique_releases.insert((
+                                table.to_string(),
+                                field.name.clone(),
+                                index_value,
+                                pk.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for field in schema
+            .iter()
+            .filter(|field| field.sequence_partition.is_some())
+        {
+            let partition_column = field
+                .sequence_partition
+                .as_deref()
+                .expect("filtered sequence field has a partition column");
+            let affected = field_values
+                .iter()
+                .any(|(name, _)| *name == field.name || *name == partition_column);
+            if !affected {
+                continue;
+            }
+            if let (Some(partition), Some(value)) =
+                (old.get(partition_column), old.get(&field.name))
+            {
+                mutation.partition_releases.insert((
+                    table.to_string(),
+                    field.name.clone(),
+                    partition.clone(),
+                    value.clone(),
+                    pk.clone(),
+                ));
+            }
+        }
     }
-    Ok((schema, matched))
+
+    let mut rows = Vec::with_capacity(matched.len());
+    for pk_str in &matched {
+        let staged =
+            stage_table_update(cache, table, pk_str, field_values, ttl, now, &mut mutation)?;
+        rows.push(staged.row);
+    }
+    mutation.publish_resolved()?;
+    Ok(BulkUpdateResult { matched, rows })
 }
 
 /// Delete rows matching WHERE conditions, returns count of deleted rows
@@ -4067,12 +4553,7 @@ pub fn table_delete_where(
     where_args: &[&str],
     now: Instant,
 ) -> Result<i64, String> {
-    let conditions = parse_where_conditions(where_args)?;
-    let (_schema, matched) = scan_matching_pks(store, cache, table, &conditions, now)?;
-    for pk_str in &matched {
-        table_delete_inner(store, cache, table, pk_str, now, 0)?;
-    }
-    Ok(matched.len() as i64)
+    Ok(table_delete_where_rows(store, cache, table, where_args, now)?.len() as i64)
 }
 
 /// DELETE returning the deleted rows (captured before removal).
@@ -4083,12 +4564,35 @@ pub fn table_delete_where_returning(
     where_args: &[&str],
     now: Instant,
 ) -> Result<Vec<Vec<(String, String)>>, String> {
+    table_delete_where_rows(store, cache, table, where_args, now)
+}
+
+fn table_delete_where_rows(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    where_args: &[&str],
+    now: Instant,
+) -> Result<Vec<Vec<(String, String)>>, String> {
     let conditions = parse_where_conditions(where_args)?;
+    let route: [&[u8]; 3] = [b"TDELETE", b"FROM", table.as_bytes()];
+    let mut mutation = TableMutation::prepare(store, &route, now)?;
     let (schema, matched) = scan_matching_pks(store, cache, table, &conditions, now)?;
     let rows = rows_for_pks(store, table, &schema, &matched, now, true)?;
+    mutation
+        .planned_deletes
+        .extend(matched.iter().cloned().map(|pk| (table.to_string(), pk)));
+    let mut visited = std::collections::HashSet::new();
     for pk_str in &matched {
-        table_delete_inner(store, cache, table, pk_str, now, 0)?;
+        if mutation
+            .deleted_rows
+            .contains(&(table.to_string(), pk_str.clone()))
+        {
+            continue;
+        }
+        stage_delete_inner(cache, table, pk_str, now, 0, &mut visited, &mut mutation)?;
     }
+    mutation.publish_resolved()?;
     Ok(rows)
 }
 
@@ -4696,6 +5200,318 @@ mod tests {
     }
 
     #[test]
+    fn rejected_bulk_insert_leaves_no_rows_indexes_or_consumed_ids() {
+        let store = Store::new();
+        let cache = make_cache();
+        let n = now();
+        table_create(&store, &cache, "accounts", &["email STR UNIQUE"], n).unwrap();
+        let rows = vec![
+            vec![("email".to_string(), "same@example.com".to_string())],
+            vec![("email".to_string(), "same@example.com".to_string())],
+        ];
+        let sequence_before = store.get(seq_key("accounts").as_bytes(), n);
+
+        let error = table_insert_many_returning(&store, &cache, "accounts", &rows, n)
+            .expect_err("a duplicate within one request must reject the whole request");
+        assert!(error.contains("unique constraint"), "{error}");
+        assert_eq!(table_count(&store, &cache, "accounts", n).unwrap(), 0);
+        assert!(store
+            .hget_checked(
+                uniq_key("accounts", "email").as_bytes(),
+                b"same@example.com",
+                n,
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.get(seq_key("accounts").as_bytes(), n),
+            sequence_before
+        );
+
+        let inserted = table_insert_returning(
+            &store,
+            &cache,
+            "accounts",
+            &[("email", "first@example.com")],
+            n,
+        )
+        .unwrap();
+        assert_eq!(row_field(&inserted, "id"), Some("1"));
+    }
+
+    #[test]
+    fn bulk_insert_can_reference_an_earlier_row_in_the_same_request() {
+        let store = Store::new();
+        let cache = make_cache();
+        let n = now();
+        table_create(&store, &cache, "nodes", &["id INT PRIMARY KEY"], n).unwrap();
+        table_add_column(
+            &store,
+            &cache,
+            "nodes",
+            "parent_id INT REFERENCES nodes(id)",
+            n,
+        )
+        .unwrap();
+        let rows = vec![
+            vec![("id".to_string(), "1".to_string())],
+            vec![
+                ("id".to_string(), "2".to_string()),
+                ("parent_id".to_string(), "1".to_string()),
+            ],
+        ];
+
+        let inserted = table_insert_many_returning(&store, &cache, "nodes", &rows, n).unwrap();
+        assert_eq!(inserted.len(), 2);
+        assert_eq!(row_field(&inserted[1], "parent_id"), Some("1"));
+
+        let rejected = vec![
+            vec![
+                ("id".to_string(), "4".to_string()),
+                ("parent_id".to_string(), "3".to_string()),
+            ],
+            vec![("id".to_string(), "3".to_string())],
+        ];
+        let error = table_insert_many_returning(&store, &cache, "nodes", &rejected, n)
+            .expect_err("a later row must not satisfy an earlier foreign key");
+        assert!(error.contains("foreign key violation"), "{error}");
+        assert!(table_get(&store, &cache, "nodes", 3, n).is_err());
+        assert!(table_get(&store, &cache, "nodes", 4, n).is_err());
+    }
+
+    #[test]
+    fn bulk_upsert_validates_foreign_keys_against_staged_unique_values() {
+        let store = Store::new();
+        let cache = make_cache();
+        let n = now();
+        table_create(
+            &store,
+            &cache,
+            "nodes",
+            &["id INT PRIMARY KEY,", "code STR UNIQUE"],
+            n,
+        )
+        .unwrap();
+        table_add_column(
+            &store,
+            &cache,
+            "nodes",
+            "parent_code STR REFERENCES nodes(code)",
+            n,
+        )
+        .unwrap();
+        table_insert(&store, &cache, "nodes", &[("id", "1"), ("code", "old")], n).unwrap();
+        let rows = vec![
+            vec![
+                ("id".to_string(), "1".to_string()),
+                ("code".to_string(), "new".to_string()),
+            ],
+            vec![
+                ("id".to_string(), "2".to_string()),
+                ("code".to_string(), "child".to_string()),
+                ("parent_code".to_string(), "old".to_string()),
+            ],
+        ];
+
+        let error =
+            table_upsert_many_returning_ttl(&store, &cache, "nodes", &rows, Some("id"), None, n)
+                .expect_err("a staged update must stop satisfying its old unique value");
+        assert!(error.contains("foreign key violation"), "{error}");
+        let original = table_get(&store, &cache, "nodes", 1, n).unwrap();
+        assert_eq!(row_field(&original, "code"), Some("old"));
+        assert!(table_get(&store, &cache, "nodes", 2, n).is_err());
+    }
+
+    #[test]
+    fn rejected_bulk_update_leaves_every_row_and_unique_index_unchanged() {
+        let store = Store::new();
+        let cache = make_cache();
+        let n = now();
+        table_create(
+            &store,
+            &cache,
+            "accounts",
+            &["id INT PRIMARY KEY,", "email STR UNIQUE"],
+            n,
+        )
+        .unwrap();
+        for (id, email) in [("1", "one@example.com"), ("2", "two@example.com")] {
+            table_insert(
+                &store,
+                &cache,
+                "accounts",
+                &[("id", id), ("email", email)],
+                n,
+            )
+            .unwrap();
+        }
+
+        let error = table_update_where(
+            &store,
+            &cache,
+            "accounts",
+            &[("email", "shared@example.com")],
+            &["id", ">=", "1"],
+            n,
+        )
+        .expect_err("two rows cannot claim the same unique value");
+        assert!(error.contains("unique constraint"), "{error}");
+        assert_eq!(
+            row_field(
+                &table_get(&store, &cache, "accounts", 1, n).unwrap(),
+                "email"
+            ),
+            Some("one@example.com")
+        );
+        assert_eq!(
+            row_field(
+                &table_get(&store, &cache, "accounts", 2, n).unwrap(),
+                "email"
+            ),
+            Some("two@example.com")
+        );
+        let unique = uniq_key("accounts", "email");
+        assert_eq!(
+            store
+                .hget_checked(unique.as_bytes(), b"one@example.com", n)
+                .unwrap()
+                .as_deref(),
+            Some(&b"1"[..])
+        );
+        assert_eq!(
+            store
+                .hget_checked(unique.as_bytes(), b"two@example.com", n)
+                .unwrap()
+                .as_deref(),
+            Some(&b"2"[..])
+        );
+        assert!(store
+            .hget_checked(unique.as_bytes(), b"shared@example.com", n)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn rejected_bulk_delete_leaves_earlier_matches_present() {
+        let store = Store::new();
+        let cache = make_cache();
+        let n = now();
+        table_create(&store, &cache, "parents", &["id INT PRIMARY KEY"], n).unwrap();
+        table_create(
+            &store,
+            &cache,
+            "children",
+            &[
+                "id INT PRIMARY KEY,",
+                "parent_id INT REFERENCES parents(id) ON DELETE RESTRICT",
+            ],
+            n,
+        )
+        .unwrap();
+        for id in ["1", "2"] {
+            table_insert(&store, &cache, "parents", &[("id", id)], n).unwrap();
+        }
+        table_insert(
+            &store,
+            &cache,
+            "children",
+            &[("id", "10"), ("parent_id", "2")],
+            n,
+        )
+        .unwrap();
+
+        let error = table_delete_where(&store, &cache, "parents", &["id", ">=", "1"], n)
+            .expect_err("a restricted later row must reject every deletion");
+        assert!(error.contains("ON DELETE RESTRICT"), "{error}");
+        assert!(table_get(&store, &cache, "parents", 1, n).is_ok());
+        assert!(table_get(&store, &cache, "parents", 2, n).is_ok());
+        assert!(table_get(&store, &cache, "children", 10, n).is_ok());
+    }
+
+    #[test]
+    fn interrupted_published_bulk_insert_recovers_the_complete_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = persistent_config(dir.path());
+        let store = Store::new_with_config(config.clone());
+        let cache = make_cache();
+        let n = now();
+        table_create(&store, &cache, "events", &["name STR UNIQUE"], n).unwrap();
+        let rows = ["one", "two", "three"]
+            .into_iter()
+            .map(|name| vec![("name".to_string(), name.to_string())])
+            .collect::<Vec<_>>();
+
+        fail_next_table_mutation_after_journal();
+        let error = table_insert_many_returning(&store, &cache, "events", &rows, n)
+            .expect_err("the interruption must happen before live publication");
+        assert!(error.contains("injected interruption"), "{error}");
+        assert_eq!(table_count(&store, &cache, "events", n).unwrap(), 0);
+        drop(store);
+
+        let restored = Store::new_with_config(config);
+        let restored_cache = make_cache();
+        restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        for (id, name) in [(1, "one"), (2, "two"), (3, "three")] {
+            let row = table_get(&restored, &restored_cache, "events", id, now()).unwrap();
+            assert_eq!(row_field(&row, "name"), Some(name));
+        }
+        let next = table_insert_returning(
+            &restored,
+            &restored_cache,
+            "events",
+            &[("name", "four")],
+            now(),
+        )
+        .unwrap();
+        assert_eq!(row_field(&next, "id"), Some("4"));
+    }
+
+    #[test]
+    fn interrupted_published_bulk_update_recovers_every_row_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = persistent_config(dir.path());
+        let store = Store::new_with_config(config.clone());
+        let cache = make_cache();
+        let n = now();
+        table_create(
+            &store,
+            &cache,
+            "states",
+            &["id INT PRIMARY KEY,", "phase INT"],
+            n,
+        )
+        .unwrap();
+        for id in ["1", "2", "3"] {
+            table_insert(&store, &cache, "states", &[("id", id), ("phase", "0")], n).unwrap();
+        }
+
+        fail_next_table_mutation_after_journal();
+        let error = table_update_where(
+            &store,
+            &cache,
+            "states",
+            &[("phase", "1")],
+            &["id", ">=", "1"],
+            n,
+        )
+        .expect_err("the interruption must happen before live publication");
+        assert!(error.contains("injected interruption"), "{error}");
+        for id in 1..=3 {
+            let row = table_get(&store, &cache, "states", id, n).unwrap();
+            assert_eq!(row_field(&row, "phase"), Some("0"));
+        }
+        drop(store);
+
+        let restored = Store::new_with_config(config);
+        let restored_cache = make_cache();
+        restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        for id in 1..=3 {
+            let row = table_get(&restored, &restored_cache, "states", id, now()).unwrap();
+            assert_eq!(row_field(&row, "phase"), Some("1"));
+        }
+    }
+
+    #[test]
     fn interrupted_published_update_recovers_as_one_complete_change() {
         let dir = tempfile::tempdir().unwrap();
         let config = persistent_config(dir.path());
@@ -5215,6 +6031,69 @@ mod tests {
             reads += 1;
         }
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn select_retries_instead_of_returning_rows_from_both_sides_of_a_bulk_commit() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let n = now();
+        table_create(
+            &store,
+            &cache,
+            "states",
+            &["id INT PRIMARY KEY,", "phase INT"],
+            n,
+        )
+        .unwrap();
+        for id in 1..=8 {
+            let id = id.to_string();
+            table_insert(
+                &store,
+                &cache,
+                "states",
+                &[("id", id.as_str()), ("phase", "0")],
+                n,
+            )
+            .unwrap();
+        }
+
+        let first_row_read = Arc::new(std::sync::Barrier::new(2));
+        let commit_finished = Arc::new(std::sync::Barrier::new(2));
+        let hook_first_row = first_row_read.clone();
+        let hook_commit_finished = commit_finished.clone();
+        store.set_table_read_after_first_row_hook(Arc::new(move || {
+            hook_first_row.wait();
+            hook_commit_finished.wait();
+        }));
+
+        let reader_store = store.clone();
+        let reader_cache = cache.clone();
+        let reader = std::thread::spawn(move || {
+            let plan = parse_select(&["*", "FROM", "states"]).unwrap();
+            table_select(&reader_store, &reader_cache, &plan, Instant::now()).unwrap()
+        });
+
+        first_row_read.wait();
+        assert_eq!(
+            table_update_where(
+                &store,
+                &cache,
+                "states",
+                &[("phase", "1")],
+                &["id", ">=", "1"],
+                Instant::now(),
+            )
+            .unwrap(),
+            8
+        );
+        commit_finished.wait();
+
+        let SelectResult::Rows(rows) = reader.join().unwrap() else {
+            panic!("SELECT * must return rows");
+        };
+        assert_eq!(rows.len(), 8);
+        assert!(rows.iter().all(|row| row_field(row, "phase") == Some("1")));
     }
 
     fn encrypted_store() -> Arc<Store> {
@@ -8307,6 +9186,41 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(cell(&rows[0], "title"), "renamed");
+    }
+
+    #[test]
+    fn predicate_mutation_returning_uses_canonical_table_order() {
+        let store = Store::new();
+        let cache = make_cache();
+        let n = now();
+        table_create(
+            &store,
+            &cache,
+            "states",
+            &["id INT PRIMARY KEY,", "phase INT"],
+            n,
+        )
+        .unwrap();
+        for id in ["10", "2", "1"] {
+            table_insert(&store, &cache, "states", &[("id", id), ("phase", "0")], n).unwrap();
+        }
+
+        for phase in ["1", "2"] {
+            let rows = table_update_where_returning(
+                &store,
+                &cache,
+                "states",
+                &[("phase", phase)],
+                &["id", ">=", "1"],
+                n,
+            )
+            .unwrap();
+            let ids = rows
+                .iter()
+                .map(|row| row_field(row, "id").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, ["1", "2", "10"]);
+        }
     }
 
     #[test]
