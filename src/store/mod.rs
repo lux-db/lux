@@ -641,6 +641,10 @@ pub struct Store {
     /// Striped commit gates keep overlapping mutations in journal/apply order
     /// without serializing independent shards behind one global writer lock.
     journal_gates: Box<[parking_lot::ReentrantMutex<()>]>,
+    /// Serializes table mutation planning and excludes snapshot capture while a
+    /// table write is moving from its resolved journal record to one atomic
+    /// multi-shard publication.
+    table_mutation_gate: parking_lot::ReentrantMutex<()>,
     /// Exact sentinel used only while replaying post-snapshot mutations. It
     /// keeps snapshot entries whose wall-clock TTL elapsed during downtime
     /// visible to TTL-preserving journal commands without reviving them after
@@ -696,6 +700,7 @@ pub(crate) struct PreparedRestore {
 /// applying the journaled change.
 pub(crate) struct JournalCommitGuard<'a> {
     store: &'a Store,
+    _table_guard: Option<parking_lot::ReentrantMutexGuard<'a, ()>>,
     _guards: Vec<parking_lot::ReentrantMutexGuard<'a, ()>>,
     armed: bool,
 }
@@ -730,6 +735,7 @@ impl Drop for JournalCommitGuard<'_> {
 /// phase; dropping it after validation fails is intentionally a no-op.
 pub(crate) struct JournalPrepareGuard<'a> {
     store: &'a Store,
+    table_guard: Option<parking_lot::ReentrantMutexGuard<'a, ()>>,
     guards: Vec<parking_lot::ReentrantMutexGuard<'a, ()>>,
     bypassed: bool,
 }
@@ -749,6 +755,7 @@ impl<'a> JournalPrepareGuard<'a> {
         }
         Ok(JournalCommitGuard {
             store: self.store,
+            _table_guard: self.table_guard,
             _guards: self.guards,
             armed,
         })
@@ -771,6 +778,517 @@ impl<T> JournalPlan<T> {
         Self {
             commands: Vec::new(),
             prepared,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TableEntryKind {
+    String,
+    Hash,
+    Set,
+    SortedSet,
+    Vector,
+}
+
+impl TableEntryKind {
+    fn empty(self) -> StoreValue {
+        match self {
+            Self::String => StoreValue::Str(Bytes::new()),
+            Self::Hash => StoreValue::Hash(HashData::default()),
+            Self::Set => StoreValue::Set(SetData::new()),
+            Self::SortedSet => StoreValue::SortedSet(BTreeMap::new(), HashMap::new()),
+            Self::Vector => StoreValue::Vector(VectorData {
+                dims: 0,
+                data: Vec::new(),
+                metadata: None,
+                encrypted: false,
+            }),
+        }
+    }
+
+    fn matches(self, value: &StoreValue) -> bool {
+        matches!(
+            (self, value),
+            (Self::String, StoreValue::Str(_) | StoreValue::StrBuf(_))
+                | (Self::Hash, StoreValue::Hash(_))
+                | (Self::Set, StoreValue::Set(_))
+                | (Self::SortedSet, StoreValue::SortedSet(..))
+                | (Self::Vector, StoreValue::Vector(_))
+        )
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Hash => "hash",
+            Self::Set => "set",
+            Self::SortedSet => "zset",
+            Self::Vector => "vector",
+        }
+    }
+}
+
+enum TableBatchOp {
+    SetString(Vec<u8>, Vec<u8>),
+    HashSet(Vec<u8>, Vec<(String, Vec<u8>)>),
+    HashDelete(Vec<u8>, Vec<String>),
+    SetAdd(Vec<u8>, String),
+    SetRemove(Vec<u8>, String),
+    SortedSetAdd(Vec<u8>, String, f64),
+    SortedSetRemove(Vec<u8>, String),
+    VectorSet(Vec<u8>, Vec<f32>, Option<String>, bool),
+    Delete(Vec<u8>),
+}
+
+/// A validated, O(changes) table mutation plan. Publication applies every
+/// operation while every affected shard is write-locked, so readers can
+/// observe only the complete state before or after the mutation.
+pub(crate) struct AtomicTableBatch<'a> {
+    store: &'a Store,
+    now: Instant,
+    kinds: BTreeMap<Vec<u8>, TableEntryKind>,
+    operations: Vec<TableBatchOp>,
+}
+
+impl<'a> AtomicTableBatch<'a> {
+    pub(crate) fn new(store: &'a Store, now: Instant) -> Self {
+        Self {
+            store,
+            now,
+            kinds: BTreeMap::new(),
+            operations: Vec::new(),
+        }
+    }
+
+    fn require_kind(&mut self, key: &[u8], kind: TableEntryKind) -> Result<(), String> {
+        if !Store::is_table_storage_key(key) {
+            return Err("ERR table mutation attempted to stage a non-table key".to_string());
+        }
+        if let Some(existing) = self.kinds.get(key) {
+            if *existing != kind {
+                return Err(format!(
+                    "ERR table storage invariant: '{}' requires both {} and {} state",
+                    key_string(key),
+                    existing.name(),
+                    kind.name()
+                ));
+            }
+            return Ok(());
+        }
+        self.store.try_promote(key, self.now)?;
+        let shard = self.store.shards[self.store.shard_index(key)].read();
+        if let Some(entry) = shard.data.get(key) {
+            if !entry.is_expired_at(self.now) && !kind.matches(&entry.value) {
+                return Err(format!(
+                    "ERR table storage invariant: '{}' expected {}, found {}",
+                    key_string(key),
+                    kind.name(),
+                    entry.value.type_name()
+                ));
+            }
+        }
+        drop(shard);
+        self.kinds.insert(key.to_vec(), kind);
+        Ok(())
+    }
+
+    pub(crate) fn set_string(&mut self, key: &str, value: Vec<u8>) -> Result<(), String> {
+        self.require_kind(key.as_bytes(), TableEntryKind::String)?;
+        self.operations
+            .push(TableBatchOp::SetString(key.as_bytes().to_vec(), value));
+        Ok(())
+    }
+
+    pub(crate) fn hash_set(
+        &mut self,
+        key: &str,
+        pairs: &[(String, Vec<u8>)],
+    ) -> Result<(), String> {
+        self.require_kind(key.as_bytes(), TableEntryKind::Hash)?;
+        self.operations.push(TableBatchOp::HashSet(
+            key.as_bytes().to_vec(),
+            pairs.to_vec(),
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn hash_delete(
+        &mut self,
+        key: &str,
+        fields_to_delete: &[String],
+    ) -> Result<(), String> {
+        self.require_kind(key.as_bytes(), TableEntryKind::Hash)?;
+        self.operations.push(TableBatchOp::HashDelete(
+            key.as_bytes().to_vec(),
+            fields_to_delete.to_vec(),
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn set_add(&mut self, key: &str, member: &str) -> Result<(), String> {
+        self.require_kind(key.as_bytes(), TableEntryKind::Set)?;
+        self.operations.push(TableBatchOp::SetAdd(
+            key.as_bytes().to_vec(),
+            member.to_string(),
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn set_remove(&mut self, key: &str, member: &str) -> Result<(), String> {
+        self.require_kind(key.as_bytes(), TableEntryKind::Set)?;
+        self.operations.push(TableBatchOp::SetRemove(
+            key.as_bytes().to_vec(),
+            member.to_string(),
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn sorted_set_add(
+        &mut self,
+        key: &str,
+        member: &str,
+        score: f64,
+    ) -> Result<(), String> {
+        self.require_kind(key.as_bytes(), TableEntryKind::SortedSet)?;
+        self.operations.push(TableBatchOp::SortedSetAdd(
+            key.as_bytes().to_vec(),
+            member.to_string(),
+            score,
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn sorted_set_remove(&mut self, key: &str, member: &str) -> Result<(), String> {
+        self.require_kind(key.as_bytes(), TableEntryKind::SortedSet)?;
+        self.operations.push(TableBatchOp::SortedSetRemove(
+            key.as_bytes().to_vec(),
+            member.to_string(),
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn vector_set(
+        &mut self,
+        key: &str,
+        data: Vec<f32>,
+        metadata: Option<String>,
+        encrypted: bool,
+    ) -> Result<(), String> {
+        self.require_kind(key.as_bytes(), TableEntryKind::Vector)?;
+        self.operations.push(TableBatchOp::VectorSet(
+            key.as_bytes().to_vec(),
+            data,
+            metadata,
+            encrypted,
+        ));
+        Ok(())
+    }
+
+    fn delete_kind(&mut self, key: &str, kind: TableEntryKind) -> Result<(), String> {
+        self.require_kind(key.as_bytes(), kind)?;
+        self.operations
+            .push(TableBatchOp::Delete(key.as_bytes().to_vec()));
+        Ok(())
+    }
+
+    pub(crate) fn delete_hash(&mut self, key: &str) -> Result<(), String> {
+        self.delete_kind(key, TableEntryKind::Hash)
+    }
+
+    pub(crate) fn delete_vector(&mut self, key: &str) -> Result<(), String> {
+        self.delete_kind(key, TableEntryKind::Vector)
+    }
+
+    /// Publish the fully prepared batch. The caller must still own the table
+    /// mutation guard carried by its journal commit guard.
+    pub(crate) fn apply(self) {
+        let store = self.store;
+        let keys = self.kinds.into_keys().collect::<Vec<_>>();
+        let shard_indices = keys
+            .iter()
+            .map(|key| store.shard_index(key))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut shard_positions = vec![usize::MAX; store.shards.len()];
+        let mut shards = Vec::with_capacity(shard_indices.len());
+        for shard_index in &shard_indices {
+            shard_positions[*shard_index] = shards.len();
+            shards.push(store.shards[*shard_index].write());
+        }
+        let mut memory_deltas = vec![0isize; store.shards.len()];
+        let mut key_delta = 0isize;
+        let mut vector_before = Vec::new();
+        for key in &keys {
+            let shard_index = store.shard_index(key);
+            let shard = &mut shards[shard_positions[shard_index]];
+            if let Some(StoreValue::Vector(vector)) = shard.data.get(key).map(|entry| &entry.value)
+            {
+                vector_before.push((key_string(key), vector.dims));
+            }
+            if shard
+                .data
+                .get(key)
+                .is_some_and(|entry| entry.is_expired_at(self.now))
+            {
+                let expired = shard
+                    .data
+                    .remove(key)
+                    .expect("the expired table entry was just observed");
+                memory_deltas[shard_index] -= estimate_entry_memory(key, &expired.value) as isize;
+                key_delta -= 1;
+            }
+        }
+        let lru_clock = store.lru_clock();
+
+        for operation in self.operations {
+            let key = match &operation {
+                TableBatchOp::SetString(key, _)
+                | TableBatchOp::HashSet(key, _)
+                | TableBatchOp::HashDelete(key, _)
+                | TableBatchOp::SetAdd(key, _)
+                | TableBatchOp::SetRemove(key, _)
+                | TableBatchOp::SortedSetAdd(key, _, _)
+                | TableBatchOp::SortedSetRemove(key, _)
+                | TableBatchOp::VectorSet(key, _, _, _)
+                | TableBatchOp::Delete(key) => key,
+            };
+            let shard_index = store.shard_index(key);
+            let shard = &mut shards[shard_positions[shard_index]];
+            match operation {
+                TableBatchOp::SetString(key, value) => {
+                    let key_len = key.len();
+                    let value_len = value.len();
+                    let previous = shard.data.insert(
+                        key,
+                        Entry {
+                            value: StoreValue::Str(Bytes::from(value)),
+                            expires_at: None,
+                            lru_clock,
+                        },
+                    );
+                    if let Some(previous) = previous {
+                        let old_len = match previous.value {
+                            StoreValue::Str(value) => value.len(),
+                            StoreValue::StrBuf(value) => value.len(),
+                            _ => unreachable!(
+                                "table string type was validated before journal publication"
+                            ),
+                        };
+                        memory_deltas[shard_index] += value_len as isize - old_len as isize;
+                    } else {
+                        memory_deltas[shard_index] += (key_len + 64 + value_len) as isize;
+                        key_delta += 1;
+                    }
+                }
+                TableBatchOp::HashSet(key, pairs) => {
+                    if !shard.data.contains_key(&key) {
+                        memory_deltas[shard_index] += (key.len() + 64) as isize;
+                        key_delta += 1;
+                    }
+                    let entry = shard.data.entry(key).or_insert_with(|| Entry {
+                        value: TableEntryKind::Hash.empty(),
+                        expires_at: None,
+                        lru_clock,
+                    });
+                    let StoreValue::Hash(fields) = &mut entry.value else {
+                        unreachable!("table hash type was validated before journal publication")
+                    };
+                    for (field, value) in pairs {
+                        fields.expiries.remove(&field);
+                        let value_len = value.len();
+                        if let Some(previous) =
+                            fields.fields.insert(field.clone(), Bytes::from(value))
+                        {
+                            memory_deltas[shard_index] +=
+                                value_len as isize - previous.len() as isize;
+                        } else {
+                            memory_deltas[shard_index] += (field.len() + value_len + 64) as isize;
+                        }
+                    }
+                    entry.expires_at = None;
+                    entry.lru_clock = lru_clock;
+                }
+                TableBatchOp::HashDelete(key, fields_to_delete) => {
+                    let mut remove_key = false;
+                    if let Some(entry) = shard.data.get_mut(&key) {
+                        if !entry.is_expired_at(self.now) {
+                            let StoreValue::Hash(fields) = &mut entry.value else {
+                                unreachable!(
+                                    "table hash type was validated before journal publication"
+                                )
+                            };
+                            for field in fields_to_delete {
+                                if let Some(value) = fields.fields.remove(&field) {
+                                    memory_deltas[shard_index] -=
+                                        (field.len() + value.len() + 64) as isize;
+                                }
+                                fields.expiries.remove(&field);
+                            }
+                            remove_key = fields.fields.is_empty();
+                        }
+                    }
+                    if remove_key {
+                        shard.data.remove(&key);
+                        memory_deltas[shard_index] -= (key.len() + 64) as isize;
+                        key_delta -= 1;
+                    }
+                }
+                TableBatchOp::SetAdd(key, member) => {
+                    if !shard.data.contains_key(&key) {
+                        memory_deltas[shard_index] += (key.len() + 64) as isize;
+                        key_delta += 1;
+                    }
+                    let entry = shard.data.entry(key).or_insert_with(|| Entry {
+                        value: TableEntryKind::Set.empty(),
+                        expires_at: None,
+                        lru_clock,
+                    });
+                    let StoreValue::Set(members) = &mut entry.value else {
+                        unreachable!("table set type was validated before journal publication")
+                    };
+                    let member_len = member.len();
+                    if members.insert(member) {
+                        memory_deltas[shard_index] += (member_len + 32) as isize;
+                    }
+                    entry.expires_at = None;
+                    entry.lru_clock = lru_clock;
+                }
+                TableBatchOp::SetRemove(key, member) => {
+                    if let Some(entry) = shard.data.get_mut(&key) {
+                        if !entry.is_expired_at(self.now) {
+                            let StoreValue::Set(members) = &mut entry.value else {
+                                unreachable!(
+                                    "table set type was validated before journal publication"
+                                )
+                            };
+                            if members.remove(&member) {
+                                memory_deltas[shard_index] -= (member.len() + 32) as isize;
+                            }
+                        }
+                    }
+                }
+                TableBatchOp::SortedSetAdd(key, member, score) => {
+                    if !shard.data.contains_key(&key) {
+                        memory_deltas[shard_index] += (key.len() + 64) as isize;
+                        key_delta += 1;
+                    }
+                    let entry = shard.data.entry(key).or_insert_with(|| Entry {
+                        value: TableEntryKind::SortedSet.empty(),
+                        expires_at: None,
+                        lru_clock,
+                    });
+                    let StoreValue::SortedSet(tree, scores) = &mut entry.value else {
+                        unreachable!(
+                            "table sorted-set type was validated before journal publication"
+                        )
+                    };
+                    if let Some(previous) = scores.insert(member.clone(), score) {
+                        tree.remove(&(OrderedFloat(previous), member.clone()));
+                    } else {
+                        memory_deltas[shard_index] += (member.len() + 48) as isize;
+                    }
+                    tree.insert((OrderedFloat(score), member), ());
+                    entry.expires_at = None;
+                    entry.lru_clock = lru_clock;
+                }
+                TableBatchOp::SortedSetRemove(key, member) => {
+                    if let Some(entry) = shard.data.get_mut(&key) {
+                        if !entry.is_expired_at(self.now) {
+                            let StoreValue::SortedSet(tree, scores) = &mut entry.value else {
+                                unreachable!(
+                                    "table sorted-set type was validated before journal publication"
+                                )
+                            };
+                            if let Some(score) = scores.remove(&member) {
+                                let member_len = member.len();
+                                tree.remove(&(OrderedFloat(score), member));
+                                memory_deltas[shard_index] -= (member_len + 48) as isize;
+                            }
+                        }
+                    }
+                }
+                TableBatchOp::VectorSet(key, data, metadata, encrypted) => {
+                    let key_len = key.len();
+                    let value_size = 16 + data.len() * 4 + metadata.as_ref().map_or(0, String::len);
+                    let previous = shard.data.insert(
+                        key,
+                        Entry {
+                            value: StoreValue::Vector(VectorData {
+                                dims: data.len() as u32,
+                                data,
+                                metadata,
+                                encrypted,
+                            }),
+                            expires_at: None,
+                            lru_clock,
+                        },
+                    );
+                    if let Some(previous) = previous {
+                        let StoreValue::Vector(previous) = previous.value else {
+                            unreachable!(
+                                "table vector type was validated before journal publication"
+                            )
+                        };
+                        let old_size = 16
+                            + previous.data.len() * 4
+                            + previous.metadata.as_ref().map_or(0, String::len);
+                        memory_deltas[shard_index] += value_size as isize - old_size as isize;
+                    } else {
+                        memory_deltas[shard_index] += (key_len + 64 + value_size) as isize;
+                        key_delta += 1;
+                    }
+                }
+                TableBatchOp::Delete(key) => {
+                    if let Some(previous) = shard.data.remove(&key) {
+                        memory_deltas[shard_index] -=
+                            estimate_entry_memory(&key, &previous.value) as isize;
+                        key_delta -= 1;
+                    }
+                }
+            }
+        }
+
+        let mut inserted_vectors = Vec::new();
+        for key in keys {
+            let shard_index = store.shard_index(&key);
+            let shard = &shards[shard_positions[shard_index]];
+            if let Some(StoreValue::Vector(vector)) = shard.data.get(&key).map(|entry| &entry.value)
+            {
+                inserted_vectors.push((key_string(&key), vector.dims, vector.data.clone()));
+            }
+        }
+
+        for (shard_index, shard) in shard_indices.iter().copied().zip(shards.iter_mut()) {
+            let delta = memory_deltas[shard_index];
+            if delta >= 0 {
+                let added = delta as usize;
+                shard.used_memory += added;
+                store.mem_add(added);
+            } else {
+                let removed = (-delta) as usize;
+                shard.used_memory = shard.used_memory.saturating_sub(removed);
+                store.mem_sub(removed);
+            }
+        }
+        if key_delta >= 0 {
+            for _ in 0..key_delta as usize {
+                store.key_added();
+            }
+        } else {
+            for _ in 0..(-key_delta) as usize {
+                store.key_removed();
+            }
+        }
+        for shard in &mut shards {
+            shard.version += 1;
+        }
+        for (key, dims) in vector_before {
+            store.remove_vector_indexes(&key, dims);
+        }
+        for (key, dims, data) in inserted_vectors {
+            store.insert_vector_indexes(key, dims, data);
         }
     }
 }
@@ -1051,6 +1569,7 @@ impl Store {
             legacy_wals,
             recovery_wal_checkpoints: parking_lot::Mutex::new(HashMap::new()),
             journal_gates,
+            table_mutation_gate: parking_lot::ReentrantMutex::new(()),
             recovery_expiry_sentinel: parking_lot::Mutex::new(None),
             wal_suppress: std::sync::atomic::AtomicBool::new(false),
             replaying_wal: std::sync::atomic::AtomicBool::new(false),
@@ -1845,6 +2364,7 @@ impl Store {
     /// the disk shard BEFORE being removed from memory. If the disk write
     /// fails, the entry stays in memory (no silent data loss).
     pub fn evict_key(&self, shard_idx: usize, key: &[u8]) -> bool {
+        let _table_guard = Self::is_table_storage_key(key).then(|| self.table_mutation_gate.lock());
         // Placement changes are not journal entries, but they must serialize
         // with the logical mutation boundary. Otherwise a prepared write could
         // inspect the in-memory value, journal its effect, and then find that an
@@ -1940,6 +2460,7 @@ impl Store {
     /// For writes like HSET/LPUSH, this preserves existing data that would
     /// otherwise be lost if the command created a new empty entry.
     pub fn try_promote(&self, key: &[u8], now: Instant) -> Result<bool, String> {
+        let _table_guard = Self::is_table_storage_key(key).then(|| self.table_mutation_gate.lock());
         // Keep the disk-to-memory move indivisible with respect to prepared
         // writes. This is reentrant when a caller already owns the key domain.
         let _placement_guard = self.journal_gates[self.journal_gate_index(key)].lock();
@@ -2071,6 +2592,7 @@ impl Store {
         };
         let JournalPrepareGuard {
             store,
+            table_guard,
             guards,
             bypassed: _,
         } = prepared;
@@ -2078,6 +2600,7 @@ impl Store {
         let append_offset = self.append_journal_commands_locked(&mut wal, &[args], true)?;
         let commit = JournalCommitGuard {
             store,
+            _table_guard: table_guard,
             _guards: guards,
             armed: true,
         };
@@ -2149,6 +2672,13 @@ impl Store {
         let bypassed = self.wal_suppress.load(Ordering::Relaxed)
             || self.journal.is_none()
             || commands.is_empty();
+        // This lock is deliberately acquired before any journal domain. A
+        // snapshot takes the same order, so cold-key promotion during table
+        // planning cannot invert a per-key gate against snapshot capture.
+        let table_guard = commands
+            .iter()
+            .any(|args| Self::requires_table_mutation_gate(args))
+            .then(|| self.table_mutation_gate.lock());
         let guards = if self.wal_suppress.load(Ordering::Relaxed) || commands.is_empty() {
             Vec::new()
         } else {
@@ -2161,9 +2691,28 @@ impl Store {
         self.ensure_journal_healthy()?;
         Ok(JournalPrepareGuard {
             store: self,
+            table_guard,
             guards,
             bypassed,
         })
+    }
+
+    fn requires_table_mutation_gate(args: &[&[u8]]) -> bool {
+        let Some(command) = args.first() else {
+            return false;
+        };
+        let table_command = command.eq_ignore_ascii_case(b"TCREATE")
+            || command.eq_ignore_ascii_case(b"TROWSET")
+            || command.eq_ignore_ascii_case(b"TDELETE")
+            || command.eq_ignore_ascii_case(b"TDROP")
+            || command.eq_ignore_ascii_case(b"TALTER")
+            || command.eq_ignore_ascii_case(b"TINDEX")
+            || command.eq_ignore_ascii_case(b"TDROPINDEX");
+        table_command
+            || args
+                .iter()
+                .skip(1)
+                .any(|argument| Self::is_table_storage_key(argument))
     }
 
     /// Resolve a state-dependent mutation while its routing gates are held,
@@ -4600,6 +5149,7 @@ impl Store {
         &self,
         f: impl FnOnce(&mut [parking_lot::RwLockWriteGuard<'_, Shard>]) -> R,
     ) -> R {
+        let _table_guard = self.table_mutation_gate.lock();
         // Mutations acquire their journal domain before they append and keep it
         // through the state change. Take every domain in the same order before
         // locking shards so a snapshot cannot observe the pre-apply state and
@@ -6654,6 +7204,100 @@ mod tests {
         let n = now();
         store.set(b"key1", b"value1", None, n);
         assert_eq!(store.get(b"key1", n).unwrap(), &b"value1"[..]);
+    }
+
+    fn assert_store_metrics_match_entries(store: &Store) {
+        let (keys, memory) = store
+            .shards
+            .iter()
+            .map(|shard| {
+                let shard = shard.read();
+                let memory = shard
+                    .data
+                    .iter()
+                    .map(|(key, entry)| estimate_entry_memory(key, &entry.value))
+                    .sum::<usize>();
+                (shard.data.len(), memory)
+            })
+            .fold((0usize, 0usize), |(keys, memory), next| {
+                (keys + next.0, memory + next.1)
+            });
+        assert_eq!(store.tracked_key_count(), keys);
+        assert_eq!(store.approximate_memory(), memory);
+    }
+
+    #[test]
+    fn atomic_table_batch_tracks_net_memory_keys_and_vectors() {
+        let store = Store::new();
+        let n = now();
+        let mut insert = AtomicTableBatch::new(&store, n);
+        insert
+            .hash_set("_t:items:row:1", &[("name".to_string(), b"first".to_vec())])
+            .unwrap();
+        insert.set_add("_t:items:idx:name:first", "1").unwrap();
+        insert.sorted_set_add("_t:items:ids", "1", 1.0).unwrap();
+        insert
+            .vector_set("_t:items:vec:embedding:1", vec![1.0, 0.0], None, false)
+            .unwrap();
+        insert.apply();
+        assert_store_metrics_match_entries(&store);
+        assert_eq!(store.vcard(n), 1);
+
+        let mut update = AtomicTableBatch::new(&store, n);
+        update
+            .hash_set(
+                "_t:items:row:1",
+                &[
+                    ("name".to_string(), b"a much longer value".to_vec()),
+                    ("detail".to_string(), b"temporary".to_vec()),
+                ],
+            )
+            .unwrap();
+        update
+            .hash_delete(
+                "_t:items:row:1",
+                &["detail".to_string(), "missing".to_string()],
+            )
+            .unwrap();
+        update.set_add("_t:items:idx:name:first", "1").unwrap();
+        update
+            .set_remove("_t:items:idx:name:first", "missing")
+            .unwrap();
+        update.sorted_set_add("_t:items:ids", "1", 2.0).unwrap();
+        update.sorted_set_remove("_t:items:ids", "missing").unwrap();
+        update
+            .vector_set("_t:items:vec:embedding:1", vec![0.0, 1.0], None, false)
+            .unwrap();
+        update.apply();
+        assert_store_metrics_match_entries(&store);
+        assert_eq!(store.vcard(n), 1);
+
+        let mut delete = AtomicTableBatch::new(&store, n);
+        delete.delete_hash("_t:items:row:1").unwrap();
+        delete.delete_vector("_t:items:vec:embedding:1").unwrap();
+        delete.set_remove("_t:items:idx:name:first", "1").unwrap();
+        delete.sorted_set_remove("_t:items:ids", "1").unwrap();
+        delete.apply();
+        assert_store_metrics_match_entries(&store);
+        assert_eq!(store.vcard(n), 0);
+    }
+
+    #[test]
+    fn internal_table_key_journal_routes_take_the_table_mutation_gate() {
+        assert!(Store::requires_table_mutation_gate(&[
+            b"ZREM",
+            b"_t:_ttl",
+            b"sessions\0one",
+        ]));
+        assert!(Store::requires_table_mutation_gate(&[
+            b"TROWSET",
+            b"sessions",
+        ]));
+        assert!(!Store::requires_table_mutation_gate(&[
+            b"SET",
+            b"ordinary",
+            b"value",
+        ]));
     }
 
     #[test]

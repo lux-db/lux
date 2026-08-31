@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use parking_lot::RwLock;
 
-use crate::store::{Store, TableVectorCandidateQuery};
+use crate::store::{AtomicTableBatch, JournalPrepareGuard, Store, TableVectorCandidateQuery};
 
 // ---------------------------------------------------------------------------
 // Schema Cache
@@ -450,10 +450,6 @@ fn scoped_seq_key(table: &str, field: &str, partition_col: &str, partition_val: 
     )
 }
 
-fn row_key(table: &str, id: i64) -> String {
-    format!("_t:{}:row:{}", table, id)
-}
-
 fn idx_sorted_key(table: &str, field: &str) -> String {
     format!("_t:{}:idx:{}", table, field)
 }
@@ -598,6 +594,232 @@ fn raw_row_journal_command(table: &str, pk: &str, row: &[(String, Vec<u8>)]) -> 
         command.push(value.clone());
     }
     command
+}
+
+/// A complete table-row change prepared privately before its resolved journal
+/// record is published. The journal guard serializes table writers while the
+/// batch holds a validated, infallible row-and-index operation plan. Once
+/// durable, every affected key changes under one affected-shard write barrier.
+struct TableMutation<'a> {
+    store: &'a Store,
+    journal: JournalPrepareGuard<'a>,
+    batch: AtomicTableBatch<'a>,
+    row_deltas: std::collections::BTreeSet<(String, String)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_TABLE_MUTATION_AFTER_JOURNAL: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+fn fail_next_table_mutation_after_journal() {
+    FAIL_TABLE_MUTATION_AFTER_JOURNAL.with(|fault| fault.set(true));
+}
+
+impl<'a> TableMutation<'a> {
+    fn prepare(store: &'a Store, route: &[&[u8]], now: Instant) -> Result<Self, String> {
+        let journal = store
+            .prepare_journaled(route)
+            .map_err(|error| format!("ERR WAL append failed: {error}"))?;
+        Ok(Self {
+            store,
+            journal,
+            batch: AtomicTableBatch::new(store, now),
+            row_deltas: std::collections::BTreeSet::new(),
+        })
+    }
+
+    fn row_changed(&mut self, table: &str, pk: &str) {
+        self.row_deltas.insert((table.to_string(), pk.to_string()));
+    }
+
+    fn publish(self, command: &[&[u8]]) -> Result<(), String> {
+        let store = self.store;
+        let commit = self
+            .journal
+            .commit(command)
+            .map_err(|error| format!("ERR WAL append failed: {error}"))?;
+        #[cfg(test)]
+        if FAIL_TABLE_MUTATION_AFTER_JOURNAL.with(|fault| fault.replace(false)) {
+            return Err("ERR injected interruption after table journal publication".to_string());
+        }
+        self.batch.apply();
+        if store.wants_row_deltas() {
+            for (table, pk) in self.row_deltas {
+                store.emit_row_delta(&table, &pk);
+            }
+        }
+        commit
+            .complete()
+            .map_err(|error| format!("ERR journal apply failed: {error}"))
+    }
+}
+
+fn stage_add_to_index(
+    mutation: &mut TableMutation<'_>,
+    store: &Store,
+    table: &str,
+    field: &FieldDef,
+    value: &str,
+    pk: &str,
+) -> Result<(), String> {
+    if field.encrypted {
+        if field.searchable {
+            for index_value in searchable_index_values(store, table, field, value)? {
+                mutation
+                    .batch
+                    .set_add(&idx_str_key(table, &field.name, &index_value), pk)?;
+            }
+        }
+        return Ok(());
+    }
+
+    match &field.field_type {
+        FieldType::Int
+        | FieldType::Float
+        | FieldType::Bool
+        | FieldType::Timestamp
+        | FieldType::Ref(_) => {
+            let score = if field.field_type == FieldType::Bool {
+                match value {
+                    "true" | "1" => 1.0,
+                    "false" | "0" => 0.0,
+                    _ => return Err(format!("ERR invalid boolean index value '{value}'")),
+                }
+            } else {
+                value
+                    .parse::<f64>()
+                    .map_err(|_| format!("ERR invalid numeric index value '{value}'"))?
+            };
+            mutation
+                .batch
+                .sorted_set_add(&idx_sorted_key(table, &field.name), pk, score)?;
+        }
+        FieldType::Str | FieldType::Uuid => mutation
+            .batch
+            .set_add(&idx_str_key(table, &field.name, value), pk)?,
+        FieldType::Vector(dims) => {
+            let vector = parse_vector_value(value, *dims)?;
+            let metadata = serde_json::json!({
+                "table": table,
+                "field": field.name,
+                "table_field": format!("{}.{}", table, field.name),
+                "pk": pk,
+                "id": pk,
+            })
+            .to_string();
+            mutation.batch.vector_set(
+                &table_vector_key(table, &field.name, pk),
+                vector,
+                Some(metadata),
+                field.encrypted,
+            )?;
+        }
+        FieldType::Json | FieldType::Array => {}
+    }
+    Ok(())
+}
+
+fn stage_remove_from_index(
+    mutation: &mut TableMutation<'_>,
+    store: &Store,
+    table: &str,
+    field: &FieldDef,
+    value: &str,
+    pk: &str,
+) -> Result<(), String> {
+    if field.encrypted {
+        if field.searchable {
+            for index_value in searchable_index_values(store, table, field, value)? {
+                mutation
+                    .batch
+                    .set_remove(&idx_str_key(table, &field.name, &index_value), pk)?;
+            }
+        }
+        return Ok(());
+    }
+
+    match &field.field_type {
+        FieldType::Int
+        | FieldType::Float
+        | FieldType::Bool
+        | FieldType::Timestamp
+        | FieldType::Ref(_) => mutation
+            .batch
+            .sorted_set_remove(&idx_sorted_key(table, &field.name), pk)?,
+        FieldType::Str | FieldType::Uuid => mutation
+            .batch
+            .set_remove(&idx_str_key(table, &field.name, value), pk)?,
+        FieldType::Vector(_) => {
+            mutation
+                .batch
+                .delete_vector(&table_vector_key(table, &field.name, pk))?
+        }
+        FieldType::Json | FieldType::Array => {}
+    }
+    Ok(())
+}
+
+fn stage_set_unique(
+    mutation: &mut TableMutation<'_>,
+    store: &Store,
+    table: &str,
+    field: &FieldDef,
+    value: &str,
+    pk: &str,
+) -> Result<(), String> {
+    let pairs = searchable_index_values(store, table, field, value)?
+        .into_iter()
+        .map(|index_value| (index_value, pk.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    mutation
+        .batch
+        .hash_set(&uniq_key(table, &field.name), &pairs)
+}
+
+fn stage_remove_unique(
+    mutation: &mut TableMutation<'_>,
+    store: &Store,
+    table: &str,
+    field: &FieldDef,
+    value: &str,
+) -> Result<(), String> {
+    let fields = searchable_index_values(store, table, field, value)?;
+    mutation
+        .batch
+        .hash_delete(&uniq_key(table, &field.name), &fields)
+}
+
+fn stage_bump_sequence(
+    mutation: &mut TableMutation<'_>,
+    store: &Store,
+    key: String,
+    value: i64,
+    now: Instant,
+) -> Result<(), String> {
+    if value > current_sequence(store, &key, now)? {
+        mutation
+            .batch
+            .set_string(&key, value.to_string().into_bytes())?;
+    }
+    Ok(())
+}
+
+fn stage_clear_row_ttl(
+    mutation: &mut TableMutation<'_>,
+    table: &str,
+    pk: &str,
+) -> Result<(), String> {
+    mutation.batch.hash_delete(
+        &row_key_for_pk(table, pk),
+        &[String::from_utf8_lossy(HIDDEN_TTL_FIELD).to_string()],
+    )?;
+    mutation
+        .batch
+        .sorted_set_remove(ttl_index_key(), &ttl_member(table, pk))
 }
 
 pub(crate) fn table_apply_wal_row(
@@ -946,6 +1168,37 @@ fn unique_holder_for_value(
     Ok(None)
 }
 
+fn referenced_value_exists(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    reference: &ForeignKey,
+    value: &str,
+    now: Instant,
+) -> Result<bool, String> {
+    let schema = load_schema(store, cache, &reference.table, now)?;
+    let primary_key = pk_column_name(&schema);
+    if reference.column == primary_key {
+        return Ok(get_row(store, &reference.table, &schema, value, now, true)?.is_some());
+    }
+
+    let field = schema
+        .iter()
+        .find(|field| field.name == reference.column)
+        .ok_or_else(|| {
+            format!(
+                "ERR referenced column '{}.{}' does not exist",
+                reference.table, reference.column
+            )
+        })?;
+    let Some(holder) = unique_holder_for_value(store, &reference.table, field, value, now)? else {
+        return Ok(false);
+    };
+    Ok(
+        get_row(store, &reference.table, &schema, &holder, now, true)?.is_some()
+            && uniq_holder_holds_value(store, &reference.table, field, &holder, value, now)?,
+    )
+}
+
 /// If the row at `pk` exists but has expired, physically remove it (full delete
 /// bookkeeping) so a fresh insert/upsert can take its place; this closes the
 /// sub-sweep-interval window where an expired-but-not-yet-swept row would still
@@ -1015,15 +1268,45 @@ pub fn expire_due_rows(
                 .map_err(|error| format!("ERR WAL append failed: {error}"))??;
             continue;
         };
-        table_delete_inner(store, cache, table, pk, now, 0)?;
-        if !affected.iter().any(|t| t == table) {
+        if expire_row_if_due(store, cache, table, pk, now_ms as u64, now)?
+            && !affected.iter().any(|t| t == table)
+        {
             affected.push(table.to_string());
         }
-        // `table_delete_inner` clears the deadline while holding the table
-        // mutation domain. On failure, retain it for a later retry; removing it
-        // here could race a TTL refresh and make the replacement row permanent.
     }
     Ok(affected)
+}
+
+fn expire_row_if_due(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk: &str,
+    cutoff_ms: u64,
+    now: Instant,
+) -> Result<bool, String> {
+    let route: [&[u8]; 3] = [b"TDELETE", b"FROM", table.as_bytes()];
+    let mut mutation = TableMutation::prepare(store, &route, now)?;
+    let row_key = row_key_for_pk(table, pk);
+    let deadline = store
+        .hget_checked(row_key.as_bytes(), HIDDEN_TTL_FIELD, now)?
+        .and_then(|value| std::str::from_utf8(&value).ok()?.parse::<u64>().ok());
+
+    match deadline {
+        Some(deadline) if deadline <= cutoff_ms => {
+            stage_and_publish_delete(cache, table, pk, now, mutation)?;
+            Ok(true)
+        }
+        Some(_) => Ok(false),
+        None => {
+            let ttl_key = ttl_index_key();
+            let member = ttl_member(table, pk);
+            mutation.batch.sorted_set_remove(ttl_key, &member)?;
+            let command: [&[u8]; 3] = [b"ZREM", ttl_key.as_bytes(), member.as_bytes()];
+            mutation.publish(&command)?;
+            Ok(false)
+        }
+    }
 }
 
 fn is_valid_name(name: &str) -> bool {
@@ -2343,6 +2626,14 @@ fn parse_conflict_columns(conflict_col: Option<&str>, pk_name: Option<&str>) -> 
         .collect()
 }
 
+fn normalized_field_values<'a>(field_values: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    let mut values = std::collections::BTreeMap::new();
+    for &(field, value) in field_values {
+        values.insert(field, value);
+    }
+    values.into_iter().collect()
+}
+
 /// Insert a row, or update the conflicting row if one already exists on the
 /// conflict column(s). `conflict_col` defaults to the primary key (implicit `id`
 /// when there is no declared PK). Returns the resulting row. Every conflict
@@ -2371,6 +2662,10 @@ pub fn table_upsert_returning_ttl(
     ttl: Option<TtlOp>,
     now: Instant,
 ) -> Result<Vec<(String, String)>, String> {
+    let field_values = normalized_field_values(field_values);
+    let field_values = field_values.as_slice();
+    let route: [&[u8]; 2] = [b"TROWSET", table.as_bytes()];
+    let mutation = TableMutation::prepare(store, &route, now)?;
     let schema = load_schema(store, cache, table, now)?;
     let pk_name = schema
         .iter()
@@ -2385,7 +2680,19 @@ pub fn table_upsert_returning_ttl(
             .map(|(_, v)| *v)
         else {
             // No value to conflict on -> behaves as a plain insert.
-            return table_insert_returning_ttl(store, cache, table, field_values, ttl, now);
+            let pk = table_insert_pk_with_mutation(
+                store,
+                cache,
+                table,
+                field_values,
+                ttl,
+                now,
+                mutation,
+            )?;
+            let mut row = get_row(store, table, &schema, &pk, now, true)?
+                .ok_or_else(|| format!("ERR inserted row not found in table '{}'", table))?;
+            row.sort_by(|left, right| left.0.cmp(&right.0));
+            return Ok(row);
         };
         conflict_values.push((conflict.as_str(), cval));
     }
@@ -2423,46 +2730,49 @@ pub fn table_upsert_returning_ttl(
                 .flatten()
             {
                 Some(pk) if !purge_if_expired(store, cache, table, &pk, now)? => Some(pk),
-                Some(_) => {
-                    if let Some(field) = conflict_field {
-                        remove_unique_entries(store, table, field, cval, now)?;
-                    }
-                    find_row_by_fields(store, table, &schema, &[(conflict, cval)], now)?
-                }
+                Some(_) => find_row_by_fields(store, table, &schema, &[(conflict, cval)], now)?,
                 None => find_row_by_fields(store, table, &schema, &[(conflict, cval)], now)?,
             }
         }
     } else {
         find_row_by_fields(store, table, &schema, &conflict_values, now)?
     };
-    let conflict = conflict_values[0].0;
-    let cval = conflict_values[0].1;
-
     match existing_pk {
         Some(pk) => {
             // Update the conflicting row with the non-key fields, then return it.
-            let mut updates: Vec<(&str, &str)> = field_values
+            let updates: Vec<(&str, &str)> = field_values
                 .iter()
                 .copied()
                 .filter(|(k, _)| !conflicts.iter().any(|conflict| conflict == *k))
                 .collect();
-            // A TTL-only upsert (no non-key fields) still needs a logged command so
-            // the refreshed deadline survives WAL replay. Carry it on a no-op write
-            // of the conflict column to its matched value.
-            if updates.is_empty() && ttl.is_some() {
-                updates.push((conflict, cval));
-            }
-            // The leaf applies AND WAL-logs the TTL atomically with the row update,
-            // so replay preserves the deadline instead of dropping it.
-            if !updates.is_empty() {
-                table_update_by_pk_str(store, cache, table, &pk, &updates, ttl, now)?;
+            // The leaf applies and journals the TTL atomically with the row update.
+            // It also accepts an empty field list for a TTL-only refresh, avoiding a
+            // synthetic no-op write to the immutable conflict/primary-key column.
+            if !updates.is_empty() || ttl.is_some() {
+                table_update_by_pk_str_with_mutation(
+                    cache, table, &pk, &updates, ttl, now, mutation,
+                )?;
             }
             let mut row = get_row(store, table, &schema, &pk, now, true)?
                 .ok_or_else(|| format!("ERR upserted row not found in table '{}'", table))?;
             row.sort_by(|a, b| a.0.cmp(&b.0));
             Ok(row)
         }
-        None => table_insert_returning_ttl(store, cache, table, field_values, ttl, now),
+        None => {
+            let pk = table_insert_pk_with_mutation(
+                store,
+                cache,
+                table,
+                field_values,
+                ttl,
+                now,
+                mutation,
+            )?;
+            let mut row = get_row(store, table, &schema, &pk, now, true)?
+                .ok_or_else(|| format!("ERR inserted row not found in table '{}'", table))?;
+            row.sort_by(|left, right| left.0.cmp(&right.0));
+            Ok(row)
+        }
     }
 }
 
@@ -2476,9 +2786,19 @@ fn table_insert_pk(
     now: Instant,
 ) -> Result<String, String> {
     let route: [&[u8]; 2] = [b"TROWSET", table.as_bytes()];
-    let journal = store
-        .prepare_journaled(&route)
-        .map_err(|error| format!("ERR WAL append failed: {error}"))?;
+    let mutation = TableMutation::prepare(store, &route, now)?;
+    table_insert_pk_with_mutation(store, cache, table, field_values, ttl, now, mutation)
+}
+
+fn table_insert_pk_with_mutation(
+    store: &Store,
+    cache: &SharedSchemaCache,
+    table: &str,
+    field_values: &[(&str, &str)],
+    ttl: Option<TtlOp>,
+    now: Instant,
+    mut mutation: TableMutation<'_>,
+) -> Result<String, String> {
     let schema = load_schema(store, cache, table, now)?;
 
     // A table with no declared PK stores rows under an implicit auto-increment
@@ -2581,9 +2901,17 @@ fn table_insert_pk(
                     field.name, value
                 )
             })?;
-            let rk = row_key(ref_table, ref_id);
-            let ref_row = store.hgetall(rk.as_bytes(), now)?;
-            if ref_row.is_empty() {
+            let ref_schema = load_schema(store, cache, ref_table, now)?;
+            if get_row(
+                store,
+                ref_table,
+                &ref_schema,
+                &ref_id.to_string(),
+                now,
+                true,
+            )?
+            .is_none()
+            {
                 return Err(format!(
                     "ERR foreign key violation: {}={} not found in table '{}'",
                     field.name, value, ref_table
@@ -2593,20 +2921,11 @@ fn table_insert_pk(
 
         // Explicit FK check
         if let Some(fk) = &field.references {
-            let ref_row_key = row_key_for_pk(&fk.table, value);
-            let ref_row = store.hgetall(ref_row_key.as_bytes(), now)?;
-            if ref_row.is_empty() {
-                // Also try the uniq index on the referenced column
-                let ukey = uniq_key(&fk.table, &fk.column);
-                if store
-                    .hget_checked(ukey.as_bytes(), value.as_bytes(), now)?
-                    .is_none()
-                {
-                    return Err(format!(
-                        "ERR foreign key violation: {}.{}='{}' not found in table '{}'",
-                        table, field.name, value, fk.table
-                    ));
-                }
+            if !referenced_value_exists(store, cache, fk, value, now)? {
+                return Err(format!(
+                    "ERR foreign key violation: {}.{}='{}' not found in table '{}'",
+                    table, field.name, value, fk.table
+                ));
             }
         }
 
@@ -2631,9 +2950,8 @@ fn table_insert_pk(
                             field.name, value
                         ));
                     }
-                    // Stale entry -> drop it so it doesn't block this (valid) insert,
-                    // which writes the fresh holder below.
-                    store.hdel(ukey.as_bytes(), &[index_value.as_bytes()], now)?;
+                    // A stale entry does not block the insert. The staged unique
+                    // index write below replaces it in the same atomic batch.
                 }
             }
         }
@@ -2666,17 +2984,7 @@ fn table_insert_pk(
     // This unifies the key scheme so get_all_row_ids / get_row always work correctly.
     let pk_str: String = if let Some(pk) = pk_field {
         match provided.get(pk.name.as_str()) {
-            Some(pk_val) => {
-                // Check the row doesn't already exist (an expired row is purged
-                // and treated as absent).
-                if !purge_if_expired(store, cache, table, pk_val, now)? {
-                    return Err(format!(
-                        "ERR primary key violation: '{}' already exists",
-                        pk_val
-                    ));
-                }
-                pk_val.to_string()
-            }
+            Some(pk_val) => pk_val.to_string(),
             None if pk.field_type == FieldType::Int => {
                 // Auto-increment INT PK
                 peek_next_id(store, table, now)?.to_string()
@@ -2697,13 +3005,22 @@ fn table_insert_pk(
             }
         }
     } else if let Some(id) = provided.get("id") {
-        // Implicit-id table carrying an explicit id (WAL replay, or a client that
-        // supplied one). The derived counter advances only after the resolved row
-        // is durable.
+        // An explicit value for the implicit primary key follows the same
+        // uniqueness rule as a declared primary key. WAL replay uses TROWSET and
+        // does not pass through this insert path.
         id.to_string()
     } else {
         peek_next_id(store, table, now)?.to_string()
     };
+
+    // All primary-key sources—explicit, sequence-generated, UUID-generated, or
+    // DEFAULT-generated—must pass the same final collision check.
+    if !purge_if_expired(store, cache, table, &pk_str, now)? {
+        return Err(format!(
+            "ERR primary key violation: '{}' already exists",
+            pk_str
+        ));
+    }
 
     let rk = row_key_for_pk(table, &pk_str);
 
@@ -2745,17 +3062,6 @@ fn table_insert_pk(
 
     let journal_command = raw_row_journal_command(table, &pk_str, &pairs_owned);
     let journal_refs: Vec<&[u8]> = journal_command.iter().map(Vec::as_slice).collect();
-    let commit = journal
-        .commit(&journal_refs)
-        .map_err(|error| format!("ERR WAL append failed: {error}"))?;
-
-    // NOTE: the row hash is committed LAST (after `:ids`, indexes, uniq, vector,
-    // and the staged TTL field). Reach-structures point at a pk whose row hash
-    // does not exist yet; reads re-fetch the row and filter it out (treated as
-    // "not committed"). The single final `hset` then flips the row visible
-    // everywhere atomically. A failure before the commit leaves only orphan index
-    // entries (harmless to reads via read-validation; cleaned lazily), never a
-    // half-applied row.
 
     // Track this row in the ids sorted set.
     // Member = pk_str, score = numeric pk if possible, else a monotonic counter.
@@ -2765,10 +3071,16 @@ fn table_insert_pk(
         Err(_) => peek_next_id(store, &format!("{}__order", table), now)? as f64,
     };
     if let Ok(id) = pk_str.parse::<i64>() {
-        bump_seq_to_at_least(store, table, id, now)?;
+        stage_bump_sequence(&mut mutation, store, seq_key(table), id, now)?;
     }
     if pk_str.parse::<f64>().is_err() {
-        bump_seq_to_at_least(store, &format!("{}__order", table), score as i64, now)?;
+        stage_bump_sequence(
+            &mut mutation,
+            store,
+            seq_key(&format!("{}__order", table)),
+            score as i64,
+            now,
+        )?;
     }
     for field in schema
         .iter()
@@ -2784,42 +3096,28 @@ fn table_insert_pk(
             continue;
         };
         if let Ok(value) = value.parse::<i64>() {
-            bump_scoped_seq_to_at_least(
+            stage_bump_sequence(
+                &mut mutation,
                 store,
-                table,
-                &field.name,
-                partition_col,
-                partition,
+                scoped_seq_key(table, &field.name, partition_col, partition),
                 value,
                 now,
             )?;
         }
     }
     let ikey = ids_key(table);
-    store.zadd(
-        ikey.as_bytes(),
-        &[(pk_str.as_bytes(), score)],
-        false,
-        false,
-        false,
-        false,
-        false,
-        now,
-    )?;
+    mutation.batch.sorted_set_add(&ikey, &pk_str, score)?;
 
     for field in &schema {
-        if let Some(value) = provided.get(field.name.as_str()) {
-            add_to_index(store, table, field, value, &pk_str, now)?;
+        let value = provided
+            .get(field.name.as_str())
+            .copied()
+            .or_else(|| field.primary_key.then_some(pk_str.as_str()));
+        if let Some(value) = value {
+            stage_add_to_index(&mut mutation, store, table, field, value, &pk_str)?;
 
             if field.unique {
-                let ukey = uniq_key(table, &field.name);
-                for index_value in searchable_index_values(store, table, field, value)? {
-                    store.hset(
-                        ukey.as_bytes(),
-                        &[(index_value.as_bytes() as &[u8], pk_str.as_bytes() as &[u8])],
-                        now,
-                    )?;
-                }
+                stage_set_unique(&mut mutation, store, table, field, value, &pk_str)?;
             }
         }
     }
@@ -2832,13 +3130,13 @@ fn table_insert_pk(
             }
             if let Some(raw) = provided.get(root).copied() {
                 if let Some(scalar) = extract_json_scalar(raw, rest) {
-                    add_to_index(
+                    stage_add_to_index(
+                        &mut mutation,
                         store,
                         table,
                         &synthetic_path_fielddef(pi),
                         &scalar,
                         &pk_str,
-                        now,
                     )?;
                 }
             }
@@ -2847,34 +3145,14 @@ fn table_insert_pk(
 
     if let Some(deadline) = resolved_deadline {
         let member = ttl_member(table, &pk_str);
-        store.zadd(
-            ttl_index_key().as_bytes(),
-            &[(member.as_bytes(), deadline as f64)],
-            false,
-            false,
-            false,
-            false,
-            false,
-            now,
-        )?;
+        mutation
+            .batch
+            .sorted_set_add(ttl_index_key(), &member, deadline as f64)?;
     }
 
-    // --- Commit: write the complete row hash LAST (the atomic visibility point) ---
-    let pair_refs: Vec<(&[u8], &[u8])> = pairs_owned
-        .iter()
-        .map(|(k, v)| (k.as_bytes() as &[u8], v.as_slice()))
-        .collect();
-    store.hset(rk.as_bytes(), &pair_refs, now)?;
-
-    // Reactive live queries: hint that this pk changed so watching queries
-    // re-evaluate it (gated, so idle writes pay nothing).
-    if store.wants_row_deltas() {
-        store.emit_row_delta(table, &pk_str);
-    }
-
-    commit
-        .complete()
-        .map_err(|error| format!("ERR journal apply failed: {error}"))?;
+    mutation.batch.hash_set(&rk, &pairs_owned)?;
+    mutation.row_changed(table, &pk_str);
+    mutation.publish(&journal_refs)?;
     Ok(pk_str)
 }
 
@@ -2971,9 +3249,22 @@ fn table_update_by_pk_str(
     now: Instant,
 ) -> Result<(), String> {
     let route: [&[u8]; 2] = [b"TROWSET", table.as_bytes()];
-    let journal = store
-        .prepare_journaled(&route)
-        .map_err(|error| format!("ERR WAL append failed: {error}"))?;
+    let mutation = TableMutation::prepare(store, &route, now)?;
+    table_update_by_pk_str_with_mutation(cache, table, pk_str, field_values, ttl, now, mutation)
+}
+
+fn table_update_by_pk_str_with_mutation(
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    field_values: &[(&str, &str)],
+    ttl: Option<TtlOp>,
+    now: Instant,
+    mut mutation: TableMutation<'_>,
+) -> Result<(), String> {
+    let store = mutation.store;
+    let field_values = normalized_field_values(field_values);
+    let field_values = field_values.as_slice();
     let schema = load_schema(store, cache, table, now)?;
     let rk = row_key_for_pk(table, pk_str);
 
@@ -2989,15 +3280,30 @@ fn table_update_by_pk_str(
             .find(|f| f.name == *fname)
             .ok_or_else(|| format!("ERR unknown field '{}'", fname))?;
 
+        if field.primary_key || (*fname == "id" && !schema.iter().any(|f| f.primary_key)) {
+            return Err(format!(
+                "ERR primary key column '{}' cannot be updated",
+                fname
+            ));
+        }
+
         validate_value(field, fval)?;
 
         if let FieldType::Ref(ref ref_table) = field.field_type {
-            let rk2 = row_key_for_pk(ref_table, fval);
-            let ref_row = store.hgetall(rk2.as_bytes(), now)?;
-            if ref_row.is_empty() {
+            let ref_schema = load_schema(store, cache, ref_table, now)?;
+            if get_row(store, ref_table, &ref_schema, fval, now, true)?.is_none() {
                 return Err(format!(
                     "ERR foreign key violation: {}={} not found in table '{}'",
                     fname, fval, ref_table
+                ));
+            }
+        }
+
+        if let Some(fk) = &field.references {
+            if !referenced_value_exists(store, cache, fk, fval, now)? {
+                return Err(format!(
+                    "ERR foreign key violation: {}.{}='{}' not found in table '{}'",
+                    table, field.name, fval, fk.table
                 ));
             }
         }
@@ -3014,10 +3320,73 @@ fn table_update_by_pk_str(
                             field.name
                         ));
                     }
-                    remove_unique_entries(store, table, field, fval, now)?;
                 }
             }
         }
+    }
+
+    let mut final_values = old_map.clone();
+    for (field, value) in field_values {
+        final_values.insert((*field).to_string(), (*value).to_string());
+    }
+    for sequence_field in schema
+        .iter()
+        .filter(|field| field.sequence_partition.is_some())
+    {
+        let partition_column = sequence_field
+            .sequence_partition
+            .as_deref()
+            .expect("filtered sequence field has a partition column");
+        let affects_sequence = field_values
+            .iter()
+            .any(|(field, _)| *field == sequence_field.name || *field == partition_column);
+        if !affects_sequence {
+            continue;
+        }
+        let sequence_value = final_values
+            .get(&sequence_field.name)
+            .ok_or_else(|| format!("ERR SEQUENCE column '{}' has no value", sequence_field.name))?;
+        let partition_value = final_values.get(partition_column).ok_or_else(|| {
+            format!(
+                "ERR SEQUENCE column '{}' requires partition column '{}'",
+                sequence_field.name, partition_column
+            )
+        })?;
+        for candidate_pk in get_all_row_ids(store, table, now)? {
+            if candidate_pk == pk_str {
+                continue;
+            }
+            let Some(candidate) = get_row(store, table, &schema, &candidate_pk, now, true)? else {
+                continue;
+            };
+            if candidate
+                .iter()
+                .any(|(field, value)| field == partition_column && value == partition_value)
+                && candidate
+                    .iter()
+                    .any(|(field, value)| field == &sequence_field.name && value == sequence_value)
+            {
+                return Err(format!(
+                    "ERR unique constraint violation on columns '{}', '{}'",
+                    partition_column, sequence_field.name
+                ));
+            }
+        }
+        let sequence_value = sequence_value
+            .parse::<i64>()
+            .map_err(|_| format!("ERR invalid int '{}'", sequence_value))?;
+        stage_bump_sequence(
+            &mut mutation,
+            store,
+            scoped_seq_key(
+                table,
+                &sequence_field.name,
+                partition_column,
+                partition_value,
+            ),
+            sequence_value,
+            now,
+        )?;
     }
 
     let mut pairs_owned: Vec<(String, Vec<u8>)> = Vec::with_capacity(field_values.len());
@@ -3055,30 +3424,20 @@ fn table_update_by_pk_str(
     let final_raw: Vec<(String, Vec<u8>)> = final_raw.into_iter().collect();
     let journal_command = raw_row_journal_command(table, pk_str, &final_raw);
     let journal_refs: Vec<&[u8]> = journal_command.iter().map(Vec::as_slice).collect();
-    let commit = journal
-        .commit(&journal_refs)
-        .map_err(|error| format!("ERR WAL append failed: {error}"))?;
 
     for (fname, fval) in field_values {
         let field = schema.iter().find(|f| f.name == *fname).unwrap();
 
         if let Some(old_val) = old_map.get(*fname) {
-            remove_from_index(store, table, field, old_val, pk_str, now)?;
+            stage_remove_from_index(&mut mutation, store, table, field, old_val, pk_str)?;
             if field.unique {
-                remove_unique_entries(store, table, field, old_val, now)?;
+                stage_remove_unique(&mut mutation, store, table, field, old_val)?;
             }
         }
 
-        add_to_index(store, table, field, fval, pk_str, now)?;
+        stage_add_to_index(&mut mutation, store, table, field, fval, pk_str)?;
         if field.unique {
-            let ukey = uniq_key(table, &field.name);
-            for index_value in searchable_index_values(store, table, field, fval)? {
-                store.hset(
-                    ukey.as_bytes(),
-                    &[(index_value.as_bytes() as &[u8], pk_str.as_bytes() as &[u8])],
-                    now,
-                )?;
-            }
+            stage_set_unique(&mut mutation, store, table, field, fval, pk_str)?;
         }
     }
 
@@ -3100,54 +3459,37 @@ fn table_update_by_pk_str(
         let synthetic = synthetic_path_fielddef(pi);
         if let Some(old_raw) = old_map.get(root) {
             if let Some(old_scalar) = extract_json_scalar(old_raw, rest) {
-                remove_from_index(store, table, &synthetic, &old_scalar, pk_str, now)?;
+                stage_remove_from_index(
+                    &mut mutation,
+                    store,
+                    table,
+                    &synthetic,
+                    &old_scalar,
+                    pk_str,
+                )?;
             }
         }
         if let Some(new_scalar) = extract_json_scalar(new_raw, rest) {
-            add_to_index(store, table, &synthetic, &new_scalar, pk_str, now)?;
+            stage_add_to_index(&mut mutation, store, table, &synthetic, &new_scalar, pk_str)?;
         }
     }
 
-    let pair_refs: Vec<(&[u8], &[u8])> = pairs_owned
-        .iter()
-        .map(|(k, v)| (k.as_bytes() as &[u8], v.as_slice()))
-        .collect();
-    store.hset(rk.as_bytes(), &pair_refs, now)?;
+    mutation.batch.hash_set(&rk, &final_raw)?;
 
     match ttl {
         Some(TtlOp::Set(_)) => {
             let deadline = resolved_deadline.expect("set TTL resolves a deadline");
-            let deadline_bytes = deadline.to_string();
-            store.hset(
-                rk.as_bytes(),
-                &[(HIDDEN_TTL_FIELD, deadline_bytes.as_bytes())],
-                now,
-            )?;
             let member = ttl_member(table, pk_str);
-            store.zadd(
-                ttl_index_key().as_bytes(),
-                &[(member.as_bytes(), deadline as f64)],
-                false,
-                false,
-                false,
-                false,
-                false,
-                now,
-            )?;
+            mutation
+                .batch
+                .sorted_set_add(ttl_index_key(), &member, deadline as f64)?;
         }
-        Some(TtlOp::Clear) => clear_row_ttl(store, table, pk_str, now)?,
+        Some(TtlOp::Clear) => stage_clear_row_ttl(&mut mutation, table, pk_str)?,
         None => {}
     }
 
-    // Reactive live queries: hint that this pk changed.
-    if store.wants_row_deltas() {
-        store.emit_row_delta(table, pk_str);
-    }
-
-    commit
-        .complete()
-        .map_err(|error| format!("ERR journal apply failed: {error}"))?;
-    Ok(())
+    mutation.row_changed(table, pk_str);
+    mutation.publish(&journal_refs)
 }
 
 #[cfg(test)]
@@ -3163,119 +3505,6 @@ pub fn table_delete(
 
 const CASCADE_DEPTH_LIMIT: usize = 16;
 
-/// Validate the complete FK cascade before the top-level delete becomes
-/// durable. The caller holds the full table-delete journal barrier, so the
-/// reference graph cannot change between this walk and apply.
-fn validate_delete_tree(
-    store: &Store,
-    cache: &SharedSchemaCache,
-    table: &str,
-    pk_str: &str,
-    now: Instant,
-    depth: usize,
-) -> Result<(), String> {
-    if depth > CASCADE_DEPTH_LIMIT {
-        return Err(format!(
-            "ERR cascade depth limit ({}) exceeded - possible circular FK reference",
-            CASCADE_DEPTH_LIMIT
-        ));
-    }
-    let schema = load_schema(store, cache, table, now)?;
-    let row: std::collections::HashMap<String, String> =
-        get_row_including_expired(store, table, &schema, pk_str, now)?
-            .ok_or_else(|| format!("ERR row '{}' not found in table '{}'", pk_str, table))?
-            .into_iter()
-            .collect();
-    let pk_value = schema
-        .iter()
-        .find(|field| field.primary_key)
-        .and_then(|field| row.get(&field.name))
-        .cloned()
-        .unwrap_or_else(|| pk_str.to_string());
-
-    for other_table in store.smembers(table_list_key().as_bytes(), now)? {
-        if other_table == table {
-            continue;
-        }
-        let other_schema = load_schema(store, cache, &other_table, now)?;
-        for field in &other_schema {
-            if matches!(&field.field_type, FieldType::Ref(ref_table) if ref_table == table) {
-                let zkey = idx_sorted_key(&other_table, &field.name);
-                let id = pk_str.parse::<f64>().unwrap_or(0.0);
-                let referenced = store.zrangebyscore(
-                    zkey.as_bytes(),
-                    id,
-                    id,
-                    false,
-                    false,
-                    false,
-                    None,
-                    None,
-                    false,
-                    now,
-                )?;
-                if !referenced.is_empty() {
-                    return Err(format!(
-                        "ERR cannot delete: row is referenced by table '{}'",
-                        other_table
-                    ));
-                }
-            }
-
-            let Some(fk) = &field.references else {
-                continue;
-            };
-            if fk.table != table {
-                continue;
-            }
-            let referencing_ids: Vec<String> = if field.unique {
-                let ukey = uniq_key(&other_table, &field.name);
-                store
-                    .hget_checked(ukey.as_bytes(), pk_value.as_bytes(), now)?
-                    .map(|id| vec![String::from_utf8_lossy(&id).to_string()])
-                    .unwrap_or_default()
-            } else {
-                let mut referencing_ids = Vec::new();
-                for other_pk in get_all_row_ids(store, &other_table, now)? {
-                    let row_key = row_key_for_pk(&other_table, &other_pk);
-                    let pairs = store.hgetall(row_key.as_bytes(), now)?;
-                    if pairs.iter().any(|(name, value)| {
-                        name == &field.name && field.field_type.decode_value(value) == pk_value
-                    }) {
-                        referencing_ids.push(other_pk);
-                    }
-                }
-                referencing_ids
-            };
-            if referencing_ids.is_empty() {
-                continue;
-            }
-            match fk.on_delete {
-                OnDelete::Restrict => {
-                    return Err(format!(
-                        "ERR cannot delete: row is referenced by table '{}' column '{}' (ON DELETE RESTRICT)",
-                        other_table, field.name
-                    ));
-                }
-                OnDelete::Cascade => {
-                    for referencing_id in referencing_ids {
-                        validate_delete_tree(
-                            store,
-                            cache,
-                            &other_table,
-                            &referencing_id,
-                            now,
-                            depth + 1,
-                        )?;
-                    }
-                }
-                OnDelete::SetNull => {}
-            }
-        }
-    }
-    Ok(())
-}
-
 fn table_delete_inner(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -3284,22 +3513,64 @@ fn table_delete_inner(
     now: Instant,
     depth: usize,
 ) -> Result<(), String> {
+    if depth != 0 {
+        return Err("ERR internal nested table delete escaped its atomic batch".to_string());
+    }
+    let route: [&[u8]; 3] = [b"TDELETE", b"FROM", table.as_bytes()];
+    let mutation = TableMutation::prepare(store, &route, now)?;
+    stage_and_publish_delete(cache, table, pk_str, now, mutation)
+}
+
+fn stage_and_publish_delete(
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    now: Instant,
+    mut mutation: TableMutation<'_>,
+) -> Result<(), String> {
+    stage_delete_inner(
+        cache,
+        table,
+        pk_str,
+        now,
+        0,
+        &mut std::collections::HashSet::new(),
+        &mut mutation,
+    )?;
+
+    let schema = load_schema(mutation.store, cache, table, now)?;
+    let pk_column = pk_column_name(&schema);
+    let command: [&[u8]; 7] = [
+        b"TDELETE",
+        b"FROM",
+        table.as_bytes(),
+        b"WHERE",
+        pk_column.as_bytes(),
+        b"=",
+        pk_str.as_bytes(),
+    ];
+    mutation.publish(&command)
+}
+
+fn stage_delete_inner(
+    cache: &SharedSchemaCache,
+    table: &str,
+    pk_str: &str,
+    now: Instant,
+    depth: usize,
+    visited: &mut std::collections::HashSet<(String, String)>,
+    mutation: &mut TableMutation<'_>,
+) -> Result<(), String> {
+    let store = mutation.store;
     if depth > CASCADE_DEPTH_LIMIT {
         return Err(format!(
             "ERR cascade depth limit ({}) exceeded - possible circular FK reference",
             CASCADE_DEPTH_LIMIT
         ));
     }
-    let journal = if depth == 0 {
-        let route: [&[u8]; 3] = [b"TDELETE", b"FROM", table.as_bytes()];
-        let journal = store
-            .prepare_journaled(&route)
-            .map_err(|error| format!("ERR WAL append failed: {error}"))?;
-        validate_delete_tree(store, cache, table, pk_str, now, 0)?;
-        Some(journal)
-    } else {
-        None
-    };
+    if !visited.insert((table.to_string(), pk_str.to_string())) {
+        return Ok(());
+    }
     let schema = load_schema(store, cache, table, now)?;
     let rk = row_key_for_pk(table, pk_str);
 
@@ -3311,41 +3582,10 @@ fn table_delete_inner(
             .into_iter()
             .collect();
 
-    // The pk_value is the user-visible PK (may differ from internal pk_str for UUID/STR PKs)
-    let pk_field = schema.iter().find(|f| f.primary_key);
-    let pk_value_owned: String = pk_field
-        .and_then(|pk| row_map.get(&pk.name))
-        .cloned()
-        .unwrap_or_else(|| pk_str.to_string());
-    let pk_value: &str = &pk_value_owned;
-
-    let commit = if let Some(journal) = journal {
-        let pk_column = pk_column_name(&schema);
-        let command: [&[u8]; 7] = [
-            b"TDELETE",
-            b"FROM",
-            table.as_bytes(),
-            b"WHERE",
-            pk_column.as_bytes(),
-            b"=",
-            pk_str.as_bytes(),
-        ];
-        Some(
-            journal
-                .commit(&command)
-                .map_err(|error| format!("ERR WAL append failed: {error}"))?,
-        )
-    } else {
-        None
-    };
-
     let tlist_key = table_list_key();
     let all_tables = store.smembers(tlist_key.as_bytes(), now)?;
 
     for other_table in &all_tables {
-        if other_table == table {
-            continue;
-        }
         let other_schema = load_schema(store, cache, other_table, now)?;
         for field in &other_schema {
             // Handle legacy Ref type - always RESTRICT
@@ -3365,11 +3605,29 @@ fn table_delete_inner(
                         false,
                         now,
                     )?;
-                    if !refs.is_empty() {
-                        return Err(format!(
-                            "ERR cannot delete: row is referenced by table '{}'",
-                            other_table
-                        ));
+                    for (referencing_id, _) in refs {
+                        if visited.contains(&(other_table.clone(), referencing_id.clone())) {
+                            continue;
+                        }
+                        let holds_reference = get_row(
+                            store,
+                            other_table,
+                            &other_schema,
+                            &referencing_id,
+                            now,
+                            true,
+                        )?
+                        .is_some_and(|candidate| {
+                            candidate
+                                .iter()
+                                .any(|(name, value)| name == &field.name && value == pk_str)
+                        });
+                        if holds_reference {
+                            return Err(format!(
+                                "ERR cannot delete: row is referenced by table '{}'",
+                                other_table
+                            ));
+                        }
                     }
                 }
             }
@@ -3379,15 +3637,26 @@ fn table_delete_inner(
                 if fk.table != table {
                     continue;
                 }
-                // Find all rows in other_table where field == pk_value.
+                let Some(referenced_value) = row_map.get(&fk.column) else {
+                    continue;
+                };
+                // Find all rows in other_table where field == referenced_value.
                 // If the FK column is unique, we can look it up directly.
                 // Otherwise we must scan all rows.
-                let referencing_ids: Vec<String> = if field.unique {
+                let mut referencing_ids: Vec<String> = if field.unique {
                     let ukey = uniq_key(other_table, &field.name);
                     if let Some(ref_id_bytes) =
-                        store.hget_checked(ukey.as_bytes(), pk_value.as_bytes(), now)?
+                        store.hget_checked(ukey.as_bytes(), referenced_value.as_bytes(), now)?
                     {
-                        vec![String::from_utf8_lossy(&ref_id_bytes).to_string()]
+                        let ref_id = String::from_utf8_lossy(&ref_id_bytes).to_string();
+                        let holds_reference =
+                            get_row(store, other_table, &other_schema, &ref_id, now, true)?
+                                .is_some_and(|candidate| {
+                                    candidate.iter().any(|(name, value)| {
+                                        name == &field.name && value == referenced_value
+                                    })
+                                });
+                        holds_reference.then_some(ref_id).into_iter().collect()
                     } else {
                         vec![]
                     }
@@ -3395,16 +3664,23 @@ fn table_delete_inner(
                     // Full scan: find all rows where the FK field equals pk_value
                     let mut referencing_ids = Vec::new();
                     for other_pk in get_all_row_ids(store, other_table, now)? {
-                        let rk = row_key_for_pk(other_table, &other_pk);
-                        let pairs = store.hgetall(rk.as_bytes(), now)?;
-                        if pairs.iter().any(|(k, v)| {
-                            k == &field.name && field.field_type.decode_value(v) == pk_value
-                        }) {
+                        let holds_reference =
+                            get_row(store, other_table, &other_schema, &other_pk, now, true)?
+                                .is_some_and(|candidate| {
+                                    candidate.iter().any(|(name, value)| {
+                                        name == &field.name && value == referenced_value
+                                    })
+                                });
+                        if holds_reference {
                             referencing_ids.push(other_pk);
                         }
                     }
                     referencing_ids
                 };
+
+                referencing_ids.retain(|referencing_id| {
+                    !visited.contains(&(other_table.clone(), referencing_id.clone()))
+                });
 
                 if referencing_ids.is_empty() {
                     continue;
@@ -3420,34 +3696,48 @@ fn table_delete_inner(
                     OnDelete::Cascade => {
                         // Delete all referencing rows, passing depth+1 to detect circular FKs
                         for ref_id_str in &referencing_ids {
-                            table_delete_inner(
-                                store,
+                            stage_delete_inner(
                                 cache,
                                 other_table,
                                 ref_id_str,
                                 now,
                                 depth + 1,
+                                visited,
+                                mutation,
                             )?;
                         }
                     }
                     OnDelete::SetNull => {
+                        if !field.nullable {
+                            return Err(format!(
+                                "ERR cannot set '{}.{}' to NULL because it is NOT NULL",
+                                other_table, field.name
+                            ));
+                        }
                         // Null out the FK column in referencing rows and clean up its indexes
                         for ref_id_str in &referencing_ids {
                             let ref_rk = row_key_for_pk(other_table, ref_id_str);
-                            // Remove the field value from the row hash
-                            store.hdel(ref_rk.as_bytes(), &[field.name.as_bytes()], now)?;
-                            // Clean up unique index if applicable
-                            let ref_ukey = uniq_key(other_table, &field.name);
-                            store.hdel(ref_ukey.as_bytes(), &[pk_value.as_bytes()], now)?;
-                            // Clean up sorted-set index (for INT/FLOAT FK columns)
-                            remove_from_index(
+                            mutation
+                                .batch
+                                .hash_delete(&ref_rk, std::slice::from_ref(&field.name))?;
+                            if field.unique {
+                                stage_remove_unique(
+                                    mutation,
+                                    store,
+                                    other_table,
+                                    field,
+                                    referenced_value,
+                                )?;
+                            }
+                            stage_remove_from_index(
+                                mutation,
                                 store,
                                 other_table,
                                 field,
-                                pk_value,
+                                referenced_value,
                                 ref_id_str.as_str(),
-                                now,
                             )?;
+                            mutation.row_changed(other_table, ref_id_str);
                         }
                     }
                 }
@@ -3457,17 +3747,17 @@ fn table_delete_inner(
 
     for field in &schema {
         if let Some(val) = row_map.get(&field.name) {
-            remove_from_index(store, table, field, val, pk_str, now)?;
+            stage_remove_from_index(mutation, store, table, field, val, pk_str)?;
             if field.unique {
-                remove_unique_entries(store, table, field, val, now)?;
+                stage_remove_unique(mutation, store, table, field, val)?;
             }
         }
         // A VECTOR column stores its embedding in a side key with its own ANN
         // index; deleting the row must remove it too, or vector search keeps
         // returning the deleted row (and the entry leaks).
-        if matches!(field.field_type, FieldType::Vector(_)) {
+        if matches!(field.field_type, FieldType::Vector(_)) && !row_map.contains_key(&field.name) {
             let vkey = table_vector_key(table, &field.name, pk_str);
-            store.del(&[vkey.as_bytes()]);
+            mutation.batch.delete_vector(&vkey)?;
         }
     }
 
@@ -3479,13 +3769,13 @@ fn table_delete_inner(
             }
             if let Some(raw) = row_map.get(root) {
                 if let Some(scalar) = extract_json_scalar(raw, rest) {
-                    remove_from_index(
+                    stage_remove_from_index(
+                        mutation,
                         store,
                         table,
                         &synthetic_path_fielddef(pi),
                         &scalar,
                         pk_str,
-                        now,
                     )?;
                 }
             }
@@ -3493,25 +3783,19 @@ fn table_delete_inner(
     }
 
     let ikey = ids_key(table);
-    store.zrem(ikey.as_bytes(), &[pk_str.as_bytes()], now)?;
+    mutation.batch.sorted_set_remove(&ikey, pk_str)?;
 
     // Drop any TTL bookkeeping for this row (hidden field is removed with the
     // hash below; this clears the `_t:_ttl` deadline member).
-    clear_row_ttl(store, table, pk_str, now)?;
+    mutation
+        .batch
+        .sorted_set_remove(ttl_index_key(), &ttl_member(table, pk_str))?;
 
-    store.del(&[rk.as_bytes()]);
+    mutation.batch.delete_hash(&rk)?;
 
     // Reactive live queries: hint that this pk changed. Cascaded child deletes
     // emit too (every real row removal is a live-query change).
-    if store.wants_row_deltas() {
-        store.emit_row_delta(table, pk_str);
-    }
-
-    if let Some(commit) = commit {
-        commit
-            .complete()
-            .map_err(|error| format!("ERR journal apply failed: {error}"))?;
-    }
+    mutation.row_changed(table, pk_str);
     Ok(())
 }
 
@@ -4269,6 +4553,668 @@ mod tests {
 
     fn now() -> Instant {
         Instant::now()
+    }
+
+    fn persistent_config(dir: &std::path::Path) -> Arc<crate::ServerConfig> {
+        Arc::new(crate::ServerConfig {
+            data_dir: dir.to_string_lossy().into_owned(),
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::AlwaysSync,
+                ..Default::default()
+            },
+            ..crate::ServerConfig::default()
+        })
+    }
+
+    fn row_field<'a>(row: &'a [(String, String)], field: &str) -> Option<&'a str> {
+        row.iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn journal_failures_leave_row_and_every_derived_structure_unchanged() {
+        for fail_fsync in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = persistent_config(dir.path());
+            let store = Store::new_with_config(config);
+            let cache = make_cache();
+            let n = now();
+            table_create(
+                &store,
+                &cache,
+                "accounts",
+                &[
+                    "id INT PRIMARY KEY,",
+                    "email STR UNIQUE,",
+                    "age INT,",
+                    "embedding VECTOR(2)",
+                ],
+                n,
+            )
+            .unwrap();
+            table_insert(
+                &store,
+                &cache,
+                "accounts",
+                &[
+                    ("id", "1"),
+                    ("email", "old@example.com"),
+                    ("age", "10"),
+                    ("embedding", "[1,0]"),
+                ],
+                n,
+            )
+            .unwrap();
+            let journal_path = store.config().journal_dir().join("global/wal.lux");
+            let journal_before = std::fs::read(&journal_path).unwrap();
+
+            if fail_fsync {
+                store.inject_journal_fsync_failures(1);
+            } else {
+                store.inject_journal_failures(1);
+            }
+            let error = table_update_by_pk_str(
+                &store,
+                &cache,
+                "accounts",
+                "1",
+                &[
+                    ("email", "new@example.com"),
+                    ("age", "20"),
+                    ("embedding", "[0,1]"),
+                ],
+                Some(TtlOp::Set(60)),
+                n,
+            )
+            .expect_err("the injected journal failure must reject the update");
+            assert!(error.contains("injected journal"), "{error}");
+            assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+
+            let row = table_get(&store, &cache, "accounts", 1, n).unwrap();
+            assert_eq!(row_field(&row, "email"), Some("old@example.com"));
+            assert_eq!(row_field(&row, "age"), Some("10"));
+            assert_eq!(
+                store
+                    .hget_checked(
+                        uniq_key("accounts", "email").as_bytes(),
+                        b"old@example.com",
+                        n,
+                    )
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"1"[..])
+            );
+            assert!(store
+                .hget_checked(
+                    uniq_key("accounts", "email").as_bytes(),
+                    b"new@example.com",
+                    n,
+                )
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                store
+                    .zscore(idx_sorted_key("accounts", "age").as_bytes(), b"1", n)
+                    .unwrap(),
+                Some(10.0)
+            );
+            assert!(store
+                .zscore(
+                    ttl_index_key().as_bytes(),
+                    ttl_member("accounts", "1").as_bytes(),
+                    n,
+                )
+                .unwrap()
+                .is_none());
+            let vectors =
+                store.table_vector_search("accounts", "embedding", &[1.0, 0.0], 1, None, n);
+            assert_eq!(vectors.first().map(|(pk, _)| pk.as_str()), Some("1"));
+            assert!(vectors[0].1 > 0.99);
+        }
+    }
+
+    #[test]
+    fn internal_type_corruption_is_rejected_before_journal_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(persistent_config(dir.path()));
+        let cache = make_cache();
+        let n = now();
+        table_create(&store, &cache, "events", &["age INT"], n).unwrap();
+        let index = idx_sorted_key("events", "age");
+        store.set(index.as_bytes(), b"not-a-sorted-set", None, n);
+        let journal_path = store.config().journal_dir().join("global/wal.lux");
+        let journal_before = std::fs::read(&journal_path).unwrap();
+        let sequence_before = store.get(seq_key("events").as_bytes(), n);
+
+        let error = table_insert(&store, &cache, "events", &[("age", "10")], n)
+            .expect_err("corrupt internal state must fail closed");
+        assert!(error.contains("expected zset, found string"), "{error}");
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+        assert_eq!(table_count(&store, &cache, "events", n).unwrap(), 0);
+        assert_eq!(store.get(seq_key("events").as_bytes(), n), sequence_before);
+    }
+
+    #[test]
+    fn interrupted_published_update_recovers_as_one_complete_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = persistent_config(dir.path());
+        let store = Store::new_with_config(config.clone());
+        let cache = make_cache();
+        let n = now();
+        table_create(
+            &store,
+            &cache,
+            "accounts",
+            &["id INT PRIMARY KEY,", "email STR UNIQUE,", "age INT"],
+            n,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "accounts",
+            &[("id", "1"), ("email", "old@example.com"), ("age", "10")],
+            n,
+        )
+        .unwrap();
+
+        fail_next_table_mutation_after_journal();
+        let error = table_update_by_pk_str(
+            &store,
+            &cache,
+            "accounts",
+            "1",
+            &[("email", "new@example.com"), ("age", "20")],
+            Some(TtlOp::Set(60)),
+            n,
+        )
+        .expect_err("the interruption must happen before live publication");
+        assert!(error.contains("injected interruption"), "{error}");
+        let old_row = table_get(&store, &cache, "accounts", 1, n).unwrap();
+        assert_eq!(row_field(&old_row, "email"), Some("old@example.com"));
+        assert_eq!(row_field(&old_row, "age"), Some("10"));
+        drop(store);
+
+        let restored = Store::new_with_config(config);
+        let restored_cache = make_cache();
+        restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        let row = table_get(&restored, &restored_cache, "accounts", 1, now()).unwrap();
+        assert_eq!(row_field(&row, "email"), Some("new@example.com"));
+        assert_eq!(row_field(&row, "age"), Some("20"));
+        assert!(restored
+            .hget_checked(
+                uniq_key("accounts", "email").as_bytes(),
+                b"old@example.com",
+                now(),
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            restored
+                .hget_checked(
+                    uniq_key("accounts", "email").as_bytes(),
+                    b"new@example.com",
+                    now(),
+                )
+                .unwrap()
+                .as_deref(),
+            Some(&b"1"[..])
+        );
+        assert_eq!(
+            restored
+                .zscore(idx_sorted_key("accounts", "age").as_bytes(), b"1", now(),)
+                .unwrap(),
+            Some(20.0)
+        );
+        assert!(restored
+            .zscore(
+                ttl_index_key().as_bytes(),
+                ttl_member("accounts", "1").as_bytes(),
+                now(),
+            )
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn rejected_cascade_delete_does_not_touch_any_related_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new_with_config(persistent_config(dir.path()));
+        let cache = make_cache();
+        let n = now();
+        table_create(&store, &cache, "parents", &["id INT PRIMARY KEY"], n).unwrap();
+        table_create(
+            &store,
+            &cache,
+            "children",
+            &[
+                "id INT PRIMARY KEY,",
+                "parent_id INT REFERENCES parents(id) ON DELETE CASCADE",
+            ],
+            n,
+        )
+        .unwrap();
+        table_create(
+            &store,
+            &cache,
+            "profiles",
+            &[
+                "id INT PRIMARY KEY,",
+                "parent_id INT REFERENCES parents(id) ON DELETE SET NULL",
+            ],
+            n,
+        )
+        .unwrap();
+        table_insert(&store, &cache, "parents", &[("id", "1")], n).unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "children",
+            &[("id", "10"), ("parent_id", "1")],
+            n,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "profiles",
+            &[("id", "20"), ("parent_id", "1")],
+            n,
+        )
+        .unwrap();
+
+        store.inject_journal_failures(1);
+        table_delete_inner(&store, &cache, "parents", "1", n, 0)
+            .expect_err("the injected journal failure must reject the whole cascade");
+        assert!(table_get(&store, &cache, "parents", 1, n).is_ok());
+        assert!(table_get(&store, &cache, "children", 10, n).is_ok());
+        let profile = table_get(&store, &cache, "profiles", 20, n).unwrap();
+        assert_eq!(row_field(&profile, "parent_id"), Some("1"));
+        assert_eq!(
+            store
+                .zscore(idx_sorted_key("children", "parent_id").as_bytes(), b"10", n,)
+                .unwrap(),
+            Some(1.0)
+        );
+
+        table_delete_inner(&store, &cache, "parents", "1", n, 0).unwrap();
+        assert!(table_get(&store, &cache, "parents", 1, n).is_err());
+        assert!(table_get(&store, &cache, "children", 10, n).is_err());
+        let profile = table_get(&store, &cache, "profiles", 20, n).unwrap();
+        assert!(row_field(&profile, "parent_id").is_none());
+        assert!(store
+            .zscore(idx_sorted_key("profiles", "parent_id").as_bytes(), b"20", n,)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn interrupted_published_cascade_recovers_all_related_rows_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = persistent_config(dir.path());
+        let store = Store::new_with_config(config.clone());
+        let cache = make_cache();
+        let n = now();
+        table_create(&store, &cache, "parents", &["id INT PRIMARY KEY"], n).unwrap();
+        table_create(
+            &store,
+            &cache,
+            "children",
+            &[
+                "id INT PRIMARY KEY,",
+                "parent_id INT REFERENCES parents(id) ON DELETE CASCADE",
+            ],
+            n,
+        )
+        .unwrap();
+        table_create(
+            &store,
+            &cache,
+            "profiles",
+            &[
+                "id INT PRIMARY KEY,",
+                "parent_id INT REFERENCES parents(id) ON DELETE SET NULL",
+            ],
+            n,
+        )
+        .unwrap();
+        table_insert(&store, &cache, "parents", &[("id", "1")], n).unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "children",
+            &[("id", "10"), ("parent_id", "1")],
+            n,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "profiles",
+            &[("id", "20"), ("parent_id", "1")],
+            n,
+        )
+        .unwrap();
+
+        fail_next_table_mutation_after_journal();
+        table_delete_inner(&store, &cache, "parents", "1", n, 0)
+            .expect_err("the injected interruption must happen before live publication");
+        assert!(table_get(&store, &cache, "parents", 1, n).is_ok());
+        assert!(table_get(&store, &cache, "children", 10, n).is_ok());
+        assert_eq!(
+            row_field(
+                &table_get(&store, &cache, "profiles", 20, n).unwrap(),
+                "parent_id"
+            ),
+            Some("1")
+        );
+        drop(store);
+
+        let restored = Store::new_with_config(config);
+        let restored_cache = make_cache();
+        restored.replay_wal(&crate::pubsub::Broker::new()).unwrap();
+        assert!(table_get(&restored, &restored_cache, "parents", 1, now()).is_err());
+        assert!(table_get(&restored, &restored_cache, "children", 10, now()).is_err());
+        let profile = table_get(&restored, &restored_cache, "profiles", 20, now()).unwrap();
+        assert!(row_field(&profile, "parent_id").is_none());
+    }
+
+    #[test]
+    fn updates_preserve_primary_foreign_and_partitioned_sequence_invariants() {
+        let store = Store::new();
+        let cache = make_cache();
+        let n = now();
+        table_create(&store, &cache, "workspaces", &["id STR PRIMARY KEY"], n).unwrap();
+        table_create(
+            &store,
+            &cache,
+            "tickets",
+            &[
+                "id INT PRIMARY KEY,",
+                "workspace_id STR REFERENCES workspaces(id),",
+                "serial INT SEQUENCE PARTITION BY workspace_id,",
+                "title STR",
+            ],
+            n,
+        )
+        .unwrap();
+        for workspace in ["a", "b"] {
+            table_insert(&store, &cache, "workspaces", &[("id", workspace)], n).unwrap();
+        }
+        table_insert(
+            &store,
+            &cache,
+            "tickets",
+            &[("id", "1"), ("workspace_id", "a"), ("title", "first")],
+            n,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "tickets",
+            &[("id", "2"), ("workspace_id", "b"), ("title", "second")],
+            n,
+        )
+        .unwrap();
+
+        let error = table_update_by_pk_str(
+            &store,
+            &cache,
+            "tickets",
+            "2",
+            &[("workspace_id", "a")],
+            None,
+            n,
+        )
+        .expect_err("moving serial 1 into a partition already holding serial 1 must fail");
+        assert!(error.contains("unique constraint"), "{error}");
+        let unchanged = table_get(&store, &cache, "tickets", 2, n).unwrap();
+        assert_eq!(row_field(&unchanged, "workspace_id"), Some("b"));
+
+        let error = table_update_by_pk_str(
+            &store,
+            &cache,
+            "tickets",
+            "2",
+            &[("workspace_id", "missing")],
+            None,
+            n,
+        )
+        .expect_err("updates must validate explicit foreign keys");
+        assert!(error.contains("foreign key violation"), "{error}");
+
+        let error = table_update_by_pk_str(&store, &cache, "tickets", "2", &[("id", "3")], None, n)
+            .expect_err("an update cannot split a primary key from its storage key");
+        assert!(error.contains("cannot be updated"), "{error}");
+
+        table_update_by_pk_str(
+            &store,
+            &cache,
+            "tickets",
+            "2",
+            &[("workspace_id", "a"), ("serial", "5")],
+            None,
+            n,
+        )
+        .unwrap();
+        let next = table_insert_returning(
+            &store,
+            &cache,
+            "tickets",
+            &[("id", "3"), ("workspace_id", "a"), ("title", "next")],
+            n,
+        )
+        .unwrap();
+        assert_eq!(row_field(&next, "serial"), Some("6"));
+    }
+
+    #[test]
+    fn duplicate_update_assignments_use_only_the_final_value() {
+        let store = Store::new();
+        let cache = make_cache();
+        let n = now();
+        table_create(
+            &store,
+            &cache,
+            "accounts",
+            &["id INT PRIMARY KEY, email STR UNIQUE"],
+            n,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "accounts",
+            &[("id", "1"), ("email", "old@example.com")],
+            n,
+        )
+        .unwrap();
+
+        table_update_by_pk_str(
+            &store,
+            &cache,
+            "accounts",
+            "1",
+            &[
+                ("email", "intermediate@example.com"),
+                ("email", "final@example.com"),
+            ],
+            None,
+            n,
+        )
+        .unwrap();
+
+        let row = table_get(&store, &cache, "accounts", 1, n).unwrap();
+        assert_eq!(row_field(&row, "email"), Some("final@example.com"));
+        let unique_key = uniq_key("accounts", "email");
+        assert!(store
+            .hget(unique_key.as_bytes(), b"intermediate@example.com", n)
+            .is_none());
+        assert_eq!(
+            store
+                .hget(unique_key.as_bytes(), b"final@example.com", n)
+                .as_deref(),
+            Some(&b"1"[..])
+        );
+    }
+
+    #[test]
+    fn cascade_uses_the_declared_referenced_column_value() {
+        let store = Store::new();
+        let cache = make_cache();
+        let n = now();
+        table_create(
+            &store,
+            &cache,
+            "parents",
+            &["id INT PRIMARY KEY,", "code STR UNIQUE"],
+            n,
+        )
+        .unwrap();
+        table_create(
+            &store,
+            &cache,
+            "children",
+            &[
+                "id INT PRIMARY KEY,",
+                "parent_code STR REFERENCES parents(code) ON DELETE CASCADE",
+            ],
+            n,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "parents",
+            &[("id", "1"), ("code", "parent-one")],
+            n,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "children",
+            &[("id", "10"), ("parent_code", "parent-one")],
+            n,
+        )
+        .unwrap();
+
+        table_delete_inner(&store, &cache, "parents", "1", n, 0).unwrap();
+        assert!(table_get(&store, &cache, "parents", 1, n).is_err());
+        assert!(table_get(&store, &cache, "children", 10, n).is_err());
+    }
+
+    #[test]
+    fn deleting_a_row_with_an_unset_referenced_column_succeeds() {
+        let store = Store::new();
+        let cache = make_cache();
+        let n = now();
+        table_create(
+            &store,
+            &cache,
+            "parents",
+            &["id INT PRIMARY KEY, code STR UNIQUE"],
+            n,
+        )
+        .unwrap();
+        table_create(
+            &store,
+            &cache,
+            "children",
+            &["id INT PRIMARY KEY, parent_code STR REFERENCES parents(code)"],
+            n,
+        )
+        .unwrap();
+        table_insert(&store, &cache, "parents", &[("id", "1")], n).unwrap();
+
+        table_delete_inner(&store, &cache, "parents", "1", n, 0).unwrap();
+        assert!(table_get(&store, &cache, "parents", 1, n).is_err());
+    }
+
+    #[test]
+    fn expiry_rechecks_the_authoritative_deadline_before_deleting() {
+        let store = Store::new();
+        let cache = make_cache();
+        let n = now();
+        table_create(&store, &cache, "sessions", &["id INT PRIMARY KEY"], n).unwrap();
+        table_insert_ttl(
+            &store,
+            &cache,
+            "sessions",
+            &[("id", "1")],
+            Some(TtlOp::Set(3_600)),
+            n,
+        )
+        .unwrap();
+        let row_key = row_key_for_pk("sessions", "1");
+        let deadline = store
+            .hget(row_key.as_bytes(), HIDDEN_TTL_FIELD, n)
+            .and_then(|value| std::str::from_utf8(&value).ok()?.parse::<u64>().ok())
+            .unwrap();
+
+        assert!(!expire_row_if_due(&store, &cache, "sessions", "1", deadline - 1, n,).unwrap());
+        assert!(table_get(&store, &cache, "sessions", 1, n).is_ok());
+    }
+
+    #[test]
+    fn concurrent_readers_never_observe_a_partially_updated_row() {
+        let store = Arc::new(Store::new());
+        let cache = make_cache();
+        let n = now();
+        table_create(
+            &store,
+            &cache,
+            "states",
+            &["id INT PRIMARY KEY,", "label STR,", "version INT"],
+            n,
+        )
+        .unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "states",
+            &[("id", "1"), ("label", "even"), ("version", "0")],
+            n,
+        )
+        .unwrap();
+
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_store = store.clone();
+        let writer_cache = cache.clone();
+        let writer_start = start.clone();
+        let writer_done = done.clone();
+        let writer = std::thread::spawn(move || {
+            writer_start.wait();
+            for version in 1..=2_000 {
+                let label = if version % 2 == 0 { "even" } else { "odd" };
+                let version = version.to_string();
+                table_update_by_pk_str(
+                    &writer_store,
+                    &writer_cache,
+                    "states",
+                    "1",
+                    &[("label", label), ("version", version.as_str())],
+                    None,
+                    Instant::now(),
+                )
+                .unwrap();
+            }
+            writer_done.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        start.wait();
+        let mut reads = 0usize;
+        while !done.load(std::sync::atomic::Ordering::Acquire) || reads < 2_000 {
+            let row = table_get(&store, &cache, "states", 1, Instant::now()).unwrap();
+            let label = row_field(&row, "label").unwrap();
+            let version = row_field(&row, "version").unwrap().parse::<u64>().unwrap();
+            assert_eq!(label, if version % 2 == 0 { "even" } else { "odd" });
+            reads += 1;
+        }
+        writer.join().unwrap();
     }
 
     fn encrypted_store() -> Arc<Store> {
@@ -6248,6 +7194,34 @@ mod tests {
         let row = table_get(&store, &cache, "logs", id, now).unwrap();
         assert!(row.iter().any(|(k, v)| k == "message" && v == "hello"));
         assert!(row.iter().any(|(k, v)| k == "level" && v == "1"));
+    }
+
+    #[test]
+    fn explicit_implicit_primary_key_cannot_overwrite_an_existing_row() {
+        let store = Store::new();
+        let cache = make_cache();
+        let n = now();
+        table_create(&store, &cache, "logs", &["message STR"], n).unwrap();
+        table_insert(
+            &store,
+            &cache,
+            "logs",
+            &[("id", "7"), ("message", "original")],
+            n,
+        )
+        .unwrap();
+
+        let error = table_insert(
+            &store,
+            &cache,
+            "logs",
+            &[("id", "7"), ("message", "replacement")],
+            n,
+        )
+        .expect_err("an implicit primary key still has primary-key uniqueness");
+        assert!(error.contains("primary key violation"), "{error}");
+        let row = table_get(&store, &cache, "logs", 7, n).unwrap();
+        assert_eq!(row_field(&row, "message"), Some("original"));
     }
 
     #[test]
