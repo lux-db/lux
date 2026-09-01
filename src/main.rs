@@ -166,6 +166,15 @@ async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
         .filter(|port| *port != 0)
         .unwrap_or(5890);
     let auth_base_url = format!("http://localhost:{auth_http_port}");
+    let studio_session_ttl = match std::env::var("LUX_STUDIO_SESSION_TTL_SECONDS") {
+        Ok(value) => std::time::Duration::from_secs(value.parse::<u64>().map_err(|_| {
+            invalid_config("LUX_STUDIO_SESSION_TTL_SECONDS must be an integer from 1 to 86400")
+        })?),
+        Err(std::env::VarError::NotPresent) => std::time::Duration::from_secs(12 * 60 * 60),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(invalid_config("LUX_STUDIO_SESSION_TTL_SECONDS must be UTF-8").into());
+        }
+    };
 
     let config = lux::ServerConfig {
         bind_host: std::env::var("LUX_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
@@ -184,6 +193,31 @@ async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(64 * 1024 * 1024),
+        http_browser: lux::HttpBrowserConfig {
+            allowed_hosts: std::env::var("LUX_HTTP_ALLOWED_HOSTS")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            allowed_origins: std::env::var("LUX_HTTP_ALLOWED_ORIGINS")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            studio_session_ttl,
+        },
         max_resp_request: std::env::var("LUX_MAX_RESP_REQUEST_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())

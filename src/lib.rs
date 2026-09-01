@@ -271,6 +271,8 @@ pub struct ServerConfig {
     pub max_rows: Option<usize>,
     /// Maximum accepted HTTP request body size in bytes.
     pub max_body: usize,
+    /// Browser-facing HTTP and local Studio trust policy.
+    pub http_browser: HttpBrowserConfig,
     /// Maximum buffered RESP request bytes accepted from one connection.
     pub max_resp_request: usize,
     /// Password used by AUTH/HELLO and HTTP bearer auth.
@@ -318,6 +320,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("http_port", &self.http_port)
             .field("max_rows", &self.max_rows)
             .field("max_body", &self.max_body)
+            .field("http_browser", &self.http_browser)
             .field("max_resp_request", &self.max_resp_request)
             .field("password", &"<redacted>")
             .field("require_auth", &self.require_auth)
@@ -347,6 +350,7 @@ impl Default for ServerConfig {
             http_port: 0,
             max_rows: None,
             max_body: 64 * 1024 * 1024,
+            http_browser: HttpBrowserConfig::default(),
             max_resp_request: 64 * 1024 * 1024,
             password: String::new(),
             require_auth: false,
@@ -364,6 +368,33 @@ impl Default for ServerConfig {
             on_info: None,
             on_warn: None,
             on_error: None,
+        }
+    }
+}
+
+/// Browser-facing HTTP policy for CORS, Host validation, and local Studio.
+///
+/// Native and server clients do not send an `Origin` header and are unaffected
+/// by the origin allowlist. A loopback listener accepts loopback Host aliases by
+/// default. A remotely bound listener requires an exact Host allowlist whenever
+/// browser origins are enabled; deployments serving only native/server clients
+/// remain compatible without one.
+#[derive(Clone, Debug)]
+pub struct HttpBrowserConfig {
+    /// Host names accepted by the HTTP listener, without ports.
+    pub allowed_hosts: Vec<String>,
+    /// Exact `http://` or `https://` origins accepted from browsers.
+    pub allowed_origins: Vec<String>,
+    /// Lifetime of an in-memory, origin-bound local Studio session.
+    pub studio_session_ttl: Duration,
+}
+
+impl Default for HttpBrowserConfig {
+    fn default() -> Self {
+        Self {
+            allowed_hosts: Vec::new(),
+            allowed_origins: Vec::new(),
+            studio_session_ttl: Duration::from_secs(12 * 60 * 60),
         }
     }
 }
@@ -2890,6 +2921,7 @@ impl Runtime {
         let bind_host = self.config.bind_host.clone();
         let max_rows = self.config.max_rows;
         let max_body = self.config.max_body;
+        let browser = self.config.http_browser.clone();
         let (startup_tx, startup_rx) = oneshot::channel();
         let on_ready = self.config.on_info.clone().map(|on_info| {
             Arc::new(move |addr| on_info(ServerInfoEvent::HttpReady { addr }))
@@ -2902,6 +2934,7 @@ impl Runtime {
                 http_port,
                 max_rows,
                 max_body,
+                browser,
                 on_ready,
                 startup_ready: Some(startup_tx),
             };

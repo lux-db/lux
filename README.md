@@ -488,6 +488,14 @@ Lux has a built-in HTTP/JSON API. Set `LUX_HTTP_PORT` to enable it alongside the
 RESP protocol. It exposes engine discovery and management, command execution,
 keys, tables, time series, vectors, push, and app-auth routes.
 
+Browser requests are opt-in. Set `LUX_HTTP_ALLOWED_ORIGINS` to the exact origins
+that may call the Engine; Lux rejects every other `Origin` and never emits
+wildcard CORS. Native and server clients normally send no `Origin` and continue
+to work. Loopback listeners accept loopback Host aliases. A non-loopback HTTP
+bind that enables browser origins additionally requires
+`LUX_HTTP_ALLOWED_HOSTS`, which prevents a browser from reaching the Engine
+through a DNS-rebinding Host.
+
 ```bash
 LUX_HTTP_PORT=5890 ./target/release/lux
 ```
@@ -545,8 +553,8 @@ curl -X POST http://localhost:5890/v1/exec \
 ```
 
 Authenticate with `Authorization: Bearer <credential>`, where the credential is
-a project secret key (`lux_sec_*`) or the operator password. CORS is enabled by
-default.
+a project secret key (`lux_sec_*`) or the operator password. Browser CORS is
+disabled until exact origins are configured with `LUX_HTTP_ALLOWED_ORIGINS`.
 
 ### App Auth
 
@@ -727,6 +735,9 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 | `LUX_BIND_HOST` | `127.0.0.1` | Interface for RESP and HTTP listeners |
 | `LUX_PORT` | `6379` | RESP (Redis-compatible) TCP port |
 | `LUX_HTTP_PORT` | (disabled) | HTTP API port (set to enable; `lux start` defaults it to `5890`) |
+| `LUX_HTTP_ALLOWED_HOSTS` | loopback aliases on a loopback bind | Comma-separated exact HTTP Host names, without ports; required when browser origins are enabled on a non-loopback bind |
+| `LUX_HTTP_ALLOWED_ORIGINS` | (none) | Comma-separated exact browser origins permitted by CORS and WebSocket handshakes |
+| `LUX_STUDIO_SESSION_TTL_SECONDS` | `43200` | Lifetime of origin-bound, in-memory Studio management sessions (1–86400 seconds) |
 | `LUX_PASSWORD` | (none) | Operator/break-glass AUTH (RESP and HTTP). Project keys also gate the engine |
 | `LUX_ALLOW_INSECURE_NO_AUTH` | `false` | Explicitly allow an unauthenticated non-loopback bind; development only |
 | `LUX_ENABLE_RESP` | `true` | Set to `0` or `false` to disable the RESP listener |

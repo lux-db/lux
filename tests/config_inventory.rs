@@ -43,6 +43,8 @@ const RUNTIME_CONFIG: &[RuntimeConfig] = &[
     stable("LUX_ENC_SEAL_KEY_PREVIOUS"),
     stable("LUX_ENC_SEAL_PATH"),
     stable("LUX_ENC_STATE_PATH"),
+    stable("LUX_HTTP_ALLOWED_HOSTS"),
+    stable("LUX_HTTP_ALLOWED_ORIGINS"),
     stable("LUX_HTTP_PORT"),
     stable("LUX_MAXMEMORY"),
     stable("LUX_MAXMEMORY_POLICY"),
@@ -60,6 +62,7 @@ const RUNTIME_CONFIG: &[RuntimeConfig] = &[
     stable("LUX_SHUTDOWN_TIMEOUT_MS"),
     stable("LUX_STORAGE_DIR"),
     stable("LUX_STORAGE_MODE"),
+    stable("LUX_STUDIO_SESSION_TTL_SECONDS"),
 ];
 
 const fn stable(name: &'static str) -> RuntimeConfig {
