@@ -2002,6 +2002,64 @@ fn direct_auth_table_reads_redact_sensitive_values() {
         !joined_users.contains("$argon2"),
         "joined password hash leaked: {joined_users}"
     );
+    let mut aliased_join = bytes::BytesMut::new();
+    crate::cmd::execute(
+        &store,
+        &cache,
+        &broker,
+        &[
+            b"TSELECT",
+            b"u.encrypted_password",
+            b"AS",
+            b"leaked",
+            b"FROM",
+            b"redaction_posts",
+            b"p",
+            b"JOIN",
+            b"auth.users",
+            b"u",
+            b"ON",
+            b"p.user_id",
+            b"=",
+            b"u.id",
+        ],
+        &mut aliased_join,
+        Instant::now(),
+    );
+    let aliased_join = std::str::from_utf8(&aliased_join).unwrap();
+    assert!(aliased_join.contains("<redacted>"), "{aliased_join}");
+    assert!(!aliased_join.contains("$argon2"), "{aliased_join}");
+
+    let mut unqualified_join = bytes::BytesMut::new();
+    crate::cmd::execute(
+        &store,
+        &cache,
+        &broker,
+        &[
+            b"TSELECT",
+            b"encrypted_password",
+            b"AS",
+            b"leaked",
+            b"FROM",
+            b"redaction_posts",
+            b"p",
+            b"JOIN",
+            b"auth.users",
+            b"u",
+            b"ON",
+            b"p.user_id",
+            b"=",
+            b"u.id",
+        ],
+        &mut unqualified_join,
+        Instant::now(),
+    );
+    let unqualified_join = std::str::from_utf8(&unqualified_join).unwrap();
+    assert!(
+        unqualified_join.contains("<redacted>"),
+        "{unqualified_join}"
+    );
+    assert!(!unqualified_join.contains("$argon2"), "{unqualified_join}");
 
     let session = find_row_by_field(
         &store,
@@ -2081,6 +2139,48 @@ fn direct_auth_table_reads_redact_sensitive_values() {
         !settings.contains("server-token"),
         "postmark token leaked: {settings}"
     );
+    for command in [
+        &[
+            b"TSELECT".as_ref(),
+            b"value".as_ref(),
+            b"AS".as_ref(),
+            b"leaked".as_ref(),
+            b"FROM".as_ref(),
+            b"auth.settings".as_ref(),
+            b"WHERE".as_ref(),
+            b"key".as_ref(),
+            b"=".as_ref(),
+            b"email_postmark_server_token".as_ref(),
+        ][..],
+        &[
+            b"TSELECT".as_ref(),
+            b"MAX(value)".as_ref(),
+            b"AS".as_ref(),
+            b"leaked".as_ref(),
+            b"FROM".as_ref(),
+            b"auth.settings".as_ref(),
+            b"WHERE".as_ref(),
+            b"key".as_ref(),
+            b"=".as_ref(),
+            b"email_postmark_server_token".as_ref(),
+        ][..],
+    ] {
+        let mut aliased = bytes::BytesMut::new();
+        crate::cmd::execute(
+            &store,
+            &cache,
+            &broker,
+            command,
+            &mut aliased,
+            Instant::now(),
+        );
+        let aliased = std::str::from_utf8(&aliased).unwrap();
+        assert!(aliased.contains("<redacted>"), "aliased setting: {aliased}");
+        assert!(
+            !aliased.contains("server-token"),
+            "aliased postmark token leaked: {aliased}"
+        );
+    }
 }
 
 #[test]
@@ -2135,6 +2235,41 @@ fn direct_push_credential_reads_redact_legacy_and_encrypted_secrets() {
         "encrypted-vapid-sentinel",
     ] {
         assert!(!response.contains(secret), "push secret leaked: {response}");
+    }
+
+    for command in [
+        &[
+            b"TSELECT".as_ref(),
+            b"apns_p8_pem_encrypted".as_ref(),
+            b"AS".as_ref(),
+            b"leaked".as_ref(),
+            b"FROM".as_ref(),
+            b"push.credentials".as_ref(),
+        ][..],
+        &[
+            b"TSELECT".as_ref(),
+            b"MAX(apns_p8_pem_encrypted)".as_ref(),
+            b"AS".as_ref(),
+            b"leaked".as_ref(),
+            b"FROM".as_ref(),
+            b"push.credentials".as_ref(),
+        ][..],
+    ] {
+        let mut aliased = bytes::BytesMut::new();
+        crate::cmd::execute(
+            &store,
+            &cache,
+            &broker,
+            command,
+            &mut aliased,
+            Instant::now(),
+        );
+        let aliased = std::str::from_utf8(&aliased).unwrap();
+        assert!(aliased.contains("<redacted>"), "aliased secret: {aliased}");
+        assert!(
+            !aliased.contains("encrypted-apns-sentinel"),
+            "aliased push provider secret leaked: {aliased}"
+        );
     }
 }
 

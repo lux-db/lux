@@ -390,6 +390,75 @@ pub(crate) fn redact_auth_select_row(plan: &SelectPlan, row: &mut [(String, Stri
     for join in &plan.joins {
         redact_auth_table_row(&join.table, row);
     }
+    for projection in &plan.projections {
+        if projection_exposes_sensitive_field(plan, &projection.expr) {
+            let output = projection
+                .alias
+                .as_deref()
+                .unwrap_or_else(|| bare_auth_field(&projection.expr));
+            redact_row_field(row, output);
+        }
+    }
+    for aggregate in &plan.aggregates {
+        if aggregate
+            .col
+            .as_deref()
+            .is_some_and(|column| projection_exposes_sensitive_field(plan, column))
+        {
+            redact_row_field(row, &aggregate.alias);
+        }
+    }
+}
+
+fn projection_exposes_sensitive_field(plan: &SelectPlan, expression: &str) -> bool {
+    let field = bare_auth_field(expression);
+    if let Some(table) = qualified_projection_source_table(plan, expression) {
+        return table_field_is_sensitive(table, field);
+    }
+    // Unqualified joined columns are resolved by the table engine to the first
+    // matching field. If any participating managed table owns a sensitive
+    // field with this name, redact conservatively rather than depending on join
+    // order and accidentally exposing it through an alias.
+    table_field_is_sensitive(&plan.table, field)
+        || plan
+            .joins
+            .iter()
+            .any(|join| table_field_is_sensitive(&join.table, field))
+}
+
+fn table_field_is_sensitive(table: &str, field: &str) -> bool {
+    // A projected settings value can omit or alias its companion `key`, so the
+    // row alone cannot prove that it is safe. Conservatively redact explicit
+    // `value` projections; wildcard rows still use key-aware redaction above.
+    (table == SETTINGS_TABLE && field == "value") || sensitive_auth_fields(table).contains(&field)
+}
+
+fn qualified_projection_source_table<'a>(
+    plan: &'a SelectPlan,
+    expression: &str,
+) -> Option<&'a str> {
+    if expression_is_qualified_by(expression, &plan.table)
+        || plan
+            .alias
+            .as_deref()
+            .is_some_and(|alias| expression_is_qualified_by(expression, alias))
+    {
+        return Some(&plan.table);
+    }
+    for join in &plan.joins {
+        if expression_is_qualified_by(expression, &join.table)
+            || expression_is_qualified_by(expression, &join.alias)
+        {
+            return Some(&join.table);
+        }
+    }
+    None
+}
+
+fn expression_is_qualified_by(expression: &str, qualifier: &str) -> bool {
+    expression
+        .strip_prefix(qualifier)
+        .is_some_and(|rest| rest.starts_with('.'))
 }
 
 fn redact_row_field(row: &mut [(String, String)], field: &str) {
