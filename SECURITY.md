@@ -12,6 +12,9 @@ The default production model is:
   authenticated gateway.
 - Expose the HTTP API only behind operator/app authentication and normal network
   controls.
+- Configure exact `LUX_HTTP_ALLOWED_HOSTS` and `LUX_HTTP_ALLOWED_ORIGINS` values
+  for every browser-facing HTTP listener. A non-loopback bind that enables any
+  browser origin fails closed without an explicit Host allowlist.
 - Use long random operator credentials when `LUX_PASSWORD` is enabled.
 - Run Lux as an unprivileged OS user with access only to its data and storage
   directories.
@@ -41,6 +44,10 @@ regressions are found:
 - Reserved auth tables (`_t:auth.*`) and the raw-KV guard that protects them.
 - HTTP `/v1/snapshot`, `/v1/restore`, table routes, `/auth/v1/*`, and live
   WebSocket routes.
+- Local Studio sessions minted by `POST /v1/studio/sessions`. They are
+  short-lived, bound to one exact Origin, stored only as hashes in process
+  memory, and never accepted by RESP. Minting another session for an Origin
+  revokes the prior one.
 - RESP commands that can delete, rewrite, persist, inspect, or execute code:
   `FLUSHALL`, `FLUSHDB`, `SAVE`, `BGSAVE`, `EVAL`, `EVALSHA`, `SCRIPT`,
   `DEBUG`, `CONFIG`, `COMMAND`, and administrative routes.

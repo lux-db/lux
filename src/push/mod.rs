@@ -1102,6 +1102,13 @@ pub(crate) fn vapid_public_key(
     now: Instant,
 ) -> Result<Option<String>, String> {
     validate_bounded_text("app_id", app_id, MAX_APP_ID_BYTES)?;
+    match tables::table_schema(store, cache, CREDENTIALS_TABLE, now) {
+        Ok(_) => {}
+        Err(error) if error == format!("ERR table '{CREDENTIALS_TABLE}' does not exist") => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    }
     Ok(get_vapid_credentials(store, cache, app_id, now)?.map(|c| c.public_key))
 }
 
@@ -2411,6 +2418,22 @@ mod tests {
             tables::table_schema(&store, &cache, CREDENTIALS_TABLE, now).unwrap_err(),
             format!("ERR table '{CREDENTIALS_TABLE}' does not exist"),
             "invalid credentials must fail before creating durable state"
+        );
+    }
+
+    #[test]
+    fn unconfigured_vapid_is_absent_without_creating_push_tables() {
+        let store = Store::new();
+        let cache = cache();
+        let now = Instant::now();
+
+        assert_eq!(
+            vapid_public_key(&store, &cache, "default", now).unwrap(),
+            None
+        );
+        assert_eq!(
+            tables::table_schema(&store, &cache, CREDENTIALS_TABLE, now).unwrap_err(),
+            format!("ERR table '{CREDENTIALS_TABLE}' does not exist")
         );
     }
 

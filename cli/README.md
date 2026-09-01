@@ -118,13 +118,15 @@ The local secret key equals the engine password, so a secret-key client gets
 operator access while a publishable-key client must sign in (JWT → grant-enforced
 user), mirroring production. Studio runs as a container
 (`ghcr.io/lux-db/studio`) and talks to the engine
-directly from your browser. With the default loopback binding, credentials
+directly from your browser. The CLI gives it only a short-lived management
+session bound to Studio's exact origin; the durable operator credential remains
+in the private local profile. With the default loopback binding, credentials
 never leave your machine.
 
 Engine and Studio ports bind to `127.0.0.1` by default. Use `--bind <IP>` only
 when another device or development environment must reach them. Non-loopback
-bindings expose an operator credential through Studio, so they are intended for
-trusted networks and explicit port-forwarding setups.
+bindings expose the engine and Studio's scoped management session, so they are
+intended for trusted networks and explicit port-forwarding setups.
 
 Existing engine and Studio containers never change versions implicitly during
 `lux start`. Start reports available image updates; `lux update engine` and

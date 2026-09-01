@@ -19,6 +19,9 @@ use crate::store::Store;
 use crate::tables::SharedSchemaCache;
 use crate::{CommandExecutor, CommandSession, LuxError};
 
+mod browser_security;
+use browser_security::{normalize_origin, BrowserPolicy, StudioSessions};
+
 const WEBSOCKET_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 enum HttpAuthContext {
@@ -30,6 +33,8 @@ enum HttpAuthContext {
     /// password for data.
     Secret,
     Operator,
+    /// In-memory browser session minted by the local CLI for one exact origin.
+    Studio,
     User(crate::auth::AuthPrincipal),
 }
 
@@ -42,7 +47,7 @@ fn decrypt_authorized(ctx: &HttpAuthContext) -> bool {
     match ctx {
         // A secret key is a server-side credential with full project access, so
         // it sees plaintext exactly as the operator does.
-        HttpAuthContext::Operator | HttpAuthContext::Secret => true,
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => true,
         HttpAuthContext::User(p) => !p.is_anonymous,
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => false,
     }
@@ -57,6 +62,7 @@ pub struct HttpServerConfig {
     pub http_port: u16,
     pub max_rows: Option<usize>,
     pub max_body: usize,
+    pub browser: crate::HttpBrowserConfig,
     pub on_ready: Option<Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>>,
     pub startup_ready: Option<oneshot::Sender<std::io::Result<std::net::SocketAddr>>>,
 }
@@ -67,10 +73,36 @@ struct RequestLimits {
     max_body: usize,
 }
 
+#[derive(Clone)]
+struct HttpServices {
+    store: Arc<Store>,
+    broker: Broker,
+    cache: SharedSchemaCache,
+    script_engine: Arc<lua::ScriptEngine>,
+    browser_policy: BrowserPolicy,
+    studio_sessions: StudioSessions,
+}
+
+#[derive(Default)]
+struct HttpResponseContext {
+    cors_origin: Option<String>,
+}
+
+impl HttpResponseContext {
+    fn cors_headers(&self) -> String {
+        self.cors_origin
+            .as_ref()
+            .map_or_else(String::new, |origin| {
+                format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n")
+            })
+    }
+}
+
 struct LiveIdentity {
     principal: Option<crate::auth::AuthPrincipal>,
     user_credential: Option<crate::auth::UserCredential>,
     secret_credential: Option<crate::auth::SecretCredential>,
+    studio_session: Option<(String, String)>,
 }
 
 /// Start the HTTP API listener and serve requests forever.
@@ -82,6 +114,8 @@ pub async fn start_http_server(
     script_engine: Arc<lua::ScriptEngine>,
     mut shutdown_rx: watch::Receiver<Option<std::time::Duration>>,
 ) -> std::io::Result<()> {
+    let browser_policy = BrowserPolicy::try_new(&config.bind_host, &config.browser)?;
+    let studio_sessions = StudioSessions::new(config.browser.studio_session_ttl);
     let addr: std::net::SocketAddr = format!("{}:{}", config.bind_host, config.http_port)
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -107,6 +141,14 @@ pub async fn start_http_server(
         max_rows: config.max_rows,
         max_body: config.max_body,
     };
+    let services = HttpServices {
+        store,
+        broker,
+        cache,
+        script_engine,
+        browser_policy,
+        studio_sessions,
+    };
 
     let mut connections = JoinSet::new();
     loop {
@@ -117,10 +159,7 @@ pub async fn start_http_server(
             }
             accepted = listener.accept() => {
                 let (socket, _) = accepted?;
-                let store = store.clone();
-                let broker = broker.clone();
-                let cache = cache.clone();
-                let script_engine = script_engine.clone();
+                let services = services.clone();
                 let connection_shutdown = shutdown_rx.clone();
 
                 connections.spawn(async move {
@@ -128,10 +167,7 @@ pub async fn start_http_server(
                     let mut connection_shutdown = connection_shutdown;
                     while let Ok(true) = handle_request(
                         &mut stream,
-                        &store,
-                        &broker,
-                        &cache,
-                        &script_engine,
+                        &services,
                         limits,
                         &mut connection_shutdown,
                     )
@@ -155,13 +191,19 @@ fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpL
 
 async fn handle_request(
     socket: &mut tokio::net::TcpStream,
-    store: &Arc<Store>,
-    broker: &Broker,
-    cache: &SharedSchemaCache,
-    script_engine: &Arc<lua::ScriptEngine>,
+    services: &HttpServices,
     limits: RequestLimits,
     shutdown_rx: &mut watch::Receiver<Option<std::time::Duration>>,
 ) -> std::io::Result<bool> {
+    let HttpServices {
+        store,
+        broker,
+        cache,
+        script_engine,
+        browser_policy,
+        studio_sessions,
+    } = services;
+    let mut response = HttpResponseContext::default();
     // Hard limits to prevent memory exhaustion DoS
     const MAX_HEADER_SIZE: usize = 64 * 1024; // 64 KB headers
 
@@ -190,7 +232,14 @@ async fn handle_request(
 
         if data.len() > MAX_HEADER_SIZE {
             let body = r#"{"error":"request headers too large"}"#;
-            return send_json(socket, 431, "Request Header Fields Too Large", body).await;
+            return send_json(
+                socket,
+                431,
+                "Request Header Fields Too Large",
+                body,
+                &response,
+            )
+            .await;
         }
 
         if data.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -210,14 +259,26 @@ async fn handle_request(
     let (method, full_path, headers) = parse_http_head(&header_str);
     drop(header_str);
 
+    if let Err(error) = browser_policy.validate_host(&headers) {
+        let body = format!(r#"{{"error":"{}"}}"#, escape_json(error));
+        return send_json(socket, 400, "Bad Request", &body, &response).await;
+    }
+    response.cors_origin = match browser_policy.request_origin(&headers) {
+        Ok(origin) => origin,
+        Err(error) => {
+            let body = format!(r#"{{"error":"{}"}}"#, escape_json(error));
+            return send_json(socket, 403, "Forbidden", &body, &response).await;
+        }
+    };
+
     if content_length > limits.max_body {
         let body = r#"{"error":"request body too large"}"#;
-        return send_json(socket, 413, "Payload Too Large", body).await;
+        return send_json(socket, 413, "Payload Too Large", body, &response).await;
     }
 
     let Some(total_needed) = header_end.checked_add(content_length) else {
         let body = r#"{"error":"request body size overflow"}"#;
-        return send_json(socket, 413, "Payload Too Large", body).await;
+        return send_json(socket, 413, "Payload Too Large", body, &response).await;
     };
     while data.len() < total_needed {
         let n = socket.read(&mut buf).await?;
@@ -228,17 +289,64 @@ async fn handle_request(
     }
     if data.len() < total_needed {
         let body = r#"{"error":"request body is shorter than Content-Length"}"#;
-        return send_json(socket, 400, "Bad Request", body).await;
+        return send_json(socket, 400, "Bad Request", body, &response).await;
     }
 
     if method == "OPTIONS" {
-        let response = "HTTP/1.1 204 No Content\r\n\
-             Access-Control-Allow-Origin: *\r\n\
+        let requested_method = header_value(&headers, "access-control-request-method");
+        if requested_method.is_some_and(|method| {
+            !matches!(
+                method,
+                "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
+            )
+        }) {
+            return send_json(
+                socket,
+                405,
+                "Method Not Allowed",
+                r#"{"error":"preflight method is not allowed"}"#,
+                &response,
+            )
+            .await;
+        }
+        const ALLOWED_HEADERS: &[&str] = &[
+            "authorization",
+            "content-type",
+            "prefer",
+            "apikey",
+            "x-lux-snapshot-sha256",
+        ];
+        let requested_headers_allowed = header_value(&headers, "access-control-request-headers")
+            .map(|value| {
+                value.split(',').all(|header| {
+                    let header = header.trim();
+                    !header.is_empty()
+                        && ALLOWED_HEADERS
+                            .iter()
+                            .any(|allowed| header.eq_ignore_ascii_case(allowed))
+                })
+            })
+            .unwrap_or(true);
+        if !requested_headers_allowed {
+            return send_json(
+                socket,
+                403,
+                "Forbidden",
+                r#"{"error":"preflight header is not allowed"}"#,
+                &response,
+            )
+            .await;
+        }
+        let cors_headers = response.cors_headers();
+        let preflight = format!("HTTP/1.1 204 No Content\r\n\
+             {cors_headers}\
              Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
              Access-Control-Allow-Headers: Authorization, Content-Type, Prefer, apikey, X-Lux-Snapshot-SHA256\r\n\
+             Access-Control-Expose-Headers: Content-Range, X-Lux-Snapshot-SHA256, X-Lux-Snapshot-Format\r\n\
+             Access-Control-Max-Age: 600\r\n\
              Content-Length: 0\r\n\r\n"
-            .to_string();
-        socket.write_all(response.as_bytes()).await?;
+        );
+        socket.write_all(preflight.as_bytes()).await?;
         return Ok(true);
     }
 
@@ -261,19 +369,11 @@ async fn handle_request(
     // The HTTP listener is created only after recovery completes, making a
     // successful liveness response stronger than a bare process check.
     if method == "GET" && path == "/health/live" {
-        return send_json(socket, 200, "OK", r#"{"status":"live"}"#).await;
+        return send_json(socket, 200, "OK", r#"{"status":"live"}"#, &response).await;
     }
     if method == "GET" && path == "/health/ready" {
         let (status, status_text, body) = health_readiness(store);
-        return send_json(socket, status, status_text, &body).await;
-    }
-
-    if path.starts_with("/auth/v1") {
-        let response = crate::auth::route_http_response(
-            &method, &path, &body, &params, &headers, store, cache,
-        )
-        .await;
-        return send_auth_response(socket, response).await;
+        return send_json(socket, status, status_text, &body, &response).await;
     }
 
     let password = &store.config().password;
@@ -329,42 +429,90 @@ async fn handle_request(
         ""
     };
 
-    let credential = match crate::auth::resolve_credential(
-        presented,
-        user_token,
-        crate::auth::Surface::Http,
-        store,
-        cache,
-    ) {
-        Ok(credential) => credential,
-        Err(e) => {
-            let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
-            return send_json(socket, 401, "Unauthorized", &body).await;
-        }
-    };
-    let live_user_credential = if path == "/live" {
-        match &credential {
-            crate::auth::Credential::User(credential) => Some((**credential).clone()),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let live_secret_credential = if path == "/live" {
-        match &credential {
-            crate::auth::Credential::Secret(credential) => Some(credential.clone()),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let auth_context = match credential {
-        crate::auth::Credential::Operator => HttpAuthContext::Operator,
-        crate::auth::Credential::Secret(_) => HttpAuthContext::Secret,
-        crate::auth::Credential::Publishable => HttpAuthContext::Publishable,
-        crate::auth::Credential::User(credential) => HttpAuthContext::User(credential.principal),
-        crate::auth::Credential::Anonymous => HttpAuthContext::Anonymous,
-    };
+    let studio_authorized = studio_sessions.authorize(presented, response.cors_origin.as_deref());
+
+    if path.starts_with("/auth/v1") {
+        let mut studio_headers = Vec::new();
+        let routed_headers = if studio_authorized {
+            studio_headers.extend(
+                headers
+                    .iter()
+                    .filter(|(name, _)| {
+                        !name.eq_ignore_ascii_case("authorization")
+                            && !name.eq_ignore_ascii_case("apikey")
+                    })
+                    .cloned(),
+            );
+            studio_headers.push(("authorization".to_string(), format!("Bearer {password}")));
+            &studio_headers
+        } else {
+            &headers
+        };
+        let auth_response = crate::auth::route_http_response(
+            &method,
+            &path,
+            &body,
+            &params,
+            routed_headers,
+            store,
+            cache,
+        )
+        .await;
+        return send_auth_response(socket, auth_response, &response).await;
+    }
+
+    let (auth_context, live_user_credential, live_secret_credential, live_studio_session) =
+        if studio_authorized {
+            (
+                HttpAuthContext::Studio,
+                None,
+                None,
+                Some((
+                    presented.to_string(),
+                    response.cors_origin.clone().unwrap_or_default(),
+                )),
+            )
+        } else {
+            let credential = match crate::auth::resolve_credential(
+                presented,
+                user_token,
+                crate::auth::Surface::Http,
+                store,
+                cache,
+            ) {
+                Ok(credential) => credential,
+                Err(e) => {
+                    let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
+                    return send_json(socket, 401, "Unauthorized", &body, &response).await;
+                }
+            };
+            let live_user = if path == "/live" {
+                match &credential {
+                    crate::auth::Credential::User(credential) => Some((**credential).clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let live_secret = if path == "/live" {
+                match &credential {
+                    crate::auth::Credential::Secret(credential) => Some(credential.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let context = match credential {
+                crate::auth::Credential::Operator => HttpAuthContext::Operator,
+                crate::auth::Credential::Secret(_) => HttpAuthContext::Secret,
+                crate::auth::Credential::Publishable => HttpAuthContext::Publishable,
+                crate::auth::Credential::User(credential) => {
+                    HttpAuthContext::User(credential.principal)
+                }
+                crate::auth::Credential::Anonymous => HttpAuthContext::Anonymous,
+            };
+            (context, live_user, live_secret, None)
+        };
 
     // An engine is credential-gated once it has either a password or project
     // keys. Before that (a bare local engine) it stays open, as it always has.
@@ -372,12 +520,15 @@ async fn handle_request(
         Ok(configured) => configured,
         Err(e) => {
             let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
-            return send_json(socket, 503, "Service Unavailable", &body).await;
+            return send_json(socket, 503, "Service Unavailable", &body, &response).await;
         }
     };
     if !password.is_empty() || project_keys_configured {
         let permitted = match &auth_context {
-            HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::User(_) => true,
+            HttpAuthContext::Operator
+            | HttpAuthContext::Secret
+            | HttpAuthContext::Studio
+            | HttpAuthContext::User(_) => true,
             // A publishable key identifies the project, not a person. It reaches
             // auth (that is how a person is obtained) and nothing else until an
             // end-user token makes it a User.
@@ -390,23 +541,76 @@ async fn handle_request(
             } else {
                 r#"{"error":"unauthorized"}"#
             };
-            return send_json(socket, 401, "Unauthorized", body).await;
+            return send_json(socket, 401, "Unauthorized", body, &response).await;
         }
+    }
+
+    if method == "POST" && path == "/v1/studio/sessions" {
+        if !matches!(auth_context, HttpAuthContext::Operator) {
+            return send_json(
+                socket,
+                403,
+                "Forbidden",
+                r#"{"error":"operator credential required"}"#,
+                &response,
+            )
+            .await;
+        }
+        let requested: Value = match serde_json::from_str(&body) {
+            Ok(value) => value,
+            Err(_) => {
+                return send_json(
+                    socket,
+                    400,
+                    "Bad Request",
+                    r#"{"error":"invalid json"}"#,
+                    &response,
+                )
+                .await;
+            }
+        };
+        let Some(origin) = requested
+            .get("origin")
+            .and_then(Value::as_str)
+            .and_then(normalize_origin)
+        else {
+            return send_json(
+                socket,
+                400,
+                "Bad Request",
+                r#"{"error":"a valid http or https origin is required"}"#,
+                &response,
+            )
+            .await;
+        };
+        if !browser_policy.allows_origin(&origin) {
+            return send_json(
+                socket,
+                403,
+                "Forbidden",
+                r#"{"error":"Studio origin is not allowed"}"#,
+                &response,
+            )
+            .await;
+        }
+        let (token, expires_at) = studio_sessions.issue(origin);
+        let body = json!({ "token": token, "expires_at": expires_at }).to_string();
+        return send_json(socket, 201, "Created", &body, &response).await;
     }
 
     if method == "GET" && path == "/live" {
         return handle_live_upgrade(
             socket,
             &headers,
-            store.clone(),
-            broker.clone(),
-            cache.clone(),
+            services.clone(),
             LiveIdentity {
                 principal: live_auth_principal(&auth_context),
                 user_credential: live_user_credential,
                 secret_credential: live_secret_credential,
+                studio_session: live_studio_session,
             },
             shutdown_rx.clone(),
+            &response,
         )
         .await;
     }
@@ -418,7 +622,7 @@ async fn handle_request(
     if method == "GET" && matches!(segments.as_slice(), ["v1", "restore"] | ["restore"]) {
         if !snapshot_management_authorized(store, cache, &auth_context) {
             let body = r#"{"error":"restore status requires management credentials"}"#;
-            return send_json(socket, 403, "Forbidden", body).await;
+            return send_json(socket, 403, "Forbidden", body, &response).await;
         }
         let restore_store = store.clone();
         match tokio::task::spawn_blocking(move || {
@@ -439,24 +643,24 @@ async fn handle_request(
                     "sha256": pending.sha256,
                 })
                 .to_string();
-                return send_json(socket, 200, "OK", &body).await;
+                return send_json(socket, 200, "OK", &body, &response).await;
             }
             Ok(Ok(None)) => {
-                return send_json(socket, 200, "OK", r#"{"pending":false}"#).await;
+                return send_json(socket, 200, "OK", r#"{"pending":false}"#, &response).await;
             }
             Ok(Err(error)) => {
                 let body = format!(
                     r#"{{"error":"restore status failed: {}"}}"#,
                     escape_json(&error.to_string())
                 );
-                return send_json(socket, 500, "Internal Server Error", &body).await;
+                return send_json(socket, 500, "Internal Server Error", &body, &response).await;
             }
             Err(error) => {
                 let body = format!(
                     r#"{{"error":"restore status task failed: {}"}}"#,
                     escape_json(&error.to_string())
                 );
-                return send_json(socket, 500, "Internal Server Error", &body).await;
+                return send_json(socket, 500, "Internal Server Error", &body, &response).await;
             }
         }
     }
@@ -467,7 +671,7 @@ async fn handle_request(
     if is_restore {
         if !snapshot_management_authorized(store, cache, &auth_context) {
             let body = r#"{"error":"restore requires management credentials"}"#;
-            return send_json(socket, 403, "Forbidden", body).await;
+            return send_json(socket, 403, "Forbidden", body, &response).await;
         }
         let checksum = headers
             .iter()
@@ -497,7 +701,7 @@ async fn handle_request(
                     "sha256": staged.sha256,
                 })
                 .to_string();
-                return send_json(socket, 202, "Accepted", &body).await;
+                return send_json(socket, 202, "Accepted", &body, &response).await;
             }
             Ok(Err(e)) => {
                 let (status, status_text) = match e.kind() {
@@ -512,14 +716,14 @@ async fn handle_request(
                     r#"{{"error":"restore failed: {}"}}"#,
                     escape_json(&e.to_string())
                 );
-                return send_json(socket, status, status_text, &body).await;
+                return send_json(socket, status, status_text, &body, &response).await;
             }
             Err(e) => {
                 let body = format!(
                     r#"{{"error":"restore task failed: {}"}}"#,
                     escape_json(&e.to_string())
                 );
-                return send_json(socket, 500, "Internal Server Error", &body).await;
+                return send_json(socket, 500, "Internal Server Error", &body, &response).await;
             }
         }
     }
@@ -533,9 +737,9 @@ async fn handle_request(
                 // management credential may use it.
                 if !snapshot_management_authorized(store, cache, &auth_context) {
                     let body = r#"{"error":"snapshot requires management credentials"}"#;
-                    return send_json(socket, 403, "Forbidden", body).await;
+                    return send_json(socket, 403, "Forbidden", body, &response).await;
                 }
-                return stream_snapshot(socket, store).await;
+                return stream_snapshot(socket, store, &response).await;
             }
             ["v1", "tables", table] => {
                 let scoped = match scope_table_query_read(
@@ -548,7 +752,7 @@ async fn handle_request(
                 ) {
                     Ok(params) => params,
                     Err((status, status_text, body)) => {
-                        return send_json(socket, status, status_text, &body).await;
+                        return send_json(socket, status, status_text, &body, &response).await;
                     }
                 };
                 let prefer = headers
@@ -566,6 +770,7 @@ async fn handle_request(
                     cache,
                     limits.max_rows,
                     da,
+                    &response,
                 )
                 .await;
             }
@@ -573,12 +778,12 @@ async fn handle_request(
                 let filter = match enforce_table_read(store, cache, &auth_context, table) {
                     Ok(f) => f,
                     Err((status, status_text, body)) => {
-                        return send_json(socket, status, status_text, &body).await;
+                        return send_json(socket, status, status_text, &body, &response).await;
                     }
                 };
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
                     let body = format!(r#"{{"error":"{}"}}"#, escape_json(&err));
-                    return send_json(socket, 403, "Forbidden", &body).await;
+                    return send_json(socket, 403, "Forbidden", &body, &response).await;
                 }
                 let now = std::time::Instant::now();
                 let scope = filter.as_deref().unwrap_or("");
@@ -590,12 +795,13 @@ async fn handle_request(
                             r#"{{"error":"database unavailable: {}"}}"#,
                             escape_json(&error.to_string())
                         );
-                        return send_json(socket, 503, "Service Unavailable", &body).await;
+                        return send_json(socket, 503, "Service Unavailable", &body, &response)
+                            .await;
                     }
                     Ok(Ok(n)) => format!(r#"{{"result":{n}}}"#),
                     Ok(Err(e)) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
                 };
-                return send_json(socket, 200, "OK", &body).await;
+                return send_json(socket, 200, "OK", &body, &response).await;
             }
             ["v1", "tables", table, "schema"] => {
                 // Schema is table-shape metadata, not rows: a read grant of any
@@ -603,11 +809,11 @@ async fn handle_request(
                 if let Err((status, status_text, body)) =
                     enforce_table_read(store, cache, &auth_context, table)
                 {
-                    return send_json(socket, status, status_text, &body).await;
+                    return send_json(socket, status, status_text, &body, &response).await;
                 }
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
                     let body = format!(r#"{{"error":"{}"}}"#, escape_json(&err));
-                    return send_json(socket, 403, "Forbidden", &body).await;
+                    return send_json(socket, 403, "Forbidden", &body, &response).await;
                 }
                 let now = std::time::Instant::now();
                 let body = match with_execution_read(store, || {
@@ -618,7 +824,8 @@ async fn handle_request(
                             r#"{{"error":"database unavailable: {}"}}"#,
                             escape_json(&error.to_string())
                         );
-                        return send_json(socket, 503, "Service Unavailable", &body).await;
+                        return send_json(socket, 503, "Service Unavailable", &body, &response)
+                            .await;
                     }
                     Ok(result) => match result {
                         Ok(fields) => {
@@ -631,18 +838,18 @@ async fn handle_request(
                         Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
                     },
                 };
-                return send_json(socket, 200, "OK", &body).await;
+                return send_json(socket, 200, "OK", &body, &response).await;
             }
             ["v1", "tables", table, id] if *id != "count" && *id != "schema" => {
                 let filter = match enforce_table_read(store, cache, &auth_context, table) {
                     Ok(f) => f,
                     Err((status, status_text, body)) => {
-                        return send_json(socket, status, status_text, &body).await;
+                        return send_json(socket, status, status_text, &body, &response).await;
                     }
                 };
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
                     let body = format!(r#"{{"error":"{}"}}"#, escape_json(&err));
-                    return send_json(socket, 403, "Forbidden", &body).await;
+                    return send_json(socket, 403, "Forbidden", &body, &response).await;
                 }
                 let now = std::time::Instant::now();
                 let scope = filter.as_deref().unwrap_or("");
@@ -663,7 +870,8 @@ async fn handle_request(
                             r#"{{"error":"database unavailable: {}"}}"#,
                             escape_json(&error.to_string())
                         );
-                        return send_json(socket, 503, "Service Unavailable", &body).await;
+                        return send_json(socket, 503, "Service Unavailable", &body, &response)
+                            .await;
                     }
                     Ok(result) => match result {
                         // A row that exists but is out of grant scope reads as
@@ -676,7 +884,7 @@ async fn handle_request(
                         Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
                     },
                 };
-                return send_json(socket, 200, "OK", &body).await;
+                return send_json(socket, 200, "OK", &body, &response).await;
             }
             _ => {}
         }
@@ -697,12 +905,12 @@ async fn handle_request(
                 r#"{{"error":"database unavailable: {}"}}"#,
                 escape_json(&error.to_string())
             );
-            return send_json(socket, 503, "Service Unavailable", &body).await;
+            return send_json(socket, 503, "Service Unavailable", &body, &response).await;
         }
     };
     let (status, status_text, result) = routed;
 
-    send_json(socket, status, status_text, &result).await
+    send_json(socket, status, status_text, &result, &response).await
 }
 
 fn snapshot_management_authorized(
@@ -711,7 +919,7 @@ fn snapshot_management_authorized(
     context: &HttpAuthContext,
 ) -> bool {
     if !store.config().password.is_empty() {
-        matches!(context, HttpAuthContext::Operator)
+        matches!(context, HttpAuthContext::Operator | HttpAuthContext::Studio)
     } else if crate::auth::project_keys_configured(store, cache).unwrap_or(true) {
         matches!(context, HttpAuthContext::Secret)
     } else {
@@ -729,6 +937,7 @@ fn snapshot_management_authorized(
 async fn stream_snapshot(
     socket: &mut tokio::net::TcpStream,
     store: &Arc<Store>,
+    response: &HttpResponseContext,
 ) -> std::io::Result<bool> {
     let store = store.clone();
     let artifact = match tokio::task::spawn_blocking(move || {
@@ -747,14 +956,14 @@ async fn stream_snapshot(
                 r#"{{"error":"snapshot failed: {}"}}"#,
                 escape_json(&e.to_string())
             );
-            return send_json(socket, status, status_text, &body).await;
+            return send_json(socket, status, status_text, &body, response).await;
         }
         Err(e) => {
             let body = format!(
                 r#"{{"error":"snapshot task panicked: {}"}}"#,
                 escape_json(&e.to_string())
             );
-            return send_json(socket, 500, "Internal Server Error", &body).await;
+            return send_json(socket, 500, "Internal Server Error", &body, response).await;
         }
     };
 
@@ -769,14 +978,16 @@ async fn stream_snapshot(
             500,
             "Internal Server Error",
             r#"{"error":"snapshot changed before it could be streamed"}"#,
+            response,
         )
         .await;
     }
+    let cors_headers = response.cors_headers();
     let header = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/octet-stream\r\n\
          Content-Disposition: attachment; filename=\"lux.dat\"\r\n\
-         Access-Control-Allow-Origin: *\r\n\
+         {cors_headers}\
          Access-Control-Expose-Headers: X-Lux-Snapshot-SHA256, X-Lux-Snapshot-Format\r\n\
          X-Lux-Snapshot-SHA256: {}\r\n\
          X-Lux-Snapshot-Format: {}\r\n\
@@ -798,6 +1009,7 @@ async fn stream_table_query(
     cache: &SharedSchemaCache,
     max_rows: Option<usize>,
     decrypt_authorized: bool,
+    response: &HttpResponseContext,
 ) -> std::io::Result<bool> {
     use tokio::io::AsyncWriteExt;
 
@@ -807,7 +1019,7 @@ async fn stream_table_query(
         Ok(v) => v,
         Err(e) => {
             let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
-            return send_json(socket, 400, "Bad Request", &body).await;
+            return send_json(socket, 400, "Bad Request", &body, response).await;
         }
     };
     plan.decrypt_authorized = decrypt_authorized;
@@ -823,14 +1035,14 @@ async fn stream_table_query(
                 r#"{{"error":"database unavailable: {}"}}"#,
                 escape_json(&error.to_string())
             );
-            return send_json(socket, 503, "Service Unavailable", &body).await;
+            return send_json(socket, 503, "Service Unavailable", &body, response).await;
         }
     };
 
     match result {
         Err(e) => {
             let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
-            return send_json(socket, 400, "Bad Request", &body).await;
+            return send_json(socket, 400, "Bad Request", &body, response).await;
         }
         Ok(crate::tables::SelectResult::Aggregate(row)) => {
             let body = {
@@ -856,7 +1068,7 @@ async fn stream_table_query(
                 out.push_str("}}");
                 out
             };
-            return send_json(socket, 200, "OK", &body).await;
+            return send_json(socket, 200, "OK", &body, response).await;
         }
         Ok(crate::tables::SelectResult::Rows(rows)) => {
             // Type-aware JSON encoding (JSON/ARRAY raw, VECTOR as array, etc.).
@@ -906,6 +1118,7 @@ async fn stream_table_query(
             };
 
             let content_range = format!("{}-{}/{}", offset, range_end, total_str);
+            let cors_headers = response.cors_headers();
 
             const CHUNK_SIZE: usize = 65536;
             let header = format!(
@@ -913,7 +1126,7 @@ async fn stream_table_query(
                  Content-Type: application/json\r\n\
                  Transfer-Encoding: chunked\r\n\
                  Content-Range: {content_range}\r\n\
-                 Access-Control-Allow-Origin: *\r\n\r\n"
+                 {cors_headers}\r\n"
             );
             socket.write_all(header.as_bytes()).await?;
 
@@ -963,11 +1176,13 @@ async fn send_json(
     status: u16,
     status_text: &str,
     body: &str,
+    context: &HttpResponseContext,
 ) -> std::io::Result<bool> {
+    let cors_headers = context.cors_headers();
     let response = format!(
         "HTTP/1.1 {status} {status_text}\r\n\
          Content-Type: application/json\r\n\
-         Access-Control-Allow-Origin: *\r\n\
+         {cors_headers}\
          Content-Length: {}\r\n\r\n{}",
         body.len(),
         body
@@ -979,11 +1194,13 @@ async fn send_json(
 async fn send_auth_response(
     socket: &mut tokio::net::TcpStream,
     response: crate::auth::AuthHttpResponse,
+    context: &HttpResponseContext,
 ) -> std::io::Result<bool> {
+    let cors_headers = context.cors_headers();
     let mut head = format!(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
+         {cors_headers}\
          Content-Length: {}\r\n",
         response.status,
         response.status_text,
@@ -1076,6 +1293,7 @@ fn live_auth_principal(auth: &HttpAuthContext) -> Option<crate::auth::AuthPrinci
         HttpAuthContext::Anonymous
         | HttpAuthContext::Operator
         | HttpAuthContext::Secret
+        | HttpAuthContext::Studio
         | HttpAuthContext::Publishable => None,
     }
 }
@@ -1096,7 +1314,7 @@ fn enforce_table_read(
     }
     match auth {
         // Full project access: no row filter.
-        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(None),
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => Ok(None),
         // Publishable is refused at the gate; deny here too rather than trust
         // that an upstream caller got it right.
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
@@ -1140,7 +1358,9 @@ fn scope_table_query_read(
         return Ok(params.to_vec());
     }
     let principal = match auth {
-        HttpAuthContext::Operator | HttpAuthContext::Secret => return Ok(params.to_vec()),
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => {
+            return Ok(params.to_vec())
+        }
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
             return Err((
                 401,
@@ -1237,7 +1457,7 @@ fn enforce_table_insert(
     }
     match auth {
         // Full project access: no row filter.
-        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(()),
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => Ok(()),
         // Publishable is refused at the gate; deny here too rather than trust
         // that an upstream caller got it right.
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
@@ -1280,7 +1500,7 @@ fn enforce_table_write_where(
     }
     match auth {
         // Full project access: no row filter.
-        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(None),
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => Ok(None),
         // Publishable is refused at the gate; deny here too rather than trust
         // that an upstream caller got it right.
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
@@ -1317,7 +1537,7 @@ fn enforce_table_update_check(
     }
     match auth {
         // Full project access: no row filter.
-        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(()),
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => Ok(()),
         // Publishable is refused at the gate; deny here too rather than trust
         // that an upstream caller got it right.
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
@@ -1382,7 +1602,7 @@ fn require_project_access(
         // A secret key is the project's server-side credential; these routes
         // (exec, raw kv, tables, ts, vectors) are exactly what it exists to
         // reach. The operator password remains valid as break-glass.
-        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(()),
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => Ok(()),
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
             401,
             "Unauthorized",
@@ -1536,11 +1756,10 @@ fn live_broker_event_from_message(message: &crate::pubsub::Message) -> Option<Li
 async fn handle_live_upgrade(
     socket: &mut tokio::net::TcpStream,
     headers: &[(String, String)],
-    store: Arc<Store>,
-    broker: Broker,
-    cache: SharedSchemaCache,
+    services: HttpServices,
     identity: LiveIdentity,
     shutdown_rx: watch::Receiver<Option<std::time::Duration>>,
+    response: &HttpResponseContext,
 ) -> std::io::Result<bool> {
     let Some(key) = header_value(headers, "sec-websocket-key") else {
         return send_json(
@@ -1548,6 +1767,7 @@ async fn handle_live_upgrade(
             400,
             "Bad Request",
             r#"{"error":"missing websocket key"}"#,
+            response,
         )
         .await;
     };
@@ -1562,7 +1782,23 @@ async fn handle_live_upgrade(
     socket.write_all(response.as_bytes()).await?;
 
     let ws = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
-    run_live_socket(ws, store, broker, cache, identity, shutdown_rx).await?;
+    let HttpServices {
+        store,
+        broker,
+        cache,
+        studio_sessions,
+        ..
+    } = services;
+    run_live_socket(
+        ws,
+        store,
+        broker,
+        cache,
+        identity,
+        studio_sessions,
+        shutdown_rx,
+    )
+    .await?;
     Ok(false)
 }
 
@@ -1572,6 +1808,7 @@ async fn run_live_socket<S>(
     broker: Broker,
     cache: SharedSchemaCache,
     identity: LiveIdentity,
+    studio_sessions: StudioSessions,
     mut shutdown_rx: watch::Receiver<Option<std::time::Duration>>,
 ) -> std::io::Result<()>
 where
@@ -1620,14 +1857,17 @@ where
                 drain_live_subscription_events(&mut ws, &mut subscriptions, &store, &cache).await?;
                 drain_live_row_deltas(&mut ws, &mut subscriptions, &store, &cache).await?;
             }
-            _ = auth_tick.tick(), if identity.user_credential.is_some() || identity.secret_credential.is_some() => {
+            _ = auth_tick.tick(), if identity.user_credential.is_some() || identity.secret_credential.is_some() || identity.studio_session.is_some() => {
                 let user_valid = identity.user_credential.as_ref().is_none_or(|credential| {
                     crate::auth::revalidate_user_credential(credential, &store, &cache).is_ok()
                 });
                 let secret_valid = identity.secret_credential.as_ref().is_none_or(|credential| {
                     crate::auth::revalidate_secret_credential(credential, &store, &cache).is_ok()
                 });
-                if !user_valid || !secret_valid {
+                let studio_valid = identity.studio_session.as_ref().is_none_or(|(token, origin)| {
+                    studio_sessions.authorize(token, Some(origin))
+                });
+                if !user_valid || !secret_valid || !studio_valid {
                     send_live_json(&mut ws, json!({"type":"live.error","error":{"code":"AUTH_REVOKED","message":"live authorization is no longer valid"}})).await?;
                     let _ = ws.send(WsMessage::Close(None)).await;
                     break;
@@ -3803,7 +4043,7 @@ fn push_register(
     }
     let subject_id = match auth {
         HttpAuthContext::User(principal) => principal.user_id.clone(),
-        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => {
             let s = parsed["subject_id"].as_str().unwrap_or("");
             if s.is_empty() {
                 return push_json_error(
@@ -3826,7 +4066,7 @@ fn push_register(
     // A self-registering end user is not trusted to name the delivery host, and
     // this route accepts a user's own JWT. See `normalize_environment`.
     let environment_source = match auth {
-        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => {
             crate::push::EnvironmentSource::Trusted
         }
         _ => crate::push::EnvironmentSource::User,
@@ -3859,7 +4099,7 @@ fn push_list_devices(
 ) -> (u16, &'static str, String) {
     let subject_id = match auth {
         HttpAuthContext::User(principal) => principal.user_id.clone(),
-        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => {
             let s = get_param(params, "subject_id").unwrap_or("");
             if s.is_empty() {
                 return push_json_error(400, "Bad Request", "subject_id query param is required");
@@ -3904,7 +4144,7 @@ fn push_delete_device(
         HttpAuthContext::User(principal) => {
             crate::push::delete_device(store, cache, &principal.user_id, id, Instant::now())
         }
-        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => {
             crate::push::delete_device_by_id(store, cache, id, Instant::now())
         }
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
@@ -4020,7 +4260,7 @@ fn push_delete_device_by_token(
             token,
             Instant::now(),
         ),
-        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => {
             crate::push::delete_device_by_token(store, cache, token, Instant::now())
         }
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
@@ -5425,7 +5665,11 @@ mod tests {
         });
         let (mut socket, _) = listener.accept().await.unwrap();
 
-        assert!(stream_snapshot(&mut socket, &store).await.unwrap());
+        assert!(
+            stream_snapshot(&mut socket, &store, &HttpResponseContext::default())
+                .await
+                .unwrap()
+        );
         drop(socket);
         let response = client.await.unwrap();
         let body_start = response

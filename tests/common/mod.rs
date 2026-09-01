@@ -548,6 +548,123 @@ fn wait_for_http_ready(port: u16, child: &mut Child) -> bool {
 // HTTP client helper (for the HTTP API tests).
 // ---------------------------------------------------------------------------
 
+pub struct BinaryHttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl BinaryHttpResponse {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+pub fn http_request_bytes_with_headers(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    auth: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> BinaryHttpResponse {
+    let addr = format!("127.0.0.1:{port}");
+    let mut last_err = None;
+    let mut stream = (0..40)
+        .find_map(|attempt| match TcpStream::connect(&addr) {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                last_err = Some(error);
+                thread::sleep(Duration::from_millis(25 * (attempt / 8 + 1)));
+                None
+            }
+        })
+        .unwrap_or_else(|| panic!("could not connect to lux http on {addr}: {last_err:?}"));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n",
+        body.len()
+    )
+    .into_bytes();
+    if let Some(token) = auth {
+        request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
+    }
+    for (key, value) in extra_headers {
+        request.extend_from_slice(format!("{key}: {value}\r\n").as_bytes());
+    }
+    request.extend_from_slice(b"\r\n");
+    request.extend_from_slice(body);
+    stream.write_all(&request).unwrap();
+
+    let mut response = Vec::new();
+    let mut expected_len = None;
+    let mut header_end = None;
+    let mut buffer = [0u8; 8192];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                if header_end.is_none() {
+                    header_end = response.windows(4).position(|window| window == b"\r\n\r\n");
+                    if let Some(end) = header_end {
+                        let head = String::from_utf8_lossy(&response[..end]);
+                        expected_len = head
+                            .lines()
+                            .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+                            .and_then(|line| line.split_once(':'))
+                            .and_then(|(_, value)| value.trim().parse::<usize>().ok());
+                    }
+                }
+                if let (Some(end), Some(length)) = (header_end, expected_len) {
+                    if response.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(error) => panic!("read HTTP response: {error}"),
+        }
+    }
+
+    let end = header_end.expect("HTTP response contained no header terminator");
+    let head = String::from_utf8_lossy(&response[..end]);
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let headers = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect();
+    let body_start = end + 4;
+    let body_end = expected_len
+        .map(|length| body_start.saturating_add(length).min(response.len()))
+        .unwrap_or(response.len());
+    BinaryHttpResponse {
+        status,
+        headers,
+        body: response[body_start..body_end].to_vec(),
+    }
+}
+
 pub fn http_request(
     port: u16,
     method: &str,

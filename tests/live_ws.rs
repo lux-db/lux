@@ -164,6 +164,92 @@ async fn connect_live(http_port: u16, password: Option<&str>) -> TestWs {
     ws
 }
 
+#[tokio::test]
+async fn websocket_origin_and_studio_expiry_use_the_http_browser_boundary() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let origin = "https://app.example.test";
+    let _server = start_lux_with_env(
+        resp_port,
+        http_port,
+        Some("secret"),
+        &[
+            ("LUX_HTTP_ALLOWED_ORIGINS", origin),
+            ("LUX_STUDIO_SESSION_TTL_SECONDS", "1"),
+        ],
+    );
+
+    let mut malicious = format!("ws://127.0.0.1:{http_port}/live")
+        .into_client_request()
+        .unwrap();
+    malicious
+        .headers_mut()
+        .insert("Authorization", HeaderValue::from_static("Bearer secret"));
+    malicious.headers_mut().insert(
+        "Origin",
+        HeaderValue::from_static("https://attacker.example"),
+    );
+    let error = connect_async(malicious)
+        .await
+        .expect_err("malicious WebSocket Origin must be rejected");
+    assert!(
+        error.to_string().contains("403"),
+        "unexpected error: {error}"
+    );
+
+    let mut trusted = format!("ws://127.0.0.1:{http_port}/live")
+        .into_client_request()
+        .unwrap();
+    trusted
+        .headers_mut()
+        .insert("Authorization", HeaderValue::from_static("Bearer secret"));
+    trusted
+        .headers_mut()
+        .insert("Origin", HeaderValue::from_static(origin));
+    let (mut operator_socket, response) = connect_async(trusted).await.expect("trusted Origin");
+    assert_eq!(response.status(), 101);
+    operator_socket.close(None).await.unwrap();
+
+    let (status, minted) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/studio/sessions",
+        r#"{"origin":"https://app.example.test"}"#,
+        Some("secret"),
+    );
+    assert_eq!(status, 201, "mint Studio session: {minted}");
+    let token = minted["token"].as_str().unwrap();
+    let mut studio = format!("ws://127.0.0.1:{http_port}/live?token={token}")
+        .into_client_request()
+        .unwrap();
+    studio
+        .headers_mut()
+        .insert("Origin", HeaderValue::from_static(origin));
+    let (mut studio_socket, response) = connect_async(studio)
+        .await
+        .expect("Studio WebSocket session");
+    assert_eq!(response.status(), 101);
+
+    let revoked = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            match studio_socket.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let message: Value = serde_json::from_str(&text).unwrap();
+                    if message["error"]["code"] == "AUTH_REVOKED" {
+                        break true;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => break false,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("Studio WebSocket failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("Studio WebSocket session did not expire");
+    assert!(revoked, "Studio WebSocket closed without an expiry error");
+}
+
 async fn send_json(ws: &mut TestWs, value: Value) {
     ws.send(Message::Text(value.to_string()))
         .await
