@@ -3,7 +3,7 @@ mod common;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::Child;
 use std::time::Duration;
 use tokio_tungstenite::connect_async;
@@ -27,11 +27,7 @@ impl Drop for LuxServer {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    common::free_port()
 }
 
 fn start_lux(resp_port: u16, http_port: u16, password: Option<&str>) -> LuxServer {
@@ -45,7 +41,7 @@ fn start_lux_with_env(
     extra_env: &[(&str, &str)],
 ) -> LuxServer {
     let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_lux"));
-    let tmpdir = std::env::temp_dir().join(format!(
+    let tmpdir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "lux_live_ws_test_{}_{}",
         std::process::id(),
         http_port
@@ -72,7 +68,7 @@ fn start_lux_with_env(
         cmd.env(key, value);
     }
 
-    let child = cmd.spawn().expect("failed to start lux");
+    let child = common::spawn_lux(&mut cmd).expect("failed to start lux");
     let server = LuxServer { child, tmpdir };
     for _ in 0..80 {
         if TcpStream::connect(("127.0.0.1", http_port)).is_ok()

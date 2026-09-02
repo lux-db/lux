@@ -2,9 +2,10 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ENGINE_BIN="$REPO_ROOT/target/debug/lux"
-CLI_BIN="$REPO_ROOT/cli/target/debug/lux"
-TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/lux-cli-e2e.XXXXXX")"
+ENGINE_BIN="${LUX_E2E_ENGINE_BIN:-$REPO_ROOT/target/debug/lux}"
+CLI_BIN="${LUX_E2E_CLI_BIN:-$REPO_ROOT/cli/target/debug/lux}"
+mkdir -p "$REPO_ROOT/.scratch"
+TEST_ROOT="$(mktemp -d "$REPO_ROOT/.scratch/cli-e2e.XXXXXX")"
 ENGINE_PID=""
 RESP_PORT="${LUX_E2E_RESP_PORT:-16379}"
 HTTP_PORT="${LUX_E2E_HTTP_PORT:-15890}"
