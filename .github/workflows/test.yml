@@ -56,6 +56,19 @@ jobs:
       - run: cargo build --locked --manifest-path cli/Cargo.toml
       - run: bash cli/tests/e2e-local.sh
 
+  client-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.3.11'
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.98.0
+      - run: bash tests/client-compat/run.sh
+
   sdk:
     runs-on: ubuntu-latest
     defaults:
