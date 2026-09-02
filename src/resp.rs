@@ -232,9 +232,6 @@ impl<'a> Parser<'a> {
                         args.push(part);
                     }
                 }
-                if args.is_empty() {
-                    return Ok(None);
-                }
                 return Ok(Some(args));
             }
             self.pos += 1;
@@ -509,6 +506,18 @@ mod tests {
         assert_eq!(args[0], b"SET");
         assert_eq!(args[1], b"foo");
         assert_eq!(args[2], b"bar");
+    }
+
+    #[test]
+    fn skips_blank_lines_before_a_command() {
+        let input = b"\r\n\n*1\r\n$4\r\nPING\r\n";
+        let mut parser = Parser::new(input);
+        let mut args = parser.parse_command().unwrap().unwrap();
+        while args.is_empty() {
+            args = parser.parse_command().unwrap().unwrap();
+        }
+        assert_eq!(args, vec![b"PING".as_slice()]);
+        assert_eq!(parser.pos(), input.len());
     }
 
     #[test]
