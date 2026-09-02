@@ -48,6 +48,10 @@ pub fn spawn_lux(cmd: &mut Command) -> std::io::Result<Child> {
 }
 
 pub fn terminate_child(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+
     #[cfg(unix)]
     {
         let _ = Command::new("kill")
@@ -186,13 +190,72 @@ pub fn read_all(stream: &mut TcpStream) -> String {
 /// Write a command and read the response.
 pub fn send(stream: &mut TcpStream, args: &[&str]) -> String {
     stream.write_all(&resp_cmd(args)).unwrap();
-    thread::sleep(Duration::from_millis(50));
-    read_all(stream)
+    let mut data = Vec::with_capacity(256);
+    read_resp_frame(stream, &mut data).expect("read complete RESP response");
+    String::from_utf8_lossy(&data).to_string()
 }
 
 /// Alias kept for call sites that named this `send_and_read`.
 pub fn send_and_read(stream: &mut TcpStream, args: &[&str]) -> String {
     send(stream, args)
+}
+
+fn read_resp_frame(stream: &mut TcpStream, output: &mut Vec<u8>) -> std::io::Result<()> {
+    let start = output.len();
+    loop {
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte)?;
+        output.push(byte[0]);
+        if output.len() >= start + 2 && output[output.len() - 2..] == *b"\r\n" {
+            break;
+        }
+    }
+
+    let prefix = output[start];
+    let value = std::str::from_utf8(&output[start + 1..output.len() - 2])
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    match prefix {
+        b'$' | b'!' | b'=' => {
+            let length = value
+                .parse::<i64>()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            if length >= 0 {
+                let body_start = output.len();
+                output.resize(body_start + length as usize + 2, 0);
+                stream.read_exact(&mut output[body_start..])?;
+                if !output.ends_with(b"\r\n") {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "RESP bulk payload is missing its terminator",
+                    ));
+                }
+            }
+        }
+        b'*' | b'~' | b'>' => {
+            let count = value
+                .parse::<i64>()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            for _ in 0..count.max(0) {
+                read_resp_frame(stream, output)?;
+            }
+        }
+        b'%' => {
+            let count = value
+                .parse::<i64>()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            for _ in 0..count.max(0) * 2 {
+                read_resp_frame(stream, output)?;
+            }
+        }
+        b'+' | b'-' | b':' | b',' | b'#' | b'_' | b'(' => {}
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown RESP prefix 0x{prefix:02x}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Storage backing for a spawned server.
@@ -392,8 +455,7 @@ impl LuxServer {
 
 impl Drop for LuxServer {
     fn drop(&mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
+        terminate_child(&mut self.child);
         // `dir` (TempDir) cleans itself on drop.
     }
 }

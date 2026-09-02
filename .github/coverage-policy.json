@@ -1,0 +1,116 @@
+{
+  "suites": {
+    "engine": {
+      "format": "llvm",
+      "path_marker": "src",
+      "path_prefix": "src/",
+      "exclude": ["^src/fuzz_api\\.rs$"],
+      "groups": [
+        {
+          "name": "overall",
+          "include": ["^src/.*\\.rs$"],
+          "minimum": { "lines": 82.6, "branches": 63.6 }
+        },
+        {
+          "name": "persistence_recovery",
+          "include": ["^src/(disk|snapshot|restore|durability|file_security)\\.rs$"],
+          "minimum": { "lines": 88.2, "branches": 69.7 }
+        },
+        {
+          "name": "parsing",
+          "include": ["^src/(resp|command|grants)\\.rs$", "^src/tables/select\\.rs$"],
+          "minimum": { "lines": 78.3, "branches": 61.1 }
+        },
+        {
+          "name": "auth_grants",
+          "include": ["^src/auth(\\.rs|/)", "^src/(grants|encryption)\\.rs$"],
+          "minimum": { "lines": 82.4, "branches": 65.5 }
+        },
+        {
+          "name": "http_websocket",
+          "include": ["^src/http(\\.rs|/)", "^src/pubsub\\.rs$"],
+          "minimum": { "lines": 82.1, "branches": 62.6 }
+        },
+        {
+          "name": "migrations",
+          "include": ["^src/migrations\\.rs$"],
+          "minimum": { "lines": 83.5, "branches": 64.2 }
+        },
+        {
+          "name": "tables_indexes",
+          "include": ["^src/tables/", "^src/(hnsw|jsonb)\\.rs$", "^src/store/vectors\\.rs$"],
+          "minimum": { "lines": 89.4, "branches": 67.5 }
+        },
+        {
+          "name": "concurrency",
+          "include": ["^src/(shard_exec|pubsub)\\.rs$", "^src/store/transactions\\.rs$"],
+          "minimum": { "lines": 88.7, "branches": 59.2 }
+        }
+      ]
+    },
+    "cli": {
+      "format": "llvm",
+      "path_marker": "cli/src",
+      "path_prefix": "src/",
+      "groups": [
+        {
+          "name": "overall",
+          "include": ["^src/.*\\.rs$"],
+          "minimum": { "lines": 39.1, "branches": 25.9 }
+        },
+        {
+          "name": "commands",
+          "include": ["^src/lib\\.rs$"],
+          "minimum": { "lines": 36.4, "branches": 24.0 }
+        },
+        {
+          "name": "local_studio",
+          "include": ["^src/studio\\.rs$"],
+          "minimum": { "lines": 40.1, "branches": 18.7 }
+        },
+        {
+          "name": "file_security",
+          "include": ["^src/file_security\\.rs$"],
+          "minimum": { "lines": 90.2, "branches": 68.7 }
+        }
+      ]
+    },
+    "sdk": {
+      "format": "lcov",
+      "path_marker": "sdk/src",
+      "path_prefix": "src/",
+      "groups": [
+        {
+          "name": "overall",
+          "include": ["^src/.*\\.ts$"],
+          "minimum": { "lines": 83.1 }
+        },
+        {
+          "name": "auth_browser",
+          "include": ["^src/(auth|cookies|browser|ssr|index\\.browser)\\.ts$"],
+          "minimum": { "lines": 86.8 }
+        },
+        {
+          "name": "project_data",
+          "include": ["^src/(project|table|namespaces)\\.ts$"],
+          "minimum": { "lines": 76.8 }
+        },
+        {
+          "name": "push",
+          "include": ["^src/push\\.ts$"],
+          "minimum": { "lines": 100.0 }
+        },
+        {
+          "name": "storage",
+          "include": ["^src/storage\\.ts$"],
+          "minimum": { "lines": 79.0 }
+        },
+        {
+          "name": "direct_client",
+          "include": ["^src/index\\.ts$"],
+          "minimum": { "lines": 97.0 }
+        }
+      ]
+    }
+  }
+}

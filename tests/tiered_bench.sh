@@ -15,7 +15,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 cleanup() { lsof -i :$PORT -t 2>/dev/null | xargs kill -9 2>/dev/null || true; sleep 1; }
-now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+now_ms() { date +%s%3N; }
 section() { echo -e "\n${BOLD}${CYAN}=== $1 ===${NC}"; }
 result() { echo -e "  ${GREEN}$1${NC}"; }
 warn() { echo -e "  ${YELLOW}$1${NC}"; }

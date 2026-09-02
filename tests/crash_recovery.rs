@@ -6,7 +6,7 @@
 //! restarts, snapshot + WAL interaction, and concurrent data type recovery.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
@@ -14,47 +14,30 @@ use std::thread;
 use std::time::Duration;
 
 mod common;
-use common::{read_all, resp_cmd, LuxServer};
-
-fn send(stream: &mut TcpStream, args: &[&str]) -> String {
-    stream.write_all(&resp_cmd(args)).unwrap();
-    // Read until we have a complete RESP response rather than sleeping and hoping.
-    // Set a generous timeout so slow restarts don't cause spurious failures.
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut data = Vec::with_capacity(256);
-    let mut buf = [0u8; 4096];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                data.extend_from_slice(&buf[..n]);
-                // A complete simple RESP response ends with \r\n.
-                // For bulk strings we need to check we got the full payload too,
-                // but for our purposes (GET returns +OK, $N\r\n...\r\n, or $-1\r\n)
-                // checking for a trailing \r\n on a non-empty buffer is sufficient.
-                if data.ends_with(b"\r\n") {
-                    break;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(_) => break,
-        }
-    }
-    // Restore the normal read timeout.
-    stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
-    String::from_utf8_lossy(&data).to_string()
-}
+use common::{read_all, resp_cmd, send, LuxServer};
 
 fn fill_memory(conn: &mut TcpStream, count: usize) {
     let val = "x".repeat(10000);
     for i in 0..count {
         send(conn, &["SET", &format!("filler:{i}"), &val]);
     }
+}
+
+fn wait_for_list_waiters(conn: &mut TcpStream, expected: usize) {
+    let mut observed = 0;
+    for _ in 0..500 {
+        let info = send(conn, &["INFO"]);
+        observed = info
+            .lines()
+            .find_map(|line| line.strip_prefix("blocked_list_waiters:"))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        if observed >= expected {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("only {observed}/{expected} blocking waiters registered before the workload");
 }
 
 fn remove_non_wal_files(path: &std::path::Path) {
@@ -522,8 +505,8 @@ fn blmove_blocked_completion_survives_wal_replay() {
         });
         blockers.push(h);
     }
-    thread::sleep(Duration::from_millis(400)); // let every BLMOVE register as a waiter
     let mut c = srv.conn();
+    wait_for_list_waiters(&mut c, n);
     for i in 0..n {
         let src = format!("bsrc{i}");
         send(&mut c, &["RPUSH", &src, "V"]); // wakes the blocked BLMOVE: V moves to dst
@@ -573,8 +556,8 @@ fn blpop_blocked_completion_survives_wal_replay() {
         });
         blockers.push(h);
     }
-    thread::sleep(Duration::from_millis(400)); // let every BLPOP register as a waiter
     let mut c = srv.conn();
+    wait_for_list_waiters(&mut c, n);
     for i in 0..n {
         let q = format!("q{i}");
         send(&mut c, &["RPUSH", &q, "V"]); // wakes the blocked BLPOP: V is consumed
@@ -619,7 +602,10 @@ fn bzpopmin_blocked_completion_survives_wal_replay() {
         });
         blockers.push(h);
     }
-    thread::sleep(Duration::from_millis(400)); // let every BZPOPMIN register/poll
+    // BZPOPMIN polls rather than registering with the list-waiter broker, so
+    // there is no observable waiter count to synchronize on. Allow one full
+    // polling interval after every client has connected before producing data.
+    thread::sleep(Duration::from_millis(100));
     let mut c = srv.conn();
     for i in 0..n {
         let z = format!("z{i}");
