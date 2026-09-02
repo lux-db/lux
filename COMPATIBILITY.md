@@ -49,7 +49,7 @@ separate:
 | Embedded Rust API | Stable | Documented `ServerConfig`, `run_with_config`, `ServerHandle`, and `EmbeddedClient` behavior. | `tests/public_api.rs` |
 | Undocumented Rust exports | Excluded | Public Rust symbols not documented in the README or rustdoc examples carry no 1.x compatibility promise. | Explicit exclusion |
 | Workbenches | Stable | The six bundled `core`, `auth`, `migrations`, `realtime`, `push`, and `durability` Workbenches. | `tests/workbench_inventory.rs` |
-| First-party Go SDK | Excluded | Go applications use a standard RESP2 client for 1.0; a dedicated first-party SDK is not a GA blocker. | RESP compatibility suite |
+| First-party Python and Go SDKs | Excluded | Python and Go applications use standard RESP2 clients for 1.0; dedicated first-party SDKs are not GA blockers. | RESP compatibility suite |
 | Multi-node clustering/replication | Excluded | Single-node Lux only. | Explicit exclusion |
 
 The stable HTTP paths are:
@@ -131,6 +131,9 @@ Lux:
 | ioredis | 6.0.0 | RESP2, binary values, pipelines, blocking operations, and reconnects |
 | BullMQ | 6.3.4 | Real queues, concurrent workers, delayed jobs, retries, and queue events |
 | go-redis | 9.22.0 | Binary values, pipelines, transactions, blocking operations, Pub/Sub, and reconnects |
+
+redis-py and other RESP2 clients use the same documented protocol contract but
+are not installed as tooling for this repository's executable gate.
 
 The versions, package locks, and container image digests are committed with the
 gate. A version not listed here may work, but is not part of the executable 1.0

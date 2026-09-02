@@ -218,8 +218,8 @@ await server.push.send(userId, {
   and authenticated APNs device registration. Swift data access, realtime,
   storage, notification sending, and secret-key administration are outside its
   current contract.
-- **Go and other languages:** use a supported RESP2 client. Lux does not
-  promise a first-party Go SDK for 1.0.
+- **Python, Go, and other languages:** use a supported RESP2 client. Lux does
+  not promise first-party Python or Go SDKs for 1.0.
 - **Rust:** the documented embedded API can run Lux in-process without opening
   network listeners.
 
@@ -273,7 +273,7 @@ Swift SDK, Local Studio, and documented embedded Rust API are stable surfaces.
 
 Unversioned HTTP aliases are preview unless the compatibility document says
 otherwise. Object storage is Cloud-only. Multi-node clustering and replication,
-RESP3, Redis modules, built-in TLS termination, first-party Go SDKs, and
+RESP3, Redis modules, built-in TLS termination, first-party Python/Go SDKs, and
 the broader Swift database surface are not part of Lux 1.0. Cloud control-plane
 commands are available in the CLI but are maintained and gated with Lux Cloud,
 not by the open-source Engine 1.0 suite.

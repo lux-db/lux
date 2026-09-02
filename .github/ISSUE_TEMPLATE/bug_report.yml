@@ -37,7 +37,7 @@ body:
     id: client
     attributes:
       label: Redis client used
-      placeholder: e.g. ioredis, go-redis, redis-cli
+      placeholder: e.g. ioredis, redis-py, go-redis, redis-cli
   - type: input
     id: os
     attributes:

@@ -107,7 +107,7 @@ seeds a fresh volume, and prints the HTTP, RESP, publishable-key, and secret-key
 connection values. Open Studio with `lux studio` or connect to the printed RESP
 port with a supported Redis client.
 
-> **Protocol note:** `lux://` is the primary protocol for the Lux SDK and CLI. When using third-party Redis clients (such as ioredis or go-redis) directly, use `redis://` since they don't recognize `lux://`. Both connect to the same server.
+> **Protocol note:** `lux://` is the primary protocol for the Lux SDK and CLI. When using third-party Redis clients (such as ioredis, redis-py, or go-redis) directly, use `redis://` since they don't recognize `lux://`. Both connect to the same server.
 
 ```bash
 lux exec local --host 127.0.0.1 --port 6379 --password <local-secret-key> SET hello world
@@ -820,6 +820,20 @@ const db = new Lux("lux://localhost:6379")
 await db.set("hello", "world")
 await db.vset("doc:1", [0.1, 0.2, 0.3], { metadata: { title: "hello" } })
 const results = await db.vsearch([0.1, 0.2, 0.3], { k: 5, meta: true })
+```
+
+### Python (redis-py)
+
+```bash
+pip install redis
+```
+
+```python
+import redis
+
+r = redis.Redis(host="localhost", port=6379, protocol=2)
+r.set("hello", "world")
+print(r.get("hello"))  # b"world"
 ```
 
 ### Go (go-redis)
