@@ -42,6 +42,7 @@ docker run --detach --rm \
 
 LUX_PORT="$PORT" \
 LUX_HTTP_PORT=0 \
+LUX_BIND_HOST=0.0.0.0 \
 LUX_PASSWORD="$PASSWORD" \
 LUX_DATA_DIR="$DATA_DIR" \
 LUX_DURABILITY=ephemeral \
