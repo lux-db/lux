@@ -9,10 +9,19 @@ permissions:
   contents: read
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - run: bash .github/scripts/check-release-tag.sh cli "$GITHUB_REF_NAME" "$GITHUB_SHA"
+
   supply-chain:
     uses: ./.github/workflows/supply-chain.yml
 
   test:
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -28,7 +37,7 @@ jobs:
       - run: bash cli/tests/e2e-local.sh
 
   build:
-    needs: [supply-chain, test]
+    needs: [supply-chain, test, validate]
     strategy:
       matrix:
         include:

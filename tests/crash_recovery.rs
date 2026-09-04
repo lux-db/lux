@@ -11,7 +11,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod common;
 use common::{read_all, resp_cmd, send, LuxServer};
@@ -64,6 +64,13 @@ fn wal_bytes(path: &std::path::Path) -> Vec<u8> {
         }
     }
     bytes
+}
+
+fn wait_until_ttl_elapsed(started: Instant, ttl: Duration) {
+    let check_after = ttl.saturating_add(Duration::from_millis(200));
+    if let Some(remaining) = check_after.checked_sub(started.elapsed()) {
+        thread::sleep(remaining);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1319,19 +1326,23 @@ fn row_ttl_active_after_wal_replay() {
             "TINSERT", "pres", "user_id", "keep", "room", "main", "TTL", "60",
         ],
     );
+    let ttl = Duration::from_secs(10);
+    let ttl_started = Instant::now();
     send(
         &mut c,
         &[
-            "TINSERT", "pres", "user_id", "gone", "room", "main", "TTL", "2",
+            "TINSERT", "pres", "user_id", "gone", "room", "main", "TTL", "10",
         ],
     );
+    // Make a replay-time TTL refresh differ materially from the original
+    // deadline while keeping the total test bounded by that original deadline.
+    thread::sleep(Duration::from_secs(3));
     // NO SAVE -> recovery is from WAL replay only.
     drop(c);
     srv.kill();
     srv.restart();
     let mut c = srv.conn();
 
-    // Restart completes before either original deadline has elapsed.
     let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
     assert!(
         resp.contains("keep"),
@@ -1342,8 +1353,7 @@ fn row_ttl_active_after_wal_replay() {
         "short-TTL row should survive WAL replay: {resp}"
     );
 
-    // The original deadline remains active: `gone` expires while `keep` stays.
-    thread::sleep(Duration::from_millis(2600));
+    wait_until_ttl_elapsed(ttl_started, ttl);
     let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
     assert!(
         resp.contains("keep"),
@@ -1375,12 +1385,15 @@ fn update_ttl_active_after_wal_replay() {
             "TUPDATE", "pres", "SET", "room", "b", "WHERE", "user_id", "=", "keep", "TTL", "60",
         ],
     );
+    let ttl = Duration::from_secs(10);
+    let ttl_started = Instant::now();
     send(
         &mut c,
         &[
-            "TUPDATE", "pres", "SET", "room", "b", "WHERE", "user_id", "=", "gone", "TTL", "2",
+            "TUPDATE", "pres", "SET", "room", "b", "WHERE", "user_id", "=", "gone", "TTL", "10",
         ],
     );
+    thread::sleep(Duration::from_secs(3));
     // NO SAVE -> recovery is from WAL replay only.
     drop(c);
     srv.kill();
@@ -1392,9 +1405,7 @@ fn update_ttl_active_after_wal_replay() {
     assert!(resp.contains("keep"), "long-TTL row recovers: {resp}");
     assert!(resp.contains("gone"), "short-TTL row recovers: {resp}");
 
-    // The update's TTL is still active: `gone` expires, `keep` stays. Before the
-    // fix `gone` had no TTL after replay and would still be present here.
-    thread::sleep(Duration::from_millis(2600));
+    wait_until_ttl_elapsed(ttl_started, ttl);
     let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
     assert!(resp.contains("keep"), "long-TTL row still present: {resp}");
     assert!(
@@ -1419,13 +1430,16 @@ fn upsert_ttl_active_after_wal_replay() {
     send(&mut c, &["TINSERT", "pres", "user_id", "gone", "room", "a"]);
     // `keep`: upsert that also updates a field. `gone`: TTL-only upsert (conflict
     // key is the sole field) -- the case that logged nothing before the fix.
+    let ttl = Duration::from_secs(10);
+    let ttl_started = Instant::now();
     send(
         &mut c,
         &[
-            "TUPSERT", "pres", "user_id", "keep", "room", "b", "TTL", "60",
+            "TUPSERT", "pres", "user_id", "keep", "room", "b", "TTL", "10",
         ],
     );
-    send(&mut c, &["TUPSERT", "pres", "user_id", "gone", "TTL", "2"]);
+    send(&mut c, &["TUPSERT", "pres", "user_id", "gone", "TTL", "10"]);
+    thread::sleep(Duration::from_secs(3));
     // NO SAVE -> recovery is from WAL replay only.
     drop(c);
     srv.kill();
@@ -1439,12 +1453,15 @@ fn upsert_ttl_active_after_wal_replay() {
         "TTL-only-upsert row recovers: {resp}"
     );
 
-    thread::sleep(Duration::from_millis(2600));
+    wait_until_ttl_elapsed(ttl_started, ttl);
     let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
-    assert!(resp.contains("keep"), "long-TTL row still present: {resp}");
+    assert!(
+        !resp.contains("keep"),
+        "field-updating upsert TTL must expire on its original schedule: {resp}"
+    );
     assert!(
         !resp.contains("gone"),
-        "upsert-set TTL must survive replay and expire the row: {resp}"
+        "TTL-only upsert must expire on its original schedule: {resp}"
     );
 }
 
