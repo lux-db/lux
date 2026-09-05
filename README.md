@@ -727,6 +727,12 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 
 ### Environment Variables
 
+For CLI-managed local projects, capacity and deadline overrides can instead be
+grouped under `[engine.limits]` and `[engine.timeouts]` in
+`lux/config.toml`. Environment variables take precedence. See the
+[CLI configuration reference](cli/README.md#project-engine-configuration) for
+the stable TOML names, accepted units, and recreation behavior.
+
 #### Server and storage
 
 | Variable | Default | Description |

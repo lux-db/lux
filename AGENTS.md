@@ -252,6 +252,11 @@ unlimited. Capacity failures are explicit protocol errors and do not acknowledge
 rejected mutations. Use `INFO` to inspect active RESP/HTTP clients, connection
 ceilings, rejected work, timeouts, and key-event backpressure.
 
+For a CLI-managed local stack, prefer the grouped `[engine.limits]` and
+`[engine.timeouts]` sections in `lux/config.toml`; environment variables override
+the project file. Changing one of these settings recreates the container on the
+same data volume during the next `lux start`.
+
 ## Move from local to Lux Cloud
 
 The engine and application APIs stay the same. Create and link a project, apply
