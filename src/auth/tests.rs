@@ -22,6 +22,29 @@ fn principal(uid: &str) -> AuthPrincipal {
 }
 
 #[test]
+fn unrepresentable_flow_lifetime_does_not_replace_the_existing_setting() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    let before = auth_settings(&store, &cache, Instant::now())
+        .unwrap()
+        .flow_token_ttl;
+    let (status, _, body) = admin_update_settings(
+        r#"{"flow_token_ttl_seconds":18446744073709551615}"#,
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("representable"));
+    assert_eq!(
+        auth_settings(&store, &cache, Instant::now())
+            .unwrap()
+            .flow_token_ttl,
+        before
+    );
+}
+
+#[test]
 fn api_key_cache_is_isolated_per_store() {
     let store_a = Store::new();
     let store_b = Store::new();

@@ -45,13 +45,21 @@ pub fn parse_memory_size(s: &str) -> Option<usize> {
             .trim()
             .parse::<usize>()
             .ok()
-            .map(|n| n * 1024 * 1024 * 1024);
+            .and_then(|n| n.checked_mul(1024 * 1024 * 1024));
     }
     if let Some(rest) = s.strip_suffix("mb") {
-        return rest.trim().parse::<usize>().ok().map(|n| n * 1024 * 1024);
+        return rest
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_mul(1024 * 1024));
     }
     if let Some(rest) = s.strip_suffix("kb") {
-        return rest.trim().parse::<usize>().ok().map(|n| n * 1024);
+        return rest
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_mul(1024));
     }
     s.parse::<usize>().ok()
 }
@@ -363,6 +371,9 @@ mod tests {
         assert_eq!(parse_memory_size("512kb"), Some(512 * 1024));
         assert_eq!(parse_memory_size("1048576"), Some(1048576));
         assert_eq!(parse_memory_size("100MB"), Some(100 * 1024 * 1024));
+        for suffix in ["kb", "mb", "gb"] {
+            assert_eq!(parse_memory_size(&format!("{}{suffix}", usize::MAX)), None);
+        }
     }
 
     #[test]

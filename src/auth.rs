@@ -2095,11 +2095,11 @@ fn admin_update_settings(
                 "flow_token_ttl_seconds must be a positive integer",
             );
         };
-        if ttl == 0 {
+        if !crate::valid_auth_token_ttl(Duration::from_secs(ttl)) {
             return error(
                 400,
                 "Bad Request",
-                "flow_token_ttl_seconds must be greater than zero",
+                "flow_token_ttl_seconds must be positive and representable as an expiry timestamp",
             );
         }
         if let Err(e) = set_auth_setting(
@@ -4589,6 +4589,13 @@ fn create_flow_token(
     let token = random_token(32);
     let token_hash = hash_secret(&token);
     let now_sec = unix_seconds();
+    if !crate::valid_auth_token_ttl(insert.settings.flow_token_ttl) {
+        return Err(error(
+            400,
+            "Bad Request",
+            "flow token lifetime cannot be represented as an expiry timestamp",
+        ));
+    }
     let expires_at = now_sec + insert.settings.flow_token_ttl.as_secs();
     durable_table_insert(
         store,

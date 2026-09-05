@@ -1009,7 +1009,17 @@ async fn concurrent_auth_work_is_bounded_with_uniform_login_errors() {
     }
     let known = invalid_login(address, "known@example.com").await;
     let unknown = invalid_login(address, "unknown@example.com").await;
-    assert_eq!(known, unknown);
+    // Per-request diagnostic identifiers differ; status, all other headers,
+    // and the response body must remain identical for both login failures.
+    let without_request_id = |response: &[u8]| {
+        String::from_utf8(response.to_vec())
+            .unwrap()
+            .split("\r\n")
+            .filter(|line| !line.starts_with("X-Lux-Request-Id:"))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    };
+    assert_eq!(without_request_id(&known), without_request_id(&unknown));
     let known_body = known.split(|byte| *byte == b'\n').next_back().unwrap();
     let unknown_body = unknown.split(|byte| *byte == b'\n').next_back().unwrap();
     assert_eq!(known_body, unknown_body);

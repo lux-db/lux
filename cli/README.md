@@ -2,6 +2,20 @@
 
 CLI for [Lux](https://luxdb.dev). Manage Lux Cloud projects, run migrations and seeds, execute commands, stream logs, and connect to Lux instances from the terminal.
 
+## Engine logging
+
+Local engine logging can be configured in `lux/config.toml`:
+
+```toml
+[engine.logging]
+level = "info"
+format = "text"
+```
+
+`level` accepts `error`, `warn`, `info`, or `debug`; `format` accepts `text` or
+`json`. `LUX_LOG_LEVEL` and `LUX_LOG_FORMAT` override those fields. Apply changes
+with `lux start`; the existing data volume is preserved.
+
 ## Install
 
 One-line install:

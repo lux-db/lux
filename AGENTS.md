@@ -257,6 +257,12 @@ For a CLI-managed local stack, prefer the grouped `[engine.limits]` and
 the project file. Changing one of these settings recreates the container on the
 same data volume during the next `lux start`.
 
+Use `[engine.logging]` with `level = "info"` and `format = "json"` for structured
+engine diagnostics. `LUX_LOG_LEVEL` and `LUX_LOG_FORMAT` override those fields.
+Read `/health/ready` for traffic readiness and its fixed failure reason, not
+just process liveness. HTTP responses expose `X-Lux-Request-Id` for matching
+slow or failed operations to bounded diagnostic events.
+
 ## Move from local to Lux Cloud
 
 The engine and application APIs stay the same. Create and link a project, apply

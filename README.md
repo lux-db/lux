@@ -195,6 +195,40 @@ write access before using a host bind mount. The image includes a small
 The unauthenticated `/health/live` and `/health/ready` endpoints expose only
 those states. They are intended for orchestrator probes, not database access.
 
+`/health/startup` returns `{"status":"started"}` only after recovery and HTTP
+binding have completed; until then the listener is unavailable. A readiness
+failure returns HTTP 503 with `status: "not_ready"` and a fixed `reason`:
+`shutting_down` or `journal_unavailable`. The latter requires investigating
+the storage problem and restarting the engine; it is not cleared by a later sync.
+`INFO` exposes the same readiness state. Liveness is not a durability guarantee.
+
+### Engine diagnostics
+
+The binary writes timestamped events to stderr. Select `LUX_LOG_LEVEL` and
+`LUX_LOG_FORMAT` when starting the process; neither changes database contents.
+JSON output is one object per line with `timestamp_ms`, `level`, `event`, and
+`fields`. Embedded engines remain silent unless the caller installs event callbacks.
+Log configuration errors are reported as plain text if a logger cannot be initialized.
+
+Normal requests do not generate per-request log lines. Routed application and
+health responses include an engine-generated `X-Lux-Request-Id`; operations taking
+at least one second emit `slow_http_request` with that ID, duration, operation
+category, and response status (zero if no response was produced). Slow-operation
+events are limited to one per second per engine. Long-lived WebSocket sessions
+are excluded. Failed operations emit `http_request_failed` and share that budget.
+Early parsing/CORS rejections and WebSocket upgrades do not carry these IDs.
+Diagnostic logs omit request bodies, credentials, command arguments, key names,
+and raw runtime error strings. The library's event callbacks retain full error
+details for callers that need their own diagnostic handling.
+Console Auth email delivery is separate: its existing development behavior prints
+the full verification/reset link. Treat that output as sensitive and configure
+an email provider for production use.
+
+Malformed numeric and boolean settings fail startup instead of silently choosing
+defaults. Boolean values are `true`, `false`, `1`, or `0` (case-insensitive).
+Zero remains valid where it has a documented meaning, such as disabling periodic
+snapshots with `LUX_SAVE_INTERVAL=0` or HTTP with `LUX_HTTP_PORT=0`.
+
 ### Docker Compose
 
 ```bash
@@ -738,6 +772,8 @@ the stable TOML names, accepted units, and recreation behavior.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LUX_RUNTIME_THREADS` | Tokio default | Positive number of async runtime worker threads |
+| `LUX_LOG_LEVEL` | `info` | Binary event verbosity: `error`, `warn`, `info`, or `debug` |
+| `LUX_LOG_FORMAT` | `text` | Binary event output: `text` or newline-delimited `json` on stderr |
 | `LUX_BIND_HOST` | `127.0.0.1` | Interface for RESP and HTTP listeners |
 | `LUX_PORT` | `6379` | RESP (Redis-compatible) TCP port |
 | `LUX_HTTP_PORT` | (disabled) | HTTP API port (set to enable; `lux start` defaults it to `5890`) |

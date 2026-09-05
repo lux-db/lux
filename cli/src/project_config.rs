@@ -23,6 +23,7 @@ pub(super) struct LocalConfig {
 
 #[derive(Clone, Copy)]
 enum ValueKind {
+    Choice(&'static [&'static str]),
     PositiveInteger,
     OptionalLimit,
     Bytes,
@@ -52,6 +53,18 @@ const fn setting(
 }
 
 const SETTINGS: &[Setting] = &[
+    setting(
+        "logging",
+        "level",
+        "LUX_LOG_LEVEL",
+        ValueKind::Choice(&["error", "warn", "info", "debug"]),
+    ),
+    setting(
+        "logging",
+        "format",
+        "LUX_LOG_FORMAT",
+        ValueKind::Choice(&["text", "json"]),
+    ),
     setting("limits", "rows", "LUX_MAX_ROWS", ValueKind::OptionalLimit),
     setting(
         "limits",
@@ -309,6 +322,7 @@ fn normalized_duration(item: &toml_edit::Item, name: &str) -> Result<String, Str
 fn normalized_toml_value(setting: Setting, item: &toml_edit::Item) -> Result<String, String> {
     let name = format!("engine.{}.{}", setting.section, setting.key);
     match setting.value {
+        ValueKind::Choice(choices) => normalized_choice(item.as_str(), &name, choices),
         ValueKind::PositiveInteger => item
             .as_integer()
             .ok_or_else(|| format!("{name} must be an integer"))
@@ -333,7 +347,7 @@ fn parse_engine_env(
         .as_table_like()
         .ok_or_else(|| format!("engine must be a table in {}", path.display()))?;
     for (key, _) in engine.iter() {
-        if key != "limits" && key != "timeouts" {
+        if key != "limits" && key != "timeouts" && key != "logging" {
             return Err(format!(
                 "unknown engine section 'engine.{key}' in {}",
                 path.display()
@@ -342,7 +356,7 @@ fn parse_engine_env(
     }
 
     let mut values = HashMap::new();
-    for section in ["limits", "timeouts"] {
+    for section in ["limits", "timeouts", "logging"] {
         let Some(item) = engine.get(section) else {
             continue;
         };
@@ -369,7 +383,17 @@ fn parse_engine_env(
     Ok(values)
 }
 
+fn normalized_choice(value: Option<&str>, name: &str, choices: &[&str]) -> Result<String, String> {
+    match value {
+        Some(value) if choices.contains(&value) => Ok(value.to_string()),
+        _ => Err(format!("{name} must be one of: {}", choices.join(", "))),
+    }
+}
+
 fn normalize_environment_value(setting: Setting, value: &str) -> Result<String, String> {
+    if let ValueKind::Choice(choices) = setting.value {
+        return normalized_choice(Some(value), setting.env, choices);
+    }
     let value = value
         .trim()
         .parse::<i64>()
@@ -516,6 +540,31 @@ pub(super) fn load(path: &Path) -> Result<Option<LocalConfig>, String> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn logging_configuration_is_strict_and_environment_wins() {
+        let doc = "[engine.logging]\nlevel = 'warn'\nformat = 'json'\n"
+            .parse()
+            .unwrap();
+        let config = LocalConfig {
+            engine_env: parse_engine_env(&doc, Path::new("config.toml")).unwrap(),
+            ..Default::default()
+        };
+        let values = resolved_engine_env_with(&config, |name| {
+            Ok((name == "LUX_LOG_LEVEL").then(|| "debug".to_string()))
+        })
+        .unwrap();
+        assert!(values.contains(&"LUX_LOG_LEVEL=debug".to_string()));
+        assert!(values.contains(&"LUX_LOG_FORMAT=json".to_string()));
+        for source in [
+            "[engine.logging]\nleve = 'info'",
+            "[engine.logging]\nlevel = 'verbose'",
+            "[engine.logging]\nformat = 1",
+        ] {
+            assert!(parse_engine_env(&source.parse().unwrap(), Path::new("config.toml")).is_err());
+        }
+        assert!(resolved_engine_env_with(&config, |_| Ok(Some("invalid".to_string()))).is_err());
+    }
 
     #[test]
     fn public_setting_names_and_engine_variables_are_unique_and_documented() {
