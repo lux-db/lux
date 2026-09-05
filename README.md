@@ -748,14 +748,74 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 | `LUX_SHUTDOWN_TIMEOUT_MS` | `30000` | Grace period for accepted work during SIGINT/SIGTERM shutdown (1–300000 ms) |
 | `LUX_SAVE_INTERVAL` | `60` | Snapshot interval in seconds (0 to disable) |
 | `LUX_SHARDS` | auto | Next power of two at or above logical CPUs × 16, clamped to 16–1024 |
-| `LUX_MAX_ROWS` | (unlimited) | Optional maximum row count returned by an HTTP table query |
+| `LUX_MAX_ROWS` | `10000` | Maximum row count returned by an HTTP table query; set to `0` for unlimited |
 | `LUX_MAX_BODY_SIZE` | `67108864` | Maximum HTTP request body in bytes |
 | `LUX_MAX_RESP_REQUEST_SIZE` | `67108864` | Maximum buffered RESP request in bytes |
+| `LUX_MAX_RESP_CONNECTIONS` | `1024` | Maximum simultaneous RESP connections |
+| `LUX_MAX_HTTP_CONNECTIONS` | `1024` | Maximum simultaneous HTTP connections, including WebSockets |
+| `LUX_MAX_BLOCKED_CLIENTS` | `256` | Maximum RESP clients waiting in blocking commands |
+| `LUX_MAX_RESP_PIPELINE_COMMANDS` | `1024` | Maximum complete commands accepted from one RESP read buffer or queued transaction |
+| `LUX_MAX_RESP_COMMAND_ARGS` | `16384` | Maximum arguments in one RESP array command |
+| `LUX_MAX_RESP_SUBSCRIPTIONS` | `1024` | Maximum channel, pattern, and key subscriptions per RESP connection |
+| `LUX_MAX_SUBSCRIPTION_NAME_SIZE` | `16384` | Maximum UTF-8 bytes in one retained channel name or subscription pattern |
+| `LUX_MAX_LIVE_SUBSCRIPTIONS` | `128` | Maximum live subscriptions per WebSocket |
+| `LUX_MAX_SUBSCRIPTIONS` | `4096` | Maximum broker receiver registrations retained by all network clients |
+| `LUX_MAX_QUERY_CANDIDATES` | `1000000` | Maximum candidate rows inspected by one table query or join |
+| `LUX_MAX_BLOCKING_KEYS` | `1024` | Maximum keys registered by one blocking command or `WATCH` session |
+| `LUX_MAX_RESP_RESPONSE_SIZE` | `67108864` | Maximum materialized RESP bytes per connection output batch |
+| `LUX_MAX_REQUEST_BUFFER_SIZE` | `268435456` | Shared process budget for buffered network requests, retained RESP session state, subscription definitions/names, and queued realtime payloads |
+| `LUX_MAX_RESPONSE_BUFFER_SIZE` | `268435456` | Shared process budget for socket writes that have not completed |
+| `LUX_MAX_AUTH_WORKERS` | CPU count minus one, clamped to `1`–`4` | Maximum concurrent app-auth requests that may perform expensive work |
+| `LUX_MAX_SCRIPT_MEMORY_SIZE` | `67108864` | Maximum heap bytes available to one Lua script VM |
+| `LUX_RESP_IDLE_TIMEOUT_MS` | `300000` | RESP connection idle timeout |
+| `LUX_RESP_REQUEST_TIMEOUT_MS` | `10000` | Total deadline for an incomplete RESP request |
+| `LUX_HTTP_HEADER_TIMEOUT_MS` | `10000` | Total deadline for an HTTP request head after its first byte |
+| `LUX_HTTP_BODY_TIMEOUT_MS` | `30000` | Total deadline for an HTTP request body |
+| `LUX_HTTP_KEEP_ALIVE_TIMEOUT_MS` | `60000` | Idle deadline between HTTP keep-alive requests |
+| `LUX_LIVE_IDLE_TIMEOUT_MS` | `300000` | Live WebSocket idle deadline without client traffic |
+| `LUX_WRITE_TIMEOUT_MS` | `30000` | Maximum time a socket write may remain unable to make progress |
 | `LUX_MAXMEMORY` | `0` (unlimited) | Memory limit (e.g. `100mb`, `1gb`) |
 | `LUX_MAXMEMORY_POLICY` | `noeviction` | Eviction policy: `allkeys-lru`, `volatile-lru`, `allkeys-random`, `volatile-random` |
 | `LUX_MAXMEMORY_SAMPLES` | `5` | Keys sampled per eviction round |
 | `LUX_STORAGE_MODE` | `memory` | Data-placement layout: `memory` or `tiered`; independent of durability |
 | `LUX_STORAGE_DIR` | `{LUX_DATA_DIR}/storage` | Tiered data and WAL directory; valid only in `tiered` mode |
+
+All listener and request defaults are finite. Invalid zero-valued limits and
+deadlines fail startup instead of silently disabling protection. A full RESP
+listener returns `ERR max number of clients reached`; a full HTTP listener
+returns `503`. Exhausted app-auth capacity returns `429`, and exhausted shared
+request- or response-buffer capacity closes the affected connection after a
+bounded protocol error where possible. Partial HTTP requests
+time out with `408`; idle connections close. Query, pipeline, argument,
+subscription, process-wide subscription, blocking-key, transaction, and response
+ceilings return explicit errors. Capacity and request-shape rejections happen
+before a mutation begins.
+If output crosses the response ceiling only after a command has executed, the
+connection returns the bounded error; clients must treat that command's outcome
+as unknown, just as they would after a network interruption.
+
+Transfer-encoded HTTP request bodies are not supported. Clients should not
+pipeline HTTP/1.1 requests: bytes already buffered beyond a declared body are
+rejected and the connection closes. Ordinary sequential keep-alive requests
+remain supported. Overload shedding does not weaken the configured durability
+policy: a rejected mutation is never acknowledged, and an acknowledged
+mutation retains the same recovery guarantee it has without load.
+
+`INFO` exposes `connected_http_clients`, the RESP/HTTP connection ceilings,
+`rejected_resp_connections`, `rejected_http_connections`,
+`rejected_auth_requests`, `rejected_request_buffers`,
+`rejected_response_buffers`, and
+`connection_timeouts`. It also exposes `network_subscriptions`,
+`max_subscriptions`, `max_request_buffer_bytes`, `max_response_buffer_bytes`,
+`max_script_memory_bytes`, and `dropped_event_messages`; Pub/Sub and live-query
+payloads may be dropped rather than exceed the shared network-buffer budget.
+Live WebSocket query subscriptions resynchronize their retained result after a
+delivery gap; raw Live WebSocket event subscriptions receive an explicit
+`EVENT_GAP` error. Key-event fanout uses fixed queues (4,096 incoming,
+1,024 per worker, and 4,096 coalesced overflow entries). Under sustained
+subscriber backpressure it keeps the newest event per queued key, then drops
+new keys rather than growing memory; `key_events_coalesced` and
+`key_events_dropped` report that pressure.
 
 #### App auth
 

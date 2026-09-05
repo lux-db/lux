@@ -2,22 +2,24 @@ use base64::Engine;
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpSocket;
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{broadcast, oneshot, watch, Semaphore};
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::lua;
-use crate::pubsub::Broker;
+use crate::pubsub::{Broker, SubscriptionReservation};
 use crate::store::Store;
 use crate::tables::SharedSchemaCache;
-use crate::{CommandExecutor, CommandSession, LuxError};
+use crate::{ByteBudget, CommandExecutor, CommandSession, DeadlineStream, LuxError, ServerLimits};
 
 mod browser_security;
 use browser_security::{normalize_origin, BrowserPolicy, StudioSessions};
@@ -62,6 +64,10 @@ pub struct HttpServerConfig {
     pub http_port: u16,
     pub max_rows: Option<usize>,
     pub max_body: usize,
+    pub limits: ServerLimits,
+    pub request_budget: ByteBudget,
+    pub response_budget: ByteBudget,
+    pub auth_workers: Arc<Semaphore>,
     pub browser: crate::HttpBrowserConfig,
     pub on_ready: Option<Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>>,
     pub startup_ready: Option<oneshot::Sender<std::io::Result<std::net::SocketAddr>>>,
@@ -71,6 +77,7 @@ pub struct HttpServerConfig {
 struct RequestLimits {
     max_rows: Option<usize>,
     max_body: usize,
+    server: ServerLimits,
 }
 
 #[derive(Clone)]
@@ -81,6 +88,27 @@ struct HttpServices {
     script_engine: Arc<lua::ScriptEngine>,
     browser_policy: BrowserPolicy,
     studio_sessions: StudioSessions,
+    request_budget: ByteBudget,
+    response_budget: ByteBudget,
+    auth_workers: Arc<Semaphore>,
+}
+
+struct LiveServices {
+    store: Arc<Store>,
+    broker: Broker,
+    cache: SharedSchemaCache,
+    studio_sessions: StudioSessions,
+    request_budget: ByteBudget,
+    limits: RequestLimits,
+}
+
+#[derive(Clone, Copy)]
+struct LiveClientContext<'a> {
+    broker: &'a Broker,
+    store: &'a Arc<Store>,
+    cache: &'a SharedSchemaCache,
+    principal: Option<&'a crate::auth::AuthPrincipal>,
+    limits: RequestLimits,
 }
 
 #[derive(Default)]
@@ -140,6 +168,7 @@ pub async fn start_http_server(
     let limits = RequestLimits {
         max_rows: config.max_rows,
         max_body: config.max_body,
+        server: config.limits,
     };
     let services = HttpServices {
         store,
@@ -148,9 +177,13 @@ pub async fn start_http_server(
         script_engine,
         browser_policy,
         studio_sessions,
+        request_budget: config.request_budget,
+        response_budget: config.response_budget,
+        auth_workers: config.auth_workers,
     };
 
     let mut connections = JoinSet::new();
+    let connection_permits = Arc::new(Semaphore::new(config.limits.max_http_connections));
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => break,
@@ -158,21 +191,58 @@ pub async fn start_http_server(
                 let _ = joined;
             }
             accepted = listener.accept() => {
-                let (socket, _) = accepted?;
+                let (mut socket, _) = accepted?;
+                let permit = match connection_permits.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        services.store.reject_http_connection();
+                        let _ = tokio::time::timeout(
+                            config.limits.write_timeout,
+                            socket.write_all(
+                                b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 43\r\n\r\n{\"error\":\"server connection limit reached\"}",
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
                 let services = services.clone();
                 let connection_shutdown = shutdown_rx.clone();
 
                 connections.spawn(async move {
-                    let mut stream = socket;
+                    let _permit = permit;
+                    services.store.http_client_connected();
+                    let mut stream = DeadlineStream::with_write_budget(
+                        socket,
+                        limits.server.write_timeout,
+                        usize::MAX,
+                        services.response_budget.clone(),
+                    );
                     let mut connection_shutdown = connection_shutdown;
-                    while let Ok(true) = handle_request(
-                        &mut stream,
-                        &services,
-                        limits,
-                        &mut connection_shutdown,
-                    )
-                    .await
-                    {}
+                    let mut first_request = true;
+                    loop {
+                        match handle_request(
+                            &mut stream,
+                            &services,
+                            limits,
+                            &mut connection_shutdown,
+                            first_request,
+                        )
+                        .await
+                        {
+                            Ok(true) => first_request = false,
+                            Ok(false) => break,
+                            Err(error) => {
+                                if error.kind() == std::io::ErrorKind::TimedOut {
+                                    services.store.record_connection_timeout();
+                                } else if error.kind() == std::io::ErrorKind::OutOfMemory {
+                                    services.store.reject_response_buffer();
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    services.store.http_client_disconnected();
                 });
             }
         }
@@ -190,10 +260,11 @@ fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpL
 }
 
 async fn handle_request(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     services: &HttpServices,
     limits: RequestLimits,
     shutdown_rx: &mut watch::Receiver<Option<std::time::Duration>>,
+    first_request: bool,
 ) -> std::io::Result<bool> {
     let HttpServices {
         store,
@@ -202,62 +273,142 @@ async fn handle_request(
         script_engine,
         browser_policy,
         studio_sessions,
+        request_budget,
+        auth_workers,
+        ..
     } = services;
     let mut response = HttpResponseContext::default();
-    // Hard limits to prevent memory exhaustion DoS
+    // Hard limits keep request memory finite.
     const MAX_HEADER_SIZE: usize = 64 * 1024; // 64 KB headers
 
     let mut buf = vec![0u8; 65536];
     let mut data = Vec::new();
+    let mut request_reservation = request_budget.reservation();
 
     if shutdown_rx.borrow().is_some() {
         return Ok(false);
     }
 
-    loop {
-        // Before the first byte this is an idle connection. Once any request
-        // bytes arrive, finish that request rather than cutting it off midway.
-        let n = if data.is_empty() {
-            tokio::select! {
-                _ = shutdown_rx.changed() => return Ok(false),
-                read = socket.read(&mut buf) => read?,
-            }
+    let mut first_byte = true;
+    let mut header_deadline = tokio::time::Instant::now()
+        + if first_request {
+            limits.server.http_header_timeout
         } else {
-            socket.read(&mut buf).await?
+            limits.server.http_keep_alive_timeout
         };
+    loop {
+        let read = tokio::select! {
+            _ = shutdown_rx.changed() => return Ok(false),
+            _ = tokio::time::sleep_until(header_deadline) => {
+                store.record_connection_timeout();
+                if data.is_empty() {
+                    return Ok(false);
+                }
+                let _ = send_json(
+                    socket,
+                    408,
+                    "Request Timeout",
+                    r#"{"error":"request header timeout"}"#,
+                    &response,
+                ).await?;
+                return Ok(false);
+            }
+            read = socket.read(&mut buf) => read,
+        };
+        let n = read?;
         if n == 0 {
             return Ok(false);
         }
+        if !request_reservation.try_grow(n) {
+            store.reject_request_buffer();
+            let _ = send_json(
+                socket,
+                503,
+                "Service Unavailable",
+                r#"{"error":"request buffer capacity exhausted"}"#,
+                &response,
+            )
+            .await?;
+            return Ok(false);
+        }
         data.extend_from_slice(&buf[..n]);
+        if first_byte {
+            first_byte = false;
+            header_deadline = tokio::time::Instant::now() + limits.server.http_header_timeout;
+        }
 
+        if let Some(position) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+            if position + 4 <= MAX_HEADER_SIZE {
+                break;
+            }
+        }
         if data.len() > MAX_HEADER_SIZE {
             let body = r#"{"error":"request headers too large"}"#;
-            return send_json(
+            let _ = send_json(
                 socket,
                 431,
                 "Request Header Fields Too Large",
                 body,
                 &response,
             )
-            .await;
-        }
-
-        if data.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+            .await?;
+            return Ok(false);
         }
     }
 
     let header_end = data.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     let header_str = String::from_utf8_lossy(&data[..header_end]);
-
-    let content_length: usize = header_str
-        .lines()
-        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.split_once(':'))
-        .and_then(|(_, v)| v.trim().parse().ok())
-        .unwrap_or(0);
     let (method, full_path, headers) = parse_http_head(&header_str);
     drop(header_str);
+
+    if headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        let _ = send_json(
+            socket,
+            501,
+            "Not Implemented",
+            r#"{"error":"transfer encoding is not supported"}"#,
+            &response,
+        )
+        .await?;
+        return Ok(false);
+    }
+
+    let mut content_length = None;
+    for (_, value) in headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+    {
+        let parsed = match value.trim().parse::<usize>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                let _ = send_json(
+                    socket,
+                    400,
+                    "Bad Request",
+                    r#"{"error":"invalid Content-Length"}"#,
+                    &response,
+                )
+                .await?;
+                return Ok(false);
+            }
+        };
+        if content_length.is_some_and(|previous| previous != parsed) {
+            let _ = send_json(
+                socket,
+                400,
+                "Bad Request",
+                r#"{"error":"conflicting Content-Length headers"}"#,
+                &response,
+            )
+            .await?;
+            return Ok(false);
+        }
+        content_length = Some(parsed);
+    }
+    let content_length = content_length.unwrap_or(0);
 
     if let Err(error) = browser_policy.validate_host(&headers) {
         let body = format!(r#"{{"error":"{}"}}"#, escape_json(error));
@@ -280,16 +431,57 @@ async fn handle_request(
         let body = r#"{"error":"request body size overflow"}"#;
         return send_json(socket, 413, "Payload Too Large", body, &response).await;
     };
+    let body_deadline = tokio::time::Instant::now() + limits.server.http_body_timeout;
     while data.len() < total_needed {
-        let n = socket.read(&mut buf).await?;
+        let remaining = total_needed - data.len();
+        let read_len = remaining.min(buf.len());
+        let read = tokio::select! {
+            _ = shutdown_rx.changed() => return Ok(false),
+            _ = tokio::time::sleep_until(body_deadline) => {
+                store.record_connection_timeout();
+                let _ = send_json(
+                    socket,
+                    408,
+                    "Request Timeout",
+                    r#"{"error":"request body timeout"}"#,
+                    &response,
+                ).await?;
+                return Ok(false);
+            }
+            read = socket.read(&mut buf[..read_len]) => read,
+        };
+        let n = read?;
         if n == 0 {
             break;
+        }
+        if !request_reservation.try_grow(n) {
+            store.reject_request_buffer();
+            let _ = send_json(
+                socket,
+                503,
+                "Service Unavailable",
+                r#"{"error":"request buffer capacity exhausted"}"#,
+                &response,
+            )
+            .await?;
+            return Ok(false);
         }
         data.extend_from_slice(&buf[..n]);
     }
     if data.len() < total_needed {
         let body = r#"{"error":"request body is shorter than Content-Length"}"#;
         return send_json(socket, 400, "Bad Request", body, &response).await;
+    }
+    if data.len() > total_needed {
+        let _ = send_json(
+            socket,
+            400,
+            "Bad Request",
+            r#"{"error":"HTTP request pipelining is not supported"}"#,
+            &response,
+        )
+        .await?;
+        return Ok(false);
     }
 
     if method == "OPTIONS" {
@@ -359,9 +551,9 @@ async fn handle_request(
     // Restore is the only binary request surface. Do not lossy-decode and copy
     // a potentially large snapshot merely to parse the HTTP head.
     let body = if is_restore {
-        String::new()
+        Cow::Borrowed("")
     } else {
-        String::from_utf8_lossy(&data[header_end..total_needed]).into_owned()
+        String::from_utf8_lossy(&data[header_end..total_needed])
     };
 
     // These endpoints intentionally contain no project data and bypass normal
@@ -432,6 +624,24 @@ async fn handle_request(
     let studio_authorized = studio_sessions.authorize(presented, response.cors_origin.as_deref());
 
     if path.starts_with("/auth/v1") {
+        let auth_permit = if auth_request_needs_worker(&method, &path) {
+            match auth_workers.try_acquire() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    store.reject_auth_request();
+                    return send_json(
+                        socket,
+                        429,
+                        "Too Many Requests",
+                        r#"{"error":"authentication capacity exhausted"}"#,
+                        &response,
+                    )
+                    .await;
+                }
+            }
+        } else {
+            None
+        };
         let mut studio_headers = Vec::new();
         let routed_headers = if studio_authorized {
             studio_headers.extend(
@@ -458,6 +668,9 @@ async fn handle_request(
             cache,
         )
         .await;
+        // The worker permit protects authentication computation, not socket
+        // delivery. Release it before a slow client receives the response.
+        drop(auth_permit);
         return send_auth_response(socket, auth_response, &response).await;
     }
 
@@ -599,6 +812,11 @@ async fn handle_request(
     }
 
     if method == "GET" && path == "/live" {
+        // The HTTP upgrade request is fully parsed and no longer retained once
+        // the socket becomes a WebSocket. Do not charge its bytes for the
+        // entire lifetime of a live connection.
+        request_reservation.release(data.len());
+        drop(data);
         return handle_live_upgrade(
             socket,
             &headers,
@@ -611,6 +829,7 @@ async fn handle_request(
             },
             shutdown_rx.clone(),
             &response,
+            limits,
         )
         .await;
     }
@@ -913,6 +1132,11 @@ async fn handle_request(
     send_json(socket, status, status_text, &result, &response).await
 }
 
+fn auth_request_needs_worker(method: &str, path: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH")
+        || (method == "GET" && path.starts_with("/auth/v1/callback/"))
+}
+
 fn snapshot_management_authorized(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -927,15 +1151,12 @@ fn snapshot_management_authorized(
     }
 }
 
-/// Stream a table query response using chunked transfer encoding.
-/// Writes rows directly to the socket as they come out of table_select,
-/// without ever building the full JSON string in memory.
 /// Stream a complete, consistent snapshot to the caller. Triggers the same save
 /// the background timer runs (full dump incl. tiered cold data + WAL truncate),
 /// then streams the resulting `lux.dat`. The blocking save runs off the async
 /// runtime via `spawn_blocking`. Caller enforces operator auth.
 async fn stream_snapshot(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     store: &Arc<Store>,
     response: &HttpResponseContext,
 ) -> std::io::Result<bool> {
@@ -999,9 +1220,12 @@ async fn stream_snapshot(
     Ok(true)
 }
 
+/// Stream a table query response using chunked transfer encoding.
+/// Writes rows directly to the socket as they come out of `table_select`,
+/// without building the full JSON response in memory.
 #[allow(clippy::too_many_arguments)]
 async fn stream_table_query(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     table: &str,
     params: &[(String, String)],
     prefer: &str,
@@ -1011,8 +1235,6 @@ async fn stream_table_query(
     decrypt_authorized: bool,
     response: &HttpResponseContext,
 ) -> std::io::Result<bool> {
-    use tokio::io::AsyncWriteExt;
-
     let now = std::time::Instant::now();
 
     let (parsed, mut plan) = match parse_http_table_query(params, table, max_rows) {
@@ -1159,8 +1381,7 @@ async fn stream_table_query(
 }
 
 /// Write a single HTTP chunk: `{hex_len}\r\n{data}\r\n`
-async fn write_chunk(socket: &mut tokio::net::TcpStream, data: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
+async fn write_chunk(socket: &mut DeadlineStream, data: &[u8]) -> std::io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
@@ -1172,27 +1393,27 @@ async fn write_chunk(socket: &mut tokio::net::TcpStream, data: &[u8]) -> std::io
 }
 
 async fn send_json(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     status: u16,
     status_text: &str,
     body: &str,
     context: &HttpResponseContext,
 ) -> std::io::Result<bool> {
     let cors_headers = context.cors_headers();
-    let response = format!(
+    let head = format!(
         "HTTP/1.1 {status} {status_text}\r\n\
          Content-Type: application/json\r\n\
          {cors_headers}\
-         Content-Length: {}\r\n\r\n{}",
-        body.len(),
-        body
+         Content-Length: {}\r\n\r\n",
+        body.len()
     );
-    socket.write_all(response.as_bytes()).await?;
+    socket.write_all(head.as_bytes()).await?;
+    socket.write_all(body.as_bytes()).await?;
     Ok(true)
 }
 
 async fn send_auth_response(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     response: crate::auth::AuthHttpResponse,
     context: &HttpResponseContext,
 ) -> std::io::Result<bool> {
@@ -1214,8 +1435,8 @@ async fn send_auth_response(
         head.push_str("\r\n");
     }
     head.push_str("\r\n");
-    head.push_str(&response.body);
     socket.write_all(head.as_bytes()).await?;
+    socket.write_all(response.body.as_bytes()).await?;
     Ok(true)
 }
 
@@ -1693,20 +1914,46 @@ struct LiveQueryState {
     /// primary key so `.live()` works for any PK name, not just `id`. `None`
     /// for non-table queries (vector/raw), which fall back to `id`/`key`.
     pk_field: Option<String>,
+    content_bytes: usize,
+    reserved_bytes: usize,
+}
+
+impl LiveQueryState {
+    fn try_reserve_rows(
+        &mut self,
+        capacity: &mut SubscriptionReservation,
+        row_count: usize,
+        content_bytes: usize,
+    ) -> bool {
+        let Some(next_bytes) = live_state_total_bytes(row_count, content_bytes) else {
+            return false;
+        };
+        if next_bytes > self.reserved_bytes
+            && !capacity.try_grow(0, next_bytes - self.reserved_bytes)
+        {
+            return false;
+        }
+        self.content_bytes = content_bytes;
+        self.reserved_bytes = self.reserved_bytes.max(next_bytes);
+        true
+    }
 }
 
 enum LiveSubscription {
     Key {
         pattern: String,
         receivers: Vec<broadcast::Receiver<crate::pubsub::Message>>,
+        _capacity: SubscriptionReservation,
     },
     Channel {
         channel: String,
         receiver: broadcast::Receiver<crate::pubsub::Message>,
+        _capacity: SubscriptionReservation,
     },
     PubSubPattern {
         pattern: String,
         receiver: broadcast::Receiver<crate::pubsub::Message>,
+        _capacity: SubscriptionReservation,
     },
     Table {
         spec: Box<LiveTableSpec>,
@@ -1717,12 +1964,61 @@ enum LiveSubscription {
         /// primary-key column used to re-evaluate a single changed row.
         delta_rx: Option<broadcast::Receiver<crate::pubsub::RowDelta>>,
         pk_col: String,
+        _capacity: SubscriptionReservation,
     },
     VectorNear {
         spec: LiveVectorNearSpec,
         state: LiveQueryState,
         receiver: broadcast::Receiver<crate::pubsub::Message>,
+        _capacity: SubscriptionReservation,
     },
+}
+
+struct LiveSubscriptions<'a> {
+    broker: &'a Broker,
+    entries: HashMap<String, LiveSubscription>,
+    last_key_event_drops: u64,
+}
+
+impl<'a> LiveSubscriptions<'a> {
+    fn new(broker: &'a Broker) -> Self {
+        Self {
+            broker,
+            entries: HashMap::new(),
+            last_key_event_drops: broker.key_event_stats().dropped,
+        }
+    }
+
+    fn take_key_event_gap(&mut self) -> bool {
+        let dropped = self.broker.key_event_stats().dropped;
+        if dropped == self.last_key_event_drops {
+            return false;
+        }
+        self.last_key_event_drops = dropped;
+        true
+    }
+}
+
+impl std::ops::Deref for LiveSubscriptions<'_> {
+    type Target = HashMap<String, LiveSubscription>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl std::ops::DerefMut for LiveSubscriptions<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
+
+impl Drop for LiveSubscriptions<'_> {
+    fn drop(&mut self) {
+        while let Some(id) = self.entries.keys().next().cloned() {
+            stop_live_subscription(self.broker, &mut self.entries, &id);
+        }
+    }
 }
 
 enum LiveBrokerEvent {
@@ -1741,25 +2037,26 @@ enum LiveBrokerEvent {
 fn live_broker_event_from_message(message: &crate::pubsub::Message) -> Option<LiveBrokerEvent> {
     match message.kind {
         crate::pubsub::MessageKind::PubSub => Some(LiveBrokerEvent::Message {
-            channel: message.channel.clone(),
+            channel: message.channel.to_string(),
             message: String::from_utf8_lossy(&message.payload).to_string(),
-            pattern: message.pattern.clone(),
+            pattern: message.pattern.as_deref().map(str::to_string),
         }),
         crate::pubsub::MessageKind::KeyEvent => Some(LiveBrokerEvent::Key {
-            pattern: message.pattern.clone()?,
-            key: message.channel.clone(),
+            pattern: message.pattern.as_deref()?.to_string(),
+            key: message.channel.to_string(),
             operation: String::from_utf8_lossy(&message.payload).to_string(),
         }),
     }
 }
 
 async fn handle_live_upgrade(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     headers: &[(String, String)],
     services: HttpServices,
     identity: LiveIdentity,
     shutdown_rx: watch::Receiver<Option<std::time::Duration>>,
     response: &HttpResponseContext,
+    limits: RequestLimits,
 ) -> std::io::Result<bool> {
     let Some(key) = header_value(headers, "sec-websocket-key") else {
         return send_json(
@@ -1781,51 +2078,75 @@ async fn handle_live_upgrade(
     );
     socket.write_all(response.as_bytes()).await?;
 
-    let ws = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
+    let write_buffer_size = limits.max_body.clamp(1, 128 * 1024);
+    let ws_config = WebSocketConfig {
+        write_buffer_size,
+        max_write_buffer_size: limits.max_body.saturating_add(write_buffer_size),
+        max_message_size: Some(limits.max_body),
+        max_frame_size: Some(limits.max_body.min(16 * 1024 * 1024)),
+        ..WebSocketConfig::default()
+    };
+    let ws = WebSocketStream::from_raw_socket(socket, Role::Server, Some(ws_config)).await;
     let HttpServices {
         store,
         broker,
         cache,
         studio_sessions,
+        request_budget,
         ..
     } = services;
-    run_live_socket(
-        ws,
+    let live_services = LiveServices {
         store,
         broker,
         cache,
-        identity,
         studio_sessions,
-        shutdown_rx,
-    )
-    .await?;
+        request_budget,
+        limits,
+    };
+    run_live_socket(ws, live_services, identity, shutdown_rx).await?;
     Ok(false)
 }
 
 async fn run_live_socket<S>(
     mut ws: WebSocketStream<S>,
-    store: Arc<Store>,
-    broker: Broker,
-    cache: SharedSchemaCache,
+    services: LiveServices,
     identity: LiveIdentity,
-    studio_sessions: StudioSessions,
     mut shutdown_rx: watch::Receiver<Option<std::time::Duration>>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut subscriptions: HashMap<String, LiveSubscription> = HashMap::new();
+    let LiveServices {
+        store,
+        broker,
+        cache,
+        studio_sessions,
+        request_budget,
+        limits,
+    } = services;
+    // Own cleanup so cancellation and socket-write failures reclaim broker
+    // registrations just like an orderly WebSocket close.
+    let mut subscriptions = LiveSubscriptions::new(&broker);
+    let mut subscription_bytes: HashMap<String, usize> = HashMap::new();
+    let mut retained_subscription_bytes = 0usize;
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Session revocation is bounded to one second. This remains separate from
     // the 1 ms event-drain timer so expensive state checks never run per event.
     let mut auth_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     auth_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let idle = tokio::time::sleep(limits.server.live_idle_timeout);
+    tokio::pin!(idle);
 
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
-                let _ = ws.send(WsMessage::Close(None)).await;
+                let _ = send_live_message(&mut ws, WsMessage::Close(None), limits).await;
+                break;
+            }
+            _ = &mut idle => {
+                store.record_connection_timeout();
+                let _ = send_live_message(&mut ws, WsMessage::Close(None), limits).await;
                 break;
             }
             incoming = ws.next() => {
@@ -1834,28 +2155,44 @@ where
                     Ok(message) => message,
                     Err(_) => break,
                 };
+                let Some(_incoming_capacity) = request_budget.try_reserve(incoming.len()) else {
+                    store.reject_request_buffer();
+                    let _ = send_live_json(
+                        &mut ws,
+                        json!({"type":"live.error","error":{"code":"LIMIT_EXCEEDED","message":"request buffer capacity exhausted"}}),
+                        limits,
+                    )
+                    .await;
+                    break;
+                };
+                idle.as_mut().reset(tokio::time::Instant::now() + limits.server.live_idle_timeout);
                 match incoming {
                     WsMessage::Text(text) => {
                         handle_live_client_message(
                             &mut ws,
                             &mut subscriptions,
-                            &broker,
-                            &store,
-                            &cache,
-                            identity.principal.as_ref(),
+                            &mut subscription_bytes,
+                            &mut retained_subscription_bytes,
+                            LiveClientContext {
+                                broker: &broker,
+                                store: &store,
+                                cache: &cache,
+                                principal: identity.principal.as_ref(),
+                                limits,
+                            },
                             &text,
                         ).await?;
                     }
                     WsMessage::Close(_) => break,
                     WsMessage::Ping(payload) => {
-                        let _ = ws.send(WsMessage::Pong(payload)).await;
+                        let _ = send_live_message(&mut ws, WsMessage::Pong(payload), limits).await;
                     }
                     _ => {}
                 }
             }
             _ = tick.tick() => {
-                drain_live_subscription_events(&mut ws, &mut subscriptions, &store, &cache).await?;
-                drain_live_row_deltas(&mut ws, &mut subscriptions, &store, &cache).await?;
+                drain_live_subscription_events(&mut ws, &mut subscriptions, &store, &cache, limits).await?;
+                drain_live_row_deltas(&mut ws, &mut subscriptions, &store, &cache, limits).await?;
             }
             _ = auth_tick.tick(), if identity.user_credential.is_some() || identity.secret_credential.is_some() || identity.studio_session.is_some() => {
                 let user_valid = identity.user_credential.as_ref().is_none_or(|credential| {
@@ -1868,19 +2205,12 @@ where
                     studio_sessions.authorize(token, Some(origin))
                 });
                 if !user_valid || !secret_valid || !studio_valid {
-                    send_live_json(&mut ws, json!({"type":"live.error","error":{"code":"AUTH_REVOKED","message":"live authorization is no longer valid"}})).await?;
-                    let _ = ws.send(WsMessage::Close(None)).await;
+                    send_live_json(&mut ws, json!({"type":"live.error","error":{"code":"AUTH_REVOKED","message":"live authorization is no longer valid"}}), limits).await?;
+                    let _ = send_live_message(&mut ws, WsMessage::Close(None), limits).await;
                     break;
                 }
             }
         }
-    }
-
-    // Tear down every subscription on disconnect so broker bookkeeping (row-delta
-    // subscriber count, per-table channels) doesn't leak past the socket.
-    let ids: Vec<String> = subscriptions.keys().cloned().collect();
-    for id in ids {
-        stop_live_subscription(&broker, &mut subscriptions, &id);
     }
 
     Ok(())
@@ -1889,19 +2219,25 @@ where
 async fn handle_live_client_message<S>(
     ws: &mut WebSocketStream<S>,
     subscriptions: &mut HashMap<String, LiveSubscription>,
-    broker: &Broker,
-    store: &Arc<Store>,
-    cache: &SharedSchemaCache,
-    principal: Option<&crate::auth::AuthPrincipal>,
+    subscription_bytes: &mut HashMap<String, usize>,
+    retained_subscription_bytes: &mut usize,
+    context: LiveClientContext<'_>,
     text: &str,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let LiveClientContext {
+        broker,
+        store,
+        cache,
+        principal,
+        limits,
+    } = context;
     let parsed: Value = match serde_json::from_str(text) {
         Ok(value) => value,
         Err(_) => {
-            send_live_json(ws, json!({"type":"live.error","error":{"code":"INVALID_JSON","message":"invalid json"}})).await?;
+            send_live_json(ws, json!({"type":"live.error","error":{"code":"INVALID_JSON","message":"invalid json"}}), limits).await?;
             return Ok(());
         }
     };
@@ -1922,47 +2258,100 @@ where
                 send_live_json(
                     ws,
                     json!({"type":"live.error","id":id,"error":{"code":"UNAVAILABLE","message":error.to_string()}}),
+                    limits,
                 )
                 .await?;
                 return Ok(());
             }
-            send_live_json(ws, json!({"type":"live.unsubscribed","id":id})).await?;
+            if let Some(bytes) = subscription_bytes.remove(&id) {
+                *retained_subscription_bytes = retained_subscription_bytes.saturating_sub(bytes);
+            }
+            send_live_json(ws, json!({"type":"live.unsubscribed","id":id}), limits).await?;
         }
         return Ok(());
     }
 
     if msg_type != "live.subscribe" {
-        send_live_json(ws, json!({"type":"live.error","id":id,"error":{"code":"UNKNOWN_MESSAGE","message":"unknown live message type"}})).await?;
+        send_live_json(ws, json!({"type":"live.error","id":id,"error":{"code":"UNKNOWN_MESSAGE","message":"unknown live message type"}}), limits).await?;
         return Ok(());
     }
 
     if id.is_empty() {
-        send_live_json(ws, json!({"type":"live.error","error":{"code":"MISSING_ID","message":"live.subscribe requires id"}})).await?;
+        send_live_json(ws, json!({"type":"live.error","error":{"code":"MISSING_ID","message":"live.subscribe requires id"}}), limits).await?;
         return Ok(());
     }
 
     let Some(spec) = parsed.get("spec").or_else(|| parsed.get("query")) else {
-        send_live_json(ws, json!({"type":"live.error","id":id,"error":{"code":"MISSING_SPEC","message":"live.subscribe requires spec"}})).await?;
+        send_live_json(ws, json!({"type":"live.error","id":id,"error":{"code":"MISSING_SPEC","message":"live.subscribe requires spec"}}), limits).await?;
         return Ok(());
     };
 
+    if !subscriptions.contains_key(&id)
+        && subscriptions.len() >= limits.server.max_live_subscriptions
+    {
+        send_live_json(
+            ws,
+            json!({"type":"live.error","id":id,"error":{"code":"LIMIT_EXCEEDED","message":"maximum live subscriptions reached"}}),
+            limits,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let replaced_bytes = subscription_bytes.get(&id).copied().unwrap_or(0);
+    if retained_subscription_bytes
+        .saturating_sub(replaced_bytes)
+        .checked_add(text.len())
+        .is_none_or(|bytes| bytes > limits.max_body)
+    {
+        send_live_json(
+            ws,
+            json!({"type":"live.error","id":id,"error":{"code":"LIMIT_EXCEEDED","message":"live subscription definitions exceed maximum retained bytes"}}),
+            limits,
+        )
+        .await?;
+        return Ok(());
+    }
+
     let subscription = match with_execution_read(store, || {
-        stop_live_subscription(broker, subscriptions, &id);
-        build_live_subscription(spec, broker, store, cache, principal)
+        build_live_subscription(spec, broker, store, cache, principal, limits, text.len())
     }) {
         Ok(subscription) => subscription,
-        Err(error) => Err(live_error("UNAVAILABLE", &error.to_string())),
+        Err(error) => {
+            send_live_json(
+                ws,
+                json!({"type":"live.error","id":id,"error":{"code":"UNAVAILABLE","message":error.to_string()}}),
+                limits,
+            )
+            .await?;
+            return Ok(());
+        }
     };
     match subscription {
         Ok((subscription, initial_events)) => {
+            stop_live_subscription(broker, subscriptions, &id);
+            if let Some(bytes) = subscription_bytes.insert(id.clone(), text.len()) {
+                *retained_subscription_bytes = retained_subscription_bytes.saturating_sub(bytes);
+            }
+            *retained_subscription_bytes = retained_subscription_bytes.saturating_add(text.len());
             subscriptions.insert(id.clone(), subscription);
-            send_live_json(ws, json!({"type":"live.subscribed","id":id})).await?;
+            send_live_json(ws, json!({"type":"live.subscribed","id":id}), limits).await?;
             for event in initial_events {
-                send_live_json(ws, json!({"type":"live.event","id":id,"event":event})).await?;
+                send_live_json(
+                    ws,
+                    json!({"type":"live.event","id":id,"event":event}),
+                    limits,
+                )
+                .await?;
             }
         }
         Err(error) => {
-            send_live_json(ws, json!({"type":"live.error","id":id,"error":error})).await?;
+            send_live_json(
+                ws,
+                json!({"type":"live.error","id":id,"error":error}),
+                limits,
+            )
+            .await?;
         }
     }
 
@@ -1975,16 +2364,21 @@ fn build_live_subscription(
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
     principal: Option<&crate::auth::AuthPrincipal>,
+    limits: RequestLimits,
+    retained_bytes: usize,
 ) -> Result<(LiveSubscription, Vec<Value>), Value> {
     if let Some(pattern) = spec
         .as_str()
         .or_else(|| spec.get("key").and_then(Value::as_str))
     {
         require_live_operator(store, principal)?;
+        ensure_live_subscription_name(pattern, limits)?;
+        let capacity = reserve_live_subscription_capacity(broker, 1, retained_bytes)?;
         return Ok((
             LiveSubscription::Key {
                 pattern: pattern.to_string(),
                 receivers: vec![broker.ksubscribe(pattern)],
+                _capacity: capacity,
             },
             Vec::new(),
         ));
@@ -1994,10 +2388,13 @@ fn build_live_subscription(
     if kind == "key" {
         let pattern = required_str(spec, "pattern")?;
         require_live_operator(store, principal)?;
+        ensure_live_subscription_name(pattern, limits)?;
+        let capacity = reserve_live_subscription_capacity(broker, 1, retained_bytes)?;
         return Ok((
             LiveSubscription::Key {
                 pattern: pattern.to_string(),
                 receivers: vec![broker.ksubscribe(pattern)],
+                _capacity: capacity,
             },
             Vec::new(),
         ));
@@ -2005,10 +2402,13 @@ fn build_live_subscription(
     if kind == "channel" || spec.get("channel").is_some() {
         let channel = required_str(spec, "channel")?;
         require_live_operator(store, principal)?;
+        ensure_live_subscription_name(channel, limits)?;
+        let capacity = reserve_live_subscription_capacity(broker, 1, retained_bytes)?;
         return Ok((
             LiveSubscription::Channel {
                 channel: channel.to_string(),
                 receiver: broker.subscribe(channel),
+                _capacity: capacity,
             },
             Vec::new(),
         ));
@@ -2025,16 +2425,26 @@ fn build_live_subscription(
                 )
             })?;
         require_live_operator(store, principal)?;
+        ensure_live_subscription_name(pattern, limits)?;
+        let capacity = reserve_live_subscription_capacity(broker, 1, retained_bytes)?;
         return Ok((
             LiveSubscription::PubSubPattern {
                 pattern: pattern.to_string(),
                 receiver: broker.psubscribe(pattern),
+                _capacity: capacity,
             },
             Vec::new(),
         ));
     }
     if kind == "table" || spec.get("table").is_some() {
         let mut table_spec = parse_live_table_spec(spec)?;
+        ensure_live_subscription_name(&table_spec.table, limits)?;
+        for join in &table_spec.joins {
+            ensure_live_subscription_name(&join.table, limits)?;
+        }
+        if let Some(max_rows) = limits.max_rows {
+            table_spec.limit = Some(table_spec.limit.unwrap_or(max_rows).min(max_rows));
+        }
         if let Some(err) = crate::auth::reserved_table_access_error(&table_spec.table) {
             return Err(live_error("FORBIDDEN", &err));
         }
@@ -2098,6 +2508,31 @@ fn build_live_subscription(
         } else {
             live_table_dependencies(&table_spec)
         };
+        for table in &key_tables {
+            ensure_live_subscription_name(table, limits)?;
+        }
+        let receiver_count = key_tables
+            .len()
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(usize::from(ivm)))
+            .ok_or_else(|| live_error("LIMIT_EXCEEDED", "subscription capacity overflow"))?;
+        let receiver_bytes = key_tables
+            .iter()
+            .try_fold(retained_bytes, |bytes, table| {
+                bytes
+                    .checked_add(table.len())
+                    .and_then(|bytes| bytes.checked_add(format!("_t:{table}:row:*").len()))
+            })
+            .and_then(|bytes| {
+                if ivm {
+                    bytes.checked_add(table_spec.table.len())
+                } else {
+                    Some(bytes)
+                }
+            })
+            .ok_or_else(|| live_error("LIMIT_EXCEEDED", "subscription bytes overflow"))?;
+        let mut capacity =
+            reserve_live_subscription_capacity(broker, receiver_count, receiver_bytes)?;
         let receivers = key_tables
             .iter()
             .flat_map(|table| {
@@ -2122,11 +2557,29 @@ fn build_live_subscription(
             }
         };
         let query = json!({"type":"table","table":table_spec.table});
-        let state = LiveQueryState {
+        let indexed_rows = index_live_rows(rows.clone(), pk_field.as_deref());
+        let content_bytes = live_state_content_bytes(&indexed_rows)
+            .ok_or_else(|| live_error("LIMIT_EXCEEDED", "live query state size overflow"))?;
+        let mut state = LiveQueryState {
             query: query.clone(),
-            rows: index_live_rows(rows.clone(), pk_field.as_deref()),
+            rows: indexed_rows,
             pk_field,
+            content_bytes: 0,
+            reserved_bytes: 0,
         };
+        if !state.try_reserve_rows(&mut capacity, state.rows.len(), content_bytes) {
+            rollback_live_table_receivers(
+                broker,
+                receivers,
+                delta_rx,
+                &key_tables,
+                &table_spec.table,
+            );
+            return Err(live_error(
+                "LIMIT_EXCEEDED",
+                "process live query state capacity exhausted",
+            ));
+        }
         return Ok((
             LiveSubscription::Table {
                 spec: Box::new(table_spec),
@@ -2134,26 +2587,45 @@ fn build_live_subscription(
                 receivers,
                 delta_rx,
                 pk_col,
+                _capacity: capacity,
             },
             vec![json!({"kind":"snapshot","scope":"query","query":query,"rows":rows})],
         ));
     }
     if kind == "vector.near" {
-        let vector_spec = parse_live_vector_near_spec(spec)?;
+        let mut vector_spec = parse_live_vector_near_spec(spec)?;
+        let max_rows = limits
+            .max_rows
+            .unwrap_or(limits.server.max_query_candidates)
+            .min(limits.server.max_query_candidates);
+        vector_spec.k = vector_spec.k.min(max_rows);
         require_live_operator(store, principal)?;
+        let mut capacity = reserve_live_subscription_capacity(broker, 1, retained_bytes)?;
         let rows = fetch_live_vector_rows(store, &vector_spec);
         let query =
             json!({"type":"vector.near","k":vector_spec.k,"threshold":vector_spec.threshold});
-        let state = LiveQueryState {
+        let indexed_rows = index_live_rows(rows.clone(), None);
+        let content_bytes = live_state_content_bytes(&indexed_rows)
+            .ok_or_else(|| live_error("LIMIT_EXCEEDED", "live query state size overflow"))?;
+        let mut state = LiveQueryState {
             query: query.clone(),
-            rows: index_live_rows(rows.clone(), None),
+            rows: indexed_rows,
             pk_field: None,
+            content_bytes: 0,
+            reserved_bytes: 0,
         };
+        if !state.try_reserve_rows(&mut capacity, state.rows.len(), content_bytes) {
+            return Err(live_error(
+                "LIMIT_EXCEEDED",
+                "process live query state capacity exhausted",
+            ));
+        }
         return Ok((
             LiveSubscription::VectorNear {
                 spec: vector_spec,
                 state,
                 receiver: broker.ksubscribe("*"),
+                _capacity: capacity,
             },
             vec![json!({"kind":"snapshot","scope":"query","query":query,"rows":rows})],
         ));
@@ -2165,53 +2637,137 @@ fn build_live_subscription(
     ))
 }
 
+fn reserve_live_subscription_capacity(
+    broker: &Broker,
+    count: usize,
+    bytes: usize,
+) -> Result<SubscriptionReservation, Value> {
+    let mut capacity = broker.subscription_reservation();
+    if capacity.try_grow(count, bytes) {
+        Ok(capacity)
+    } else {
+        Err(live_error(
+            "LIMIT_EXCEEDED",
+            "process subscription capacity exhausted",
+        ))
+    }
+}
+
+fn ensure_live_subscription_name(name: &str, limits: RequestLimits) -> Result<(), Value> {
+    if name.len() <= limits.server.max_subscription_name_bytes {
+        Ok(())
+    } else {
+        Err(live_error(
+            "LIMIT_EXCEEDED",
+            "subscription name exceeds maximum",
+        ))
+    }
+}
+
 async fn drain_live_subscription_events<S>(
     ws: &mut WebSocketStream<S>,
-    subscriptions: &mut HashMap<String, LiveSubscription>,
+    subscriptions: &mut LiveSubscriptions<'_>,
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
+    limits: RequestLimits,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut events = Vec::new();
-    for subscription in subscriptions.values_mut() {
-        match subscription {
-            LiveSubscription::Key { receivers, .. } | LiveSubscription::Table { receivers, .. } => {
-                for receiver in receivers {
-                    drain_receiver(receiver, &mut events);
-                }
-            }
-            LiveSubscription::Channel { receiver, .. }
-            | LiveSubscription::PubSubPattern { receiver, .. }
-            | LiveSubscription::VectorNear { receiver, .. } => {
-                drain_receiver(receiver, &mut events)
-            }
+    // Drain one broker message per subscription per tick. A WebSocket that
+    // cannot keep pace will lag against the fixed broker queue rather than
+    // materializing an unbounded event batch in this task.
+    let ids: Vec<String> = subscriptions.keys().cloned().collect();
+    let process_gap = subscriptions.take_key_event_gap();
+    for id in ids {
+        if process_gap {
+            handle_live_subscription_gap(ws, subscriptions, store, cache, &id, limits).await?;
+            continue;
         }
-    }
-
-    for event in events {
-        dispatch_live_broker_event(ws, subscriptions, store, cache, event).await?;
+        let input = subscriptions
+            .get_mut(&id)
+            .and_then(next_live_subscription_input);
+        match input {
+            Some(LiveBrokerInput::Message(message)) => {
+                let Some(event) = live_broker_event_from_message(&message) else {
+                    continue;
+                };
+                dispatch_live_broker_event(ws, subscriptions, store, cache, &id, event, limits)
+                    .await?;
+            }
+            Some(LiveBrokerInput::Gap) => {
+                handle_live_subscription_gap(ws, subscriptions, store, cache, &id, limits).await?;
+            }
+            None => {}
+        }
     }
     Ok(())
 }
 
-fn drain_receiver(
+enum LiveBrokerInput {
+    Message(crate::pubsub::Message),
+    Gap,
+}
+
+fn next_receiver_input(
     receiver: &mut broadcast::Receiver<crate::pubsub::Message>,
-    events: &mut Vec<LiveBrokerEvent>,
-) {
-    loop {
-        match receiver.try_recv() {
-            Ok(message) => {
-                if let Some(event) = live_broker_event_from_message(&message) {
-                    events.push(event);
-                }
+) -> Option<LiveBrokerInput> {
+    match receiver.try_recv() {
+        Ok(message) => Some(LiveBrokerInput::Message(message)),
+        Err(broadcast::error::TryRecvError::Lagged(_)) => Some(LiveBrokerInput::Gap),
+        Err(broadcast::error::TryRecvError::Empty)
+        | Err(broadcast::error::TryRecvError::Closed) => None,
+    }
+}
+
+fn next_live_subscription_input(subscription: &mut LiveSubscription) -> Option<LiveBrokerInput> {
+    match subscription {
+        LiveSubscription::Key { receivers, .. } | LiveSubscription::Table { receivers, .. } => {
+            receivers.iter_mut().find_map(next_receiver_input)
+        }
+        LiveSubscription::Channel { receiver, .. }
+        | LiveSubscription::PubSubPattern { receiver, .. }
+        | LiveSubscription::VectorNear { receiver, .. } => next_receiver_input(receiver),
+    }
+}
+
+async fn handle_live_subscription_gap<S>(
+    ws: &mut WebSocketStream<S>,
+    subscriptions: &mut HashMap<String, LiveSubscription>,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    id: &str,
+    limits: RequestLimits,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(subscription) = subscriptions.get_mut(id) else {
+        return Ok(());
+    };
+    match subscription {
+        LiveSubscription::Table { .. } | LiveSubscription::VectorNear { .. } => {
+            for event in resync_live_query_subscription(subscription, id, store, cache)? {
+                send_live_json(
+                    ws,
+                    json!({"type":"live.event","id":id,"event":event}),
+                    limits,
+                )
+                .await?;
             }
-            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-            Err(broadcast::error::TryRecvError::Empty)
-            | Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+        LiveSubscription::Key { .. }
+        | LiveSubscription::Channel { .. }
+        | LiveSubscription::PubSubPattern { .. } => {
+            send_live_json(
+                ws,
+                json!({"type":"live.error","id":id,"error":{"code":"EVENT_GAP","message":"live event delivery fell behind; resubscribe to establish a new delivery point"}}),
+                limits,
+            )
+            .await?;
         }
     }
+    Ok(())
 }
 
 async fn dispatch_live_broker_event<S>(
@@ -2219,76 +2775,99 @@ async fn dispatch_live_broker_event<S>(
     subscriptions: &mut HashMap<String, LiveSubscription>,
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
+    id: &str,
     event: LiveBrokerEvent,
+    limits: RequestLimits,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut outgoing = Vec::new();
-    for (id, subscription) in subscriptions.iter_mut() {
-        match (subscription, &event) {
-            (
-                LiveSubscription::Key { pattern, .. },
-                LiveBrokerEvent::Key {
-                    pattern: event_pattern,
-                    key,
-                    operation,
-                },
-            ) if pattern == event_pattern => {
-                outgoing.push((id.clone(), live_key_event(event_pattern, key, operation)));
-            }
-            (
-                LiveSubscription::Channel { channel, .. },
-                LiveBrokerEvent::Message {
-                    channel: event_channel,
-                    message,
-                    pattern: None,
-                },
-            ) if channel == event_channel => {
-                outgoing.push((id.clone(), json!({"kind":"pubsub.message","scope":"pubsub","channel":event_channel,"message":message})));
-            }
-            (
-                LiveSubscription::PubSubPattern { pattern, .. },
-                LiveBrokerEvent::Message {
-                    channel,
-                    message,
-                    pattern: Some(event_pattern),
-                },
-            ) if pattern == event_pattern => {
-                outgoing.push((id.clone(), json!({"kind":"pubsub.message","scope":"pubsub","pattern":event_pattern,"channel":channel,"message":message})));
-            }
-            (
-                LiveSubscription::Table { spec, state, .. },
-                LiveBrokerEvent::Key { key, operation, .. },
-            ) => {
-                if let Some(changed_table) = live_table_for_key(spec, key) {
-                    let next = fetch_live_table_rows(store, cache, spec).unwrap_or_default();
-                    outgoing.extend(diff_live_query(
-                        id,
-                        state,
-                        next,
-                        Some(json!({"kind":table_cause_kind(operation),"table":changed_table,"operation":operation,"raw":{"pattern":format!("_t:{changed_table}:row:*"),"key":key,"operation":operation}})),
-                    ));
-                }
-            }
-            (
-                LiveSubscription::VectorNear { spec, state, .. },
-                LiveBrokerEvent::Key { key, operation, .. },
-            ) => {
-                let next = fetch_live_vector_rows(store, spec);
+    let Some(subscription) = subscriptions.get_mut(id) else {
+        return Ok(());
+    };
+    match (subscription, &event) {
+        (
+            LiveSubscription::Key { pattern, .. },
+            LiveBrokerEvent::Key {
+                pattern: event_pattern,
+                key,
+                operation,
+            },
+        ) if pattern == event_pattern => {
+            outgoing.push((
+                id.to_string(),
+                live_key_event(event_pattern, key, operation),
+            ));
+        }
+        (
+            LiveSubscription::Channel { channel, .. },
+            LiveBrokerEvent::Message {
+                channel: event_channel,
+                message,
+                pattern: None,
+            },
+        ) if channel == event_channel => {
+            outgoing.push((id.to_string(), json!({"kind":"pubsub.message","scope":"pubsub","channel":event_channel,"message":message})));
+        }
+        (
+            LiveSubscription::PubSubPattern { pattern, .. },
+            LiveBrokerEvent::Message {
+                channel,
+                message,
+                pattern: Some(event_pattern),
+            },
+        ) if pattern == event_pattern => {
+            outgoing.push((id.to_string(), json!({"kind":"pubsub.message","scope":"pubsub","pattern":event_pattern,"channel":channel,"message":message})));
+        }
+        (
+            LiveSubscription::Table {
+                spec,
+                state,
+                _capacity: capacity,
+                ..
+            },
+            LiveBrokerEvent::Key { key, operation, .. },
+        ) => {
+            if let Some(changed_table) = live_table_for_key(spec, key) {
+                let next = fetch_live_table_rows(store, cache, spec).map_err(live_query_error)?;
                 outgoing.extend(diff_live_query(
                     id,
                     state,
+                    capacity,
                     next,
-                    Some(json!({"kind":vector_cause_kind(operation),"key":key,"operation":operation})),
-                ));
+                    Some(json!({"kind":table_cause_kind(operation),"table":changed_table,"operation":operation,"raw":{"pattern":format!("_t:{changed_table}:row:*"),"key":key,"operation":operation}})),
+                ).map_err(live_state_capacity_error)?);
             }
-            _ => {}
         }
+        (
+            LiveSubscription::VectorNear {
+                spec,
+                state,
+                _capacity: capacity,
+                ..
+            },
+            LiveBrokerEvent::Key { key, operation, .. },
+        ) => {
+            let next = fetch_live_vector_rows(store, spec);
+            outgoing.extend(diff_live_query(
+                id,
+                state,
+                capacity,
+                next,
+                Some(json!({"kind":vector_cause_kind(operation),"key":key,"operation":operation})),
+            ).map_err(live_state_capacity_error)?);
+        }
+        _ => {}
     }
 
     for (id, event) in outgoing {
-        send_live_json(ws, json!({"type":"live.event","id":id,"event":event})).await?;
+        send_live_json(
+            ws,
+            json!({"type":"live.event","id":id,"event":event}),
+            limits,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2302,9 +2881,24 @@ fn stop_live_subscription(
         return;
     };
     match subscription {
-        LiveSubscription::Key { pattern, .. } => broker.kunsub(&pattern),
-        LiveSubscription::Channel { channel, .. } => broker.unsubscribe_channel(&channel),
-        LiveSubscription::PubSubPattern { pattern, .. } => broker.punsubscribe_pattern(&pattern),
+        LiveSubscription::Key {
+            pattern, receivers, ..
+        } => {
+            drop(receivers);
+            broker.kunsub(&pattern);
+        }
+        LiveSubscription::Channel {
+            channel, receiver, ..
+        } => {
+            drop(receiver);
+            broker.unsubscribe_channel(&channel);
+        }
+        LiveSubscription::PubSubPattern {
+            pattern, receiver, ..
+        } => {
+            drop(receiver);
+            broker.punsubscribe_pattern(&pattern);
+        }
         LiveSubscription::Table {
             spec,
             receivers,
@@ -2320,7 +2914,10 @@ fn stop_live_subscription(
             };
             rollback_live_table_receivers(broker, receivers, delta_rx, &key_tables, &spec.table);
         }
-        LiveSubscription::VectorNear { .. } => broker.kunsub("*"),
+        LiveSubscription::VectorNear { receiver, .. } => {
+            drop(receiver);
+            broker.kunsub("*");
+        }
     }
 }
 
@@ -2347,38 +2944,65 @@ fn rollback_live_table_receivers(
 fn diff_live_query(
     id: &str,
     state: &mut LiveQueryState,
+    capacity: &mut SubscriptionReservation,
     next_rows: Vec<Value>,
     cause: Option<Value>,
-) -> Vec<(String, Value)> {
-    let previous = std::mem::take(&mut state.rows);
+) -> Result<Vec<(String, Value)>, ()> {
     let next = index_live_rows(next_rows, state.pk_field.as_deref());
+    let content_bytes = live_state_content_bytes(&next).ok_or(())?;
+    if !state.try_reserve_rows(capacity, next.len(), content_bytes) {
+        return Err(());
+    }
+    let previous = std::mem::replace(&mut state.rows, next);
     let mut events = Vec::new();
 
-    for (pk, row) in &next {
+    for (pk, row) in &state.rows {
         match previous.get(pk) {
             None => events.push((
                 id.to_string(),
-                json!({"kind":"insert","scope":"query","query":state.query,"pk":pk,"row":row,"previous":null,"cause":cause}),
+                json!({"kind":"insert","scope":"query","query":state.query,"pk":pk,"row":row,"previous":null,"cause":live_transition_cause(cause.as_ref(), "insert")}),
             )),
             Some(before) if row_fingerprint(before) != row_fingerprint(row) => events.push((
                 id.to_string(),
-                json!({"kind":"update","scope":"query","query":state.query,"pk":pk,"row":row,"previous":before,"changed":changed_json_fields(before, row),"cause":cause}),
+                json!({"kind":"update","scope":"query","query":state.query,"pk":pk,"row":row,"previous":before,"changed":changed_json_fields(before, row),"cause":live_transition_cause(cause.as_ref(), "update")}),
             )),
             _ => {}
         }
     }
 
     for (pk, before) in &previous {
-        if !next.contains_key(pk) {
+        if !state.rows.contains_key(pk) {
             events.push((
                 id.to_string(),
-                json!({"kind":"delete","scope":"query","query":state.query,"pk":pk,"row":null,"previous":before,"cause":cause}),
+                json!({"kind":"delete","scope":"query","query":state.query,"pk":pk,"row":null,"previous":before,"cause":live_transition_cause(cause.as_ref(), "delete")}),
             ));
         }
     }
 
-    state.rows = next;
-    events
+    Ok(events)
+}
+
+fn live_state_capacity_error(_: ()) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::OutOfMemory,
+        "process live query state capacity exhausted",
+    )
+}
+
+fn live_query_error(error: Value) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+}
+
+fn live_transition_cause(cause: Option<&Value>, transition: &str) -> Option<Value> {
+    let mut cause = cause?.clone();
+    let is_table_cause = cause
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("table."));
+    if is_table_cause {
+        cause["kind"] = Value::String(format!("table.{transition}"));
+    }
+    Some(cause)
 }
 
 /// A single-table query with no joins/near/limit/offset/aggregate can be
@@ -2428,7 +3052,7 @@ fn fetch_live_table_row_for_pk(
     spec: &LiveTableSpec,
     pk_col: &str,
     pk: &str,
-) -> Option<Value> {
+) -> Result<Option<Value>, Value> {
     let mut s = spec.clone();
     s.where_conditions.push((
         pk_col.to_string(),
@@ -2438,103 +3062,225 @@ fn fetch_live_table_row_for_pk(
     s.order_by = None;
     s.offset = None;
     s.limit = Some(1);
-    fetch_live_table_rows(store, cache, &s)
-        .ok()?
-        .into_iter()
-        .next()
+    fetch_live_table_rows(store, cache, &s).map(|rows| rows.into_iter().next())
 }
 
 /// Incremental view maintenance: drain typed row deltas for IVM table
 /// subscriptions and emit per-row insert/update/delete by re-evaluating only the
 /// changed pk, instead of re-running the whole query.
+const LIVE_ROW_DELTA_BATCH_MAX: usize = 64;
+
+enum LiveRowDeltaBatch {
+    Resync,
+    Keys(Vec<Arc<str>>),
+}
+
 async fn drain_live_row_deltas<S>(
     ws: &mut WebSocketStream<S>,
     subscriptions: &mut HashMap<String, LiveSubscription>,
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
+    limits: RequestLimits,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut outgoing: Vec<(String, Value)> = Vec::new();
-    for (id, subscription) in subscriptions.iter_mut() {
-        let LiveSubscription::Table {
-            spec,
-            state,
-            delta_rx: Some(rx),
-            pk_col,
-            ..
-        } = subscription
-        else {
-            continue;
-        };
-        // Distinct changed pks since the last tick (one re-eval each).
-        let mut changed: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut lagged = false;
-        loop {
-            match rx.try_recv() {
-                Ok(delta) => {
-                    if seen.insert(delta.pk.clone()) {
-                        changed.push(delta.pk);
+    let ids: Vec<String> = subscriptions.keys().cloned().collect();
+    for id in ids {
+        let batch = subscriptions
+            .get_mut(&id)
+            .and_then(take_live_row_delta_batch);
+        match batch {
+            None => {}
+            Some(LiveRowDeltaBatch::Resync) => {
+                let events = match subscriptions.get_mut(&id) {
+                    Some(subscription) => {
+                        resync_live_query_subscription(subscription, &id, store, cache)?
                     }
+                    None => Vec::new(),
+                };
+                for event in events {
+                    send_live_json(
+                        ws,
+                        json!({"type":"live.event","id":id,"event":event}),
+                        limits,
+                    )
+                    .await?;
                 }
-                Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                    lagged = true;
-                    continue;
+            }
+            Some(LiveRowDeltaBatch::Keys(keys)) => {
+                for pk in keys {
+                    let event = match subscriptions.get_mut(&id) {
+                        Some(subscription) => {
+                            process_live_row_key(subscription, &pk, store, cache)?
+                        }
+                        None => None,
+                    };
+                    let Some(event) = event else {
+                        continue;
+                    };
+                    send_live_json(
+                        ws,
+                        json!({"type":"live.event","id":id,"event":event}),
+                        limits,
+                    )
+                    .await?;
                 }
-                Err(_) => break,
             }
         }
-        if lagged {
-            // Fell behind the delta stream: resync from a fresh query (safe truth).
-            let rows = fetch_live_table_rows(store, cache, spec).unwrap_or_default();
-            outgoing.extend(diff_live_query(
-                id,
-                state,
-                rows,
-                Some(json!({"kind":"resync","scope":"query"})),
-            ));
-            continue;
-        }
-        for pk in changed {
-            let now_row = fetch_live_table_row_for_pk(store, cache, spec, pk_col, &pk);
-            let prev = state.rows.get(&pk).cloned();
-            // The cause reflects the row's transition in this query's result set
-            // (which is what the client observes); table names the source table.
-            let table = spec.table.as_str();
-            match (prev, now_row) {
-                (None, Some(row)) => {
-                    state.rows.insert(pk.clone(), row.clone());
-                    outgoing.push((
-                        id.clone(),
-                        json!({"kind":"insert","scope":"query","query":state.query,"pk":pk,"row":row,"previous":null,"cause":{"kind":"table.insert","table":table,"operation":"tinsert"}}),
-                    ));
-                }
-                (Some(before), None) => {
-                    state.rows.remove(&pk);
-                    outgoing.push((
-                        id.clone(),
-                        json!({"kind":"delete","scope":"query","query":state.query,"pk":pk,"row":null,"previous":before,"cause":{"kind":"table.delete","table":table,"operation":"tdelete"}}),
-                    ));
-                }
-                (Some(before), Some(row)) => {
-                    if row_fingerprint(&before) != row_fingerprint(&row) {
-                        state.rows.insert(pk.clone(), row.clone());
-                        outgoing.push((
-                            id.clone(),
-                            json!({"kind":"update","scope":"query","query":state.query,"pk":pk,"row":row,"previous":before,"changed":changed_json_fields(&before,&row),"cause":{"kind":"table.update","table":table,"operation":"tupdate"}}),
-                        ));
-                    }
-                }
-                (None, None) => {}
-            }
-        }
-    }
-    for (id, event) in outgoing {
-        send_live_json(ws, json!({"type":"live.event","id":id,"event":event})).await?;
     }
     Ok(())
+}
+
+fn take_live_row_delta_batch(subscription: &mut LiveSubscription) -> Option<LiveRowDeltaBatch> {
+    let LiveSubscription::Table {
+        delta_rx: Some(rx), ..
+    } = subscription
+    else {
+        return None;
+    };
+
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for _ in 0..LIVE_ROW_DELTA_BATCH_MAX {
+        match rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Empty)
+            | Err(broadcast::error::TryRecvError::Closed) => break,
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                while rx.try_recv().is_ok() {}
+                return Some(LiveRowDeltaBatch::Resync);
+            }
+            Ok(delta) => {
+                let Some(pk) = delta.pk else {
+                    while rx.try_recv().is_ok() {}
+                    return Some(LiveRowDeltaBatch::Resync);
+                };
+                if seen.insert(pk.clone()) {
+                    keys.push(pk);
+                }
+            }
+        }
+    }
+
+    (!keys.is_empty()).then_some(LiveRowDeltaBatch::Keys(keys))
+}
+
+fn resync_live_query_subscription(
+    subscription: &mut LiveSubscription,
+    id: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> std::io::Result<Vec<Value>> {
+    let events = match subscription {
+        LiveSubscription::Table {
+            spec,
+            state,
+            _capacity: capacity,
+            ..
+        } => {
+            let rows = fetch_live_table_rows(store, cache, spec).map_err(live_query_error)?;
+            diff_live_query(
+                id,
+                state,
+                capacity,
+                rows,
+                Some(json!({"kind":"resync","scope":"query"})),
+            )
+            .map_err(live_state_capacity_error)?
+        }
+        LiveSubscription::VectorNear {
+            spec,
+            state,
+            _capacity: capacity,
+            ..
+        } => diff_live_query(
+            id,
+            state,
+            capacity,
+            fetch_live_vector_rows(store, spec),
+            Some(json!({"kind":"resync","scope":"query"})),
+        )
+        .map_err(live_state_capacity_error)?,
+        _ => Vec::new(),
+    };
+    Ok(events.into_iter().map(|(_, event)| event).collect())
+}
+
+fn process_live_row_key(
+    subscription: &mut LiveSubscription,
+    pk: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> std::io::Result<Option<Value>> {
+    let LiveSubscription::Table {
+        spec,
+        state,
+        pk_col,
+        _capacity: capacity,
+        ..
+    } = subscription
+    else {
+        return Ok(None);
+    };
+
+    let now_row =
+        fetch_live_table_row_for_pk(store, cache, spec, pk_col, pk).map_err(live_query_error)?;
+    let prev = state.rows.get(pk).cloned();
+    // The cause reflects the row's transition in this query's result set
+    // (which is what the client observes); table names the source table.
+    let table = spec.table.as_str();
+    match (prev, now_row) {
+        (None, Some(row)) => {
+            let entry_bytes = live_state_entry_content_bytes(pk, &row)
+                .ok_or_else(|| live_state_capacity_error(()))?;
+            let content_bytes = state
+                .content_bytes
+                .checked_add(entry_bytes)
+                .ok_or_else(|| live_state_capacity_error(()))?;
+            if !state.try_reserve_rows(capacity, state.rows.len() + 1, content_bytes) {
+                return Err(live_state_capacity_error(()));
+            }
+            state.rows.insert(pk.to_string(), row.clone());
+            Ok(Some(
+                json!({"kind":"insert","scope":"query","query":state.query,"pk":pk,"row":row,"previous":null,"cause":{"kind":"table.insert","table":table,"operation":"tinsert"}}),
+            ))
+        }
+        (Some(before), None) => {
+            let entry_bytes = live_state_entry_content_bytes(pk, &before)
+                .ok_or_else(|| live_state_capacity_error(()))?;
+            let content_bytes = state.content_bytes.saturating_sub(entry_bytes);
+            if !state.try_reserve_rows(capacity, state.rows.len().saturating_sub(1), content_bytes)
+            {
+                return Err(live_state_capacity_error(()));
+            }
+            state.rows.remove(pk);
+            Ok(Some(
+                json!({"kind":"delete","scope":"query","query":state.query,"pk":pk,"row":null,"previous":before,"cause":{"kind":"table.delete","table":table,"operation":"tdelete"}}),
+            ))
+        }
+        (Some(before), Some(row)) => {
+            if row_fingerprint(&before) == row_fingerprint(&row) {
+                return Ok(None);
+            }
+            let before_bytes = live_state_entry_content_bytes(pk, &before)
+                .ok_or_else(|| live_state_capacity_error(()))?;
+            let after_bytes = live_state_entry_content_bytes(pk, &row)
+                .ok_or_else(|| live_state_capacity_error(()))?;
+            let content_bytes = state
+                .content_bytes
+                .saturating_sub(before_bytes)
+                .checked_add(after_bytes)
+                .ok_or_else(|| live_state_capacity_error(()))?;
+            if !state.try_reserve_rows(capacity, state.rows.len(), content_bytes) {
+                return Err(live_state_capacity_error(()));
+            }
+            state.rows.insert(pk.to_string(), row.clone());
+            Ok(Some(
+                json!({"kind":"update","scope":"query","query":state.query,"pk":pk,"row":row,"previous":before,"changed":changed_json_fields(&before,&row),"cause":{"kind":"table.update","table":table,"operation":"tupdate"}}),
+            ))
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 fn parse_live_table_spec(spec: &Value) -> Result<LiveTableSpec, Value> {
@@ -2924,13 +3670,41 @@ fn fetch_live_vector_rows(store: &Arc<Store>, spec: &LiveVectorNearSpec) -> Vec<
         .collect()
 }
 
-async fn send_live_json<S>(ws: &mut WebSocketStream<S>, value: Value) -> std::io::Result<()>
+async fn send_live_json<S>(
+    ws: &mut WebSocketStream<S>,
+    value: Value,
+    limits: RequestLimits,
+) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    ws.send(WsMessage::Text(value.to_string()))
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))
+    let text = value.to_string();
+    if text.len() > limits.max_body {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "live message exceeds maximum size",
+        ));
+    }
+    send_live_message(ws, WsMessage::Text(text), limits).await
+}
+
+async fn send_live_message<S>(
+    ws: &mut WebSocketStream<S>,
+    message: WsMessage,
+    limits: RequestLimits,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(limits.server.write_timeout, ws.send(message)).await {
+        Ok(result) => {
+            result.map_err(|error| std::io::Error::new(std::io::ErrorKind::BrokenPipe, error))
+        }
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "live socket write deadline exceeded",
+        )),
+    }
 }
 
 fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -3063,6 +3837,50 @@ fn index_live_rows(rows: Vec<Value>, pk_field: Option<&str>) -> HashMap<String, 
         indexed.insert(key, row);
     }
     indexed
+}
+
+fn live_state_content_bytes(rows: &HashMap<String, Value>) -> Option<usize> {
+    rows.iter().try_fold(0usize, |total, (pk, row)| {
+        total.checked_add(live_state_entry_content_bytes(pk, row)?)
+    })
+}
+
+fn live_state_entry_content_bytes(pk: &str, row: &Value) -> Option<usize> {
+    pk.len().checked_add(json_heap_bytes(row)?)
+}
+
+fn live_state_total_bytes(row_count: usize, content_bytes: usize) -> Option<usize> {
+    // HashMap keeps spare buckets. Two buckets per live row is a conservative
+    // allowance across growth and deletion churn; string/value heap storage is
+    // counted separately below.
+    let bucket_bytes = std::mem::size_of::<(String, Value)>().checked_add(1)?;
+    row_count
+        .checked_mul(2)?
+        .checked_mul(bucket_bytes)?
+        .checked_add(content_bytes)
+}
+
+fn json_heap_bytes(value: &Value) -> Option<usize> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => Some(0),
+        Value::String(value) => Some(value.len()),
+        Value::Array(values) => values
+            .capacity()
+            .checked_mul(std::mem::size_of::<Value>())?
+            .checked_add(values.iter().try_fold(0usize, |total, value| {
+                total.checked_add(json_heap_bytes(value)?)
+            })?),
+        Value::Object(values) => {
+            values
+                .len()
+                .checked_mul(128)?
+                .checked_add(values.iter().try_fold(0usize, |total, (key, value)| {
+                    total
+                        .checked_add(key.len())
+                        .and_then(|total| total.checked_add(json_heap_bytes(value)?))
+                })?)
+        }
+    }
 }
 
 fn row_fingerprint(value: &Value) -> String {
@@ -5453,15 +6271,24 @@ fn exec_resp(
     let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
     let mut out = BytesMut::with_capacity(1024);
     let now = Instant::now();
+    let mut session = CommandSession::with_broker(false, broker.clone(), None);
     let executor = CommandExecutor::new(
         store.clone(),
         broker.clone(),
         script_engine.clone(),
         cache.clone(),
     );
-    let mut session = CommandSession::new(false);
     store.add_total_commands(1);
-    if let Some(action) = executor.execute_command(&refs, &mut session, &mut out, now) {
+    let output_limit = crate::resp::limit_output(store.config().limits.max_resp_response);
+    let action = executor.execute_command(&refs, &mut session, &mut out, now);
+    let response_exceeded = output_limit.exceeded();
+    drop(output_limit);
+    if response_exceeded {
+        return Err(LuxError::Unsupported(
+            "command response exceeds maximum".to_string(),
+        ));
+    }
+    if let Some(action) = action {
         let kind = match action {
             crate::cmd::CmdResult::BlockPop { .. } => "BLPOP/BRPOP",
             crate::cmd::CmdResult::BlockMove { .. } => "BLMOVE",
@@ -5643,6 +6470,60 @@ mod tests {
     use crate::tables::JoinType;
     use sha2::{Digest, Sha256};
 
+    #[test]
+    fn live_subscription_registry_reclaims_broker_state_on_drop() {
+        let broker = Broker::new();
+        let mut subscriptions = LiveSubscriptions::new(&broker);
+        let capacity = reserve_live_subscription_capacity(&broker, 1, "abandoned:*".len()).unwrap();
+        let receiver = broker.ksubscribe("abandoned:*");
+        subscriptions.insert(
+            "test".to_string(),
+            LiveSubscription::Key {
+                pattern: "abandoned:*".to_string(),
+                receivers: vec![receiver],
+                _capacity: capacity,
+            },
+        );
+        assert!(broker.has_key_subs());
+
+        drop(subscriptions);
+
+        assert!(!broker.has_key_subs());
+    }
+
+    #[tokio::test]
+    async fn live_subscriptions_observe_each_key_event_gap_once() {
+        let broker = Broker::with_budgets(
+            crate::limits::ByteBudget::new(1),
+            crate::limits::CountBudget::new(8),
+        );
+        let _receiver = broker.ksubscribe("*");
+        let mut subscriptions = LiveSubscriptions::new(&broker);
+
+        broker.enqueue_key_event(b"key", b"set");
+
+        assert!(subscriptions.take_key_event_gap());
+        assert!(!subscriptions.take_key_event_gap());
+    }
+
+    #[test]
+    fn live_receivers_report_a_delivery_gap_before_resuming() {
+        let broker = Broker::new();
+        let mut receiver = broker.subscribe("events");
+        for index in 0..128 {
+            broker.publish("events", bytes::Bytes::from(index.to_string()));
+        }
+
+        assert!(matches!(
+            next_receiver_input(&mut receiver),
+            Some(LiveBrokerInput::Gap)
+        ));
+        assert!(matches!(
+            next_receiver_input(&mut receiver),
+            Some(LiveBrokerInput::Message(_))
+        ));
+    }
+
     #[tokio::test]
     async fn snapshot_stream_serves_the_securely_opened_installed_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -5663,7 +6544,9 @@ mod tests {
             socket.read_to_end(&mut response).await.unwrap();
             response
         });
-        let (mut socket, _) = listener.accept().await.unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket =
+            DeadlineStream::new(socket, std::time::Duration::from_secs(30), usize::MAX);
 
         assert!(
             stream_snapshot(&mut socket, &store, &HttpResponseContext::default())
@@ -5709,12 +6592,125 @@ mod tests {
             &store,
             &cache,
             Some(&principal),
+            RequestLimits {
+                max_rows: Some(10_000),
+                max_body: 64 * 1024 * 1024,
+                server: ServerLimits::default(),
+            },
+            0,
         );
 
         assert!(result.is_err());
         assert!(broker.key_event_loop_started());
         assert!(!broker.has_key_subs());
         assert!(!broker.has_any_row_delta_subs());
+    }
+
+    #[test]
+    fn incremental_live_query_errors_do_not_become_delete_events() {
+        let store = Arc::new(Store::new());
+        let cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let broker = Broker::new();
+        let now = Instant::now();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "live_rows",
+            &["id", "INT", "PRIMARY", "KEY,", "body", "STR"],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "live_rows",
+            &[("id", "1"), ("body", "present")],
+            now,
+        )
+        .unwrap();
+
+        let (mut subscription, _) = build_live_subscription(
+            &json!({"kind":"table","table":"live_rows"}),
+            &broker,
+            &store,
+            &cache,
+            None,
+            RequestLimits {
+                max_rows: Some(10_000),
+                max_body: 64 * 1024 * 1024,
+                server: ServerLimits::default(),
+            },
+            0,
+        )
+        .unwrap();
+        let before = match &subscription {
+            LiveSubscription::Table { state, .. } => state.rows.clone(),
+            _ => unreachable!(),
+        };
+        if let LiveSubscription::Table { spec, .. } = &mut subscription {
+            spec.where_conditions
+                .push(("id".to_string(), ">>".to_string(), Value::from(1)));
+        }
+
+        let error = process_live_row_key(&mut subscription, "1", &store, &cache).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let after = match &subscription {
+            LiveSubscription::Table { state, .. } => &state.rows,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            after, &before,
+            "query errors must not mutate retained state"
+        );
+    }
+
+    #[test]
+    fn live_query_resync_repairs_retained_table_state() {
+        let store = Arc::new(Store::new());
+        let cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let broker = Broker::new();
+        let now = Instant::now();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "resync_rows",
+            &["id", "INT", "PRIMARY", "KEY,", "body", "STR"],
+            now,
+        )
+        .unwrap();
+        let (mut subscription, initial) = build_live_subscription(
+            &json!({"kind":"table","table":"resync_rows"}),
+            &broker,
+            &store,
+            &cache,
+            None,
+            RequestLimits {
+                max_rows: Some(10_000),
+                max_body: 64 * 1024 * 1024,
+                server: ServerLimits::default(),
+            },
+            0,
+        )
+        .unwrap();
+        assert!(initial[0]["rows"].as_array().unwrap().is_empty());
+
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "resync_rows",
+            &[("id", "1"), ("body", "present")],
+            now,
+        )
+        .unwrap();
+        let events =
+            resync_live_query_subscription(&mut subscription, "rows", &store, &cache).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["kind"], "insert");
+        assert_eq!(events[0]["cause"]["kind"], "resync");
+        assert_eq!(events[0]["row"]["body"], "present");
     }
 
     #[test]

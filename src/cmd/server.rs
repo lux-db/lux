@@ -506,11 +506,25 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
          \r\n\
          # Clients\r\n\
          connected_clients:{}\r\n\
+         connected_http_clients:{}\r\n\
+         max_resp_connections:{}\r\n\
+         max_http_connections:{}\r\n\
+         network_subscriptions:{}\r\n\
+         max_subscriptions:{}\r\n\
+         max_request_buffer_bytes:{}\r\n\
+         max_response_buffer_bytes:{}\r\n\
          blocked_list_waiters:{}\r\n\
          blocked_stream_waiters:{}\r\n\
          \r\n\
          # Stats\r\n\
          total_commands_processed:{}\r\n\
+         rejected_resp_connections:{}\r\n\
+         rejected_http_connections:{}\r\n\
+         rejected_auth_requests:{}\r\n\
+         rejected_request_buffers:{}\r\n\
+         rejected_response_buffers:{}\r\n\
+         connection_timeouts:{}\r\n\
+         dropped_event_messages:{}\r\n\
          key_events_enqueued:{}\r\n\
          key_events_dropped:{}\r\n\
          key_events_emitted:{}\r\n\
@@ -518,6 +532,7 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
          \r\n\
          # Memory\r\n\
          used_memory_bytes:{}\r\n\
+         max_script_memory_bytes:{}\r\n\
          \r\n\
          # Storage\r\n\
          storage_layout:{}\r\n\
@@ -552,14 +567,29 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
         store.shard_count(),
         store.uptime_seconds(),
         store.connected_clients(),
+        store.connected_http_clients(),
+        store.config().limits.max_resp_connections,
+        store.config().limits.max_http_connections,
+        broker.network_subscription_count(),
+        store.config().limits.max_subscriptions,
+        store.config().limits.max_request_buffer_bytes,
+        store.config().limits.max_response_buffer_bytes,
         broker.list_waiter_count(),
         broker.stream_waiter_count(),
         store.total_commands(),
+        store.rejected_resp_connections(),
+        store.rejected_http_connections(),
+        store.rejected_auth_requests(),
+        store.rejected_request_buffers(),
+        store.rejected_response_buffers(),
+        store.connection_timeouts(),
+        broker.dropped_event_messages(),
         key_event_stats.enqueued,
         key_event_stats.dropped,
         key_event_stats.emitted,
         key_event_stats.coalesced,
         store.approximate_memory(),
+        store.config().limits.max_script_memory,
         store.config().storage.mode.as_str(),
         if store.config().storage.mode == crate::disk::StorageMode::Tiered {
             "tiered"

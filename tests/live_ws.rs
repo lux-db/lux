@@ -1211,7 +1211,7 @@ async fn live_table_where_predicate_transitions_emit_incremental_deltas() {
     let e = recv_live_event(&mut ws, "open").await;
     assert_eq!(e["kind"], "delete", "move-out should read as delete: {e}");
     assert_eq!(e["pk"], "t1");
-    assert_eq!(e["cause"]["kind"], "table.delete");
+    assert_eq!(e["cause"]["kind"], "table.delete", "move-out cause: {e}");
 
     // An UPDATE to a row that is out of the set on both sides -> no event.
     let (status, _) = http_json_request(

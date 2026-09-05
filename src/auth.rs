@@ -54,6 +54,7 @@ const OAUTH_CALLBACK_BODY_LIMIT: usize = 64 * 1024;
 const POSTMARK_EMAIL_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCESS_REVOKED_AFTER_PREFIX: &[u8] = b"_auth:access_revoked_after:";
 static FLOW_TOKEN_CONSUME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static NONEXISTENT_ACCOUNT_HASH: OnceLock<Result<String, String>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ApiKeyKind {
@@ -772,6 +773,9 @@ pub(crate) fn bootstrap_runtime(
     cache: &SharedSchemaCache,
     config: &AuthConfig,
 ) -> Result<AuthRuntimeBootstrap, String> {
+    // Pay this cost before the listener opens so an unknown email follows the
+    // same password-verification path as an existing account from request one.
+    nonexistent_account_hash()?;
     let now = Instant::now();
     let migration = secrets::migrate_storage(store, cache, now)?;
     ensure_signing_key(store, cache, now)?;
@@ -1225,33 +1229,27 @@ fn password_grant(
         Err(response) => return response,
     };
     let now = Instant::now();
-    let Some(user) = find_row_by_field(store, cache, USERS_TABLE, "email", &email, now)
-        .ok()
-        .flatten()
-    else {
+    let user = match find_row_by_field(store, cache, USERS_TABLE, "email", &email, now) {
+        Ok(user) => user,
+        Err(reason) => return error(500, "Internal Server Error", &reason),
+    };
+    let password_hash = match user.as_ref().and_then(|row| row.get("encrypted_password")) {
+        Some(hash) => hash.as_str(),
+        None => match nonexistent_account_hash() {
+            Ok(hash) => hash,
+            Err(reason) => return error(500, "Internal Server Error", &reason),
+        },
+    };
+    let verification = match verify_password_state(password, password_hash) {
+        Ok(verification) => verification,
+        Err(reason) => return error(500, "Internal Server Error", &reason),
+    };
+    let Some(user) = user else {
         return error(400, "Bad Request", "invalid login credentials");
     };
-    let Some(password_hash) = user.get("encrypted_password") else {
-        return error(400, "Bad Request", "invalid login credentials");
-    };
-    if let Err(response) = validate_user_active(&user, unix_seconds()) {
-        return response;
-    }
-    let settings = match auth_settings(store, cache, now) {
-        Ok(settings) => settings,
-        Err(e) => return error(400, "Bad Request", &e),
-    };
-    if settings.email_confirmation_required
-        && user
-            .get("email_confirmed_at")
-            .map(|value| value.trim().is_empty() || value == "0")
-            .unwrap_or(true)
-    {
-        return error(401, "Unauthorized", "email not confirmed");
-    }
-    match verify_password_state(password, password_hash) {
-        Ok(PasswordVerification::Valid) => {}
-        Ok(PasswordVerification::ValidNeedsRehash) => {
+    match verification {
+        PasswordVerification::Valid => {}
+        PasswordVerification::ValidNeedsRehash => {
             if let Some(user_id) = user.get("id") {
                 match hash_password(password) {
                     Ok(hash) => {
@@ -1272,10 +1270,24 @@ fn password_grant(
                 }
             }
         }
-        Ok(PasswordVerification::Invalid) => {
+        PasswordVerification::Invalid => {
             return error(400, "Bad Request", "invalid login credentials")
         }
-        Err(e) => return error(500, "Internal Server Error", &e),
+    }
+    if let Err(response) = validate_user_active(&user, unix_seconds()) {
+        return response;
+    }
+    let settings = match auth_settings(store, cache, now) {
+        Ok(settings) => settings,
+        Err(e) => return error(400, "Bad Request", &e),
+    };
+    if settings.email_confirmation_required
+        && user
+            .get("email_confirmed_at")
+            .map(|value| value.trim().is_empty() || value == "0")
+            .unwrap_or(true)
+    {
+        return error(401, "Unauthorized", "email not confirmed");
     }
     let Some(user_id) = user.get("id") else {
         return error(500, "Internal Server Error", "auth user row is missing id");
@@ -5934,6 +5946,15 @@ fn hash_password(password: &str) -> Result<String, String> {
             .map(|hash| hash.to_string())
             .map_err(|e| e.to_string())
     })
+}
+
+fn nonexistent_account_hash() -> Result<&'static str, String> {
+    match NONEXISTENT_ACCOUNT_HASH
+        .get_or_init(|| hash_password("lux-nonexistent-account-password-verification"))
+    {
+        Ok(hash) => Ok(hash.as_str()),
+        Err(error) => Err(error.clone()),
+    }
 }
 
 #[cfg(test)]

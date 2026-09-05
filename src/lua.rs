@@ -1,6 +1,6 @@
 use bytes::BytesMut;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -205,7 +205,15 @@ fn resp_element_to_lua(lua: &mlua::Lua, data: &[u8]) -> mlua::Result<(mlua::Valu
     }
 }
 
-fn lua_to_resp(val: &mlua::Value, out: &mut BytesMut) {
+const MAX_LUA_VALUE_DEPTH: usize = 128;
+const MAX_LUA_CONTAINER_ITEMS: usize = 1_000_000;
+
+fn lua_to_resp(
+    val: &mlua::Value,
+    out: &mut BytesMut,
+    depth: usize,
+    ancestry: &mut HashSet<usize>,
+) -> Result<(), String> {
     match val {
         mlua::Value::Nil => {
             crate::resp::write_null(out);
@@ -227,36 +235,52 @@ fn lua_to_resp(val: &mlua::Value, out: &mut BytesMut) {
             crate::resp::write_bulk_raw(out, &b);
         }
         mlua::Value::Table(tbl) => {
-            if let Ok(mlua::Value::String(s)) = tbl.get::<mlua::Value>("ok") {
-                let sv: String = s
-                    .to_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|_| "OK".to_string());
-                crate::resp::write_simple(out, &sv);
-                return;
+            if depth >= MAX_LUA_VALUE_DEPTH {
+                return Err("lua result exceeds maximum nesting depth".to_string());
             }
-            if let Ok(mlua::Value::String(s)) = tbl.get::<mlua::Value>("err") {
-                let sv: String = s
-                    .to_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|_| "ERR".to_string());
-                crate::resp::write_error(out, &sv);
-                return;
+            let pointer = tbl.to_pointer() as usize;
+            if !ancestry.insert(pointer) {
+                return Err("lua result contains a cyclic table".to_string());
             }
-            let len = tbl.len().unwrap_or(0) as usize;
-            crate::resp::write_array_header(out, len);
-            for i in 1..=len {
-                if let Ok(v) = tbl.get::<mlua::Value>(i) {
-                    lua_to_resp(&v, out);
-                } else {
-                    crate::resp::write_null(out);
+            let result: Result<(), String> = (|| {
+                if let Ok(mlua::Value::String(s)) = tbl.get::<mlua::Value>("ok") {
+                    let sv: String = s
+                        .to_str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|_| "OK".to_string());
+                    crate::resp::write_simple(out, &sv);
+                    return Ok(());
                 }
-            }
+                if let Ok(mlua::Value::String(s)) = tbl.get::<mlua::Value>("err") {
+                    let sv: String = s
+                        .to_str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|_| "ERR".to_string());
+                    crate::resp::write_error(out, &sv);
+                    return Ok(());
+                }
+                let len = tbl.len().unwrap_or(0) as usize;
+                if len > MAX_LUA_CONTAINER_ITEMS {
+                    return Err("lua result exceeds maximum item count".to_string());
+                }
+                crate::resp::write_array_header(out, len);
+                for i in 1..=len {
+                    if let Ok(v) = tbl.get::<mlua::Value>(i) {
+                        lua_to_resp(&v, out, depth + 1, ancestry)?;
+                    } else {
+                        crate::resp::write_null(out);
+                    }
+                }
+                Ok(())
+            })();
+            ancestry.remove(&pointer);
+            result?;
         }
         _ => {
             crate::resp::write_null(out);
         }
     }
+    Ok(())
 }
 
 pub fn eval(
@@ -268,6 +292,13 @@ pub fn eval(
     now: Instant,
 ) -> Result<BytesMut, String> {
     let lua = mlua::Lua::new();
+    let script_memory_limit = store.config().limits.max_script_memory;
+    let absolute_memory_limit = lua
+        .used_memory()
+        .checked_add(script_memory_limit)
+        .ok_or_else(|| "ERR script memory limit overflow".to_string())?;
+    lua.set_memory_limit(absolute_memory_limit)
+        .map_err(|error| format!("ERR cannot enforce script memory limit: {error}"))?;
     let budget = Arc::new(LuaExecutionBudget::new());
     install_lua_sandbox(&lua)?;
 
@@ -342,13 +373,16 @@ pub fn eval(
         .create_table()
         .map_err(|e| format!("ERR lua error: {}", e))?;
     let pack_fn = lua
-        .create_function(|_lua, args: mlua::MultiValue| {
+        .create_function(move |_lua, args: mlua::MultiValue| {
             let mut buf = Vec::new();
+            let mut ancestry = HashSet::new();
             if args.len() == 1 {
-                msgpack_pack_value(&args[0], &mut buf).map_err(mlua::Error::external)?;
+                msgpack_pack_value(&args[0], &mut buf, 0, &mut ancestry, script_memory_limit)
+                    .map_err(mlua::Error::external)?;
             } else {
                 for val in &args {
-                    msgpack_pack_value(val, &mut buf).map_err(mlua::Error::external)?;
+                    msgpack_pack_value(val, &mut buf, 0, &mut ancestry, script_memory_limit)
+                        .map_err(mlua::Error::external)?;
                 }
             }
             Ok(mlua::Value::String(_lua.create_string(&buf)?))
@@ -375,8 +409,9 @@ pub fn eval(
         .create_table()
         .map_err(|e| format!("ERR lua error: {}", e))?;
     let cjson_encode = lua
-        .create_function(|lua_ctx, val: mlua::Value| {
-            let json = lua_value_to_json(&val);
+        .create_function(move |lua_ctx, val: mlua::Value| {
+            let json = lua_value_to_json(&val, 0, &mut HashSet::new(), script_memory_limit)
+                .map_err(mlua::Error::external)?;
             lua_ctx
                 .create_string(json.as_bytes())
                 .map(mlua::Value::String)
@@ -386,7 +421,7 @@ pub fn eval(
         .create_function(|lua_ctx, s: mlua::String| {
             let bytes = s.as_bytes().to_vec();
             let json_str = std::str::from_utf8(&bytes).unwrap_or("null");
-            json_to_lua_value(lua_ctx, json_str).map_err(mlua::Error::external)
+            json_to_lua_value(lua_ctx, json_str, 0).map_err(mlua::Error::external)
         })
         .map_err(|e| format!("ERR lua error: {}", e))?;
     cjson
@@ -426,7 +461,8 @@ pub fn eval(
     let result: mlua::Value = lua.load(script).eval().map_err(|e| format!("ERR {}", e))?;
 
     let mut out = BytesMut::new();
-    lua_to_resp(&result, &mut out);
+    lua_to_resp(&result, &mut out, 0, &mut HashSet::new())
+        .map_err(|error| format!("ERR {error}"))?;
     Ok(out)
 }
 
@@ -549,7 +585,13 @@ fn install_lua_sandbox(lua: &mlua::Lua) -> Result<(), String> {
     Ok(())
 }
 
-fn msgpack_pack_value(val: &mlua::Value, buf: &mut Vec<u8>) -> Result<(), String> {
+fn msgpack_pack_value(
+    val: &mlua::Value,
+    buf: &mut Vec<u8>,
+    depth: usize,
+    ancestry: &mut HashSet<usize>,
+    max_bytes: usize,
+) -> Result<(), String> {
     use rmp::encode;
     match val {
         mlua::Value::Nil => {
@@ -566,37 +608,66 @@ fn msgpack_pack_value(val: &mlua::Value, buf: &mut Vec<u8>) -> Result<(), String
         }
         mlua::Value::String(s) => {
             let b = s.as_bytes().to_vec();
+            if buf
+                .len()
+                .checked_add(b.len())
+                .and_then(|bytes| bytes.checked_add(5))
+                .is_none_or(|bytes| bytes > max_bytes)
+            {
+                return Err("msgpack output exceeds script memory limit".to_string());
+            }
             encode::write_str(buf, std::str::from_utf8(&b).unwrap_or(""))
                 .map_err(|e| e.to_string())?;
         }
         mlua::Value::Table(tbl) => {
-            let len = tbl.len().unwrap_or(0) as usize;
-            if len > 0 {
-                encode::write_array_len(buf, len as u32).map_err(|e| e.to_string())?;
-                for i in 1..=len {
-                    if let Ok(v) = tbl.get::<mlua::Value>(i) {
-                        msgpack_pack_value(&v, buf)?;
-                    } else {
-                        encode::write_nil(buf).map_err(|e| e.to_string())?;
+            if depth >= MAX_LUA_VALUE_DEPTH {
+                return Err("lua value exceeds maximum nesting depth".to_string());
+            }
+            let pointer = tbl.to_pointer() as usize;
+            if !ancestry.insert(pointer) {
+                return Err("lua value contains a cyclic table".to_string());
+            }
+            let result: Result<(), String> = (|| {
+                let len = tbl.len().unwrap_or(0) as usize;
+                if len > 0 {
+                    if len > MAX_LUA_CONTAINER_ITEMS {
+                        return Err("lua value exceeds maximum item count".to_string());
+                    }
+                    encode::write_array_len(buf, len as u32).map_err(|e| e.to_string())?;
+                    for i in 1..=len {
+                        if let Ok(v) = tbl.get::<mlua::Value>(i) {
+                            msgpack_pack_value(&v, buf, depth + 1, ancestry, max_bytes)?;
+                        } else {
+                            encode::write_nil(buf).map_err(|e| e.to_string())?;
+                        }
+                    }
+                } else {
+                    let mut pairs: Vec<(mlua::Value, mlua::Value)> = Vec::new();
+                    let tbl_clone = tbl.clone();
+                    let iter = tbl_clone.pairs::<mlua::Value, mlua::Value>();
+                    for (k, v) in iter.flatten() {
+                        if pairs.len() >= MAX_MSGPACK_CONTAINER_ITEMS {
+                            return Err("msgpack container exceeds maximum item count".to_string());
+                        }
+                        pairs.push((k, v));
+                    }
+                    encode::write_map_len(buf, pairs.len() as u32).map_err(|e| e.to_string())?;
+                    for (k, v) in &pairs {
+                        msgpack_pack_value(k, buf, depth + 1, ancestry, max_bytes)?;
+                        msgpack_pack_value(v, buf, depth + 1, ancestry, max_bytes)?;
                     }
                 }
-            } else {
-                let mut pairs: Vec<(mlua::Value, mlua::Value)> = Vec::new();
-                let tbl_clone = tbl.clone();
-                let iter = tbl_clone.pairs::<mlua::Value, mlua::Value>();
-                for (k, v) in iter.flatten() {
-                    pairs.push((k, v));
-                }
-                encode::write_map_len(buf, pairs.len() as u32).map_err(|e| e.to_string())?;
-                for (k, v) in &pairs {
-                    msgpack_pack_value(k, buf)?;
-                    msgpack_pack_value(v, buf)?;
-                }
-            }
+                Ok(())
+            })();
+            ancestry.remove(&pointer);
+            result?;
         }
         _ => {
             encode::write_nil(buf).map_err(|e| e.to_string())?;
         }
+    }
+    if buf.len() > max_bytes {
+        return Err("msgpack output exceeds script memory limit".to_string());
     }
     Ok(())
 }
@@ -823,82 +894,133 @@ pub(crate) fn msgpack_unpack_value(
     }
 }
 
-fn lua_value_to_json(val: &mlua::Value) -> String {
+fn lua_value_to_json(
+    val: &mlua::Value,
+    depth: usize,
+    ancestry: &mut HashSet<usize>,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let mut output = String::new();
+    push_lua_json_value(val, &mut output, depth, ancestry, max_bytes)?;
+    Ok(output)
+}
+
+fn push_lua_json(output: &mut String, value: &str, max_bytes: usize) -> Result<(), String> {
+    if output
+        .len()
+        .checked_add(value.len())
+        .is_none_or(|bytes| bytes > max_bytes)
+    {
+        return Err("json output exceeds script memory limit".to_string());
+    }
+    output.push_str(value);
+    Ok(())
+}
+
+fn push_lua_json_string(output: &mut String, value: &[u8], max_bytes: usize) -> Result<(), String> {
+    push_lua_json(output, "\"", max_bytes)?;
+    for character in String::from_utf8_lossy(value).chars() {
+        match character {
+            '"' => push_lua_json(output, "\\\"", max_bytes)?,
+            '\\' => push_lua_json(output, "\\\\", max_bytes)?,
+            '\n' => push_lua_json(output, "\\n", max_bytes)?,
+            '\r' => push_lua_json(output, "\\r", max_bytes)?,
+            '\t' => push_lua_json(output, "\\t", max_bytes)?,
+            character if (character as u32) < 0x20 => {
+                push_lua_json(output, &format!("\\u{:04x}", character as u32), max_bytes)?;
+            }
+            character => {
+                let mut encoded = [0; 4];
+                push_lua_json(output, character.encode_utf8(&mut encoded), max_bytes)?;
+            }
+        }
+    }
+    push_lua_json(output, "\"", max_bytes)
+}
+
+fn push_lua_json_value(
+    val: &mlua::Value,
+    output: &mut String,
+    depth: usize,
+    ancestry: &mut HashSet<usize>,
+    max_bytes: usize,
+) -> Result<(), String> {
     match val {
-        mlua::Value::Nil => "null".to_string(),
-        mlua::Value::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
-        mlua::Value::Integer(n) => n.to_string(),
+        mlua::Value::Nil => push_lua_json(output, "null", max_bytes),
+        mlua::Value::Boolean(b) => {
+            push_lua_json(output, if *b { "true" } else { "false" }, max_bytes)
+        }
+        mlua::Value::Integer(n) => push_lua_json(output, &n.to_string(), max_bytes),
         mlua::Value::Number(n) => {
-            if n.fract() == 0.0 && n.abs() < 1e15 {
+            let number = if n.fract() == 0.0 && n.abs() < 1e15 {
                 format!("{}", *n as i64)
             } else {
                 format!("{}", n)
-            }
+            };
+            push_lua_json(output, &number, max_bytes)
         }
-        mlua::Value::String(s) => {
-            let bytes = s.as_bytes().to_vec();
-            let st = String::from_utf8_lossy(&bytes);
-            let escaped: String = st
-                .chars()
-                .map(|c| match c {
-                    '"' => "\\\"".to_string(),
-                    '\\' => "\\\\".to_string(),
-                    '\n' => "\\n".to_string(),
-                    '\r' => "\\r".to_string(),
-                    '\t' => "\\t".to_string(),
-                    c if (c as u32) < 0x20 => format!("\\u{:04x}", c as u32),
-                    c => c.to_string(),
-                })
-                .collect();
-            format!("\"{}\"", escaped)
-        }
+        mlua::Value::String(value) => push_lua_json_string(output, &value.as_bytes(), max_bytes),
         mlua::Value::Table(tbl) => {
-            let len = tbl.len().unwrap_or(0) as usize;
-            if len > 0 {
-                let items: Vec<String> = (1..=len)
-                    .map(|i| {
-                        if let Ok(v) = tbl.get::<mlua::Value>(i) {
-                            lua_value_to_json(&v)
-                        } else {
-                            "null".to_string()
-                        }
-                    })
-                    .collect();
-                format!("[{}]", items.join(","))
-            } else {
-                let tbl_clone = tbl.clone();
-                let mut pairs: Vec<String> = Vec::new();
-                for (k, v) in tbl_clone.pairs::<mlua::Value, mlua::Value>().flatten() {
-                    let key_str = match &k {
-                        mlua::Value::String(s) => {
-                            let bytes = s.as_bytes().to_vec();
-                            String::from_utf8_lossy(&bytes).to_string()
-                        }
-                        mlua::Value::Integer(n) => n.to_string(),
-                        _ => continue,
-                    };
-                    let escaped_key: String = key_str
-                        .chars()
-                        .map(|c| match c {
-                            '"' => "\\\"".to_string(),
-                            '\\' => "\\\\".to_string(),
-                            c => c.to_string(),
-                        })
-                        .collect();
-                    pairs.push(format!("\"{}\":{}", escaped_key, lua_value_to_json(&v)));
-                }
-                if pairs.is_empty() {
-                    "{}".to_string()
-                } else {
-                    format!("{{{}}}", pairs.join(","))
-                }
+            if depth >= MAX_LUA_VALUE_DEPTH {
+                return Err("lua value exceeds maximum nesting depth".to_string());
             }
+            let pointer = tbl.to_pointer() as usize;
+            if !ancestry.insert(pointer) {
+                return Err("lua value contains a cyclic table".to_string());
+            }
+            let result: Result<(), String> = (|| {
+                let len = tbl.len().unwrap_or(0) as usize;
+                if len > MAX_LUA_CONTAINER_ITEMS {
+                    return Err("lua value exceeds maximum item count".to_string());
+                }
+                if len > 0 {
+                    push_lua_json(output, "[", max_bytes)?;
+                    for index in 1..=len {
+                        if index > 1 {
+                            push_lua_json(output, ",", max_bytes)?;
+                        }
+                        if let Ok(value) = tbl.get::<mlua::Value>(index) {
+                            push_lua_json_value(&value, output, depth + 1, ancestry, max_bytes)?;
+                        } else {
+                            push_lua_json(output, "null", max_bytes)?;
+                        }
+                    }
+                    push_lua_json(output, "]", max_bytes)
+                } else {
+                    let tbl_clone = tbl.clone();
+                    push_lua_json(output, "{", max_bytes)?;
+                    let mut pair_count = 0usize;
+                    for (k, v) in tbl_clone.pairs::<mlua::Value, mlua::Value>().flatten() {
+                        let key = match &k {
+                            mlua::Value::String(value) => value.as_bytes().to_vec(),
+                            mlua::Value::Integer(value) => value.to_string().into_bytes(),
+                            _ => continue,
+                        };
+                        if pair_count >= MAX_LUA_CONTAINER_ITEMS {
+                            return Err("lua value exceeds maximum item count".to_string());
+                        }
+                        if pair_count > 0 {
+                            push_lua_json(output, ",", max_bytes)?;
+                        }
+                        push_lua_json_string(output, &key, max_bytes)?;
+                        push_lua_json(output, ":", max_bytes)?;
+                        push_lua_json_value(&v, output, depth + 1, ancestry, max_bytes)?;
+                        pair_count += 1;
+                    }
+                    push_lua_json(output, "}", max_bytes)
+                }
+            })();
+            ancestry.remove(&pointer);
+            result
         }
-        _ => "null".to_string(),
+        _ => push_lua_json(output, "null", max_bytes),
     }
 }
 
-fn json_to_lua_value(lua: &mlua::Lua, s: &str) -> Result<mlua::Value, String> {
+fn json_to_lua_value(lua: &mlua::Lua, s: &str, depth: usize) -> Result<mlua::Value, String> {
+    if depth >= MAX_LUA_VALUE_DEPTH {
+        return Err("json input exceeds maximum nesting depth".to_string());
+    }
     let s = s.trim();
     if s.is_empty() || s == "null" {
         return Ok(mlua::Value::Nil);
@@ -924,8 +1046,11 @@ fn json_to_lua_value(lua: &mlua::Lua, s: &str) -> Result<mlua::Value, String> {
             return Ok(mlua::Value::Table(tbl));
         }
         let items = json_split_top_level(inner);
+        if items.len() > MAX_LUA_CONTAINER_ITEMS {
+            return Err("json array exceeds maximum item count".to_string());
+        }
         for (i, item) in items.iter().enumerate() {
-            let v = json_to_lua_value(lua, item)?;
+            let v = json_to_lua_value(lua, item, depth + 1)?;
             tbl.set(i + 1, v).map_err(|e| e.to_string())?;
         }
         return Ok(mlua::Value::Table(tbl));
@@ -937,12 +1062,15 @@ fn json_to_lua_value(lua: &mlua::Lua, s: &str) -> Result<mlua::Value, String> {
             return Ok(mlua::Value::Table(tbl));
         }
         let pairs = json_split_top_level(inner);
+        if pairs.len() > MAX_LUA_CONTAINER_ITEMS {
+            return Err("json object exceeds maximum item count".to_string());
+        }
         for pair in &pairs {
             if let Some(colon_pos) = json_find_colon(pair) {
                 let key = pair[..colon_pos].trim();
                 let val = pair[colon_pos + 1..].trim();
-                let key_val = json_to_lua_value(lua, key)?;
-                let val_val = json_to_lua_value(lua, val)?;
+                let key_val = json_to_lua_value(lua, key, depth + 1)?;
+                let val_val = json_to_lua_value(lua, val, depth + 1)?;
                 tbl.set(key_val, val_val).map_err(|e| e.to_string())?;
             }
         }
@@ -990,7 +1118,7 @@ fn json_unescape(s: &str) -> String {
     result
 }
 
-fn json_split_top_level(s: &str) -> Vec<String> {
+fn json_split_top_level(s: &str) -> Vec<&str> {
     let mut items = Vec::new();
     let mut depth = 0i32;
     let mut in_string = false;
@@ -1016,14 +1144,14 @@ fn json_split_top_level(s: &str) -> Vec<String> {
             '{' | '[' => depth += 1,
             '}' | ']' => depth -= 1,
             ',' if depth == 0 => {
-                items.push(s[start..i].to_string());
+                items.push(&s[start..i]);
                 start = i + 1;
             }
             _ => {}
         }
     }
     if start < s.len() {
-        items.push(s[start..].to_string());
+        items.push(&s[start..]);
     }
     items
 }

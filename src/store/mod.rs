@@ -524,6 +524,13 @@ pub(crate) struct StoreMetrics {
     used_memory: AtomicUsize,
     lru_clock: AtomicU32,
     connected_clients: AtomicUsize,
+    connected_http_clients: AtomicUsize,
+    rejected_resp_connections: AtomicUsize,
+    rejected_http_connections: AtomicUsize,
+    rejected_auth_requests: AtomicUsize,
+    rejected_request_buffers: AtomicUsize,
+    rejected_response_buffers: AtomicUsize,
+    connection_timeouts: AtomicUsize,
     total_commands: AtomicUsize,
     key_count: AtomicUsize,
     persistence_err_wal_append: AtomicUsize,
@@ -538,6 +545,13 @@ impl StoreMetrics {
             used_memory: AtomicUsize::new(0),
             lru_clock: AtomicU32::new(0),
             connected_clients: AtomicUsize::new(0),
+            connected_http_clients: AtomicUsize::new(0),
+            rejected_resp_connections: AtomicUsize::new(0),
+            rejected_http_connections: AtomicUsize::new(0),
+            rejected_auth_requests: AtomicUsize::new(0),
+            rejected_request_buffers: AtomicUsize::new(0),
+            rejected_response_buffers: AtomicUsize::new(0),
+            connection_timeouts: AtomicUsize::new(0),
             total_commands: AtomicUsize::new(0),
             key_count: AtomicUsize::new(0),
             persistence_err_wal_append: AtomicUsize::new(0),
@@ -2256,6 +2270,90 @@ impl Store {
             .fetch_sub(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn connected_http_clients(&self) -> usize {
+        self.metrics.connected_http_clients.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn http_client_connected(&self) {
+        self.metrics
+            .connected_http_clients
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn http_client_disconnected(&self) {
+        self.metrics
+            .connected_http_clients
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reject_resp_connection(&self) {
+        self.metrics
+            .rejected_resp_connections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rejected_resp_connections(&self) -> usize {
+        self.metrics
+            .rejected_resp_connections
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reject_http_connection(&self) {
+        self.metrics
+            .rejected_http_connections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rejected_http_connections(&self) -> usize {
+        self.metrics
+            .rejected_http_connections
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reject_auth_request(&self) {
+        self.metrics
+            .rejected_auth_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rejected_auth_requests(&self) -> usize {
+        self.metrics.rejected_auth_requests.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reject_request_buffer(&self) {
+        self.metrics
+            .rejected_request_buffers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rejected_request_buffers(&self) -> usize {
+        self.metrics
+            .rejected_request_buffers
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reject_response_buffer(&self) {
+        self.metrics
+            .rejected_response_buffers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rejected_response_buffers(&self) -> usize {
+        self.metrics
+            .rejected_response_buffers
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_connection_timeout(&self) {
+        self.metrics
+            .connection_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn connection_timeouts(&self) -> usize {
+        self.metrics.connection_timeouts.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn total_commands(&self) -> usize {
         self.metrics.total_commands.load(Ordering::Relaxed)
     }
@@ -2478,10 +2576,7 @@ impl Store {
         let Some(broker) = self.row_delta_broker.get() else {
             return;
         };
-        broker.publish_row_delta(crate::pubsub::RowDelta {
-            table: table.to_string(),
-            pk: pk.to_string(),
-        });
+        broker.publish_row_delta(table, pk);
     }
 
     /// Decode and apply an `LXRESTORE` blob (COPY's resolved journal effect). Only
@@ -5077,6 +5172,24 @@ impl Store {
         }
     }
 
+    pub(crate) fn smembers_limited(
+        &self,
+        key: &[u8],
+        limit: usize,
+        now: Instant,
+    ) -> Result<Vec<String>, String> {
+        self.try_promote(key, now)?;
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Set(set) => Ok(set.iter().take(limit).cloned().collect()),
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Ok(Vec::new()),
+        }
+    }
+
     /// Resolve the members `SPOP` would remove without changing the set.
     ///
     /// The caller must hold the key's journal gate until the returned members
@@ -7278,61 +7391,18 @@ pub struct DumpEntry {
 }
 
 struct GlobMatcher {
-    pattern: Vec<char>,
+    pattern: crate::glob::GlobPattern,
 }
 
 impl GlobMatcher {
     fn new(pattern: &str) -> Self {
         Self {
-            pattern: pattern.chars().collect(),
+            pattern: crate::glob::GlobPattern::new(pattern),
         }
     }
 
     fn matches(&self, s: &str) -> bool {
-        if self.pattern.len() == 1 && self.pattern[0] == '*' {
-            return true;
-        }
-        if self.pattern.len() > 10_000
-            && self.pattern.iter().filter(|&&ch| ch == '*').count() > 1_000
-        {
-            return false;
-        }
-        let s: Vec<char> = s.chars().collect();
-        Self::do_match(&self.pattern, &s)
-    }
-
-    /// Iterative glob matching (linear time). Avoids the exponential
-    /// backtracking of the naive recursive approach where patterns like
-    /// `a*a*a*a*b` against long strings would cause CPU exhaustion.
-    fn do_match(pattern: &[char], s: &[char]) -> bool {
-        let mut pi = 0;
-        let mut si = 0;
-        let mut star_pi = usize::MAX; // pattern index of last '*'
-        let mut star_si = 0; // string index when last '*' was hit
-
-        while si < s.len() {
-            if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == s[si]) {
-                pi += 1;
-                si += 1;
-            } else if pi < pattern.len() && pattern[pi] == '*' {
-                star_pi = pi;
-                star_si = si;
-                pi += 1; // try matching '*' with empty string first
-            } else if star_pi != usize::MAX {
-                // Mismatch: backtrack to last '*' and consume one more char.
-                pi = star_pi + 1;
-                star_si += 1;
-                si = star_si;
-            } else {
-                return false;
-            }
-        }
-
-        // Consume trailing '*'s in pattern.
-        while pi < pattern.len() && pattern[pi] == '*' {
-            pi += 1;
-        }
-        pi == pattern.len()
+        self.pattern.matches(s)
     }
 }
 #[cfg(test)]
@@ -8698,14 +8768,14 @@ mod tests {
     }
 
     #[test]
-    fn keys_matches_very_long_nested_pattern() {
+    fn keys_matches_very_long_nested_pattern_without_recursion() {
         let store = Store::new();
         let n = now();
         let key = "a".repeat(50_000);
         let pattern = "*?".repeat(50_000);
 
         store.set(key.as_bytes(), b"1", None, n);
-        assert!(store.keys(pattern.as_bytes(), n).is_empty());
+        assert_eq!(store.keys(pattern.as_bytes(), n), vec![key]);
     }
 
     #[test]
