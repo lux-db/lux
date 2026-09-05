@@ -143,6 +143,73 @@ fn eval_return_table() {
 }
 
 #[test]
+fn cyclic_and_deep_lua_values_are_rejected_without_stopping_the_server() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+
+    for script in [
+        "local t = {}; t[1] = t; return t",
+        "local root = {}; local t = root; for _ = 1, 256 do local child = {}; t[1] = child; t = child end; return root",
+    ] {
+        let response = send_and_read(&mut conn, &["EVAL", script, "0"]);
+        assert!(
+            response.contains("ERR")
+                && (response.contains("cyclic") || response.contains("nesting depth")),
+            "unsafe Lua result was not rejected: {response}"
+        );
+        assert!(
+            send_and_read(&mut conn, &["PING"]).contains("PONG"),
+            "server stopped responding after rejecting a Lua result"
+        );
+    }
+
+    for encoder in ["cjson.encode", "cmsgpack.pack"] {
+        let script = format!(
+            "local t = {{}}; t[1] = t; local ok = pcall(function() return {encoder}(t) end); return ok and 'accepted' or 'rejected'"
+        );
+        let response = send_and_read(&mut conn, &["EVAL", &script, "0"]);
+        assert!(
+            response.contains("rejected"),
+            "{encoder} accepted a cyclic table: {response}"
+        );
+        assert!(send_and_read(&mut conn, &["PING"]).contains("PONG"));
+    }
+
+    let nested_json = format!("{}0{}", "[".repeat(256), "]".repeat(256));
+    let response = send_and_read(
+        &mut conn,
+        &[
+            "EVAL",
+            "local ok = pcall(function() return cjson.decode(ARGV[1]) end); return ok and 'accepted' or 'rejected'",
+            "0",
+            &nested_json,
+        ],
+    );
+    assert!(
+        response.contains("rejected"),
+        "cjson accepted excessive nesting: {response}"
+    );
+    assert!(send_and_read(&mut conn, &["PING"]).contains("PONG"));
+}
+
+#[test]
+fn lua_heap_limit_rejects_large_allocations_without_stopping_the_server() {
+    let server = LuxServer::builder()
+        .env("LUX_MAX_SCRIPT_MEMORY_SIZE", "1048576")
+        .start();
+    let mut conn = server.conn();
+    let response = send_and_read(
+        &mut conn,
+        &["EVAL", "return string.rep('x', 2 * 1024 * 1024)", "0"],
+    );
+    assert!(response.contains("ERR"), "large Lua allocation: {response}");
+    assert!(
+        send_and_read(&mut conn, &["PING"]).contains("PONG"),
+        "server stopped responding after enforcing the Lua heap limit"
+    );
+}
+
+#[test]
 fn eval_sandbox_removes_dangerous_globals() {
     let server = LuxServer::start();
     let mut conn = server.conn();

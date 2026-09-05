@@ -6,12 +6,32 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
-type KeySubMap = Vec<(String, broadcast::Sender<Message>)>;
-type KeyExactSubMap = HashMap<String, broadcast::Sender<Message>>;
-type KeyEvent = (Box<[u8]>, Box<[u8]>);
+use crate::glob::GlobPattern;
+use crate::limits::{ByteBudget, ByteReservation, CountBudget, CountReservation};
 
-const CHANNEL_CAPACITY: usize = 1024;
-const KEY_EVENT_QUEUE_CAPACITY: usize = 65536;
+type KeySubMap = Vec<(Arc<str>, GlobPattern, broadcast::Sender<Message>)>;
+type KeyExactSubMap = HashMap<String, broadcast::Sender<Message>>;
+struct KeyEvent {
+    key: Box<[u8]>,
+    command: Box<[u8]>,
+    _buffer_reservation: Arc<ByteReservation>,
+}
+
+struct CoalescedKeyEvent {
+    command: Box<[u8]>,
+    buffer_reservation: Arc<ByteReservation>,
+}
+
+struct PatternSubscription {
+    pattern: Arc<str>,
+    matcher: GlobPattern,
+    sender: broadcast::Sender<Message>,
+}
+
+const CHANNEL_CAPACITY: usize = 64;
+const KEY_EVENT_QUEUE_CAPACITY: usize = 4096;
+const KEY_EVENT_WORKER_CAPACITY: usize = 1024;
+const KEY_EVENT_OVERFLOW_CAPACITY: usize = 4096;
 
 /// Snapshot of key-event counters for this broker instance.
 #[derive(Clone, Copy, Debug, Default)]
@@ -66,16 +86,16 @@ pub struct StreamWaiter {
 #[derive(Clone)]
 pub struct Broker {
     channels: Arc<parking_lot::RwLock<HashMap<String, broadcast::Sender<Message>>>>,
-    pattern_subs: Arc<parking_lot::RwLock<HashMap<String, broadcast::Sender<Message>>>>,
+    pattern_subs: Arc<parking_lot::RwLock<HashMap<String, PatternSubscription>>>,
     key_exact_subs: Arc<parking_lot::RwLock<Arc<KeyExactSubMap>>>,
     key_glob_subs: Arc<parking_lot::RwLock<Arc<KeySubMap>>>,
     key_sub_count: Arc<AtomicU64>,
     key_event_tx: mpsc::Sender<KeyEvent>,
     key_event_rx: Arc<parking_lot::Mutex<Option<mpsc::Receiver<KeyEvent>>>>,
     key_event_started: Arc<AtomicBool>,
-    key_worker_txs: Arc<Vec<mpsc::UnboundedSender<KeyEvent>>>,
-    key_worker_rxs: Arc<parking_lot::Mutex<Option<Vec<mpsc::UnboundedReceiver<KeyEvent>>>>>,
-    key_event_overflow: Arc<parking_lot::Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
+    key_worker_txs: Arc<Vec<mpsc::Sender<KeyEvent>>>,
+    key_worker_rxs: Arc<parking_lot::Mutex<Option<Vec<mpsc::Receiver<KeyEvent>>>>>,
+    key_event_overflow: Arc<parking_lot::Mutex<HashMap<Vec<u8>, CoalescedKeyEvent>>>,
     key_event_counters: Arc<KeyEventCounters>,
     list_waiters: Arc<parking_lot::Mutex<HashMap<String, VecDeque<BlockedPopRequest>>>>,
     list_waiter_count: Arc<AtomicU64>,
@@ -83,8 +103,36 @@ pub struct Broker {
     stream_waiter_count: Arc<AtomicU64>,
     waiter_counter: Arc<AtomicU64>,
     /// Per-table broadcast of typed row deltas for reactive live queries.
-    row_delta_subs: Arc<parking_lot::RwLock<HashMap<String, broadcast::Sender<RowDelta>>>>,
+    row_delta_subs: Arc<parking_lot::RwLock<HashMap<Arc<str>, broadcast::Sender<RowDelta>>>>,
     row_delta_sub_count: Arc<AtomicU64>,
+    event_budget: ByteBudget,
+    subscription_budget: CountBudget,
+    dropped_event_messages: Arc<AtomicU64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SubscriptionReservation {
+    count: CountReservation,
+    bytes: ByteReservation,
+}
+
+impl SubscriptionReservation {
+    pub(crate) fn try_grow(&mut self, count: usize, bytes: usize) -> bool {
+        if !self.count.try_grow(count) {
+            return false;
+        }
+        if self.bytes.try_grow(bytes) {
+            true
+        } else {
+            self.count.release(count);
+            false
+        }
+    }
+
+    pub(crate) fn release(&mut self, count: usize, bytes: usize) {
+        self.count.release(count);
+        self.bytes.release(bytes);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -95,10 +143,11 @@ pub enum MessageKind {
 
 #[derive(Clone, Debug)]
 pub struct Message {
-    pub channel: String,
+    pub channel: Arc<str>,
     pub payload: Bytes,
-    pub pattern: Option<String>,
+    pub pattern: Option<Arc<str>>,
     pub kind: MessageKind,
+    _buffer_reservation: Option<Arc<ByteReservation>>,
 }
 
 /// A typed hint, emitted at the table mutation site, that row `pk` in `table`
@@ -107,14 +156,25 @@ pub struct Message {
 /// not the row image.
 #[derive(Clone, Debug)]
 pub struct RowDelta {
-    pub table: String,
-    pub pk: String,
+    /// Large primary keys use `None` to request a bounded full-query resync
+    /// instead of retaining the key once per queued delta.
+    pub pk: Option<Arc<str>>,
+    _buffer_reservation: Option<Arc<ByteReservation>>,
 }
 
-const ROW_DELTA_CAPACITY: usize = 4096;
+const ROW_DELTA_CAPACITY: usize = 256;
 
 impl Broker {
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn new() -> Self {
+        let limits = crate::ServerLimits::default();
+        Self::with_budgets(
+            ByteBudget::new(limits.max_request_buffer_bytes),
+            CountBudget::new(limits.max_subscriptions),
+        )
+    }
+
+    pub(crate) fn with_budgets(event_budget: ByteBudget, subscription_budget: CountBudget) -> Self {
         let (tx, rx) = mpsc::channel(KEY_EVENT_QUEUE_CAPACITY);
         let worker_count = std::thread::available_parallelism()
             .map(|n| n.get().clamp(2, 8))
@@ -122,7 +182,7 @@ impl Broker {
         let mut worker_txs = Vec::with_capacity(worker_count);
         let mut worker_rxs = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
-            let (wtx, wrx) = mpsc::unbounded_channel();
+            let (wtx, wrx) = mpsc::channel(KEY_EVENT_WORKER_CAPACITY);
             worker_txs.push(wtx);
             worker_rxs.push(wrx);
         }
@@ -146,7 +206,25 @@ impl Broker {
             waiter_counter: Arc::new(AtomicU64::new(0)),
             row_delta_subs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             row_delta_sub_count: Arc::new(AtomicU64::new(0)),
+            event_budget,
+            subscription_budget,
+            dropped_event_messages: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn subscription_reservation(&self) -> SubscriptionReservation {
+        SubscriptionReservation {
+            count: self.subscription_budget.reservation(),
+            bytes: self.event_budget.reservation(),
+        }
+    }
+
+    pub fn network_subscription_count(&self) -> usize {
+        self.subscription_budget.used()
+    }
+
+    pub fn dropped_event_messages(&self) -> u64 {
+        self.dropped_event_messages.load(Ordering::Relaxed)
     }
 
     /// Cheap global gate: are there any reactive live-query subscribers at all?
@@ -159,7 +237,7 @@ impl Broker {
     pub fn subscribe_row_deltas(&self, table: &str) -> broadcast::Receiver<RowDelta> {
         let mut subs = self.row_delta_subs.write();
         let tx = subs
-            .entry(table.to_string())
+            .entry(Arc::from(table))
             .or_insert_with(|| broadcast::channel(ROW_DELTA_CAPACITY).0);
         let rx = tx.subscribe();
         self.row_delta_sub_count.fetch_add(1, Ordering::Relaxed);
@@ -180,11 +258,22 @@ impl Broker {
     }
 
     /// Publish a typed row delta to any live queries watching its table.
-    pub fn publish_row_delta(&self, delta: RowDelta) {
+    pub(crate) fn publish_row_delta(&self, table: &str, pk: &str) {
         let subs = self.row_delta_subs.read();
-        if let Some(tx) = subs.get(&delta.table) {
-            let _ = tx.send(delta);
-        }
+        let Some(tx) = subs.get(table) else {
+            return;
+        };
+        let (pk, reservation) = match self.event_budget.try_reserve(pk.len()) {
+            Some(reservation) => (Some(Arc::from(pk)), Some(Arc::new(reservation))),
+            None => {
+                self.dropped_event_messages.fetch_add(1, Ordering::Relaxed);
+                (None, None)
+            }
+        };
+        let _ = tx.send(RowDelta {
+            pk,
+            _buffer_reservation: reservation,
+        });
     }
 
     pub fn next_waiter_id(&self) -> u64 {
@@ -430,47 +519,83 @@ impl Broker {
 
     pub fn psubscribe(&self, pattern: &str) -> broadcast::Receiver<Message> {
         let mut patterns = self.pattern_subs.write();
-        let tx = patterns
-            .entry(pattern.to_string())
-            .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0);
-        tx.subscribe()
+        let subscription =
+            patterns
+                .entry(pattern.to_string())
+                .or_insert_with(|| PatternSubscription {
+                    pattern: Arc::from(pattern),
+                    matcher: GlobPattern::new(pattern),
+                    sender: broadcast::channel(CHANNEL_CAPACITY).0,
+                });
+        subscription.sender.subscribe()
     }
 
     pub fn punsubscribe_pattern(&self, pattern: &str) {
         let mut patterns = self.pattern_subs.write();
         if patterns
             .get(pattern)
-            .is_some_and(|tx| tx.receiver_count() == 0)
+            .is_some_and(|subscription| subscription.sender.receiver_count() == 0)
         {
             patterns.remove(pattern);
         }
     }
 
     pub fn publish(&self, channel: &str, payload: Bytes) -> i64 {
+        let Some(reservation) = self.reserve_event_message(channel.len(), payload.len()) else {
+            self.record_dropped_event();
+            return 0;
+        };
+        self.publish_reserved(channel, payload, reservation)
+    }
+
+    pub(crate) fn reserve_event_message(
+        &self,
+        channel_bytes: usize,
+        payload_bytes: usize,
+    ) -> Option<Arc<ByteReservation>> {
+        channel_bytes
+            .checked_add(payload_bytes)
+            .and_then(|bytes| self.event_budget.try_reserve(bytes))
+            .map(Arc::new)
+    }
+
+    pub(crate) fn record_dropped_event(&self) {
+        self.dropped_event_messages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn publish_reserved(
+        &self,
+        channel: &str,
+        payload: Bytes,
+        reservation: Arc<ByteReservation>,
+    ) -> i64 {
         let mut count = 0i64;
+        let channel: Arc<str> = Arc::from(channel);
         {
             let channels = self.channels.read();
-            if let Some(tx) = channels.get(channel) {
+            if let Some(tx) = channels.get(channel.as_ref()) {
                 let msg = Message {
-                    channel: channel.to_string(),
+                    channel: channel.clone(),
                     payload: payload.clone(),
                     pattern: None,
                     kind: MessageKind::PubSub,
+                    _buffer_reservation: Some(reservation.clone()),
                 };
                 count += tx.send(msg).unwrap_or(0) as i64;
             }
         }
         {
             let patterns = self.pattern_subs.read();
-            for (pat, tx) in patterns.iter() {
-                if glob_match(pat, channel) {
+            for subscription in patterns.values() {
+                if subscription.matcher.matches(channel.as_ref()) {
                     let msg = Message {
-                        channel: channel.to_string(),
+                        channel: channel.clone(),
                         payload: payload.clone(),
-                        pattern: Some(pat.clone()),
+                        pattern: Some(subscription.pattern.clone()),
                         kind: MessageKind::PubSub,
+                        _buffer_reservation: Some(reservation.clone()),
                     };
-                    count += tx.send(msg).unwrap_or(0) as i64;
+                    count += subscription.sender.send(msg).unwrap_or(0) as i64;
                 }
             }
         }
@@ -492,8 +617,10 @@ impl Broker {
             .pattern_subs
             .read()
             .iter()
-            .filter(|(pattern, tx)| glob_match(pattern, channel) && tx.receiver_count() > 0)
-            .map(|(_, tx)| tx.receiver_count() as i64)
+            .filter(|(_, subscription)| {
+                subscription.matcher.matches(channel) && subscription.sender.receiver_count() > 0
+            })
+            .map(|(_, subscription)| subscription.sender.receiver_count() as i64)
             .sum::<i64>();
         exact + patterns
     }
@@ -501,12 +628,13 @@ impl Broker {
     /// PUBSUB CHANNELS: active channels (those with at least one subscriber),
     /// optionally filtered by a glob `pattern`.
     pub fn pubsub_channels(&self, pattern: Option<&str>) -> Vec<String> {
+        let matcher = pattern.map(GlobPattern::new);
         let channels = self.channels.read();
         channels
             .iter()
             .filter(|(_, tx)| tx.receiver_count() > 0)
             .map(|(name, _)| name.clone())
-            .filter(|name| pattern.is_none_or(|p| glob_match(p, name)))
+            .filter(|name| matcher.as_ref().is_none_or(|pattern| pattern.matches(name)))
             .collect()
     }
 
@@ -524,72 +652,69 @@ impl Broker {
         let patterns = self.pattern_subs.read();
         patterns
             .values()
-            .filter(|tx| tx.receiver_count() > 0)
+            .filter(|subscription| subscription.sender.receiver_count() > 0)
             .count() as i64
     }
 
     pub fn ksubscribe(&self, pattern: &str) -> broadcast::Receiver<Message> {
         if is_glob_pattern(pattern) {
-            let mut subs = self.key_glob_subs.write();
-            let inner = Arc::make_mut(&mut subs);
-            if let Some((_, tx)) = inner.iter().find(|(p, _)| p == pattern) {
-                self.ensure_key_event_loop_started();
-                return tx.subscribe();
+            let (rx, inserted) = {
+                let mut subs = self.key_glob_subs.write();
+                let inner = Arc::make_mut(&mut subs);
+                if let Some((_, _, tx)) = inner.iter().find(|(p, _, _)| p.as_ref() == pattern) {
+                    (tx.subscribe(), false)
+                } else {
+                    let (tx, rx) = broadcast::channel(CHANNEL_CAPACITY);
+                    inner.push((Arc::from(pattern), GlobPattern::new(pattern), tx));
+                    (rx, true)
+                }
+            };
+            if inserted {
+                self.key_sub_count.fetch_add(1, Ordering::AcqRel);
             }
-            let (tx, rx) = broadcast::channel(CHANNEL_CAPACITY);
-            inner.push((pattern.to_string(), tx));
-            let exact_len = self.key_exact_subs.read().len();
-            self.key_sub_count
-                .store((exact_len + inner.len()) as u64, Ordering::Release);
             self.ensure_key_event_loop_started();
             return rx;
         }
 
-        let mut subs = self.key_exact_subs.write();
-        let inner = Arc::make_mut(&mut subs);
-        if let Some(tx) = inner.get(pattern) {
-            self.ensure_key_event_loop_started();
-            return tx.subscribe();
+        let (rx, inserted) = {
+            let mut subs = self.key_exact_subs.write();
+            let inner = Arc::make_mut(&mut subs);
+            if let Some(tx) = inner.get(pattern) {
+                (tx.subscribe(), false)
+            } else {
+                let (tx, rx) = broadcast::channel(CHANNEL_CAPACITY);
+                inner.insert(pattern.to_string(), tx);
+                (rx, true)
+            }
+        };
+        if inserted {
+            self.key_sub_count.fetch_add(1, Ordering::AcqRel);
         }
-        let (tx, rx) = broadcast::channel(CHANNEL_CAPACITY);
-        inner.insert(pattern.to_string(), tx);
-        let glob_len = self.key_glob_subs.read().len();
-        self.key_sub_count
-            .store((inner.len() + glob_len) as u64, Ordering::Release);
         self.ensure_key_event_loop_started();
         rx
     }
 
     pub fn kunsub(&self, pattern: &str) {
-        if is_glob_pattern(pattern) {
-            let mut subs = self.key_glob_subs.write();
-            let inner = Arc::make_mut(&mut subs);
-            inner.retain(|(p, tx)| {
-                if p != pattern {
-                    return true;
-                }
-                tx.receiver_count() > 0
-            });
-            let exact_len = self.key_exact_subs.read().len();
-            self.key_sub_count
-                .store((exact_len + inner.len()) as u64, Ordering::Release);
-            return;
-        }
-
-        let mut subs = self.key_exact_subs.write();
-        let inner = Arc::make_mut(&mut subs);
-        if let Some(tx) = inner.get(pattern) {
-            if tx.receiver_count() > 0 {
-                let glob_len = self.key_glob_subs.read().len();
-                self.key_sub_count
-                    .store((inner.len() + glob_len) as u64, Ordering::Release);
-                return;
+        let removed = if is_glob_pattern(pattern) {
+            {
+                let mut subs = self.key_glob_subs.write();
+                let inner = Arc::make_mut(&mut subs);
+                let before = inner.len();
+                inner.retain(|(p, _, tx)| p.as_ref() != pattern || tx.receiver_count() > 0);
+                inner.len() != before
             }
+        } else {
+            let mut subs = self.key_exact_subs.write();
+            let inner = Arc::make_mut(&mut subs);
+            if inner.get(pattern).is_none_or(|tx| tx.receiver_count() == 0) {
+                inner.remove(pattern).is_some()
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.key_sub_count.fetch_sub(1, Ordering::AcqRel);
         }
-        inner.remove(pattern);
-        let glob_len = self.key_glob_subs.read().len();
-        self.key_sub_count
-            .store((inner.len() + glob_len) as u64, Ordering::Release);
     }
 
     #[inline(always)]
@@ -610,14 +735,26 @@ impl Broker {
         self.key_event_counters
             .enqueued
             .fetch_add(1, Ordering::Relaxed);
-        match self.key_event_tx.try_send((key.into(), cmd.into())) {
+        let Some(reservation) = key
+            .len()
+            .checked_add(cmd.len())
+            .and_then(|bytes| self.event_budget.try_reserve(bytes))
+            .map(Arc::new)
+        else {
+            self.key_event_counters
+                .dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let event = KeyEvent {
+            key: key.into(),
+            command: cmd.into(),
+            _buffer_reservation: reservation,
+        };
+        match self.key_event_tx.try_send(event) {
             Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full((k, c))) => {
-                let mut overflow = self.key_event_overflow.lock();
-                overflow.insert(k.into_vec(), c.into_vec());
-                self.key_event_counters
-                    .coalesced
-                    .fetch_add(1, Ordering::Relaxed);
+            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                self.coalesce_key_event(event);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 self.key_event_counters
@@ -630,8 +767,42 @@ impl Broker {
     fn pop_overflow_event(&self) -> Option<KeyEvent> {
         let mut overflow = self.key_event_overflow.lock();
         let key = overflow.keys().next()?.clone();
-        let cmd = overflow.remove(&key)?;
-        Some((key.into_boxed_slice(), cmd.into_boxed_slice()))
+        let event = overflow.remove(&key)?;
+        Some(KeyEvent {
+            key: key.into_boxed_slice(),
+            command: event.command,
+            _buffer_reservation: event.buffer_reservation,
+        })
+    }
+
+    fn coalesce_key_event(&self, event: KeyEvent) {
+        let key = event.key.into_vec();
+        let mut overflow = self.key_event_overflow.lock();
+        if let Some(existing) = overflow.get_mut(&key) {
+            existing.command = event.command;
+            existing.buffer_reservation = event._buffer_reservation;
+            self.key_event_counters
+                .dropped
+                .fetch_add(1, Ordering::Relaxed);
+            self.key_event_counters
+                .coalesced
+                .fetch_add(1, Ordering::Relaxed);
+        } else if overflow.len() < KEY_EVENT_OVERFLOW_CAPACITY {
+            overflow.insert(
+                key,
+                CoalescedKeyEvent {
+                    command: event.command,
+                    buffer_reservation: event._buffer_reservation,
+                },
+            );
+            self.key_event_counters
+                .coalesced
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.key_event_counters
+                .dropped
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[inline(always)]
@@ -642,27 +813,41 @@ impl Broker {
     }
 
     #[inline(always)]
-    fn dispatch_key_event(&self, key: Box<[u8]>, cmd: Box<[u8]>) {
-        let index = self.key_worker_index(&key);
-        if self.key_worker_txs[index].send((key, cmd)).is_err() {
-            self.key_event_counters
-                .dropped
-                .fetch_add(1, Ordering::Relaxed);
+    fn dispatch_key_event(&self, event: KeyEvent) -> bool {
+        let index = self.key_worker_index(&event.key);
+        match self.key_worker_txs[index].try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                self.coalesce_key_event(event);
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.key_event_counters
+                    .dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                true
+            }
         }
     }
 
-    fn process_key_event(&self, key: &[u8], cmd: &[u8]) {
+    fn process_key_event(&self, event: &KeyEvent) {
         let exact_snap = self.key_exact_subs.read().clone();
         let glob_snap = self.key_glob_subs.read().clone();
         if exact_snap.is_empty() && glob_snap.is_empty() {
             return;
         }
-        if let Ok(key_str) = std::str::from_utf8(key) {
-            self.emit_key_event(exact_snap.as_ref(), glob_snap.as_ref(), key_str, cmd);
+        if let Ok(key_str) = std::str::from_utf8(&event.key) {
+            self.emit_key_event(
+                exact_snap.as_ref(),
+                glob_snap.as_ref(),
+                key_str,
+                &event.command,
+                event._buffer_reservation.clone(),
+            );
         }
     }
 
-    pub fn take_key_event_rx(&self) -> Option<mpsc::Receiver<KeyEvent>> {
+    fn take_key_event_rx(&self) -> Option<mpsc::Receiver<KeyEvent>> {
         self.key_event_rx.lock().take()
     }
 
@@ -687,34 +872,36 @@ impl Broker {
     fn emit_key_event(
         &self,
         exact_subs: &KeyExactSubMap,
-        glob_subs: &[(String, broadcast::Sender<Message>)],
+        glob_subs: &KeySubMap,
         key: &str,
         cmd: &[u8],
+        reservation: Arc<ByteReservation>,
     ) {
         let mut op: Option<Bytes> = None;
-        if let Some(tx) = exact_subs.get(key) {
-            let operation =
-                op.get_or_insert_with(|| Bytes::copy_from_slice(&cmd.to_ascii_lowercase()));
+        let key: Arc<str> = Arc::from(key);
+        if let Some(tx) = exact_subs.get(key.as_ref()) {
+            let operation = op.get_or_insert_with(|| Bytes::from(cmd.to_ascii_lowercase()));
             let msg = Message {
-                channel: key.to_string(),
+                channel: key.clone(),
                 payload: operation.clone(),
-                pattern: Some(key.to_string()),
+                pattern: Some(key.clone()),
                 kind: MessageKind::KeyEvent,
+                _buffer_reservation: Some(reservation.clone()),
             };
             let _ = tx.send(msg);
             self.key_event_counters
                 .emitted
                 .fetch_add(1, Ordering::Relaxed);
         }
-        for (pat, tx) in glob_subs.iter() {
-            if glob_match(pat, key) {
-                let operation =
-                    op.get_or_insert_with(|| Bytes::copy_from_slice(&cmd.to_ascii_lowercase()));
+        for (pat, matcher, tx) in glob_subs.iter() {
+            if matcher.matches(key.as_ref()) {
+                let operation = op.get_or_insert_with(|| Bytes::from(cmd.to_ascii_lowercase()));
                 let msg = Message {
-                    channel: key.to_string(),
+                    channel: key.clone(),
                     payload: operation.clone(),
                     pattern: Some(pat.clone()),
                     kind: MessageKind::KeyEvent,
+                    _buffer_reservation: Some(reservation.clone()),
                 };
                 let _ = tx.send(msg);
                 self.key_event_counters
@@ -733,8 +920,8 @@ impl Broker {
             for mut worker_rx in worker_rxs {
                 let broker = self.clone();
                 tokio::spawn(async move {
-                    while let Some((key, cmd)) = worker_rx.recv().await {
-                        broker.process_key_event(&key, &cmd);
+                    while let Some(event) = worker_rx.recv().await {
+                        broker.process_key_event(&event);
                     }
                 });
             }
@@ -745,18 +932,20 @@ impl Broker {
         loop {
             tokio::select! {
                 maybe = rx.recv() => {
-                    let Some((key, cmd)) = maybe else {
+                    let Some(event) = maybe else {
                         break;
                     };
-                    self.dispatch_key_event(key, cmd);
+                    self.dispatch_key_event(event);
                 }
                 _ = overflow_tick.tick() => {
                     let mut drained = 0;
                     while drained < 1024 {
-                        let Some((key, cmd)) = self.pop_overflow_event() else {
+                        let Some(event) = self.pop_overflow_event() else {
                             break;
                         };
-                        self.dispatch_key_event(key, cmd);
+                        if !self.dispatch_key_event(event) {
+                            break;
+                        }
                         drained += 1;
                     }
                 }
@@ -770,74 +959,21 @@ fn is_glob_pattern(pattern: &str) -> bool {
     pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
 }
 
-fn glob_match(pattern: &str, s: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        if !prefix.contains(['?', '[', '*']) {
-            return s.starts_with(prefix);
-        }
-    }
-    let p: Vec<char> = pattern.chars().collect();
-    let sc: Vec<char> = s.chars().collect();
-    do_glob(&p, &sc, 0, 0)
-}
-
-fn do_glob(p: &[char], s: &[char], pi: usize, si: usize) -> bool {
-    if pi == p.len() && si == s.len() {
-        return true;
-    }
-    if pi == p.len() {
-        return false;
-    }
-    match p[pi] {
-        '*' => {
-            for i in si..=s.len() {
-                if do_glob(p, s, pi + 1, i) {
-                    return true;
-                }
-            }
-            false
-        }
-        '?' if si < s.len() => do_glob(p, s, pi + 1, si + 1),
-        '[' if si < s.len() => {
-            let mut j = pi + 1;
-            let negate = j < p.len() && p[j] == '^';
-            if negate {
-                j += 1;
-            }
-            let mut matched = false;
-            while j < p.len() && p[j] != ']' {
-                if j + 2 < p.len() && p[j + 1] == '-' {
-                    if s[si] >= p[j] && s[si] <= p[j + 2] {
-                        matched = true;
-                    }
-                    j += 3;
-                } else {
-                    if s[si] == p[j] {
-                        matched = true;
-                    }
-                    j += 1;
-                }
-            }
-            if negate {
-                matched = !matched;
-            }
-            if matched && j < p.len() {
-                do_glob(p, s, j + 1, si + 1)
-            } else {
-                false
-            }
-        }
-        c if si < s.len() && c == s[si] => do_glob(p, s, pi + 1, si + 1),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_event(broker: &Broker, key: &[u8], command: &[u8]) -> KeyEvent {
+        let reservation = broker
+            .event_budget
+            .try_reserve(key.len().saturating_add(command.len()))
+            .expect("test event should fit within the broker budget");
+        KeyEvent {
+            key: key.into(),
+            command: command.into(),
+            _buffer_reservation: Arc::new(reservation),
+        }
+    }
     use crate::{DurabilityConfig, DurabilityPolicy, ServerConfig, StorageConfig, StorageMode};
     use std::sync::Arc;
     use std::time::Instant;
@@ -865,7 +1001,7 @@ mod tests {
         let count = broker.publish("test-channel", Bytes::from_static(b"hello"));
         assert_eq!(count, 1);
         let msg = rx.try_recv().unwrap();
-        assert_eq!(msg.channel, "test-channel");
+        assert_eq!(msg.channel.as_ref(), "test-channel");
         assert_eq!(msg.payload.as_ref(), b"hello");
     }
 
@@ -877,6 +1013,61 @@ mod tests {
     }
 
     #[test]
+    fn key_event_queues_are_bounded_under_backpressure() {
+        let broker = Broker::new();
+        let _subscription = broker.ksubscribe("*");
+        assert!(!broker.key_event_loop_started());
+
+        for index in 0..=KEY_EVENT_QUEUE_CAPACITY {
+            broker.enqueue_key_event(format!("key-{index}").as_bytes(), b"set");
+        }
+        assert_eq!(broker.key_event_overflow.lock().len(), 1);
+
+        for index in 0..KEY_EVENT_OVERFLOW_CAPACITY {
+            let key = format!("overflow-{index}");
+            broker.coalesce_key_event(key_event(&broker, key.as_bytes(), b"set"));
+        }
+        broker.coalesce_key_event(key_event(&broker, b"one-too-many", b"set"));
+
+        assert_eq!(
+            broker.key_event_overflow.lock().len(),
+            KEY_EVENT_OVERFLOW_CAPACITY
+        );
+        let stats = broker.key_event_stats();
+        assert!(stats.coalesced >= KEY_EVENT_OVERFLOW_CAPACITY as u64);
+        assert!(stats.dropped >= 1);
+    }
+
+    #[test]
+    fn key_event_is_dropped_when_its_buffer_budget_is_full() {
+        let broker = Broker::with_budgets(ByteBudget::new(4), CountBudget::new(1));
+        let _subscription = broker.ksubscribe("*");
+        broker.enqueue_key_event(b"key", b"set");
+
+        let stats = broker.key_event_stats();
+        assert_eq!(stats.enqueued, 1);
+        assert_eq!(stats.dropped, 1);
+        assert!(broker.key_event_overflow.lock().is_empty());
+        assert!(broker.take_key_event_rx().unwrap().try_recv().is_err());
+    }
+
+    #[test]
+    fn worker_queue_overflow_coalesces_instead_of_growing() {
+        let broker = Broker::new();
+        for _ in 0..=KEY_EVENT_WORKER_CAPACITY {
+            broker.dispatch_key_event(key_event(&broker, b"same-key", b"set"));
+        }
+
+        assert_eq!(broker.key_event_overflow.lock().len(), 1);
+        assert_eq!(broker.key_event_stats().coalesced, 1);
+        assert_eq!(broker.key_event_stats().dropped, 0);
+
+        broker.dispatch_key_event(key_event(&broker, b"same-key", b"del"));
+        assert_eq!(broker.key_event_stats().coalesced, 2);
+        assert_eq!(broker.key_event_stats().dropped, 1);
+    }
+
+    #[test]
     fn multiple_subscribers() {
         let broker = Broker::new();
         let mut rx1 = broker.subscribe("ch");
@@ -884,6 +1075,93 @@ mod tests {
         broker.publish("ch", Bytes::from_static(b"msg"));
         assert_eq!(rx1.try_recv().unwrap().payload.as_ref(), b"msg");
         assert_eq!(rx2.try_recv().unwrap().payload.as_ref(), b"msg");
+    }
+
+    #[test]
+    fn subscription_capacity_is_atomic_and_reusable() {
+        let broker = Broker::with_budgets(ByteBudget::new(10), CountBudget::new(2));
+        let mut first = broker.subscription_reservation();
+        let mut second = broker.subscription_reservation();
+        let mut third = broker.subscription_reservation();
+
+        assert!(first.try_grow(1, 6));
+        assert!(!second.try_grow(1, 5));
+        assert_eq!(broker.network_subscription_count(), 1);
+        assert!(second.try_grow(1, 4));
+        assert!(!third.try_grow(1, 0));
+
+        first.release(1, 6);
+        assert!(third.try_grow(1, 6));
+        assert_eq!(broker.network_subscription_count(), 2);
+    }
+
+    #[test]
+    fn event_budget_recovers_after_every_receiver_releases_a_message() {
+        let broker = Broker::with_budgets(ByteBudget::new(11), CountBudget::new(2));
+        let mut first = broker.subscribe("events");
+        let mut second = broker.subscribe("events");
+
+        assert_eq!(broker.publish("events", Bytes::from_static(b"hello")), 2);
+        assert_eq!(broker.publish("events", Bytes::from_static(b"x")), 0);
+        assert_eq!(broker.dropped_event_messages(), 1);
+
+        drop(first.try_recv().unwrap());
+        assert_eq!(broker.publish("events", Bytes::from_static(b"x")), 0);
+        drop(second.try_recv().unwrap());
+
+        assert_eq!(broker.publish("events", Bytes::from_static(b"x")), 2);
+        assert_eq!(first.try_recv().unwrap().payload.as_ref(), b"x");
+        assert_eq!(second.try_recv().unwrap().payload.as_ref(), b"x");
+    }
+
+    #[test]
+    fn fanout_messages_share_channel_and_retained_pattern_names() {
+        let broker = Broker::new();
+        let mut first = broker.psubscribe("room:*");
+        let mut second = broker.psubscribe("*:events");
+
+        assert_eq!(broker.publish("room:events", Bytes::from_static(b"one")), 2);
+        let first_message = first.try_recv().unwrap();
+        let second_message = second.try_recv().unwrap();
+        assert!(Arc::ptr_eq(&first_message.channel, &second_message.channel));
+
+        assert_eq!(broker.publish("room:events", Bytes::from_static(b"two")), 2);
+        let next_first = first.try_recv().unwrap();
+        assert!(Arc::ptr_eq(
+            first_message.pattern.as_ref().unwrap(),
+            next_first.pattern.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn concurrent_exact_and_glob_key_registry_changes_do_not_deadlock() {
+        let broker = Broker::new();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let exact_broker = broker.clone();
+        let exact_barrier = barrier.clone();
+        let exact = std::thread::spawn(move || {
+            exact_barrier.wait();
+            for _ in 0..1_000 {
+                let receiver = exact_broker.ksubscribe("exact");
+                drop(receiver);
+                exact_broker.kunsub("exact");
+            }
+        });
+        let glob_broker = broker.clone();
+        let glob_barrier = barrier.clone();
+        let glob = std::thread::spawn(move || {
+            glob_barrier.wait();
+            for _ in 0..1_000 {
+                let receiver = glob_broker.ksubscribe("glob:*");
+                drop(receiver);
+                glob_broker.kunsub("glob:*");
+            }
+        });
+
+        barrier.wait();
+        exact.join().unwrap();
+        glob.join().unwrap();
+        assert!(!broker.has_key_subs());
     }
 
     #[test]
@@ -921,9 +1199,10 @@ mod tests {
             broker.key_glob_subs.read().as_ref(),
             "table:users",
             b"set",
+            Arc::new(broker.event_budget.try_reserve(18).unwrap()),
         );
 
-        assert_eq!(rx2.try_recv().unwrap().channel, "table:users");
+        assert_eq!(rx2.try_recv().unwrap().channel.as_ref(), "table:users");
         assert_eq!(
             rx2.try_recv().err(),
             Some(broadcast::error::TryRecvError::Empty)
@@ -940,11 +1219,8 @@ mod tests {
         assert!(broker.has_any_row_delta_subs());
 
         // A published delta reaches every live receiver on the table.
-        broker.publish_row_delta(RowDelta {
-            table: "tasks".to_string(),
-            pk: "t1".to_string(),
-        });
-        assert_eq!(rx2.try_recv().unwrap().pk, "t1");
+        broker.publish_row_delta("tasks", "t1");
+        assert_eq!(rx2.try_recv().unwrap().pk.as_deref(), Some("t1"));
 
         // Dropping one receiver then unsubscribing keeps the channel (rx2 lives).
         drop(rx1);
@@ -964,11 +1240,17 @@ mod tests {
     fn publish_row_delta_to_idle_table_is_noop() {
         let broker = Broker::new();
         // No panic, no subscribers, nothing to receive.
-        broker.publish_row_delta(RowDelta {
-            table: "ghost".to_string(),
-            pk: "x".to_string(),
-        });
+        broker.publish_row_delta("ghost", "x");
         assert!(!broker.has_any_row_delta_subs());
+    }
+
+    #[test]
+    fn row_delta_without_buffer_capacity_becomes_a_resync_marker() {
+        let broker = Broker::with_budgets(ByteBudget::new(1), CountBudget::new(1));
+        let mut receiver = broker.subscribe_row_deltas("tasks");
+        broker.publish_row_delta("tasks", "too-large");
+
+        assert_eq!(receiver.try_recv().unwrap().pk, None);
     }
 
     #[test]

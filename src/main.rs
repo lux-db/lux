@@ -39,6 +39,45 @@ fn invalid_config(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
 }
 
+fn positive_usize_env(name: &str, default: usize) -> std::io::Result<usize> {
+    match std::env::var(name) {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| invalid_config(format!("{name} must be a positive integer"))),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(invalid_config(format!("{name} must be UTF-8")))
+        }
+    }
+}
+
+fn positive_duration_ms_env(
+    name: &str,
+    default: std::time::Duration,
+) -> std::io::Result<std::time::Duration> {
+    let default_ms = usize::try_from(default.as_millis())
+        .map_err(|_| invalid_config(format!("default value for {name} is too large")))?;
+    let millis = positive_usize_env(name, default_ms)?;
+    let millis =
+        u64::try_from(millis).map_err(|_| invalid_config(format!("{name} is too large")))?;
+    Ok(std::time::Duration::from_millis(millis))
+}
+
+fn optional_limit_env(name: &str, default: usize) -> std::io::Result<Option<usize>> {
+    match std::env::var(name) {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .map(|value| (value != 0).then_some(value))
+            .map_err(|_| invalid_config(format!("{name} must be a non-negative integer"))),
+        Err(std::env::VarError::NotPresent) => Ok(Some(default)),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(invalid_config(format!("{name} must be UTF-8")))
+        }
+    }
+}
+
 fn parse_storage_mode(raw: Option<String>) -> std::io::Result<lux::StorageMode> {
     match raw.as_deref().map(str::trim) {
         None => Ok(lux::StorageMode::Memory),
@@ -156,6 +195,7 @@ async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
     let managed_email = managed_auth_email_from_env();
 
     let encryption = encryption_config_from_env()?;
+    let default_limits = lux::ServerLimits::default();
 
     // `site_url` and `issuer` default to the address this engine actually serves
     // HTTP on. They used to hardcode port 7379, which is not the RESP port, the
@@ -186,13 +226,8 @@ async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
-        max_rows: std::env::var("LUX_MAX_ROWS")
-            .ok()
-            .and_then(|s| s.parse().ok()),
-        max_body: std::env::var("LUX_MAX_BODY_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64 * 1024 * 1024),
+        max_rows: optional_limit_env("LUX_MAX_ROWS", 10_000)?,
+        max_body: positive_usize_env("LUX_MAX_BODY_SIZE", 64 * 1024 * 1024)?,
         http_browser: lux::HttpBrowserConfig {
             allowed_hosts: std::env::var("LUX_HTTP_ALLOWED_HOSTS")
                 .ok()
@@ -218,10 +253,101 @@ async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
                 .unwrap_or_default(),
             studio_session_ttl,
         },
-        max_resp_request: std::env::var("LUX_MAX_RESP_REQUEST_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64 * 1024 * 1024),
+        max_resp_request: positive_usize_env("LUX_MAX_RESP_REQUEST_SIZE", 64 * 1024 * 1024)?,
+        limits: lux::ServerLimits {
+            max_resp_connections: positive_usize_env(
+                "LUX_MAX_RESP_CONNECTIONS",
+                default_limits.max_resp_connections,
+            )?,
+            max_http_connections: positive_usize_env(
+                "LUX_MAX_HTTP_CONNECTIONS",
+                default_limits.max_http_connections,
+            )?,
+            max_blocked_clients: positive_usize_env(
+                "LUX_MAX_BLOCKED_CLIENTS",
+                default_limits.max_blocked_clients,
+            )?,
+            max_resp_pipeline_commands: positive_usize_env(
+                "LUX_MAX_RESP_PIPELINE_COMMANDS",
+                default_limits.max_resp_pipeline_commands,
+            )?,
+            max_resp_command_args: positive_usize_env(
+                "LUX_MAX_RESP_COMMAND_ARGS",
+                default_limits.max_resp_command_args,
+            )?,
+            max_resp_subscriptions: positive_usize_env(
+                "LUX_MAX_RESP_SUBSCRIPTIONS",
+                default_limits.max_resp_subscriptions,
+            )?,
+            max_subscription_name_bytes: positive_usize_env(
+                "LUX_MAX_SUBSCRIPTION_NAME_SIZE",
+                default_limits.max_subscription_name_bytes,
+            )?,
+            max_live_subscriptions: positive_usize_env(
+                "LUX_MAX_LIVE_SUBSCRIPTIONS",
+                default_limits.max_live_subscriptions,
+            )?,
+            max_subscriptions: positive_usize_env(
+                "LUX_MAX_SUBSCRIPTIONS",
+                default_limits.max_subscriptions,
+            )?,
+            max_query_candidates: positive_usize_env(
+                "LUX_MAX_QUERY_CANDIDATES",
+                default_limits.max_query_candidates,
+            )?,
+            max_blocking_keys: positive_usize_env(
+                "LUX_MAX_BLOCKING_KEYS",
+                default_limits.max_blocking_keys,
+            )?,
+            max_resp_response: positive_usize_env(
+                "LUX_MAX_RESP_RESPONSE_SIZE",
+                default_limits.max_resp_response,
+            )?,
+            max_request_buffer_bytes: positive_usize_env(
+                "LUX_MAX_REQUEST_BUFFER_SIZE",
+                default_limits.max_request_buffer_bytes,
+            )?,
+            max_response_buffer_bytes: positive_usize_env(
+                "LUX_MAX_RESPONSE_BUFFER_SIZE",
+                default_limits.max_response_buffer_bytes,
+            )?,
+            max_auth_workers: positive_usize_env(
+                "LUX_MAX_AUTH_WORKERS",
+                default_limits.max_auth_workers,
+            )?,
+            max_script_memory: positive_usize_env(
+                "LUX_MAX_SCRIPT_MEMORY_SIZE",
+                default_limits.max_script_memory,
+            )?,
+            resp_idle_timeout: positive_duration_ms_env(
+                "LUX_RESP_IDLE_TIMEOUT_MS",
+                default_limits.resp_idle_timeout,
+            )?,
+            resp_request_timeout: positive_duration_ms_env(
+                "LUX_RESP_REQUEST_TIMEOUT_MS",
+                default_limits.resp_request_timeout,
+            )?,
+            http_header_timeout: positive_duration_ms_env(
+                "LUX_HTTP_HEADER_TIMEOUT_MS",
+                default_limits.http_header_timeout,
+            )?,
+            http_body_timeout: positive_duration_ms_env(
+                "LUX_HTTP_BODY_TIMEOUT_MS",
+                default_limits.http_body_timeout,
+            )?,
+            http_keep_alive_timeout: positive_duration_ms_env(
+                "LUX_HTTP_KEEP_ALIVE_TIMEOUT_MS",
+                default_limits.http_keep_alive_timeout,
+            )?,
+            live_idle_timeout: positive_duration_ms_env(
+                "LUX_LIVE_IDLE_TIMEOUT_MS",
+                default_limits.live_idle_timeout,
+            )?,
+            write_timeout: positive_duration_ms_env(
+                "LUX_WRITE_TIMEOUT_MS",
+                default_limits.write_timeout,
+            )?,
+        },
         password,
         require_auth,
         allow_insecure_no_auth: std::env::var("LUX_ALLOW_INSECURE_NO_AUTH").is_ok_and(|v| {

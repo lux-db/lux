@@ -386,6 +386,7 @@ pub fn cmd_hscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         }
     }
     let pat_str = pattern.map(|p| arg_str(p).to_string());
+    let matcher = pat_str.as_deref().map(crate::glob::GlobPattern::new);
     let idx = store.shard_for_key(args[1]);
     let shard = store.lock_read_shard(idx);
     let ks = args[1];
@@ -399,8 +400,8 @@ pub fn cmd_hscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
                     let next = if e >= all.len() { 0 } else { e };
                     let filtered: Vec<_> = all[s..e]
                         .iter()
-                        .filter(|(k, _)| match &pat_str {
-                            Some(p) => glob_match(p, k),
+                        .filter(|(k, _)| match &matcher {
+                            Some(pattern) => pattern.matches(k),
                             None => true,
                         })
                         .collect();
@@ -434,8 +435,8 @@ pub fn cmd_hscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
                 let next = if e >= all.len() { 0 } else { e };
                 let filtered: Vec<_> = all[s..e]
                     .iter()
-                    .filter(|m| match &pat_str {
-                        Some(p) => glob_match(p, m),
+                    .filter(|m| match &matcher {
+                        Some(pattern) => pattern.matches(m),
                         None => true,
                     })
                     .collect();
@@ -456,39 +457,6 @@ pub fn cmd_hscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
         }
     }
     CmdResult::Written
-}
-
-fn glob_match(pattern: &str, s: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    let p: Vec<char> = pattern.chars().collect();
-    let s: Vec<char> = s.chars().collect();
-    do_glob(&p, &s, 0, 0)
-}
-
-fn do_glob(p: &[char], s: &[char], pi: usize, si: usize) -> bool {
-    if pi == p.len() && si == s.len() {
-        return true;
-    }
-    if pi == p.len() {
-        return false;
-    }
-    if p[pi] == '*' {
-        for i in si..=s.len() {
-            if do_glob(p, s, pi + 1, i) {
-                return true;
-            }
-        }
-        return false;
-    }
-    if si == s.len() {
-        return false;
-    }
-    if p[pi] == '?' || p[pi] == s[si] {
-        return do_glob(p, s, pi + 1, si + 1);
-    }
-    false
 }
 
 // --- Hash field TTL family (Redis 7.4) ---

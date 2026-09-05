@@ -72,23 +72,22 @@ pub fn terminate_child(child: &mut Child) {
     child.wait().ok();
 }
 
-/// Locate the compiled `lux` binary, preferring release, falling back to debug.
+/// Locate the `lux` binary built in the same Cargo profile as this test.
+/// Selecting a different profile can silently exercise a stale binary.
 pub fn find_lux_binary() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
-    let target_dir = exe
+    let profile_dir = exe
         .parent()
         .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .expect("target dir");
-    let release = target_dir.join("release").join("lux");
-    if release.exists() {
-        return release;
+        .expect("Cargo profile dir");
+    let binary = profile_dir.join("lux");
+    if binary.exists() {
+        return binary;
     }
-    let debug = target_dir.join("debug").join("lux");
-    if debug.exists() {
-        return debug;
-    }
-    panic!("no lux binary found (build it first)");
+    panic!(
+        "no lux binary found for test profile at {} (build it first)",
+        binary.display()
+    );
 }
 
 /// Reserve `n` distinct loopback ports for this test process.

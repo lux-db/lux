@@ -244,6 +244,19 @@ guarantee. For production, preserve the entire data directory, use an
 intentional durability policy, allow graceful shutdown to finish, and back up
 complete snapshots rather than individual private WAL or tiered-storage files.
 
+Network, request, authentication, blocking-command, subscription, response, and
+query-work defaults are finite. Tune the `LUX_MAX_*` and `LUX_*_TIMEOUT_MS`
+settings documented in the README when a workload needs different ceilings;
+invalid zero values fail startup. Only `LUX_MAX_ROWS=0` intentionally means
+unlimited. Capacity failures are explicit protocol errors and do not acknowledge
+rejected mutations. Use `INFO` to inspect active RESP/HTTP clients, connection
+ceilings, rejected work, timeouts, and key-event backpressure.
+
+For a CLI-managed local stack, prefer the grouped `[engine.limits]` and
+`[engine.timeouts]` sections in `lux/config.toml`; environment variables override
+the project file. Changing one of these settings recreates the container on the
+same data volume during the next `lux start`.
+
 ## Move from local to Lux Cloud
 
 The engine and application APIs stay the same. Create and link a project, apply

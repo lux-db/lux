@@ -1,4 +1,130 @@
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
+use std::cell::RefCell;
+
+use crate::limits::{ByteBudget, ByteReservation};
+
+struct OutputLimitState {
+    limit: usize,
+    exceeded: bool,
+    capacity_exhausted: bool,
+    reservation: Option<ByteReservation>,
+}
+
+thread_local! {
+    static OUTPUT_LIMIT: RefCell<OutputLimitState> = const {
+        RefCell::new(OutputLimitState {
+            limit: usize::MAX,
+            exceeded: false,
+            capacity_exhausted: false,
+            reservation: None,
+        })
+    };
+}
+
+/// Synchronous guard for response construction on the current runtime thread.
+/// It must be dropped before the next `.await` so another task cannot inherit
+/// this command's response budget.
+#[must_use]
+pub(crate) struct OutputLimitGuard {
+    previous: OutputLimitState,
+}
+
+impl OutputLimitGuard {
+    pub(crate) fn exceeded(&self) -> bool {
+        OUTPUT_LIMIT.with(|state| state.borrow().exceeded)
+    }
+
+    pub(crate) fn capacity_exhausted(&self) -> bool {
+        OUTPUT_LIMIT.with(|state| state.borrow().capacity_exhausted)
+    }
+}
+
+impl Drop for OutputLimitGuard {
+    fn drop(&mut self) {
+        OUTPUT_LIMIT.with(|state| {
+            *state.borrow_mut() = std::mem::replace(
+                &mut self.previous,
+                OutputLimitState {
+                    limit: usize::MAX,
+                    exceeded: false,
+                    capacity_exhausted: false,
+                    reservation: None,
+                },
+            );
+        });
+    }
+}
+
+pub(crate) fn limit_output(bytes: usize) -> OutputLimitGuard {
+    limit_output_inner(bytes, 0, None)
+}
+
+pub(crate) fn limit_output_with_budget(
+    bytes: usize,
+    existing_bytes: usize,
+    budget: ByteBudget,
+) -> OutputLimitGuard {
+    limit_output_inner(bytes, existing_bytes, Some(budget))
+}
+
+fn limit_output_inner(
+    bytes: usize,
+    existing_bytes: usize,
+    budget: Option<ByteBudget>,
+) -> OutputLimitGuard {
+    let (reservation, capacity_exhausted) = match budget {
+        Some(budget) => match budget.try_reserve(existing_bytes) {
+            Some(reservation) => (Some(reservation), false),
+            None => (None, true),
+        },
+        None => (None, false),
+    };
+    let previous = OUTPUT_LIMIT.with(|state| {
+        std::mem::replace(
+            &mut *state.borrow_mut(),
+            OutputLimitState {
+                limit: bytes,
+                exceeded: existing_bytes > bytes || capacity_exhausted,
+                capacity_exhausted,
+                reservation,
+            },
+        )
+    });
+    OutputLimitGuard { previous }
+}
+
+fn extend(buf: &mut BytesMut, bytes: &[u8]) {
+    OUTPUT_LIMIT.with(|state| {
+        let mut current = state.borrow_mut();
+        if current.exceeded {
+            return;
+        }
+        if buf
+            .len()
+            .checked_add(bytes.len())
+            .is_none_or(|next| next > current.limit)
+        {
+            current.exceeded = true;
+            return;
+        }
+        if current
+            .reservation
+            .as_mut()
+            .is_some_and(|reservation| !reservation.try_grow(bytes.len()))
+        {
+            current.exceeded = true;
+            current.capacity_exhausted = true;
+            return;
+        }
+        buf.extend_from_slice(bytes);
+    });
+}
+
+/// Appends an already RESP-encoded fragment while preserving the active
+/// response-construction limit.
+pub(crate) fn write_encoded(buf: &mut BytesMut, encoded: &[u8]) {
+    extend(buf, encoded);
+}
 
 // Pre-encoded RESP fragments reused across hot paths to avoid reformatting.
 pub static OK: &[u8] = b"+OK\r\n";
@@ -14,55 +140,55 @@ pub static NULL_ARRAY: &[u8] = b"*-1\r\n";
 
 /// Writes a pre-encoded `+OK` simple string.
 pub fn write_ok(buf: &mut BytesMut) {
-    buf.extend_from_slice(OK);
+    extend(buf, OK);
 }
 
 /// Writes a pre-encoded `+PONG` simple string.
 pub fn write_pong(buf: &mut BytesMut) {
-    buf.extend_from_slice(PONG);
+    extend(buf, PONG);
 }
 
 /// Writes a RESP null bulk (`$-1`).
 pub fn write_null(buf: &mut BytesMut) {
-    buf.extend_from_slice(NULL);
+    extend(buf, NULL);
 }
 
 /// Writes the transaction `+QUEUED` marker.
 pub fn write_queued(buf: &mut BytesMut) {
-    buf.extend_from_slice(QUEUED);
+    extend(buf, QUEUED);
 }
 
 /// Writes a RESP null array (`*-1`).
 pub fn write_null_array(buf: &mut BytesMut) {
-    buf.extend_from_slice(NULL_ARRAY);
+    extend(buf, NULL_ARRAY);
 }
 
 /// Writes a RESP simple string (`+...`).
 pub fn write_simple(buf: &mut BytesMut, s: &str) {
-    buf.put_u8(b'+');
-    buf.extend_from_slice(s.as_bytes());
-    buf.extend_from_slice(b"\r\n");
+    extend(buf, b"+");
+    extend(buf, s.as_bytes());
+    extend(buf, b"\r\n");
 }
 
 /// Writes a RESP error (`-...`).
 pub fn write_error(buf: &mut BytesMut, s: &str) {
-    buf.put_u8(b'-');
-    buf.extend_from_slice(s.as_bytes());
-    buf.extend_from_slice(b"\r\n");
+    extend(buf, b"-");
+    extend(buf, s.as_bytes());
+    extend(buf, b"\r\n");
 }
 
 /// Writes a RESP integer (`:...`), using cached common values on hot paths.
 pub fn write_integer(buf: &mut BytesMut, n: i64) {
     match n {
-        0 => buf.extend_from_slice(ZERO),
-        1 => buf.extend_from_slice(ONE),
-        -1 => buf.extend_from_slice(NEG_ONE),
-        -2 => buf.extend_from_slice(NEG_TWO),
+        0 => extend(buf, ZERO),
+        1 => extend(buf, ONE),
+        -1 => extend(buf, NEG_ONE),
+        -2 => extend(buf, NEG_TWO),
         _ => {
-            buf.put_u8(b':');
+            extend(buf, b":");
             let mut tmp = itoa::Buffer::new();
-            buf.extend_from_slice(tmp.format_i64(n).as_bytes());
-            buf.extend_from_slice(b"\r\n");
+            extend(buf, tmp.format_i64(n).as_bytes());
+            extend(buf, b"\r\n");
         }
     }
 }
@@ -74,23 +200,23 @@ pub fn write_bulk(buf: &mut BytesMut, s: &str) {
 
 /// Writes a raw RESP bulk string payload.
 pub fn write_bulk_raw(buf: &mut BytesMut, data: &[u8]) {
-    buf.put_u8(b'$');
+    extend(buf, b"$");
     let mut tmp = itoa::Buffer::new();
-    buf.extend_from_slice(tmp.format_usize(data.len()).as_bytes());
-    buf.extend_from_slice(b"\r\n");
-    buf.extend_from_slice(data);
-    buf.extend_from_slice(b"\r\n");
+    extend(buf, tmp.format_usize(data.len()).as_bytes());
+    extend(buf, b"\r\n");
+    extend(buf, data);
+    extend(buf, b"\r\n");
 }
 
 /// Writes a RESP array header (`*len`).
 pub fn write_array_header(buf: &mut BytesMut, len: usize) {
     if len == 0 {
-        buf.extend_from_slice(EMPTY_ARRAY);
+        extend(buf, EMPTY_ARRAY);
     } else {
-        buf.put_u8(b'*');
+        extend(buf, b"*");
         let mut tmp = itoa::Buffer::new();
-        buf.extend_from_slice(tmp.format_usize(len).as_bytes());
-        buf.extend_from_slice(b"\r\n");
+        extend(buf, tmp.format_usize(len).as_bytes());
+        extend(buf, b"\r\n");
     }
 }
 
@@ -123,6 +249,7 @@ pub struct Parser<'a> {
     buf: &'a [u8],
     pos: usize,
     max_bulk_len: usize,
+    max_array_len: usize,
 }
 
 const INLINE_ARG_COUNT: usize = 8;
@@ -189,10 +316,15 @@ impl<'a> Parser<'a> {
     }
 
     pub fn with_max_bulk_len(buf: &'a [u8], max_bulk_len: usize) -> Self {
+        Self::with_limits(buf, max_bulk_len, 16_384)
+    }
+
+    pub fn with_limits(buf: &'a [u8], max_bulk_len: usize, max_array_len: usize) -> Self {
         Self {
             buf,
             pos: 0,
             max_bulk_len,
+            max_array_len,
         }
     }
 
@@ -227,9 +359,14 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 let line = &self.buf[start..end];
                 let mut args = CommandArgs::new(0);
+                let mut count = 0usize;
                 for part in line.split(|&b| b == b' ') {
                     if !part.is_empty() {
+                        if count >= self.max_array_len {
+                            return Err("ERR RESP argument count exceeds maximum");
+                        }
                         args.push(part);
+                        count += 1;
                     }
                 }
                 return Ok(Some(args));
@@ -254,9 +391,7 @@ impl<'a> Parser<'a> {
         if count < 0 {
             return Ok(None);
         }
-        // Cap array size to prevent OOM from malicious clients.
-        // 1M args is far beyond any legitimate command.
-        if count > 1_048_576 {
+        if count as u64 > self.max_array_len as u64 {
             return Err("ERR RESP array count exceeds maximum");
         }
         let mut args = CommandArgs::new(count as usize);
@@ -480,6 +615,42 @@ mod tests {
     }
 
     #[test]
+    fn response_limit_discards_payload_before_buffer_growth() {
+        let mut buf = BytesMut::new();
+        let payload = vec![b'x'; 1024 * 1024];
+        let limit = limit_output(32);
+
+        write_bulk_raw(&mut buf, &payload);
+
+        assert!(limit.exceeded());
+        assert!(buf.len() <= 32);
+        drop(limit);
+        write_error(&mut buf, "ERR response limit");
+        assert!(buf.ends_with(b"\r\n"));
+    }
+
+    #[test]
+    fn response_construction_reserves_and_releases_process_capacity() {
+        let budget = ByteBudget::new(4);
+        let mut buf = BytesMut::from(&b"ab"[..]);
+        let limit = limit_output_with_budget(8, buf.len(), budget.clone());
+
+        write_encoded(&mut buf, b"cd");
+        assert!(!limit.exceeded());
+        write_encoded(&mut buf, b"e");
+        assert!(limit.exceeded());
+        assert!(limit.capacity_exhausted());
+        assert_eq!(&buf[..], b"abcd");
+        drop(limit);
+
+        let limit = limit_output_with_budget(8, 0, budget);
+        let mut recovered = BytesMut::new();
+        write_encoded(&mut recovered, b"wxyz");
+        assert!(!limit.exceeded());
+        assert_eq!(&recovered[..], b"wxyz");
+    }
+
+    #[test]
     fn incomplete_buffer_returns_none() {
         let input = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n";
         let mut parser = Parser::new(input);
@@ -506,6 +677,15 @@ mod tests {
         assert_eq!(args[0], b"SET");
         assert_eq!(args[1], b"foo");
         assert_eq!(args[2], b"bar");
+    }
+
+    #[test]
+    fn inline_commands_obey_the_argument_limit() {
+        let mut parser = Parser::with_limits(b"SET foo bar\r\n", 64, 2);
+        assert_eq!(
+            parser.parse_command().unwrap_err(),
+            "ERR RESP argument count exceeds maximum"
+        );
     }
 
     #[test]

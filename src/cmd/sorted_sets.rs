@@ -29,6 +29,20 @@ fn parse_usize_arg(arg: &[u8], out: &mut BytesMut) -> Option<usize> {
     }
 }
 
+fn parse_block_timeout(arg: &[u8], out: &mut BytesMut) -> Option<Duration> {
+    let duration = match arg_str(arg).parse::<f64>() {
+        Ok(0.0) => Some(Duration::from_secs(300)),
+        Ok(secs) if secs > 0.0 => Duration::try_from_secs_f64(secs)
+            .ok()
+            .filter(|duration| tokio::time::Instant::now().checked_add(*duration).is_some()),
+        _ => None,
+    };
+    if duration.is_none() {
+        resp::write_error(out, "ERR timeout is not a float or out of range");
+    }
+    duration
+}
+
 fn parse_score_bound(s: &str, _is_max: bool) -> Result<(f64, bool), String> {
     if s == "-inf" || s == "-" {
         Ok((f64::NEG_INFINITY, false))
@@ -59,29 +73,6 @@ fn parse_limit(
     let offset = parse_usize_arg(args[i + 1], out)?;
     let count = parse_usize_arg(args[i + 2], out)?;
     Some((Some(offset), Some(count)))
-}
-
-fn glob_match(pattern: &str, s: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    let p: Vec<char> = pattern.chars().collect();
-    let s: Vec<char> = s.chars().collect();
-    do_glob(&p, &s, 0, 0)
-}
-
-fn do_glob(p: &[char], s: &[char], pi: usize, si: usize) -> bool {
-    if pi == p.len() && si == s.len() {
-        return true;
-    }
-    if pi == p.len() {
-        return false;
-    }
-    match p[pi] {
-        '*' => do_glob(p, s, pi + 1, si) || (si < s.len() && do_glob(p, s, pi, si + 1)),
-        '?' => si < s.len() && do_glob(p, s, pi + 1, si + 1),
-        c => si < s.len() && c == s[si] && do_glob(p, s, pi + 1, si + 1),
-    }
 }
 
 fn parse_zstore_numkeys(arg: &[u8], out: &mut BytesMut) -> Option<usize> {
@@ -1363,6 +1354,7 @@ pub fn cmd_zscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
             return CmdResult::Written;
         }
     }
+    let matcher = pattern.map(crate::glob::GlobPattern::new);
     let idx = store.shard_for_key(args[1]);
     let shard = store.lock_read_shard(idx);
     let ks = args[1];
@@ -1371,7 +1363,11 @@ pub fn cmd_zscan(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant
             if let StoreValue::SortedSet(tree, _) = &entry.value {
                 let all: Vec<_> = tree
                     .keys()
-                    .filter(|(_, member)| pattern.is_none_or(|p| glob_match(p, member)))
+                    .filter(|(_, member)| {
+                        matcher
+                            .as_ref()
+                            .is_none_or(|pattern| pattern.matches(member))
+                    })
                     .collect();
                 let s = cursor.min(all.len());
                 let e = (s + count).min(all.len());
@@ -1411,7 +1407,10 @@ pub fn cmd_bzpopmin(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
         return CmdResult::Written;
     }
     let is_min = cmd_eq(args[0], b"BZPOPMIN");
-    let timeout_secs: f64 = arg_str(args[args.len() - 1]).parse().unwrap_or(0.0);
+    let timeout = match parse_block_timeout(args[args.len() - 1], out) {
+        Some(timeout) => timeout,
+        None => return CmdResult::Written,
+    };
     let keys: Vec<&[u8]> = args[1..args.len() - 1].to_vec();
 
     match journaled_zmpop(store, &keys, is_min, 1, now) {
@@ -1430,11 +1429,6 @@ pub fn cmd_bzpopmin(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Inst
         }
     }
 
-    let timeout = if timeout_secs <= 0.0 {
-        Duration::from_secs(300)
-    } else {
-        Duration::from_secs_f64(timeout_secs)
-    };
     let owned_keys: Vec<String> = keys.iter().map(|k| arg_str(k).to_string()).collect();
     CmdResult::BlockZPop {
         keys: owned_keys,
@@ -1507,11 +1501,10 @@ pub fn cmd_bzmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
         resp::write_error(out, "ERR wrong number of arguments for 'bzmpop' command");
         return CmdResult::Written;
     }
-    let timeout_secs: f64 = arg_str(args[1]).parse().unwrap_or(-1.0);
-    if timeout_secs < 0.0 {
-        resp::write_error(out, "ERR timeout is not a float or out of range");
-        return CmdResult::Written;
-    }
+    let timeout = match parse_block_timeout(args[1], out) {
+        Some(timeout) => timeout,
+        None => return CmdResult::Written,
+    };
     let numkeys = match parse_zstore_numkeys(args[2], out) {
         Some(n) => n,
         None => return CmdResult::Written,
@@ -1558,11 +1551,6 @@ pub fn cmd_bzmpop(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
             return CmdResult::Written;
         }
     }
-    let timeout = if timeout_secs <= 0.0 {
-        Duration::from_secs(300)
-    } else {
-        Duration::from_secs_f64(timeout_secs)
-    };
     let owned_keys: Vec<String> = keys.iter().map(|k| arg_str(k).to_string()).collect();
     CmdResult::BlockZMPop {
         keys: owned_keys,

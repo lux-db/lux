@@ -128,6 +128,69 @@ when another device or development environment must reach them. Non-loopback
 bindings expose the engine and Studio's scoped management session, so they are
 intended for trusted networks and explicit port-forwarding setups.
 
+### Project Engine configuration
+
+`lux/config.toml` may set local Engine capacity and deadline overrides without
+putting a wall of variables in the shell or application `.env` file:
+
+```toml
+[engine.limits]
+resp_connections = 1024
+http_connections = 1024
+query_candidates = 1_000_000
+request_buffer_bytes = "256mb"
+
+[engine.timeouts]
+resp_idle = "5m"
+http_body = "30s"
+write = "30s"
+```
+
+Omitted values use Engine defaults. Engine environment variables override the
+corresponding TOML values; explicit `lux start` flags continue to override the
+project's port and bind settings. Changing an Engine setting makes the next
+`lux start` gracefully recreate the container while preserving its data volume.
+Unknown Engine keys and invalid values fail before the running container is
+changed. Secrets do not belong in this file.
+
+Byte settings accept a positive integer or a string using `b`, `kb`/`kib`,
+`mb`/`mib`, or `gb`/`gib` binary units. Duration settings accept positive
+milliseconds or a string using `ms`, `s`, `m`, or `h`. `rows = 0` is the only
+zero value and removes the HTTP result-row cap; the independent query-work cap
+still applies.
+
+| `[engine.limits]` key | Engine setting |
+|---|---|
+| `rows` | Maximum HTTP query result rows |
+| `http_body_bytes` | Maximum HTTP request body |
+| `resp_request_bytes` | Maximum buffered RESP request |
+| `resp_connections` | Simultaneous RESP connections |
+| `http_connections` | Simultaneous HTTP connections, including WebSockets |
+| `blocked_clients` | Clients waiting in blocking commands |
+| `resp_pipeline_commands` | Commands in one RESP input batch or transaction |
+| `resp_command_args` | Arguments in one RESP command |
+| `resp_subscriptions` | Subscriptions on one RESP connection |
+| `subscription_name_bytes` | Bytes in one subscription name or pattern |
+| `live_subscriptions` | Live subscriptions on one WebSocket |
+| `process_subscriptions` | Broker registrations across network clients |
+| `query_candidates` | Candidate rows inspected by one query or join |
+| `blocking_keys` | Keys in one blocking command or watched session |
+| `resp_response_bytes` | Materialized RESP output batch |
+| `request_buffer_bytes` | Shared retained-request and realtime-input budget |
+| `response_buffer_bytes` | Shared pending socket-write budget |
+| `auth_workers` | Concurrent expensive app-auth operations |
+| `script_memory_bytes` | Heap available to one Lua VM |
+
+| `[engine.timeouts]` key | Deadline |
+|---|---|
+| `resp_idle` | Idle RESP connection |
+| `resp_request` | Incomplete RESP request |
+| `http_header` | HTTP request head |
+| `http_body` | HTTP request body |
+| `http_keep_alive` | Idle HTTP keep-alive connection |
+| `live_idle` | Live WebSocket without client traffic |
+| `write` | Socket write without progress |
+
 Existing engine and Studio containers never change versions implicitly during
 `lux start`. Start reports available image updates; `lux update engine` and
 `lux update studio` perform them explicitly. Local engine updates preserve the
