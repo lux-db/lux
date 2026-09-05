@@ -1440,6 +1440,23 @@ async fn send_auth_response(
     Ok(true)
 }
 
+#[cfg(feature = "fuzzing")]
+pub(crate) fn check_http_input(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, &text));
+    let (_, path, _) = parse_http_head(head);
+    let query = path
+        .split_once('?')
+        .map_or(text.as_ref(), |(_, query)| query);
+    let params = parse_query_string(query);
+    let _ = parse_http_table_query(&params, "items", Some(100));
+    let _ = parse_migration_request(body);
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        let _ = parse_live_table_spec(&value);
+        let _ = parse_live_vector_near_spec(&value);
+    }
+}
+
 fn parse_http_head(raw: &str) -> (String, String, Vec<(String, String)>) {
     let mut lines = raw.lines();
     let request_line = lines.next().unwrap_or("");

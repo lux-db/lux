@@ -1,6 +1,30 @@
 pub const HLL_REGISTERS: usize = 16384;
 const HLL_P: u32 = 14;
 
+pub(crate) fn read_registers(
+    reader: &mut impl std::io::Read,
+    len: usize,
+) -> std::io::Result<Vec<u8>> {
+    if len != HLL_REGISTERS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid HyperLogLog register count",
+        ));
+    }
+    let mut registers = vec![0; HLL_REGISTERS];
+    reader.read_exact(&mut registers)?;
+    if registers
+        .iter()
+        .any(|&value| value > (64 - HLL_P + 1) as u8)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid HyperLogLog register value",
+        ));
+    }
+    Ok(registers)
+}
+
 pub fn murmur_hash_64a(data: &[u8]) -> u64 {
     let seed: u64 = 0xadc83b19;
     let m: u64 = 0xc6a4a7935bd1e995;
@@ -116,6 +140,40 @@ pub fn hll_merge(dest: &mut [u8], src: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_registers_validate_shape_values_and_completeness() {
+        for len in [
+            0,
+            1,
+            HLL_REGISTERS - 1,
+            HLL_REGISTERS + 1,
+            u32::MAX as usize,
+        ] {
+            assert_eq!(
+                read_registers(&mut &[][..], len).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+        assert_eq!(
+            read_registers(&mut &[][..], HLL_REGISTERS)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        let mut data = vec![51; HLL_REGISTERS];
+        assert_eq!(
+            read_registers(&mut data.as_slice(), data.len()).unwrap(),
+            data
+        );
+        data[HLL_REGISTERS - 1] = 52;
+        assert_eq!(
+            read_registers(&mut data.as_slice(), data.len())
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
 
     #[test]
     fn known_hash_values() {
