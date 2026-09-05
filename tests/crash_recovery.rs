@@ -600,18 +600,29 @@ fn bzpopmin_blocked_completion_survives_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let n = 16usize;
     let port = srv.port();
+    let ready = Arc::new(Barrier::new(n + 1));
     let mut blockers = Vec::new();
     for i in 0..n {
+        let ready = ready.clone();
         let h = thread::spawn(move || {
             let mut b = common::connect(port);
+            b.set_read_timeout(Some(Duration::from_secs(7))).unwrap();
+            ready.wait();
             let z = format!("z{i}");
-            send(&mut b, &["BZPOPMIN", &z, "5"]);
+            let response = send(&mut b, &["BZPOPMIN", &z, "5"]);
+            assert!(
+                response.starts_with("*3\r\n"),
+                "BZPOPMIN for {z} was not satisfied: {response:?}"
+            );
         });
         blockers.push(h);
     }
     // BZPOPMIN polls rather than registering with the list-waiter broker, so
-    // there is no observable waiter count to synchronize on. Allow one full
-    // polling interval after every client has connected before producing data.
+    // there is no observable waiter count to synchronize on. Wait until every
+    // client is connected, then allow one full polling interval before producing
+    // data. The client timeout exceeds the command timeout so a missed wake is
+    // reported as a command failure rather than a socket timeout.
+    ready.wait();
     thread::sleep(Duration::from_millis(100));
     let mut c = srv.conn();
     for i in 0..n {

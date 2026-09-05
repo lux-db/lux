@@ -16,24 +16,34 @@ fn resp_command(args: &[&[u8]]) -> Vec<u8> {
     request
 }
 
-async fn read_quiet(socket: &mut TcpStream) -> Vec<u8> {
+async fn try_read_quiet(socket: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
         match tokio::time::timeout(Duration::from_millis(100), socket.read(&mut buf)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(count)) => response.extend_from_slice(&buf[..count]),
-            Ok(Err(error)) => panic!("socket read failed: {error}"),
+            Ok(Err(error)) => return Err(error),
             Err(_) => break,
         }
     }
-    response
+    Ok(response)
+}
+
+async fn read_quiet(socket: &mut TcpStream) -> Vec<u8> {
+    try_read_quiet(socket).await.expect("socket read failed")
+}
+
+async fn try_send_resp(address: SocketAddr, args: &[&[u8]]) -> std::io::Result<Vec<u8>> {
+    let mut socket = TcpStream::connect(address).await?;
+    socket.write_all(&resp_command(args)).await?;
+    try_read_quiet(&mut socket).await
 }
 
 async fn send_resp(address: SocketAddr, args: &[&[u8]]) -> Vec<u8> {
-    let mut socket = TcpStream::connect(address).await.unwrap();
-    socket.write_all(&resp_command(args)).await.unwrap();
-    read_quiet(&mut socket).await
+    try_send_resp(address, args)
+        .await
+        .expect("RESP request failed")
 }
 
 async fn read_http_response(socket: &mut TcpStream) -> Vec<u8> {
@@ -1430,7 +1440,10 @@ async fn slow_response_writer_is_evicted_and_connection_capacity_recovers() {
 
     let mut recovered = false;
     for _ in 0..20 {
-        if send_resp(address, &[b"PING"]).await == b"+PONG\r\n" {
+        if try_send_resp(address, &[b"PING"])
+            .await
+            .is_ok_and(|response| response == b"+PONG\r\n")
+        {
             recovered = true;
             break;
         }
