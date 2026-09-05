@@ -1,38 +1,120 @@
+#[path = "bin_support/logging.rs"]
+mod logging;
+
 fn main() -> std::process::ExitCode {
+    let log_config = (|| {
+        let level = optional_env("LUX_LOG_LEVEL")?;
+        let format = optional_env("LUX_LOG_FORMAT")?;
+        logging::Logger::parse(level.as_deref(), format.as_deref()).map_err(invalid_config)
+    })();
+    match log_config {
+        Ok(logger) => logging::init(logger),
+        Err(error) => {
+            eprintln!("lux: {error}");
+            return std::process::ExitCode::from(1);
+        }
+    }
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     runtime.enable_all();
-    if let Some(worker_threads) = runtime_threads_from_env() {
-        runtime.worker_threads(worker_threads);
+    match runtime_threads_from_env() {
+        Ok(Some(worker_threads)) => {
+            runtime.worker_threads(worker_threads);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            logging::failure("runtime_configuration_failed", &error);
+            return std::process::ExitCode::from(1);
+        }
     }
     let result = match runtime.build() {
         Ok(runtime) => runtime.block_on(async_main()),
         Err(error) => {
-            eprintln!("lux: failed to initialize async runtime: {error}");
+            logging::failure("runtime_initialization_failed", &error);
             return std::process::ExitCode::from(1);
         }
     };
     match result {
-        Ok(lux::ShutdownOutcome::Clean) => std::process::ExitCode::SUCCESS,
+        Ok(lux::ShutdownOutcome::Clean) => {
+            logging::emit(
+                logging::Level::Info,
+                "shutdown_completed",
+                serde_json::json!({}),
+            );
+            std::process::ExitCode::SUCCESS
+        }
         Ok(lux::ShutdownOutcome::Forced) => {
-            eprintln!("lux: graceful shutdown timed out; remaining work was cancelled");
+            logging::emit(
+                logging::Level::Error,
+                "shutdown_timeout",
+                serde_json::json!({"remaining_work_cancelled": true}),
+            );
             std::process::ExitCode::from(2)
         }
         Err(lux::ShutdownError::Persistence(error)) => {
-            eprintln!("lux: final persistence sync failed: {error}");
+            logging::failure("shutdown_persistence_failed", &error);
             std::process::ExitCode::from(3)
         }
         Err(lux::ShutdownError::Runtime(error)) => {
-            eprintln!("lux: {error}");
+            logging::failure("server_failed", &error);
             std::process::ExitCode::from(1)
         }
     }
 }
 
-fn runtime_threads_from_env() -> Option<usize> {
-    std::env::var("LUX_RUNTIME_THREADS")
+fn runtime_threads_from_env() -> std::io::Result<Option<usize>> {
+    optional_env("LUX_RUNTIME_THREADS")?
+        .map(|raw| parse_number("LUX_RUNTIME_THREADS", &raw, 1usize))
+        .transpose()
+}
+
+fn optional_env(name: &str) -> std::io::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(invalid_config(format!("{name} must be UTF-8")))
+        }
+    }
+}
+
+fn parse_number<T: std::str::FromStr + PartialOrd + std::fmt::Display>(
+    name: &str,
+    raw: &str,
+    minimum: T,
+) -> std::io::Result<T> {
+    raw.parse::<T>()
         .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 0)
+        .filter(|value| *value >= minimum)
+        .ok_or_else(|| {
+            invalid_config(format!(
+                "{name} must be an integer >= {minimum} within the supported range"
+            ))
+        })
+}
+
+fn number_env<T: std::str::FromStr + PartialOrd + std::fmt::Display>(
+    name: &str,
+    default: T,
+    minimum: T,
+) -> std::io::Result<T> {
+    match optional_env(name)? {
+        Some(raw) => parse_number(name, &raw, minimum),
+        None => Ok(default),
+    }
+}
+
+fn parse_bool(name: &str, raw: &str) -> std::io::Result<bool> {
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(invalid_config(format!(
+            "{name} must be true, false, 1, or 0"
+        ))),
+    }
+}
+
+fn bool_env(name: &str, default: bool) -> std::io::Result<bool> {
+    optional_env(name)?.map_or(Ok(default), |raw| parse_bool(name, &raw))
 }
 
 fn invalid_config(message: impl Into<String>) -> std::io::Error {
@@ -136,21 +218,15 @@ fn parse_durability(
 }
 
 async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
-    let password = std::env::var("LUX_PASSWORD").unwrap_or_default();
-    let restricted = std::env::var("LUX_RESTRICTED").is_ok_and(|v| {
-        let v = v.to_ascii_lowercase();
-        v == "1" || v == "true"
-    });
+    let password = optional_env("LUX_PASSWORD")?.unwrap_or_default();
+    let restricted = bool_env("LUX_RESTRICTED", false)?;
     let require_auth = !password.is_empty();
 
-    let shards = std::env::var("LUX_SHARDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(lux::default_shard_count);
+    let shards = number_env("LUX_SHARDS", lux::default_shard_count(), 1usize)?;
 
-    let data_dir = std::env::var("LUX_DATA_DIR").unwrap_or_else(|_| ".".to_string());
-    let storage_mode = parse_storage_mode(std::env::var("LUX_STORAGE_MODE").ok())?;
-    let storage_dir_env = std::env::var("LUX_STORAGE_DIR").ok();
+    let data_dir = optional_env("LUX_DATA_DIR")?.unwrap_or_else(|| ".".to_string());
+    let storage_mode = parse_storage_mode(optional_env("LUX_STORAGE_MODE")?)?;
+    let storage_dir_env = optional_env("LUX_STORAGE_DIR")?;
     if storage_mode == lux::StorageMode::Memory && storage_dir_env.is_some() {
         return Err(
             invalid_config("LUX_STORAGE_DIR is valid only when LUX_STORAGE_MODE=tiered").into(),
@@ -159,40 +235,25 @@ async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
     let storage_dir =
         storage_dir_env.unwrap_or_else(|| format!("{}/storage", data_dir.trim_end_matches('/')));
     let durability = parse_durability(
-        std::env::var("LUX_DURABILITY").ok(),
-        std::env::var("LUX_DURABILITY_SYNC_INTERVAL_MS").ok(),
+        optional_env("LUX_DURABILITY")?,
+        optional_env("LUX_DURABILITY_SYNC_INTERVAL_MS")?,
     )?;
-    let save_interval_secs = std::env::var("LUX_SAVE_INTERVAL")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60);
+    let save_interval_secs = number_env("LUX_SAVE_INTERVAL", 60u64, 0)?;
 
-    let eviction_max_memory = std::env::var("LUX_MAXMEMORY")
-        .ok()
-        .as_deref()
-        .and_then(lux::parse_memory_size)
-        .unwrap_or(0);
-    let eviction_policy = std::env::var("LUX_MAXMEMORY_POLICY")
-        .ok()
-        .map(|s| lux::parse_eviction_policy(&s))
-        .unwrap_or(lux::EvictionPolicy::NoEviction);
-    let eviction_sample_size = std::env::var("LUX_MAXMEMORY_SAMPLES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5usize);
-    let auth_enabled = std::env::var("LUX_AUTH_ENABLED").is_ok_and(|v| {
-        let v = v.to_ascii_lowercase();
-        v == "1" || v == "true"
-    });
-    let auth_access_token_ttl = std::env::var("LUX_AUTH_ACCESS_TOKEN_TTL")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3600);
-    let auth_refresh_token_ttl = std::env::var("LUX_AUTH_REFRESH_TOKEN_TTL")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30 * 24 * 60 * 60);
-    let managed_email = managed_auth_email_from_env();
+    let eviction_max_memory = optional_env("LUX_MAXMEMORY")?.map_or(Ok(0), |raw| {
+        lux::parse_memory_size(&raw).ok_or_else(|| invalid_config("LUX_MAXMEMORY must be a byte count or a supported memory size within the supported range"))
+    })?;
+    let eviction_policy = optional_env("LUX_MAXMEMORY_POLICY")?.map_or(Ok(lux::EvictionPolicy::NoEviction), |raw| {
+        match raw.to_ascii_lowercase().as_str() {
+            "noeviction" | "allkeys-lru" | "volatile-lru" | "allkeys-random" | "volatile-random" => Ok(lux::parse_eviction_policy(&raw)),
+            _ => Err(invalid_config("LUX_MAXMEMORY_POLICY must be noeviction, allkeys-lru, volatile-lru, allkeys-random, or volatile-random")),
+        }
+    })?;
+    let eviction_sample_size = number_env("LUX_MAXMEMORY_SAMPLES", 5usize, 1)?;
+    let auth_enabled = bool_env("LUX_AUTH_ENABLED", false)?;
+    let auth_access_token_ttl = number_env("LUX_AUTH_ACCESS_TOKEN_TTL", 3600u64, 1)?;
+    let auth_refresh_token_ttl = number_env("LUX_AUTH_REFRESH_TOKEN_TTL", 30u64 * 24 * 60 * 60, 1)?;
+    let managed_email = managed_auth_email_from_env()?;
 
     let encryption = encryption_config_from_env()?;
     let default_limits = lux::ServerLimits::default();
@@ -200,11 +261,8 @@ async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
     // `site_url` and `issuer` default to the address this engine actually serves
     // HTTP on. They used to hardcode port 7379, which is not the RESP port, the
     // HTTP port, or the Studio port -- a default that looked derived and was not.
-    let auth_http_port = std::env::var("LUX_HTTP_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .filter(|port| *port != 0)
-        .unwrap_or(5890);
+    let http_port = number_env("LUX_HTTP_PORT", 0u16, 0)?;
+    let auth_http_port = if http_port == 0 { 5890 } else { http_port };
     let auth_base_url = format!("http://localhost:{auth_http_port}");
     let studio_session_ttl = match std::env::var("LUX_STUDIO_SESSION_TTL_SECONDS") {
         Ok(value) => std::time::Duration::from_secs(value.parse::<u64>().map_err(|_| {
@@ -217,20 +275,13 @@ async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
     };
 
     let config = lux::ServerConfig {
-        bind_host: std::env::var("LUX_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
-        port: std::env::var("LUX_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6379),
-        http_port: std::env::var("LUX_HTTP_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0),
+        bind_host: optional_env("LUX_BIND_HOST")?.unwrap_or_else(|| "127.0.0.1".to_string()),
+        port: number_env("LUX_PORT", 6379u16, 0)?,
+        http_port,
         max_rows: optional_limit_env("LUX_MAX_ROWS", 10_000)?,
         max_body: positive_usize_env("LUX_MAX_BODY_SIZE", 64 * 1024 * 1024)?,
         http_browser: lux::HttpBrowserConfig {
-            allowed_hosts: std::env::var("LUX_HTTP_ALLOWED_HOSTS")
-                .ok()
+            allowed_hosts: optional_env("LUX_HTTP_ALLOWED_HOSTS")?
                 .map(|value| {
                     value
                         .split(',')
@@ -240,8 +291,7 @@ async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
                         .collect()
                 })
                 .unwrap_or_default(),
-            allowed_origins: std::env::var("LUX_HTTP_ALLOWED_ORIGINS")
-                .ok()
+            allowed_origins: optional_env("LUX_HTTP_ALLOWED_ORIGINS")?
                 .map(|value| {
                     value
                         .split(',')
@@ -350,15 +400,9 @@ async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
         },
         password,
         require_auth,
-        allow_insecure_no_auth: std::env::var("LUX_ALLOW_INSECURE_NO_AUTH").is_ok_and(|v| {
-            let v = v.to_ascii_lowercase();
-            v == "1" || v == "true"
-        }),
+        allow_insecure_no_auth: bool_env("LUX_ALLOW_INSECURE_NO_AUTH", false)?,
         restricted,
-        enable_resp: std::env::var("LUX_ENABLE_RESP").map_or(true, |v| {
-            let v = v.to_ascii_lowercase();
-            !(v == "0" || v == "false")
-        }),
+        enable_resp: bool_env("LUX_ENABLE_RESP", true)?,
         shards,
         data_dir,
         save_interval: std::time::Duration::from_secs(save_interval_secs),
@@ -374,40 +418,28 @@ async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
         },
         auth: lux::AuthConfig {
             enabled: auth_enabled,
-            issuer: std::env::var("LUX_AUTH_ISSUER")
-                .unwrap_or_else(|_| format!("{auth_base_url}/auth/v1")),
+            issuer: optional_env("LUX_AUTH_ISSUER")?
+                .unwrap_or_else(|| format!("{auth_base_url}/auth/v1")),
             access_token_ttl: std::time::Duration::from_secs(auth_access_token_ttl),
             refresh_token_ttl: std::time::Duration::from_secs(auth_refresh_token_ttl),
-            email_password_enabled: std::env::var("LUX_AUTH_EMAIL_PASSWORD").map_or(true, |v| {
-                let v = v.to_ascii_lowercase();
-                !(v == "0" || v == "false")
-            }),
-            email_confirmation_required: std::env::var("LUX_AUTH_EMAIL_CONFIRMATION_REQUIRED")
-                .is_ok_and(|v| {
-                    let v = v.to_ascii_lowercase();
-                    v == "1" || v == "true"
-                }),
-            anonymous_enabled: std::env::var("LUX_AUTH_ANONYMOUS").map_or(true, |v| {
-                let v = v.to_ascii_lowercase();
-                !(v == "0" || v == "false")
-            }),
-            flow_token_ttl: std::time::Duration::from_secs(
-                std::env::var("LUX_AUTH_FLOW_TOKEN_TTL_SECONDS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(24 * 60 * 60),
-            ),
-            site_url: std::env::var("LUX_AUTH_SITE_URL").unwrap_or_else(|_| auth_base_url.clone()),
-            initial_publishable_key: std::env::var("LUX_AUTH_PUBLISHABLE_KEY").ok(),
-            initial_secret_key: std::env::var("LUX_AUTH_SECRET_KEY").ok(),
+            email_password_enabled: bool_env("LUX_AUTH_EMAIL_PASSWORD", true)?,
+            email_confirmation_required: bool_env("LUX_AUTH_EMAIL_CONFIRMATION_REQUIRED", false)?,
+            anonymous_enabled: bool_env("LUX_AUTH_ANONYMOUS", true)?,
+            flow_token_ttl: std::time::Duration::from_secs(number_env(
+                "LUX_AUTH_FLOW_TOKEN_TTL_SECONDS",
+                24u64 * 60 * 60,
+                1,
+            )?),
+            site_url: optional_env("LUX_AUTH_SITE_URL")?.unwrap_or_else(|| auth_base_url.clone()),
+            initial_publishable_key: optional_env("LUX_AUTH_PUBLISHABLE_KEY")?,
+            initial_secret_key: optional_env("LUX_AUTH_SECRET_KEY")?,
             managed_email,
         },
         encryption,
-        // The library is quiet by default; the binary maps severity-specific
-        // callbacks back to the previous stdout/stderr behavior.
-        on_info: Some(std::sync::Arc::new(print_info_event)),
-        on_warn: Some(std::sync::Arc::new(print_warn_event)),
-        on_error: Some(std::sync::Arc::new(print_error_event)),
+        // Embedded callers remain quiet unless they install callbacks.
+        on_info: Some(std::sync::Arc::new(logging::info)),
+        on_warn: Some(std::sync::Arc::new(logging::warn)),
+        on_error: Some(std::sync::Arc::new(logging::error)),
     };
 
     let shutdown_timeout = shutdown_timeout_from_env()?;
@@ -417,16 +449,47 @@ async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
     // back to an ungraceful process termination.
     let signal = shutdown_signal()?;
     let signal_task = tokio::spawn(signal);
+    logging::emit(
+        logging::Level::Debug,
+        "effective_configuration",
+        serde_json::json!({
+            "resp_enabled": config.enable_resp,
+            "resp_port": config.port,
+            "http_port": config.http_port,
+            "shards": config.shards,
+            "storage_layout": config.storage.mode.as_str(),
+            "durability": config.durability.policy.as_str(),
+            "auth_enabled": config.auth.enabled,
+            "operator_auth_configured": config.require_auth,
+            "restricted": config.restricted,
+            "max_memory": config.eviction.max_memory,
+            "max_resp_connections": config.limits.max_resp_connections,
+            "max_http_connections": config.limits.max_http_connections,
+            "max_body_size": config.max_body,
+            "max_rows": config.max_rows,
+            "shutdown_timeout_ms": shutdown_timeout.as_millis(),
+        }),
+    );
+    logging::emit(
+        logging::Level::Info,
+        "startup_started",
+        serde_json::json!({"version": env!("CARGO_PKG_VERSION")}),
+    );
     let handle = lux::run_with_config(config).await?;
-    if let Some(addr) = handle.local_addr() {
-        println!("lux v{} ready on {}", env!("CARGO_PKG_VERSION"), addr);
-    } else {
-        println!("lux v{} ready", env!("CARGO_PKG_VERSION"));
-    }
+    logging::emit(
+        logging::Level::Info,
+        "server_ready",
+        serde_json::json!({"address": handle.local_addr().map(|addr| addr.to_string())}),
+    );
     handle
         .wait_or_shutdown(
             async move {
                 let _ = signal_task.await;
+                logging::emit(
+                    logging::Level::Info,
+                    "shutdown_started",
+                    serde_json::json!({}),
+                );
             },
             shutdown_timeout,
         )
@@ -434,7 +497,7 @@ async fn async_main() -> Result<lux::ShutdownOutcome, lux::ShutdownError> {
 }
 
 fn shutdown_timeout_from_env() -> std::io::Result<std::time::Duration> {
-    parse_shutdown_timeout(std::env::var("LUX_SHUTDOWN_TIMEOUT_MS").ok().as_deref())
+    parse_shutdown_timeout(optional_env("LUX_SHUTDOWN_TIMEOUT_MS")?.as_deref())
 }
 
 fn parse_shutdown_timeout(raw: Option<&str>) -> std::io::Result<std::time::Duration> {
@@ -470,18 +533,15 @@ fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
 fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     Ok(async {
         if let Err(error) = tokio::signal::ctrl_c().await {
-            eprintln!("lux: failed while waiting for interrupt signal: {error}");
+            logging::failure("interrupt_wait_failed", &error);
         }
     })
 }
 
 fn encryption_config_from_env() -> std::io::Result<lux::EncryptionConfig> {
-    let state_path = std::env::var("LUX_ENC_STATE_PATH").ok();
-    let seal_path = std::env::var("LUX_ENC_SEAL_PATH").ok();
-    let auto_init = std::env::var("LUX_ENC_AUTO_INIT").is_ok_and(|value| {
-        let value = value.to_ascii_lowercase();
-        value == "1" || value == "true"
-    });
+    let state_path = optional_env("LUX_ENC_STATE_PATH")?;
+    let seal_path = optional_env("LUX_ENC_SEAL_PATH")?;
+    let auto_init = bool_env("LUX_ENC_AUTO_INIT", false)?;
     let seal_secret = parse_seal_env("LUX_ENC_SEAL_KEY")
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let previous_seal_secrets = parse_seal_list_env("LUX_ENC_SEAL_KEY_PREVIOUS")
@@ -494,17 +554,23 @@ fn encryption_config_from_env() -> std::io::Result<lux::EncryptionConfig> {
         || std::env::var("LUX_ENCRYPTION_KEYS").is_ok()
         || std::env::var("LUX_ENCRYPTION_KEY").is_ok();
     if seal_secret.is_none() && encryption_in_use {
-        eprintln!(
-            "lux: warning: encryption seal key is stored on the data volume; \
-             a stolen disk or backup carries the key. Set LUX_ENC_SEAL_KEY \
-             (base64 of 32 bytes) from your secret store."
+        logging::emit(
+            logging::Level::Warn,
+            "encryption_seal_on_data_volume",
+            serde_json::json!({"action": "set LUX_ENC_SEAL_KEY from your secret store so backups do not carry the seal key"}),
         );
     }
 
-    if let Ok(raw) = std::env::var("LUX_ENCRYPTION_KEYS") {
-        let mut config =
-            parse_encryption_keys_json(&raw, std::env::var("LUX_ENCRYPTION_KEY_ID").ok())
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error));
+    let keys_json = optional_env("LUX_ENCRYPTION_KEYS")?;
+    let single_key = optional_env("LUX_ENCRYPTION_KEY")?;
+    if keys_json.is_some() && single_key.is_some() {
+        return Err(invalid_config(
+            "configure only one of LUX_ENCRYPTION_KEYS and LUX_ENCRYPTION_KEY",
+        ));
+    }
+    if let Some(raw) = keys_json {
+        let mut config = parse_encryption_keys_json(&raw, optional_env("LUX_ENCRYPTION_KEY_ID")?)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error));
         if let Ok(config) = &mut config {
             config.state_path = state_path;
             config.seal_path = seal_path;
@@ -515,7 +581,7 @@ fn encryption_config_from_env() -> std::io::Result<lux::EncryptionConfig> {
         return config;
     }
 
-    let Some(secret) = std::env::var("LUX_ENCRYPTION_KEY").ok() else {
+    let Some(secret) = single_key else {
         return Ok(lux::EncryptionConfig {
             state_path,
             seal_path,
@@ -525,7 +591,7 @@ fn encryption_config_from_env() -> std::io::Result<lux::EncryptionConfig> {
             ..Default::default()
         });
     };
-    let id = std::env::var("LUX_ENCRYPTION_KEY_ID").unwrap_or_else(|_| "local".to_string());
+    let id = optional_env("LUX_ENCRYPTION_KEY_ID")?.unwrap_or_else(|| "local".to_string());
     Ok(lux::EncryptionConfig {
         active_key_id: Some(id.clone()),
         keys: vec![lux::EncryptionKeyConfig {
@@ -545,15 +611,15 @@ fn encryption_config_from_env() -> std::io::Result<lux::EncryptionConfig> {
 /// malformed / wrong length -> hard error (fail closed rather than silently
 /// falling back to a disk seal).
 fn parse_seal_env(name: &str) -> Result<Option<[u8; 32]>, String> {
-    match std::env::var(name) {
-        Ok(raw) if !raw.trim().is_empty() => Ok(Some(decode_seal_value(name, raw.trim())?)),
-        _ => Ok(None),
+    match optional_env(name).map_err(|error| error.to_string())? {
+        Some(raw) => Ok(Some(decode_seal_value(name, raw.trim())?)),
+        None => Ok(None),
     }
 }
 
 /// Decode a comma-separated list of base64 seals (previous/rotated-out keys).
 fn parse_seal_list_env(name: &str) -> Result<Vec<[u8; 32]>, String> {
-    let Ok(raw) = std::env::var(name) else {
+    let Some(raw) = optional_env(name).map_err(|error| error.to_string())? else {
         return Ok(Vec::new());
     };
     raw.split(',')
@@ -584,6 +650,33 @@ fn parse_encryption_keys_json(
         .ok_or_else(|| "LUX_ENCRYPTION_KEYS must be a JSON array".to_string())?;
     let mut keys = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
+        let object = item
+            .as_object()
+            .ok_or_else(|| format!("LUX_ENCRYPTION_KEYS[{idx}] must be an object"))?;
+        if object.keys().any(|name| {
+            !matches!(
+                name.as_str(),
+                "id" | "secret" | "decryptOnly" | "decrypt_only"
+            )
+        }) {
+            return Err(format!(
+                "LUX_ENCRYPTION_KEYS[{idx}] contains an unknown field"
+            ));
+        }
+        let mut decrypt_only = None;
+        for name in ["decryptOnly", "decrypt_only"] {
+            if let Some(value) = item.get(name) {
+                let value = value.as_bool().ok_or_else(|| {
+                    format!("LUX_ENCRYPTION_KEYS[{idx}].{name} must be a boolean")
+                })?;
+                if decrypt_only.is_some_and(|previous| previous != value) {
+                    return Err(format!(
+                        "LUX_ENCRYPTION_KEYS[{idx}] contains contradictory decrypt-only settings"
+                    ));
+                }
+                decrypt_only = Some(value);
+            }
+        }
         let id = item
             .get("id")
             .and_then(|v| v.as_str())
@@ -599,11 +692,7 @@ fn parse_encryption_keys_json(
         keys.push(lux::EncryptionKeyConfig {
             id: id.to_string(),
             secret: secret.as_bytes().to_vec(),
-            decrypt_only: item
-                .get("decryptOnly")
-                .or_else(|| item.get("decrypt_only"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            decrypt_only: decrypt_only.unwrap_or(false),
         });
     }
     let active_key_id = active_key_id.or_else(|| {
@@ -620,10 +709,7 @@ fn parse_encryption_keys_json(
         keys,
         state_path: std::env::var("LUX_ENC_STATE_PATH").ok(),
         seal_path: std::env::var("LUX_ENC_SEAL_PATH").ok(),
-        auto_init: std::env::var("LUX_ENC_AUTO_INIT").is_ok_and(|value| {
-            let value = value.to_ascii_lowercase();
-            value == "1" || value == "true"
-        }),
+        auto_init: bool_env("LUX_ENC_AUTO_INIT", false).map_err(|error| error.to_string())?,
         // Filled in by the caller from LUX_ENC_SEAL_KEY / _PREVIOUS.
         seal_secret: None,
         previous_seal_secrets: Vec::new(),
@@ -631,127 +717,45 @@ fn parse_encryption_keys_json(
     Ok(config)
 }
 
-fn managed_auth_email_from_env() -> Option<lux::AuthManagedEmailConfig> {
-    let token = std::env::var("LUX_AUTH_MANAGED_POSTMARK_SERVER_TOKEN").ok();
-    let provider = std::env::var("LUX_AUTH_MANAGED_EMAIL_PROVIDER")
-        .ok()
-        .or_else(|| token.as_ref().map(|_| "postmark".to_string()))?;
-    let from = std::env::var("LUX_AUTH_MANAGED_EMAIL_FROM").ok()?;
-    Some(lux::AuthManagedEmailConfig {
+fn managed_auth_email_from_env() -> std::io::Result<Option<lux::AuthManagedEmailConfig>> {
+    let token = optional_env("LUX_AUTH_MANAGED_POSTMARK_SERVER_TOKEN")?;
+    let provider = optional_env("LUX_AUTH_MANAGED_EMAIL_PROVIDER")?
+        .or_else(|| token.as_ref().map(|_| "postmark".to_string()));
+    let from = optional_env("LUX_AUTH_MANAGED_EMAIL_FROM")?;
+    let reply_to = optional_env("LUX_AUTH_MANAGED_EMAIL_REPLY_TO")?;
+    let postmark_message_stream = optional_env("LUX_AUTH_MANAGED_POSTMARK_MESSAGE_STREAM")?;
+    if provider.is_none()
+        && from.is_none()
+        && reply_to.is_none()
+        && postmark_message_stream.is_none()
+    {
+        return Ok(None);
+    }
+    let provider = provider.ok_or_else(|| {
+        invalid_config("LUX_AUTH_MANAGED_EMAIL_PROVIDER is required for managed email")
+    })?;
+    if provider != "postmark" {
+        return Err(invalid_config(
+            "LUX_AUTH_MANAGED_EMAIL_PROVIDER must be postmark",
+        ));
+    }
+    let from = from
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            invalid_config("LUX_AUTH_MANAGED_EMAIL_FROM is required for managed email")
+        })?;
+    if token.as_ref().is_none_or(|value| value.trim().is_empty()) {
+        return Err(invalid_config(
+            "LUX_AUTH_MANAGED_POSTMARK_SERVER_TOKEN is required for managed email",
+        ));
+    }
+    Ok(Some(lux::AuthManagedEmailConfig {
         provider,
         from,
-        reply_to: std::env::var("LUX_AUTH_MANAGED_EMAIL_REPLY_TO").ok(),
+        reply_to,
         postmark_server_token: token,
-        postmark_message_stream: std::env::var("LUX_AUTH_MANAGED_POSTMARK_MESSAGE_STREAM").ok(),
-    })
-}
-
-fn print_info_event(event: lux::ServerInfoEvent) {
-    match event {
-        lux::ServerInfoEvent::PersistenceConfigured {
-            storage_layout,
-            durability,
-            sync_interval_ms,
-        } => match sync_interval_ms {
-            Some(interval) => println!(
-                "persistence: layout={}, durability={} (sync interval: {}ms)",
-                storage_layout.as_str(),
-                durability.as_str(),
-                interval
-            ),
-            None => println!(
-                "persistence: layout={}, durability={}",
-                storage_layout.as_str(),
-                durability.as_str()
-            ),
-        },
-        lux::ServerInfoEvent::TieredStorageEnabled { dir } => {
-            println!("storage: tiered mode (dir: {dir})");
-        }
-        lux::ServerInfoEvent::NoSnapshotFound => {
-            println!("no snapshot found");
-        }
-        lux::ServerInfoEvent::SnapshotLoaded { keys } => {
-            println!("loaded {keys} keys from snapshot");
-        }
-        lux::ServerInfoEvent::SnapshotSaved { keys } => {
-            println!("snapshot: saved {keys} keys");
-        }
-        lux::ServerInfoEvent::WalReplayed { commands } => {
-            println!("wal: replayed {commands} commands");
-        }
-        lux::ServerInfoEvent::HttpReady { addr } => {
-            println!("lux http api ready on {addr}");
-        }
-    }
-}
-
-fn print_warn_event(event: lux::ServerWarnEvent) {
-    match event {
-        lux::ServerWarnEvent::AuthSecretStorageDegraded => {
-            eprintln!(
-                "auth: development-only plaintext memory mode; this Auth state cannot be exported and will be discarded on restart; configure Lux encryption before restarting or using persistent durability"
-            );
-        }
-        lux::ServerWarnEvent::DiskCorruptedEntrySkipped { offset, .. } => {
-            eprintln!("disk: corrupted entry at offset {offset} (crc mismatch), skipping");
-        }
-        lux::ServerWarnEvent::DiskEntryParseFailed { offset, error, .. } => {
-            eprintln!("disk: failed to parse entry at offset {offset}: {error}");
-        }
-        lux::ServerWarnEvent::DiskCorruptedEntriesSkipped { entries, .. } => {
-            eprintln!("disk: skipped {entries} corrupted entry/entries during index rebuild");
-        }
-        lux::ServerWarnEvent::ConnectionFailed { peer, error } => {
-            eprintln!("connection error {peer}: {error}");
-        }
-    }
-}
-
-fn print_error_event(event: lux::ServerErrorEvent) {
-    match event {
-        lux::ServerErrorEvent::SnapshotLoadFailed { error } => {
-            eprintln!("snapshot load error: {error}");
-        }
-        lux::ServerErrorEvent::SnapshotSaveFailed { error, path } => {
-            eprintln!("snapshot error: {error} (path: {path})");
-        }
-        lux::ServerErrorEvent::WalReplayFailed { shard, error } => {
-            eprintln!("WAL replay error (shard {shard}): {error}");
-        }
-        lux::ServerErrorEvent::WalTruncateFailed { error } => {
-            eprintln!("WAL truncate error: {error}");
-        }
-        lux::ServerErrorEvent::DiskEvictionWriteFailed { key, error } => {
-            eprintln!(
-                "CRITICAL: disk eviction write failed for key '{}', keeping in memory: {error}",
-                key
-            );
-        }
-        lux::ServerErrorEvent::DiskPromotionReadFailed { key, error } => {
-            eprintln!("CRITICAL: failed to promote cold key '{key}'; entry retained: {error}");
-        }
-        lux::ServerErrorEvent::InlineCompactionFailed { error } => {
-            eprintln!("inline compaction error: {error}");
-        }
-        lux::ServerErrorEvent::DiskCompactionFailed { shard, error } => {
-            eprintln!("compaction error (shard {shard}): {error}");
-        }
-        lux::ServerErrorEvent::WalAppendFailed { error } => {
-            eprintln!("CRITICAL: WAL append failed, mutation was rejected: {error}");
-        }
-        lux::ServerErrorEvent::SnapshotDiskDumpFailed { error } => {
-            eprintln!("CRITICAL: failed to dump disk shard; snapshot aborted: {error}");
-        }
-        lux::ServerErrorEvent::WalFsyncFailed { error } => {
-            eprintln!(
-                "CRITICAL: WAL fsync failed; durability is degraded until synchronization succeeds: {error}"
-            );
-        }
-        lux::ServerErrorEvent::HttpServerFailed { error } => {
-            eprintln!("http server error: {error}");
-        }
-    }
+        postmark_message_stream,
+    }))
 }
 
 #[cfg(test)]
@@ -760,6 +764,31 @@ mod tests {
         decode_seal_value, parse_durability, parse_encryption_keys_json, parse_shutdown_timeout,
         parse_storage_mode,
     };
+
+    #[test]
+    fn numeric_configuration_rejects_malformed_and_out_of_range_values() {
+        for raw in ["", "no", "-1", "1.5", "65536", "18446744073709551616"] {
+            assert!(super::parse_number("port", raw, 0u16).is_err());
+        }
+        assert_eq!(super::parse_number("port", "0", 0u16).unwrap(), 0);
+        assert_eq!(super::parse_number("port", "65535", 0u16).unwrap(), 65535);
+        assert!(super::parse_number("threads", "0", 1usize).is_err());
+        assert_eq!(super::parse_number("threads", "2", 1usize).unwrap(), 2);
+    }
+
+    #[test]
+    fn boolean_configuration_is_explicit_and_does_not_echo_values() {
+        for raw in ["true", "TRUE", "1"] {
+            assert!(super::parse_bool("setting", raw).unwrap());
+        }
+        for raw in ["false", "FALSE", "0"] {
+            assert!(!super::parse_bool("setting", raw).unwrap());
+        }
+        for raw in ["", "yes", "tru", "private-value"] {
+            let error = super::parse_bool("setting", raw).unwrap_err().to_string();
+            assert_eq!(error, "setting must be true, false, 1, or 0");
+        }
+    }
 
     #[test]
     fn decode_seal_value_requires_base64_of_32_bytes() {
@@ -820,6 +849,22 @@ mod tests {
 
         let always = parse_durability(Some("always_sync".to_string()), None).unwrap();
         assert_eq!(always.policy, lux::DurabilityPolicy::AlwaysSync);
+    }
+
+    #[test]
+    fn encryption_bootstrap_rejects_unknown_and_contradictory_fields() {
+        for raw in [
+            r#"[{"id":"key","secret":"value","decrypt_onyl":true}]"#,
+            r#"[{"id":"key","secret":"value","decrypt_only":"true"}]"#,
+            r#"[{"id":"key","secret":"value","decrypt_only":false,"decryptOnly":true}]"#,
+        ] {
+            assert!(parse_encryption_keys_json(raw, None).is_err());
+        }
+        assert!(parse_encryption_keys_json(
+            r#"[{"id":"key","secret":"value","decrypt_only":false,"decryptOnly":false}]"#,
+            None
+        )
+        .is_ok());
     }
 
     #[test]

@@ -114,15 +114,67 @@ struct LiveClientContext<'a> {
 #[derive(Default)]
 struct HttpResponseContext {
     cors_origin: Option<String>,
+    diagnostic: Option<HttpDiagnostic>,
+}
+
+struct HttpDiagnostic {
+    store: Arc<Store>,
+    request_id: usize,
+    started: Instant,
+    operation: &'static str,
+    status: std::sync::atomic::AtomicU16,
+}
+
+impl Drop for HttpDiagnostic {
+    fn drop(&mut self) {
+        let elapsed_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let status = self.status.load(std::sync::atomic::Ordering::Relaxed);
+        let failed = status == 0 || status >= 500;
+        if self.operation != "live"
+            && (elapsed_ms >= 1000 || failed)
+            && self.store.config().on_warn.is_some()
+            && self.store.allow_slow_http_log()
+        {
+            let event = if failed {
+                crate::ServerWarnEvent::HttpRequestFailed {
+                    request_id: self.request_id,
+                    operation: self.operation,
+                    status,
+                    elapsed_ms,
+                }
+            } else {
+                crate::ServerWarnEvent::SlowHttpRequest {
+                    request_id: self.request_id,
+                    operation: self.operation,
+                    status,
+                    elapsed_ms,
+                }
+            };
+            crate::emit_warn(self.store.config(), event);
+        }
+    }
 }
 
 impl HttpResponseContext {
     fn cors_headers(&self) -> String {
-        self.cors_origin
+        let mut headers = self
+            .cors_origin
             .as_ref()
             .map_or_else(String::new, |origin| {
-                format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n")
-            })
+                format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\nAccess-Control-Expose-Headers: X-Lux-Request-Id, Content-Range, X-Lux-Snapshot-SHA256, X-Lux-Snapshot-Format\r\n")
+            });
+        if let Some(diagnostic) = &self.diagnostic {
+            headers.push_str(&format!("X-Lux-Request-Id: {}\r\n", diagnostic.request_id));
+        }
+        headers
+    }
+
+    fn record_status(&self, status: u16) {
+        if let Some(diagnostic) = &self.diagnostic {
+            diagnostic
+                .status
+                .store(status, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -534,7 +586,6 @@ async fn handle_request(
              {cors_headers}\
              Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
              Access-Control-Allow-Headers: Authorization, Content-Type, Prefer, apikey, X-Lux-Snapshot-SHA256\r\n\
-             Access-Control-Expose-Headers: Content-Range, X-Lux-Snapshot-SHA256, X-Lux-Snapshot-Format\r\n\
              Access-Control-Max-Age: 600\r\n\
              Content-Length: 0\r\n\r\n"
         );
@@ -547,6 +598,21 @@ async fn handle_request(
         None => (full_path.clone(), String::new()),
     };
     let params = parse_query_string(&query_string);
+    response.diagnostic = Some(HttpDiagnostic {
+        store: store.clone(),
+        request_id: store.next_http_request_id(),
+        started: Instant::now(),
+        operation: if path == "/live" {
+            "live"
+        } else if path.starts_with("/auth/") {
+            "auth"
+        } else if path.starts_with("/health/") {
+            "health"
+        } else {
+            "http"
+        },
+        status: std::sync::atomic::AtomicU16::new(0),
+    });
     let is_restore = method == "POST" && matches!(path.as_str(), "/v1/restore" | "/restore");
     // Restore is the only binary request surface. Do not lossy-decode and copy
     // a potentially large snapshot merely to parse the HTTP head.
@@ -562,6 +628,9 @@ async fn handle_request(
     // successful liveness response stronger than a bare process check.
     if method == "GET" && path == "/health/live" {
         return send_json(socket, 200, "OK", r#"{"status":"live"}"#, &response).await;
+    }
+    if method == "GET" && path == "/health/startup" {
+        return send_json(socket, 200, "OK", r#"{"status":"started"}"#, &response).await;
     }
     if method == "GET" && path == "/health/ready" {
         let (status, status_text, body) = health_readiness(store);
@@ -1203,13 +1272,13 @@ async fn stream_snapshot(
         )
         .await;
     }
+    response.record_status(200);
     let cors_headers = response.cors_headers();
     let header = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/octet-stream\r\n\
          Content-Disposition: attachment; filename=\"lux.dat\"\r\n\
          {cors_headers}\
-         Access-Control-Expose-Headers: X-Lux-Snapshot-SHA256, X-Lux-Snapshot-Format\r\n\
          X-Lux-Snapshot-SHA256: {}\r\n\
          X-Lux-Snapshot-Format: {}\r\n\
          Content-Length: {len}\r\n\r\n",
@@ -1340,6 +1409,7 @@ async fn stream_table_query(
             };
 
             let content_range = format!("{}-{}/{}", offset, range_end, total_str);
+            response.record_status(200);
             let cors_headers = response.cors_headers();
 
             const CHUNK_SIZE: usize = 65536;
@@ -1399,6 +1469,7 @@ async fn send_json(
     body: &str,
     context: &HttpResponseContext,
 ) -> std::io::Result<bool> {
+    context.record_status(status);
     let cors_headers = context.cors_headers();
     let head = format!(
         "HTTP/1.1 {status} {status_text}\r\n\
@@ -1417,6 +1488,7 @@ async fn send_auth_response(
     response: crate::auth::AuthHttpResponse,
     context: &HttpResponseContext,
 ) -> std::io::Result<bool> {
+    context.record_status(response.status);
     let cors_headers = context.cors_headers();
     let mut head = format!(
         "HTTP/1.1 {} {}\r\n\
@@ -4605,14 +4677,13 @@ fn persistence_json(store: &Store) -> Value {
 }
 
 fn health_readiness(store: &Store) -> (u16, &'static str, String) {
-    if store.ready_for_traffic() {
-        (200, "OK", r#"{"status":"ready"}"#.to_string())
-    } else {
-        (
+    match store.readiness_reason() {
+        None => (200, "OK", r#"{"status":"ready"}"#.to_string()),
+        Some(reason) => (
             503,
             "Service Unavailable",
-            r#"{"status":"not_ready"}"#.to_string(),
-        )
+            json!({"status": "not_ready", "reason": reason}).to_string(),
+        ),
     }
 }
 
@@ -7200,7 +7271,54 @@ mod tests {
         store.begin_shutdown();
         let (status, _, body) = health_readiness(&store);
         assert_eq!(status, 503);
-        assert_eq!(body, r#"{"status":"not_ready"}"#);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["reason"], "shutting_down");
+    }
+
+    #[test]
+    fn slow_http_events_are_bounded_and_exclude_live_sessions() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let config = crate::ServerConfig {
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::Ephemeral,
+                ..Default::default()
+            },
+            on_warn: Some(Arc::new(move |event| recorded.lock().unwrap().push(event))),
+            ..Default::default()
+        };
+        let store = Arc::new(Store::new_with_config(Arc::new(config)));
+        for (operation, age) in [("live", 2), ("http", 0)] {
+            drop(HttpDiagnostic {
+                store: store.clone(),
+                request_id: store.next_http_request_id(),
+                started: Instant::now() - std::time::Duration::from_secs(age),
+                operation,
+                status: std::sync::atomic::AtomicU16::new(200),
+            });
+        }
+        assert!(events.lock().unwrap().is_empty());
+        for _ in 0..32 {
+            drop(HttpDiagnostic {
+                store: store.clone(),
+                request_id: store.next_http_request_id(),
+                started: Instant::now() - std::time::Duration::from_secs(2),
+                operation: "http",
+                status: std::sync::atomic::AtomicU16::new(200),
+            });
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            crate::ServerWarnEvent::SlowHttpRequest {
+                request_id: 3,
+                status: 200,
+                operation: "http",
+                ..
+            }
+        ));
     }
 
     #[test]

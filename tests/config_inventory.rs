@@ -74,6 +74,8 @@ const RUNTIME_CONFIG: &[RuntimeConfig] = &[
     stable("LUX_HTTP_BODY_TIMEOUT_MS"),
     stable("LUX_HTTP_KEEP_ALIVE_TIMEOUT_MS"),
     stable("LUX_LIVE_IDLE_TIMEOUT_MS"),
+    stable("LUX_LOG_LEVEL"),
+    stable("LUX_LOG_FORMAT"),
     stable("LUX_WRITE_TIMEOUT_MS"),
     stable("LUX_PASSWORD"),
     stable("LUX_PORT"),

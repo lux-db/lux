@@ -532,6 +532,8 @@ pub(crate) struct StoreMetrics {
     rejected_response_buffers: AtomicUsize,
     connection_timeouts: AtomicUsize,
     total_commands: AtomicUsize,
+    http_request_sequence: AtomicUsize,
+    slow_http_log_second: AtomicUsize,
     key_count: AtomicUsize,
     persistence_err_wal_append: AtomicUsize,
     persistence_err_wal_fsync: AtomicUsize,
@@ -553,6 +555,8 @@ impl StoreMetrics {
             rejected_response_buffers: AtomicUsize::new(0),
             connection_timeouts: AtomicUsize::new(0),
             total_commands: AtomicUsize::new(0),
+            http_request_sequence: AtomicUsize::new(1),
+            slow_http_log_second: AtomicUsize::new(0),
             key_count: AtomicUsize::new(0),
             persistence_err_wal_append: AtomicUsize::new(0),
             persistence_err_wal_fsync: AtomicUsize::new(0),
@@ -2491,8 +2495,34 @@ impl Store {
 
     /// Whether this instance can safely accept normal traffic.
     pub(crate) fn ready_for_traffic(&self) -> bool {
-        self.accepting_mutations.load(Ordering::Acquire)
-            && !self.journal_poisoned.load(Ordering::Acquire)
+        self.readiness_reason().is_none()
+    }
+
+    pub(crate) fn next_http_request_id(&self) -> usize {
+        self.metrics
+            .http_request_sequence
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn allow_slow_http_log(&self) -> bool {
+        let second = self.metrics.start_time.elapsed().as_secs() as usize + 1;
+        self.metrics
+            .slow_http_log_second
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                (last < second).then_some(second)
+            })
+            .is_ok()
+    }
+
+    /// Fixed, secret-free reasons suitable for probes and INFO.
+    pub(crate) fn readiness_reason(&self) -> Option<&'static str> {
+        if !self.accepting_mutations.load(Ordering::Acquire) {
+            Some("shutting_down")
+        } else if self.journal_poisoned.load(Ordering::Acquire) {
+            Some("journal_unavailable")
+        } else {
+            None
+        }
     }
 
     pub(crate) fn ensure_journal_healthy(&self) -> std::io::Result<()> {
@@ -2901,6 +2931,9 @@ impl Store {
                 self.record_wal_append_error();
                 self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
                     error: error.to_string(),
+                    error_kind: error.kind(),
+                    os_error: error.raw_os_error(),
+                    restart_required: self.journal_poisoned.load(Ordering::Acquire),
                 });
                 return Err(std::io::Error::other(format!(
                     "failed to remove rejected WAL command: {error}"
@@ -3167,6 +3200,9 @@ impl Store {
             self.record_wal_append_error();
             self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
                 error: error.to_string(),
+                error_kind: error.kind(),
+                os_error: error.raw_os_error(),
+                restart_required: self.journal_poisoned.load(Ordering::Acquire),
             });
             return Err(error);
         }
@@ -3192,6 +3228,9 @@ impl Store {
             self.record_wal_append_error();
             self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
                 error: error.to_string(),
+                error_kind: error.kind(),
+                os_error: error.raw_os_error(),
+                restart_required: self.journal_poisoned.load(Ordering::Acquire),
             });
             return Err(match rollback_error {
                 Some(rollback_error) => std::io::Error::other(format!(
@@ -3209,6 +3248,9 @@ impl Store {
                 self.record_wal_fsync_error();
                 self.emit_error(crate::ServerErrorEvent::WalFsyncFailed {
                     error: error.to_string(),
+                    error_kind: error.kind(),
+                    os_error: error.raw_os_error(),
+                    restart_required: self.journal_poisoned.load(Ordering::Acquire),
                 });
                 return Err(match rollback_error {
                     Some(rollback_error) => std::io::Error::other(format!(
@@ -3463,6 +3505,9 @@ impl Store {
                 self.record_wal_fsync_error();
                 self.emit_error(crate::ServerErrorEvent::WalFsyncFailed {
                     error: e.to_string(),
+                    error_kind: e.kind(),
+                    os_error: e.raw_os_error(),
+                    restart_required: true,
                 });
                 return Err(e);
             }
@@ -8831,6 +8876,8 @@ mod tests {
         });
         let store = Store::new_with_config(config);
         store.poison_journal();
+
+        assert_eq!(store.readiness_reason(), Some("journal_unavailable"));
 
         let command: [&[u8]; 3] = [b"SET", b"unsafe", b"value"];
         let error = store

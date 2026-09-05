@@ -1651,6 +1651,8 @@ fn background_save_worker(
                 crate::ServerErrorEvent::SnapshotSaveFailed {
                     error: error.to_string(),
                     path: snapshot_path(&store),
+                    error_kind: error.kind(),
+                    os_error: error.raw_os_error(),
                 },
             ),
         }

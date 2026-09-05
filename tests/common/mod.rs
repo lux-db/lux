@@ -803,7 +803,7 @@ pub fn http_request_with_headers(
                     if headers
                         .to_lowercase()
                         .contains("transfer-encoding: chunked")
-                        && response.windows(5).any(|w| w == b"0\r\n\r\n")
+                        && chunked_body_complete(&response[header_end + 4..])
                     {
                         break;
                     }
@@ -828,4 +828,41 @@ pub fn http_request_with_headers(
         .unwrap_or("")
         .to_string();
     (status, body)
+}
+
+fn chunked_body_complete(mut body: &[u8]) -> bool {
+    loop {
+        let Some(end) = body.windows(2).position(|bytes| bytes == b"\r\n") else {
+            return false;
+        };
+        let Ok(line) = std::str::from_utf8(&body[..end]) else {
+            return false;
+        };
+        let size = line.split(';').next().unwrap_or("");
+        let Ok(size) = usize::from_str_radix(size, 16) else {
+            return false;
+        };
+        body = &body[end + 2..];
+        if size == 0 {
+            return body.starts_with(b"\r\n") || body.windows(4).any(|bytes| bytes == b"\r\n\r\n");
+        }
+        let Some(framed_size) = size.checked_add(2) else {
+            return false;
+        };
+        if body.len() < framed_size || &body[size..framed_size] != b"\r\n" {
+            return false;
+        }
+        body = &body[framed_size..];
+    }
+}
+
+#[test]
+fn chunked_completion_requires_complete_frames() {
+    assert!(!chunked_body_complete(b""));
+    assert!(!chunked_body_complete(b"5\r\n0\r\n\r\n\r\n"));
+    assert!(chunked_body_complete(b"5\r\n0\r\n\r\n\r\n0\r\n\r\n"));
+    assert!(!chunked_body_complete(b"1\r\nx\r\n0\r\n"));
+    assert!(chunked_body_complete(b"1;name=value\r\nx\r\n0\r\n\r\n"));
+    assert!(chunked_body_complete(b"0\r\nTrailer: value\r\n\r\n"));
+    assert!(!chunked_body_complete(b"ffffffffffffffffffffffff\r\n"));
 }

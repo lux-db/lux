@@ -62,6 +62,33 @@ fn orchestrator_health_checks_do_not_require_database_credentials() {
     let (status, body) = http_request(http, "GET", "/health/ready", None, None);
     assert_eq!(status, 200, "readiness: {body}");
     assert_eq!(body, r#"{"status":"ready"}"#);
+    let (status, body) = http_request(http, "GET", "/health/startup", None, None);
+    assert_eq!(status, 200);
+    assert_eq!(body, r#"{"status":"started"}"#);
+}
+
+#[test]
+fn http_request_ids_are_generated_and_returned_on_errors() {
+    let server = LuxServer::builder().http().start();
+    let mut previous = None;
+    for _ in 0..3 {
+        let mut socket = TcpStream::connect(("127.0.0.1", server.http_port())).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        socket.write_all(b"GET /not-a-route HTTP/1.1\r\nHost: localhost\r\nX-Lux-Request-Id: client-chosen\r\n\r\n").unwrap();
+        let response = read_all(&mut socket);
+        let id = response
+            .lines()
+            .find_map(|line| line.strip_prefix("X-Lux-Request-Id: "))
+            .expect("request identifier")
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        assert_ne!(previous, Some(id));
+        assert!(!response.contains("client-chosen"));
+        previous = Some(id);
+    }
 }
 
 #[test]

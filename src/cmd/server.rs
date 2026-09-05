@@ -491,6 +491,8 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
         .flatten()
         .unwrap_or(0);
     let restricted = is_restricted(store);
+    let ready = usize::from(store.ready_for_traffic());
+    let readiness_reason = store.readiness_reason().unwrap_or("none");
     let powered_by = if restricted {
         "\r\npowered_by:LuxDB Cloud (luxdb.dev)"
     } else {
@@ -502,6 +504,8 @@ fn build_info(store: &Store, broker: &Broker, _section: &str, now: Instant) -> S
          lux_version:{}\r\n\
          shards:{}\r\n\
          uptime_in_seconds:{}\r\n\
+         ready:{ready}\r\n\
+         readiness_reason:{readiness_reason}\r\n\
          {powered_by}\
          \r\n\
          # Clients\r\n\

@@ -143,7 +143,12 @@ pub(crate) async fn run_delivery_worker(store: Arc<Store>, cache: SharedSchemaCa
     loop {
         ticker.tick().await;
         if let Err(e) = process_pending(&store, &cache, &mut sinks).await {
-            eprintln!("push delivery worker error: {e}");
+            crate::emit_error(
+                store.config(),
+                crate::ServerErrorEvent::PushDeliveryWorkerFailed {
+                    error: e.to_string(),
+                },
+            );
         }
     }
 }

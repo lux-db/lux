@@ -436,6 +436,24 @@ pub enum ServerInfoEvent {
 /// database mutation.
 #[derive(Clone, Debug)]
 pub enum ServerWarnEvent {
+    /// Optional migration of older push records could not complete.
+    PushScopeMigrationFailed { error: String },
+    /// An HTTP operation failed or ended without a response. Shares the
+    /// per-engine diagnostic event budget with slow HTTP operations.
+    HttpRequestFailed {
+        request_id: usize,
+        operation: &'static str,
+        status: u16,
+        elapsed_ms: u64,
+    },
+    /// An HTTP operation exceeded one second. Emitted at most once per second
+    /// per engine; identifiers are engine-generated, never client input.
+    SlowHttpRequest {
+        request_id: usize,
+        operation: &'static str,
+        status: u16,
+        elapsed_ms: u64,
+    },
     /// Auth is explicitly running in development-only plaintext memory because
     /// durability is ephemeral and no encryption key is active.
     AuthSecretStorageDegraded,
@@ -462,10 +480,19 @@ pub enum ServerWarnEvent {
 /// durability, or persistence.
 #[derive(Clone, Debug)]
 pub enum ServerErrorEvent {
+    /// Expired table rows were retained for a later retry.
+    TableExpirationFailed { error: String },
+    /// A background push delivery iteration failed.
+    PushDeliveryWorkerFailed { error: String },
     /// Snapshot load failed during startup.
     SnapshotLoadFailed { error: String },
     /// Background snapshot failed.
-    SnapshotSaveFailed { error: String, path: String },
+    SnapshotSaveFailed {
+        error: String,
+        path: String,
+        error_kind: std::io::ErrorKind,
+        os_error: Option<i32>,
+    },
     /// WAL replay failed for a shard.
     WalReplayFailed { shard: usize, error: String },
     /// WAL truncate after snapshot failed.
@@ -479,11 +506,21 @@ pub enum ServerErrorEvent {
     /// Background disk compaction failed.
     DiskCompactionFailed { shard: usize, error: String },
     /// WAL append failed before an in-memory mutation was made durable.
-    WalAppendFailed { error: String },
+    WalAppendFailed {
+        error: String,
+        error_kind: std::io::ErrorKind,
+        os_error: Option<i32>,
+        restart_required: bool,
+    },
     /// Dumping cold data into a snapshot failed.
     SnapshotDiskDumpFailed { error: String },
     /// Periodic WAL fsync failed.
-    WalFsyncFailed { error: String },
+    WalFsyncFailed {
+        error: String,
+        error_kind: std::io::ErrorKind,
+        os_error: Option<i32>,
+        restart_required: bool,
+    },
     /// HTTP server task returned an error after startup.
     HttpServerFailed { error: String },
 }
@@ -580,7 +617,32 @@ fn validate_auth_config(config: &ServerConfig) -> std::io::Result<()> {
             "auth refresh token ttl must be greater than zero",
         ));
     }
+    for (name, ttl) in [
+        ("LUX_AUTH_ACCESS_TOKEN_TTL", config.auth.access_token_ttl),
+        ("LUX_AUTH_REFRESH_TOKEN_TTL", config.auth.refresh_token_ttl),
+        (
+            "LUX_AUTH_FLOW_TOKEN_TTL_SECONDS",
+            config.auth.flow_token_ttl,
+        ),
+    ] {
+        if !valid_auth_token_ttl(ttl) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{name} must be positive and representable as an expiry timestamp"),
+            ));
+        }
+    }
     Ok(())
+}
+
+pub(crate) fn valid_auth_token_ttl(ttl: Duration) -> bool {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    !ttl.is_zero()
+        && ttl.as_millis() <= (i64::MAX as u128).saturating_sub(now_ms)
+        && Instant::now().checked_add(ttl).is_some()
 }
 
 fn validate_server_limits(config: &ServerConfig) -> std::io::Result<()> {
@@ -2978,7 +3040,12 @@ impl Runtime {
         if let Err(e) =
             push::migrate_from_auth_scope(&runtime.store, &runtime.schema_cache, Instant::now())
         {
-            eprintln!("push scope migration skipped: {e}");
+            emit_warn(
+                &runtime.config,
+                ServerWarnEvent::PushScopeMigrationFailed {
+                    error: e.to_string(),
+                },
+            );
         }
 
         let snapshot_worker = snapshot::start_background_save_worker(runtime.store.clone())?;
@@ -3017,7 +3084,12 @@ impl Runtime {
                             }
                         }
                         Err(error) => {
-                            eprintln!("table TTL sweep failed; rows retained for retry: {error}");
+                            emit_error(
+                                store.config(),
+                                ServerErrorEvent::TableExpirationFailed {
+                                    error: error.to_string(),
+                                },
+                            );
                         }
                     }
                 }
@@ -6227,6 +6299,23 @@ mod persistence_config_tests {
 mod shutdown_tests {
     use super::*;
 
+    #[test]
+    fn auth_expiry_must_fit_both_clocks() {
+        assert!(valid_auth_token_ttl(Duration::from_secs(3600)));
+        assert!(!valid_auth_token_ttl(Duration::ZERO));
+        assert!(!valid_auth_token_ttl(Duration::from_secs(u64::MAX)));
+        assert!(!valid_auth_token_ttl(Duration::from_millis(u64::MAX)));
+        for field in 0..3 {
+            let mut config = ServerConfig::default();
+            config.auth.enabled = true;
+            match field {
+                0 => config.auth.access_token_ttl = Duration::MAX,
+                1 => config.auth.refresh_token_ttl = Duration::MAX,
+                _ => config.auth.flow_token_ttl = Duration::MAX,
+            }
+            assert!(validate_auth_config(&config).is_err());
+        }
+    }
     async fn wait_for_background_save(store: &Store) -> store::SnapshotStatus {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
