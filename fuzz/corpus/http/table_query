@@ -1,0 +1,2 @@
+GET /v1/tables/items?select=id,name&limit=10&where=id%20%3D%201 HTTP/1.1
+Host: localhost

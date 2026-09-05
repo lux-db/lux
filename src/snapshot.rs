@@ -1215,8 +1215,7 @@ fn read_dump_value(
         }
         b'P' => {
             let len = read_sized_count(r, "hyperloglog register", 1)?;
-            let mut regs = vec![0u8; len];
-            r.read_exact(&mut regs)?;
+            let regs = crate::hll::read_registers(r, len)?;
             let cached = crate::hll::hll_count(&regs);
             DumpValue::HyperLogLog(regs, cached)
         }
@@ -1770,6 +1769,28 @@ mod tests {
             }
         }
         (path, Cleanup(dir))
+    }
+
+    #[test]
+    fn stored_hll_shape_is_validated_before_loading() {
+        let store = Store::new();
+        for len in [
+            0,
+            1,
+            crate::hll::HLL_REGISTERS - 1,
+            crate::hll::HLL_REGISTERS + 1,
+        ] {
+            let mut bytes = Vec::new();
+            write_u32(&mut bytes, len as u32).unwrap();
+            bytes.resize(bytes.len() + len, 0);
+            assert!(read_dump_value(&store, &mut bytes.as_slice(), b'P', "hll", true).is_err());
+        }
+        let mut bytes = Vec::new();
+        write_u32(&mut bytes, crate::hll::HLL_REGISTERS as u32).unwrap();
+        bytes.resize(bytes.len() + crate::hll::HLL_REGISTERS, 0);
+        assert!(read_dump_value(&store, &mut bytes.as_slice(), b'P', "hll", true).is_ok());
+        *bytes.last_mut().unwrap() = 52;
+        assert!(read_dump_value(&store, &mut bytes.as_slice(), b'P', "hll", true).is_err());
     }
 
     #[test]
