@@ -421,6 +421,16 @@ lux seed run --file lux/demo.seed.lux
 
 Seed files use the same command format as migrations, including JSON argv arrays. Seeds are not recorded in `__migrations`; write stable IDs if you want predictable demo data.
 
+First-start initialization is tracked independently of the data volume. Restarting
+before seeding begins still runs the seed. If a seed fails or is interrupted,
+`lux start` refuses to replay it automatically because some commands may already
+have taken effect. Inspect the data and make `lux/seed.lux` safe to replay, then
+run `lux seed run` explicitly. Alternatively, `lux start --fresh` discards local
+data and initializes again. Older CLI state files are treated as already seeded.
+
+Starting cached engine and Studio images does not query the registry. Check for
+new images explicitly with `lux update engine --check` or `lux update studio --check`.
+
 ## Types
 
 Generate TypeScript types from your project's table schema and feed them to the

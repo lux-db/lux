@@ -800,6 +800,18 @@ struct LocalState {
     studio_port: u16,
     #[serde(default)]
     studio_container: String,
+    #[serde(default)]
+    seed_status: SeedStatus,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SeedStatus {
+    Pending,
+    Running,
+    // Older local states must not replay potentially non-idempotent seeds.
+    #[default]
+    Complete,
 }
 
 fn local_state_path() -> PathBuf {
@@ -882,9 +894,23 @@ fn project_slug() -> String {
     )
 }
 
-/// True if `port` is bindable on the same host address Docker will publish.
+/// Check both bindability and forwarding already active on the host address.
+/// Docker Desktop can forward a published port even when a host bind succeeds.
 fn port_is_free(bind_host: IpAddr, port: u16) -> bool {
-    std::net::TcpListener::bind((bind_host, port)).is_ok()
+    let Ok(listener) = std::net::TcpListener::bind((bind_host, port)) else {
+        return false;
+    };
+    drop(listener);
+    let connect_host = match bind_host {
+        IpAddr::V4(host) if host.is_unspecified() => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        IpAddr::V6(host) if host.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        host => host,
+    };
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::new(connect_host, port),
+        std::time::Duration::from_millis(100),
+    )
+    .is_err()
 }
 
 /// Return `preferred` if free, else the next free port above it. Lets multiple
@@ -947,6 +973,7 @@ fn ensure_local_state(config: &LocalConfig) -> LocalState {
         studio_port: DEFAULT_STUDIO_PORT,
         studio_container: format!("lux-{slug}-studio"),
         bind_host: default_bind_host(),
+        seed_status: SeedStatus::Pending,
     };
     // secret_key == password: the operator credential and the SDK secret key are
     // the same value locally (see LocalState doc comment).
@@ -1036,7 +1063,11 @@ fn docker_output(args: &[&str]) -> Result<String, String> {
 /// `rm -f` skips the engine's final persistence barrier, and Docker's default
 /// stop timeout is shorter than Lux's default shutdown grace period.
 fn remove_engine_container(name: &str) -> Result<(), String> {
-    if docker_container_state(name).as_deref() == Some("running") {
+    let status = docker_container_state(name);
+    if status.as_deref() == Some("paused") {
+        docker_output(&["unpause", name])?;
+    }
+    if matches!(status.as_deref(), Some("running" | "restarting" | "paused")) {
         docker_output(&["stop", "--timeout", "35", name])?;
     }
     docker_output(&["rm", name]).map(|_| ())
@@ -1228,17 +1259,6 @@ fn image_update_status(container: &str, image: &str) -> ImageUpdateStatus {
                     .or_else(|| Some("version status unavailable".to_string())),
             }
         }
-    }
-}
-
-fn print_image_update_hint(label: &str, container: &str, image: &str, command: &str) {
-    let status = image_update_status(container, image);
-    if status.update_available == Some(true) {
-        println!(
-            "{} A newer {label} image is available; run {}.",
-            "Update:".yellow(),
-            command.cyan()
-        );
     }
 }
 
@@ -1672,12 +1692,6 @@ async fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
             docker_container_env(&state.studio_container, "LUX_STUDIO_TOKEN").unwrap_or_default();
         if session_is_valid(&engine_url, &studio_origin, &token).await {
             println!("{} {}", "Lux Studio:".bold(), studio_origin.cyan());
-            print_image_update_hint(
-                "Studio",
-                &state.studio_container,
-                STUDIO_IMAGE,
-                "lux update studio",
-            );
             if open_browser {
                 let _ = open::that(&studio_origin);
             }
@@ -1766,6 +1780,38 @@ async fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
 /// Apply migrations through the engine-owned contract. The engine persists
 /// progress before executing commands, so a failed migration cannot be
 /// silently replayed by `lux start`.
+/// Reconcile schema on every start, including when reusing a running engine.
+/// Seed files run only for a fresh volume because they may not be idempotent.
+async fn prepare_local_data(state: &mut LocalState) {
+    if state.seed_status == SeedStatus::Running {
+        eprintln!("Seed initialization was interrupted or failed. Some commands may already have run. Inspect the data and lux/seed.lux, then explicitly run `lux seed run` after making it safe to replay, or use `lux start --fresh` to discard local data and initialize again.");
+        std::process::exit(1);
+    }
+    let conn = DirectConn::connect(&state.connection_host(), state.resp_port, &state.password)
+        .unwrap_or_else(|error| {
+            eprintln!("{} {error}", "Error:".red());
+            std::process::exit(1);
+        });
+    let mut target = MigrateTarget::Direct(Box::new(conn));
+    let migrations_dir = PathBuf::from("lux/migrations");
+    if migrations_dir.exists() {
+        let count = apply_pending_migrations(&mut target, &migrations_dir).await;
+        if count > 0 {
+            println!("{} Applied {count} migration(s).", "Done.".green());
+        }
+    }
+    let seed_path = PathBuf::from("lux/seed.lux");
+    if state.seed_status == SeedStatus::Pending {
+        if seed_path.exists() {
+            state.seed_status = SeedStatus::Running;
+            save_local_state(state);
+            run_command_file(&mut target, &seed_path, "Seed").await;
+        }
+        state.seed_status = SeedStatus::Complete;
+        save_local_state(state);
+    }
+}
+
 async fn apply_pending_migrations(target: &mut MigrateTarget, dir: &Path) -> usize {
     let local = get_local_migrations(dir);
     let mut applied = 0usize;
@@ -3218,7 +3264,6 @@ async fn update_local_engine(check: bool) -> Result<(), String> {
     let desired_image = desired_engine_image(Some(&local_config));
     if state.image != desired_image {
         state.image = desired_image;
-        save_local_state(&state);
     }
     let engine_env = local_engine_env(&state, &engine_settings);
     let status = image_update_status(&state.container, &state.image);
@@ -3248,6 +3293,8 @@ async fn update_local_engine(check: bool) -> Result<(), String> {
     let before = docker_container_digest(&state.container).ok();
     pull_image(&state.image)?;
     let after = docker_image_digest(&state.image)?;
+    // A check or failed download must not change the recorded runtime image.
+    save_local_state(&state);
     if before.as_deref() == Some(after.as_str()) && !configuration_update {
         println!("{}", "Local engine is already up to date.".green());
         return Ok(());
@@ -3556,17 +3603,12 @@ pub async fn run() {
                 && !studio_port_changed
             {
                 println!("{}", "Local Lux engine already running.".green());
+                prepare_local_data(&mut state).await;
                 refresh_local_profile(&state).unwrap_or_else(|e| {
                     eprintln!("{} {e}", "Failed to refresh local env profile:".red());
                     std::process::exit(1);
                 });
                 print_connection_block(&state);
-                print_image_update_hint(
-                    "engine",
-                    &state.container,
-                    &state.image,
-                    "lux update engine",
-                );
                 if !no_studio {
                     ensure_studio(&mut state, false).await;
                 }
@@ -3603,9 +3645,16 @@ pub async fn run() {
             }
             let volume_existed = docker_volume_exists(&state.volume);
             if fresh && volume_existed {
-                let _ = docker_output(&["volume", "rm", &state.volume]);
+                docker_output(&["volume", "rm", &state.volume]).unwrap_or_else(|error| {
+                    eprintln!("Could not clear local data volume: {error}");
+                    std::process::exit(1);
+                });
             }
             let fresh_volume = fresh || !volume_existed;
+            if fresh_volume {
+                state.seed_status = SeedStatus::Pending;
+                save_local_state(&state);
+            }
 
             // Pick free host ports if this project's configured ports are taken
             // (e.g. another local project is already running). Removing the stale
@@ -3693,49 +3742,13 @@ pub async fn run() {
             }
             println!(" {}", "ready".green());
 
-            // Apply migrations (idempotent). Seed only on a fresh volume, since
-            // seed scripts generally aren't idempotent.
-            let conn = match DirectConn::connect(
-                &state.connection_host(),
-                state.resp_port,
-                &state.password,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("{} {e}", "Error:".red());
-                    std::process::exit(1);
-                }
-            };
-            let mut target = MigrateTarget::Direct(Box::new(conn));
-            let migrations_dir = PathBuf::from("lux/migrations");
-            if migrations_dir.exists() {
-                let n = apply_pending_migrations(&mut target, &migrations_dir).await;
-                if n > 0 {
-                    println!("{} Applied {n} migration(s).", "Done.".green());
-                }
-            }
-            let seed_path = PathBuf::from("lux/seed.lux");
-            if fresh_volume
-                && seed_path.exists()
-                && !std::fs::read_to_string(&seed_path)
-                    .unwrap_or_default()
-                    .trim()
-                    .is_empty()
-            {
-                run_command_file(&mut target, &seed_path, "Seed").await;
-            }
+            prepare_local_data(&mut state).await;
 
             refresh_local_profile(&state).unwrap_or_else(|e| {
                 eprintln!("{} {e}", "Failed to refresh local env profile:".red());
                 std::process::exit(1);
             });
             print_connection_block(&state);
-            print_image_update_hint(
-                "engine",
-                &state.container,
-                &state.image,
-                "lux update engine",
-            );
             if !no_studio {
                 ensure_studio(&mut state, false).await;
             }
@@ -3783,11 +3796,17 @@ pub async fn run() {
             if !state.studio_container.is_empty()
                 && docker_container_state(&state.studio_container).is_some()
             {
-                let _ = docker_output(&["rm", "-f", &state.studio_container]);
+                docker_output(&["rm", "-f", &state.studio_container]).unwrap_or_else(|error| {
+                    eprintln!("Could not stop Lux Studio: {error}");
+                    std::process::exit(1);
+                });
                 println!("{} Stopped Lux Studio.", "Done.".green());
             }
             if clear && docker_volume_exists(&state.volume) {
-                let _ = docker_output(&["volume", "rm", &state.volume]);
+                docker_output(&["volume", "rm", &state.volume]).unwrap_or_else(|error| {
+                    eprintln!("Could not clear local data volume: {error}");
+                    std::process::exit(1);
+                });
                 println!("{} Cleared data volume {}.", "Done.".green(), state.volume);
             }
         }
@@ -5340,6 +5359,16 @@ pub async fn run() {
                 port,
                 password,
             } => {
+                let local_seed = project.as_deref().is_none_or(|name| name == "local")
+                    && host.is_none()
+                    && port.is_none()
+                    && password.is_none()
+                    && file == Path::new("lux/seed.lux");
+                let mut initialization = if local_seed {
+                    load_local_state().filter(|state| state.seed_status != SeedStatus::Complete)
+                } else {
+                    None
+                };
                 let mut target = resolve_migrate_target(
                     project.as_deref(),
                     host.as_deref(),
@@ -5348,7 +5377,15 @@ pub async fn run() {
                     &api_url_override,
                 )
                 .await;
+                if let Some(state) = initialization.as_mut() {
+                    state.seed_status = SeedStatus::Running;
+                    save_local_state(state);
+                }
                 run_command_file(&mut target, &file, "Seed").await;
+                if let Some(state) = initialization.as_mut() {
+                    state.seed_status = SeedStatus::Complete;
+                    save_local_state(state);
+                }
             }
         },
         Commands::Types {
@@ -7510,6 +7547,20 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_listener_reserves_the_loopback_port() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(!port_is_free(
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port
+        ));
+        assert!(!port_is_free(
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            port
+        ));
+    }
+
+    #[test]
     fn docker_port_maps_are_address_scoped() {
         assert_eq!(
             docker_port_map("127.0.0.1".parse().unwrap(), 5890, 5890),
@@ -7764,7 +7815,35 @@ mod tests {
             bind_host: default_bind_host(),
             studio_port: DEFAULT_STUDIO_PORT,
             studio_container: "lux-sample-abc123-studio".to_string(),
+            seed_status: SeedStatus::Complete,
         }
+    }
+
+    #[test]
+    fn seed_status_roundtrips_and_older_states_do_not_reseed() {
+        let mut state = sample_state();
+        for status in [
+            SeedStatus::Pending,
+            SeedStatus::Running,
+            SeedStatus::Complete,
+        ] {
+            state.seed_status = status;
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(
+                serde_json::from_str::<LocalState>(&json)
+                    .unwrap()
+                    .seed_status,
+                status
+            );
+        }
+        let mut json = serde_json::to_value(&state).unwrap();
+        json.as_object_mut().unwrap().remove("seed_status");
+        assert_eq!(
+            serde_json::from_value::<LocalState>(json)
+                .unwrap()
+                .seed_status,
+            SeedStatus::Complete
+        );
     }
 
     #[test]
