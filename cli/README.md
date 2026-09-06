@@ -116,6 +116,13 @@ lux restore ./lux.dat      # validate, stage, gracefully restart, and verify rea
 35 seconds to finish before removing the container. Local engine updates use
 the same graceful stop path.
 
+For the v0.37.0-to-1.0 transition, follow the
+[snapshot-based upgrade runbook](../DURABILITY.md#upgrading-from-v0370-to-10)
+before changing engine versions. `lux update engine` reuses the existing volume;
+it does not quiesce applications, retain a pre-upgrade backup, or import into a
+fresh volume. Do not use `lux start --fresh` or `lux stop --clear` on the source
+project during this procedure: those commands discard its data volume.
+
 `lux restore` accepts snapshots produced by current or older Lux engines. The
 running database remains available while the engine validates and stages the
 file. The CLI verifies the source checksum echoed by the engine, gracefully

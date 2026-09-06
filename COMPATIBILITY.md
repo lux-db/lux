@@ -314,6 +314,13 @@ configuration interface.
 | WAL (`LXW3`, with legacy readers) and tiered data (`LXD1`) | Excluded as interchange formats | They are private restart/recovery files. Durability is guaranteed as documented, but external tools must not parse or copy them independently of the complete data directory. | disk, tiered, reliability, and crash-recovery tests |
 | Encryption envelope/state (`LUXENC2`, `LUXENCSTATE1`) | Excluded as interchange formats | Private authenticated-encryption formats; access them only through Lux commands and complete snapshots. | encryption and corruption tests |
 
+The supported v0.37.0-to-1.0 transition is a final old-version snapshot imported
+into a fresh data directory with the required encryption keys. Stop application
+writes before that snapshot and preserve the old installation for backup-based
+rollback. Direct reuse of old WAL/tiered files and in-place downgrade to v0.37.0
+are not supported upgrade/rollback procedures. See the
+[upgrade runbook](DURABILITY.md#upgrading-from-v0370-to-10).
+
 ## Unsupported
 
 The following are outside the documented public surface:
