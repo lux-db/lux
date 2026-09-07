@@ -68,6 +68,14 @@ jobs:
         with:
           toolchain: 1.98.0
       - run: bash tests/client-compat/run.sh
+      - name: Verify built SDK against the Engine
+        working-directory: sdk
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+          LUX_TEST_ENGINE_BIN="$GITHUB_WORKSPACE/target/debug/lux" \
+          LUX_TEST_WORK_DIR="$GITHUB_WORKSPACE/.cache/sdk-engine" \
+            bun run test:engine
 
   sdk:
     runs-on: ubuntu-latest

@@ -1753,6 +1753,32 @@ fn http_tables_rest() {
 }
 
 #[test]
+fn http_timeseries_numeric_timestamps_are_preserved() {
+    let server = LuxServer::builder().http().start();
+    let http = server.http_port();
+    let (status, body) = http_request(
+        http,
+        "POST",
+        "/v1/ts/numeric",
+        Some(r#"{"timestamp":1000,"value":42}"#),
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    let (_, body) = http_request(http, "GET", "/v1/ts/numeric?from=1000&to=1000", None, None);
+    assert!(body.contains("1000") && body.contains("42"), "{body}");
+    for timestamp in ["null", "true", "1.5", "{}", "[]", "9223372036854775808"] {
+        let payload = format!(r#"{{"timestamp":{timestamp},"value":99}}"#);
+        let (status, body) = http_request(http, "POST", "/v1/ts/numeric", Some(&payload), None);
+        assert_eq!(status, 400, "{timestamp}: {body}");
+    }
+    let (_, body) = http_request(http, "GET", "/v1/ts/numeric", None, None);
+    assert!(
+        !body.contains("99"),
+        "invalid timestamps must not write: {body}"
+    );
+}
+
+#[test]
 fn http_timeseries_rest() {
     let server = LuxServer::builder().http().start();
     let http = server.http_port();

@@ -55,11 +55,14 @@ describe('LuxAuthClient session state', () => {
 	test('emits auth state changes', async () => {
 		const auth = new LuxAuthClient({ persistSession: false, autoRefreshToken: false });
 		const events: string[] = [];
+		let initialized!: () => void;
+		const initialSession = new Promise<void>(resolve => { initialized = resolve; });
 		const subscription = auth.onAuthStateChange((event, nextSession) => {
 			events.push(`${event}:${nextSession ? 'session' : 'none'}`);
+			if (event === 'INITIAL_SESSION') initialized();
 		});
 
-		await Promise.resolve();
+		await initialSession;
 		await auth.setSession(session());
 		await auth.clearSession();
 		subscription.unsubscribe();
@@ -922,7 +925,7 @@ describe('LuxAuthClient session state', () => {
 		expect(result.data?.user).toEqual({ id: 'usr_oauth', email: 'oauth@example.com' });
 		expect(result.error).toBeNull();
 		expect(authorization).toBe('Bearer access');
-		expect(storage.data.has('lux.auth.session')).toBe(true);
+		expect(storage.data.has('lux.auth.session-http%3A%2F%2Flocalhost%3A3957%2Fv1%2Fproject')).toBe(true);
 	});
 
 	test('consumeOAuthRedirect returns an error when callback tokens are missing', async () => {
