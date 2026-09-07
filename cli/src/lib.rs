@@ -16,6 +16,7 @@ use std::sync::Arc;
 mod file_security;
 mod project_config;
 mod studio;
+mod upgrade;
 use file_security::{
     delete_secret_file, ensure_private_dir, random_hex, read_optional_secret_file,
     write_secret_file,
@@ -782,7 +783,7 @@ fn default_bind_host() -> IpAddr {
 /// exactly how the prod gateway maps a secret key. So a secret-key SDK client
 /// gets operator access locally, while a publishable-key client must sign in
 /// (JWT -> grant-enforced user), mirroring production.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct LocalState {
     password: String,
     publishable_key: String,
@@ -938,14 +939,8 @@ fn ensure_local_state(config: &LocalConfig) -> LocalState {
     let missing_bind_host = local_state_missing_bind_host();
     if let Some(mut state) = load_local_state() {
         let mut dirty = missing_bind_host;
-        // Follow the engine image config.toml asks for: a pinned `engine_version`,
-        // else `:latest`. Re-evaluated each load so editing config.toml takes
-        // effect on the next `lux start`.
-        let desired_image = desired_engine_image(Some(config));
-        if state.image != desired_image {
-            state.image = desired_image;
-            dirty = true;
-        }
+        // Existing data follows its recorded runtime. Image changes go through
+        // `lux update engine`, including after editing engine_version.
         // Backfill Studio fields for states written before Studio existed.
         if state.studio_container.is_empty() {
             state.studio_container = format!("lux-{}-studio", project_slug());
@@ -1263,12 +1258,19 @@ fn image_update_status(container: &str, image: &str) -> ImageUpdateStatus {
 }
 
 fn run_local_engine_container(state: &LocalState, engine_env: &[String]) -> Result<(), String> {
+    create_engine_container(state, engine_env, true)
+}
+
+fn create_engine_container(
+    state: &LocalState,
+    engine_env: &[String],
+    start: bool,
+) -> Result<(), String> {
     let resp_map = docker_port_map(state.bind_host, state.resp_port, 6379);
     let http_map = docker_port_map(state.bind_host, state.http_port, 5890);
     let vol_map = format!("{}:/data", state.volume);
     let mut run_args: Vec<&str> = vec![
-        "run",
-        "-d",
+        if start { "run" } else { "create" },
         "--name",
         &state.container,
         "-p",
@@ -1280,6 +1282,9 @@ fn run_local_engine_container(state: &LocalState, engine_env: &[String]) -> Resu
         "--stop-timeout",
         "35",
     ];
+    if start {
+        run_args.insert(1, "-d");
+    }
     for entry in engine_env {
         run_args.push("-e");
         run_args.push(entry);
@@ -3286,44 +3291,21 @@ async fn update_local_engine(check: bool) -> Result<(), String> {
         }
         return Ok(());
     }
-    let was_running = docker_container_state(&state.container).as_deref() == Some("running");
-    let existed = docker_container_state(&state.container).is_some();
     let studio_was_running =
         docker_container_state(&state.studio_container).as_deref() == Some("running");
     let before = docker_container_digest(&state.container).ok();
     pull_image(&state.image)?;
     let after = docker_image_digest(&state.image)?;
-    // A check or failed download must not change the recorded runtime image.
-    save_local_state(&state);
     if before.as_deref() == Some(after.as_str()) && !configuration_update {
         println!("{}", "Local engine is already up to date.".green());
         return Ok(());
     }
-    if docker_container_state(&state.studio_container).is_some() {
-        docker_output(&["rm", "-f", &state.studio_container])?;
+    let image_id = docker_output(&["image", "inspect", "--format", "{{.Id}}", &state.image])?;
+    state = upgrade::perform(&state, &image_id, engine_env)?;
+    if studio_was_running && !ensure_studio(&mut state, false).await {
+        return Err("engine updated, but Studio did not restart".to_string());
     }
-    if existed {
-        remove_engine_container(&state.container)?;
-    }
-    if was_running {
-        run_local_engine_container(&state, &engine_env)?;
-        if !wait_for_local_ready(&state) {
-            return Err(format!(
-                "updated engine did not become ready; inspect `docker logs {}`",
-                state.container
-            ));
-        }
-        refresh_local_profile(&state)?;
-        if studio_was_running && !ensure_studio(&mut state, false).await {
-            return Err("engine updated, but Studio did not restart".to_string());
-        }
-        println!("{} Local engine updated and restarted.", "Done.".green());
-    } else {
-        println!(
-            "{} Engine image updated; it will be used by the next `lux start`.",
-            "Done.".green()
-        );
-    }
+    println!("{} Local engine updated; backup retained.", "Done.".green());
     Ok(())
 }
 
@@ -3464,6 +3446,27 @@ fn format_bytes(bytes: u64) -> String {
 pub async fn run() {
     let cli = Cli::parse();
     let api_url_override = cli.api_url.clone();
+    let local_mutation = matches!(
+        &cli.command,
+        Commands::Start { .. }
+            | Commands::Stop { .. }
+            | Commands::Restore { .. }
+            | Commands::Update {
+                action: Some(UpdateAction::Engine {
+                    project: None,
+                    check: false
+                }),
+                ..
+            }
+    );
+    let _upgrade_lock = if local_mutation && local_state_path().exists() {
+        Some(upgrade::lock_and_recover().unwrap_or_else(|error| {
+            eprintln!("Local engine operation failed: {error}");
+            std::process::exit(1);
+        }))
+    } else {
+        None
+    };
 
     match cli.command {
         Commands::Init => {
