@@ -1,7 +1,20 @@
 import { describe, expect, test } from 'bun:test';
 import Lux from '../src';
+import { createClient } from '../src/project';
 
 describe('TSRANGE options', () => {
+	test('HTTP timestamps use the engine string representation instead of falling back to now', async () => {
+		const bodies: unknown[] = [];
+		const client = createClient('http://localhost', 'secret-fixture', {
+			fetch:(async (_url, init) => {
+				bodies.push(JSON.parse(String(init?.body)));
+				return Response.json({result:'OK'});
+			}) as typeof fetch,
+		});
+		await client.tsAdd('cpu', 42, {timestamp:1000});
+		await client.tsAdd('cpu', 43);
+		expect(bodies).toEqual([{timestamp:'1000',value:42},{timestamp:'*',value:43}]);
+	});
 	test('serializes aggregation before COUNT for the direct API', async () => {
 		let seen: Array<string | number> = [];
 		const client = new Lux({ lazyConnect: true });

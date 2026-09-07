@@ -40,7 +40,7 @@ separate:
 | Engine live WebSocket `/live` | Stable | Authenticated key and grant-scoped table subscriptions using the documented message shapes. | `tests/live_ws.rs` |
 | CLI local/self-hosted workflow | Stable | `init`, `start`, `stop`, `studio`, local `status`, `exec`, `connect`, `doctor`, `version`, `update engine`, `update studio`, migrations, auth providers, push, seed, encryption, types, and local env profiles. | CLI unit tests and `cli/tests/e2e-local.sh` |
 | CLI Cloud control-plane workflow | Excluded | Login, linking, project/key lifecycle, Cloud env profiles, logs, snapshots, restarts/updates, billing-aware create/destroy, and Cloud targets are maintained with Lux Cloud, not gated by OSS Engine 1.0. | Cloud integration tests |
-| TypeScript SDK | Stable | Direct RESP client plus HTTP project/browser/SSR clients for auth, tables, vectors, time series, realtime, and push. | `sdk/tests/*.test.ts` plus SDK typecheck/build |
+| TypeScript SDK | Stable | Direct RESP client plus HTTP project/browser/SSR clients for auth, tables, vectors, time series, realtime, and push. | `sdk/tests/*.test.ts`, SDK typecheck/build, and `sdk/tests/engine.integration.ts` against a built Engine |
 | TypeScript SDK storage client | Excluded | Object storage is Cloud-only; the OSS engine has no local object-storage service. | `sdk/tests/storage.test.ts` against its Cloud contract |
 | Swift SDK | Stable | Authentication/session handling and APNs device registration for Apple platforms. | `lux-swift/Tests/LuxTests` |
 | Swift data, realtime, storage, and push sending | Excluded | The 1.0 Swift contract is auth plus device registration, not a general database client. | Explicitly outside the Swift package surface |

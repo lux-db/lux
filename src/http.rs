@@ -5924,7 +5924,18 @@ fn route_ts_add(
         }
     };
 
-    let timestamp = parsed["timestamp"].as_str().unwrap_or("*").to_string();
+    let timestamp = match parsed.get("timestamp") {
+        None => "*".to_string(),
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Number(value)) if value.as_i64().is_some() => value.to_string(),
+        _ => {
+            return (
+                400,
+                "Bad Request",
+                r#"{"error":"timestamp must be an integer or string"}"#.to_string(),
+            );
+        }
+    };
     let value = match parsed.get("value") {
         Some(serde_json::Value::Number(n)) => n.to_string(),
         Some(serde_json::Value::String(s)) => s.clone(),

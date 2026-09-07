@@ -1,10 +1,11 @@
 import { LuxAuthClient, type LuxAuthOptions } from './auth';
+import { fetchText, requestTimeout, type LuxRequestOptions } from './http';
 import { LuxPushNamespace } from './push';
 import { LuxStorageNamespace } from './storage';
 import type { LuxError, LuxResult, LuxSchema, LuxTypedRow } from './types';
 import { err, ok, toLuxError } from './utils';
 
-export interface LuxProjectOptions {
+export interface LuxProjectOptions extends LuxRequestOptions {
 	url: string;
 	key: string;
 	fetch?: typeof fetch;
@@ -132,8 +133,12 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 	readonly storage: LuxStorageNamespace;
 	readonly push: LuxPushNamespace;
 	private fetchImpl: typeof fetch;
+	private requestTimeoutMs: number;
+	private signal?: AbortSignal;
 	private WebSocketImpl?: typeof WebSocket;
 	private liveSocket: WebSocket | null = null;
+	private liveGeneration = 0;
+	private reconnectTimer?: ReturnType<typeof setTimeout>;
 	private liveSubscriptions = new Map<string, LiveSubscriptionRecord>();
 	// Desired subscriptions awaiting the next open socket, keyed by subscription
 	// ID so repeated reconnect cycles cannot duplicate or grow this set.
@@ -143,12 +148,16 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 		this.url = options.url.replace(/\/+$/, '');
 		this.key = options.key;
 		this.fetchImpl = resolveFetch(options.fetch);
+		this.requestTimeoutMs = requestTimeout(options.requestTimeoutMs);
+		this.signal = options.signal;
 		this.WebSocketImpl = options.websocket;
 		this.auth = new LuxAuthClient({
 			...options.auth,
 			httpUrl: this.url,
 			apiKey: this.key,
 			fetch: this.fetchImpl,
+			requestTimeoutMs: options.auth?.requestTimeoutMs ?? this.requestTimeoutMs,
+			signal: options.auth?.signal ?? this.signal,
 		});
 		this.auth.onAuthStateChange((event) => {
 			if (event === 'INITIAL_SESSION') return;
@@ -200,7 +209,7 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 
 	async tsAdd(key: string, value: number, options?: { timestamp?: number | '*'; labels?: Record<string, string>; retention?: number }): Promise<LuxResult<unknown>> {
 		return this.request('POST', `/ts/${encodeURIComponent(key)}`, {
-			timestamp: options?.timestamp ?? '*',
+			timestamp: String(options?.timestamp ?? '*'),
 			value,
 			labels: options?.labels,
 			retention: options?.retention,
@@ -216,7 +225,7 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 		return this.request('GET', `/ts/${encodeURIComponent(key)}${query ? `?${query}` : ''}`);
 	}
 
-	async request<T = unknown>(method: string, path: string, body?: unknown): Promise<LuxResult<T>> {
+	async request<T = unknown>(method: string, path: string, body?: unknown, options: { signal?: AbortSignal } = {}): Promise<LuxResult<T>> {
 		try {
 			const accessToken = await this.auth.getAccessToken();
 			const headers: Record<string, string> = {
@@ -224,16 +233,15 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 				apikey: this.key,
 				Authorization: `Bearer ${accessToken ?? this.key}`,
 			};
-			const init: RequestInit = { method, headers };
+			const init: RequestInit = { method, headers, signal: options.signal ?? this.signal };
 			if (body !== undefined) {
 				headers['Content-Type'] = 'application/json';
 				init.body = JSON.stringify(body);
 			}
 
-			const response = await this.fetchImpl(`${this.url}${path}`, init);
-			const text = await response.text();
+			const { response, text } = await fetchText(this.fetchImpl, `${this.url}${path}`, init, this.requestTimeoutMs, this.signal);
 			const payload = text ? JSON.parse(text) : {};
-			if (!response.ok) {
+			if (!response.ok || typeof payload?.error === 'string') {
 				return err(
 					'LUX_PROJECT_REQUEST_ERROR',
 					payload?.error || `Lux request failed with HTTP ${response.status}`,
@@ -258,7 +266,11 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 		const id = `sub_${Math.random().toString(36).slice(2)}_${Date.now().toString(36)}`;
 		const record: LiveSubscriptionRecord = { id, spec, handler, error };
 		this.liveSubscriptions.set(id, record);
-		await this.ensureLiveSocket();
+		try { await this.ensureLiveSocket(); } catch (failure) {
+			this.liveSubscriptions.delete(id);
+			this.livePending.delete(id);
+			throw failure;
+		}
 		this.sendLive({
 			type: 'live.subscribe',
 			id,
@@ -269,13 +281,14 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 			this.livePending.delete(id);
 			this.sendLive({ type: 'live.unsubscribe', id });
 			if (this.liveSubscriptions.size === 0) {
-				this.liveSocket?.close();
-				this.liveSocket = null;
+				this.closeLiveSocket();
 			}
 		};
 	}
 
 	private async ensureLiveSocket(): Promise<void> {
+		if (this.signal?.aborted) throw new Error('Lux client was cancelled');
+		const generation = this.liveGeneration;
 		const WebSocketImpl = resolveWebSocket(this.WebSocketImpl);
 		this.WebSocketImpl = WebSocketImpl;
 		if (
@@ -287,6 +300,10 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 		}
 
 		const accessToken = await this.auth.getAccessToken();
+		if (generation !== this.liveGeneration || this.liveSubscriptions.size === 0) return;
+		// Another subscription may have opened the shared socket while auth loaded.
+		if (this.liveSocket && (this.liveSocket.readyState === WebSocketImpl.OPEN ||
+			this.liveSocket.readyState === WebSocketImpl.CONNECTING)) return;
 		const url = new URL(`${this.url}/live`);
 		url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
 		url.searchParams.set('apikey', this.key);
@@ -338,8 +355,10 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 			if (isActiveSocket) this.liveSocket = null;
 			if (isActiveSocket && this.liveSubscriptions.size > 0) {
 				this.queueLiveResubscriptions();
-				setTimeout(() => {
-					void this.ensureLiveSocket();
+				this.reconnectTimer = setTimeout(() => {
+					this.reconnectTimer = undefined;
+					if (generation !== this.liveGeneration || this.liveSubscriptions.size === 0) return;
+					void this.ensureLiveSocket().catch(error => this.failLiveSocket(error));
 				}, 1000);
 			}
 		};
@@ -347,19 +366,28 @@ export class LuxProjectClient<DB extends Record<string, object> = LuxSchema> {
 
 	private restartLiveSocket(): void {
 		if (this.liveSubscriptions.size === 0) return;
+		++this.liveGeneration;
+		clearTimeout(this.reconnectTimer);
 		const socket = this.liveSocket;
 		this.liveSocket = null;
 		this.livePending.clear();
 		this.queueLiveResubscriptions();
 		socket?.close();
-		void this.ensureLiveSocket();
+		void this.ensureLiveSocket().catch(error => this.failLiveSocket(error));
 	}
 
 	private closeLiveSocket(): void {
+		++this.liveGeneration;
+		clearTimeout(this.reconnectTimer);
 		const socket = this.liveSocket;
 		this.liveSocket = null;
 		this.livePending.clear();
 		socket?.close();
+	}
+
+	private failLiveSocket(failure: unknown): void {
+		this.closeLiveSocket();
+		for (const sub of this.liveSubscriptions.values()) sub.error(toLuxError(failure, 'LIVE_ERROR'));
 	}
 
 	private queueLiveResubscriptions(): void {
@@ -857,31 +885,36 @@ export class LuxProjectLiveSubscription<T extends object> {
 			settle({ code: 'LIVE_TIMEOUT', message: 'Timed out establishing live subscription' });
 		}, 15000);
 
-		this.unsubscribeFn = await this.client._subscribeLive(
-			this.spec(),
-			(event) => {
-				const kind = (event as { kind?: string })?.kind;
-				this.handleEvent(event);
-				if (kind === 'snapshot') settle(null);
-			},
-			(error) => {
-				const luxError: LuxError = {
-					code: error.code ?? 'LIVE_ERROR',
-					message: error.message ?? 'Live subscription failed',
-				};
-				if (settled) {
-					// Post-start failure: notify handlers and end the stream.
-					this.emit({ type: 'error', table: this.table, new: null, old: null, error });
-					this.close();
-				} else {
-					settle(luxError);
-				}
-			},
-		);
+		try {
+			this.unsubscribeFn = await this.client._subscribeLive(
+				this.spec(),
+				(event) => {
+					const kind = (event as { kind?: string })?.kind;
+					this.handleEvent(event);
+					if (kind === 'snapshot') settle(null);
+				},
+				(error) => {
+					const luxError: LuxError = {
+						code: error.code ?? 'LIVE_ERROR',
+						message: error.message ?? 'Live subscription failed',
+					};
+					if (settled) {
+						// Post-start failure: notify handlers and end the stream.
+						this.emit({ type: 'error', table: this.table, new: null, old: null, error });
+						this.close();
+					} else {
+						settle(luxError);
+					}
+				},
+			);
 
-		const result = await ready;
-		clearTimeout(timeout);
-		return result;
+			const result = await ready;
+			return result;
+		} catch (error) {
+			return toLuxError(error, 'LIVE_ERROR');
+		} finally {
+			clearTimeout(timeout);
+		}
 	}
 
 	[Symbol.asyncIterator](): AsyncIterator<LuxProjectLiveEvent<T>> {

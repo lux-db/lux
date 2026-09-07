@@ -1,5 +1,6 @@
 import type { LuxResult } from './types';
-import { err, ok, toLuxError } from './utils';
+import { fetchText, requestTimeout, type LuxRequestOptions } from './http';
+import { err, ok, projectStorageKey, toLuxError } from './utils';
 
 export interface LuxAuthUser {
 	id: string;
@@ -164,7 +165,7 @@ export interface LuxAuthKey {
 	last_used_at?: number | null;
 }
 
-export interface LuxAuthOptions {
+export interface LuxAuthOptions extends LuxRequestOptions {
 	httpUrl?: string;
 	apiKey?: string;
 	authToken?: string;
@@ -410,10 +411,15 @@ export class LuxAuthClient {
 	private storage: LuxAuthStorage | null;
 	private storageKey: string;
 	private refreshMarginSeconds: number;
+	private requestTimeoutMs: number;
+	private signal?: AbortSignal;
 	private currentSession: LuxAuthSession | null = null;
 	private loadedSession = false;
+	private loadingSession?: Promise<void>;
 	private storedSessionRaw: string | null = null;
 	private refreshTimer: ReturnType<typeof setTimeout> | null = null;
+	private sessionRevision = 0;
+	private storageWrites: Promise<void> = Promise.resolve();
 	private refreshAdoptions = new WeakMap<Promise<RefreshResult>, Promise<RefreshResult>>();
 	private listeners = new Set<LuxAuthStateChangeCallback>();
 	private broadcastChannel?: {
@@ -426,10 +432,12 @@ export class LuxAuthClient {
 		this.apiKey = options.apiKey;
 		this.authToken = options.authToken;
 		this.fetchImpl = resolveFetch(options.fetch);
+		this.requestTimeoutMs = requestTimeout(options.requestTimeoutMs);
+		this.signal = options.signal;
 		this.persistSession = options.persistSession ?? false;
 		this.autoRefreshToken = options.autoRefreshToken ?? this.persistSession;
 		this.storage = options.storage === undefined ? defaultBrowserStorage() : options.storage;
-		this.storageKey = options.storageKey ?? 'lux.auth.session';
+		this.storageKey = options.storageKey ?? projectStorageKey(this.httpUrl, 'lux.auth.session');
 		this.refreshMarginSeconds = options.refreshMarginSeconds ?? 60;
 		if (this.authToken) {
 			this.currentSession = null;
@@ -489,6 +497,7 @@ export class LuxAuthClient {
 	}
 
 	private async setSessionValue(session: LuxAuthSession | string | null): Promise<LuxAuthSession | null> {
+		const revision = ++this.sessionRevision;
 		if (typeof session === 'string') {
 			this.authToken = session;
 			this.currentSession = null;
@@ -498,7 +507,7 @@ export class LuxAuthClient {
 			await this.clearSessionValue();
 			return null;
 		}
-		await this.saveSession(normalizeSession(session), 'SESSION_UPDATED');
+		await this.saveSession(normalizeSession(session), 'SESSION_UPDATED', revision);
 		return this.currentSession;
 	}
 
@@ -512,13 +521,14 @@ export class LuxAuthClient {
 	}
 
 	private async clearSessionValue(): Promise<void> {
+		++this.sessionRevision;
 		this.authToken = undefined;
 		this.currentSession = null;
 		this.loadedSession = true;
 		this.storedSessionRaw = null;
 		this.clearRefreshTimer();
 		if (this.persistSession && this.storage) {
-			await this.storage.removeItem(this.storageKey);
+			await this.writeStorage(null);
 		}
 		this.emit('SIGNED_OUT', null);
 		this.broadcast('SIGNED_OUT', null);
@@ -559,6 +569,7 @@ export class LuxAuthClient {
 	}
 
 	async signUp(options: LuxSignUpOptions): Promise<LuxResult<LuxAuthSessionResult>> {
+		const revision = ++this.sessionRevision;
 		try {
 			const payload = await this.requestRaw<LuxAuthSession>('/auth/v1/signup', {
 				method: 'POST',
@@ -571,7 +582,7 @@ export class LuxAuthClient {
 				apiKey: true,
 			});
 			if (payload.access_token && payload.refresh_token) {
-				await this.saveSession(normalizeSession(payload), 'SIGNED_IN');
+				await this.saveSession(normalizeSession(payload), 'SIGNED_IN', revision);
 				return ok({ session: this.currentSession!, user: this.currentSession!.user });
 			}
 			return ok({ session: null, user: payload.user });
@@ -581,6 +592,7 @@ export class LuxAuthClient {
 	}
 
 	async signInWithPassword(options: LuxSignInOptions): Promise<LuxResult<LuxAuthSessionResult>> {
+		const revision = ++this.sessionRevision;
 		try {
 			const session = await this.requestRaw<LuxAuthSession>('/auth/v1/token', {
 				method: 'POST',
@@ -591,7 +603,7 @@ export class LuxAuthClient {
 				}),
 				apiKey: true,
 			});
-			await this.saveSession(normalizeSession(session), 'SIGNED_IN');
+			await this.saveSession(normalizeSession(session), 'SIGNED_IN', revision);
 			return ok({ session: this.currentSession!, user: this.currentSession!.user });
 		} catch (error) {
 			return err('LUX_AUTH_SIGNIN_ERROR', 'Failed to sign in', toLuxError(error));
@@ -612,6 +624,7 @@ export class LuxAuthClient {
 	}
 
 	async signInWithApple(options: LuxSignInWithAppleOptions): Promise<LuxResult<LuxAuthSessionResult>> {
+		const revision = ++this.sessionRevision;
 		try {
 			const session = await this.requestRaw<LuxAuthSession>('/auth/v1/signin/apple', {
 				method: 'POST',
@@ -622,7 +635,7 @@ export class LuxAuthClient {
 				}),
 				apiKey: true,
 			});
-			await this.saveSession(normalizeSession(session), 'SIGNED_IN');
+			await this.saveSession(normalizeSession(session), 'SIGNED_IN', revision);
 			return ok({ session: this.currentSession!, user: this.currentSession!.user });
 		} catch (error) {
 			return err('LUX_AUTH_APPLE_SIGNIN_ERROR', 'Failed to sign in with Apple', toLuxError(error));
@@ -630,13 +643,14 @@ export class LuxAuthClient {
 	}
 
 	async signInAnonymously(): Promise<LuxResult<LuxAuthSessionResult>> {
+		const revision = ++this.sessionRevision;
 		try {
 			const session = await this.requestRaw<LuxAuthSession>('/auth/v1/signin/anonymous', {
 				method: 'POST',
 				body: '{}',
 				apiKey: true,
 			});
-			await this.saveSession(normalizeSession(session), 'SIGNED_IN');
+			await this.saveSession(normalizeSession(session), 'SIGNED_IN', revision);
 			return ok({ session: this.currentSession!, user: this.currentSession!.user });
 		} catch (error) {
 			return err('LUX_AUTH_SIGNIN_ERROR', 'Failed to sign in anonymously', toLuxError(error));
@@ -666,6 +680,7 @@ export class LuxAuthClient {
 	}
 
 	async consumeOAuthRedirect(url = browserLocation()): Promise<LuxResult<LuxAuthSessionResult>> {
+		const revision = ++this.sessionRevision;
 		try {
 			if (!url) {
 				return err('LUX_AUTH_OAUTH_ERROR', 'OAuth redirect URL is missing');
@@ -691,7 +706,7 @@ export class LuxAuthClient {
 				if (user.error) return user as LuxResult<LuxAuthSessionResult>;
 				session.user = user.data.user;
 			}
-			await this.saveSession(session, 'SIGNED_IN');
+			await this.saveSession(session, 'SIGNED_IN', revision);
 			return ok({ session, user: session.user });
 		} catch (error) {
 			return err('LUX_AUTH_OAUTH_ERROR', 'Failed to consume OAuth redirect', toLuxError(error));
@@ -699,6 +714,7 @@ export class LuxAuthClient {
 	}
 
 	async exchangeCodeForSession(code: string): Promise<LuxResult<LuxAuthSessionResult>> {
+		const revision = ++this.sessionRevision;
 		try {
 			const session = await this.requestRaw<LuxAuthSession>('/auth/v1/token?grant_type=authorization_code', {
 				method: 'POST',
@@ -708,7 +724,7 @@ export class LuxAuthClient {
 				}),
 				apiKey: true,
 			});
-			await this.saveSession(normalizeSession(session), 'SIGNED_IN');
+			await this.saveSession(normalizeSession(session), 'SIGNED_IN', revision);
 			return ok({ session: this.currentSession!, user: this.currentSession!.user });
 		} catch (error) {
 			return err('LUX_AUTH_OAUTH_ERROR', 'Failed to exchange auth code for session', toLuxError(error));
@@ -732,13 +748,14 @@ export class LuxAuthClient {
 	}
 
 	async verifyOtp(options: LuxVerifyOtpOptions): Promise<LuxResult<LuxAuthSessionResult>> {
+		const revision = ++this.sessionRevision;
 		try {
 			const session = await this.requestRaw<LuxAuthSession>('/auth/v1/verify', {
 				method: 'POST',
 				body: JSON.stringify(options),
 				apiKey: true,
 			});
-			await this.saveSession(normalizeSession(session), 'SIGNED_IN');
+			await this.saveSession(normalizeSession(session), 'SIGNED_IN', revision);
 			return ok({ session: this.currentSession!, user: this.currentSession!.user });
 		} catch (error) {
 			return err('LUX_AUTH_VERIFY_ERROR', 'Failed to verify auth token', toLuxError(error));
@@ -754,10 +771,11 @@ export class LuxAuthClient {
 	}
 
 	refreshSession(refreshToken: string): Promise<LuxResult<LuxAuthSessionResult>> {
-		const coordinationKey = `${this.httpUrl ?? ''}\u0000${this.storageKey}\u0000${refreshToken}`;
+		const revision = this.sessionRevision;
+		const coordinationKey = `${this.httpUrl ?? ''}\u0000${this.apiKey ?? ''}\u0000${this.storageKey}\u0000${refreshToken}`;
 		let pending = realmRefreshes.get(coordinationKey);
 		if (!pending) {
-			const created = this.refreshSessionCoordinated(refreshToken);
+			const created = this.refreshSessionCoordinated(refreshToken, revision);
 			pending = created;
 			realmRefreshes.set(coordinationKey, created);
 			void created.then(
@@ -767,7 +785,7 @@ export class LuxAuthClient {
 		}
 		let adopted = this.refreshAdoptions.get(pending);
 		if (!adopted) {
-			adopted = this.adoptRefreshResult(pending);
+			adopted = this.adoptRefreshResult(pending, revision);
 			this.refreshAdoptions.set(pending, adopted);
 		}
 		return adopted;
@@ -779,19 +797,20 @@ export class LuxAuthClient {
 		}
 	}
 
-	private async adoptRefreshResult(pending: Promise<RefreshResult>): Promise<RefreshResult> {
+	private async adoptRefreshResult(pending: Promise<RefreshResult>, revision: number): Promise<RefreshResult> {
 		const result = await pending;
+		if (revision !== this.sessionRevision) return err('LUX_AUTH_SESSION_CHANGED', 'Auth session changed while refresh was pending');
 		if (result.error || !result.data.session) return result;
 		if (this.currentSession === result.data.session) return result;
 		try {
-			await this.saveSession(result.data.session, 'TOKEN_REFRESHED');
+			await this.saveSession(result.data.session, 'TOKEN_REFRESHED', revision);
 			return ok({ session: this.currentSession!, user: this.currentSession!.user });
 		} catch (error) {
 			return err('LUX_AUTH_REFRESH_ERROR', 'Failed to persist refreshed auth session', toLuxError(error));
 		}
 	}
 
-	private async refreshSessionCoordinated(refreshToken: string): Promise<RefreshResult> {
+	private async refreshSessionCoordinated(refreshToken: string, revision: number): Promise<RefreshResult> {
 		const locks = typeof globalThis === 'undefined'
 			? undefined
 			: (globalThis as any).navigator?.locks;
@@ -805,14 +824,14 @@ export class LuxAuthClient {
 						const result = replacement
 							? ok({ session: replacement, user: replacement.user })
 							: await this.requestRefreshSession(refreshToken);
-						return this.adoptRefreshResult(Promise.resolve(result));
+						return this.adoptRefreshResult(Promise.resolve(result), revision);
 					},
 				);
 			} catch (error) {
 				return err('LUX_AUTH_REFRESH_ERROR', 'Failed to coordinate auth session refresh', toLuxError(error));
 			}
 		}
-		return this.adoptRefreshResult(this.requestRefreshSession(refreshToken));
+		return this.adoptRefreshResult(this.requestRefreshSession(refreshToken), revision);
 	}
 
 	private async readReplacementSession(refreshToken: string): Promise<LuxAuthSession | null> {
@@ -879,6 +898,7 @@ export class LuxAuthClient {
 		if (!sessionOrRefreshToken) {
 			sessionOrRefreshToken = await this.getSessionValue() ?? undefined;
 		}
+		const revision = ++this.sessionRevision;
 		const token = typeof sessionOrRefreshToken === 'string'
 			? sessionOrRefreshToken
 			: sessionOrRefreshToken?.access_token;
@@ -899,7 +919,7 @@ export class LuxAuthClient {
 		try {
 			// Local sign-out must not depend on the remote session still being
 			// valid. The server may already have revoked or expired it.
-			await this.clearSessionValue();
+			if (revision === this.sessionRevision) await this.clearSessionValue();
 		} catch (error) {
 			return err('LUX_AUTH_LOGOUT_ERROR', 'Failed to clear the local auth session', {
 				logout: logoutError ? toLuxError(logoutError) : null,
@@ -1134,31 +1154,39 @@ export class LuxAuthClient {
 	}
 
 	private async loadStoredSession(): Promise<void> {
+		if (this.loadingSession) return this.loadingSession;
 		if (this.loadedSession) return;
-		this.loadedSession = true;
-		if (!this.persistSession || !this.storage) return;
-		const raw = await this.storage.getItem(this.storageKey);
-		this.storedSessionRaw = raw;
-		if (!raw) return;
-		try {
-			const session = normalizeSession(JSON.parse(raw));
-			this.currentSession = session;
-			this.authToken = session.access_token;
-			this.scheduleRefresh(session);
-		} catch {
-			await this.storage.removeItem(this.storageKey);
-		}
+		const revision = this.sessionRevision;
+		const load = async () => {
+			if (!this.persistSession || !this.storage) { this.loadedSession = true; return; }
+			await this.storageWrites;
+			const raw = await this.storage.getItem(this.storageKey);
+			if (revision !== this.sessionRevision) return;
+			await this.applyExternalSession(raw, undefined, false);
+			this.loadedSession = true;
+		};
+		this.loadingSession = load();
+		try { await this.loadingSession; } finally { this.loadingSession = undefined; }
 	}
 
-	private async saveSession(session: LuxAuthSession, event: LuxAuthChangeEvent): Promise<void> {
+	private async writeStorage(raw: string | null): Promise<void> {
+		const write = this.storageWrites.then(async () => {
+			if (raw === null) await this.storage?.removeItem(this.storageKey);
+			else await this.storage?.setItem(this.storageKey, raw);
+		});
+		this.storageWrites = write.catch(() => {});
+		await write;
+	}
+
+	private async saveSession(session: LuxAuthSession, event: LuxAuthChangeEvent, revision: number): Promise<void> {
+		if (revision !== this.sessionRevision) throw new Error('Auth session changed while the operation was pending');
+		const raw = JSON.stringify(session);
+		if (this.persistSession && this.storage) await this.writeStorage(raw);
+		if (revision !== this.sessionRevision) throw new Error('Auth session changed while the operation was pending');
 		this.currentSession = session;
 		this.authToken = session.access_token;
 		this.loadedSession = true;
-		const raw = JSON.stringify(session);
 		this.storedSessionRaw = raw;
-		if (this.persistSession && this.storage) {
-			await this.storage.setItem(this.storageKey, raw);
-		}
 		this.scheduleRefresh(session);
 		this.emit(event, session);
 		this.broadcast(event, raw);
@@ -1189,7 +1217,7 @@ export class LuxAuthClient {
 
 		const BroadcastChannelImpl = (globalThis as any).BroadcastChannel;
 		if (BroadcastChannelImpl) {
-			this.broadcastChannel = new BroadcastChannelImpl(this.storageKey);
+			this.broadcastChannel = new BroadcastChannelImpl(`${this.httpUrl ?? ''}:${this.storageKey}`);
 			this.broadcastChannel?.addEventListener('message', (event) => {
 				const message = event.data as {
 					event?: LuxAuthChangeEvent;
@@ -1211,7 +1239,10 @@ export class LuxAuthClient {
 
 	private async recoverStoredSession(notify: boolean): Promise<void> {
 		if (!this.persistSession || !this.storage) return;
+		await this.storageWrites;
+		const revision = this.sessionRevision;
 		const raw = await this.storage.getItem(this.storageKey);
+		if (revision !== this.sessionRevision) return;
 		await this.applyExternalSession(
 			raw,
 			undefined,
@@ -1241,6 +1272,7 @@ export class LuxAuthClient {
 		notify = true,
 	): Promise<void> {
 		if (raw === this.storedSessionRaw) return;
+		if (this.loadedSession) ++this.sessionRevision;
 
 		const previousSession = this.currentSession;
 		this.storedSessionRaw = raw;
@@ -1319,12 +1351,12 @@ export class LuxAuthClient {
 		if ((init.apiKey || init.secret) && this.apiKey) {
 			headers.apikey = this.apiKey;
 		}
-		const response = await this.fetchImpl(`${this.httpUrl}${path}`, {
+		const { response, text } = await fetchText(this.fetchImpl, `${this.httpUrl}${path}`, {
 			method: init.method,
 			headers,
 			body: init.body,
-		});
-		const text = await response.text();
+			signal: this.signal,
+		}, this.requestTimeoutMs);
 		const payload = text ? JSON.parse(text) : {};
 		if (!response.ok) {
 			const message = payload?.error || `Lux auth request failed with HTTP ${response.status}`;

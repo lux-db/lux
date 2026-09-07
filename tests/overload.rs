@@ -1448,22 +1448,23 @@ async fn slow_response_writer_is_evicted_and_connection_capacity_recovers() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(750)).await;
 
-    let mut recovered = false;
+    let mut info = None;
     for _ in 0..20 {
-        if try_send_resp(address, &[b"PING"])
-            .await
-            .is_ok_and(|response| response == b"+PONG\r\n")
-        {
-            recovered = true;
-            break;
+        if let Ok(response) = try_send_resp(address, &[b"INFO"]).await {
+            if response
+                .windows(b"connection_timeouts:1".len())
+                .any(|value| value == b"connection_timeouts:1")
+            {
+                info = Some(response);
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(
-        recovered,
-        "write timeout did not release connection capacity"
+    let info = String::from_utf8_lossy(
+        info.as_deref()
+            .expect("write timeout did not release connection capacity"),
     );
-    let info = String::from_utf8_lossy(&send_resp(address, &[b"INFO"]).await).into_owned();
     assert!(info.contains("connection_timeouts:1"), "{info}");
     drop(stalled);
 
