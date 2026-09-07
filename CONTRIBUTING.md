@@ -18,25 +18,20 @@ cargo run --release
 
 ## Running tests
 
-The pre-1.0 upgrade matrix uses real standalone binaries and Node.js 22 or
-newer, without npm packages:
+Automatic CLI upgrade tests use Node.js 22 or newer, Docker, a built CLI, and
+preloaded old/candidate engine images. No registry push is performed:
 
 ```bash
-node tests/upgrade.mjs /path/to/lux-v0.37.0 /path/to/lux-candidate
+node cli/tests/upgrade.mjs ./cli/target/debug/lux OLD_IMAGE CANDIDATE_IMAGE
 ```
 
-Supply the published v0.37.0 binary for the host architecture; the test verifies
-its release checksum before execution. It creates isolated loopback instances
-and private fixtures under `.scratch/`, never an installed project. The JSON
-report records both binary hashes, snapshot hashes, fixture location, and each
-case's result. Fixtures are retained for inspection. The matrix checks snapshot
-imports and backup-based rollback with Auth, encrypted values, core data types,
-table indexes, migration history, queue consumer state, and cold tiered data.
-It also checks expiry during downtime, row grants, reconnected live queries,
-and repair after incomplete snapshot or encryption-state copies.
-Rollback is checked without the old engine's memory-pressure eviction, whose
-cold table scans are not a reliable logical-data oracle. This does not certify
-in-place downgrade, every platform, or future release artifacts.
+Set `AUTO_TEST_MODE` to `snapshot-failure`, `stopped-snapshot-failure`,
+`probe-failure`, `import-failure`, `verification-write`, `stopped`, `prepare-interruption`, or
+`cutover-interruption` to exercise the corresponding failure boundary. The
+default verifies a running upgrade with concurrent writes and an existing auth
+session. Registry lookups use the preloaded images; container, volume, network,
+snapshot, and recovery operations are real. Fixtures and their volume names are
+retained under `.scratch/` for inspection.
 
 ```bash
 cargo test --all-targets

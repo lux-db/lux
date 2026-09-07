@@ -113,15 +113,25 @@ lux restore ./lux.dat      # validate, stage, gracefully restart, and verify rea
 ```
 
 `lux stop` sends SIGTERM to the engine and gives its checked durability barrier
-35 seconds to finish before removing the container. Local engine updates use
-the same graceful stop path.
+35 seconds to finish before removing the container. Engine updates use the
+separate snapshot handoff described below.
 
-For the v0.37.0-to-1.0 transition, follow the
-[snapshot-based upgrade runbook](../DURABILITY.md#upgrading-from-v0370-to-10)
-before changing engine versions. `lux update engine` reuses the existing volume;
-it does not quiesce applications, retain a pre-upgrade backup, or import into a
-fresh volume. Do not use `lux start --fresh` or `lux stop --clear` on the source
-project during this procedure: those commands discard its data volume.
+`lux update engine` handles snapshot migration automatically. It temporarily
+disconnects application access, saves with the old engine, imports into a fresh
+volume, and checks the candidate before switching. Connections drop during the
+update; applications should reconnect afterward. A stopped stack stays stopped.
+
+If preparation fails, the CLI restores the original engine. Once cutover can
+accept new writes, recovery stays on the new volume rather than discarding those
+writes through an automatic downgrade. Retry `lux start` after an interrupted
+operation. The original container and volume are retained; private recovery
+records live under `lux/.backups/`. Backups consume additional disk space and
+are not removed by clearing the current volume.
+
+Image changes, including edits to `engine_version`, take effect through
+`lux update engine`; ordinary restarts reuse the recorded runtime image.
+Self-hosted binaries not managed by the CLI should follow the
+[upgrade runbook](../DURABILITY.md#upgrading-from-v0370-to-10).
 
 `lux restore` accepts snapshots produced by current or older Lux engines. The
 running database remains available while the engine validates and stages the

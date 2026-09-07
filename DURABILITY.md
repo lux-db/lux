@@ -297,6 +297,15 @@ Upgrade:
 
 ### Upgrading from v0.37.0 to 1.0
 
+For CLI-managed local stacks, run `lux update engine`. The CLI disconnects
+application networking, saves using the old engine, imports into a separate
+volume, and verifies the candidate before cutover. It retains the original
+container and data volume. Failed preparation restores the old engine;
+interrupted operations are recovered by `lux start`. After cutover, recovery
+keeps the candidate volume so newly accepted writes are not silently lost.
+
+For standalone binaries and installations not managed by the CLI:
+
 Use a final snapshot produced by v0.37.0, not a direct handoff of its live WAL
 or tiered files. That release can contain duplicate Auth inserts in its journal;
 strict recovery rejects those records instead of silently skipping errors.
@@ -329,7 +338,3 @@ start v0.37.0 against a directory that 1.0 has modified. Backup-based rollback
 returns to the pre-upgrade state: it does not retain writes accepted after
 cutover. Once clients resume writes, stop and reconcile those writes before any
 rollback; do not silently discard them.
-
-`lux update engine` replaces the local container on its existing volume. It
-does not stop external applications, create this backup, or import into a fresh
-volume. It is not a substitute for the pre-1.0 procedure above.
