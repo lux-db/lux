@@ -82,7 +82,8 @@ mod tests {
 
     #[test]
     fn accepts_only_http_success() {
-        assert!(run_probe("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").is_ok());
+        let success = run_probe("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert!(success.is_ok(), "{success:?}");
         assert!(
             run_probe("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n").is_err()
         );
@@ -93,8 +94,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 256];
-            let _ = stream.read(&mut request).unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 256];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0, "healthcheck request ended before its headers");
+                request.extend_from_slice(&chunk[..count]);
+            }
             stream.write_all(response.as_bytes()).unwrap();
         });
         let result = check(
