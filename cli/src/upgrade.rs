@@ -297,8 +297,16 @@ pub(super) fn perform(
     if networks.len() != 1 || !networks.contains_key("bridge") {
         return Err("automatic local upgrades require the CLI-managed bridge network; old engine left unchanged".into());
     }
-    if helper(image_id, "none", &["version"], &[])?.trim() != "1" {
-        return Err("target image does not support automatic snapshot upgrades".into());
+    let maintenance_version = helper(image_id, "none", &["version"], &[]).map_err(|error| {
+        format!(
+            "target image does not support automatic snapshot upgrades ({error}); current engine and data left unchanged"
+        )
+    })?;
+    if maintenance_version.trim() != "1" {
+        return Err(
+            "target image does not support automatic snapshot upgrades; current engine and data left unchanged"
+                .into(),
+        );
     }
     let suffix = random_hex(8);
     let mut target = state.clone();

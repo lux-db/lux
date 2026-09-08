@@ -35,8 +35,10 @@ mkdirSync(bin);
 cpSync(join(root, "cli/tests/upgrade-docker.mjs"), join(bin, "docker"));
 chmodSync(join(bin, "docker"), 0o755);
 const mode = process.env.AUTO_TEST_MODE || "normal";
-assert(["normal", "verification-write", "snapshot-failure", "stopped-snapshot-failure", "probe-failure", "import-failure", "stopped", "prepare-interruption", "cutover-interruption"].includes(mode), "unknown test mode");
-const refusesUpdate = ["snapshot-failure", "stopped-snapshot-failure", "probe-failure", "import-failure"].includes(mode);
+assert(["normal", "backup-rollback", "unsupported-downgrade", "verification-write", "snapshot-failure", "stopped-snapshot-failure", "probe-failure", "import-failure", "stopped", "prepare-interruption", "cutover-interruption"].includes(mode), "unknown test mode");
+const sourceStorage = process.env.LUX_SOURCE_STORAGE_MODE || "tiered";
+assert(["memory", "tiered"].includes(sourceStorage), "unknown source storage mode");
+const refusesUpdate = ["unsupported-downgrade", "snapshot-failure", "stopped-snapshot-failure", "probe-failure", "import-failure"].includes(mode);
 const startsStopped = ["stopped", "stopped-snapshot-failure"].includes(mode);
 const docker = (...args) => exec(realDocker, args, { timeout: 30000 });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -114,6 +116,14 @@ function cmd(port, args) {
     });
   });
 }
+async function assertDocumentSchema(port, phase) {
+  const schema = await cmd(port, ["TSCHEMA", "documents"]);
+  for (const field of [
+    "id INT PRIMARY KEY NOT NULL",
+    "metadata JSON",
+    "embedding VECTOR(3)",
+  ]) assert(schema.includes(field), `${phase} schema is missing ${field}`);
+}
 const p = await port(),
   h = await port();
 const container = `lux-upgrade-test-${nonce}`;
@@ -133,9 +143,15 @@ assert.notEqual(
 await docker("tag", candidateImage, `ghcr.io/lux-db/lux:${candidateTag}`);
 const project = join(dir, "project");
 mkdirSync(join(project, "lux"), { recursive: true });
+mkdirSync(join(project, "lux/migrations"));
 writeFileSync(
   join(project, "lux/config.toml"),
   `engine_version = "${candidateTag}"\n`,
+);
+writeFileSync(
+  join(project, "lux/migrations/001_lifecycle.lux"),
+  "TCREATE migration_rows id INT PRIMARY KEY, value STR;\n" +
+    "TINSERT migration_rows id 1 value preserved;\n",
 );
 const state = {
   password,
@@ -165,6 +181,7 @@ if (mode.endsWith("interruption")) {
   else env.AUTO_CUTOVER_NAME = container;
 }
 const owned = [];
+let completed = false;
 try {
   await docker(
     "run",
@@ -184,7 +201,7 @@ try {
     "-e",
     "LUX_DATA_DIR=/data",
     "-e",
-    "LUX_STORAGE_MODE=tiered",
+    `LUX_STORAGE_MODE=${sourceStorage}`,
     "-e",
     "LUX_PORT=6379",
     "-e",
@@ -228,20 +245,48 @@ try {
   });
   assert(signup.ok);
   const session = await signup.json();
+  await exec(cliBinary, ["migrate", "run"], {
+    cwd: project,
+    env,
+    timeout: 30000,
+  });
   for (const operation of [
+    ["SET", "string", "preserved"],
+    ["SET", "expires", "preserved"],
+    ["PEXPIREAT", "expires", "4102444800000"],
+    ["SET", "protected", "sealed-value", "ENCRYPTED"],
     ["HSET", "hash", "field", "preserved"],
     ["RPUSH", "list", "first", "second"],
     ["SADD", "set", "member"],
     ["ZADD", "sorted", "1", "member"],
+    ["XADD", "jobs", "1-0", "body", "preserved"],
+    ["XGROUP", "CREATE", "jobs", "workers", "0"],
+    ["XREADGROUP", "GROUP", "workers", "fixture", "COUNT", "1", "STREAMS", "jobs", ">"],
+    ["PFADD", "cardinality", "one", "two", "three"],
+    ["TSADD", "metric", "1000", "42.5", "LABELS", "kind", "fixture"],
+    ["VSET", "vector", "3", "1", "0", "0", "META", '{"kind":"fixture"}'],
     ["TCREATE", "rows", "id INT PRIMARY KEY, value STR"],
     ["TINSERT", "rows", "id", "1", "value", "preserved"],
+    ["TCREATE", "documents", "id INT PRIMARY KEY, metadata JSON, embedding VECTOR(3)"],
+    ["TINDEX", "documents", "metadata.kind", "STR"],
+    ["TINSERT", "documents", "id", "1", "metadata", '{"kind":"fixture"}', "embedding", "[1,0,0]"],
   ]) assert(!((await cmd(p, operation)).startsWith("-")), `${operation[0]} failed`);
   const reads = [
+    ["GET", "string"],
+    ["GET", "expires"],
+    ["GET", "protected"],
     ["HGET", "hash", "field"],
     ["LRANGE", "list", "0", "-1"],
     ["SISMEMBER", "set", "member"],
     ["ZRANGE", "sorted", "0", "-1", "WITHSCORES"],
+    ["XLEN", "jobs"],
+    ["XPENDING", "jobs", "workers"],
+    ["PFCOUNT", "cardinality"],
+    ["TSRANGE", "metric", "0", "2000"],
+    ["VGET", "vector"],
     ["TSELECT", "*", "FROM", "rows"],
+    ["TSELECT", "*", "FROM", "migration_rows"],
+    ["TSELECT", "*", "FROM", "documents", "WHERE", "metadata.kind", "=", "fixture"],
   ];
   const before = [];
   for (const query of reads) {
@@ -249,6 +294,7 @@ try {
     assert(!response.startsWith("-"), `${query[0]} failed`);
     before.push(response);
   }
+  await assertDocumentSchema(p, "source");
   if (startsStopped) {
     assert.match(await cmd(p, ["SET", "before-stop", "value"]), /\+OK/);
     assert.match(await cmd(p, ["SAVE"]), /\+OK/);
@@ -322,7 +368,9 @@ try {
     if (!refusesUpdate) throw error;
     assert.equal(error.code, 1);
     cli = error;
-    assert.match(error.stderr, /original engine restored/);
+    if (mode === "unsupported-downgrade")
+      assert.match(error.stderr, /does not support automatic snapshot upgrades/);
+    else assert.match(error.stderr, /original engine restored/);
   }
   sending = false;
   await writer;
@@ -333,7 +381,8 @@ try {
   if (refusesUpdate || mode === "prepare-interruption")
     assert.equal(updated.volume, volume);
   else assert.notEqual(updated.volume, volume);
-  assert(updated.image.startsWith("sha256:"));
+  if (mode === "unsupported-downgrade") assert.equal(updated.image, old);
+  else assert(updated.image.startsWith("sha256:"));
   if (startsStopped) {
     const status = await docker(
       "inspect",
@@ -350,6 +399,9 @@ try {
     assert.match(await cmd(p, ["EXISTS", `written:${i}`]), /:1\r\n/);
   for (let i = 0; i < reads.length; i++)
     assert.equal(await cmd(p, reads[i]), before[i], `${reads[i][0]} changed`);
+  await assertDocumentSchema(p, "candidate");
+  const ttl = await cmd(p, ["PTTL", "expires"]);
+  assert.match(ttl, /^:\d+\r\n$/, "absolute TTL was not preserved");
   if (mode === "verification-write")
     assert.equal(await cmd(p, ["EXISTS", "verification-only"]), ":0\r\n");
   if (mode === "cutover-interruption")
@@ -361,6 +413,23 @@ try {
     },
   });
   assert.equal(user.status, 200);
+  const login = await fetch(`http://127.0.0.1:${h}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: {
+      apikey: state.publishable_key,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      email: "automatic@example.test",
+      password: "fixture-password-12345",
+    }),
+  });
+  assert.equal(login.status, 200, "password login failed after upgrade");
+  await exec(cliBinary, ["migrate", "status", "--check"], {
+    cwd: project,
+    env,
+    timeout: 30000,
+  });
   const records = await docker("ps", "-a", "--format", "{{.Names}}");
   owned.push(
     ...records.stdout
@@ -374,10 +443,43 @@ try {
     const policy = await docker("inspect", "-f", "{{.HostConfig.RestartPolicy.Name}}", backup);
     assert.equal(policy.stdout.trim(), "no", "a retained backup must not auto-start");
   }
+  if (mode === "backup-rollback") {
+    const backup = owned.find((name) => name.includes("-backup-"));
+    assert(backup, "upgrade did not retain a backup container");
+    await docker("stop", "--timeout", "300", updated.container);
+    await docker("network", "connect", "bridge", backup);
+    await docker("start", backup);
+    for (let i = 0; i < 40; i++) {
+      try {
+        assert.match(await cmd(p, ["PING"]), /PONG/);
+        break;
+      } catch {
+        assert(i < 39, "backup did not become ready");
+        await sleep(100);
+      }
+    }
+    for (let i = 0; i < reads.length; i++)
+      assert.equal(await cmd(p, reads[i]), before[i], `${reads[i][0]} changed in backup`);
+    await assertDocumentSchema(p, "backup");
+    assert.match(await cmd(p, ["SAVE"]), /OK/, "backup SAVE failed");
+    await docker("kill", "--signal", "KILL", backup);
+    await docker("network", "disconnect", "--force", "bridge", backup);
+    await docker("start", updated.container);
+    for (let i = 0; i < 40; i++) {
+      try {
+        assert.match(await cmd(p, ["PING"]), /PONG/);
+        break;
+      } catch {
+        assert(i < 39, "candidate did not resume after backup verification");
+        await sleep(100);
+      }
+    }
+  }
   console.log(
     JSON.stringify({
       result: "pass",
       mode,
+      sourceStorage,
       sourceId,
       candidateId,
       acknowledged: acknowledged.length,
@@ -385,6 +487,7 @@ try {
       updatedVolume: updated.volume,
     }),
   );
+  completed = true;
 } catch (error) {
   console.error(error.message, error.stdout || "", error.stderr || "");
   process.exitCode = 1;
@@ -398,5 +501,12 @@ try {
   await docker("image", "rm", `ghcr.io/lux-db/lux:${candidateTag}`).catch(
     () => {},
   );
-  // Fixture volumes are retained for examination; their names are recorded in the local state and backup records.
+  if (completed && process.env.LUX_KEEP_LIFECYCLE_FIXTURES !== "1") {
+    const volumes = await docker("volume", "ls", "--format", "{{.Name}}");
+    for (const name of volumes.stdout
+      .trim()
+      .split("\n")
+      .filter((name) => name.startsWith(`${container}-data`)))
+      await docker("volume", "rm", name).catch(() => {});
+  }
 }

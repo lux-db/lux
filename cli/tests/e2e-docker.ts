@@ -1,16 +1,19 @@
 // Run against an explicitly selected, already-built image; never pull or retag latest.
-// LUX_E2E_ENGINE_VERSION=local-test LUX_E2E_CLI_BIN=/path/to/lux bun cli/tests/e2e-docker.ts
+// LUX_E2E_ENGINE_IMAGE=ghcr.io/lux-db/lux:local-test LUX_E2E_CLI_BIN=/path/to/lux bun cli/tests/e2e-docker.ts
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+const selectedImage = process.env.LUX_E2E_ENGINE_IMAGE;
 const version = process.env.LUX_E2E_ENGINE_VERSION;
-assert(version && /^[A-Za-z0-9_.-]+$/.test(version), 'set LUX_E2E_ENGINE_VERSION to a locally built image tag');
+assert(selectedImage || (version && /^[A-Za-z0-9_.-]+$/.test(version)), 'set LUX_E2E_ENGINE_IMAGE to an already-built image');
 const binary = resolve(process.env.LUX_E2E_CLI_BIN ?? join(repo, 'cli/target/debug/lux'));
 assert(existsSync(binary), 'build the CLI first');
-const image = `ghcr.io/lux-db/lux:${version}`;
+const image = selectedImage ?? `ghcr.io/lux-db/lux:${version}`;
+const configuredVersion = selectedImage?.match(/^ghcr\.io\/lux-db\/lux:([A-Za-z0-9_.-]+)$/)?.[1] ?? version;
+assert(configuredVersion, 'the selected image must use a ghcr.io/lux-db/lux:<version> tag');
 assert.equal(Bun.spawnSync(['docker', 'image', 'inspect', image], { stdout: 'ignore', stderr: 'ignore' }).exitCode, 0, 'build the selected engine image first');
 mkdirSync(join(repo, '.scratch'), { recursive: true });
 const project = mkdtempSync(join(repo, '.scratch', 'cli-docker-'));
@@ -46,7 +49,7 @@ function containerId(): string {
 let completed = false;
 try {
   cli(['init']);
-  const config = `engine_version = "${version}"\n[engine.logging]\nformat = "json"\n`;
+  const config = `engine_version = "${configuredVersion}"\n[engine.logging]\nformat = "json"\n`;
   writeFileSync(join(project, 'lux/config.toml'), config);
   writeFileSync(join(project, '.env.local'), '# application settings\nAPP_MARKER=preserved\n');
   writeFileSync(join(project, 'lux/migrations/001_create.lux'), 'TCREATE local_rows id INT PRIMARY KEY, value STR;\n');
