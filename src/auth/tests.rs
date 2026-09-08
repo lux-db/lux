@@ -3131,6 +3131,89 @@ fn postmark_payload_renders_builtin_signup_and_recovery_emails() {
     assert!(recovery_payload.html_body.contains("Reset your password"));
 }
 
+#[tokio::test]
+async fn auth_provider_json_rejects_a_declared_oversized_response() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 1024];
+        let _ = socket.read(&mut request).await.unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            AUTH_PROVIDER_RESPONSE_MAX_BYTES + 1
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}"))
+        .send()
+        .await
+        .unwrap();
+    let result = auth_provider_json::<Value>(response, "request_failed", "response_invalid").await;
+    assert_eq!(result.unwrap_err(), "response_invalid");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn auth_provider_json_bounds_a_response_without_a_declared_length() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 1024];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"value\":\"too long\"}")
+            .await
+            .unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}"))
+        .send()
+        .await
+        .unwrap();
+    let result =
+        auth_provider_json_with_limit::<Value>(response, "request_failed", "response_invalid", 8)
+            .await;
+    assert_eq!(result.unwrap_err(), "response_invalid");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn auth_provider_client_returns_redirects_to_the_caller() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 1024];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: /unexpected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+
+    let response = auth_http_client()
+        .unwrap()
+        .get(format!("http://{address}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    server.await.unwrap();
+}
+
 #[test]
 fn admin_settings_redacts_and_preserves_postmark_token() {
     let config = Arc::new(crate::ServerConfig {

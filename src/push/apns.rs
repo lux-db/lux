@@ -3,10 +3,10 @@
 //! OneSignal/Firebase in the path): an ES256 provider JWT minted from the app's
 //! `.p8` key, cached and refreshed, and a `POST /3/device/<token>`.
 
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -132,7 +132,7 @@ impl ApnsSink {
     /// signing at `src/auth.rs` (`EncodingKey::from_ec_pem` + `Header.kid`); a
     /// `.p8` file is a PKCS8 EC PEM, so it feeds `from_ec_pem` directly.
     fn provider_token(&self, now_secs: u64) -> Result<String, DeliveryError> {
-        let mut cache = self.token_cache.lock().unwrap();
+        let mut cache = self.token_cache.lock();
         if let Some(cached) = cache.as_ref() {
             if cached.minted.elapsed() < APNS_TOKEN_TTL {
                 return Ok(cached.jwt.clone());

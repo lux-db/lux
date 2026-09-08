@@ -1,4 +1,5 @@
 use super::*;
+use parking_lot::Mutex as ParkingMutex;
 
 const APPLE_PRIVATE_KEY_MAX_BYTES: usize = 16 * 1024;
 const APPLE_NATIVE_NONCE_PREFIX: &str = "_auth:apple_native_nonce:";
@@ -301,10 +302,9 @@ const APPLE_JWKS_URL: &str = "https://appleid.apple.com/auth/keys";
 const APPLE_JWKS_TTL: Duration = Duration::from_secs(6 * 3600);
 const APPLE_JWKS_FORCE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
-static APPLE_JWKS_CACHE: OnceLock<Mutex<Option<(Instant, JwkSet)>>> = OnceLock::new();
-static APPLE_JWKS_FORCE_REFRESHED_AT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+static APPLE_JWKS_CACHE: OnceLock<ParkingMutex<Option<(Instant, JwkSet)>>> = OnceLock::new();
+static APPLE_JWKS_FORCE_REFRESHED_AT: OnceLock<ParkingMutex<Option<Instant>>> = OnceLock::new();
 static APPLE_JWKS_FETCH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-static APPLE_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 pub(super) struct AppleIdTokenClaims {
@@ -317,31 +317,21 @@ pub(super) struct AppleIdTokenClaims {
     pub(super) nonce: Option<String>,
 }
 
-fn apple_jwks_cache() -> &'static Mutex<Option<(Instant, JwkSet)>> {
-    APPLE_JWKS_CACHE.get_or_init(|| Mutex::new(None))
-}
-
-fn apple_http_client() -> &'static reqwest::Client {
-    APPLE_HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("valid Apple HTTP client")
-    })
+fn apple_jwks_cache() -> &'static ParkingMutex<Option<(Instant, JwkSet)>> {
+    APPLE_JWKS_CACHE.get_or_init(|| ParkingMutex::new(None))
 }
 
 /// Seed the Apple JWKS cache so verification runs without a network fetch.
 #[cfg(test)]
 pub(super) fn seed_apple_jwks_for_test(set: JwkSet) {
-    *apple_jwks_cache().lock().unwrap() = Some((Instant::now(), set));
+    *apple_jwks_cache().lock() = Some((Instant::now(), set));
 }
 
 /// Apple's public signing keys, cached with a TTL. In tests the cache is seeded
 /// directly (see test_support) so no network call is made.
 async fn apple_jwks(force_refresh: bool) -> Result<JwkSet, String> {
     if !force_refresh {
-        if let Some((fetched, set)) = apple_jwks_cache().lock().unwrap().as_ref() {
+        if let Some((fetched, set)) = apple_jwks_cache().lock().as_ref() {
             if fetched.elapsed() < APPLE_JWKS_TTL {
                 return Ok(set.clone());
             }
@@ -354,20 +344,18 @@ async fn apple_jwks(force_refresh: bool) -> Result<JwkSet, String> {
         .await;
     let stale = apple_jwks_cache()
         .lock()
-        .unwrap()
         .as_ref()
         .map(|(_, set)| set.clone());
     if !force_refresh {
-        if let Some((fetched, set)) = apple_jwks_cache().lock().unwrap().as_ref() {
+        if let Some((fetched, set)) = apple_jwks_cache().lock().as_ref() {
             if fetched.elapsed() < APPLE_JWKS_TTL {
                 return Ok(set.clone());
             }
         }
     } else {
         let mut refreshed_at = APPLE_JWKS_FORCE_REFRESHED_AT
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .unwrap();
+            .get_or_init(|| ParkingMutex::new(None))
+            .lock();
         if refreshed_at
             .as_ref()
             .map(|last| last.elapsed() < APPLE_JWKS_FORCE_REFRESH_INTERVAL)
@@ -377,21 +365,25 @@ async fn apple_jwks(force_refresh: bool) -> Result<JwkSet, String> {
         }
         *refreshed_at = Some(Instant::now());
     }
-    let response = match apple_http_client().get(APPLE_JWKS_URL).send().await {
+    let client = match auth_http_client() {
+        Ok(client) => client,
+        Err(_) => return stale.ok_or_else(|| "apple_jwks_fetch_failed".to_string()),
+    };
+    let response = match client.get(APPLE_JWKS_URL).send().await {
         Ok(response) => response,
         Err(_) => return stale.ok_or_else(|| "apple_jwks_fetch_failed".to_string()),
     };
-    let response = match response.error_for_status() {
-        Ok(response) => response,
-        Err(_) => return stale.ok_or_else(|| "apple_jwks_fetch_failed".to_string()),
-    };
-    let set: JwkSet = match response.json().await {
+    let set: JwkSet = match auth_provider_json(
+        response,
+        "apple_jwks_fetch_failed",
+        "apple_jwks_parse_failed",
+    )
+    .await
+    {
         Ok(set) => set,
-        Err(_) => {
-            return stale.ok_or_else(|| "apple_jwks_parse_failed".to_string());
-        }
+        Err(error) => return stale.ok_or(error),
     };
-    *apple_jwks_cache().lock().unwrap() = Some((Instant::now(), set.clone()));
+    *apple_jwks_cache().lock() = Some((Instant::now(), set.clone()));
     Ok(set)
 }
 
@@ -647,19 +639,17 @@ pub(super) async fn exchange_apple_code(
         ("grant_type", "authorization_code"),
         ("redirect_uri", redirect_uri),
     ]);
-    let token: Value = apple_http_client()
+    let client = auth_http_client().map_err(|_| "token_exchange_failed".to_string())?;
+    let response = client
         .post("https://appleid.apple.com/auth/token")
         .header("Accept", "application/json")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
         .await
-        .map_err(|_| "token_exchange_failed".to_string())?
-        .error_for_status()
-        .map_err(|_| "token_exchange_failed".to_string())?
-        .json()
-        .await
-        .map_err(|_| "token_response_invalid".to_string())?;
+        .map_err(|_| "token_exchange_failed".to_string())?;
+    let token: Value =
+        auth_provider_json(response, "token_exchange_failed", "token_response_invalid").await?;
     let id_token = token
         .get("id_token")
         .and_then(Value::as_str)

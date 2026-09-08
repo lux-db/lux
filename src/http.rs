@@ -1211,13 +1211,13 @@ fn snapshot_management_authorized(
     cache: &SharedSchemaCache,
     context: &HttpAuthContext,
 ) -> bool {
-    if !store.config().password.is_empty() {
-        matches!(context, HttpAuthContext::Operator | HttpAuthContext::Studio)
-    } else if crate::auth::project_keys_configured(store, cache).unwrap_or(true) {
-        matches!(context, HttpAuthContext::Secret)
-    } else {
-        true
-    }
+    let credentials_configured = !store.config().password.is_empty()
+        || crate::auth::project_keys_configured(store, cache).unwrap_or(true);
+    !credentials_configured
+        || matches!(
+            context,
+            HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio
+        )
 }
 
 /// Stream a complete, consistent snapshot to the caller. Triggers the same save

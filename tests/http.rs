@@ -270,6 +270,39 @@ fn http_snapshot_management_accepts_a_secret_key_when_no_password_exists() {
 }
 
 #[test]
+fn http_snapshot_management_accepts_each_configured_management_credential() {
+    let password = "operator_restore_management_test";
+    let secret = "lux_sec_restore_management_test";
+    let server = LuxServer::builder()
+        .http()
+        .password(password)
+        .env("LUX_AUTH_ENABLED", "true")
+        .env("LUX_AUTH_SECRET_KEY", secret)
+        .start();
+    let http = server.http_port();
+
+    for (label, credential) in [
+        ("operator password", password),
+        ("project secret key", secret),
+    ] {
+        let (status, body) = http_request(http, "GET", "/v1/snapshot", None, Some(credential));
+        assert_eq!(status, 200, "{label} snapshot: {body}");
+
+        let (status, body) = http_request(
+            http,
+            "POST",
+            "/v1/restore",
+            Some("not-a-dump"),
+            Some(credential),
+        );
+        assert_eq!(
+            status, 400,
+            "{label} did not reach restore validation: {body}"
+        );
+    }
+}
+
+#[test]
 fn http_rejects_a_short_restore_body_instead_of_staging_a_prefix() {
     let server = LuxServer::builder().http().start();
     let mut stream = TcpStream::connect(("127.0.0.1", server.http_port())).unwrap();
