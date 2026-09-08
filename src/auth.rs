@@ -13,6 +13,7 @@ use jsonwebtoken::{
 use p256::pkcs8::{EncodePrivateKey, LineEnding};
 use p256::SecretKey;
 use rand_core::{OsRng, RngCore};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -51,10 +52,13 @@ const AUTH_SCHEMA_VERSION_KEY: &[u8] = b"_auth:schema_version";
 const AUTH_SCHEMA_VERSION: &[u8] = b"4";
 const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
 const OAUTH_CALLBACK_BODY_LIMIT: usize = 64 * 1024;
-const POSTMARK_EMAIL_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTH_PROVIDER_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
+const AUTH_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const AUTH_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCESS_REVOKED_AFTER_PREFIX: &[u8] = b"_auth:access_revoked_after:";
 static FLOW_TOKEN_CONSUME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static NONEXISTENT_ACCOUNT_HASH: OnceLock<Result<String, String>> = OnceLock::new();
+static AUTH_HTTP_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ApiKeyKind {
@@ -4033,15 +4037,72 @@ async fn exchange_oauth_code(
     }
 }
 
-/// Mint Apple's OAuth "client secret" on demand: an ES256 JWT signed with the
-/// stored .p8. Minted per exchange with a short expiry, so unlike a manually
-/// pasted secret it never goes stale and never needs rotation.
+/// Reuse connections across auth-provider calls while bounding every request.
+/// Provider endpoints are final destinations; redirects are handled as errors.
+fn auth_http_client() -> Result<&'static reqwest::Client, String> {
+    AUTH_HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(AUTH_HTTP_CONNECT_TIMEOUT)
+                .timeout(AUTH_HTTP_REQUEST_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| "auth provider client setup failed".to_string())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+async fn auth_provider_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+    status_error: &str,
+    response_error: &str,
+) -> Result<T, String> {
+    auth_provider_json_with_limit(
+        response,
+        status_error,
+        response_error,
+        AUTH_PROVIDER_RESPONSE_MAX_BYTES,
+    )
+    .await
+}
+
+async fn auth_provider_json_with_limit<T: DeserializeOwned>(
+    mut response: reqwest::Response,
+    status_error: &str,
+    response_error: &str,
+    max_bytes: usize,
+) -> Result<T, String> {
+    response = response
+        .error_for_status()
+        .map_err(|_| status_error.to_string())?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(response_error.to_string());
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| status_error.to_string())?
+    {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(response_error.to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| response_error.to_string())
+}
+
 async fn exchange_google_code(
     config: &OAuthProviderConfig,
     code: &str,
     redirect_uri: &str,
 ) -> Result<OAuthUser, String> {
-    let client = reqwest::Client::new();
+    let client = auth_http_client().map_err(|_| "token_exchange_failed".to_string())?;
     let body = form_body(&[
         ("client_id", config.client_id.as_str()),
         ("client_secret", config.client_secret.as_str()),
@@ -4049,30 +4110,28 @@ async fn exchange_google_code(
         ("grant_type", "authorization_code"),
         ("redirect_uri", redirect_uri),
     ]);
-    let token: Value = client
+    let response = client
         .post("https://oauth2.googleapis.com/token")
         .header("Accept", "application/json")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
         .await
-        .map_err(|_| "token_exchange_failed".to_string())?
-        .json()
-        .await
-        .map_err(|_| "token_response_invalid".to_string())?;
+        .map_err(|_| "token_exchange_failed".to_string())?;
+    let token: Value =
+        auth_provider_json(response, "token_exchange_failed", "token_response_invalid").await?;
     let access_token = token
         .get("access_token")
         .and_then(Value::as_str)
         .ok_or_else(|| "token_exchange_failed".to_string())?;
-    let profile: Value = client
+    let response = client
         .get("https://openidconnect.googleapis.com/v1/userinfo")
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|_| "userinfo_failed".to_string())?
-        .json()
-        .await
-        .map_err(|_| "userinfo_invalid".to_string())?;
+        .map_err(|_| "userinfo_failed".to_string())?;
+    let profile: Value =
+        auth_provider_json(response, "userinfo_failed", "userinfo_invalid").await?;
     oauth_user_from_google(profile)
 }
 
@@ -4081,48 +4140,44 @@ async fn exchange_github_code(
     code: &str,
     redirect_uri: &str,
 ) -> Result<OAuthUser, String> {
-    let client = reqwest::Client::new();
+    let client = auth_http_client().map_err(|_| "token_exchange_failed".to_string())?;
     let body = form_body(&[
         ("client_id", config.client_id.as_str()),
         ("client_secret", config.client_secret.as_str()),
         ("code", code),
         ("redirect_uri", redirect_uri),
     ]);
-    let token: Value = client
+    let response = client
         .post("https://github.com/login/oauth/access_token")
         .header("Accept", "application/json")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
         .await
-        .map_err(|_| "token_exchange_failed".to_string())?
-        .json()
-        .await
-        .map_err(|_| "token_response_invalid".to_string())?;
+        .map_err(|_| "token_exchange_failed".to_string())?;
+    let token: Value =
+        auth_provider_json(response, "token_exchange_failed", "token_response_invalid").await?;
     let access_token = token
         .get("access_token")
         .and_then(Value::as_str)
         .ok_or_else(|| "token_exchange_failed".to_string())?;
-    let profile: Value = client
+    let response = client
         .get("https://api.github.com/user")
         .header("User-Agent", "Lux Auth")
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|_| "userinfo_failed".to_string())?
-        .json()
-        .await
-        .map_err(|_| "userinfo_invalid".to_string())?;
-    let emails: Value = client
+        .map_err(|_| "userinfo_failed".to_string())?;
+    let profile: Value =
+        auth_provider_json(response, "userinfo_failed", "userinfo_invalid").await?;
+    let response = client
         .get("https://api.github.com/user/emails")
         .header("User-Agent", "Lux Auth")
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|_| "userinfo_failed".to_string())?
-        .json()
-        .await
-        .map_err(|_| "userinfo_invalid".to_string())?;
+        .map_err(|_| "userinfo_failed".to_string())?;
+    let emails: Value = auth_provider_json(response, "userinfo_failed", "userinfo_invalid").await?;
     oauth_user_from_github(profile, emails)
 }
 
@@ -4529,10 +4584,8 @@ async fn send_postmark_email(
     server_token: String,
     message: AuthEmailMessage,
 ) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .timeout(POSTMARK_EMAIL_TIMEOUT)
-        .build()
-        .map_err(|_| "postmark email client setup failed".to_string())?;
+    let client =
+        auth_http_client().map_err(|_| "postmark email client setup failed".to_string())?;
     let response = client
         .post("https://api.postmarkapp.com/email")
         .header("Accept", "application/json")
@@ -6011,10 +6064,9 @@ where
     }
 }
 
-fn run_async_work<T, F>(future: F) -> T
+fn run_async_work<F>(future: F) -> Result<(), String>
 where
-    T: Send + 'static,
-    F: Future<Output = T> + Send + 'static,
+    F: Future<Output = Result<(), String>> + Send + 'static,
 {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
@@ -6024,15 +6076,15 @@ where
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("failed to build auth email runtime")
+                .map_err(|_| "failed to build auth email runtime".to_string())?
                 .block_on(future)
         })
         .join()
-        .expect("auth email runtime thread panicked"),
+        .map_err(|_| "auth email runtime thread failed".to_string())?,
         Err(_) => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("failed to build auth email runtime")
+            .map_err(|_| "failed to build auth email runtime".to_string())?
             .block_on(future),
     }
 }

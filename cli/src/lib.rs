@@ -8,13 +8,12 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpStream};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod file_security;
 mod project_config;
+mod self_update;
 mod studio;
 mod upgrade;
 use file_security::{
@@ -29,6 +28,7 @@ use project_config::{
     resolved_engine_env as resolved_project_engine_env, LocalConfig,
     INITIAL_CONFIG as INITIAL_LOCAL_CONFIG,
 };
+use self_update::{latest_cli_release, newer_cli_version, update_cli};
 use studio::{mint_session, session_is_valid, StudioContainerConfig};
 
 const DEFAULT_API_URL: &str = "https://api.luxdb.dev";
@@ -2916,46 +2916,6 @@ fn short_digest(value: Option<&str>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-async fn latest_cli_release() -> Result<(String, String), String> {
-    let client = reqwest::Client::builder()
-        .user_agent("lux-cli")
-        .build()
-        .map_err(|e| e.to_string())?;
-    let response = client
-        .get("https://api.github.com/repos/lux-db/lux/releases")
-        .send()
-        .await
-        .map_err(|e| format!("release check failed: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "release check failed (HTTP {})",
-            response.status().as_u16()
-        ));
-    }
-    let releases: Vec<serde_json::Value> = response
-        .json()
-        .await
-        .map_err(|e| format!("invalid GitHub release response: {e}"))?;
-    let tag = releases
-        .iter()
-        .filter_map(|release| release.get("tag_name")?.as_str())
-        .find(|tag| tag.starts_with("cli-v"))
-        .ok_or_else(|| "no Lux CLI releases found".to_string())?
-        .to_string();
-    let version = tag.trim_start_matches("cli-v").to_string();
-    Ok((tag, version))
-}
-
-fn newer_cli_version(current: &str, latest: &str) -> bool {
-    match (
-        semver::Version::parse(current),
-        semver::Version::parse(latest),
-    ) {
-        (Ok(current), Ok(latest)) => latest > current,
-        _ => latest != current,
-    }
-}
-
 async fn cli_version_component() -> VersionComponent {
     let current = env!("CARGO_PKG_VERSION").to_string();
     match latest_cli_release().await {
@@ -3154,98 +3114,6 @@ async fn show_versions(
             println!("  {:<10}  {}", "", component.detail.dimmed());
         }
     }
-}
-
-async fn update_cli(check: bool) -> Result<(), String> {
-    let current = env!("CARGO_PKG_VERSION");
-    let (latest_tag, latest_version) = latest_cli_release().await?;
-    println!("{} v{current}", "Current CLI:".bold());
-    if !newer_cli_version(current, &latest_version) {
-        println!("{}", "CLI is already up to date.".green());
-        return Ok(());
-    }
-    println!(
-        "{} v{current} → v{latest_version}",
-        "Update available:".yellow()
-    );
-    if check {
-        println!("Run {} to install.", "lux update cli".cyan());
-        return Ok(());
-    }
-
-    let os = if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "linux") {
-        "linux"
-    } else {
-        return Err("unsupported OS for self-update".to_string());
-    };
-    let arch = if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else {
-        return Err("unsupported architecture for self-update".to_string());
-    };
-    let artifact = format!("lux-cli-{os}-{arch}");
-    let download_url =
-        format!("https://github.com/lux-db/lux/releases/download/{latest_tag}/{artifact}.tar.gz");
-    let client = reqwest::Client::builder()
-        .user_agent("lux-cli")
-        .build()
-        .map_err(|e| e.to_string())?;
-    println!("{} Downloading v{latest_version}...", "...".dimmed());
-    let response = client
-        .get(download_url)
-        .send()
-        .await
-        .map_err(|e| format!("download failed: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "download failed (HTTP {})",
-            response.status().as_u16()
-        ));
-    }
-    let tar_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("download failed: {e}"))?;
-    let current_exe =
-        std::env::current_exe().map_err(|e| format!("could not determine binary path: {e}"))?;
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "lux-cli-update-{}-{}",
-        std::process::id(),
-        random_hex(8)
-    ));
-    ensure_private_dir(&tmp_dir)
-        .map_err(|e| format!("failed to create private update directory: {e}"))?;
-    let tar_path = tmp_dir.join("lux-cli.tar.gz");
-    std::fs::write(&tar_path, &tar_bytes).map_err(|e| format!("failed to stage update: {e}"))?;
-    let status = std::process::Command::new("tar")
-        .args([
-            "xzf",
-            tar_path.to_str().unwrap_or_default(),
-            "-C",
-            tmp_dir.to_str().unwrap_or_default(),
-        ])
-        .status()
-        .map_err(|e| format!("failed to extract update: {e}"))?;
-    if !status.success() {
-        return Err("failed to extract update".to_string());
-    }
-    let new_binary = tmp_dir.join(&artifact);
-    if !new_binary.is_file() {
-        return Err("binary not found in release archive".to_string());
-    }
-    #[cfg(unix)]
-    std::fs::set_permissions(&new_binary, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("failed to make update executable: {e}"))?;
-    std::fs::rename(&new_binary, &current_exe)
-        .or_else(|_| std::fs::copy(&new_binary, &current_exe).map(|_| ()))
-        .map_err(|_| "could not replace binary; try with appropriate permissions".to_string())?;
-    std::fs::remove_dir_all(&tmp_dir).ok();
-    println!("{} Updated CLI to v{latest_version}.", "Done.".green());
-    Ok(())
 }
 
 fn pull_image(image: &str) -> Result<(), String> {
@@ -8661,12 +8529,5 @@ write = 750
                 }
             }
         ));
-    }
-
-    #[test]
-    fn cli_update_check_never_offers_a_downgrade() {
-        assert!(newer_cli_version("0.26.2", "0.27.0"));
-        assert!(!newer_cli_version("0.27.0", "0.26.2"));
-        assert!(!newer_cli_version("0.27.0", "0.27.0"));
     }
 }
