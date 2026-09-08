@@ -307,7 +307,7 @@ configuration interface.
 
 | File or payload | 1.0 status | Compatibility promise | Executable owner |
 |---|---|---|---|
-| `lux.dat` snapshot | Stable | Lux writes snapshot version 6 and reads the legacy pre-versioned format plus binary versions 1 through 6. Every Lux 1.x release must keep reading those formats. | snapshot unit tests, `tests/http.rs`, and crash-recovery tests |
+| `lux.dat` snapshot | Stable | Lux writes snapshot version 6 and reads the legacy pre-versioned format plus binary versions 1 through 6. Every Lux 1.x release must keep reading those formats. | snapshot unit tests, `tests/http.rs`, crash-recovery tests, and `cli/tests/lifecycle-matrix.mjs` |
 | `DUMP`/`RESTORE` payload | Stable within Lux | Lux 1.x preserves read compatibility for its own payloads. They are not Redis RDB payloads. | `tests/server.rs` |
 | `lux/migrations/*.lux` | Stable | UTF-8 command files with SHA-256 ledger identity; filename/content mismatches fail until explicitly repaired. | migration unit/integration tests and CLI E2E |
 | `lux/config.toml` | Stable | The five documented keys above retain their meaning throughout 1.x; unknown keys/comments survive CLI edits. | CLI config unit tests |

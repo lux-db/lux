@@ -8,6 +8,16 @@ if (!docker) throw Error("missing test Docker executable");
 const marker = process.env.VALIDATION_MARKER;
 const mode = process.env.AUTO_TEST_MODE;
 if (mode === "verification-write" && args[0] === "exec" && args.at(-1) === "final") {
+  const inspected = spawnSync(
+    docker,
+    ["inspect", "--format", "{{json .Config.Env}}", args[1]],
+    { encoding: "utf8" },
+  );
+  if (inspected.status !== 0) throw Error("fixture could not inspect candidate environment");
+  const password = JSON.parse(inspected.stdout)
+    .find((value) => value.startsWith("LUX_PASSWORD="))
+    ?.slice("LUX_PASSWORD=".length);
+  if (!password) throw Error("fixture candidate has no password");
   const script = `
     const s = require("node:net").createConnection({host:"127.0.0.1", port:6379});
     const encode = a => "*"+a.length+"\\r\\n"+a.map(v=>"$"+Buffer.byteLength(v)+"\\r\\n"+v+"\\r\\n").join("");
@@ -17,7 +27,20 @@ if (mode === "verification-write" && args[0] === "exec" && args.at(-1) === "fina
     s.on("connect",()=>s.write(encode(["AUTH",process.env.LUX_PASSWORD])+encode(["SET","verification-only","discard-me"])));
     s.on("data",c=>{body+=c;if(body==="+OK\\r\\n+OK\\r\\n"){s.destroy();process.exit(0);}if(body.includes("-ERR"))process.exit(4);});
   `;
-  const injected = spawnSync(docker, ["exec", args[1], "node", "-e", script]);
+  const injected = spawnSync(docker, [
+    "run",
+    "--rm",
+    "--network",
+    `container:${args[1]}`,
+    "-e",
+    `LUX_PASSWORD=${password}`,
+    "--entrypoint",
+    "node",
+    process.env.UPGRADE_TEST_CLIENT_IMAGE ||
+      "node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf",
+    "-e",
+    script,
+  ]);
   if (injected.status !== 0) throw Error("fixture verification write failed");
 }
 if (mode === "import-failure" && args[0] === "exec" && args.at(-1) === "restore-snapshot") {
