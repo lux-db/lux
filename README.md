@@ -57,7 +57,8 @@ documented behavior.
 
 Lux does not publish comparative performance claims from this repository
 without pinned versions, configurations, hardware, raw results, and
-reproducible commands.
+reproducible commands. The public methodology and runner live in
+[`benchmarks/`](benchmarks/).
 
 ## Lux Cloud
 
