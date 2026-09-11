@@ -102,11 +102,7 @@ pub fn evict_if_needed(store: &Store) -> Result<(), String> {
     let mut iterations = 0;
     while store.approximate_memory() > max {
         iterations += 1;
-        if iterations > 128 {
-            if tiered {
-                // In tiered mode, data spills to disk. Never reject writes.
-                return Ok(());
-            }
+        if !tiered && iterations > 128 {
             return Err("OOM command not allowed when used memory > 'maxmemory'".to_string());
         }
 

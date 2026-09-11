@@ -1967,7 +1967,7 @@ pub fn execute(
         return CmdResult::Written;
     }
 
-    if crate::eviction::is_write_command(cmd) {
+    if crate::eviction::is_write_command(cmd) && !store.is_tiered() {
         if let Err(e) = crate::eviction::evict_if_needed(store) {
             resp::write_error(out, &e);
             return CmdResult::Written;
@@ -2924,6 +2924,7 @@ pub fn execute_with_wal(
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
+    let _tiered_memory = store.tiered_memory_boundary();
     let strategy = journal_strategy_for_args(args);
     if matches!(strategy, JournalStrategy::Unclassified)
         && args

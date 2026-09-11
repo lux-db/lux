@@ -2,8 +2,11 @@ use bytes::Bytes;
 use hashbrown::{HashMap, HashSet as FxHashSet};
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::Arc;
@@ -16,6 +19,11 @@ mod transactions;
 mod vectors;
 
 pub(crate) use transactions::ExecutionReadGuard;
+
+thread_local! {
+    static TIERED_MEMORY_BOUNDARY_DEPTH: RefCell<BTreeMap<usize, usize>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId {
@@ -687,6 +695,10 @@ pub struct Store {
     /// batch is being published. Multi-key readers retry when this changes,
     /// preventing a scan from combining rows from opposite sides of a commit.
     table_publication: AtomicU64,
+    /// Active tiered commands that must finish before hot placement changes.
+    tiered_memory_operations: AtomicUsize,
+    /// Closes admission while an over-limit tiered store is rebalanced.
+    tiered_memory_rebalancing: AtomicBool,
     /// Exact sentinel used only while replaying post-snapshot mutations. It
     /// keeps snapshot entries whose wall-clock TTL elapsed during downtime
     /// visible to TTL-preserving journal commands without reviving them after
@@ -727,6 +739,67 @@ pub struct Store {
     /// live queries. Absent for embedded/replay-only stores, so emission is a
     /// cheap no-op there.
     row_delta_broker: std::sync::OnceLock<crate::pubsub::Broker>,
+}
+
+/// Restores the tiered memory ceiling when the outer synchronous operation
+/// finishes. The marker keeps this guard on the thread where its nesting depth
+/// was registered.
+pub(crate) struct TieredMemoryBoundary<'a> {
+    store: Option<&'a Store>,
+    store_id: usize,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+struct TieredMemoryRebalance<'a>(&'a AtomicBool);
+
+impl Drop for TieredMemoryRebalance<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for TieredMemoryBoundary<'_> {
+    fn drop(&mut self) {
+        let Some(store) = self.store else {
+            return;
+        };
+        let outermost = TIERED_MEMORY_BOUNDARY_DEPTH.with(|depths| {
+            let mut depths = depths.borrow_mut();
+            let depth = depths
+                .get_mut(&self.store_id)
+                .expect("tiered memory boundary depth must exist");
+            *depth -= 1;
+            if *depth == 0 {
+                depths.remove(&self.store_id);
+                true
+            } else {
+                false
+            }
+        });
+        if !outermost {
+            return;
+        }
+
+        let over_limit = store.approximate_memory() > store.config().eviction.max_memory;
+        let rebalance = over_limit
+            && store
+                .tiered_memory_rebalancing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+        store
+            .tiered_memory_operations
+            .fetch_sub(1, Ordering::Release);
+        if !rebalance {
+            return;
+        }
+
+        let _rebalance = TieredMemoryRebalance(&store.tiered_memory_rebalancing);
+        while store.tiered_memory_operations.load(Ordering::Acquire) != 0 {
+            std::thread::yield_now();
+        }
+        let result = crate::eviction::evict_if_needed(store);
+        debug_assert!(result.is_ok(), "tiered rebalancing must not reject data");
+    }
 }
 
 /// A fully resolved mutation ready to cross the journal boundary. The payload
@@ -1698,6 +1771,8 @@ impl Store {
             journal_gates,
             table_mutation_gate: parking_lot::ReentrantMutex::new(()),
             table_publication: AtomicU64::new(0),
+            tiered_memory_operations: AtomicUsize::new(0),
+            tiered_memory_rebalancing: AtomicBool::new(false),
             recovery_expiry_sentinel: parking_lot::Mutex::new(None),
             wal_suppress: std::sync::atomic::AtomicBool::new(false),
             replaying_wal: std::sync::atomic::AtomicBool::new(false),
@@ -1725,6 +1800,50 @@ impl Store {
 
     pub fn config(&self) -> &crate::ServerConfig {
         &self.config
+    }
+
+    /// Keep tiered placement stable for one synchronous command or request and
+    /// restore the configured memory ceiling when the outer boundary ends.
+    pub(crate) fn tiered_memory_boundary(&self) -> TieredMemoryBoundary<'_> {
+        if !self.is_tiered() || !crate::eviction::eviction_enabled(self) {
+            return TieredMemoryBoundary {
+                store: None,
+                store_id: 0,
+                _not_send: PhantomData,
+            };
+        }
+
+        let store_id = std::ptr::from_ref(self).addr();
+        let outermost = TIERED_MEMORY_BOUNDARY_DEPTH.with(|depths| {
+            let mut depths = depths.borrow_mut();
+            let depth = depths.entry(store_id).or_insert(0);
+            *depth += 1;
+            *depth == 1
+        });
+        if outermost {
+            loop {
+                while self.tiered_memory_rebalancing.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                self.tiered_memory_operations.fetch_add(1, Ordering::AcqRel);
+                if !self.tiered_memory_rebalancing.load(Ordering::Acquire) {
+                    break;
+                }
+                self.tiered_memory_operations
+                    .fetch_sub(1, Ordering::Release);
+            }
+        }
+        TieredMemoryBoundary {
+            store: Some(self),
+            store_id,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Restore tiered placement after startup recovery, before the server is
+    /// made available to clients.
+    pub(crate) fn restore_tiered_memory_ceiling(&self) {
+        drop(self.tiered_memory_boundary());
     }
 
     pub(crate) fn snapshot_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
@@ -2619,6 +2738,30 @@ impl Store {
 
     pub(crate) fn lock_read_shard(&self, idx: usize) -> parking_lot::RwLockReadGuard<'_, Shard> {
         self.shards[idx].read()
+    }
+
+    /// Run a single-key read while its hot-or-absent placement is stable.
+    /// A cold key returns `None` so the caller can enter a promotion boundary.
+    pub(crate) fn with_stable_resident_or_absent_key<T>(
+        &self,
+        shard_idx: usize,
+        key: &[u8],
+        operation: impl FnOnce(&Shard) -> T,
+    ) -> Option<T> {
+        let _placement_guard = self.journal_gates[self.journal_gate_index(key)].lock();
+        let shard = self.shards[shard_idx].read();
+        if shard.data.contains_key(key) {
+            return Some(operation(&shard));
+        }
+
+        let cold = self.disk_shards.as_ref().is_some_and(|disk_shards| {
+            let disk_idx = self.disk_shard_index(key);
+            let key = std::str::from_utf8(key).unwrap_or_default();
+            disk_shards[disk_idx]
+                .lock()
+                .contains_valid(key, Instant::now())
+        });
+        (!cold).then(|| operation(&shard))
     }
 
     pub(crate) fn lock_write_shard(&self, idx: usize) -> parking_lot::RwLockWriteGuard<'_, Shard> {

@@ -26,14 +26,18 @@ function padded(index: number): string {
 	return String(index).padStart(12, "0");
 }
 
+export function tieredKey(tier: "cold" | "hot", index: number): string {
+	return `benchmark:tiered:${tier}:${tier === "cold" ? padded(index) : index}`;
+}
+
 function tieredCommands(
-	prefix: string,
+	tier: "cold" | "hot",
 	count: number,
 	payload: string,
 ): Iterable<string[]> {
 	return (function* () {
 		for (let index = 0; index < count; index++)
-			yield ["SET", `${prefix}:${padded(index)}`, payload];
+			yield ["SET", tieredKey(tier, index), payload];
 	})();
 }
 
@@ -73,7 +77,7 @@ async function mixedSample(
 					const requestStarted = performance.now();
 					const value = await connection.request([
 						"GET",
-						`benchmark:tiered:${expected}:${padded(keyIndex)}`,
+						tieredKey(expected, keyIndex),
 					]);
 					latencies.push(performance.now() - requestStarted);
 					if (
@@ -116,7 +120,7 @@ async function uniqueColdSample(
 					const requestStarted = performance.now();
 					const value = await connection.request([
 						"GET",
-						`benchmark:tiered:cold:${padded(index)}`,
+						tieredKey("cold", index),
 					]);
 					latencies.push(performance.now() - requestStarted);
 					if (typeof value !== "string" || !value.startsWith("cold"))
@@ -151,16 +155,12 @@ export async function measureTiered(
 	await loadCommands(
 		subject.resp_port,
 		BENCHMARK_PASSWORD,
-		tieredCommands(
-			"benchmark:tiered:cold",
-			coldCount,
-			"cold".padEnd(1_024, "x"),
-		),
+		tieredCommands("cold", coldCount, "cold".padEnd(1_024, "x")),
 	);
 	await loadCommands(
 		subject.resp_port,
 		BENCHMARK_PASSWORD,
-		tieredCommands("benchmark:tiered:hot", hotCount, "hot"),
+		tieredCommands("hot", hotCount, "hot"),
 	);
 	const before = parseInfo(
 		await redisCli(subject, network, clientImage, "INFO", "storage"),

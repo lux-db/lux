@@ -3048,6 +3048,8 @@ impl Runtime {
             );
         }
 
+        runtime.store.restore_tiered_memory_ceiling();
+
         let snapshot_worker = snapshot::start_background_save_worker(runtime.store.clone())?;
         *runtime.snapshot_worker.lock() = Some(snapshot_worker);
 
@@ -5250,11 +5252,13 @@ async fn handle_block_stream_read(
     noack: bool,
     timeout: std::time::Duration,
 ) -> std::io::Result<()> {
+    let tiered_memory = store.tiered_memory_boundary();
     let now_pre = Instant::now();
     for key in keys {
         if let Err(error) = store.try_promote(key.as_bytes(), now_pre) {
             let mut out = BytesMut::new();
             resp::write_error(&mut out, &error);
+            drop(tiered_memory);
             return socket.write_all(&out).await;
         }
     }
@@ -5272,6 +5276,7 @@ async fn handle_block_stream_read(
             }
         })
         .collect();
+    drop(tiered_memory);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
     let waiter_id = broker.next_waiter_id();
@@ -5295,32 +5300,35 @@ async fn handle_block_stream_read(
         return Ok(());
     };
 
-    let write_buf = bounded_resp_buffer(socket, |write_buf| {
-        if woken {
-            let now = Instant::now();
-            let result = if let Some((ref grp, ref consumer)) = group {
-                store.xreadgroup(grp, consumer, keys, &resolved_ids, count, noack, now)
-            } else {
-                let ids: Vec<store::StreamId> = resolved_ids
-                    .iter()
-                    .map(|s| store::StreamId::parse(s).unwrap_or(store::StreamId::zero()))
-                    .collect();
-                store.xread(keys, &ids, count, now)
-            };
+    let write_buf = {
+        let _tiered_memory = store.tiered_memory_boundary();
+        bounded_resp_buffer(socket, |write_buf| {
+            if woken {
+                let now = Instant::now();
+                let result = if let Some((ref grp, ref consumer)) = group {
+                    store.xreadgroup(grp, consumer, keys, &resolved_ids, count, noack, now)
+                } else {
+                    let ids: Vec<store::StreamId> = resolved_ids
+                        .iter()
+                        .map(|s| store::StreamId::parse(s).unwrap_or(store::StreamId::zero()))
+                        .collect();
+                    store.xread(keys, &ids, count, now)
+                };
 
-            match result {
-                Ok(r) if !r.is_empty() => {
-                    write_xread_response(write_buf, &r);
+                match result {
+                    Ok(r) if !r.is_empty() => {
+                        write_xread_response(write_buf, &r);
+                    }
+                    Ok(_) => {
+                        resp::write_null_array(write_buf);
+                    }
+                    Err(error) => resp::write_error(write_buf, &error),
                 }
-                Ok(_) => {
-                    resp::write_null_array(write_buf);
-                }
-                Err(error) => resp::write_error(write_buf, &error),
+            } else {
+                resp::write_null_array(write_buf);
             }
-        } else {
-            resp::write_null_array(write_buf);
-        }
-    });
+        })
+    };
 
     socket.write_all(&write_buf).await
 }
@@ -5440,7 +5448,11 @@ async fn handle_block_lmpop(
     let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
     loop {
         let now = Instant::now();
-        match cmd::journaled_lmpop(store, &key_refs, pop_left, count, now) {
+        let result = {
+            let _tiered_memory = store.tiered_memory_boundary();
+            cmd::journaled_lmpop(store, &key_refs, pop_left, count, now)
+        };
+        match result {
             Ok(Some((key, items))) => {
                 let write_buf = bounded_resp_buffer(socket, |write_buf| {
                     resp::write_array_header(write_buf, 2);
@@ -5493,7 +5505,11 @@ async fn handle_block_zmpop(
     let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
     loop {
         let now = Instant::now();
-        match cmd::journaled_zmpop(store, &key_refs, pop_min, count, now) {
+        let result = {
+            let _tiered_memory = store.tiered_memory_boundary();
+            cmd::journaled_zmpop(store, &key_refs, pop_min, count, now)
+        };
+        match result {
             Ok(Some((key, items))) => {
                 let write_buf = bounded_resp_buffer(socket, |write_buf| {
                     resp::write_array_header(write_buf, 2);
@@ -5549,7 +5565,11 @@ async fn handle_block_zpop(
     loop {
         let now = Instant::now();
         let key_refs: Vec<&[u8]> = keys.iter().map(|key| key.as_bytes()).collect();
-        if let Ok(Some((key, items))) = cmd::journaled_zmpop(store, &key_refs, pop_min, 1, now) {
+        let result = {
+            let _tiered_memory = store.tiered_memory_boundary();
+            cmd::journaled_zmpop(store, &key_refs, pop_min, 1, now)
+        };
+        if let Ok(Some((key, items))) = result {
             if let Some((member, score)) = items.first() {
                 let write_buf = bounded_resp_buffer(socket, |write_buf| {
                     resp::write_array_header(write_buf, 3);
