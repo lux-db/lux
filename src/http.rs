@@ -4228,6 +4228,7 @@ struct RouteDeps<'a> {
 }
 
 fn with_execution_read<T>(store: &Store, operation: impl FnOnce() -> T) -> std::io::Result<T> {
+    let _tiered_memory = store.tiered_memory_boundary();
     let _guard = store.execution_read_guard()?;
     Ok(operation())
 }

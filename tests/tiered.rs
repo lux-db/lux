@@ -1,13 +1,247 @@
+use std::io::Write;
 use std::net::TcpStream;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 mod common;
-use common::{send, LuxServer};
+use common::{http_request, read_all, resp_cmd, send, LuxServer};
+
+const TIERED_MEMORY_LIMIT_BYTES: usize = 100 * 1024;
+
+fn info_metric(info: &str, name: &str) -> usize {
+    info.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}:")))
+        .unwrap_or_else(|| panic!("INFO is missing {name}: {info}"))
+        .trim()
+        .parse()
+        .unwrap_or_else(|error| panic!("invalid INFO value for {name}: {error}"))
+}
+
+fn assert_tiered_ceiling(conn: &mut TcpStream) {
+    let info = send(conn, &["INFO"]);
+    let used_memory = info_metric(&info, "used_memory_bytes");
+    assert!(
+        used_memory <= TIERED_MEMORY_LIMIT_BYTES,
+        "tiered memory exceeded its configured ceiling: {used_memory} > {TIERED_MEMORY_LIMIT_BYTES}\n{info}"
+    );
+
+    let hot_keys = info_metric(&info, "tracked_key_count");
+    let disk_keys = info_metric(&info, "disk_keys");
+    let total_keys = info_metric(&info, "tracked_total_key_count");
+    assert_eq!(
+        hot_keys + disk_keys,
+        total_keys,
+        "hot and cold INFO counters disagree\n{info}"
+    );
+    assert_eq!(
+        send(conn, &["DBSIZE"]),
+        format!(":{total_keys}\r\n"),
+        "DBSIZE and INFO disagree"
+    );
+}
+
+fn seed_distinct_values(conn: &mut TcpStream, count: usize, value_bytes: usize) {
+    for i in 0..count {
+        let value = format!("value-{i:04}-{}", "x".repeat(value_bytes));
+        assert_eq!(
+            send(conn, &["SET", &format!("ceiling:{i}"), &value]),
+            "+OK\r\n"
+        );
+    }
+}
 
 fn fill_memory(conn: &mut TcpStream, count: usize) {
     let val = "x".repeat(10000);
     for i in 0..count {
         send(conn, &["SET", &format!("filler:{i}"), &val]);
     }
+}
+
+#[test]
+fn tiered_repeated_promotions_preserve_values_and_memory_ceiling() {
+    let srv = LuxServer::builder()
+        .tiered()
+        .shards(1)
+        .maxmemory("100kb")
+        .env("LUX_MAXMEMORY_SAMPLES", "512")
+        .start();
+    let mut conn = srv.conn();
+    seed_distinct_values(&mut conn, 180, 2_000);
+    assert_tiered_ceiling(&mut conn);
+
+    for pass in 0..3 {
+        for i in 0..180 {
+            let value = format!("value-{i:04}-{}", "x".repeat(2_000));
+            assert_eq!(
+                send(&mut conn, &["GET", &format!("ceiling:{i}")]),
+                format!("${}\r\n{value}\r\n", value.len()),
+                "pass {pass} returned the wrong value for ceiling:{i}"
+            );
+        }
+        assert_tiered_ceiling(&mut conn);
+        assert!(
+            info_metric(&send(&mut conn, &["INFO"]), "disk_keys") > 0,
+            "the test must retain cold keys"
+        );
+    }
+}
+
+#[test]
+fn tiered_large_multi_key_and_pipeline_reads_restore_memory_ceiling() {
+    let srv = LuxServer::builder()
+        .tiered()
+        .shards(1)
+        .maxmemory("100kb")
+        .env("LUX_MAXMEMORY_SAMPLES", "512")
+        .start();
+    let mut conn = srv.conn();
+    seed_distinct_values(&mut conn, 220, 2_000);
+
+    let mut command = Vec::with_capacity(221);
+    command.push("MGET".to_string());
+    command.extend((0..220).map(|i| format!("ceiling:{i}")));
+    let args: Vec<&str> = command.iter().map(String::as_str).collect();
+    let response = send(&mut conn, &args);
+    assert!(
+        response.starts_with("*220\r\n"),
+        "MGET response: {response}"
+    );
+    for i in 0..220 {
+        assert!(
+            response.contains(&format!("value-{i:04}-")),
+            "MGET omitted ceiling:{i}"
+        );
+    }
+    assert_tiered_ceiling(&mut conn);
+
+    let mut pipeline = Vec::new();
+    for i in 0..220 {
+        pipeline.extend_from_slice(&resp_cmd(&["GET", &format!("ceiling:{i}")]));
+    }
+    conn.write_all(&pipeline).unwrap();
+    let response = read_all(&mut conn);
+    for i in 0..220 {
+        assert!(
+            response.contains(&format!("value-{i:04}-")),
+            "pipeline omitted ceiling:{i}"
+        );
+    }
+    assert_tiered_ceiling(&mut conn);
+}
+
+#[test]
+fn tiered_concurrent_promotions_preserve_values_and_memory_ceiling() {
+    let srv = LuxServer::builder()
+        .tiered()
+        .shards(4)
+        .maxmemory("100kb")
+        .env("LUX_MAXMEMORY_SAMPLES", "512")
+        .start();
+    let mut conn = srv.conn();
+    seed_distinct_values(&mut conn, 160, 2_000);
+    let barrier = Arc::new(Barrier::new(8));
+    let port = srv.port();
+
+    let readers: Vec<_> = (0..8)
+        .map(|reader| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut conn = common::connect(port);
+                barrier.wait();
+                for offset in 0..80 {
+                    let i = (reader * 17 + offset) % 160;
+                    let response = send(&mut conn, &["GET", &format!("ceiling:{i}")]);
+                    assert!(
+                        response.contains(&format!("value-{i:04}-")),
+                        "concurrent read returned the wrong value for ceiling:{i}: {response}"
+                    );
+                }
+            })
+        })
+        .collect();
+    for reader in readers {
+        reader.join().unwrap();
+    }
+
+    assert_tiered_ceiling(&mut conn);
+    for i in 0..160 {
+        assert!(
+            send(&mut conn, &["GET", &format!("ceiling:{i}")]).contains(&format!("value-{i:04}-")),
+            "concurrent promotion lost ceiling:{i}"
+        );
+    }
+    assert_tiered_ceiling(&mut conn);
+}
+
+#[test]
+fn tiered_native_data_survives_rebalancing_and_restart() {
+    let mut srv = LuxServer::builder()
+        .tiered()
+        .shards(1)
+        .http()
+        .maxmemory("100kb")
+        .env("LUX_MAXMEMORY_SAMPLES", "512")
+        .start();
+    let mut conn = srv.conn();
+    assert_eq!(
+        send(&mut conn, &["TCREATE", "accounts", "name STR"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send(&mut conn, &["TINSERT", "accounts", "name", "alice"]),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send(&mut conn, &["TSADD", "temperature", "1000", "72.5"]),
+        ":1000\r\n"
+    );
+    assert_eq!(
+        send(&mut conn, &["VSET", "direction", "3", "1", "0", "0"]),
+        "+OK\r\n"
+    );
+    seed_distinct_values(&mut conn, 100, 2_000);
+
+    let table = send(&mut conn, &["TSELECT", "*", "FROM", "accounts"]);
+    assert!(table.contains("alice"), "table row was lost: {table}");
+    let series = send(&mut conn, &["TSRANGE", "temperature", "-", "+"]);
+    assert!(
+        series.contains("72.5"),
+        "time-series sample was lost: {series}"
+    );
+    let vectors = send(&mut conn, &["VSEARCH", "3", "1", "0", "0", "K", "1"]);
+    assert!(vectors.contains("direction"), "vector was lost: {vectors}");
+
+    let (status, body) = http_request(srv.http_port(), "GET", "/v1/kv/ceiling:0", None, None);
+    assert_eq!(status, 200, "HTTP cold read failed: {body}");
+    assert!(
+        body.contains("value-0000-"),
+        "HTTP returned the wrong value: {body}"
+    );
+    assert_tiered_ceiling(&mut conn);
+    drop(conn);
+
+    srv.restart_with_maxmemory("100kb");
+    let mut conn = srv.conn();
+    assert_tiered_ceiling(&mut conn);
+    assert!(
+        send(&mut conn, &["TSELECT", "*", "FROM", "accounts"]).contains("alice"),
+        "restart lost the table row"
+    );
+    assert!(
+        send(&mut conn, &["TSRANGE", "temperature", "-", "+"]).contains("72.5"),
+        "restart lost the time-series sample"
+    );
+    assert!(
+        send(&mut conn, &["VSEARCH", "3", "1", "0", "0", "K", "1"]).contains("direction"),
+        "restart lost the vector"
+    );
+    for i in 0..100 {
+        assert!(
+            send(&mut conn, &["GET", &format!("ceiling:{i}")]).contains(&format!("value-{i:04}-")),
+            "restart lost ceiling:{i}"
+        );
+    }
+    assert_tiered_ceiling(&mut conn);
 }
 
 #[test]
