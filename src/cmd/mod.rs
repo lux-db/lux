@@ -1767,6 +1767,7 @@ fn pipeline_fast_path_arity(args: &[&[u8]]) -> bool {
                 || (cmd_eq(cmd, b"SMEMBERS") && args.len() == 2)
                 || (cmd_eq(cmd, b"SISMEMBER") && args.len() == 3)
                 || (cmd_eq(cmd, b"SRANDMEMBER") && args.len() == 2)
+                || (cmd_eq(cmd, b"SET") && args.len() == 3)
                 || (cmd_eq(cmd, b"SADD") && args.len() >= 3)
                 || (cmd_eq(cmd, b"SREM") && args.len() >= 3)
         }
@@ -6238,7 +6239,7 @@ mod tests {
         );
         assert_eq!(
             pipeline_access_for_args(&[b"SET" as &[u8], b"k", b"v"]),
-            PipelineAccess::General
+            PipelineAccess::Write
         );
         assert_eq!(
             pipeline_access_for_args(&[b"SET" as &[u8], b"k", b"v", b"NX"]),

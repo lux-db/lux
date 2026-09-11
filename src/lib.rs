@@ -4073,7 +4073,8 @@ impl CommandExecutor {
         }
 
         let mut has_special = session.in_multi;
-        let mut all_single_key_rw = true;
+        let mut all_shard_batch_safe = true;
+        let ephemeral = self.store.config().durability.policy == DurabilityPolicy::Ephemeral;
         let mut flags: Vec<cmd::PipelineAccess> = Vec::with_capacity(cmd_count);
         for command in commands {
             let args = command.argv();
@@ -4094,22 +4095,27 @@ impl CommandExecutor {
                     .iter()
                     .any(|arg| cmd::is_reserved_internal_argument(arg))
             {
-                all_single_key_rw = false;
+                all_shard_batch_safe = false;
             }
             let access = cmd::pipeline_access_for_args(args);
             flags.push(access);
             // Writes must cross their per-command authoritative journal
             // boundary so a rejected command cannot leave a durable frame in a
-            // pre-journaled batch. Only read-only runs use shard batching.
-            if access != cmd::PipelineAccess::Read {
-                all_single_key_rw = false;
+            // pre-journaled batch. A plain SET on an ephemeral engine has no
+            // journal boundary and is safe to execute in a shard-local batch.
+            let ephemeral_plain_set = ephemeral
+                && access == cmd::PipelineAccess::Write
+                && args.len() == 3
+                && cmd_eq_fast(cmd, b"SET");
+            if access != cmd::PipelineAccess::Read && !(cmd_count > 1 && ephemeral_plain_set) {
+                all_shard_batch_safe = false;
             }
         }
 
         // When encryption is active, the shard-local fast batch path can neither
         // encrypt writes nor decrypt reads (no keyring there), so force every
         // command onto the slow path (cmd::execute) which handles both.
-        if has_special || !all_single_key_rw || self.store.encryption().has_active_key() {
+        if has_special || !all_shard_batch_safe || self.store.encryption().has_active_key() {
             for command in commands {
                 let args = command.argv();
                 if !session.authenticated && !is_public_without_auth_cmd(args[0]) {
