@@ -1,4 +1,17 @@
 use super::*;
+use std::ops::Bound;
+
+fn score_upper_bound(score: f64, exclusive: bool) -> Bound<(OrderedFloat<f64>, String)> {
+    if exclusive {
+        Bound::Excluded((OrderedFloat(score), String::new()))
+    } else if score == f64::INFINITY {
+        // OrderedFloat places NaN above infinity; numeric ranges exclude it.
+        Bound::Excluded((OrderedFloat(f64::NAN), String::new()))
+    } else {
+        // No member string is largest; end before the next representable score.
+        Bound::Excluded((OrderedFloat(score.next_up()), String::new()))
+    }
+}
 
 impl Store {
     #[allow(clippy::too_many_arguments)]
@@ -361,13 +374,14 @@ impl Store {
         match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(tree, _) => {
-                    let range_start = (OrderedFloat(min), String::new());
-                    let range_end = (
-                        OrderedFloat(max),
-                        "\u{ffff}\u{ffff}\u{ffff}\u{ffff}".to_string(),
-                    );
-                    let iter = tree.range(range_start..=range_end);
-                    let filtered: Vec<(String, f64)> = if reverse {
+                    let range_start = Bound::Included((OrderedFloat(min), String::new()));
+                    let range_end = score_upper_bound(max, false);
+                    let iter = tree.range((range_start, range_end));
+                    let off = offset.unwrap_or(0);
+                    let cnt = count.unwrap_or(usize::MAX);
+                    // Bound the index walk before cloning members. Table queries use
+                    // this path for range predicates, pages, and candidate sentinels.
+                    let items = if reverse {
                         iter.rev()
                             .filter(|((s, _), _)| {
                                 let sv = s.0;
@@ -375,6 +389,8 @@ impl Store {
                                 let hi = if max_exclusive { sv < max } else { sv <= max };
                                 lo && hi
                             })
+                            .skip(off)
+                            .take(cnt)
                             .map(|((s, m), _)| (m.clone(), s.0))
                             .collect()
                     } else {
@@ -384,12 +400,12 @@ impl Store {
                             let hi = if max_exclusive { sv < max } else { sv <= max };
                             lo && hi
                         })
+                        .skip(off)
+                        .take(cnt)
                         .map(|((s, m), _)| (m.clone(), s.0))
                         .collect()
                     };
-                    let off = offset.unwrap_or(0);
-                    let cnt = count.unwrap_or(filtered.len());
-                    Ok(filtered.into_iter().skip(off).take(cnt).collect())
+                    Ok(items)
                 }
                 _ => Err(WRONGTYPE.to_string()),
             },
@@ -459,7 +475,6 @@ impl Store {
         max_exclusive: bool,
         now: Instant,
     ) -> Result<i64, String> {
-        use std::ops::Bound::{Excluded, Included};
         if min > max {
             return Ok(0);
         }
@@ -476,21 +491,14 @@ impl Store {
                         && min.is_sign_negative()
                         && max.is_infinite()
                         && max.is_sign_positive()
+                        && !min_exclusive
+                        && !max_exclusive
                     {
                         return Ok(scores.len() as i64);
                     }
-                    let start_member = String::new();
-                    let end_member = "\u{10ffff}\u{10ffff}".to_string();
-                    let start = if min_exclusive {
-                        Excluded((OrderedFloat(min), end_member.clone()))
-                    } else {
-                        Included((OrderedFloat(min), start_member))
-                    };
-                    let end = if max_exclusive {
-                        Excluded((OrderedFloat(max), String::new()))
-                    } else {
-                        Included((OrderedFloat(max), end_member))
-                    };
+                    let start_score = if min_exclusive { min.next_up() } else { min };
+                    let start = Bound::Included((OrderedFloat(start_score), String::new()));
+                    let end = score_upper_bound(max, max_exclusive);
                     let count = tree.range((start, end)).count();
                     Ok(count as i64)
                 }
@@ -536,9 +544,9 @@ impl Store {
         match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(tree, _) => {
-                    let start = (OrderedFloat(min), String::new());
-                    let end = (OrderedFloat(max), "\u{10ffff}\u{10ffff}".to_string());
-                    for ((score, member), _) in tree.range(start..=end) {
+                    let start = Bound::Included((OrderedFloat(min), String::new()));
+                    let end = score_upper_bound(max, false);
+                    for ((score, member), _) in tree.range((start, end)) {
                         visit(member, score.0);
                     }
                     Ok(())
