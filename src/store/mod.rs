@@ -8607,6 +8607,8 @@ mod tests {
             (-6.0, 6.0),
             (f64::MAX, f64::MAX),
             (f64::from_bits(1), f64::from_bits(1)),
+            (3.0, -3.0),
+            (f64::INFINITY, f64::NEG_INFINITY),
         ] {
             for min_exclusive in [false, true] {
                 for max_exclusive in [false, true] {
@@ -8730,6 +8732,8 @@ mod tests {
             (f64::MAX, f64::MAX),
             (f64::from_bits(1), f64::from_bits(1)),
             (-0.0, 0.0),
+            (2.0, 1.0),
+            (f64::INFINITY, f64::NEG_INFINITY),
         ] {
             for min_exclusive in [false, true] {
                 for max_exclusive in [false, true] {
@@ -8784,6 +8788,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sorted_set_score_readers_reject_nan_bounds() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"bounds",
+                &[(b"one", 1.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        for key in [b"bounds".as_slice(), b"missing".as_slice()] {
+            for (min, max) in [(f64::NAN, 1.0), (1.0, f64::NAN), (f64::NAN, f64::NAN)] {
+                assert_eq!(
+                    store
+                        .zrangebyscore(key, min, max, false, false, false, None, None, false, n)
+                        .unwrap_err(),
+                    "ERR min or max is not a float",
+                );
+                assert_eq!(
+                    store.zcount(key, min, max, false, false, n).unwrap_err(),
+                    "ERR min or max is not a float",
+                );
+                assert_eq!(
+                    store
+                        .zvisit_scores_inclusive(key, min, max, n, |_, _| {
+                            panic!("invalid score bounds must not visit members");
+                        })
+                        .unwrap_err(),
+                    "ERR min or max is not a float",
+                );
+            }
+        }
+        store.set(b"string", b"value", None, n);
+        assert_eq!(
+            store
+                .zrangebyscore(b"string", 2.0, 1.0, false, false, false, None, None, false, n)
+                .unwrap_err(),
+            WRONGTYPE,
+        );
+        assert_eq!(
+            store
+                .zvisit_scores_inclusive(b"string", 2.0, 1.0, n, |_, _| {
+                    panic!("wrong-type values must not visit members");
+                })
+                .unwrap_err(),
+            WRONGTYPE,
+        );
     }
 
     #[test]

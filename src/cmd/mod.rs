@@ -1808,33 +1808,6 @@ fn format_float(v: f64) -> String {
     }
 }
 
-#[inline(always)]
-fn parse_score_bound_fast(s: &str, is_max: bool) -> (f64, bool) {
-    if s == "-inf" || s == "-" {
-        (f64::NEG_INFINITY, false)
-    } else if s == "+inf" || s == "+" {
-        (f64::INFINITY, false)
-    } else if let Some(rest) = s.strip_prefix('(') {
-        (
-            rest.parse::<f64>().unwrap_or(if is_max {
-                f64::INFINITY
-            } else {
-                f64::NEG_INFINITY
-            }),
-            true,
-        )
-    } else {
-        (
-            s.parse::<f64>().unwrap_or(if is_max {
-                f64::INFINITY
-            } else {
-                f64::NEG_INFINITY
-            }),
-            false,
-        )
-    }
-}
-
 fn write_stream_entries_fast(
     out: &mut BytesMut,
     entries: &std::collections::BTreeMap<StreamId, Vec<(String, Bytes)>>,
@@ -3426,8 +3399,20 @@ pub(crate) fn execute_on_shard_read(
             return;
         }
         if cmd_eq(cmd, b"ZCOUNT") && args.len() >= 4 {
-            let (min, min_ex) = parse_score_bound_fast(arg_str(args[2]), false);
-            let (max, max_ex) = parse_score_bound_fast(arg_str(args[3]), true);
+            let (min, min_ex) = match sorted_sets::parse_score_bound(arg_str(args[2]), false) {
+                Ok(bound) => bound,
+                Err(error) => {
+                    resp::write_error(out, &error);
+                    return;
+                }
+            };
+            let (max, max_ex) = match sorted_sets::parse_score_bound(arg_str(args[3]), true) {
+                Ok(bound) => bound,
+                Err(error) => {
+                    resp::write_error(out, &error);
+                    return;
+                }
+            };
             match data.get(ks) {
                 Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                     StoreValue::SortedSet(_, scores) => {

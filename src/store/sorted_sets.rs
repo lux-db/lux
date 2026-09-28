@@ -368,12 +368,18 @@ impl Store {
         _with_scores: bool,
         now: Instant,
     ) -> Result<Vec<(String, f64)>, String> {
+        if min.is_nan() || max.is_nan() {
+            return Err("ERR min or max is not a float".to_string());
+        }
         self.try_promote(key, now)?;
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(tree, _) => {
+                    if min > max || (min == max && (min_exclusive || max_exclusive)) {
+                        return Ok(vec![]);
+                    }
                     let range_start = Bound::Included((OrderedFloat(min), String::new()));
                     let range_end = score_upper_bound(max, false);
                     let iter = tree.range((range_start, range_end));
@@ -475,6 +481,9 @@ impl Store {
         max_exclusive: bool,
         now: Instant,
     ) -> Result<i64, String> {
+        if min.is_nan() || max.is_nan() {
+            return Err("ERR min or max is not a float".to_string());
+        }
         if min > max {
             return Ok(0);
         }
@@ -539,11 +548,17 @@ impl Store {
     where
         F: FnMut(&str, f64),
     {
+        if min.is_nan() || max.is_nan() {
+            return Err("ERR min or max is not a float".to_string());
+        }
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::SortedSet(tree, _) => {
+                    if min > max {
+                        return Ok(());
+                    }
                     let start = Bound::Included((OrderedFloat(min), String::new()));
                     let end = score_upper_bound(max, false);
                     for ((score, member), _) in tree.range((start, end)) {
