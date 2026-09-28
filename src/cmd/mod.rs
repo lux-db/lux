@@ -3022,6 +3022,27 @@ pub(crate) fn execute_on_shard(
     }
 
     if cmd_eq(cmd, b"SET") && args.len() >= 3 {
+        // A key can become encrypted while a selected batch waits for its
+        // mutation gate. Preserve that state under the shard lock, not just
+        // at the connection's earlier keyring check.
+        if args.len() == 3
+            && shard.data.get(key).is_some_and(|entry| {
+                !entry.is_expired_at(now)
+                    && entry
+                        .value
+                        .string_bytes()
+                        .is_some_and(crate::encryption::EncryptionKeyring::is_encrypted_value)
+            })
+        {
+            match store.encrypt_kv_string_value(key, args[2]) {
+                Ok(value) => {
+                    store.set_on_shard(&mut shard.data, key, &value, None, now);
+                    resp::write_ok(out);
+                }
+                Err(error) => resp::write_error(out, &error),
+            }
+            return;
+        }
         let mut ttl = None;
         let mut nx = false;
         let mut xx = false;

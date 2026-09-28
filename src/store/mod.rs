@@ -3697,7 +3697,11 @@ impl Store {
             .map(Bytes::from)
     }
 
-    fn encrypt_kv_string_value(&self, key: &[u8], value: &[u8]) -> Result<Vec<u8>, String> {
+    pub(crate) fn encrypt_kv_string_value(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<Vec<u8>, String> {
         let key_name = Self::user_kv_key(key);
         self.encryption()
             .encrypt("__lux_kv", "value", &key_name, value)
