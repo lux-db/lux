@@ -1,5 +1,21 @@
 use serde::Deserialize;
 
+pub(crate) fn browser_origin(value: &str, name: &str) -> Result<reqwest::Url, String> {
+    let url =
+        reqwest::Url::parse(value.trim()).map_err(|error| format!("invalid {name}: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err(format!("{name} must be an exact HTTP(S) origin"));
+    }
+    Ok(url)
+}
+
 #[derive(Deserialize)]
 pub(crate) struct StudioSession {
     pub(crate) token: String,
@@ -128,6 +144,25 @@ pub(crate) async fn session_is_valid(engine_url: &str, origin: &str, token: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_origin_requires_an_exact_origin() {
+        assert_eq!(
+            browser_origin("https://studio.example.test", "Studio URL")
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+            "https://studio.example.test"
+        );
+        for value in [
+            "https://studio.example.test/path",
+            "https://studio.example.test?x=1",
+            "https://user@studio.example.test",
+            "file:///tmp/studio",
+        ] {
+            assert!(browser_origin(value, "Studio URL").is_err(), "{value}");
+        }
+    }
 
     #[test]
     fn container_env_contains_no_durable_engine_credentials() {
