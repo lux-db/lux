@@ -1767,6 +1767,7 @@ fn pipeline_fast_path_arity(args: &[&[u8]]) -> bool {
                 || (cmd_eq(cmd, b"SMEMBERS") && args.len() == 2)
                 || (cmd_eq(cmd, b"SISMEMBER") && args.len() == 3)
                 || (cmd_eq(cmd, b"SRANDMEMBER") && args.len() == 2)
+                || (cmd_eq(cmd, b"SET") && args.len() == 3)
                 || (cmd_eq(cmd, b"SADD") && args.len() >= 3)
                 || (cmd_eq(cmd, b"SREM") && args.len() >= 3)
         }
@@ -1804,33 +1805,6 @@ fn format_float(v: f64) -> String {
         format!("{}", v as i64)
     } else {
         format!("{}", v)
-    }
-}
-
-#[inline(always)]
-fn parse_score_bound_fast(s: &str, is_max: bool) -> (f64, bool) {
-    if s == "-inf" || s == "-" {
-        (f64::NEG_INFINITY, false)
-    } else if s == "+inf" || s == "+" {
-        (f64::INFINITY, false)
-    } else if let Some(rest) = s.strip_prefix('(') {
-        (
-            rest.parse::<f64>().unwrap_or(if is_max {
-                f64::INFINITY
-            } else {
-                f64::NEG_INFINITY
-            }),
-            true,
-        )
-    } else {
-        (
-            s.parse::<f64>().unwrap_or(if is_max {
-                f64::INFINITY
-            } else {
-                f64::NEG_INFINITY
-            }),
-            false,
-        )
     }
 }
 
@@ -3021,6 +2995,27 @@ pub(crate) fn execute_on_shard(
     }
 
     if cmd_eq(cmd, b"SET") && args.len() >= 3 {
+        // A key can become encrypted while a selected batch waits for its
+        // mutation gate. Preserve that state under the shard lock, not just
+        // at the connection's earlier keyring check.
+        if args.len() == 3
+            && shard.data.get(key).is_some_and(|entry| {
+                !entry.is_expired_at(now)
+                    && entry
+                        .value
+                        .string_bytes()
+                        .is_some_and(crate::encryption::EncryptionKeyring::is_encrypted_value)
+            })
+        {
+            match store.encrypt_kv_string_value(key, args[2]) {
+                Ok(value) => {
+                    store.set_on_shard(&mut shard.data, key, &value, None, now);
+                    resp::write_ok(out);
+                }
+                Err(error) => resp::write_error(out, &error),
+            }
+            return;
+        }
         let mut ttl = None;
         let mut nx = false;
         let mut xx = false;
@@ -3404,8 +3399,20 @@ pub(crate) fn execute_on_shard_read(
             return;
         }
         if cmd_eq(cmd, b"ZCOUNT") && args.len() >= 4 {
-            let (min, min_ex) = parse_score_bound_fast(arg_str(args[2]), false);
-            let (max, max_ex) = parse_score_bound_fast(arg_str(args[3]), true);
+            let (min, min_ex) = match sorted_sets::parse_score_bound(arg_str(args[2]), false) {
+                Ok(bound) => bound,
+                Err(error) => {
+                    resp::write_error(out, &error);
+                    return;
+                }
+            };
+            let (max, max_ex) = match sorted_sets::parse_score_bound(arg_str(args[3]), true) {
+                Ok(bound) => bound,
+                Err(error) => {
+                    resp::write_error(out, &error);
+                    return;
+                }
+            };
             match data.get(ks) {
                 Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                     StoreValue::SortedSet(_, scores) => {
@@ -6238,7 +6245,7 @@ mod tests {
         );
         assert_eq!(
             pipeline_access_for_args(&[b"SET" as &[u8], b"k", b"v"]),
-            PipelineAccess::General
+            PipelineAccess::Write
         );
         assert_eq!(
             pipeline_access_for_args(&[b"SET" as &[u8], b"k", b"v", b"NX"]),

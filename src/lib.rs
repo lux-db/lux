@@ -4073,7 +4073,11 @@ impl CommandExecutor {
         }
 
         let mut has_special = session.in_multi;
-        let mut all_single_key_rw = true;
+        let mut all_shard_batch_safe = true;
+        let ephemeral_batch_writes = self.store.config().durability.policy
+            == DurabilityPolicy::Ephemeral
+            && !self.store.is_tiered()
+            && !crate::eviction::eviction_enabled(&self.store);
         let mut flags: Vec<cmd::PipelineAccess> = Vec::with_capacity(cmd_count);
         for command in commands {
             let args = command.argv();
@@ -4094,22 +4098,28 @@ impl CommandExecutor {
                     .iter()
                     .any(|arg| cmd::is_reserved_internal_argument(arg))
             {
-                all_single_key_rw = false;
+                all_shard_batch_safe = false;
             }
             let access = cmd::pipeline_access_for_args(args);
             flags.push(access);
             // Writes must cross their per-command authoritative journal
             // boundary so a rejected command cannot leave a durable frame in a
-            // pre-journaled batch. Only read-only runs use shard batching.
-            if access != cmd::PipelineAccess::Read {
-                all_single_key_rw = false;
+            // pre-journaled batch. Only an unlimited, memory-layout ephemeral
+            // engine can batch plain SETs without per-command memory checks
+            // or fallible disk promotion.
+            let ephemeral_plain_set = ephemeral_batch_writes
+                && access == cmd::PipelineAccess::Write
+                && args.len() == 3
+                && cmd_eq_fast(cmd, b"SET");
+            if access != cmd::PipelineAccess::Read && !(cmd_count > 1 && ephemeral_plain_set) {
+                all_shard_batch_safe = false;
             }
         }
 
-        // When encryption is active, the shard-local fast batch path can neither
-        // encrypt writes nor decrypt reads (no keyring there), so force every
-        // command onto the slow path (cmd::execute) which handles both.
-        if has_special || !all_single_key_rw || self.store.encryption().has_active_key() {
+        // Keep encrypted workloads on the resolved command path. Shard-local
+        // SETs also preserve existing encryption if it becomes active after
+        // this check while a selected batch waits for its mutation gate.
+        if has_special || !all_shard_batch_safe || self.store.encryption().has_active_key() {
             for command in commands {
                 let args = command.argv();
                 if !session.authenticated && !is_public_without_auth_cmd(args[0]) {
@@ -4173,6 +4183,9 @@ impl CommandExecutor {
                 return None;
             }
         };
+        let _script_guard = flags
+            .contains(&cmd::PipelineAccess::Write)
+            .then(|| self.store.script_read_guard());
         for (idx, command) in commands.iter().enumerate() {
             let args = command.argv();
             shards.push(self.store.shard_for_key(args[1]) as u32);
@@ -5697,6 +5710,159 @@ mod tx_tests {
         executor.execute_command(&[b"GET", b"k"], &mut session, &mut out, Instant::now());
 
         assert_eq!(&out[..], b"$1\r\nv\r\n");
+    }
+
+    fn limited_pipeline_executor(policy: EvictionPolicy) -> CommandExecutor {
+        let store = Arc::new(Store::new_with_config(Arc::new(ServerConfig {
+            shards: 1,
+            durability: DurabilityConfig {
+                policy: DurabilityPolicy::Ephemeral,
+                ..Default::default()
+            },
+            eviction: EvictionConfig {
+                max_memory: 1,
+                policy,
+                sample_size: 5,
+            },
+            ..ServerConfig::default()
+        })));
+        executor_for(store, Broker::new())
+    }
+
+    fn execute_test_pipeline(
+        executor: &CommandExecutor,
+        session: &mut CommandSession,
+        commands: &[&[&[u8]]],
+    ) -> BytesMut {
+        let commands: Vec<_> = commands.iter().map(|args| args.to_vec()).collect();
+        let mut out = BytesMut::new();
+        executor.execute_pipeline(&commands, session, &mut out, Instant::now());
+        out
+    }
+
+    #[test]
+    fn ephemeral_set_pipeline_checks_memory_before_each_write() {
+        let executor = limited_pipeline_executor(EvictionPolicy::NoEviction);
+        let mut session = CommandSession::new(false);
+        let commands: &[&[&[u8]]] = &[&[b"SET", b"first", b"one"], &[b"SET", b"second", b"two"]];
+
+        let out = execute_test_pipeline(&executor, &mut session, commands);
+
+        assert_eq!(
+            &out[..],
+            b"+OK\r\n-OOM command not allowed when used memory > 'maxmemory'\r\n"
+        );
+        assert_eq!(
+            executor.store.get(b"first", Instant::now()).unwrap(),
+            b"one"[..]
+        );
+        assert!(executor.store.get(b"second", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn ephemeral_set_pipeline_continues_after_memory_rejection() {
+        let executor = limited_pipeline_executor(EvictionPolicy::NoEviction);
+        executor.store.set(b"seed", b"value", None, Instant::now());
+        let mut session = CommandSession::new(false);
+        let commands: &[&[&[u8]]] = &[
+            &[b"SET", b"first", b"one"],
+            &[b"GET", b"seed"],
+            &[b"SET", b"second", b"two"],
+            &[b"GET", b"missing"],
+        ];
+
+        let out = execute_test_pipeline(&executor, &mut session, commands);
+
+        assert_eq!(
+            &out[..],
+            b"-OOM command not allowed when used memory > 'maxmemory'\r\n\
+              $5\r\nvalue\r\n\
+              -OOM command not allowed when used memory > 'maxmemory'\r\n\
+              $-1\r\n"
+        );
+        assert!(executor.store.get(b"first", Instant::now()).is_none());
+        assert!(executor.store.get(b"second", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn ephemeral_set_pipeline_preserves_per_command_eviction() {
+        let executor = limited_pipeline_executor(EvictionPolicy::AllKeysLru);
+        let mut session = CommandSession::new(false);
+        let commands: &[&[&[u8]]] = &[
+            &[b"SET", b"first", b"one"],
+            &[b"SET", b"second", b"two"],
+            &[b"GET", b"first"],
+            &[b"GET", b"second"],
+        ];
+
+        let out = execute_test_pipeline(&executor, &mut session, commands);
+
+        assert_eq!(&out[..], b"+OK\r\n+OK\r\n$-1\r\n$3\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn ephemeral_set_pipeline_waits_for_script_boundary() {
+        let store = Arc::new(Store::new());
+        let script_guard = store.script_write_guard();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                let executor = executor_for(store, Broker::new());
+                let mut session = CommandSession::new(false);
+                let commands: &[&[&[u8]]] =
+                    &[&[b"SET", b"first", b"one"], &[b"SET", b"second", b"two"]];
+                started_tx.send(()).unwrap();
+                let out = execute_test_pipeline(&executor, &mut session, commands);
+                finished_tx.send(out).unwrap();
+            }
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let early_reply = finished_rx.recv_timeout(Duration::from_millis(100));
+        drop(script_guard);
+        writer.join().unwrap();
+
+        assert!(
+            matches!(early_reply, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "pipeline writes crossed an active script boundary"
+        );
+        let out = finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(&out[..], b"+OK\r\n+OK\r\n");
+    }
+
+    #[test]
+    fn ephemeral_set_pipeline_waits_for_key_mutation_boundary() {
+        let store = Arc::new(Store::new());
+        let route: &[&[u8]] = &[b"SET", b"first", b"value", b"NX"];
+        let mutation_guard = store.prepare_journaled(route).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                let executor = executor_for(store, Broker::new());
+                let mut session = CommandSession::new(false);
+                let commands: &[&[&[u8]]] =
+                    &[&[b"SET", b"first", b"one"], &[b"SET", b"second", b"two"]];
+                started_tx.send(()).unwrap();
+                let out = execute_test_pipeline(&executor, &mut session, commands);
+                finished_tx.send(out).unwrap();
+            }
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let early_reply = finished_rx.recv_timeout(Duration::from_millis(100));
+        drop(mutation_guard);
+        writer.join().unwrap();
+
+        assert!(
+            matches!(early_reply, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "pipeline writes crossed an active key mutation boundary"
+        );
+        let out = finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(&out[..], b"+OK\r\n+OK\r\n");
     }
 
     #[test]

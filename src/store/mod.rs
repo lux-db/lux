@@ -3697,7 +3697,11 @@ impl Store {
             .map(Bytes::from)
     }
 
-    fn encrypt_kv_string_value(&self, key: &[u8], value: &[u8]) -> Result<Vec<u8>, String> {
+    pub(crate) fn encrypt_kv_string_value(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<Vec<u8>, String> {
         let key_name = Self::user_kv_key(key);
         self.encryption()
             .encrypt("__lux_kv", "value", &key_name, value)
@@ -8566,6 +8570,310 @@ mod tests {
             .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].0, "b");
+    }
+
+    #[test]
+    fn sorted_set_score_pagination_matches_complete_range() {
+        let store = Store::new();
+        let n = now();
+        let mut reference: Vec<(String, f64)> = (0..257)
+            .map(|index| (format!("member-{index:03}"), (index % 13) as f64 - 6.0))
+            .collect();
+        reference.push(("negative-infinity".to_string(), f64::NEG_INFINITY));
+        reference.push(("positive-infinity".to_string(), f64::INFINITY));
+        reference.push(("🦀".to_string(), 3.0));
+        reference.push(("𐀀".to_string(), 6.0));
+        reference.push(("🦀-infinity".to_string(), f64::INFINITY));
+        reference.push(("".to_string(), -6.0));
+        reference.push(("largest-finite".to_string(), f64::MAX));
+        reference.push(("smallest-positive".to_string(), f64::from_bits(1)));
+        let members: Vec<(&[u8], f64)> = reference
+            .iter()
+            .map(|(member, score)| (member.as_bytes(), *score))
+            .collect();
+        store
+            .zadd(b"pages", &members, false, false, false, false, false, n)
+            .unwrap();
+        reference.sort_by(|(left_member, left_score), (right_member, right_score)| {
+            left_score
+                .total_cmp(right_score)
+                .then_with(|| left_member.cmp(right_member))
+        });
+
+        for (min, max) in [
+            (f64::NEG_INFINITY, f64::INFINITY),
+            (-3.0, 3.0),
+            (0.0, 0.0),
+            (-6.0, 6.0),
+            (f64::MAX, f64::MAX),
+            (f64::from_bits(1), f64::from_bits(1)),
+            (3.0, -3.0),
+            (f64::INFINITY, f64::NEG_INFINITY),
+        ] {
+            for min_exclusive in [false, true] {
+                for max_exclusive in [false, true] {
+                    for reverse in [false, true] {
+                        let mut complete: Vec<_> = reference
+                            .iter()
+                            .filter(|(_, score)| {
+                                (if min_exclusive {
+                                    *score > min
+                                } else {
+                                    *score >= min
+                                }) && (if max_exclusive {
+                                    *score < max
+                                } else {
+                                    *score <= max
+                                })
+                            })
+                            .cloned()
+                            .collect();
+                        if reverse {
+                            complete.reverse();
+                        }
+                        for offset in [None, Some(0), Some(3), Some(256), Some(usize::MAX)] {
+                            for count in [None, Some(0), Some(1), Some(7), Some(300)] {
+                                let expected: Vec<_> = complete
+                                    .iter()
+                                    .skip(offset.unwrap_or(0))
+                                    .take(count.unwrap_or(usize::MAX))
+                                    .cloned()
+                                    .collect();
+                                let actual = store
+                                    .zrangebyscore(
+                                        b"pages",
+                                        min,
+                                        max,
+                                        min_exclusive,
+                                        max_exclusive,
+                                        reverse,
+                                        offset,
+                                        count,
+                                        false,
+                                        n,
+                                    )
+                                    .unwrap();
+                                assert_eq!(actual, expected, "bounds={min}..{max}, exclusive={min_exclusive}/{max_exclusive}, reverse={reverse}, offset={offset:?}, count={count:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(store
+            .zrangebyscore(
+                b"missing",
+                -1.0,
+                1.0,
+                false,
+                false,
+                false,
+                Some(0),
+                Some(0),
+                false,
+                n
+            )
+            .unwrap()
+            .is_empty());
+        store.set(b"string", b"value", None, n);
+        assert_eq!(
+            store
+                .zrangebyscore(
+                    b"string",
+                    -1.0,
+                    1.0,
+                    false,
+                    false,
+                    false,
+                    Some(0),
+                    Some(0),
+                    false,
+                    n
+                )
+                .unwrap_err(),
+            WRONGTYPE,
+        );
+    }
+
+    #[test]
+    fn sorted_set_score_counts_and_visitors_match_numeric_bounds() {
+        let store = Store::new();
+        let n = now();
+        let mut reference = vec![
+            ("\u{10ffff}\u{10ffff}suffix".to_string(), 1.0),
+            ("🦀".to_string(), 1.0),
+            ("ascii".to_string(), 2.0),
+            ("".to_string(), 0.0),
+            ("negative-zero".to_string(), -0.0),
+            ("negative-infinity".to_string(), f64::NEG_INFINITY),
+            ("\u{10ffff}\u{10ffff}infinity".to_string(), f64::INFINITY),
+            ("largest-finite".to_string(), f64::MAX),
+            ("smallest-positive".to_string(), f64::from_bits(1)),
+        ];
+        let members: Vec<_> = reference
+            .iter()
+            .map(|(member, score)| (member.as_bytes(), *score))
+            .collect();
+        store
+            .zadd(b"bounds", &members, false, false, false, false, false, n)
+            .unwrap();
+        reference.sort_by(|(left_member, left_score), (right_member, right_score)| {
+            OrderedFloat(*left_score)
+                .cmp(&OrderedFloat(*right_score))
+                .then_with(|| left_member.cmp(right_member))
+        });
+
+        for (min, max) in [
+            (1.0, 1.0),
+            (1.0, 2.0),
+            (f64::NEG_INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY),
+            (f64::INFINITY, f64::INFINITY),
+            (f64::MAX, f64::MAX),
+            (f64::from_bits(1), f64::from_bits(1)),
+            (-0.0, 0.0),
+            (2.0, 1.0),
+            (f64::INFINITY, f64::NEG_INFINITY),
+        ] {
+            for min_exclusive in [false, true] {
+                for max_exclusive in [false, true] {
+                    let expected: Vec<_> = reference
+                        .iter()
+                        .filter(|(_, score)| {
+                            (if min_exclusive {
+                                *score > min
+                            } else {
+                                *score >= min
+                            }) && (if max_exclusive {
+                                *score < max
+                            } else {
+                                *score <= max
+                            })
+                        })
+                        .cloned()
+                        .collect();
+                    assert_eq!(
+                        store
+                            .zcount(b"bounds", min, max, min_exclusive, max_exclusive, n)
+                            .unwrap(),
+                        expected.len() as i64,
+                        "count bounds={min}..{max}, exclusive={min_exclusive}/{max_exclusive}",
+                    );
+                    assert_eq!(
+                        store
+                            .zrangebyscore(
+                                b"bounds",
+                                min,
+                                max,
+                                min_exclusive,
+                                max_exclusive,
+                                false,
+                                None,
+                                None,
+                                false,
+                                n,
+                            )
+                            .unwrap(),
+                        expected,
+                    );
+                    if !min_exclusive && !max_exclusive {
+                        let mut visited = Vec::new();
+                        store
+                            .zvisit_scores_inclusive(b"bounds", min, max, n, |member, score| {
+                                visited.push((member.to_string(), score));
+                            })
+                            .unwrap();
+                        assert_eq!(visited, expected, "visitor bounds={min}..{max}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sorted_set_score_readers_reject_nan_bounds() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"bounds",
+                &[(b"one", 1.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        for key in [b"bounds".as_slice(), b"missing".as_slice()] {
+            for (min, max) in [(f64::NAN, 1.0), (1.0, f64::NAN), (f64::NAN, f64::NAN)] {
+                assert_eq!(
+                    store
+                        .zrangebyscore(key, min, max, false, false, false, None, None, false, n)
+                        .unwrap_err(),
+                    "ERR min or max is not a float",
+                );
+                assert_eq!(
+                    store.zcount(key, min, max, false, false, n).unwrap_err(),
+                    "ERR min or max is not a float",
+                );
+                assert_eq!(
+                    store
+                        .zvisit_scores_inclusive(key, min, max, n, |_, _| {
+                            panic!("invalid score bounds must not visit members");
+                        })
+                        .unwrap_err(),
+                    "ERR min or max is not a float",
+                );
+            }
+        }
+        store.set(b"string", b"value", None, n);
+        assert_eq!(
+            store
+                .zrangebyscore(b"string", 2.0, 1.0, false, false, false, None, None, false, n)
+                .unwrap_err(),
+            WRONGTYPE,
+        );
+        assert_eq!(
+            store
+                .zvisit_scores_inclusive(b"string", 2.0, 1.0, n, |_, _| {
+                    panic!("wrong-type values must not visit members");
+                })
+                .unwrap_err(),
+            WRONGTYPE,
+        );
+    }
+
+    #[test]
+    fn sorted_set_infinite_upper_bound_excludes_non_numeric_scores() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"bounds",
+                &[(b"nan" as &[u8], f64::NAN), (b"infinity", f64::INFINITY)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .zcount(b"bounds", 0.0, f64::INFINITY, false, false, n)
+                .unwrap(),
+            1
+        );
+        let mut visited = Vec::new();
+        store
+            .zvisit_scores_inclusive(b"bounds", 0.0, f64::INFINITY, n, |member, _| {
+                visited.push(member.to_string());
+            })
+            .unwrap();
+        assert_eq!(visited, ["infinity"]);
     }
 
     #[test]

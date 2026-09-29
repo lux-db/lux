@@ -244,6 +244,9 @@ pub async fn start_http_server(
             }
             accepted = listener.accept() => {
                 let (mut socket, _) = accepted?;
+                // Small keep-alive responses must not wait for a delayed ACK
+                // between their header and body writes, as on the RESP listener.
+                socket.set_nodelay(true).ok();
                 let permit = match connection_permits.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {

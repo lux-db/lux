@@ -117,6 +117,25 @@ fn test_config(root: &std::path::Path) -> lux::ServerConfig {
     }
 }
 
+async fn wait_for_resp_clients(handle: &lux::ServerHandle, expected: usize) {
+    let client = handle.client();
+    let expected_line = format!("connected_clients:{expected}");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let info = client.execute("INFO", &[]).await.unwrap();
+            if String::from_utf8_lossy(&info)
+                .lines()
+                .any(|line| line == expected_line)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("RESP connection capacity did not reach the expected state");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connection_ceilings_shed_and_recover() {
     let root = tempfile::tempdir().unwrap();
@@ -1100,9 +1119,23 @@ async fn idle_live_socket_is_closed_and_capacity_recovers() {
             || matches!(closed, Some(Err(_)))
     );
 
-    let (recovered, _) = tokio_tungstenite::connect_async(format!("ws://{address}/live"))
-        .await
-        .unwrap();
+    // Observing the close frame does not mean the server task has already
+    // dropped its connection permit. Bound the cleanup wait explicitly.
+    let (recovered, _) = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match tokio_tungstenite::connect_async(format!("ws://{address}/live")).await {
+                Ok(socket) => return socket,
+                Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                    if response.status().as_u16() == 503 =>
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => panic!("unexpected reconnect error: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("idle live socket leaked HTTP connection capacity");
     drop(recovered);
     handle.shutdown_and_wait().await.unwrap();
 }
@@ -1162,9 +1195,14 @@ async fn overload_does_not_lose_acknowledged_writes() {
         send_resp(address, &[b"SET", b"before-overload", b"safe"]).await,
         b"+OK\r\n"
     );
-    let held_one = TcpStream::connect(address).await.unwrap();
-    let held_two = TcpStream::connect(address).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    wait_for_resp_clients(&handle, 0).await;
+    let mut held_one = TcpStream::connect(address).await.unwrap();
+    let mut held_two = TcpStream::connect(address).await.unwrap();
+    // A successful TCP connect alone does not prove server-side admission.
+    for socket in [&mut held_one, &mut held_two] {
+        socket.write_all(&resp_command(&[b"PING"])).await.unwrap();
+        assert_eq!(read_quiet(socket).await, b"+PONG\r\n");
+    }
     for _ in 0..16 {
         let mut rejected = TcpStream::connect(address).await.unwrap();
         assert!(read_quiet(&mut rejected)
@@ -1173,7 +1211,7 @@ async fn overload_does_not_lose_acknowledged_writes() {
     }
     drop(held_one);
     drop(held_two);
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    wait_for_resp_clients(&handle, 0).await;
     assert_eq!(
         send_resp(address, &[b"SET", b"after-overload", b"safe"]).await,
         b"+OK\r\n"

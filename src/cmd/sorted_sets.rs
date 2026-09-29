@@ -43,7 +43,7 @@ fn parse_block_timeout(arg: &[u8], out: &mut BytesMut) -> Option<Duration> {
     duration
 }
 
-fn parse_score_bound(s: &str, _is_max: bool) -> Result<(f64, bool), String> {
+pub(super) fn parse_score_bound(s: &str, _is_max: bool) -> Result<(f64, bool), String> {
     if s == "-inf" || s == "-" {
         Ok((f64::NEG_INFINITY, false))
     } else if s == "+inf" || s == "+" {
@@ -455,6 +455,11 @@ pub fn cmd_zrange(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
                 resp::write_error(out, &e);
                 return CmdResult::Written;
             }
+        };
+        let (min, max, min_ex, max_ex) = if reverse {
+            (max, min, max_ex, min_ex)
+        } else {
+            (min, max, min_ex, max_ex)
         };
         match store.zrangebyscore(
             args[1],
@@ -1641,6 +1646,11 @@ pub fn cmd_zrangestore(
                 resp::write_error(out, &e);
                 return CmdResult::Written;
             }
+        };
+        let (min, max, min_ex, max_ex) = if reverse {
+            (max, min, max_ex, min_ex)
+        } else {
+            (min, max, min_ex, max_ex)
         };
         store.zrangebyscore(
             src, min, max, min_ex, max_ex, reverse, offset, count, true, now,

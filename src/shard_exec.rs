@@ -84,7 +84,6 @@ impl ShardExecutor {
     ) -> Result<(), ShardExecutionError> {
         let eviction_enabled = crate::eviction::eviction_enabled(&self.store);
         let tiered = self.store.is_tiered();
-        let wal_enabled = self.store.wal_enabled();
         let mut wal_commands: Vec<&[&[u8]]> = Vec::new();
         for command in commands {
             let args = command.args;
@@ -101,9 +100,9 @@ impl ShardExecutor {
                     crate::eviction::evict_if_needed(&self.store)
                         .map_err(ShardExecutionError::Eviction)?;
                 }
-                if wal_enabled {
-                    wal_commands.push(args);
-                }
+                // The mutation gate also serializes ephemeral writes against
+                // conditional commands; disabling the WAL must not skip it.
+                wal_commands.push(args);
             }
         }
 
@@ -146,7 +145,6 @@ impl ShardExecutor {
     ) -> Result<(), ShardExecutionError> {
         let eviction_enabled = crate::eviction::eviction_enabled(&self.store);
         let tiered = self.store.is_tiered();
-        let wal_enabled = self.store.wal_enabled();
         let mut wal_commands: Vec<&[&[u8]]> = Vec::new();
         for command in commands {
             let args = command.argv();
@@ -163,9 +161,9 @@ impl ShardExecutor {
                     crate::eviction::evict_if_needed(&self.store)
                         .map_err(ShardExecutionError::Eviction)?;
                 }
-                if wal_enabled {
-                    wal_commands.push(args);
-                }
+                // The mutation gate also serializes ephemeral writes against
+                // conditional commands; disabling the WAL must not skip it.
+                wal_commands.push(args);
             }
         }
 
@@ -437,6 +435,55 @@ mod tests {
             .unwrap();
 
         assert_eq!(&out[..], b"$6\r\nabcdef\r\n");
+    }
+
+    #[test]
+    fn write_batch_preserves_existing_string_encryption() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::new_with_config(Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..Default::default()
+        })));
+        store.encryption().init(Some("k1")).unwrap();
+        let now = Instant::now();
+        store
+            .set_conditional(
+                b"secret",
+                b"before",
+                SetOptions {
+                    ttl: None,
+                    keep_ttl: false,
+                    nx: false,
+                    xx: false,
+                    ifeq: None,
+                    get: false,
+                    encrypted: true,
+                },
+                now,
+            )
+            .unwrap();
+
+        // Encryption can become active after the connection selects a batch
+        // but before it acquires the key's mutation gate.
+        let executor = ShardExecutor::new(store.clone(), Broker::new());
+        let commands = vec![
+            vec![b"SET".as_slice(), b"secret".as_slice(), b"after".as_slice()],
+            vec![b"GET".as_slice(), b"secret".as_slice()],
+        ];
+        let access = vec![PipelineAccess::Write, PipelineAccess::Read];
+        let mut out = BytesMut::new();
+        executor
+            .execute_argv_pipeline_batch(
+                store.shard_for_key(b"secret"),
+                &commands,
+                &access,
+                &mut out,
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(&out[..], b"+OK\r\n$5\r\nafter\r\n");
+        assert!(store.kv_string_is_encrypted(b"secret", now));
     }
 
     #[test]
