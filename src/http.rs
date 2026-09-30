@@ -22,7 +22,7 @@ use crate::tables::SharedSchemaCache;
 use crate::{ByteBudget, CommandExecutor, CommandSession, DeadlineStream, LuxError, ServerLimits};
 
 mod browser_security;
-use browser_security::{normalize_origin, BrowserPolicy, StudioSessions};
+use browser_security::{normalize_origin, BrowserPolicy, RequestOrigin, StudioSessions};
 
 const WEBSOCKET_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -113,7 +113,10 @@ struct LiveClientContext<'a> {
 
 #[derive(Default)]
 struct HttpResponseContext {
+    /// A configured origin. Studio sessions are honored only from here.
     cors_origin: Option<String>,
+    /// Any other browser origin on a credential-gated engine.
+    cors_public: bool,
     diagnostic: Option<HttpDiagnostic>,
 }
 
@@ -157,12 +160,14 @@ impl Drop for HttpDiagnostic {
 
 impl HttpResponseContext {
     fn cors_headers(&self) -> String {
-        let mut headers = self
-            .cors_origin
-            .as_ref()
-            .map_or_else(String::new, |origin| {
-                format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\nAccess-Control-Expose-Headers: X-Lux-Request-Id, Content-Range, X-Lux-Snapshot-SHA256, X-Lux-Snapshot-Format\r\n")
-            });
+        let allowed = match (&self.cors_origin, self.cors_public) {
+            (Some(origin), _) => Some(origin.as_str()),
+            (None, true) => Some("*"),
+            (None, false) => None,
+        };
+        let mut headers = allowed.map_or_else(String::new, |origin| {
+            format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\nAccess-Control-Expose-Headers: X-Lux-Request-Id, Content-Range, X-Lux-Snapshot-SHA256, X-Lux-Snapshot-Format\r\n")
+        });
         if let Some(diagnostic) = &self.diagnostic {
             headers.push_str(&format!("X-Lux-Request-Id: {}\r\n", diagnostic.request_id));
         }
@@ -465,17 +470,22 @@ async fn handle_request(
     }
     let content_length = content_length.unwrap_or(0);
 
-    if let Err(error) = browser_policy.validate_host(&headers) {
+    // A failed key lookup keeps the stricter policy of an open engine.
+    let credentials_required = !store.config().password.is_empty()
+        || crate::auth::project_keys_configured(store, cache).unwrap_or(false);
+    if let Err(error) = browser_policy.validate_host(&headers, credentials_required) {
         let body = format!(r#"{{"error":"{}"}}"#, escape_json(error));
         return send_json(socket, 400, "Bad Request", &body, &response).await;
     }
-    response.cors_origin = match browser_policy.request_origin(&headers) {
-        Ok(origin) => origin,
+    match browser_policy.request_origin(&headers, credentials_required) {
+        Ok(RequestOrigin::Trusted(origin)) => response.cors_origin = Some(origin),
+        Ok(RequestOrigin::Public) => response.cors_public = true,
+        Ok(RequestOrigin::None) => {}
         Err(error) => {
             let body = format!(r#"{{"error":"{}"}}"#, escape_json(error));
             return send_json(socket, 403, "Forbidden", &body, &response).await;
         }
-    };
+    }
 
     if content_length > limits.max_body {
         let body = r#"{"error":"request body too large"}"#;
