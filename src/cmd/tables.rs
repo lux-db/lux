@@ -338,6 +338,7 @@ pub fn cmd_tupsert(
         &field_values,
         conflict_col.as_deref(),
         ttl,
+        None,
         now,
     ) {
         Ok(row) => write_rows(out, &[row], &proj),
