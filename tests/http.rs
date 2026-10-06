@@ -1208,7 +1208,7 @@ fn http_options_allows_auth_api_key_header() {
 }
 
 #[test]
-fn http_browser_boundary_uses_exact_cors_and_rejects_before_mutation() {
+fn http_credential_gated_engine_answers_any_browser_origin() {
     let server = LuxServer::builder()
         .http()
         .password("operator-secret")
@@ -1239,37 +1239,63 @@ fn http_browser_boundary_uses_exact_cors_and_rejects_before_mutation() {
     assert_eq!(trusted.header("Vary"), Some("Origin"));
     assert_ne!(trusted.header("Access-Control-Allow-Origin"), Some("*"));
 
-    let malicious = http_request_bytes_with_headers(
+    // Any other app origin gets public CORS. The credential, not the origin,
+    // decides what the request may do.
+    let app_preflight = http_request_bytes_with_headers(
         http,
-        "GET",
-        "/v1",
+        "OPTIONS",
+        "/v1/exec",
         &[],
-        Some("operator-secret"),
-        &[("Origin", "https://attacker.example")],
+        None,
+        &[
+            ("Origin", "http://localhost:5173"),
+            ("Access-Control-Request-Method", "POST"),
+            (
+                "Access-Control-Request-Headers",
+                "authorization, content-type",
+            ),
+        ],
     );
-    assert_eq!(malicious.status, 403);
-    assert!(malicious.header("Access-Control-Allow-Origin").is_none());
+    assert_eq!(app_preflight.status, 204);
+    assert_eq!(
+        app_preflight.header("Access-Control-Allow-Origin"),
+        Some("*")
+    );
 
-    let blocked_mutation = http_request_bytes_with_headers(
+    let anonymous = http_request_bytes_with_headers(
         http,
         "POST",
         "/v1/exec",
-        br#"{"command":["SET","browser:blocked","yes"]}"#,
-        Some("operator-secret"),
-        &[("Origin", "https://attacker.example")],
+        br#"{"command":["SET","browser:anonymous","yes"]}"#,
+        None,
+        &[("Origin", "http://localhost:5173")],
     );
-    assert_eq!(blocked_mutation.status, 403);
+    assert_eq!(anonymous.status, 401);
+    assert_eq!(anonymous.header("Access-Control-Allow-Origin"), Some("*"));
+
+    let authorized = http_request_bytes_with_headers(
+        http,
+        "POST",
+        "/v1/exec",
+        br#"{"command":["SET","browser:authorized","yes"]}"#,
+        Some("operator-secret"),
+        &[("Origin", "http://localhost:5173")],
+    );
+    assert_eq!(authorized.status, 200);
+    assert_eq!(authorized.header("Access-Control-Allow-Origin"), Some("*"));
+
     let native_read = http_request_bytes_with_headers(
         http,
         "POST",
         "/v1/exec",
-        br#"{"command":["GET","browser:blocked"]}"#,
+        br#"{"command":["MGET","browser:anonymous","browser:authorized"]}"#,
         Some("operator-secret"),
         &[],
     );
     assert_eq!(native_read.status, 200);
     let native_read: serde_json::Value = serde_json::from_slice(&native_read.body).unwrap();
-    assert!(native_read["result"].is_null());
+    assert_eq!(native_read["result"], serde_json::json!([null, "yes"]));
+    assert!(native_read.get("error").is_none());
 
     let duplicate_origin = http_request_bytes_with_headers(
         http,
@@ -1292,7 +1318,8 @@ fn http_browser_boundary_uses_exact_cors_and_rejects_before_mutation() {
         Some("operator-secret"),
         &[("Origin", "null")],
     );
-    assert_eq!(null_origin.status, 403);
+    assert_eq!(null_origin.status, 200);
+    assert_eq!(null_origin.header("Access-Control-Allow-Origin"), Some("*"));
 
     let unknown_header = http_request_bytes_with_headers(
         http,
@@ -1307,6 +1334,54 @@ fn http_browser_boundary_uses_exact_cors_and_rejects_before_mutation() {
         ],
     );
     assert_eq!(unknown_header.status, 403);
+}
+
+#[test]
+fn http_open_engine_rejects_unlisted_origins_before_mutation() {
+    let server = LuxServer::builder()
+        .http()
+        .env("LUX_HTTP_ALLOWED_ORIGINS", "https://app.example.test")
+        .start();
+    let http = server.http_port();
+
+    for origin in ["https://attacker.example", "null"] {
+        let blocked = http_request_bytes_with_headers(
+            http,
+            "POST",
+            "/v1/exec",
+            br#"{"command":["SET","browser:blocked","yes"]}"#,
+            None,
+            &[("Origin", origin)],
+        );
+        assert_eq!(blocked.status, 403, "{origin}");
+        assert!(blocked.header("Access-Control-Allow-Origin").is_none());
+    }
+
+    let trusted = http_request_bytes_with_headers(
+        http,
+        "GET",
+        "/v1",
+        &[],
+        None,
+        &[("Origin", "https://app.example.test")],
+    );
+    assert_eq!(trusted.status, 200);
+    assert_eq!(
+        trusted.header("Access-Control-Allow-Origin"),
+        Some("https://app.example.test")
+    );
+
+    let native_read = http_request_bytes_with_headers(
+        http,
+        "POST",
+        "/v1/exec",
+        br#"{"command":["GET","browser:blocked"]}"#,
+        None,
+        &[],
+    );
+    assert_eq!(native_read.status, 200);
+    let native_read: serde_json::Value = serde_json::from_slice(&native_read.body).unwrap();
+    assert!(native_read["result"].is_null());
 }
 
 fn raw_http_status(port: u16, headers: &str) -> u16 {
@@ -1338,6 +1413,36 @@ fn http_host_boundary_blocks_rebinding_and_accepts_loopback_aliases() {
     assert_eq!(raw_http_status(http, ""), 400);
     assert_eq!(
         raw_http_status(http, "Host: localhost\r\nHost: localhost\r\n"),
+        400
+    );
+}
+
+#[test]
+fn http_credential_gated_engine_accepts_any_valid_host() {
+    let server = LuxServer::builder()
+        .http()
+        .password("operator-secret")
+        .start();
+    let http = server.http_port();
+    let auth = "Authorization: Bearer operator-secret\r\n";
+
+    for host in [
+        "host.docker.internal:5890",
+        "lux.preview.example.test",
+        "192.168.1.20",
+    ] {
+        assert_eq!(
+            raw_http_status(http, &format!("Host: {host}\r\n{auth}")),
+            200,
+            "{host}"
+        );
+    }
+    assert_eq!(raw_http_status(http, auth), 400);
+    assert_eq!(
+        raw_http_status(
+            http,
+            &format!("Host: localhost\r\nHost: localhost\r\n{auth}")
+        ),
         400
     );
 }

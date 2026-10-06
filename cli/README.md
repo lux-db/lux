@@ -159,6 +159,12 @@ when another device or development environment must reach them. Non-loopback
 bindings expose the engine and Studio's scoped management session, so they are
 intended for trusted networks and explicit port-forwarding setups.
 
+For a reverse-proxied local stack, run `lux start --bind 0.0.0.0` with `LUX_URL`
+set to the browser-visible engine origin and `LUX_STUDIO_ORIGIN` set to the
+browser-visible Studio origin. The CLI allows the public engine host and binds
+Studio's session to that origin. The proxy must preserve the public `Host`
+header.
+
 ### Project Engine configuration
 
 `lux/config.toml` may set local Engine capacity and deadline overrides without

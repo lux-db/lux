@@ -14,6 +14,18 @@ pub(super) struct BrowserPolicy {
     allowed_origins: HashSet<String>,
 }
 
+/// How a request's `Origin` header is answered.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RequestOrigin {
+    /// No `Origin` header: a native or server client.
+    None,
+    /// An exact configured origin. Only these can carry a Studio session.
+    Trusted(String),
+    /// Any other browser origin on a credential-gated engine. Credentials and
+    /// grants, not the origin, decide what the request may do.
+    Public,
+}
+
 #[derive(Clone, Debug)]
 struct StudioSession {
     origin: String,
@@ -135,7 +147,14 @@ impl BrowserPolicy {
         })
     }
 
-    pub(super) fn validate_host(&self, headers: &[(String, String)]) -> Result<(), &'static str> {
+    /// `credentials_required` is true once the engine has an operator password
+    /// or project keys. DNS rebinding only matters for an engine that answers
+    /// without credentials, so the Host allowlist applies only to that engine.
+    pub(super) fn validate_host(
+        &self,
+        headers: &[(String, String)],
+        credentials_required: bool,
+    ) -> Result<(), &'static str> {
         let values: Vec<&str> = headers
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
@@ -148,7 +167,8 @@ impl BrowserPolicy {
             return Err("invalid Host header");
         };
         let host_allowlist_enabled = !self.allowed_hosts.is_empty() || self.allow_loopback_hosts;
-        if host_allowlist_enabled
+        if !credentials_required
+            && host_allowlist_enabled
             && !self.allowed_hosts.contains(&host)
             && !(self.allow_loopback_hosts && is_loopback_host(&host))
         {
@@ -157,10 +177,14 @@ impl BrowserPolicy {
         Ok(())
     }
 
+    /// A credential-gated engine answers every browser origin, as any
+    /// publishable-key API does. An engine without credentials answers only
+    /// configured origins, so an arbitrary page cannot read or write it.
     pub(super) fn request_origin(
         &self,
         headers: &[(String, String)],
-    ) -> Result<Option<String>, &'static str> {
+        credentials_required: bool,
+    ) -> Result<RequestOrigin, &'static str> {
         let values: Vec<&str> = headers
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case("origin"))
@@ -170,15 +194,16 @@ impl BrowserPolicy {
             return Err("duplicate Origin header");
         }
         let Some(raw) = values.first() else {
-            return Ok(None);
+            return Ok(RequestOrigin::None);
         };
-        let Some(origin) = normalize_origin(raw) else {
-            return Err("invalid Origin header");
-        };
-        if !self.allowed_origins.contains(&origin) {
-            return Err("Origin is not allowed");
+        match normalize_origin(raw) {
+            Some(origin) if self.allowed_origins.contains(&origin) => {
+                Ok(RequestOrigin::Trusted(origin))
+            }
+            _ if credentials_required => Ok(RequestOrigin::Public),
+            Some(_) => Err("Origin is not allowed"),
+            None => Err("invalid Origin header"),
         }
-        Ok(Some(origin))
     }
 
     pub(super) fn allows_origin(&self, origin: &str) -> bool {
@@ -308,15 +333,58 @@ mod tests {
             "[::1]:5890",
         ] {
             assert!(policy
-                .validate_host(&[("host".to_string(), host.to_string())])
+                .validate_host(&[("host".to_string(), host.to_string())], false)
                 .is_ok());
         }
+        let rebinding = [(
+            "host".to_string(),
+            "localhost.attacker.example:5890".to_string(),
+        )];
+        assert!(policy.validate_host(&rebinding, false).is_err());
+        // A credential-gated engine is reachable under any valid Host name,
+        // such as host.docker.internal or a tunnel, but never a malformed one.
+        assert!(policy.validate_host(&rebinding, true).is_ok());
         assert!(policy
-            .validate_host(&[(
-                "host".to_string(),
-                "localhost.attacker.example:5890".to_string(),
-            )])
+            .validate_host(&[("host".to_string(), "bad host".to_string())], true)
             .is_err());
+        assert!(policy.validate_host(&[], true).is_err());
+    }
+
+    #[test]
+    fn credential_gated_engines_answer_any_browser_origin() {
+        let mut config = browser_config();
+        config.allowed_origins = vec!["http://localhost:5891".to_string()];
+        let policy = BrowserPolicy::try_new("127.0.0.1", &config).unwrap();
+        let origin = |value: &str| vec![("origin".to_string(), value.to_string())];
+
+        for credentials_required in [false, true] {
+            assert_eq!(
+                policy.request_origin(&[], credentials_required),
+                Ok(RequestOrigin::None)
+            );
+            assert_eq!(
+                policy.request_origin(&origin("http://localhost:5891"), credentials_required),
+                Ok(RequestOrigin::Trusted("http://localhost:5891".to_string()))
+            );
+            let mut duplicate = origin("http://localhost:5891");
+            duplicate.extend(origin("http://localhost:5891"));
+            assert!(policy
+                .request_origin(&duplicate, credentials_required)
+                .is_err());
+        }
+
+        assert_eq!(
+            policy.request_origin(&origin("http://localhost:5173"), true),
+            Ok(RequestOrigin::Public)
+        );
+        assert_eq!(
+            policy.request_origin(&origin("null"), true),
+            Ok(RequestOrigin::Public)
+        );
+        assert!(policy
+            .request_origin(&origin("http://localhost:5173"), false)
+            .is_err());
+        assert!(policy.request_origin(&origin("null"), false).is_err());
     }
 
     #[test]

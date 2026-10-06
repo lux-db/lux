@@ -29,7 +29,7 @@ use project_config::{
     INITIAL_CONFIG as INITIAL_LOCAL_CONFIG,
 };
 use self_update::{latest_cli_release, newer_cli_version, update_cli};
-use studio::{mint_session, session_is_valid, StudioContainerConfig};
+use studio::{browser_origin, mint_session, session_is_valid, StudioContainerConfig};
 
 const DEFAULT_API_URL: &str = "https://api.luxdb.dev";
 
@@ -672,7 +672,12 @@ fn enc_command_args(action: &EncAction) -> Vec<String> {
 /// `KEY=VALUE` engine env for the local `lux start` container: auth keys, ports,
 /// explicit durability, tiered storage, and `LUX_ENC_AUTO_INIT=1` so encrypted
 /// columns work without a manual `ENC INIT`.
-fn local_engine_env(state: &LocalState, engine_settings: &[String]) -> Vec<String> {
+fn local_engine_env_for_browser(
+    state: &LocalState,
+    engine_settings: &[String],
+    studio_origin: &str,
+    public_engine_url: Option<&str>,
+) -> Result<Vec<String>, String> {
     let mut allowed_hosts = vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
@@ -682,6 +687,20 @@ fn local_engine_env(state: &LocalState, engine_settings: &[String]) -> Vec<Strin
     if !allowed_hosts.contains(&connection_host) {
         allowed_hosts.push(connection_host);
     }
+    // A reverse proxy that preserves the browser-visible Host must reach the
+    // engine under that name. An unparseable LUX_URL is ignored here, as it is
+    // when configuring Studio.
+    if let Some(host) = public_engine_url
+        .and_then(|url| browser_origin(url, "LUX_URL").ok())
+        .and_then(|url| url.host_str().map(str::to_string))
+    {
+        if !allowed_hosts.contains(&host) {
+            allowed_hosts.push(host);
+        }
+    }
+    let studio_origin = browser_origin(studio_origin, "LUX_STUDIO_ORIGIN")?
+        .origin()
+        .ascii_serialization();
     let mut env = vec![
         "LUX_AUTH_ENABLED=1".to_string(),
         format!("LUX_PASSWORD={}", state.password),
@@ -700,13 +719,39 @@ fn local_engine_env(state: &LocalState, engine_settings: &[String]) -> Vec<Strin
             state.http_port
         ),
         format!("LUX_HTTP_ALLOWED_HOSTS={}", allowed_hosts.join(",")),
-        format!("LUX_HTTP_ALLOWED_ORIGINS={}", state.studio_origin()),
+        format!("LUX_HTTP_ALLOWED_ORIGINS={studio_origin}"),
         // Engine self-mints its keyring + seal into /data on first boot; the CLI
         // never handles encryption key material (unlike the auth keys above).
         "LUX_ENC_AUTO_INIT=1".to_string(),
     ];
     env.extend_from_slice(engine_settings);
-    env
+    Ok(env)
+}
+
+fn configured_studio_origin(state: &LocalState) -> Result<String, String> {
+    let raw = std::env::var("LUX_STUDIO_ORIGIN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| state.studio_origin());
+    Ok(browser_origin(&raw, "LUX_STUDIO_ORIGIN")?
+        .origin()
+        .ascii_serialization())
+}
+
+fn local_engine_env(state: &LocalState, engine_settings: &[String]) -> Vec<String> {
+    configured_studio_origin(state)
+        .and_then(|studio_origin| {
+            local_engine_env_for_browser(
+                state,
+                engine_settings,
+                &studio_origin,
+                std::env::var("LUX_URL").ok().as_deref(),
+            )
+        })
+        .unwrap_or_else(|error| {
+            eprintln!("{} {error}", "Error:".red());
+            std::process::exit(1);
+        })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1678,11 +1723,28 @@ fn studio_project_name() -> String {
 /// for remote/sandbox setups. The browser receives only a short-lived Engine
 /// management session bound to Studio's exact origin.
 async fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
-    let studio_origin = state.studio_origin();
-    let engine_url = match std::env::var("LUX_URL") {
+    let studio_origin = match configured_studio_origin(state) {
+        Ok(origin) => origin,
+        Err(error) => {
+            eprintln!("{} {error}", "Warning:".yellow());
+            return false;
+        }
+    };
+    let browser_engine_url = match std::env::var("LUX_URL") {
         Ok(url) if !url.trim().is_empty() => url.trim().to_string(),
         _ => state.lux_url(),
     };
+    let browser_engine_url = match browser_origin(&browser_engine_url, "LUX_URL") {
+        Ok(url) => url.origin().ascii_serialization(),
+        Err(error) => {
+            eprintln!("{} {error}", "Warning:".yellow());
+            return false;
+        }
+    };
+    // The public preview route may not be online until setup completes. Mint
+    // and verify sessions over the local engine port; only the SPA needs the
+    // browser-visible URL.
+    let local_engine_url = state.lux_url();
     let binding_matches = docker_port_binding_matches(
         &state.studio_container,
         "80/tcp",
@@ -1695,7 +1757,7 @@ async fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
     {
         let token =
             docker_container_env(&state.studio_container, "LUX_STUDIO_TOKEN").unwrap_or_default();
-        if session_is_valid(&engine_url, &studio_origin, &token).await {
+        if session_is_valid(&local_engine_url, &studio_origin, &token).await {
             println!("{} {}", "Lux Studio:".bold(), studio_origin.cyan());
             if open_browser {
                 let _ = open::that(&studio_origin);
@@ -1716,7 +1778,7 @@ async fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
         return false;
     }
 
-    let session = match mint_session(&engine_url, &state.password, &studio_origin).await {
+    let session = match mint_session(&local_engine_url, &state.password, &studio_origin).await {
         Ok(session) => session,
         Err(error) => {
             eprintln!(
@@ -1731,10 +1793,14 @@ async fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
     let or_key = std::env::var("LUX_OPENROUTER_KEY")
         .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
         .unwrap_or_default();
-    let connection_host = state.connection_host();
+    let connection_host = browser_origin(&studio_origin, "LUX_STUDIO_ORIGIN")
+        .expect("validated Studio origin")
+        .host_str()
+        .expect("validated Studio origin has a host")
+        .to_string();
     let project_name = studio_project_name();
     let studio_env = StudioContainerConfig {
-        engine_url: &engine_url,
+        engine_url: &browser_engine_url,
         session: &session,
         host: &connection_host,
         publishable_key: &state.publishable_key,
@@ -1775,7 +1841,7 @@ async fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
     println!(" {}", "ready".green());
 
     println!("{} {}", "Lux Studio:".bold(), studio_origin.cyan());
-    println!("{} {}", "  → engine:".dimmed(), engine_url.dimmed());
+    println!("{} {}", "  → engine:".dimmed(), browser_engine_url.dimmed());
     if open_browser {
         let _ = open::that(&studio_origin);
     }
@@ -7776,7 +7842,8 @@ mod tests {
 
     #[test]
     fn local_engine_env_enables_encryption_auto_init() {
-        let env = local_engine_env(&sample_state(), &[]);
+        let state = sample_state();
+        let env = local_engine_env_for_browser(&state, &[], &state.studio_origin(), None).unwrap();
         assert!(
             env.iter().any(|e| e == "LUX_ENC_AUTO_INIT=1"),
             "engine env must enable encryption auto-init: {env:?}"
@@ -7796,6 +7863,41 @@ mod tests {
         assert!(!env
             .iter()
             .any(|e| e.starts_with("LUX_DURABILITY_SYNC_INTERVAL_MS=")));
+    }
+
+    #[test]
+    fn preview_browser_policy_includes_public_urls() {
+        let env = local_engine_env_for_browser(
+            &sample_state(),
+            &[],
+            "https://studio.preview.example.test",
+            Some("https://lux.preview.example.test"),
+        )
+        .unwrap();
+        assert!(env.iter().any(|entry| {
+            entry == "LUX_HTTP_ALLOWED_HOSTS=localhost,127.0.0.1,::1,lux.preview.example.test"
+        }));
+        assert!(env
+            .iter()
+            .any(|entry| entry == "LUX_HTTP_ALLOWED_ORIGINS=https://studio.preview.example.test"));
+        assert!(local_engine_env_for_browser(
+            &sample_state(),
+            &[],
+            "https://studio.preview.example.test/path",
+            None,
+        )
+        .is_err());
+        // An unrelated or malformed LUX_URL never blocks a local start.
+        let env = local_engine_env_for_browser(
+            &sample_state(),
+            &[],
+            "http://localhost:5891",
+            Some("https://example.test/app?x=1"),
+        )
+        .unwrap();
+        assert!(env
+            .iter()
+            .any(|entry| entry == "LUX_HTTP_ALLOWED_HOSTS=localhost,127.0.0.1,::1"));
     }
 
     #[test]

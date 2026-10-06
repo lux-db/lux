@@ -175,23 +175,21 @@ async fn websocket_origin_and_studio_expiry_use_the_http_browser_boundary() {
         ],
     );
 
-    let mut malicious = format!("ws://127.0.0.1:{http_port}/live")
+    // A credential-gated engine accepts any app origin; the credential decides.
+    let mut other_app = format!("ws://127.0.0.1:{http_port}/live")
         .into_client_request()
         .unwrap();
-    malicious
+    other_app
         .headers_mut()
         .insert("Authorization", HeaderValue::from_static("Bearer secret"));
-    malicious.headers_mut().insert(
-        "Origin",
-        HeaderValue::from_static("https://attacker.example"),
-    );
-    let error = connect_async(malicious)
+    other_app
+        .headers_mut()
+        .insert("Origin", HeaderValue::from_static("http://localhost:5173"));
+    let (mut other_socket, response) = connect_async(other_app)
         .await
-        .expect_err("malicious WebSocket Origin must be rejected");
-    assert!(
-        error.to_string().contains("403"),
-        "unexpected error: {error}"
-    );
+        .expect("credentialed app WebSocket from another origin");
+    assert_eq!(response.status(), 101);
+    other_socket.close(None).await.unwrap();
 
     let mut trusted = format!("ws://127.0.0.1:{http_port}/live")
         .into_client_request()
@@ -215,6 +213,23 @@ async fn websocket_origin_and_studio_expiry_use_the_http_browser_boundary() {
     );
     assert_eq!(status, 201, "mint Studio session: {minted}");
     let token = minted["token"].as_str().unwrap();
+
+    // The Studio session stays bound to its exact origin.
+    let mut stolen = format!("ws://127.0.0.1:{http_port}/live?token={token}")
+        .into_client_request()
+        .unwrap();
+    stolen.headers_mut().insert(
+        "Origin",
+        HeaderValue::from_static("https://attacker.example"),
+    );
+    let error = connect_async(stolen)
+        .await
+        .expect_err("Studio session from another origin must be rejected");
+    assert!(
+        error.to_string().contains("401"),
+        "unexpected error: {error}"
+    );
+
     let mut studio = format!("ws://127.0.0.1:{http_port}/live?token={token}")
         .into_client_request()
         .unwrap();
