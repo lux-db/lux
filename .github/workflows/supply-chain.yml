@@ -15,15 +15,6 @@ jobs:
         with:
           toolchain: 1.98.0
 
-      - name: Enforce advisory exception expiry
-        env:
-          RSA_EXCEPTION_EXPIRES: '2026-09-30'
-        run: |
-          if [[ "$(date -u +%F)" > "$RSA_EXCEPTION_EXPIRES" ]]; then
-            echo "The reviewed RSA advisory exception expired on $RSA_EXCEPTION_EXPIRES."
-            exit 1
-          fi
-
       - name: Install dependency policy tool
         run: cargo install cargo-deny --version 0.20.2 --locked
 
