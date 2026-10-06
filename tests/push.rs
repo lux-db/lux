@@ -1,6 +1,6 @@
-//! Integration tests for lux push (engine PR1): device registry, reserved-table
-//! guards, durable outbox delivery through a mock APNs server, dead-token
-//! pruning, and WAL-replay durability.
+//! Integration tests for Lux Push: device ownership and authorization,
+//! reserved-table guards, bounded durable delivery through mock providers,
+//! dead-token pruning, and WAL-replay durability.
 
 mod common;
 
@@ -67,6 +67,16 @@ fn start(dir: &std::path::Path, resp_port: u16, http_port: u16, keep_dir: bool) 
         // Integration delivery uses a loopback mock push service. Production
         // defaults reject private and non-HTTPS Web Push endpoints.
         .env("LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS", "1")
+        // A hostile ambient proxy must never see provider credentials or
+        // subscription endpoints. The sinks explicitly disable proxy use.
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .env("NO_PROXY", "")
+        .env("http_proxy", "http://127.0.0.1:9")
+        .env("https_proxy", "http://127.0.0.1:9")
+        .env("all_proxy", "http://127.0.0.1:9")
+        .env("no_proxy", "")
         .stdout(log.try_clone().unwrap())
         .stderr(log);
     let child = common::spawn_lux(&mut cmd).expect("spawn lux");
@@ -217,6 +227,18 @@ impl MockApns {
     }
 
     fn start_with_reason(status: u16, reason: &str) -> Self {
+        Self::start_with_headers(status, reason, Vec::new())
+    }
+
+    fn start_redirect(location: String) -> Self {
+        Self::start_with_headers(302, "{}", vec![("location".to_string(), location)])
+    }
+
+    fn start_with_headers(
+        status: u16,
+        reason: &str,
+        response_headers: Vec<(String, String)>,
+    ) -> Self {
         let listener = common::bind_registered_ephemeral_listener();
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -276,8 +298,12 @@ impl MockApns {
                 }
                 cap.body = String::from_utf8_lossy(&body).to_string();
                 reqs.lock().unwrap().push(cap);
+                let extra_headers: String = response_headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}\r\n"))
+                    .collect();
                 let response = format!(
-                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reason}",
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\n{extra_headers}connection: close\r\n\r\n{reason}",
                     reason.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
@@ -309,6 +335,19 @@ fn test_p8() -> String {
         .to_pkcs8_pem(LineEnding::LF)
         .unwrap()
         .to_string()
+}
+
+fn test_vapid_pair() -> (String, String) {
+    use base64::Engine as _;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::pkcs8::{EncodePrivateKey, LineEnding};
+    use p256::SecretKey;
+
+    let secret = SecretKey::random(&mut rand_core::OsRng);
+    let public = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(secret.public_key().to_encoded_point(false).as_bytes());
+    let private = secret.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+    (public, private)
 }
 
 fn set_creds(http_port: u16, environment: &str) {
@@ -467,11 +506,11 @@ fn credential_change_rebuilds_cached_sink() {
 
     // The second delivery must carry the NEW topic, not the cached one.
     let deadline = Instant::now() + Duration::from_secs(5);
-    let second_topic = loop {
+    let (second_topic, second_authorization) = loop {
         {
             let reqs = mock.requests.lock().unwrap();
             if reqs.len() >= 2 {
-                break reqs[1].apns_topic.clone();
+                break (reqs[1].apns_topic.clone(), reqs[1].authorization.clone());
             }
         }
         assert!(Instant::now() < deadline, "second delivery not received");
@@ -480,6 +519,33 @@ fn credential_change_rebuilds_cached_sink() {
     assert_eq!(
         second_topic, "com.example.second",
         "a credential change must invalidate the cached sink"
+    );
+
+    // Replacing only the private key must also rebuild the sink. A key repair
+    // can legitimately retain the same Apple key id and topic.
+    set_creds_topic(http_port, &mock.url(), "com.example.second");
+    let (s, _) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({"subject_id": uid, "notification": {"title":"Hi","body":"3"}}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 200);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let third_authorization = loop {
+        {
+            let reqs = mock.requests.lock().unwrap();
+            if reqs.len() >= 3 {
+                break reqs[2].authorization.clone();
+            }
+        }
+        assert!(Instant::now() < deadline, "third delivery not received");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_ne!(
+        third_authorization, second_authorization,
+        "private-key replacement must invalidate the cached provider token"
     );
 }
 
@@ -558,6 +624,45 @@ fn delete_by_token_edge_cases() {
         assert_eq!(s, 200, "register {t}: {b}");
     }
 
+    let (status, first_page) = http(
+        http_port,
+        "GET",
+        "/v1/push/devices?limit=1&offset=0",
+        "",
+        Some(&token),
+    );
+    assert_eq!(status, 200, "first device page: {first_page}");
+    assert_eq!(first_page["devices"].as_array().map(Vec::len), Some(1));
+    assert_eq!(first_page["page"]["limit"], 1);
+    assert_eq!(first_page["page"]["offset"], 0);
+    assert_eq!(first_page["page"]["has_more"], true);
+    assert_eq!(first_page["page"]["next_offset"], 1);
+    let (status, second_page) = http(
+        http_port,
+        "GET",
+        "/v1/push/devices?limit=1&offset=1",
+        "",
+        Some(&token),
+    );
+    assert_eq!(status, 200, "second device page: {second_page}");
+    assert_eq!(second_page["devices"].as_array().map(Vec::len), Some(1));
+    assert_eq!(second_page["page"]["has_more"], false);
+    assert!(second_page["page"]["next_offset"].is_null());
+    assert_ne!(
+        first_page["devices"][0]["id"], second_page["devices"][0]["id"],
+        "adjacent pages repeated the same row"
+    );
+    for path in [
+        "/v1/push/devices?limit=0",
+        "/v1/push/devices?limit=1001",
+        "/v1/push/devices?limit=nope",
+        "/v1/push/devices?offset=100001",
+        "/v1/push/devices?limit=1&limit=2",
+    ] {
+        let (status, body) = http(http_port, "GET", path, "", Some(&token));
+        assert_eq!(status, 400, "invalid page was accepted at {path}: {body}");
+    }
+
     // Missing token -> 400.
     let (s, _) = http(
         http_port,
@@ -629,6 +734,44 @@ fn push_admin_routes_require_operator_and_token_cleanup_requires_auth() {
     assert_eq!(deleted["deleted"], false);
     let (s, _) = http(http_port, "GET", "/v1/push/admin/stats", "", Some(&token));
     assert!(s == 401 || s == 403, "user stats read denied, got {s}");
+    for (method, path, body) in [
+        (
+            "POST",
+            "/v1/push/send",
+            json!({"subject_id":"someone", "notification":{"title":"x"}}).to_string(),
+        ),
+        ("POST", "/v1/push/credentials", "{}".to_string()),
+        ("PUT", "/v1/push/config/apns", "{}".to_string()),
+        ("GET", "/v1/push/admin/devices", String::new()),
+        ("GET", "/v1/push/admin/outbox", String::new()),
+    ] {
+        let (status, response) = http(http_port, method, path, &body, Some(&token));
+        assert!(
+            status == 401 || status == 403,
+            "end-user access to {method} {path} must be denied, got {status}: {response}"
+        );
+    }
+
+    let (status, created) = http(
+        http_port,
+        "POST",
+        "/auth/v1/admin/keys",
+        &json!({"kind":"publishable", "name":"push-boundary"}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "create publishable key: {created}");
+    let publishable = created["plain_key"].as_str().unwrap();
+    let (status, response) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"token":"publishable-token", "platform":"ios", "app_id":"default"}).to_string(),
+        Some(publishable),
+    );
+    assert!(
+        status == 401 || status == 403,
+        "a publishable key is not an end user, got {status}: {response}"
+    );
 
     // No auth at all is denied too.
     let (s, _) = http(
@@ -641,6 +784,85 @@ fn push_admin_routes_require_operator_and_token_cleanup_requires_auth() {
     assert!(
         s == 401 || s == 403,
         "unauth delete-by-token denied, got {s}"
+    );
+}
+
+#[test]
+fn push_registration_rejects_malformed_and_oversized_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let (resp_port, http_port) = free_port_pair();
+    let _server = start(dir.path(), resp_port, http_port, false);
+    let (token, _) = anon_login(http_port);
+
+    let malformed_web = json!({
+        "endpoint": "http://127.0.0.1:8080/push",
+        "keys": {"p256dh":"not-a-curve-point", "auth":"too-short"}
+    })
+    .to_string();
+    for body in [
+        json!({"token":"ios/token", "platform":"ios", "app_id":"default"}),
+        json!({"token":"token", "platform":"windows", "app_id":"default"}),
+        json!({"token":"token", "platform":"ios", "app_id":"x".repeat(129)}),
+        json!({"token":"x".repeat(513), "platform":"ios", "app_id":"default"}),
+        json!({"token":"x".repeat(8 * 1024 + 1), "platform":"web", "app_id":"default"}),
+        json!({"token":malformed_web, "platform":"web", "app_id":"default"}),
+    ] {
+        let (status, response) = http(
+            http_port,
+            "POST",
+            "/v1/push/devices",
+            &body.to_string(),
+            Some(&token),
+        );
+        assert_eq!(status, 400, "unsafe registration was accepted: {response}");
+    }
+
+    let (status, response) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({
+            "subject_id":"x".repeat(257),
+            "token":"operator-token",
+            "platform":"ios",
+            "app_id":"default"
+        })
+        .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 400, "oversized subject was accepted: {response}");
+
+    let (status, response) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({
+            "subject_id":"nobody",
+            "notification":{"data":{"blob":"x".repeat(4_096)}}
+        })
+        .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 400, "oversized payload was accepted: {response}");
+
+    let (status, response) = http(
+        http_port,
+        "POST",
+        "/v1/push/credentials",
+        &json!({
+            "app_id":"default",
+            "team_id":"team",
+            "key_id":"key",
+            "topic":"com.example.app",
+            "environment":"sandbox",
+            "p8_pem":"x".repeat(16 * 1024 + 1)
+        })
+        .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(
+        status, 400,
+        "oversized provider secret was accepted: {response}"
     );
 }
 
@@ -825,7 +1047,8 @@ fn push_unregistered_token_disables_device() {
 
 #[test]
 fn push_bad_request_dead_letters_without_disabling_device() {
-    let mock = MockApns::start_with_reason(400, r#"{"reason":"BadCollapseId"}"#);
+    let mock =
+        MockApns::start_with_reason(400, r#"{"reason":"BadCollapseId","token":"healthy-token"}"#);
     let dir = tempfile::tempdir().unwrap();
     let (resp_port, http_port) = free_port_pair();
     let server = start(dir.path(), resp_port, http_port, false);
@@ -879,9 +1102,18 @@ fn push_bad_request_dead_letters_without_disabling_device() {
     assert!(
         dead["dead_letters"][0]["last_error"]
             .as_str()
-            .is_some_and(|error| error.contains("BadCollapseId") && error.contains("apns-id")),
+            .is_some_and(|error| error.contains("ProviderRejected") && error.contains("apns-id")),
         "dead letter should retain APNs diagnostics: {dead}"
     );
+    assert!(
+        dead["page"].is_object(),
+        "dead letters must be paginated: {dead}"
+    );
+    assert!(
+        !dead.to_string().contains("healthy-token"),
+        "dead-letter output exposed a raw target token: {dead}"
+    );
+    assert!(dead["dead_letters"][0].get("payload").is_none(), "{dead}");
 
     let (s, devices) = http(http_port, "GET", "/v1/push/devices", "", Some(&token));
     assert_eq!(s, 200, "devices: {devices}");
@@ -890,6 +1122,63 @@ fn push_bad_request_dead_letters_without_disabling_device() {
         Some(1),
         "request errors must not disable a healthy device: {devices}"
     );
+    drop(server);
+}
+
+#[test]
+fn oversized_provider_responses_are_not_persisted() {
+    let mock = MockApns::start_with_reason(400, &"x".repeat(9 * 1024));
+    let dir = tempfile::tempdir().unwrap();
+    let (resp_port, http_port) = free_port_pair();
+    let server = start(dir.path(), resp_port, http_port, false);
+
+    set_creds(http_port, &mock.url());
+    let (token, uid) = anon_login(http_port);
+    let (status, body) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"token":"bounded-error-token","platform":"ios","app_id":"default"}).to_string(),
+        Some(&token),
+    );
+    assert_eq!(status, 200, "register: {body}");
+    let (status, body) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({"subject_id":uid,"notification":{"title":"Hi"}}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "send: {body}");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let dead = loop {
+        let (status, body) = http(
+            http_port,
+            "GET",
+            "/v1/push/admin/outbox",
+            "",
+            Some("rootsecret"),
+        );
+        assert_eq!(status, 200, "dead letters: {body}");
+        if body["dead_letters"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+        {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "delivery did not terminate: {body}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let error = dead["dead_letters"][0]["last_error"]
+        .as_str()
+        .expect("bounded provider error");
+    assert_eq!(error, "APNs response exceeded the safety limit");
+    assert!(error.len() <= 1_024);
+    assert!(!dead.to_string().contains("bounded-error-token"));
     drop(server);
 }
 
@@ -916,6 +1205,20 @@ fn push_devices_scoped_and_reserved_guarded() {
     let (_, list_b) = http(http_port, "GET", "/v1/push/devices", "", Some(&token_b));
     assert_eq!(list_b["devices"].as_array().unwrap().len(), 0);
 
+    // A globally unique token cannot be claimed by another signed-in user.
+    let (status, body) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({"token":"a-token","platform":"ios","app_id":"default"}).to_string(),
+        Some(&token_b),
+    );
+    assert_eq!(status, 400, "cross-user token claim must fail: {body}");
+    let (_, list_a) = http(http_port, "GET", "/v1/push/devices", "", Some(&token_a));
+    let (_, list_b) = http(http_port, "GET", "/v1/push/devices", "", Some(&token_b));
+    assert_eq!(list_a["devices"].as_array().map(Vec::len), Some(1));
+    assert_eq!(list_b["devices"].as_array().map(Vec::len), Some(0));
+
     // The stable token cleanup route is user-scoped: B cannot delete A's
     // device, while A can remove it without knowing the internal device id.
     let (s, deleted) = http(
@@ -927,6 +1230,18 @@ fn push_devices_scoped_and_reserved_guarded() {
     );
     assert_eq!(s, 200, "other-user cleanup: {deleted}");
     assert_eq!(deleted["deleted"], false);
+    let (s, missing) = http(
+        http_port,
+        "DELETE",
+        "/v1/push/devices",
+        &json!({"token":"never-registered"}).to_string(),
+        Some(&token_b),
+    );
+    assert_eq!(s, 200, "missing-token cleanup: {missing}");
+    assert_eq!(
+        missing, deleted,
+        "foreign and missing tokens must be indistinguishable"
+    );
     let (_, list_a) = http(http_port, "GET", "/v1/push/devices", "", Some(&token_a));
     assert_eq!(list_a["devices"].as_array().unwrap().len(), 1);
 
@@ -1020,6 +1335,52 @@ fn push_registry_survives_restart() {
     drop(server);
 }
 
+#[test]
+fn concurrent_sessions_cannot_claim_the_same_device_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let (resp_port, http_port) = free_port_pair();
+    let server = start(dir.path(), resp_port, http_port, false);
+    let (token_a, _) = anon_login(http_port);
+    let (token_b, _) = anon_login(http_port);
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let handles: Vec<_> = [token_a.clone(), token_b.clone()]
+        .into_iter()
+        .map(|token| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                http(
+                    http_port,
+                    "POST",
+                    "/v1/push/devices",
+                    &json!({
+                        "token":"concurrently-claimed-token",
+                        "platform":"ios",
+                        "app_id":"default"
+                    })
+                    .to_string(),
+                    Some(&token),
+                )
+                .0
+            })
+        })
+        .collect();
+    barrier.wait();
+    let statuses: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert_eq!(statuses.iter().filter(|status| **status == 200).count(), 1);
+    assert_eq!(statuses.iter().filter(|status| **status == 400).count(), 1);
+
+    let (_, devices_a) = http(http_port, "GET", "/v1/push/devices", "", Some(&token_a));
+    let (_, devices_b) = http(http_port, "GET", "/v1/push/devices", "", Some(&token_b));
+    let registered = devices_a["devices"].as_array().map_or(0, Vec::len)
+        + devices_b["devices"].as_array().map_or(0, Vec::len);
+    assert_eq!(registered, 1, "token was registered more than once");
+    drop(server);
+}
+
 /// Same as `start` but WITHOUT Lux auth — push is a standalone scope and must
 /// work with `LUX_AUTH_ENABLED` unset.
 fn start_no_auth(dir: &std::path::Path, resp_port: u16, http_port: u16) -> PushServer {
@@ -1039,6 +1400,14 @@ fn start_no_auth(dir: &std::path::Path, resp_port: u16, http_port: u16) -> PushS
         .env("LUX_ENCRYPTION_KEY_ID", "push-integration")
         .env("LUX_ENCRYPTION_KEY", "push-integration-secret")
         .env("LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS", "1")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .env("NO_PROXY", "")
+        .env("http_proxy", "http://127.0.0.1:9")
+        .env("https_proxy", "http://127.0.0.1:9")
+        .env("all_proxy", "http://127.0.0.1:9")
+        .env("no_proxy", "")
         .stdout(log.try_clone().unwrap())
         .stderr(log);
     let child = common::spawn_lux(&mut cmd).expect("spawn lux");
@@ -1138,6 +1507,15 @@ fn push_batch_send_to_many_subjects() {
         http_port,
         "POST",
         "/v1/push/send",
+        &json!({"subject_ids":["s1",7],"notification":{"title":"invalid"}}).to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(s, 400, "mixed-type subject list must be rejected: {b}");
+
+    let (s, b) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
         &json!({"subject_ids":["s1","s2"],"notification":{"title":"batch","body":"x"}}).to_string(),
         Some("rootsecret"),
     );
@@ -1166,16 +1544,16 @@ fn push_web_push_delivers_encrypted() {
     let (resp_port, http_port) = free_port_pair();
     let server = start_no_auth(dir.path(), resp_port, http_port);
 
-    // Configure VAPID. The private key is any valid P-256 PKCS8 PEM (used to
-    // sign the JWT); the public key is passed through as the `k=` param.
+    // Configure one matching VAPID keypair.
+    let (vapid_public, vapid_private) = test_vapid_pair();
     let (s, b) = http(
         http_port,
         "POST",
         "/v1/push/credentials",
         &json!({
             "app_id":"default",
-            "vapid_public":"BExamplePublicKeyForTestingOnly_notvalidated_1234567890abcdefgh",
-            "vapid_private": test_p8(),
+            "vapid_public":vapid_public,
+            "vapid_private":vapid_private,
             "vapid_subject":"mailto:test@luxdb.dev"
         })
         .to_string(),
@@ -1186,15 +1564,12 @@ fn push_web_push_delivers_encrypted() {
     // Public VAPID key endpoint is readable.
     let (s, vk) = http(http_port, "GET", "/v1/push/vapid", "", Some("rootsecret"));
     assert_eq!(s, 200, "get vapid: {vk}");
-    assert!(vk["public_key"]
-        .as_str()
-        .unwrap_or("")
-        .starts_with("BExample"));
+    assert_eq!(vk["public_key"], vapid_public);
 
     // Register a browser subscription as the device token (P-256 keys from the
     // RFC 8291 vector — any valid point works, the mock doesn't decrypt).
     let subscription = json!({
-        "endpoint": format!("{}/wp/device-1", mock.url()),
+        "endpoint": format!("http://localhost:{}/wp/device-1", mock.port),
         "keys": {
             "p256dh":"BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
             "auth":"BTBZMqHH6r4Tts7J_aSIgg"
@@ -1236,12 +1611,112 @@ fn push_web_push_delivers_encrypted() {
     drop(server);
 }
 
-/// Item 12: a project has one APNs key but its devices live on two hosts. Apple
-/// issues sandbox tokens to development builds and production tokens to
-/// TestFlight, both at once while a team is still developing, and a token is
-/// only valid against the host that minted it. Before this, a project held a
-/// single environment and every send went to that one host, so half the fleet
-/// failed with BadDeviceToken depending on which way the toggle was set.
+#[test]
+fn push_provider_redirects_are_never_followed() {
+    let destination = MockApns::start(200);
+    let redirect = MockApns::start_redirect(format!("{}/credential-capture", destination.url()));
+    let dir = tempfile::tempdir().unwrap();
+    let (resp_port, http_port) = free_port_pair();
+    let server = start_no_auth(dir.path(), resp_port, http_port);
+
+    set_creds(http_port, &redirect.url());
+    let (status, body) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({
+            "subject_id":"apns-redirect-user",
+            "token":"redirect-apns-token",
+            "platform":"ios",
+            "app_id":"default"
+        })
+        .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "register APNs redirect target: {body}");
+    let (status, body) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({
+            "subject_id":"apns-redirect-user",
+            "notification":{"title":"APNs redirect"}
+        })
+        .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "enqueue APNs redirect: {body}");
+
+    let (vapid_public, vapid_private) = test_vapid_pair();
+    let (status, body) = http(
+        http_port,
+        "POST",
+        "/v1/push/credentials",
+        &json!({
+            "app_id":"default",
+            "vapid_public":vapid_public,
+            "vapid_private":vapid_private,
+            "vapid_subject":"mailto:test@luxdb.dev"
+        })
+        .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "set VAPID credentials: {body}");
+    let subscription = json!({
+        "endpoint": format!("{}/web-redirect", redirect.url()),
+        "keys": {
+            "p256dh":"BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
+            "auth":"BTBZMqHH6r4Tts7J_aSIgg"
+        }
+    })
+    .to_string();
+    let (status, body) = http(
+        http_port,
+        "POST",
+        "/v1/push/devices",
+        &json!({
+            "subject_id":"web-redirect-user",
+            "token":subscription,
+            "platform":"web",
+            "app_id":"default"
+        })
+        .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "register Web Push redirect target: {body}");
+    let (status, body) = http(
+        http_port,
+        "POST",
+        "/v1/push/send",
+        &json!({
+            "subject_id":"web-redirect-user",
+            "notification":{"title":"Web redirect"}
+        })
+        .to_string(),
+        Some("rootsecret"),
+    );
+    assert_eq!(status, 200, "enqueue Web Push redirect: {body}");
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while redirect.requests.lock().unwrap().len() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        redirect.requests.lock().unwrap().len(),
+        2,
+        "both providers should receive exactly their initial request"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        destination.requests.lock().unwrap().is_empty(),
+        "neither provider may follow a redirect with credentials"
+    );
+    drop(server);
+}
+
+/// A project can have one APNs key while its devices use both Apple hosts.
+/// Development builds receive sandbox tokens and TestFlight receives production
+/// tokens, so each device must retain the environment that minted its token.
 #[test]
 fn push_routes_each_device_to_its_own_apns_host() {
     // Two mocks stand in for the two APNs hosts.
@@ -1334,11 +1809,17 @@ fn push_device_environment_is_recorded_and_sticky() {
         let (s, b) = http(
             http_port,
             "GET",
-            "/v1/push/admin/devices",
+            "/v1/push/admin/devices?limit=1&offset=0",
             "",
             Some("rootsecret"),
         );
         assert_eq!(s, 200, "admin devices: {b}");
+        assert_eq!(b["page"]["limit"], 1);
+        assert_eq!(b["page"]["offset"], 0);
+        assert!(
+            !b.to_string().contains("sticky-token"),
+            "admin output exposed a raw device token: {b}"
+        );
         b["devices"]
             .as_array()
             .expect("devices array")

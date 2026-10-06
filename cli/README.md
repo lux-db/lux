@@ -2,6 +2,20 @@
 
 CLI for [Lux](https://luxdb.dev). Manage Lux Cloud projects, run migrations and seeds, execute commands, stream logs, and connect to Lux instances from the terminal.
 
+## Engine logging
+
+Local engine logging can be configured in `lux/config.toml`:
+
+```toml
+[engine.logging]
+level = "info"
+format = "text"
+```
+
+`level` accepts `error`, `warn`, `info`, or `debug`; `format` accepts `text` or
+`json`. `LUX_LOG_LEVEL` and `LUX_LOG_FORMAT` override those fields. Apply changes
+with `lux start`; the existing data volume is preserved.
+
 ## Install
 
 One-line install:
@@ -99,8 +113,25 @@ lux restore ./lux.dat      # validate, stage, gracefully restart, and verify rea
 ```
 
 `lux stop` sends SIGTERM to the engine and gives its checked durability barrier
-35 seconds to finish before removing the container. Local engine updates use
-the same graceful stop path.
+35 seconds to finish before removing the container. Engine updates use the
+separate snapshot handoff described below.
+
+`lux update engine` handles snapshot migration automatically. It temporarily
+disconnects application access, saves with the old engine, imports into a fresh
+volume, and checks the candidate before switching. Connections drop during the
+update; applications should reconnect afterward. A stopped stack stays stopped.
+
+If preparation fails, the CLI restores the original engine. Once cutover can
+accept new writes, recovery stays on the new volume rather than discarding those
+writes through an automatic downgrade. Retry `lux start` after an interrupted
+operation. The original container and volume are retained; private recovery
+records live under `lux/.backups/`. Backups consume additional disk space and
+are not removed by clearing the current volume.
+
+Image changes, including edits to `engine_version`, take effect through
+`lux update engine`; ordinary restarts reuse the recorded runtime image.
+Self-hosted binaries not managed by the CLI should follow the
+[upgrade runbook](../DURABILITY.md#upgrading-from-v0370-to-10).
 
 `lux restore` accepts snapshots produced by current or older Lux engines. The
 running database remains available while the engine validates and stages the
@@ -118,13 +149,78 @@ The local secret key equals the engine password, so a secret-key client gets
 operator access while a publishable-key client must sign in (JWT → grant-enforced
 user), mirroring production. Studio runs as a container
 (`ghcr.io/lux-db/studio`) and talks to the engine
-directly from your browser. With the default loopback binding, credentials
+directly from your browser. The CLI gives it only a short-lived management
+session bound to Studio's exact origin; the durable operator credential remains
+in the private local profile. With the default loopback binding, credentials
 never leave your machine.
 
 Engine and Studio ports bind to `127.0.0.1` by default. Use `--bind <IP>` only
 when another device or development environment must reach them. Non-loopback
-bindings expose an operator credential through Studio, so they are intended for
-trusted networks and explicit port-forwarding setups.
+bindings expose the engine and Studio's scoped management session, so they are
+intended for trusted networks and explicit port-forwarding setups.
+
+### Project Engine configuration
+
+`lux/config.toml` may set local Engine capacity and deadline overrides without
+putting a wall of variables in the shell or application `.env` file:
+
+```toml
+[engine.limits]
+resp_connections = 1024
+http_connections = 1024
+query_candidates = 1_000_000
+request_buffer_bytes = "256mb"
+
+[engine.timeouts]
+resp_idle = "5m"
+http_body = "30s"
+write = "30s"
+```
+
+Omitted values use Engine defaults. Engine environment variables override the
+corresponding TOML values; explicit `lux start` flags continue to override the
+project's port and bind settings. Changing an Engine setting makes the next
+`lux start` gracefully recreate the container while preserving its data volume.
+Unknown Engine keys and invalid values fail before the running container is
+changed. Secrets do not belong in this file.
+
+Byte settings accept a positive integer or a string using `b`, `kb`/`kib`,
+`mb`/`mib`, or `gb`/`gib` binary units. Duration settings accept positive
+milliseconds or a string using `ms`, `s`, `m`, or `h`. `rows = 0` is the only
+zero value and removes the HTTP result-row cap; the independent query-work cap
+still applies.
+
+| `[engine.limits]` key | Engine setting |
+|---|---|
+| `rows` | Maximum HTTP query result rows |
+| `http_body_bytes` | Maximum HTTP request body |
+| `resp_request_bytes` | Maximum buffered RESP request |
+| `resp_connections` | Simultaneous RESP connections |
+| `http_connections` | Simultaneous HTTP connections, including WebSockets |
+| `blocked_clients` | Clients waiting in blocking commands |
+| `resp_pipeline_commands` | Commands in one RESP input batch or transaction |
+| `resp_command_args` | Arguments in one RESP command |
+| `resp_subscriptions` | Subscriptions on one RESP connection |
+| `subscription_name_bytes` | Bytes in one subscription name or pattern |
+| `live_subscriptions` | Live subscriptions on one WebSocket |
+| `process_subscriptions` | Broker registrations across network clients |
+| `query_candidates` | Candidate rows inspected by one query or join |
+| `blocking_keys` | Keys in one blocking command or watched session |
+| `resp_response_bytes` | Materialized RESP output batch |
+| `request_buffer_bytes` | Shared retained-request and realtime-input budget |
+| `response_buffer_bytes` | Shared pending socket-write budget |
+| `auth_workers` | Concurrent expensive app-auth operations |
+| `script_memory_bytes` | Heap available to one Lua VM |
+
+| `[engine.timeouts]` key | Deadline |
+|---|---|
+| `resp_idle` | Idle RESP connection |
+| `resp_request` | Incomplete RESP request |
+| `http_header` | HTTP request head |
+| `http_body` | HTTP request body |
+| `http_keep_alive` | Idle HTTP keep-alive connection |
+| `live_idle` | Live WebSocket without client traffic |
+| `write` | Socket write without progress |
 
 Existing engine and Studio containers never change versions implicitly during
 `lux start`. Start reports available image updates; `lux update engine` and
@@ -341,6 +437,16 @@ lux seed run --file lux/demo.seed.lux
 ```
 
 Seed files use the same command format as migrations, including JSON argv arrays. Seeds are not recorded in `__migrations`; write stable IDs if you want predictable demo data.
+
+First-start initialization is tracked independently of the data volume. Restarting
+before seeding begins still runs the seed. If a seed fails or is interrupted,
+`lux start` refuses to replay it automatically because some commands may already
+have taken effect. Inspect the data and make `lux/seed.lux` safe to replay, then
+run `lux seed run` explicitly. Alternatively, `lux start --fresh` discards local
+data and initializes again. Older CLI state files are treated as already seeded.
+
+Starting cached engine and Studio images does not query the registry. Check for
+new images explicitly with `lux update engine --check` or `lux update studio --check`.
 
 ## Types
 

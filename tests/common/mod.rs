@@ -48,6 +48,10 @@ pub fn spawn_lux(cmd: &mut Command) -> std::io::Result<Child> {
 }
 
 pub fn terminate_child(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+
     #[cfg(unix)]
     {
         let _ = Command::new("kill")
@@ -68,23 +72,22 @@ pub fn terminate_child(child: &mut Child) {
     child.wait().ok();
 }
 
-/// Locate the compiled `lux` binary, preferring release, falling back to debug.
+/// Locate the `lux` binary built in the same Cargo profile as this test.
+/// Selecting a different profile can silently exercise a stale binary.
 pub fn find_lux_binary() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
-    let target_dir = exe
+    let profile_dir = exe
         .parent()
         .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .expect("target dir");
-    let release = target_dir.join("release").join("lux");
-    if release.exists() {
-        return release;
+        .expect("Cargo profile dir");
+    let binary = profile_dir.join("lux");
+    if binary.exists() {
+        return binary;
     }
-    let debug = target_dir.join("debug").join("lux");
-    if debug.exists() {
-        return debug;
-    }
-    panic!("no lux binary found (build it first)");
+    panic!(
+        "no lux binary found for test profile at {} (build it first)",
+        binary.display()
+    );
 }
 
 /// Reserve `n` distinct loopback ports for this test process.
@@ -186,13 +189,72 @@ pub fn read_all(stream: &mut TcpStream) -> String {
 /// Write a command and read the response.
 pub fn send(stream: &mut TcpStream, args: &[&str]) -> String {
     stream.write_all(&resp_cmd(args)).unwrap();
-    thread::sleep(Duration::from_millis(50));
-    read_all(stream)
+    let mut data = Vec::with_capacity(256);
+    read_resp_frame(stream, &mut data).expect("read complete RESP response");
+    String::from_utf8_lossy(&data).to_string()
 }
 
 /// Alias kept for call sites that named this `send_and_read`.
 pub fn send_and_read(stream: &mut TcpStream, args: &[&str]) -> String {
     send(stream, args)
+}
+
+fn read_resp_frame(stream: &mut TcpStream, output: &mut Vec<u8>) -> std::io::Result<()> {
+    let start = output.len();
+    loop {
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte)?;
+        output.push(byte[0]);
+        if output.len() >= start + 2 && output[output.len() - 2..] == *b"\r\n" {
+            break;
+        }
+    }
+
+    let prefix = output[start];
+    let value = std::str::from_utf8(&output[start + 1..output.len() - 2])
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    match prefix {
+        b'$' | b'!' | b'=' => {
+            let length = value
+                .parse::<i64>()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            if length >= 0 {
+                let body_start = output.len();
+                output.resize(body_start + length as usize + 2, 0);
+                stream.read_exact(&mut output[body_start..])?;
+                if !output.ends_with(b"\r\n") {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "RESP bulk payload is missing its terminator",
+                    ));
+                }
+            }
+        }
+        b'*' | b'~' | b'>' => {
+            let count = value
+                .parse::<i64>()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            for _ in 0..count.max(0) {
+                read_resp_frame(stream, output)?;
+            }
+        }
+        b'%' => {
+            let count = value
+                .parse::<i64>()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            for _ in 0..count.max(0) * 2 {
+                read_resp_frame(stream, output)?;
+            }
+        }
+        b'+' | b'-' | b':' | b',' | b'#' | b'_' | b'(' => {}
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown RESP prefix 0x{prefix:02x}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Storage backing for a spawned server.
@@ -392,8 +454,7 @@ impl LuxServer {
 
 impl Drop for LuxServer {
     fn drop(&mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
+        terminate_child(&mut self.child);
         // `dir` (TempDir) cleans itself on drop.
     }
 }
@@ -548,6 +609,123 @@ fn wait_for_http_ready(port: u16, child: &mut Child) -> bool {
 // HTTP client helper (for the HTTP API tests).
 // ---------------------------------------------------------------------------
 
+pub struct BinaryHttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl BinaryHttpResponse {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+pub fn http_request_bytes_with_headers(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    auth: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> BinaryHttpResponse {
+    let addr = format!("127.0.0.1:{port}");
+    let mut last_err = None;
+    let mut stream = (0..40)
+        .find_map(|attempt| match TcpStream::connect(&addr) {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                last_err = Some(error);
+                thread::sleep(Duration::from_millis(25 * (attempt / 8 + 1)));
+                None
+            }
+        })
+        .unwrap_or_else(|| panic!("could not connect to lux http on {addr}: {last_err:?}"));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n",
+        body.len()
+    )
+    .into_bytes();
+    if let Some(token) = auth {
+        request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
+    }
+    for (key, value) in extra_headers {
+        request.extend_from_slice(format!("{key}: {value}\r\n").as_bytes());
+    }
+    request.extend_from_slice(b"\r\n");
+    request.extend_from_slice(body);
+    stream.write_all(&request).unwrap();
+
+    let mut response = Vec::new();
+    let mut expected_len = None;
+    let mut header_end = None;
+    let mut buffer = [0u8; 8192];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                if header_end.is_none() {
+                    header_end = response.windows(4).position(|window| window == b"\r\n\r\n");
+                    if let Some(end) = header_end {
+                        let head = String::from_utf8_lossy(&response[..end]);
+                        expected_len = head
+                            .lines()
+                            .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+                            .and_then(|line| line.split_once(':'))
+                            .and_then(|(_, value)| value.trim().parse::<usize>().ok());
+                    }
+                }
+                if let (Some(end), Some(length)) = (header_end, expected_len) {
+                    if response.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(error) => panic!("read HTTP response: {error}"),
+        }
+    }
+
+    let end = header_end.expect("HTTP response contained no header terminator");
+    let head = String::from_utf8_lossy(&response[..end]);
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let headers = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect();
+    let body_start = end + 4;
+    let body_end = expected_len
+        .map(|length| body_start.saturating_add(length).min(response.len()))
+        .unwrap_or(response.len());
+    BinaryHttpResponse {
+        status,
+        headers,
+        body: response[body_start..body_end].to_vec(),
+    }
+}
+
 pub fn http_request(
     port: u16,
     method: &str,
@@ -625,7 +803,7 @@ pub fn http_request_with_headers(
                     if headers
                         .to_lowercase()
                         .contains("transfer-encoding: chunked")
-                        && response.windows(5).any(|w| w == b"0\r\n\r\n")
+                        && chunked_body_complete(&response[header_end + 4..])
                     {
                         break;
                     }
@@ -650,4 +828,41 @@ pub fn http_request_with_headers(
         .unwrap_or("")
         .to_string();
     (status, body)
+}
+
+fn chunked_body_complete(mut body: &[u8]) -> bool {
+    loop {
+        let Some(end) = body.windows(2).position(|bytes| bytes == b"\r\n") else {
+            return false;
+        };
+        let Ok(line) = std::str::from_utf8(&body[..end]) else {
+            return false;
+        };
+        let size = line.split(';').next().unwrap_or("");
+        let Ok(size) = usize::from_str_radix(size, 16) else {
+            return false;
+        };
+        body = &body[end + 2..];
+        if size == 0 {
+            return body.starts_with(b"\r\n") || body.windows(4).any(|bytes| bytes == b"\r\n\r\n");
+        }
+        let Some(framed_size) = size.checked_add(2) else {
+            return false;
+        };
+        if body.len() < framed_size || &body[size..framed_size] != b"\r\n" {
+            return false;
+        }
+        body = &body[framed_size..];
+    }
+}
+
+#[test]
+fn chunked_completion_requires_complete_frames() {
+    assert!(!chunked_body_complete(b""));
+    assert!(!chunked_body_complete(b"5\r\n0\r\n\r\n\r\n"));
+    assert!(chunked_body_complete(b"5\r\n0\r\n\r\n\r\n0\r\n\r\n"));
+    assert!(!chunked_body_complete(b"1\r\nx\r\n0\r\n"));
+    assert!(chunked_body_complete(b"1;name=value\r\nx\r\n0\r\n\r\n"));
+    assert!(chunked_body_complete(b"0\r\nTrailer: value\r\n\r\n"));
+    assert!(!chunked_body_complete(b"ffffffffffffffffffffffff\r\n"));
 }

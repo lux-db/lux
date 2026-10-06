@@ -533,34 +533,39 @@ pub(crate) fn candidates_from_index(
     limit: Option<usize>,
     now: Instant,
 ) -> Result<Option<Vec<String>>, String> {
+    let fetch_limit = bounded_candidate_limit(store, limit);
     if field_def.encrypted {
         if !field_def.searchable || cond.op != CmpOp::Eq {
             return Ok(None);
         }
         let index_values = searchable_index_values(store, table, field_def, &cond.value)?;
-        let mut members = Vec::new();
+        let mut members = HashSet::new();
+        let mut inspected = 0usize;
         for index_value in index_values {
             let skey = idx_str_key(table, &cond.field, &index_value);
-            members.extend(store.smembers(skey.as_bytes(), now)?);
+            let indexed = store.smembers_limited(skey.as_bytes(), fetch_limit, now)?;
+            inspected = inspected
+                .checked_add(indexed.len())
+                .ok_or_else(|| query_candidate_error(store))?;
+            ensure_candidate_count(store, inspected)?;
+            for member in indexed {
+                members.insert(member);
+                ensure_candidate_count(store, members.len())?;
+            }
         }
+        let mut members: Vec<String> = members.into_iter().collect();
         members.sort();
-        members.dedup();
-        let members = match limit {
-            Some(n) => members.into_iter().take(n).collect(),
-            None => members,
-        };
+        if let Some(limit) = limit {
+            members.truncate(limit);
+        }
         return Ok(Some(members));
     }
     match &field_def.field_type {
         FieldType::Str | FieldType::Uuid => {
             if cond.op == CmpOp::Eq {
                 let skey = idx_str_key(table, &cond.field, &cond.value);
-                let members = store.smembers(skey.as_bytes(), now)?;
-                // Apply limit if set - STR equality index returns exact matches only
-                let members = match limit {
-                    Some(n) => members.into_iter().take(n).collect(),
-                    None => members,
-                };
+                let members = store.smembers_limited(skey.as_bytes(), fetch_limit, now)?;
+                ensure_candidate_count(store, members.len())?;
                 return Ok(Some(members));
             }
             Ok(None)
@@ -605,11 +610,12 @@ pub(crate) fn candidates_from_index(
                 max_excl,
                 false,
                 Some(0),
-                limit,
+                Some(fetch_limit),
                 false,
                 now,
             )?;
             let ids: Vec<String> = results.into_iter().map(|(s, _)| s).collect();
+            ensure_candidate_count(store, ids.len())?;
             Ok(Some(ids))
         }
     }
@@ -622,6 +628,7 @@ pub(crate) fn candidates_from_implicit_id(
     limit: Option<usize>,
     now: Instant,
 ) -> Result<Option<Vec<String>>, String> {
+    let fetch_limit = bounded_candidate_limit(store, limit);
     let score: f64 = match cond.value.parse() {
         Ok(v) => v,
         Err(_) => return Ok(None),
@@ -653,11 +660,13 @@ pub(crate) fn candidates_from_implicit_id(
         max_excl,
         false,
         Some(0),
-        limit,
+        Some(fetch_limit),
         false,
         now,
     )?;
-    Ok(Some(results.into_iter().map(|(s, _)| s).collect()))
+    let ids: Vec<String> = results.into_iter().map(|(s, _)| s).collect();
+    ensure_candidate_count(store, ids.len())?;
+    Ok(Some(ids))
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,6 +1134,76 @@ pub(crate) struct OrderScan<'a> {
     limit: Option<usize>,
 }
 
+fn query_candidate_error(store: &Store) -> String {
+    format!(
+        "ERR query candidate limit exceeded ({})",
+        store.config().limits.max_query_candidates
+    )
+}
+
+fn bounded_candidate_limit(store: &Store, requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(usize::MAX)
+        .min(store.config().limits.max_query_candidates.saturating_add(1))
+}
+
+fn bounded_order_pagination(
+    store: &Store,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> (Option<usize>, Option<usize>, bool) {
+    let offset_value = offset.unwrap_or(0);
+    let work_is_bounded = limit
+        .and_then(|limit| offset_value.checked_add(limit))
+        .is_some_and(|window| window <= store.config().limits.max_query_candidates);
+    if work_is_bounded {
+        return (
+            Some(offset_value),
+            limit,
+            limit.is_some() || offset.is_some(),
+        );
+    }
+
+    // If OFFSET plus LIMIT cannot prove a bounded index walk, read a bounded
+    // prefix and paginate locally. Small tables still succeed; larger tables
+    // trip the candidate sentinel before an unbounded skip can occur.
+    (
+        Some(0),
+        Some(store.config().limits.max_query_candidates.saturating_add(1)),
+        false,
+    )
+}
+
+fn ensure_candidate_count(store: &Store, count: usize) -> Result<(), String> {
+    if count > store.config().limits.max_query_candidates {
+        Err(query_candidate_error(store))
+    } else {
+        Ok(())
+    }
+}
+
+fn get_query_row_ids(
+    store: &Store,
+    table: &str,
+    requested: Option<usize>,
+    now: Instant,
+) -> Result<Vec<String>, String> {
+    let rows = store.zrangebyscore(
+        ids_key(table).as_bytes(),
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        false,
+        false,
+        false,
+        Some(0),
+        Some(bounded_candidate_limit(store, requested)),
+        false,
+        now,
+    )?;
+    ensure_candidate_count(store, rows.len())?;
+    Ok(rows.into_iter().map(|(id, _)| id).collect())
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ScoreRange {
     min: f64,
@@ -1253,7 +1332,8 @@ fn table_select_once(
     // - no joins (join changes the row count unpredictably)
     // - no ORDER BY (ordering requires all rows before truncating)
     let early_limit = if plan.joins.is_empty() && plan.order_by.is_none() && plan.near.is_none() {
-        plan.limit.map(|l| l + plan.offset.unwrap_or(0))
+        plan.limit
+            .map(|limit| limit.saturating_add(plan.offset.unwrap_or(0)))
     } else {
         None
     };
@@ -1272,6 +1352,7 @@ fn table_select_once(
         },
         now,
     )?;
+    ensure_candidate_count(store, scan.row_ids.len())?;
 
     let near_candidate_pks = if plan.near.is_some() && !conditions.is_empty() {
         let mut candidates = HashSet::new();
@@ -1632,8 +1713,8 @@ pub(crate) fn plan_table_scan(
         if let Some((order_col, ascending)) = plan.order_by {
             let order_col = bare_col(order_col);
             if let Some(range) = score_range_from_conditions(order_col, plan.conditions) {
-                let pushed_offset = Some(plan.offset.unwrap_or(0));
-                let pushed_limit = Some(plan.limit.unwrap_or(usize::MAX));
+                let (pushed_offset, pushed_limit, pagination_satisfied) =
+                    bounded_order_pagination(store, plan.limit, plan.offset);
 
                 if let Some(row_ids) = candidates_from_order_index(
                     store,
@@ -1651,10 +1732,11 @@ pub(crate) fn plan_table_scan(
                     },
                     now,
                 )? {
+                    ensure_candidate_count(store, row_ids.len())?;
                     return Ok(TableScan {
                         row_ids,
                         order_satisfied: true,
-                        pagination_satisfied: plan.limit.is_some() || plan.offset.is_some(),
+                        pagination_satisfied,
                     });
                 }
             }
@@ -1664,13 +1746,16 @@ pub(crate) fn plan_table_scan(
     let candidate_set =
         build_candidate_set(store, table, schema, plan.conditions, plan.early_limit, now)?;
 
-    if plan.allow_order_pushdown {
+    if plan.allow_order_pushdown && candidate_set.is_none() {
         if let Some((order_col, ascending)) = plan.order_by {
-            let can_push_pagination = candidate_set.is_none() && plan.conditions.is_empty();
-            let pushed_offset = can_push_pagination.then_some(plan.offset.unwrap_or(0));
-            let pushed_limit = can_push_pagination.then_some(plan.limit.unwrap_or(usize::MAX));
+            let can_push_pagination = plan.conditions.is_empty();
+            let (pushed_offset, pushed_limit, pagination_satisfied) = if can_push_pagination {
+                bounded_order_pagination(store, plan.limit, plan.offset)
+            } else {
+                (None, Some(bounded_candidate_limit(store, None)), false)
+            };
 
-            if let Some(mut row_ids) = candidates_from_order_index(
+            if let Some(row_ids) = candidates_from_order_index(
                 store,
                 table,
                 schema,
@@ -1686,26 +1771,33 @@ pub(crate) fn plan_table_scan(
                 },
                 now,
             )? {
-                if let Some(set) = candidate_set.as_ref() {
-                    row_ids.retain(|pk| set.contains(pk));
-                }
+                ensure_candidate_count(store, row_ids.len())?;
                 return Ok(TableScan {
                     row_ids,
                     order_satisfied: true,
-                    pagination_satisfied: can_push_pagination
-                        && (plan.limit.is_some() || plan.offset.is_some()),
+                    pagination_satisfied,
                 });
             }
         }
     }
 
+    let can_apply_early_limit =
+        plan.conditions.is_empty() || (plan.conditions.len() == 1 && candidate_set.is_some());
     let mut row_ids = match candidate_set {
         Some(pks) => pks.into_iter().collect(),
-        None => get_all_row_ids(store, table, now)?,
+        None => get_query_row_ids(
+            store,
+            table,
+            can_apply_early_limit.then_some(plan.early_limit).flatten(),
+            now,
+        )?,
     };
-    if let Some(lim) = plan.early_limit {
-        row_ids.truncate(lim);
+    if can_apply_early_limit {
+        if let Some(lim) = plan.early_limit {
+            row_ids.truncate(lim);
+        }
     }
+    ensure_candidate_count(store, row_ids.len())?;
     Ok(TableScan {
         row_ids,
         order_satisfied: false,
@@ -1738,13 +1830,14 @@ pub(crate) fn table_vector_candidates(
         ));
     }
 
+    let candidate_limit = bounded_candidate_limit(store, Some(near.k));
     let results = match candidate_pks {
         Some(candidates) => store.table_vector_search_candidates(TableVectorCandidateQuery {
             table,
             field: &field.name,
             query: &near.vector,
             candidate_pks: candidates,
-            k: near.k,
+            k: candidate_limit,
             threshold: near.threshold,
             now,
         }),
@@ -1752,12 +1845,13 @@ pub(crate) fn table_vector_candidates(
             table,
             &field.name,
             &near.vector,
-            near.k,
+            candidate_limit,
             near.threshold,
             now,
         ),
     };
 
+    ensure_candidate_count(store, results.len())?;
     let mut matches = Vec::with_capacity(results.len());
     for (pk, similarity) in results {
         matches.push(TableVectorMatch { pk, similarity });
@@ -1839,6 +1933,9 @@ pub(crate) fn score_range_from_conditions(
     };
 
     for cond in conditions {
+        if !cond.or_clauses.is_empty() {
+            return None;
+        }
         if bare_col(&cond.field) != order_col {
             return None;
         }
@@ -1900,12 +1997,12 @@ pub(crate) fn build_candidates(
     limit: Option<usize>,
     now: Instant,
 ) -> Result<Vec<String>, String> {
-    Ok(
-        match build_candidate_set(store, table, schema, conditions, limit, now)? {
-            Some(pks) => pks.into_iter().collect(),
-            None => get_all_row_ids(store, table, now)?,
-        },
-    )
+    let candidates = match build_candidate_set(store, table, schema, conditions, limit, now)? {
+        Some(pks) => pks.into_iter().collect(),
+        None => get_query_row_ids(store, table, limit, now)?,
+    };
+    ensure_candidate_count(store, candidates.len())?;
+    Ok(candidates)
 }
 
 /// True when range-scanning or ordering `col` should use the table's `ids`
@@ -1940,9 +2037,18 @@ pub(crate) fn build_candidate_set(
 
     // Only push limit down to index when there's a single condition - with multiple
     // conditions we need the full set from each index to intersect correctly.
-    let index_limit = if conditions.len() == 1 { limit } else { None };
+    let index_limit = Some(bounded_candidate_limit(
+        store,
+        if conditions.len() == 1 { limit } else { None },
+    ));
 
     for cond in conditions {
+        // A compound OR clause is not represented by the primary condition's
+        // index alone. Leave it for row evaluation rather than narrowing away
+        // rows that satisfy another arm.
+        if !cond.or_clauses.is_empty() {
+            continue;
+        }
         // JSON dot-path: use a declared path index if one exists (O(log n) range
         // scan), otherwise leave the candidate set unnarrowed (the row-level
         // filter applies the predicate on a full scan).
@@ -2101,7 +2207,7 @@ pub(crate) fn hash_join(
 
     // ---- Build phase ----
     // Key: right join column value -> list of right rows
-    let right_ids = get_all_row_ids(store, &join.table, now)?;
+    let right_ids = get_query_row_ids(store, &join.table, None, now)?;
     let mut hash_map: hashbrown::HashMap<String, Vec<Vec<(String, String)>>> =
         hashbrown::HashMap::with_capacity(right_ids.len());
 
@@ -2129,7 +2235,7 @@ pub(crate) fn hash_join(
 
     // ---- Probe phase with early termination ----
     // If LIMIT is set, stop as soon as we have enough results.
-    let need = limit.map(|l| l + offset.unwrap_or(0));
+    let need = limit.map(|limit| limit.saturating_add(offset.unwrap_or(0)));
     let mut result = Vec::new();
 
     'outer: for left_row in left_rows {
@@ -2144,6 +2250,7 @@ pub(crate) fn hash_join(
                 let mut combined = left_row.clone();
                 combined.extend(right_row.iter().cloned());
                 result.push(combined);
+                ensure_candidate_count(store, result.len())?;
                 // Fix 2: stop as soon as we have enough rows
                 if let Some(n) = need {
                     if result.len() >= n {
@@ -2159,6 +2266,7 @@ pub(crate) fn hash_join(
                     .map(|field| (format!("{}.{}", right_alias, field.name), String::new())),
             );
             result.push(combined);
+            ensure_candidate_count(store, result.len())?;
             if let Some(n) = need {
                 if result.len() >= n {
                     break 'outer;
@@ -2498,11 +2606,12 @@ pub(crate) fn try_fast_aggregate(
                     min_excl,
                     max_excl,
                     false,
-                    None,
-                    None,
+                    Some(0),
+                    Some(bounded_candidate_limit(store, None)),
                     false,
                     now,
                 )?;
+                ensure_candidate_count(store, entries.len())?;
 
                 let scores: Vec<f64> = entries.iter().map(|(_, s)| *s).collect();
 
@@ -2905,23 +3014,37 @@ fn sql_like_matches(actual: &str, pattern: &str, case_insensitive: bool) -> bool
     };
     let text: Vec<char> = actual.chars().collect();
     let pat: Vec<char> = pattern.chars().collect();
-    let mut dp = vec![vec![false; text.len() + 1]; pat.len() + 1];
-    dp[0][0] = true;
-    for i in 1..=pat.len() {
-        if pat[i - 1] == '%' {
-            dp[i][0] = dp[i - 1][0];
+
+    // SQL LIKE has only two wildcards. Retain the most recent `%` and advance
+    // its match one character at a time after a mismatch. This avoids the
+    // pattern-by-value boolean matrix, whose quadratic allocation let one
+    // otherwise bounded query exhaust the process.
+    let mut text_pos = 0usize;
+    let mut pattern_pos = 0usize;
+    let mut percent_pos = None;
+    let mut percent_match = 0usize;
+    while text_pos < text.len() {
+        if pattern_pos < pat.len()
+            && (pat[pattern_pos] == '_' || pat[pattern_pos] == text[text_pos])
+        {
+            text_pos += 1;
+            pattern_pos += 1;
+        } else if pattern_pos < pat.len() && pat[pattern_pos] == '%' {
+            percent_pos = Some(pattern_pos);
+            pattern_pos += 1;
+            percent_match = text_pos;
+        } else if let Some(percent) = percent_pos {
+            percent_match += 1;
+            text_pos = percent_match;
+            pattern_pos = percent + 1;
+        } else {
+            return false;
         }
     }
-    for i in 1..=pat.len() {
-        for j in 1..=text.len() {
-            dp[i][j] = match pat[i - 1] {
-                '%' => dp[i - 1][j] || dp[i][j - 1],
-                '_' => dp[i - 1][j - 1],
-                ch => dp[i - 1][j - 1] && ch == text[j - 1],
-            };
-        }
+    while pattern_pos < pat.len() && pat[pattern_pos] == '%' {
+        pattern_pos += 1;
     }
-    dp[pat.len()][text.len()]
+    pattern_pos == pat.len()
 }
 
 pub(crate) fn scan_matching_pks(
@@ -3096,4 +3219,63 @@ pub(crate) fn scan_projected_column(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod like_tests {
+    use super::sql_like_matches;
+
+    fn reference(actual: &[char], pattern: &[char]) -> bool {
+        let mut rows = vec![vec![false; actual.len() + 1]; pattern.len() + 1];
+        rows[0][0] = true;
+        for pattern_pos in 1..=pattern.len() {
+            if pattern[pattern_pos - 1] == '%' {
+                rows[pattern_pos][0] = rows[pattern_pos - 1][0];
+            }
+            for text_pos in 1..=actual.len() {
+                rows[pattern_pos][text_pos] = match pattern[pattern_pos - 1] {
+                    '%' => rows[pattern_pos - 1][text_pos] || rows[pattern_pos][text_pos - 1],
+                    '_' => rows[pattern_pos - 1][text_pos - 1],
+                    value => rows[pattern_pos - 1][text_pos - 1] && value == actual[text_pos - 1],
+                };
+            }
+        }
+        rows[pattern.len()][actual.len()]
+    }
+
+    fn strings(alphabet: &[char], max_len: usize) -> Vec<String> {
+        let mut values = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for value in alphabet {
+                    let mut item = prefix.clone();
+                    item.push(*value);
+                    values.push(item.clone());
+                    next.push(item);
+                }
+            }
+            frontier = next;
+        }
+        values
+    }
+
+    #[test]
+    fn linear_like_matcher_matches_reference_exhaustively() {
+        let values = strings(&['a', 'b'], 5);
+        let patterns = strings(&['a', 'b', '%', '_'], 5);
+        for value in &values {
+            for pattern in &patterns {
+                let actual_chars: Vec<char> = value.chars().collect();
+                let pattern_chars: Vec<char> = pattern.chars().collect();
+                assert_eq!(
+                    sql_like_matches(value, pattern, false),
+                    reference(&actual_chars, &pattern_chars),
+                    "value={value:?}, pattern={pattern:?}"
+                );
+            }
+        }
+        assert!(sql_like_matches("İstanbul", "i%", true));
+    }
 }

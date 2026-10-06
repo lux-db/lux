@@ -8,16 +8,28 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpStream};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod file_security;
+mod project_config;
+mod self_update;
+mod studio;
+mod upgrade;
 use file_security::{
     delete_secret_file, ensure_private_dir, random_hex, read_optional_secret_file,
     write_secret_file,
 };
+#[cfg(test)]
+use project_config::resolved_engine_env_with as resolved_project_engine_env_with;
+use project_config::{
+    load as load_local_config_from,
+    managed_configuration_matches as managed_engine_configuration_matches,
+    resolved_engine_env as resolved_project_engine_env, LocalConfig,
+    INITIAL_CONFIG as INITIAL_LOCAL_CONFIG,
+};
+use self_update::{latest_cli_release, newer_cli_version, update_cli};
+use studio::{mint_session, session_is_valid, StudioContainerConfig};
 
 const DEFAULT_API_URL: &str = "https://api.luxdb.dev";
 
@@ -660,8 +672,17 @@ fn enc_command_args(action: &EncAction) -> Vec<String> {
 /// `KEY=VALUE` engine env for the local `lux start` container: auth keys, ports,
 /// explicit durability, tiered storage, and `LUX_ENC_AUTO_INIT=1` so encrypted
 /// columns work without a manual `ENC INIT`.
-fn local_engine_env(state: &LocalState) -> Vec<String> {
-    vec![
+fn local_engine_env(state: &LocalState, engine_settings: &[String]) -> Vec<String> {
+    let mut allowed_hosts = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    let connection_host = state.connection_host();
+    if !allowed_hosts.contains(&connection_host) {
+        allowed_hosts.push(connection_host);
+    }
+    let mut env = vec![
         "LUX_AUTH_ENABLED=1".to_string(),
         format!("LUX_PASSWORD={}", state.password),
         format!("LUX_AUTH_PUBLISHABLE_KEY={}", state.publishable_key),
@@ -678,29 +699,20 @@ fn local_engine_env(state: &LocalState) -> Vec<String> {
             "LUX_AUTH_ISSUER=http://localhost:{}/auth/v1",
             state.http_port
         ),
+        format!("LUX_HTTP_ALLOWED_HOSTS={}", allowed_hosts.join(",")),
+        format!("LUX_HTTP_ALLOWED_ORIGINS={}", state.studio_origin()),
         // Engine self-mints its keyring + seal into /data on first boot; the CLI
         // never handles encryption key material (unlike the auth keys above).
         "LUX_ENC_AUTO_INIT=1".to_string(),
-    ]
+    ];
+    env.extend_from_slice(engine_settings);
+    env
 }
 
 #[derive(Serialize, Deserialize)]
 struct Config {
     token: String,
     api_url: String,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct LocalConfig {
-    project_id: Option<String>,
-    project_name: Option<String>,
-    /// Optional host port overrides for `lux start` (engine listens on 6379/5890
-    /// inside the container; these map to the host).
-    local_http_port: Option<u16>,
-    local_resp_port: Option<u16>,
-    /// Pin the local engine to a specific version (e.g. "0.23.0") instead of
-    /// tracking `:latest`. Maps to the `ghcr.io/lux-db/lux:<version>` image.
-    engine_version: Option<String>,
 }
 
 const ENV_PROFILE_DIR: &str = "lux/.env-profiles";
@@ -749,8 +761,8 @@ const DEFAULT_RESP_PORT: u16 = 6379;
 
 /// Lux Studio image `lux studio` runs. Existing installs use the cached image
 /// until `lux update studio` explicitly pulls a newer digest. It serves the
-/// local web UI and talks to the engine from the browser over the engine's
-/// CORS-`*` HTTP API.
+/// local web UI and talks to the engine from the browser with a scoped,
+/// origin-bound management session.
 const STUDIO_IMAGE: &str = "ghcr.io/lux-db/studio:latest";
 /// Default host port for Studio. Lux owns the 5890 block: 5890 = HTTP API,
 /// 5891 = Studio (RESP stays on 6379 for Redis drop-in compatibility).
@@ -771,7 +783,7 @@ fn default_bind_host() -> IpAddr {
 /// exactly how the prod gateway maps a secret key. So a secret-key SDK client
 /// gets operator access locally, while a publishable-key client must sign in
 /// (JWT -> grant-enforced user), mirroring production.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct LocalState {
     password: String,
     publishable_key: String,
@@ -789,6 +801,18 @@ struct LocalState {
     studio_port: u16,
     #[serde(default)]
     studio_container: String,
+    #[serde(default)]
+    seed_status: SeedStatus,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SeedStatus {
+    Pending,
+    Running,
+    // Older local states must not replay potentially non-idempotent seeds.
+    #[default]
+    Complete,
 }
 
 fn local_state_path() -> PathBuf {
@@ -871,17 +895,35 @@ fn project_slug() -> String {
     )
 }
 
-/// True if `port` is bindable on the same host address Docker will publish.
+/// Check both bindability and forwarding already active on the host address.
+/// Docker Desktop can forward a published port even when a host bind succeeds.
 fn port_is_free(bind_host: IpAddr, port: u16) -> bool {
-    std::net::TcpListener::bind((bind_host, port)).is_ok()
+    let Ok(listener) = std::net::TcpListener::bind((bind_host, port)) else {
+        return false;
+    };
+    drop(listener);
+    let connect_host = match bind_host {
+        IpAddr::V4(host) if host.is_unspecified() => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        IpAddr::V6(host) if host.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        host => host,
+    };
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::new(connect_host, port),
+        std::time::Duration::from_millis(100),
+    )
+    .is_err()
 }
 
 /// Return `preferred` if free, else the next free port above it. Lets multiple
 /// projects run at once: the first gets the default port, the next bumps up.
 fn free_port_from(bind_host: IpAddr, preferred: u16) -> u16 {
+    free_port_from_avoiding(bind_host, preferred, &[])
+}
+
+fn free_port_from_avoiding(bind_host: IpAddr, preferred: u16, excluded: &[u16]) -> u16 {
     let mut p = preferred;
     for _ in 0..500 {
-        if port_is_free(bind_host, p) {
+        if !excluded.contains(&p) && port_is_free(bind_host, p) {
             return p;
         }
         p = p.saturating_add(1);
@@ -893,18 +935,12 @@ fn free_port_from(bind_host: IpAddr, preferred: u16) -> u16 {
 }
 
 /// Load the persisted local state, generating + saving fresh creds on first use.
-fn ensure_local_state() -> LocalState {
+fn ensure_local_state(config: &LocalConfig) -> LocalState {
     let missing_bind_host = local_state_missing_bind_host();
     if let Some(mut state) = load_local_state() {
         let mut dirty = missing_bind_host;
-        // Follow the engine image config.toml asks for: a pinned `engine_version`,
-        // else `:latest`. Re-evaluated each load so editing config.toml takes
-        // effect on the next `lux start`.
-        let desired_image = desired_engine_image(load_local_config().as_ref());
-        if state.image != desired_image {
-            state.image = desired_image;
-            dirty = true;
-        }
+        // Existing data follows its recorded runtime. Image changes go through
+        // `lux update engine`, including after editing engine_version.
         // Backfill Studio fields for states written before Studio existed.
         if state.studio_container.is_empty() {
             state.studio_container = format!("lux-{}-studio", project_slug());
@@ -919,26 +955,20 @@ fn ensure_local_state() -> LocalState {
         }
         return state;
     }
-    let local = load_local_config();
     let slug = project_slug();
     let state = LocalState {
         password: format!("lux_sec_local_{}", random_hex(24)),
         publishable_key: format!("lux_pub_local_{}", random_hex(24)),
         secret_key: String::new(), // filled below to equal password
-        http_port: local
-            .as_ref()
-            .and_then(|c| c.local_http_port)
-            .unwrap_or(DEFAULT_HTTP_PORT),
-        resp_port: local
-            .as_ref()
-            .and_then(|c| c.local_resp_port)
-            .unwrap_or(DEFAULT_RESP_PORT),
+        http_port: config.local_http_port.unwrap_or(DEFAULT_HTTP_PORT),
+        resp_port: config.local_resp_port.unwrap_or(DEFAULT_RESP_PORT),
         container: format!("lux-{slug}"),
         volume: format!("lux-{slug}-data"),
-        image: desired_engine_image(local.as_ref()),
+        image: desired_engine_image(Some(config)),
         studio_port: DEFAULT_STUDIO_PORT,
         studio_container: format!("lux-{slug}-studio"),
         bind_host: default_bind_host(),
+        seed_status: SeedStatus::Pending,
     };
     // secret_key == password: the operator credential and the SDK secret key are
     // the same value locally (see LocalState doc comment).
@@ -970,6 +1000,9 @@ impl LocalState {
     fn lux_url(&self) -> String {
         format_host_url("http", &self.connection_host(), self.http_port)
     }
+    fn studio_origin(&self) -> String {
+        format_host_url("http", &self.connection_host(), self.studio_port)
+    }
     fn direct_url(&self) -> String {
         format_host_url(
             &format!("lux://:{}@", self.password),
@@ -977,7 +1010,7 @@ impl LocalState {
             self.resp_port,
         )
     }
-    /// The LUX_* lines for `.env.local` / `lux status -o env`.
+    /// The LUX_* lines for `.env.local` / `lux env export local`.
     fn env_lines(&self) -> Vec<String> {
         vec![
             format!("LUX_URL={}", self.lux_url()),
@@ -1025,7 +1058,11 @@ fn docker_output(args: &[&str]) -> Result<String, String> {
 /// `rm -f` skips the engine's final persistence barrier, and Docker's default
 /// stop timeout is shorter than Lux's default shutdown grace period.
 fn remove_engine_container(name: &str) -> Result<(), String> {
-    if docker_container_state(name).as_deref() == Some("running") {
+    let status = docker_container_state(name);
+    if status.as_deref() == Some("paused") {
+        docker_output(&["unpause", name])?;
+    }
+    if matches!(status.as_deref(), Some("running" | "restarting" | "paused")) {
         docker_output(&["stop", "--timeout", "35", name])?;
     }
     docker_output(&["rm", name]).map(|_| ())
@@ -1041,6 +1078,49 @@ fn docker_preflight() -> Result<(), String> {
 /// Container state: "running", "exited", "created", ... or None if absent.
 fn docker_container_state(name: &str) -> Option<String> {
     docker_output(&["inspect", "-f", "{{.State.Status}}", name]).ok()
+}
+
+fn docker_container_env(name: &str, key: &str) -> Option<String> {
+    docker_container_envs(name)?.remove(key)
+}
+
+fn docker_container_envs(name: &str) -> Option<HashMap<String, String>> {
+    let output = docker_output(&[
+        "inspect",
+        "-f",
+        "{{range .Config.Env}}{{println .}}{{end}}",
+        name,
+    ])
+    .ok()?;
+    Some(
+        output
+            .lines()
+            .filter_map(|line| {
+                line.split_once('=')
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+            })
+            .collect(),
+    )
+}
+
+fn engine_configuration_matches(state: &LocalState, expected: &[String]) -> bool {
+    let Some(actual) = docker_container_envs(&state.container) else {
+        return false;
+    };
+    managed_engine_configuration_matches(&actual, expected)
+}
+
+fn studio_container_has_scoped_credentials(name: &str) -> bool {
+    docker_container_env(name, "LUX_STUDIO_TOKEN")
+        .is_some_and(|token| token.starts_with("lux_studio_"))
+        && [
+            "LUX_KEY",
+            "LUX_PASSWORD",
+            "LUX_SECRET_KEY",
+            "LUX_DIRECT_URL",
+        ]
+        .into_iter()
+        .all(|key| docker_container_env(name, key).is_none())
 }
 
 fn published_binding_matches(output: &str, bind_host: IpAddr, host_port: u16) -> bool {
@@ -1177,25 +1257,20 @@ fn image_update_status(container: &str, image: &str) -> ImageUpdateStatus {
     }
 }
 
-fn print_image_update_hint(label: &str, container: &str, image: &str, command: &str) {
-    let status = image_update_status(container, image);
-    if status.update_available == Some(true) {
-        println!(
-            "{} A newer {label} image is available; run {}.",
-            "Update:".yellow(),
-            command.cyan()
-        );
-    }
+fn run_local_engine_container(state: &LocalState, engine_env: &[String]) -> Result<(), String> {
+    create_engine_container(state, engine_env, true)
 }
 
-fn run_local_engine_container(state: &LocalState) -> Result<(), String> {
+fn create_engine_container(
+    state: &LocalState,
+    engine_env: &[String],
+    start: bool,
+) -> Result<(), String> {
     let resp_map = docker_port_map(state.bind_host, state.resp_port, 6379);
     let http_map = docker_port_map(state.bind_host, state.http_port, 5890);
     let vol_map = format!("{}:/data", state.volume);
-    let engine_env = local_engine_env(state);
     let mut run_args: Vec<&str> = vec![
-        "run",
-        "-d",
+        if start { "run" } else { "create" },
         "--name",
         &state.container,
         "-p",
@@ -1207,7 +1282,10 @@ fn run_local_engine_container(state: &LocalState) -> Result<(), String> {
         "--stop-timeout",
         "35",
     ];
-    for entry in &engine_env {
+    if start {
+        run_args.insert(1, "-d");
+    }
+    for entry in engine_env {
         run_args.push("-e");
         run_args.push(entry);
     }
@@ -1597,8 +1675,14 @@ fn studio_project_name() -> String {
 /// Non-fatal: warns and returns on failure so callers like `lux start` keep
 /// going. The SPA runs in the browser, so LUX_URL must be reachable from the
 /// browser: defaults to host-visible localhost, but honors an explicit LUX_URL
-/// for remote/sandbox setups. LUX_KEY is the operator secret and stays local.
-fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
+/// for remote/sandbox setups. The browser receives only a short-lived Engine
+/// management session bound to Studio's exact origin.
+async fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
+    let studio_origin = state.studio_origin();
+    let engine_url = match std::env::var("LUX_URL") {
+        Ok(url) if !url.trim().is_empty() => url.trim().to_string(),
+        _ => state.lux_url(),
+    };
     let binding_matches = docker_port_binding_matches(
         &state.studio_container,
         "80/tcp",
@@ -1607,73 +1691,71 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
     );
     if docker_container_state(&state.studio_container).as_deref() == Some("running")
         && binding_matches
+        && studio_container_has_scoped_credentials(&state.studio_container)
     {
-        let url = format_host_url("http", &state.connection_host(), state.studio_port);
-        println!("{} {}", "Lux Studio:".bold(), url.cyan());
-        print_image_update_hint(
-            "Studio",
-            &state.studio_container,
-            STUDIO_IMAGE,
-            "lux update studio",
-        );
-        if open_browser {
-            let _ = open::that(&url);
+        let token =
+            docker_container_env(&state.studio_container, "LUX_STUDIO_TOKEN").unwrap_or_default();
+        if session_is_valid(&engine_url, &studio_origin, &token).await {
+            println!("{} {}", "Lux Studio:".bold(), studio_origin.cyan());
+            if open_browser {
+                let _ = open::that(&studio_origin);
+            }
+            return true;
         }
-        return true;
     }
     if docker_container_state(&state.studio_container).is_some() {
         let _ = docker_output(&["rm", "-f", &state.studio_container]);
     }
-    let studio_port = free_port_from(state.bind_host, state.studio_port);
-    if studio_port != state.studio_port {
-        state.studio_port = studio_port;
-        save_local_state(state);
+    if !port_is_free(state.bind_host, state.studio_port) {
+        eprintln!(
+            "{} Studio port {} is occupied. Run {} so Lux can select a new port and update the engine's exact browser policy.",
+            "Warning:".yellow(),
+            state.studio_port,
+            "lux start".cyan()
+        );
+        return false;
     }
 
-    let port_map = docker_port_map(state.bind_host, studio_port, 80);
-    // The Studio SPA runs in the browser and calls the engine directly. Normally
-    // that's the host-visible localhost, but in a remote/sandbox context (e2b,
-    // a dev container, an SSH port-forward) the browser can't reach the engine
-    // at localhost. Honor an explicit LUX_URL so Studio points at whatever URL
-    // is actually reachable from the browser; fall back to localhost otherwise.
-    let engine_url = match std::env::var("LUX_URL") {
-        Ok(u) if !u.trim().is_empty() => u.trim().to_string(),
-        _ => state.lux_url(),
+    let session = match mint_session(&engine_url, &state.password, &studio_origin).await {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!(
+                "{} Studio failed to authenticate: {error}",
+                "Warning:".yellow()
+            );
+            return false;
+        }
     };
-    let e_url = format!("LUX_URL={engine_url}");
-    let e_key = format!("LUX_KEY={}", state.secret_key);
-    let e_pub = format!("LUX_PUBLISHABLE_KEY={}", state.publishable_key);
-    let e_direct = format!("LUX_DIRECT_URL={}", state.direct_url());
-    let e_name = format!("LUX_PROJECT_NAME={}", studio_project_name());
     // Optional: enables AI grant drafting in Studio. The browser calls OpenRouter
-    // directly with this key; localhost-only.
+    // directly with this key, so only set it for a trusted local Studio.
     let or_key = std::env::var("LUX_OPENROUTER_KEY")
         .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
         .unwrap_or_default();
-    let e_or = format!("LUX_OPENROUTER_KEY={or_key}");
-    let run_args: Vec<&str> = vec![
+    let connection_host = state.connection_host();
+    let project_name = studio_project_name();
+    let studio_env = StudioContainerConfig {
+        engine_url: &engine_url,
+        session: &session,
+        host: &connection_host,
+        publishable_key: &state.publishable_key,
+        project_name: &project_name,
+        openrouter_key: &or_key,
+    }
+    .env();
+    let port_map = docker_port_map(state.bind_host, state.studio_port, 80);
+    let mut run_args: Vec<&str> = vec![
         "run",
         "-d",
         "--name",
         &state.studio_container,
         "-p",
         &port_map,
-        "-e",
-        &e_url,
-        "-e",
-        &e_key,
-        "-e",
-        &e_pub,
-        "-e",
-        &e_direct,
-        "-e",
-        &e_name,
-        "-e",
-        &e_or,
-        "--restart",
-        "unless-stopped",
-        STUDIO_IMAGE,
     ];
+    for entry in &studio_env {
+        run_args.push("-e");
+        run_args.push(entry);
+    }
+    run_args.extend(["--restart", "unless-stopped", STUDIO_IMAGE]);
     if let Err(e) = docker_output(&run_args) {
         eprintln!("{} Studio failed to start: {e}", "Warning:".yellow());
         return false;
@@ -1692,11 +1774,10 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
     }
     println!(" {}", "ready".green());
 
-    let url = format_host_url("http", &state.connection_host(), studio_port);
-    println!("{} {}", "Lux Studio:".bold(), url.cyan());
+    println!("{} {}", "Lux Studio:".bold(), studio_origin.cyan());
     println!("{} {}", "  → engine:".dimmed(), engine_url.dimmed());
     if open_browser {
-        let _ = open::that(&url);
+        let _ = open::that(&studio_origin);
     }
     true
 }
@@ -1704,6 +1785,38 @@ fn ensure_studio(state: &mut LocalState, open_browser: bool) -> bool {
 /// Apply migrations through the engine-owned contract. The engine persists
 /// progress before executing commands, so a failed migration cannot be
 /// silently replayed by `lux start`.
+/// Reconcile schema on every start, including when reusing a running engine.
+/// Seed files run only for a fresh volume because they may not be idempotent.
+async fn prepare_local_data(state: &mut LocalState) {
+    if state.seed_status == SeedStatus::Running {
+        eprintln!("Seed initialization was interrupted or failed. Some commands may already have run. Inspect the data and lux/seed.lux, then explicitly run `lux seed run` after making it safe to replay, or use `lux start --fresh` to discard local data and initialize again.");
+        std::process::exit(1);
+    }
+    let conn = DirectConn::connect(&state.connection_host(), state.resp_port, &state.password)
+        .unwrap_or_else(|error| {
+            eprintln!("{} {error}", "Error:".red());
+            std::process::exit(1);
+        });
+    let mut target = MigrateTarget::Direct(Box::new(conn));
+    let migrations_dir = PathBuf::from("lux/migrations");
+    if migrations_dir.exists() {
+        let count = apply_pending_migrations(&mut target, &migrations_dir).await;
+        if count > 0 {
+            println!("{} Applied {count} migration(s).", "Done.".green());
+        }
+    }
+    let seed_path = PathBuf::from("lux/seed.lux");
+    if state.seed_status == SeedStatus::Pending {
+        if seed_path.exists() {
+            state.seed_status = SeedStatus::Running;
+            save_local_state(state);
+            run_command_file(&mut target, &seed_path, "Seed").await;
+        }
+        state.seed_status = SeedStatus::Complete;
+        save_local_state(state);
+    }
+}
+
 async fn apply_pending_migrations(target: &mut MigrateTarget, dir: &Path) -> usize {
     let local = get_local_migrations(dir);
     let mut applied = 0usize;
@@ -2208,42 +2321,6 @@ fn load_local_config() -> Option<LocalConfig> {
     })
 }
 
-fn load_local_config_from(path: &Path) -> Result<Option<LocalConfig>, String> {
-    let Some(data) = read_optional_secret_file(path)? else {
-        return Ok(None);
-    };
-    let doc = data
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|error| format!("parse {}: {error}", path.display()))?;
-    let string = |key: &str| -> Result<Option<String>, String> {
-        let Some(item) = doc.get(key) else {
-            return Ok(None);
-        };
-        let value = item
-            .as_str()
-            .ok_or_else(|| format!("{key} must be a string in {}", path.display()))?;
-        Ok((!value.trim().is_empty()).then(|| value.to_string()))
-    };
-    let port = |key: &str| -> Result<Option<u16>, String> {
-        let Some(item) = doc.get(key) else {
-            return Ok(None);
-        };
-        let value = item
-            .as_integer()
-            .ok_or_else(|| format!("{key} must be an integer in {}", path.display()))?;
-        u16::try_from(value)
-            .map(Some)
-            .map_err(|_| format!("{key} must be between 0 and 65535 in {}", path.display()))
-    };
-    Ok(Some(LocalConfig {
-        project_id: string("project_id")?,
-        project_name: string("project_name")?,
-        local_http_port: port("local_http_port")?,
-        local_resp_port: port("local_resp_port")?,
-        engine_version: string("engine_version")?,
-    }))
-}
-
 fn save_local_config(config: &LocalConfig) {
     let path = local_config_path();
     let existing = read_optional_secret_file(&path)
@@ -2251,7 +2328,7 @@ fn save_local_config(config: &LocalConfig) {
             eprintln!("{} {e}", "Failed to read lux/config.toml:".red());
             std::process::exit(1);
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| INITIAL_LOCAL_CONFIG.to_string());
     let mut doc = existing
         .parse::<toml_edit::DocumentMut>()
         .unwrap_or_else(|e| {
@@ -2839,46 +2916,6 @@ fn short_digest(value: Option<&str>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-async fn latest_cli_release() -> Result<(String, String), String> {
-    let client = reqwest::Client::builder()
-        .user_agent("lux-cli")
-        .build()
-        .map_err(|e| e.to_string())?;
-    let response = client
-        .get("https://api.github.com/repos/lux-db/lux/releases")
-        .send()
-        .await
-        .map_err(|e| format!("release check failed: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "release check failed (HTTP {})",
-            response.status().as_u16()
-        ));
-    }
-    let releases: Vec<serde_json::Value> = response
-        .json()
-        .await
-        .map_err(|e| format!("invalid GitHub release response: {e}"))?;
-    let tag = releases
-        .iter()
-        .filter_map(|release| release.get("tag_name")?.as_str())
-        .find(|tag| tag.starts_with("cli-v"))
-        .ok_or_else(|| "no Lux CLI releases found".to_string())?
-        .to_string();
-    let version = tag.trim_start_matches("cli-v").to_string();
-    Ok((tag, version))
-}
-
-fn newer_cli_version(current: &str, latest: &str) -> bool {
-    match (
-        semver::Version::parse(current),
-        semver::Version::parse(latest),
-    ) {
-        (Ok(current), Ok(latest)) => latest > current,
-        _ => latest != current,
-    }
-}
-
 async fn cli_version_component() -> VersionComponent {
     let current = env!("CARGO_PKG_VERSION").to_string();
     match latest_cli_release().await {
@@ -3079,98 +3116,6 @@ async fn show_versions(
     }
 }
 
-async fn update_cli(check: bool) -> Result<(), String> {
-    let current = env!("CARGO_PKG_VERSION");
-    let (latest_tag, latest_version) = latest_cli_release().await?;
-    println!("{} v{current}", "Current CLI:".bold());
-    if !newer_cli_version(current, &latest_version) {
-        println!("{}", "CLI is already up to date.".green());
-        return Ok(());
-    }
-    println!(
-        "{} v{current} → v{latest_version}",
-        "Update available:".yellow()
-    );
-    if check {
-        println!("Run {} to install.", "lux update cli".cyan());
-        return Ok(());
-    }
-
-    let os = if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "linux") {
-        "linux"
-    } else {
-        return Err("unsupported OS for self-update".to_string());
-    };
-    let arch = if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else {
-        return Err("unsupported architecture for self-update".to_string());
-    };
-    let artifact = format!("lux-cli-{os}-{arch}");
-    let download_url =
-        format!("https://github.com/lux-db/lux/releases/download/{latest_tag}/{artifact}.tar.gz");
-    let client = reqwest::Client::builder()
-        .user_agent("lux-cli")
-        .build()
-        .map_err(|e| e.to_string())?;
-    println!("{} Downloading v{latest_version}...", "...".dimmed());
-    let response = client
-        .get(download_url)
-        .send()
-        .await
-        .map_err(|e| format!("download failed: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "download failed (HTTP {})",
-            response.status().as_u16()
-        ));
-    }
-    let tar_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("download failed: {e}"))?;
-    let current_exe =
-        std::env::current_exe().map_err(|e| format!("could not determine binary path: {e}"))?;
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "lux-cli-update-{}-{}",
-        std::process::id(),
-        random_hex(8)
-    ));
-    ensure_private_dir(&tmp_dir)
-        .map_err(|e| format!("failed to create private update directory: {e}"))?;
-    let tar_path = tmp_dir.join("lux-cli.tar.gz");
-    std::fs::write(&tar_path, &tar_bytes).map_err(|e| format!("failed to stage update: {e}"))?;
-    let status = std::process::Command::new("tar")
-        .args([
-            "xzf",
-            tar_path.to_str().unwrap_or_default(),
-            "-C",
-            tmp_dir.to_str().unwrap_or_default(),
-        ])
-        .status()
-        .map_err(|e| format!("failed to extract update: {e}"))?;
-    if !status.success() {
-        return Err("failed to extract update".to_string());
-    }
-    let new_binary = tmp_dir.join(&artifact);
-    if !new_binary.is_file() {
-        return Err("binary not found in release archive".to_string());
-    }
-    #[cfg(unix)]
-    std::fs::set_permissions(&new_binary, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("failed to make update executable: {e}"))?;
-    std::fs::rename(&new_binary, &current_exe)
-        .or_else(|_| std::fs::copy(&new_binary, &current_exe).map(|_| ()))
-        .map_err(|_| "could not replace binary; try with appropriate permissions".to_string())?;
-    std::fs::remove_dir_all(&tmp_dir).ok();
-    println!("{} Updated CLI to v{latest_version}.", "Done.".green());
-    Ok(())
-}
-
 fn pull_image(image: &str) -> Result<(), String> {
     println!("{} {}", "Pulling".bold(), image.dimmed());
     let status = std::process::Command::new("docker")
@@ -3184,12 +3129,21 @@ fn pull_image(image: &str) -> Result<(), String> {
     }
 }
 
-fn update_local_engine(check: bool) -> Result<(), String> {
+async fn update_local_engine(check: bool) -> Result<(), String> {
     docker_preflight()?;
-    let state = load_local_state().ok_or_else(|| "run `lux start` first".to_string())?;
+    let local_config = load_local_config().unwrap_or_default();
+    let engine_settings = resolved_project_engine_env(&local_config)?;
+    let mut state = load_local_state().ok_or_else(|| "run `lux start` first".to_string())?;
+    let desired_image = desired_engine_image(Some(&local_config));
+    if state.image != desired_image {
+        state.image = desired_image;
+    }
+    let engine_env = local_engine_env(&state, &engine_settings);
     let status = image_update_status(&state.container, &state.image);
+    let configuration_update = docker_container_state(&state.container).is_some()
+        && !engine_configuration_matches(&state, &engine_env);
     if check {
-        if status.update_available == Some(true) {
+        if status.update_available == Some(true) || configuration_update {
             println!(
                 "{} {} → {}",
                 "Engine update available:".yellow(),
@@ -3205,38 +3159,25 @@ fn update_local_engine(check: bool) -> Result<(), String> {
         }
         return Ok(());
     }
-    let was_running = docker_container_state(&state.container).as_deref() == Some("running");
-    let existed = docker_container_state(&state.container).is_some();
+    let studio_was_running =
+        docker_container_state(&state.studio_container).as_deref() == Some("running");
     let before = docker_container_digest(&state.container).ok();
     pull_image(&state.image)?;
     let after = docker_image_digest(&state.image)?;
-    if before.as_deref() == Some(after.as_str()) {
+    if before.as_deref() == Some(after.as_str()) && !configuration_update {
         println!("{}", "Local engine is already up to date.".green());
         return Ok(());
     }
-    if existed {
-        remove_engine_container(&state.container)?;
+    let image_id = docker_output(&["image", "inspect", "--format", "{{.Id}}", &state.image])?;
+    state = upgrade::perform(&state, &image_id, engine_env)?;
+    if studio_was_running && !ensure_studio(&mut state, false).await {
+        return Err("engine updated, but Studio did not restart".to_string());
     }
-    if was_running {
-        run_local_engine_container(&state)?;
-        if !wait_for_local_ready(&state) {
-            return Err(format!(
-                "updated engine did not become ready; inspect `docker logs {}`",
-                state.container
-            ));
-        }
-        refresh_local_profile(&state)?;
-        println!("{} Local engine updated and restarted.", "Done.".green());
-    } else {
-        println!(
-            "{} Engine image updated; it will be used by the next `lux start`.",
-            "Done.".green()
-        );
-    }
+    println!("{} Local engine updated; backup retained.", "Done.".green());
     Ok(())
 }
 
-fn update_local_studio(check: bool) -> Result<(), String> {
+async fn update_local_studio(check: bool) -> Result<(), String> {
     docker_preflight()?;
     let mut state = load_local_state().ok_or_else(|| "run `lux start` first".to_string())?;
     let status = image_update_status(&state.studio_container, STUDIO_IMAGE);
@@ -3270,7 +3211,7 @@ fn update_local_studio(check: bool) -> Result<(), String> {
         docker_output(&["rm", "-f", &state.studio_container])?;
     }
     if was_running {
-        if !ensure_studio(&mut state, false) {
+        if !ensure_studio(&mut state, false).await {
             return Err("updated Studio did not become ready".to_string());
         }
         println!("{} Studio updated and restarted.", "Done.".green());
@@ -3373,6 +3314,27 @@ fn format_bytes(bytes: u64) -> String {
 pub async fn run() {
     let cli = Cli::parse();
     let api_url_override = cli.api_url.clone();
+    let local_mutation = matches!(
+        &cli.command,
+        Commands::Start { .. }
+            | Commands::Stop { .. }
+            | Commands::Restore { .. }
+            | Commands::Update {
+                action: Some(UpdateAction::Engine {
+                    project: None,
+                    check: false
+                }),
+                ..
+            }
+    );
+    let _upgrade_lock = if local_mutation && local_state_path().exists() {
+        Some(upgrade::lock_and_recover().unwrap_or_else(|error| {
+            eprintln!("Local engine operation failed: {error}");
+            std::process::exit(1);
+        }))
+    } else {
+        None
+    };
 
     match cli.command {
         Commands::Init => {
@@ -3436,12 +3398,17 @@ pub async fn run() {
             http_port: http_port_flag,
             bind,
         } => {
+            let local_config = load_local_config().unwrap_or_default();
+            let engine_settings = resolved_project_engine_env(&local_config).unwrap_or_else(|e| {
+                eprintln!("{} {e}", "Invalid Engine configuration:".red());
+                std::process::exit(1);
+            });
             if let Err(e) = docker_preflight() {
                 eprintln!("{} {e}", "Error:".red());
                 std::process::exit(1);
             }
 
-            let mut state = ensure_local_state();
+            let mut state = ensure_local_state(&local_config);
             let bind_changed = bind.is_some_and(|host| host != state.bind_host);
             if let Some(bind_host) = bind.filter(|host| *host != state.bind_host) {
                 state.bind_host = bind_host;
@@ -3449,7 +3416,7 @@ pub async fn run() {
             }
             if !state.bind_host.is_loopback() {
                 eprintln!(
-                    "{} local engine and Studio are exposed on {}. Studio contains operator credentials; use only a trusted network.",
+                    "{} local engine and Studio are exposed on {}. Studio grants a scoped management session; use only a trusted network.",
                     "Warning:".yellow(),
                     state.bind_host.to_string().cyan()
                 );
@@ -3461,40 +3428,80 @@ pub async fn run() {
                 "lux/.backups/",
             ]);
 
-            // Already running? Just reprint the connection block.
+            // The Studio origin is part of the engine's exact browser policy,
+            // so settle its port before deciding whether an existing engine can
+            // be reused. A running Studio already owns its intended port.
+            let studio_running =
+                docker_container_state(&state.studio_container).as_deref() == Some("running");
+            let studio_binding_matches = studio_running
+                && docker_port_binding_matches(
+                    &state.studio_container,
+                    "80/tcp",
+                    state.bind_host,
+                    state.studio_port,
+                );
+            let old_studio_credentials = docker_container_state(&state.studio_container).is_some()
+                && !studio_container_has_scoped_credentials(&state.studio_container);
+            if old_studio_credentials || (!no_studio && !studio_binding_matches) {
+                let _ = docker_output(&["rm", "-f", &state.studio_container]);
+            }
+            let studio_port_changed =
+                if !no_studio && (!studio_binding_matches || old_studio_credentials) {
+                    let selected = free_port_from(state.bind_host, state.studio_port);
+                    if selected != state.studio_port {
+                        state.studio_port = selected;
+                        save_local_state(&state);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+            // Already running? Reuse it only when its bindings and complete
+            // CLI-managed Engine configuration match the project.
             let engine_running =
                 docker_container_state(&state.container).as_deref() == Some("running");
             let bindings_match = engine_running && engine_bindings_match(&state);
-            if engine_running && !fresh && bindings_match {
+            let engine_env = local_engine_env(&state, &engine_settings);
+            let configuration_matches =
+                engine_running && engine_configuration_matches(&state, &engine_env);
+            if engine_running
+                && !fresh
+                && bindings_match
+                && configuration_matches
+                && !studio_port_changed
+            {
                 println!("{}", "Local Lux engine already running.".green());
+                prepare_local_data(&mut state).await;
                 refresh_local_profile(&state).unwrap_or_else(|e| {
                     eprintln!("{} {e}", "Failed to refresh local env profile:".red());
                     std::process::exit(1);
                 });
                 print_connection_block(&state);
-                print_image_update_hint(
-                    "engine",
-                    &state.container,
-                    &state.image,
-                    "lux update engine",
-                );
                 if !no_studio {
-                    ensure_studio(&mut state, false);
+                    ensure_studio(&mut state, false).await;
                 }
                 return;
             }
 
-            if engine_running && !fresh && !bindings_match {
+            if engine_running
+                && !fresh
+                && (!bindings_match || !configuration_matches || studio_port_changed)
+            {
                 println!(
                     "{} Recreating the local containers on {} without deleting the data volume.",
-                    "Binding changed.".yellow(),
+                    "Local configuration changed.".yellow(),
                     state.bind_host
                 );
             }
 
-            // Never leave a credential-bearing Studio container published on
-            // the previous address, including when --no-studio was requested.
-            if (bind_changed || (engine_running && !bindings_match))
+            // Never leave Studio published against an obsolete origin or Engine
+            // session, including when --no-studio was requested.
+            if (bind_changed
+                || studio_port_changed
+                || (engine_running && (!bindings_match || !configuration_matches)))
                 && docker_container_state(&state.studio_container).is_some()
             {
                 let _ = docker_output(&["rm", "-f", &state.studio_container]);
@@ -3509,9 +3516,16 @@ pub async fn run() {
             }
             let volume_existed = docker_volume_exists(&state.volume);
             if fresh && volume_existed {
-                let _ = docker_output(&["volume", "rm", &state.volume]);
+                docker_output(&["volume", "rm", &state.volume]).unwrap_or_else(|error| {
+                    eprintln!("Could not clear local data volume: {error}");
+                    std::process::exit(1);
+                });
             }
             let fresh_volume = fresh || !volume_existed;
+            if fresh_volume {
+                state.seed_status = SeedStatus::Pending;
+                save_local_state(&state);
+            }
 
             // Pick free host ports if this project's configured ports are taken
             // (e.g. another local project is already running). Removing the stale
@@ -3522,6 +3536,10 @@ pub async fn run() {
             // a flag, fall back to the configured port and auto-bump past any
             // conflict so multiple projects can run at once.
             let pin = |label: &str, p: u16| {
+                if !no_studio && p == state.studio_port {
+                    eprintln!("{} {label} port {p} is reserved for Studio", "Error:".red());
+                    std::process::exit(1);
+                }
                 if !port_is_free(state.bind_host, p) {
                     eprintln!("{} {label} port {p} is already in use", "Error:".red());
                     std::process::exit(1);
@@ -3530,7 +3548,15 @@ pub async fn run() {
             };
             let resp_port = match resp_port_flag {
                 Some(p) => pin("RESP", p),
-                None => free_port_from(state.bind_host, state.resp_port),
+                None => free_port_from_avoiding(
+                    state.bind_host,
+                    state.resp_port,
+                    if no_studio {
+                        &[]
+                    } else {
+                        std::slice::from_ref(&state.studio_port)
+                    },
+                ),
             };
             let http_port = match http_port_flag {
                 Some(p) => {
@@ -3540,7 +3566,13 @@ pub async fn run() {
                     }
                     pin("HTTP", p)
                 }
-                None => free_port_from(state.bind_host, state.http_port),
+                None => {
+                    let mut excluded = vec![resp_port];
+                    if !no_studio {
+                        excluded.push(state.studio_port);
+                    }
+                    free_port_from_avoiding(state.bind_host, state.http_port, &excluded)
+                }
             };
             if resp_port != state.resp_port || http_port != state.http_port {
                 // Only narrate auto-bumps; an explicit flag is the user's choice.
@@ -3562,7 +3594,8 @@ pub async fn run() {
             // Starting uses the locally installed image. Existing projects
             // update only through `lux update engine`; Docker pulls here only
             // when the image has never been installed.
-            if let Err(e) = run_local_engine_container(&state) {
+            let engine_env = local_engine_env(&state, &engine_settings);
+            if let Err(e) = run_local_engine_container(&state, &engine_env) {
                 eprintln!("{} Failed to start container: {e}", "Error:".red());
                 std::process::exit(1);
             }
@@ -3580,51 +3613,15 @@ pub async fn run() {
             }
             println!(" {}", "ready".green());
 
-            // Apply migrations (idempotent). Seed only on a fresh volume, since
-            // seed scripts generally aren't idempotent.
-            let conn = match DirectConn::connect(
-                &state.connection_host(),
-                state.resp_port,
-                &state.password,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("{} {e}", "Error:".red());
-                    std::process::exit(1);
-                }
-            };
-            let mut target = MigrateTarget::Direct(Box::new(conn));
-            let migrations_dir = PathBuf::from("lux/migrations");
-            if migrations_dir.exists() {
-                let n = apply_pending_migrations(&mut target, &migrations_dir).await;
-                if n > 0 {
-                    println!("{} Applied {n} migration(s).", "Done.".green());
-                }
-            }
-            let seed_path = PathBuf::from("lux/seed.lux");
-            if fresh_volume
-                && seed_path.exists()
-                && !std::fs::read_to_string(&seed_path)
-                    .unwrap_or_default()
-                    .trim()
-                    .is_empty()
-            {
-                run_command_file(&mut target, &seed_path, "Seed").await;
-            }
+            prepare_local_data(&mut state).await;
 
             refresh_local_profile(&state).unwrap_or_else(|e| {
                 eprintln!("{} {e}", "Failed to refresh local env profile:".red());
                 std::process::exit(1);
             });
             print_connection_block(&state);
-            print_image_update_hint(
-                "engine",
-                &state.container,
-                &state.image,
-                "lux update engine",
-            );
             if !no_studio {
-                ensure_studio(&mut state, false);
+                ensure_studio(&mut state, false).await;
             }
         }
 
@@ -3633,7 +3630,8 @@ pub async fn run() {
                 eprintln!("{} {e}", "Error:".red());
                 std::process::exit(1);
             }
-            let mut state = ensure_local_state();
+            let local_config = load_local_config().unwrap_or_default();
+            let mut state = ensure_local_state(&local_config);
 
             // Studio needs a running engine to talk to.
             if docker_container_state(&state.container).as_deref() != Some("running") {
@@ -3645,7 +3643,7 @@ pub async fn run() {
                 std::process::exit(1);
             }
 
-            ensure_studio(&mut state, !no_open);
+            ensure_studio(&mut state, !no_open).await;
         }
 
         Commands::Stop { clear } => {
@@ -3669,16 +3667,27 @@ pub async fn run() {
             if !state.studio_container.is_empty()
                 && docker_container_state(&state.studio_container).is_some()
             {
-                let _ = docker_output(&["rm", "-f", &state.studio_container]);
+                docker_output(&["rm", "-f", &state.studio_container]).unwrap_or_else(|error| {
+                    eprintln!("Could not stop Lux Studio: {error}");
+                    std::process::exit(1);
+                });
                 println!("{} Stopped Lux Studio.", "Done.".green());
             }
             if clear && docker_volume_exists(&state.volume) {
-                let _ = docker_output(&["volume", "rm", &state.volume]);
+                docker_output(&["volume", "rm", &state.volume]).unwrap_or_else(|error| {
+                    eprintln!("Could not clear local data volume: {error}");
+                    std::process::exit(1);
+                });
                 println!("{} Cleared data volume {}.", "Done.".green(), state.volume);
             }
         }
 
         Commands::Restore { file } => {
+            let local_config = load_local_config().unwrap_or_default();
+            let engine_settings = resolved_project_engine_env(&local_config).unwrap_or_else(|e| {
+                eprintln!("{} {e}", "Invalid Engine configuration:".red());
+                std::process::exit(1);
+            });
             if let Err(error) = docker_preflight() {
                 eprintln!("{} {error}", "Error:".red());
                 std::process::exit(1);
@@ -3778,7 +3787,8 @@ pub async fn run() {
                 eprintln!("{} {error}", "Failed to stop local Lux engine:".red());
                 std::process::exit(1);
             });
-            run_local_engine_container(&state).unwrap_or_else(|error| {
+            let engine_env = local_engine_env(&state, &engine_settings);
+            run_local_engine_container(&state, &engine_env).unwrap_or_else(|error| {
                 eprintln!("{} {error}", "Failed to restart local Lux engine:".red());
                 std::process::exit(1);
             });
@@ -3874,6 +3884,7 @@ pub async fn run() {
                 local_http_port: existing.local_http_port,
                 local_resp_port: existing.local_resp_port,
                 engine_version: existing.engine_version,
+                engine_env: existing.engine_env,
             });
             println!("{} Linked to project '{}'", "Done.".green(), inst.name);
             println!("{} {}", "ID:".bold(), inst.id);
@@ -4609,9 +4620,9 @@ pub async fn run() {
                 Some(UpdateAction::Cli { check }) => update_cli(check).await,
                 Some(UpdateAction::Engine { project, check }) => match project {
                     Some(project) => update_cloud_engine(&project, check, &api_url_override).await,
-                    None => update_local_engine(check),
+                    None => update_local_engine(check).await,
                 },
-                Some(UpdateAction::Studio { check }) => update_local_studio(check),
+                Some(UpdateAction::Studio { check }) => update_local_studio(check).await,
             };
             if let Err(error) = result {
                 eprintln!("{} {error}", "Update failed:".red());
@@ -5219,6 +5230,16 @@ pub async fn run() {
                 port,
                 password,
             } => {
+                let local_seed = project.as_deref().is_none_or(|name| name == "local")
+                    && host.is_none()
+                    && port.is_none()
+                    && password.is_none()
+                    && file == Path::new("lux/seed.lux");
+                let mut initialization = if local_seed {
+                    load_local_state().filter(|state| state.seed_status != SeedStatus::Complete)
+                } else {
+                    None
+                };
                 let mut target = resolve_migrate_target(
                     project.as_deref(),
                     host.as_deref(),
@@ -5227,7 +5248,15 @@ pub async fn run() {
                     &api_url_override,
                 )
                 .await;
+                if let Some(state) = initialization.as_mut() {
+                    state.seed_status = SeedStatus::Running;
+                    save_local_state(state);
+                }
                 run_command_file(&mut target, &file, "Seed").await;
+                if let Some(state) = initialization.as_mut() {
+                    state.seed_status = SeedStatus::Complete;
+                    save_local_state(state);
+                }
             }
         },
         Commands::Types {
@@ -7389,6 +7418,20 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_listener_reserves_the_loopback_port() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(!port_is_free(
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port
+        ));
+        assert!(!port_is_free(
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            port
+        ));
+    }
+
+    #[test]
     fn docker_port_maps_are_address_scoped() {
         assert_eq!(
             docker_port_map("127.0.0.1".parse().unwrap(), 5890, 5890),
@@ -7643,13 +7686,42 @@ mod tests {
             bind_host: default_bind_host(),
             studio_port: DEFAULT_STUDIO_PORT,
             studio_container: "lux-sample-abc123-studio".to_string(),
+            seed_status: SeedStatus::Complete,
         }
+    }
+
+    #[test]
+    fn seed_status_roundtrips_and_older_states_do_not_reseed() {
+        let mut state = sample_state();
+        for status in [
+            SeedStatus::Pending,
+            SeedStatus::Running,
+            SeedStatus::Complete,
+        ] {
+            state.seed_status = status;
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(
+                serde_json::from_str::<LocalState>(&json)
+                    .unwrap()
+                    .seed_status,
+                status
+            );
+        }
+        let mut json = serde_json::to_value(&state).unwrap();
+        json.as_object_mut().unwrap().remove("seed_status");
+        assert_eq!(
+            serde_json::from_value::<LocalState>(json)
+                .unwrap()
+                .seed_status,
+            SeedStatus::Complete
+        );
     }
 
     #[test]
     fn local_state_urls_and_env_lines() {
         let s = sample_state();
         assert_eq!(s.lux_url(), "http://localhost:5890");
+        assert_eq!(s.studio_origin(), "http://localhost:5891");
         assert_eq!(
             s.direct_url(),
             "lux://:lux_sec_local_deadbeef@localhost:6379"
@@ -7704,7 +7776,7 @@ mod tests {
 
     #[test]
     fn local_engine_env_enables_encryption_auto_init() {
-        let env = local_engine_env(&sample_state());
+        let env = local_engine_env(&sample_state(), &[]);
         assert!(
             env.iter().any(|e| e == "LUX_ENC_AUTO_INIT=1"),
             "engine env must enable encryption auto-init: {env:?}"
@@ -7715,6 +7787,12 @@ mod tests {
             .any(|e| e == "LUX_PASSWORD=lux_sec_local_deadbeef"));
         assert!(env.iter().any(|e| e == "LUX_STORAGE_MODE=tiered"));
         assert!(env.iter().any(|e| e == "LUX_DURABILITY=always_sync"));
+        assert!(env
+            .iter()
+            .any(|e| e == "LUX_HTTP_ALLOWED_HOSTS=localhost,127.0.0.1,::1"));
+        assert!(env
+            .iter()
+            .any(|e| e == "LUX_HTTP_ALLOWED_ORIGINS=http://localhost:5891"));
         assert!(!env
             .iter()
             .any(|e| e.starts_with("LUX_DURABILITY_SYNC_INTERVAL_MS=")));
@@ -7937,6 +8015,19 @@ project_name = "Project"
 local_http_port = 5890
 local_resp_port = 6379
 engine_version = "1.0.0"
+
+[engine.limits]
+rows = 0
+resp_connections = 64
+request_buffer_bytes = "128mb"
+http_body_bytes = "32mb"
+resp_request_bytes = "64mb"
+response_buffer_bytes = "16mb"
+resp_response_bytes = "8mb"
+
+[engine.timeouts]
+resp_idle = "2m"
+write = 750
 "#,
         )
         .unwrap();
@@ -7946,12 +8037,50 @@ engine_version = "1.0.0"
         assert_eq!(config.local_http_port, Some(5890));
         assert_eq!(config.local_resp_port, Some(6379));
         assert_eq!(config.engine_version.as_deref(), Some("1.0.0"));
+        assert_eq!(
+            config.engine_env.get("LUX_MAX_ROWS").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            config
+                .engine_env
+                .get("LUX_MAX_RESP_CONNECTIONS")
+                .map(String::as_str),
+            Some("64")
+        );
+        assert_eq!(
+            config
+                .engine_env
+                .get("LUX_MAX_REQUEST_BUFFER_SIZE")
+                .map(String::as_str),
+            Some("134217728")
+        );
+        assert_eq!(
+            config
+                .engine_env
+                .get("LUX_RESP_IDLE_TIMEOUT_MS")
+                .map(String::as_str),
+            Some("120000")
+        );
+        assert_eq!(
+            config
+                .engine_env
+                .get("LUX_WRITE_TIMEOUT_MS")
+                .map(String::as_str),
+            Some("750")
+        );
 
         for invalid in [
             "project_id = 1\n",
             "local_http_port = \"5890\"\n",
             "local_resp_port = -1\n",
             "local_http_port = 65536\n",
+            "[engine]\nunknown = 1\n",
+            "[engine.limits]\nresp_conections = 10\n",
+            "[engine.limits]\nresp_connections = 0\n",
+            "[engine.limits]\nrequest_buffer_bytes = \"12tb\"\n",
+            "[engine.timeouts]\nwrite = \"soon\"\n",
+            "[engine.timeouts]\nwrite = 0\n",
             "not valid toml =\n",
         ] {
             std::fs::write(&path, invalid).unwrap();
@@ -7961,6 +8090,73 @@ engine_version = "1.0.0"
             );
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn project_engine_environment_overrides_toml_and_is_normalized() {
+        let mut config = LocalConfig::default();
+        config
+            .engine_env
+            .insert("LUX_MAX_RESP_CONNECTIONS".to_string(), "64".to_string());
+        config
+            .engine_env
+            .insert("LUX_RESP_IDLE_TIMEOUT_MS".to_string(), "120000".to_string());
+        let resolved = resolved_project_engine_env_with(&config, |name| {
+            Ok(match name {
+                "LUX_MAX_RESP_CONNECTIONS" => Some("96".to_string()),
+                _ => None,
+            })
+        })
+        .unwrap();
+        assert!(resolved
+            .iter()
+            .any(|entry| entry == "LUX_MAX_RESP_CONNECTIONS=96"));
+        assert!(resolved
+            .iter()
+            .any(|entry| entry == "LUX_RESP_IDLE_TIMEOUT_MS=120000"));
+
+        let error = resolved_project_engine_env_with(&config, |name| {
+            Ok((name == "LUX_MAX_RESP_CONNECTIONS").then(|| "0".to_string()))
+        })
+        .unwrap_err();
+        assert!(error.contains("LUX_MAX_RESP_CONNECTIONS must be greater than zero"));
+    }
+
+    #[test]
+    fn project_engine_relationships_fail_before_container_changes() {
+        let mut config = LocalConfig::default();
+        config.engine_env.insert(
+            "LUX_MAX_REQUEST_BUFFER_SIZE".to_string(),
+            (32 * 1024 * 1024).to_string(),
+        );
+        let error = resolved_project_engine_env_with(&config, |_| Ok(None)).unwrap_err();
+        assert!(error.contains("request_buffer_bytes"));
+
+        config.engine_env.clear();
+        config.engine_env.insert(
+            "LUX_MAX_RESPONSE_BUFFER_SIZE".to_string(),
+            (32 * 1024 * 1024).to_string(),
+        );
+        let error = resolved_project_engine_env_with(&config, |_| Ok(None)).unwrap_err();
+        assert!(error.contains("response_buffer_bytes"));
+    }
+
+    #[test]
+    fn managed_engine_configuration_detects_added_changed_and_removed_overrides() {
+        let base = vec!["LUX_PORT=6379".to_string()];
+        let mut actual = HashMap::from([("LUX_PORT".to_string(), "6379".to_string())]);
+        assert!(managed_engine_configuration_matches(&actual, &base));
+
+        let configured = vec![
+            "LUX_PORT=6379".to_string(),
+            "LUX_MAX_RESP_CONNECTIONS=64".to_string(),
+        ];
+        assert!(!managed_engine_configuration_matches(&actual, &configured));
+        actual.insert("LUX_MAX_RESP_CONNECTIONS".to_string(), "64".to_string());
+        assert!(managed_engine_configuration_matches(&actual, &configured));
+        assert!(!managed_engine_configuration_matches(&actual, &base));
+        actual.insert("LUX_PORT".to_string(), "6380".to_string());
+        assert!(!managed_engine_configuration_matches(&actual, &configured));
     }
 
     #[test]
@@ -8333,12 +8529,5 @@ engine_version = "1.0.0"
                 }
             }
         ));
-    }
-
-    #[test]
-    fn cli_update_check_never_offers_a_downgrade() {
-        assert!(newer_cli_version("0.26.2", "0.27.0"));
-        assert!(!newer_cli_version("0.27.0", "0.26.2"));
-        assert!(!newer_cli_version("0.27.0", "0.27.0"));
     }
 }

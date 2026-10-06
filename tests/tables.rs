@@ -1,51 +1,83 @@
+mod common;
+
 use std::io::{BufRead, BufReader, Read as IoRead, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command};
+use std::net::TcpStream;
+use std::ops::{Deref, DerefMut};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
-fn start_server() -> (u16, Child) {
-    // Allocate a port and bring the server up, retrying on a fresh port if the
-    // bind loses a race to another parallel test binary. alloc_port drops its
-    // listener before lux rebinds the port, so under full-suite concurrency a
-    // sibling can steal it in the gap -- the classic ephemeral-port TOCTOU.
-    for _ in 0..10 {
-        let port = alloc_port();
-        let data_dir = std::env::temp_dir().join(format!(
-            "lux-test-{}-{}-{}",
-            std::process::id(),
-            port,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be after epoch")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&data_dir).expect("create unique test data dir");
+struct TestChild {
+    child: Child,
+    data_dir: std::path::PathBuf,
+    log_path: std::path::PathBuf,
+}
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_lux"))
-            .env("LUX_PORT", port.to_string())
-            .env("LUX_SAVE_INTERVAL", "0")
-            .env("LUX_DATA_DIR", &data_dir)
-            .spawn()
-            .expect("failed to start lux");
+impl Deref for TestChild {
+    type Target = Child;
 
-        if server_ready(port, &mut child) {
-            return (port, child);
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl DerefMut for TestChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl TestChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        common::terminate_child(&mut self.child);
+        Ok(())
+    }
+}
+
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "table test engine log:\n{}",
+                std::fs::read_to_string(&self.log_path).unwrap_or_default()
+            );
         }
+        common::terminate_child(&mut self.child);
+        let _ = std::fs::remove_dir_all(&self.data_dir);
+    }
+}
 
-        // Lost the port race (lux exited on bind) -- clean up and retry.
+fn start_server() -> (u16, TestChild) {
+    let port = common::free_port();
+    let data_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tables-{}-{port}", std::process::id()));
+    std::fs::create_dir_all(&data_dir).expect("create unique test data dir");
+    let log_path = data_dir.join("engine.log");
+    let log = std::fs::File::create(&log_path).expect("create engine log");
+    let mut command = common::lux_command(env!("CARGO_BIN_EXE_lux"));
+    command
+        .env("LUX_PORT", port.to_string())
+        .env("LUX_SAVE_INTERVAL", "0")
+        .env("LUX_DATA_DIR", &data_dir)
+        .stdout(Stdio::from(log.try_clone().expect("clone engine log")))
+        .stderr(Stdio::from(log));
+    let mut child = common::spawn_lux(&mut command).expect("failed to start lux");
+
+    if !server_ready(port, &mut child) {
+        let output = std::fs::read_to_string(&log_path).unwrap_or_default();
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&data_dir);
+        panic!("server did not start on port {port}:\n{output}");
     }
-    panic!("server did not start after 10 attempts");
-}
 
-fn alloc_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral test port")
-        .local_addr()
-        .expect("read ephemeral test port")
-        .port()
+    (
+        port,
+        TestChild {
+            child,
+            data_dir,
+            log_path,
+        },
+    )
 }
 
 /// Wait until the server answers PING on `port`, or the child exits (failed to

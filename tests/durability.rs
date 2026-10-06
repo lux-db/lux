@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 mod common;
-use common::{read_all, send, LuxServer};
+use common::{read_all, resp_cmd, send, LuxServer};
 
 fn restore_snapshot(port: u16, dump: &[u8]) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -62,6 +62,27 @@ fn always_sync_recovers_memory_write_after_immediate_kill() {
         value.contains("value"),
         "acknowledged value was lost: {value}"
     );
+}
+
+#[test]
+fn always_sync_recovers_acknowledged_plain_set_pipeline() {
+    let mut server = LuxServer::builder()
+        .env("LUX_DURABILITY", "always_sync")
+        .start();
+    let mut connection = server.conn();
+
+    let mut pipeline = resp_cmd(&["SET", "pipeline:first", "one"]);
+    pipeline.extend_from_slice(&resp_cmd(&["SET", "pipeline:second", "two"]));
+    connection.write_all(&pipeline).unwrap();
+    let responses = read_all(&mut connection);
+    assert_eq!(responses.matches("+OK\r\n").count(), 2, "{responses:?}");
+    drop(connection);
+    server.kill();
+    server.restart();
+
+    let mut connection = server.conn();
+    assert!(send(&mut connection, &["GET", "pipeline:first"]).contains("one"));
+    assert!(send(&mut connection, &["GET", "pipeline:second"]).contains("two"));
 }
 
 #[test]

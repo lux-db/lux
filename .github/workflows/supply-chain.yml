@@ -37,6 +37,13 @@ jobs:
         with:
           bun-version: '1.3.11'
 
-      - name: Check SDK advisories and licenses
+      - name: Check SDK licenses
         working-directory: sdk
-        run: bun install --frozen-lockfile && bun audit && bun run licenses
+        run: |
+          bun install --frozen-lockfile
+          bun run licenses
+
+      - name: Check SDK advisories
+        uses: docker://ghcr.io/google/osv-scanner-action@sha256:dcd947131d8d11b8d0964de6590661fb921a4ecbd7b90a7cb21083acfc3fd8cc # v2.5.1
+        with:
+          args: --lockfile=./sdk/bun.lock

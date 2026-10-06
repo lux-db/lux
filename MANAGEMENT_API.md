@@ -24,6 +24,24 @@ accepting normal traffic and its mutation journal to be healthy. A staged
 restore is committed before the HTTP listener starts. The endpoints return
 only the health state and never project data.
 
+## Local Studio sessions
+
+`POST /v1/studio/sessions` exchanges the operator credential for a short-lived
+browser management session. The JSON body must name one exact origin already
+present in `LUX_HTTP_ALLOWED_ORIGINS`:
+
+```json
+{"origin":"http://localhost:5891"}
+```
+
+The response contains `token` and `expires_at` (Unix seconds). The token has
+operator-equivalent access only on the HTTP and live WebSocket surfaces when
+the request carries that exact Origin. It cannot mint another Studio session,
+cannot authenticate to RESP, is retained only as a SHA-256 hash in process
+memory, and is invalid after expiry, rotation, or Engine restart. This endpoint
+is for the local CLI and Studio artifact; applications should use publishable,
+secret, or end-user credentials as appropriate.
+
 ## Auth secret storage
 
 Auth JWT signing private keys, OAuth client secrets, Apple `.p8` keys, and

@@ -6,55 +6,38 @@
 //! restarts, snapshot + WAL interaction, and concurrent data type recovery.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod common;
-use common::{read_all, resp_cmd, LuxServer};
-
-fn send(stream: &mut TcpStream, args: &[&str]) -> String {
-    stream.write_all(&resp_cmd(args)).unwrap();
-    // Read until we have a complete RESP response rather than sleeping and hoping.
-    // Set a generous timeout so slow restarts don't cause spurious failures.
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut data = Vec::with_capacity(256);
-    let mut buf = [0u8; 4096];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                data.extend_from_slice(&buf[..n]);
-                // A complete simple RESP response ends with \r\n.
-                // For bulk strings we need to check we got the full payload too,
-                // but for our purposes (GET returns +OK, $N\r\n...\r\n, or $-1\r\n)
-                // checking for a trailing \r\n on a non-empty buffer is sufficient.
-                if data.ends_with(b"\r\n") {
-                    break;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(_) => break,
-        }
-    }
-    // Restore the normal read timeout.
-    stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
-    String::from_utf8_lossy(&data).to_string()
-}
+use common::{read_all, resp_cmd, send, LuxServer};
 
 fn fill_memory(conn: &mut TcpStream, count: usize) {
     let val = "x".repeat(10000);
     for i in 0..count {
         send(conn, &["SET", &format!("filler:{i}"), &val]);
     }
+}
+
+fn wait_for_list_waiters(conn: &mut TcpStream, expected: usize) {
+    let mut observed = 0;
+    for _ in 0..500 {
+        let info = send(conn, &["INFO"]);
+        observed = info
+            .lines()
+            .find_map(|line| line.strip_prefix("blocked_list_waiters:"))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        if observed >= expected {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("only {observed}/{expected} blocking waiters registered before the workload");
 }
 
 fn remove_non_wal_files(path: &std::path::Path) {
@@ -81,6 +64,13 @@ fn wal_bytes(path: &std::path::Path) -> Vec<u8> {
         }
     }
     bytes
+}
+
+fn wait_until_ttl_elapsed(started: Instant, ttl: Duration) {
+    let check_after = ttl.saturating_add(Duration::from_millis(200));
+    if let Some(remaining) = check_after.checked_sub(started.elapsed()) {
+        thread::sleep(remaining);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -522,8 +512,8 @@ fn blmove_blocked_completion_survives_wal_replay() {
         });
         blockers.push(h);
     }
-    thread::sleep(Duration::from_millis(400)); // let every BLMOVE register as a waiter
     let mut c = srv.conn();
+    wait_for_list_waiters(&mut c, n);
     for i in 0..n {
         let src = format!("bsrc{i}");
         send(&mut c, &["RPUSH", &src, "V"]); // wakes the blocked BLMOVE: V moves to dst
@@ -573,8 +563,8 @@ fn blpop_blocked_completion_survives_wal_replay() {
         });
         blockers.push(h);
     }
-    thread::sleep(Duration::from_millis(400)); // let every BLPOP register as a waiter
     let mut c = srv.conn();
+    wait_for_list_waiters(&mut c, n);
     for i in 0..n {
         let q = format!("q{i}");
         send(&mut c, &["RPUSH", &q, "V"]); // wakes the blocked BLPOP: V is consumed
@@ -610,16 +600,30 @@ fn bzpopmin_blocked_completion_survives_wal_replay() {
     let mut srv = LuxServer::builder().tiered().maxmemory("100kb").start();
     let n = 16usize;
     let port = srv.port();
+    let ready = Arc::new(Barrier::new(n + 1));
     let mut blockers = Vec::new();
     for i in 0..n {
+        let ready = ready.clone();
         let h = thread::spawn(move || {
             let mut b = common::connect(port);
+            b.set_read_timeout(Some(Duration::from_secs(7))).unwrap();
+            ready.wait();
             let z = format!("z{i}");
-            send(&mut b, &["BZPOPMIN", &z, "5"]);
+            let response = send(&mut b, &["BZPOPMIN", &z, "5"]);
+            assert!(
+                response.starts_with("*3\r\n"),
+                "BZPOPMIN for {z} was not satisfied: {response:?}"
+            );
         });
         blockers.push(h);
     }
-    thread::sleep(Duration::from_millis(400)); // let every BZPOPMIN register/poll
+    // BZPOPMIN polls rather than registering with the list-waiter broker, so
+    // there is no observable waiter count to synchronize on. Wait until every
+    // client is connected, then allow one full polling interval before producing
+    // data. The client timeout exceeds the command timeout so a missed wake is
+    // reported as a command failure rather than a socket timeout.
+    ready.wait();
+    thread::sleep(Duration::from_millis(100));
     let mut c = srv.conn();
     for i in 0..n {
         let z = format!("z{i}");
@@ -1333,19 +1337,23 @@ fn row_ttl_active_after_wal_replay() {
             "TINSERT", "pres", "user_id", "keep", "room", "main", "TTL", "60",
         ],
     );
+    let ttl = Duration::from_secs(10);
+    let ttl_started = Instant::now();
     send(
         &mut c,
         &[
-            "TINSERT", "pres", "user_id", "gone", "room", "main", "TTL", "2",
+            "TINSERT", "pres", "user_id", "gone", "room", "main", "TTL", "10",
         ],
     );
+    // Make a replay-time TTL refresh differ materially from the original
+    // deadline while keeping the total test bounded by that original deadline.
+    thread::sleep(Duration::from_secs(3));
     // NO SAVE -> recovery is from WAL replay only.
     drop(c);
     srv.kill();
     srv.restart();
     let mut c = srv.conn();
 
-    // Restart completes before either original deadline has elapsed.
     let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
     assert!(
         resp.contains("keep"),
@@ -1356,8 +1364,7 @@ fn row_ttl_active_after_wal_replay() {
         "short-TTL row should survive WAL replay: {resp}"
     );
 
-    // The original deadline remains active: `gone` expires while `keep` stays.
-    thread::sleep(Duration::from_millis(2600));
+    wait_until_ttl_elapsed(ttl_started, ttl);
     let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
     assert!(
         resp.contains("keep"),
@@ -1389,12 +1396,15 @@ fn update_ttl_active_after_wal_replay() {
             "TUPDATE", "pres", "SET", "room", "b", "WHERE", "user_id", "=", "keep", "TTL", "60",
         ],
     );
+    let ttl = Duration::from_secs(10);
+    let ttl_started = Instant::now();
     send(
         &mut c,
         &[
-            "TUPDATE", "pres", "SET", "room", "b", "WHERE", "user_id", "=", "gone", "TTL", "2",
+            "TUPDATE", "pres", "SET", "room", "b", "WHERE", "user_id", "=", "gone", "TTL", "10",
         ],
     );
+    thread::sleep(Duration::from_secs(3));
     // NO SAVE -> recovery is from WAL replay only.
     drop(c);
     srv.kill();
@@ -1406,9 +1416,7 @@ fn update_ttl_active_after_wal_replay() {
     assert!(resp.contains("keep"), "long-TTL row recovers: {resp}");
     assert!(resp.contains("gone"), "short-TTL row recovers: {resp}");
 
-    // The update's TTL is still active: `gone` expires, `keep` stays. Before the
-    // fix `gone` had no TTL after replay and would still be present here.
-    thread::sleep(Duration::from_millis(2600));
+    wait_until_ttl_elapsed(ttl_started, ttl);
     let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
     assert!(resp.contains("keep"), "long-TTL row still present: {resp}");
     assert!(
@@ -1433,13 +1441,16 @@ fn upsert_ttl_active_after_wal_replay() {
     send(&mut c, &["TINSERT", "pres", "user_id", "gone", "room", "a"]);
     // `keep`: upsert that also updates a field. `gone`: TTL-only upsert (conflict
     // key is the sole field) -- the case that logged nothing before the fix.
+    let ttl = Duration::from_secs(10);
+    let ttl_started = Instant::now();
     send(
         &mut c,
         &[
-            "TUPSERT", "pres", "user_id", "keep", "room", "b", "TTL", "60",
+            "TUPSERT", "pres", "user_id", "keep", "room", "b", "TTL", "10",
         ],
     );
-    send(&mut c, &["TUPSERT", "pres", "user_id", "gone", "TTL", "2"]);
+    send(&mut c, &["TUPSERT", "pres", "user_id", "gone", "TTL", "10"]);
+    thread::sleep(Duration::from_secs(3));
     // NO SAVE -> recovery is from WAL replay only.
     drop(c);
     srv.kill();
@@ -1453,12 +1464,15 @@ fn upsert_ttl_active_after_wal_replay() {
         "TTL-only-upsert row recovers: {resp}"
     );
 
-    thread::sleep(Duration::from_millis(2600));
+    wait_until_ttl_elapsed(ttl_started, ttl);
     let resp = send(&mut c, &["TSELECT", "*", "FROM", "pres"]);
-    assert!(resp.contains("keep"), "long-TTL row still present: {resp}");
+    assert!(
+        !resp.contains("keep"),
+        "field-updating upsert TTL must expire on its original schedule: {resp}"
+    );
     assert!(
         !resp.contains("gone"),
-        "upsert-set TTL must survive replay and expire the row: {resp}"
+        "TTL-only upsert must expire on its original schedule: {resp}"
     );
 }
 

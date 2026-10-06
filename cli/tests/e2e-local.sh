@@ -2,9 +2,10 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ENGINE_BIN="$REPO_ROOT/target/debug/lux"
-CLI_BIN="$REPO_ROOT/cli/target/debug/lux"
-TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/lux-cli-e2e.XXXXXX")"
+ENGINE_BIN="${LUX_E2E_ENGINE_BIN:-$REPO_ROOT/target/debug/lux}"
+CLI_BIN="${LUX_E2E_CLI_BIN:-$REPO_ROOT/cli/target/debug/lux}"
+mkdir -p "$REPO_ROOT/.scratch"
+TEST_ROOT="$(mktemp -d "$REPO_ROOT/.scratch/cli-e2e.XXXXXX")"
 ENGINE_PID=""
 RESP_PORT="${LUX_E2E_RESP_PORT:-16379}"
 HTTP_PORT="${LUX_E2E_HTTP_PORT:-15890}"
@@ -61,6 +62,20 @@ curl -fsS \
   "http://127.0.0.1:$HTTP_PORT/v1/version" >/dev/null
 
 cd "$TEST_ROOT/project"
+
+# Project Engine settings are resolved before Docker is inspected or a running
+# container can be changed.
+cat >lux/config.toml <<'TOML'
+[engine.limits]
+request_buffer_bytes = "32mb"
+TOML
+if "$CLI_BIN" start --no-studio >"$TEST_ROOT/invalid-engine-config.log" 2>&1; then
+  echo "expected an incoherent project Engine configuration to fail" >&2
+  exit 1
+fi
+grep -q "request_buffer_bytes must be at least" "$TEST_ROOT/invalid-engine-config.log"
+rm lux/config.toml
+
 cat >lux/migrations/001_create.lux <<'LUX'
 TCREATE cli_e2e id INT;
 LUX
@@ -82,11 +97,8 @@ fi
 "$CLI_BIN" migrate repair 002_partial.lux abandon \
   --host 127.0.0.1 --port "$RESP_PORT" --password "$OPERATOR_KEY"
 
-cat >AuthKey_TEST.p8 <<'KEY'
------BEGIN PRIVATE KEY-----
-dGVzdC1vbmx5LW5vdC1hLXJlYWwta2V5
------END PRIVATE KEY-----
-KEY
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+  -out AuthKey_TEST.p8 2>/dev/null
 "$CLI_BIN" push status --check --output json
 "$CLI_BIN" push apns set \
   --team-id TEAM123 \
@@ -124,5 +136,30 @@ if grep -q "dGVzdC1vbmx5" <<<"$FINAL_STATUS"; then
   echo "push status exposed private key material" >&2
   exit 1
 fi
+
+# A valid project configuration reaches container reconciliation. A controlled
+# Docker stub keeps this test hermetic while exercising the no-container path.
+cat >lux/config.toml <<'TOML'
+[engine.limits]
+resp_connections = 64
+
+[engine.timeouts]
+write = "12s"
+TOML
+mkdir -p "$TEST_ROOT/fake-bin"
+cat >"$TEST_ROOT/fake-bin/docker" <<'SH'
+#!/bin/sh
+if [ "$1" = "info" ]; then
+  exit 0
+fi
+exit 1
+SH
+chmod +x "$TEST_ROOT/fake-bin/docker"
+if PATH="$TEST_ROOT/fake-bin:$PATH" "$CLI_BIN" start --no-studio \
+  >"$TEST_ROOT/container-reconciliation.log" 2>&1; then
+  echo "expected the controlled container launch to stop at Docker run" >&2
+  exit 1
+fi
+grep -q "Failed to start container" "$TEST_ROOT/container-reconciliation.log"
 
 echo "CLI local migration and push E2E passed"

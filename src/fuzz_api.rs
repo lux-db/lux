@@ -9,6 +9,21 @@
 
 use std::io::Cursor;
 
+/// HTTP request fields, table parameters, migration requests, and live query specifications.
+pub fn fuzz_http(data: &[u8]) {
+    crate::http::check_http_input(data);
+}
+
+/// WAL frames and command payloads.
+pub fn fuzz_wal(data: &[u8]) {
+    crate::disk::check_wal_input(data);
+}
+
+/// Serialized tiered-storage values.
+pub fn fuzz_tiered(data: &[u8]) {
+    let _ = crate::disk::read_single_entry(&mut Cursor::new(data));
+}
+
 /// Binary snapshot loader (`lux.dat`).
 pub fn fuzz_snapshot(data: &[u8]) {
     let store = crate::store::Store::new_with_config(std::sync::Arc::new(crate::ServerConfig {

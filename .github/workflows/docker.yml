@@ -13,10 +13,19 @@ permissions:
   contents: read
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - run: bash .github/scripts/check-release-tag.sh engine "$GITHUB_REF_NAME" "$GITHUB_SHA"
+
   supply-chain:
     uses: ./.github/workflows/supply-chain.yml
 
   test:
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -29,7 +38,7 @@ jobs:
       - run: cargo test --locked --all-targets
 
   build-amd64:
-    needs: [supply-chain, test]
+    needs: [supply-chain, test, validate]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -68,7 +77,7 @@ jobs:
           path: /tmp/digest-amd64.txt
 
   build-arm64:
-    needs: [supply-chain, test]
+    needs: [supply-chain, test, validate]
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
@@ -109,12 +118,18 @@ jobs:
   merge:
     needs: [build-amd64, build-arm64]
     runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
     permissions:
       attestations: write
       contents: read
       id-token: write
       packages: write
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -122,15 +137,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        id: meta
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
 
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
@@ -141,16 +147,14 @@ jobs:
       - name: Create manifest
         id: manifest
         run: |
+          VERSION=${GITHUB_REF_NAME#v}
           AMD64_DIGEST=$(cat /tmp/digests/digest-amd64.txt)
           ARM64_DIGEST=$(cat /tmp/digests/digest-arm64.txt)
-          TAGS=$(echo "${{ steps.meta.outputs.tags }}" | tr '\n' ' ')
-          for TAG in $TAGS; do
-            docker buildx imagetools create -t "$TAG" \
-              "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${AMD64_DIGEST}" \
-              "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${ARM64_DIGEST}"
-          done
-          FIRST_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n 1)
-          DIGEST=$(docker buildx imagetools inspect "$FIRST_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          VERSION_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$VERSION"
+          docker buildx imagetools create -t "$VERSION_TAG" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${AMD64_DIGEST}" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${ARM64_DIGEST}"
+          DIGEST=$(docker buildx imagetools inspect "$VERSION_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Attest image provenance
@@ -159,3 +163,56 @@ jobs:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
+
+  aliases:
+    needs: merge
+    runs-on: ubuntu-latest
+    concurrency:
+      group: docker-release-aliases
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Move floating aliases without regressing them
+        env:
+          RELEASE_DIGEST: ${{ needs.merge.outputs.digest }}
+        run: |
+          git fetch --force --tags origin
+          VERSION=${GITHUB_REF_NAME#v}
+          VERSION_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$VERSION"
+          RELEASE_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@$RELEASE_DIGEST"
+
+          if [[ "$VERSION" == *-* ]]; then
+            echo "Prerelease published as $VERSION_TAG; floating aliases were not changed."
+            exit 0
+          fi
+
+          MAJOR_MINOR=${VERSION%.*}
+          LATEST_PATCH=$(git tag --list "v$MAJOR_MINOR.*" --sort=-version:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n '1p')
+          if [[ "$GITHUB_REF_NAME" == "$LATEST_PATCH" ]]; then
+            docker buildx imagetools create \
+              -t "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$MAJOR_MINOR" \
+              "$RELEASE_IMAGE"
+          fi
+
+          LATEST_STABLE=$(git tag --list 'v*' --sort=-version:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n '1p')
+          if [[ "$GITHUB_REF_NAME" == "$LATEST_STABLE" ]]; then
+            docker buildx imagetools create \
+              -t "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" \
+              "$RELEASE_IMAGE"
+          fi

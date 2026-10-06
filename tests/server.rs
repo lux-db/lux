@@ -20,6 +20,10 @@ fn send_b(conn: &mut TcpStream, args: &[&[u8]]) -> Vec<u8> {
         cmd.extend_from_slice(b"\r\n");
     }
     conn.write_all(&cmd).unwrap();
+    read_b(conn)
+}
+
+fn read_b(conn: &mut TcpStream) -> Vec<u8> {
     conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut reply = Vec::new();
     let mut byte = [0u8; 1];
@@ -49,6 +53,24 @@ fn bulk_payload(reply: &[u8]) -> Vec<u8> {
     let nl = reply.windows(2).position(|w| w == b"\r\n").unwrap();
     let len: usize = std::str::from_utf8(&reply[1..nl]).unwrap().parse().unwrap();
     reply[nl + 2..nl + 2 + len].to_vec()
+}
+
+#[test]
+fn redis_cli_pipe_sentinel_after_a_blank_line_is_processed() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    let magic = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x80\x81\x82\x83\x84\x85\xfc\xfd\xfe\xff";
+    let mut request =
+        b"*3\r\n$3\r\nSET\r\n$8\r\ncli:pipe\r\n$1\r\n1\r\n\r\n*2\r\n$4\r\nECHO\r\n$20\r\n".to_vec();
+    request.extend_from_slice(magic);
+    request.extend_from_slice(b"\r\n");
+    conn.write_all(&request).unwrap();
+
+    let first = read_b(&mut conn);
+    assert_eq!(first, b"+OK\r\n");
+    let sentinel = read_b(&mut conn);
+    assert_eq!(bulk_payload(&sentinel), magic);
+    assert_eq!(send_b(&mut conn, &[b"PING"]), b"+PONG\r\n");
 }
 
 // Commands that used to fake `+OK` must return an honest response of the correct

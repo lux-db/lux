@@ -14,7 +14,7 @@ COPY src/ src/
 ARG LUX_BUILD_SHA=unknown
 ENV LUX_BUILD_SHA=${LUX_BUILD_SHA}
 RUN touch src/lib.rs src/main.rs \
-    && cargo build --locked --release --bin lux --bin lux-healthcheck \
+    && cargo build --locked --release --bin lux --bin lux-healthcheck --bin lux-maintenance \
     && mkdir -p /runtime/data \
     && chmod 0700 /runtime/data
 
@@ -35,6 +35,7 @@ ENV LUX_BIND_HOST=0.0.0.0 \
 
 COPY --from=builder /build/target/release/lux /lux
 COPY --from=builder /build/target/release/lux-healthcheck /lux-healthcheck
+COPY --from=builder /build/target/release/lux-maintenance /lux-maintenance
 COPY --from=builder --chown=10001:10001 /runtime/data/ /data/
 
 USER 10001:10001

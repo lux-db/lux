@@ -13,7 +13,7 @@ use base64::Engine as _;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use p256::ecdh::diffie_hellman;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
-use p256::pkcs8::{EncodePrivateKey, LineEnding};
+use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use p256::{PublicKey, SecretKey};
 use rand_core::{OsRng, RngCore};
 use ring::{aead, hmac};
@@ -28,6 +28,7 @@ const NONCE_INFO: &[u8] = b"Content-Encoding: nonce\0";
 /// small record; any value larger than the plaintext + 17 works.
 const RECORD_SIZE: u32 = 4096;
 const ALLOW_PRIVATE_ENDPOINTS_ENV: &str = "LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS";
+const MAX_ENDPOINT_BYTES: usize = 2 * 1024;
 
 const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -43,6 +44,19 @@ pub(crate) fn generate_vapid_keypair() -> Result<(String, String), String> {
         .map_err(|error| format!("could not encode VAPID private key: {error}"))?
         .to_string();
     Ok((public, private))
+}
+
+pub(super) fn validate_vapid_keypair(public_key: &str, private_pem: &str) -> Result<(), String> {
+    let declared = b64url_decode(public_key).map_err(|_| "invalid VAPID public key".to_string())?;
+    if declared.len() != 65 || PublicKey::from_sec1_bytes(&declared).is_err() {
+        return Err("invalid VAPID public key".to_string());
+    }
+    let private = SecretKey::from_pkcs8_pem(private_pem)
+        .map_err(|_| "invalid VAPID private key".to_string())?;
+    if private.public_key().to_encoded_point(false).as_bytes() != declared {
+        return Err("VAPID public and private keys do not match".to_string());
+    }
+    Ok(())
 }
 
 /// Decode a base64url (no-pad) subscription field.
@@ -173,7 +187,7 @@ struct SubscriptionKeys {
     auth: String,
 }
 
-fn private_endpoints_allowed() -> bool {
+fn loopback_mock_allowed() -> bool {
     std::env::var(ALLOW_PRIVATE_ENDPOINTS_ENV).as_deref() == Ok("1")
 }
 
@@ -181,12 +195,38 @@ fn private_endpoints_allowed() -> bool {
 /// `PushSubscription`. This runs both when the device is registered and again
 /// immediately before delivery so legacy/WAL-restored rows cannot bypass it.
 pub(super) fn validate_subscription_token(token: &str) -> Result<(), String> {
-    let subscription: Subscription =
-        serde_json::from_str(token).map_err(|e| format!("invalid web push subscription: {e}"))?;
-    validate_endpoint(&subscription.endpoint, private_endpoints_allowed()).map(|_| ())
+    parse_subscription(token, loopback_mock_allowed()).map(|_| ())
 }
 
-fn validate_endpoint(endpoint: &str, allow_private: bool) -> Result<reqwest::Url, String> {
+fn parse_subscription(token: &str, allow_loopback_mock: bool) -> Result<Subscription, String> {
+    if token.is_empty() || token.len() > super::MAX_WEB_SUBSCRIPTION_BYTES {
+        return Err(format!(
+            "web push subscription must contain 1 to {} bytes",
+            super::MAX_WEB_SUBSCRIPTION_BYTES
+        ));
+    }
+    let subscription: Subscription =
+        serde_json::from_str(token).map_err(|e| format!("invalid web push subscription: {e}"))?;
+    validate_endpoint(&subscription.endpoint, allow_loopback_mock)?;
+    let public_key = b64url_decode(&subscription.keys.p256dh)
+        .map_err(|_| "invalid web push p256dh key".to_string())?;
+    if public_key.len() != 65 || PublicKey::from_sec1_bytes(&public_key).is_err() {
+        return Err("invalid web push p256dh key".to_string());
+    }
+    let auth = b64url_decode(&subscription.keys.auth)
+        .map_err(|_| "invalid web push auth secret".to_string())?;
+    if auth.len() != 16 {
+        return Err("invalid web push auth secret".to_string());
+    }
+    Ok(subscription)
+}
+
+fn validate_endpoint(endpoint: &str, allow_loopback_mock: bool) -> Result<reqwest::Url, String> {
+    if endpoint.is_empty() || endpoint.len() > MAX_ENDPOINT_BYTES {
+        return Err(format!(
+            "bad push endpoint: must contain 1 to {MAX_ENDPOINT_BYTES} bytes"
+        ));
+    }
     let url = reqwest::Url::parse(endpoint).map_err(|e| format!("bad push endpoint: {e}"))?;
     if url.username() != "" || url.password().is_some() {
         return Err("bad push endpoint: credentials are not allowed".to_string());
@@ -194,27 +234,29 @@ fn validate_endpoint(endpoint: &str, allow_private: bool) -> Result<reqwest::Url
     if url.fragment().is_some() {
         return Err("bad push endpoint: fragments are not allowed".to_string());
     }
-    match url.scheme() {
-        "https" => {}
-        "http" if allow_private => {}
-        _ => return Err("bad push endpoint: HTTPS is required".to_string()),
-    }
     let host = url
         .host_str()
         .ok_or_else(|| "bad push endpoint: host is required".to_string())?;
-    if !allow_private {
-        let normalized = host.trim_end_matches('.').to_ascii_lowercase();
-        if normalized == "localhost" || normalized.ends_with(".localhost") {
-            return Err("bad push endpoint: private hosts are not allowed".to_string());
-        }
-        let ip_literal = host
-            .strip_prefix('[')
-            .and_then(|host| host.strip_suffix(']'))
-            .unwrap_or(host);
-        if let Ok(ip) = ip_literal.parse::<IpAddr>() {
-            if !is_public_ip(ip) {
-                return Err("bad push endpoint: private addresses are not allowed".to_string());
-            }
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    let localhost_name = normalized == "localhost";
+    let reserved_localhost_name = localhost_name || normalized.ends_with(".localhost");
+    let ip_literal = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let literal_ip = ip_literal.parse::<IpAddr>().ok();
+    let loopback = localhost_name || literal_ip.is_some_and(|address| address.is_loopback());
+    match url.scheme() {
+        "https" => {}
+        "http" if allow_loopback_mock && loopback => {}
+        _ => return Err("bad push endpoint: HTTPS is required".to_string()),
+    }
+    if reserved_localhost_name && !(allow_loopback_mock && localhost_name) {
+        return Err("bad push endpoint: private hosts are not allowed".to_string());
+    }
+    if let Some(ip) = literal_ip {
+        if !is_public_ip(ip) && !(allow_loopback_mock && ip.is_loopback()) {
+            return Err("bad push endpoint: private addresses are not allowed".to_string());
         }
     }
     Ok(url)
@@ -250,12 +292,22 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
     (segments[0] & 0xe000) == 0x2000 && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
 }
 
+fn resolved_address_allowed(host: &str, ip: IpAddr, allow_loopback_mock: bool) -> bool {
+    is_public_ip(ip)
+        || (allow_loopback_mock
+            && host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+            && ip.is_loopback())
+}
+
 #[derive(Debug)]
-struct PublicDnsResolver;
+struct PublicDnsResolver {
+    allow_loopback_mock: bool,
+}
 
 impl reqwest::dns::Resolve for PublicDnsResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
+        let allow_loopback_mock = self.allow_loopback_mock;
         Box::pin(async move {
             let resolved = tokio::net::lookup_host((host.as_str(), 0))
                 .await
@@ -263,7 +315,9 @@ impl reqwest::dns::Resolve for PublicDnsResolver {
                     Box::new(error) as Box<dyn std::error::Error + Send + Sync + 'static>
                 })?;
             let addresses: Vec<SocketAddr> = resolved
-                .filter(|address| is_public_ip(address.ip()))
+                .filter(|address| {
+                    resolved_address_allowed(&host, address.ip(), allow_loopback_mock)
+                })
                 .collect();
             if addresses.is_empty() {
                 return Err(Box::new(std::io::Error::new(
@@ -294,20 +348,21 @@ pub(crate) struct WebPushSink {
 
 impl WebPushSink {
     pub fn new(creds: super::ResolvedVapidCreds) -> Result<Self, String> {
-        let allow_private = private_endpoints_allowed();
-        let mut client = reqwest::Client::builder()
+        let allow_loopback_mock = loopback_mock_allowed();
+        let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             // A configured forward proxy would perform its own DNS resolution
             // and bypass the address filter below.
             .no_proxy()
             // Never follow a push-service redirect to a destination that was
             // not validated or used as the VAPID audience.
-            .redirect(reqwest::redirect::Policy::none());
-        if !allow_private {
+            .redirect(reqwest::redirect::Policy::none())
             // Validate resolved addresses at connect time as well as literal IP
-            // hosts above, closing the DNS-rebinding/private-DNS gap.
-            client = client.dns_resolver(Arc::new(PublicDnsResolver));
-        }
+            // hosts above, closing the DNS-rebinding/private-DNS gap. The test
+            // override admits only the exact localhost hostname.
+            .dns_resolver(Arc::new(PublicDnsResolver {
+                allow_loopback_mock,
+            }));
         let client = client
             .build()
             .map_err(|e| format!("web push client setup failed: {e}"))?;
@@ -326,7 +381,7 @@ impl WebPushSink {
 
     /// Sign a VAPID JWT (RFC 8292) scoped to the push service origin.
     fn vapid_jwt(&self, endpoint: &str) -> Result<String, DeliveryError> {
-        let endpoint = validate_endpoint(endpoint, private_endpoints_allowed())
+        let endpoint = validate_endpoint(endpoint, loopback_mock_allowed())
             .map_err(DeliveryError::InvalidTarget)?;
         let aud = endpoint.origin().ascii_serialization();
         let claims = VapidClaims {
@@ -344,10 +399,7 @@ impl WebPushSink {
 impl Sink for WebPushSink {
     async fn deliver(&self, target: &DeliveryTarget, payload: &[u8]) -> Result<(), DeliveryError> {
         // The web "token" is the serialized browser PushSubscription.
-        let sub: Subscription = serde_json::from_str(&target.token).map_err(|e| {
-            DeliveryError::InvalidTarget(format!("invalid web push subscription: {e}"))
-        })?;
-        validate_endpoint(&sub.endpoint, private_endpoints_allowed())
+        let sub = parse_subscription(&target.token, loopback_mock_allowed())
             .map_err(DeliveryError::InvalidTarget)?;
         let p256dh = b64url_decode(&sub.keys.p256dh).map_err(DeliveryError::InvalidTarget)?;
         let auth = b64url_decode(&sub.keys.auth).map_err(DeliveryError::InvalidTarget)?;
@@ -367,7 +419,16 @@ impl Sink for WebPushSink {
             .body(body)
             .send()
             .await
-            .map_err(|e| DeliveryError::Retryable(format!("web push transport: {e}")))?;
+            .map_err(|error| {
+                let message = if error.is_timeout() {
+                    "web push request timed out"
+                } else if error.is_connect() {
+                    "web push connection failed"
+                } else {
+                    "web push transport failed"
+                };
+                DeliveryError::Retryable(message.to_string())
+            })?;
         classify_web_push(resp.status().as_u16())
     }
 }
@@ -380,7 +441,10 @@ fn classify_web_push(status: u16) -> Result<(), DeliveryError> {
         404 | 410 => Err(DeliveryError::InvalidTarget(format!(
             "subscription gone ({status})"
         ))),
-        400 | 401 | 403 => Err(DeliveryError::Permanent(format!("rejected ({status})"))),
+        300..=399 => Err(DeliveryError::Permanent(format!(
+            "push service redirect refused ({status})"
+        ))),
+        400..=499 if status != 429 => Err(DeliveryError::Permanent(format!("rejected ({status})"))),
         429 => Err(DeliveryError::Retryable("throttled".to_string())),
         500..=599 => Err(DeliveryError::Retryable(format!(
             "push service error ({status})"
@@ -482,6 +546,57 @@ mod tests {
         )
         .is_ok());
         assert!(validate_endpoint("http://127.0.0.1:9000/mock", true).is_ok());
+        assert!(validate_endpoint("http://localhost:9000/mock", true).is_ok());
+        assert!(validate_endpoint("http://10.1.2.3/mock", true).is_err());
+        assert!(validate_endpoint("http://push.example.test/mock", true).is_err());
+        assert!(validate_endpoint("https://10.1.2.3/mock", true).is_err());
+    }
+
+    #[test]
+    fn dns_address_policy_keeps_only_public_or_explicit_loopback_addresses() {
+        for address in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "169.254.169.254",
+            "100.64.0.1",
+            "::1",
+            "fd00::1",
+            "2001:db8::1",
+        ] {
+            assert!(!is_public_ip(address.parse().unwrap()), "{address}");
+        }
+        for address in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(is_public_ip(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[test]
+    fn dns_rebinding_to_private_space_is_rejected_at_connect_time() {
+        let private: IpAddr = "169.254.169.254".parse().unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let public: IpAddr = "1.1.1.1".parse().unwrap();
+        assert!(!resolved_address_allowed("push.example", private, false));
+        assert!(!resolved_address_allowed("push.example", loopback, false));
+        assert!(!resolved_address_allowed("push.example", loopback, true));
+        assert!(resolved_address_allowed("push.example", public, false));
+        assert!(resolved_address_allowed("localhost", loopback, true));
+    }
+
+    #[test]
+    fn malformed_subscription_keys_are_rejected_before_delivery() {
+        let bad_curve = serde_json::json!({
+            "endpoint": "https://push.example.test/device",
+            "keys": { "p256dh": enc(&[4_u8; 65]), "auth": enc(&[7_u8; 16]) }
+        });
+        assert!(parse_subscription(&bad_curve.to_string(), false).is_err());
+
+        let secret = SecretKey::random(&mut OsRng);
+        let valid_public = enc(secret.public_key().to_encoded_point(false).as_bytes());
+        let short_auth = serde_json::json!({
+            "endpoint": "https://push.example.test/device",
+            "keys": { "p256dh": valid_public, "auth": enc(&[7_u8; 15]) }
+        });
+        assert!(parse_subscription(&short_auth.to_string(), false).is_err());
     }
 
     #[test]
@@ -496,5 +611,9 @@ mod tests {
         let unavailable = classify_web_push(503).unwrap_err();
         assert!(!unavailable.is_permanent());
         assert!(!unavailable.invalidates_target());
+
+        let redirect = classify_web_push(302).unwrap_err();
+        assert!(redirect.is_permanent());
+        assert!(!redirect.invalidates_target());
     }
 }

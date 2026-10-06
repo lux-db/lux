@@ -57,7 +57,8 @@ documented behavior.
 
 Lux does not publish comparative performance claims from this repository
 without pinned versions, configurations, hardware, raw results, and
-reproducible commands.
+reproducible commands. The public methodology and runner live in
+[`benchmarks/`](benchmarks/).
 
 ## Lux Cloud
 
@@ -107,7 +108,7 @@ seeds a fresh volume, and prints the HTTP, RESP, publishable-key, and secret-key
 connection values. Open Studio with `lux studio` or connect to the printed RESP
 port with a supported Redis client.
 
-> **Protocol note:** `lux://` is the primary protocol for the Lux SDK and CLI. When using third-party Redis clients (ioredis, redis-py, go-redis) directly, use `redis://` since they don't recognize `lux://`. Both connect to the same server.
+> **Protocol note:** `lux://` is the primary protocol for the Lux SDK and CLI. When using third-party Redis clients (such as ioredis, redis-py, or go-redis) directly, use `redis://` since they don't recognize `lux://`. Both connect to the same server.
 
 ```bash
 lux exec local --host 127.0.0.1 --port 6379 --password <local-secret-key> SET hello world
@@ -194,6 +195,40 @@ write access before using a host bind mount. The image includes a small
 `ready` additionally requires the engine to be available for normal traffic.
 The unauthenticated `/health/live` and `/health/ready` endpoints expose only
 those states. They are intended for orchestrator probes, not database access.
+
+`/health/startup` returns `{"status":"started"}` only after recovery and HTTP
+binding have completed; until then the listener is unavailable. A readiness
+failure returns HTTP 503 with `status: "not_ready"` and a fixed `reason`:
+`shutting_down` or `journal_unavailable`. The latter requires investigating
+the storage problem and restarting the engine; it is not cleared by a later sync.
+`INFO` exposes the same readiness state. Liveness is not a durability guarantee.
+
+### Engine diagnostics
+
+The binary writes timestamped events to stderr. Select `LUX_LOG_LEVEL` and
+`LUX_LOG_FORMAT` when starting the process; neither changes database contents.
+JSON output is one object per line with `timestamp_ms`, `level`, `event`, and
+`fields`. Embedded engines remain silent unless the caller installs event callbacks.
+Log configuration errors are reported as plain text if a logger cannot be initialized.
+
+Normal requests do not generate per-request log lines. Routed application and
+health responses include an engine-generated `X-Lux-Request-Id`; operations taking
+at least one second emit `slow_http_request` with that ID, duration, operation
+category, and response status (zero if no response was produced). Slow-operation
+events are limited to one per second per engine. Long-lived WebSocket sessions
+are excluded. Failed operations emit `http_request_failed` and share that budget.
+Early parsing/CORS rejections and WebSocket upgrades do not carry these IDs.
+Diagnostic logs omit request bodies, credentials, command arguments, key names,
+and raw runtime error strings. The library's event callbacks retain full error
+details for callers that need their own diagnostic handling.
+Console Auth email delivery is separate: its existing development behavior prints
+the full verification/reset link. Treat that output as sensitive and configure
+an email provider for production use.
+
+Malformed numeric and boolean settings fail startup instead of silently choosing
+defaults. Boolean values are `true`, `false`, `1`, or `0` (case-insensitive).
+Zero remains valid where it has a documented meaning, such as disabling periodic
+snapshots with `LUX_SAVE_INTERVAL=0` or HTTP with `LUX_HTTP_PORT=0`.
 
 ### Docker Compose
 
@@ -488,6 +523,14 @@ Lux has a built-in HTTP/JSON API. Set `LUX_HTTP_PORT` to enable it alongside the
 RESP protocol. It exposes engine discovery and management, command execution,
 keys, tables, time series, vectors, push, and app-auth routes.
 
+Browser requests are opt-in. Set `LUX_HTTP_ALLOWED_ORIGINS` to the exact origins
+that may call the Engine; Lux rejects every other `Origin` and never emits
+wildcard CORS. Native and server clients normally send no `Origin` and continue
+to work. Loopback listeners accept loopback Host aliases. A non-loopback HTTP
+bind that enables browser origins additionally requires
+`LUX_HTTP_ALLOWED_HOSTS`, which prevents a browser from reaching the Engine
+through a DNS-rebinding Host.
+
 ```bash
 LUX_HTTP_PORT=5890 ./target/release/lux
 ```
@@ -545,8 +588,8 @@ curl -X POST http://localhost:5890/v1/exec \
 ```
 
 Authenticate with `Authorization: Bearer <credential>`, where the credential is
-a project secret key (`lux_sec_*`) or the operator password. CORS is enabled by
-default.
+a project secret key (`lux_sec_*`) or the operator password. Browser CORS is
+disabled until exact origins are configured with `LUX_HTTP_ALLOWED_ORIGINS`.
 
 ### App Auth
 
@@ -719,14 +762,25 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 
 ### Environment Variables
 
+For CLI-managed local projects, capacity and deadline overrides can instead be
+grouped under `[engine.limits]` and `[engine.timeouts]` in
+`lux/config.toml`. Environment variables take precedence. See the
+[CLI configuration reference](cli/README.md#project-engine-configuration) for
+the stable TOML names, accepted units, and recreation behavior.
+
 #### Server and storage
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LUX_RUNTIME_THREADS` | Tokio default | Positive number of async runtime worker threads |
+| `LUX_LOG_LEVEL` | `info` | Binary event verbosity: `error`, `warn`, `info`, or `debug` |
+| `LUX_LOG_FORMAT` | `text` | Binary event output: `text` or newline-delimited `json` on stderr |
 | `LUX_BIND_HOST` | `127.0.0.1` | Interface for RESP and HTTP listeners |
 | `LUX_PORT` | `6379` | RESP (Redis-compatible) TCP port |
 | `LUX_HTTP_PORT` | (disabled) | HTTP API port (set to enable; `lux start` defaults it to `5890`) |
+| `LUX_HTTP_ALLOWED_HOSTS` | loopback aliases on a loopback bind | Comma-separated exact HTTP Host names, without ports; required when browser origins are enabled on a non-loopback bind |
+| `LUX_HTTP_ALLOWED_ORIGINS` | (none) | Comma-separated exact browser origins permitted by CORS and WebSocket handshakes |
+| `LUX_STUDIO_SESSION_TTL_SECONDS` | `43200` | Lifetime of origin-bound, in-memory Studio management sessions (1–86400 seconds) |
 | `LUX_PASSWORD` | (none) | Operator/break-glass AUTH (RESP and HTTP). Project keys also gate the engine |
 | `LUX_ALLOW_INSECURE_NO_AUTH` | `false` | Explicitly allow an unauthenticated non-loopback bind; development only |
 | `LUX_ENABLE_RESP` | `true` | Set to `0` or `false` to disable the RESP listener |
@@ -737,14 +791,74 @@ redis-cli GRANT read, write ON messages WHERE workspace_id IN ( SELECT workspace
 | `LUX_SHUTDOWN_TIMEOUT_MS` | `30000` | Grace period for accepted work during SIGINT/SIGTERM shutdown (1–300000 ms) |
 | `LUX_SAVE_INTERVAL` | `60` | Snapshot interval in seconds (0 to disable) |
 | `LUX_SHARDS` | auto | Next power of two at or above logical CPUs × 16, clamped to 16–1024 |
-| `LUX_MAX_ROWS` | (unlimited) | Optional maximum row count returned by an HTTP table query |
+| `LUX_MAX_ROWS` | `10000` | Maximum row count returned by an HTTP table query; set to `0` for unlimited |
 | `LUX_MAX_BODY_SIZE` | `67108864` | Maximum HTTP request body in bytes |
 | `LUX_MAX_RESP_REQUEST_SIZE` | `67108864` | Maximum buffered RESP request in bytes |
+| `LUX_MAX_RESP_CONNECTIONS` | `1024` | Maximum simultaneous RESP connections |
+| `LUX_MAX_HTTP_CONNECTIONS` | `1024` | Maximum simultaneous HTTP connections, including WebSockets |
+| `LUX_MAX_BLOCKED_CLIENTS` | `256` | Maximum RESP clients waiting in blocking commands |
+| `LUX_MAX_RESP_PIPELINE_COMMANDS` | `1024` | Maximum complete commands accepted from one RESP read buffer or queued transaction |
+| `LUX_MAX_RESP_COMMAND_ARGS` | `16384` | Maximum arguments in one RESP array command |
+| `LUX_MAX_RESP_SUBSCRIPTIONS` | `1024` | Maximum channel, pattern, and key subscriptions per RESP connection |
+| `LUX_MAX_SUBSCRIPTION_NAME_SIZE` | `16384` | Maximum UTF-8 bytes in one retained channel name or subscription pattern |
+| `LUX_MAX_LIVE_SUBSCRIPTIONS` | `128` | Maximum live subscriptions per WebSocket |
+| `LUX_MAX_SUBSCRIPTIONS` | `4096` | Maximum broker receiver registrations retained by all network clients |
+| `LUX_MAX_QUERY_CANDIDATES` | `1000000` | Maximum candidate rows inspected by one table query or join |
+| `LUX_MAX_BLOCKING_KEYS` | `1024` | Maximum keys registered by one blocking command or `WATCH` session |
+| `LUX_MAX_RESP_RESPONSE_SIZE` | `67108864` | Maximum materialized RESP bytes per connection output batch |
+| `LUX_MAX_REQUEST_BUFFER_SIZE` | `268435456` | Shared process budget for buffered network requests, retained RESP session state, subscription definitions/names, and queued realtime payloads |
+| `LUX_MAX_RESPONSE_BUFFER_SIZE` | `268435456` | Shared process budget for socket writes that have not completed |
+| `LUX_MAX_AUTH_WORKERS` | CPU count minus one, clamped to `1`–`4` | Maximum concurrent app-auth requests that may perform expensive work |
+| `LUX_MAX_SCRIPT_MEMORY_SIZE` | `67108864` | Maximum heap bytes available to one Lua script VM |
+| `LUX_RESP_IDLE_TIMEOUT_MS` | `300000` | RESP connection idle timeout |
+| `LUX_RESP_REQUEST_TIMEOUT_MS` | `10000` | Total deadline for an incomplete RESP request |
+| `LUX_HTTP_HEADER_TIMEOUT_MS` | `10000` | Total deadline for an HTTP request head after its first byte |
+| `LUX_HTTP_BODY_TIMEOUT_MS` | `30000` | Total deadline for an HTTP request body |
+| `LUX_HTTP_KEEP_ALIVE_TIMEOUT_MS` | `60000` | Idle deadline between HTTP keep-alive requests |
+| `LUX_LIVE_IDLE_TIMEOUT_MS` | `300000` | Live WebSocket idle deadline without client traffic |
+| `LUX_WRITE_TIMEOUT_MS` | `30000` | Maximum time a socket write may remain unable to make progress |
 | `LUX_MAXMEMORY` | `0` (unlimited) | Memory limit (e.g. `100mb`, `1gb`) |
 | `LUX_MAXMEMORY_POLICY` | `noeviction` | Eviction policy: `allkeys-lru`, `volatile-lru`, `allkeys-random`, `volatile-random` |
 | `LUX_MAXMEMORY_SAMPLES` | `5` | Keys sampled per eviction round |
 | `LUX_STORAGE_MODE` | `memory` | Data-placement layout: `memory` or `tiered`; independent of durability |
 | `LUX_STORAGE_DIR` | `{LUX_DATA_DIR}/storage` | Tiered data and WAL directory; valid only in `tiered` mode |
+
+All listener and request defaults are finite. Invalid zero-valued limits and
+deadlines fail startup instead of silently disabling protection. A full RESP
+listener returns `ERR max number of clients reached`; a full HTTP listener
+returns `503`. Exhausted app-auth capacity returns `429`, and exhausted shared
+request- or response-buffer capacity closes the affected connection after a
+bounded protocol error where possible. Partial HTTP requests
+time out with `408`; idle connections close. Query, pipeline, argument,
+subscription, process-wide subscription, blocking-key, transaction, and response
+ceilings return explicit errors. Capacity and request-shape rejections happen
+before a mutation begins.
+If output crosses the response ceiling only after a command has executed, the
+connection returns the bounded error; clients must treat that command's outcome
+as unknown, just as they would after a network interruption.
+
+Transfer-encoded HTTP request bodies are not supported. Clients should not
+pipeline HTTP/1.1 requests: bytes already buffered beyond a declared body are
+rejected and the connection closes. Ordinary sequential keep-alive requests
+remain supported. Overload shedding does not weaken the configured durability
+policy: a rejected mutation is never acknowledged, and an acknowledged
+mutation retains the same recovery guarantee it has without load.
+
+`INFO` exposes `connected_http_clients`, the RESP/HTTP connection ceilings,
+`rejected_resp_connections`, `rejected_http_connections`,
+`rejected_auth_requests`, `rejected_request_buffers`,
+`rejected_response_buffers`, and
+`connection_timeouts`. It also exposes `network_subscriptions`,
+`max_subscriptions`, `max_request_buffer_bytes`, `max_response_buffer_bytes`,
+`max_script_memory_bytes`, and `dropped_event_messages`; Pub/Sub and live-query
+payloads may be dropped rather than exceed the shared network-buffer budget.
+Live WebSocket query subscriptions resynchronize their retained result after a
+delivery gap; raw Live WebSocket event subscriptions receive an explicit
+`EVENT_GAP` error. Key-event fanout uses fixed queues (4,096 incoming,
+1,024 per worker, and 4,096 coalesced overflow entries). Under sustained
+subscriber backpressure it keeps the newest event per queued key, then drops
+new keys rather than growing memory; `key_events_coalesced` and
+`key_events_dropped` report that pressure.
 
 #### App auth
 
@@ -790,10 +904,11 @@ not contain both encrypted state and the key that seals it.
 | `LUX_ENCRYPTION_KEY` | (none) | Legacy single bootstrap key |
 | `LUX_ENCRYPTION_KEY_ID` | `local` | Active/bootstrap key ID for legacy configuration |
 
-`LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS` set to `1` is an unsafe local
-integration-test escape hatch for Web Push. It is not supported in production. See
-[COMPATIBILITY.md](COMPATIBILITY.md#configuration-contract) for lifecycle and
-file-format guarantees.
+`LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS` set to `1` is a local integration-test
+escape hatch that permits Push delivery only to loopback mocks. It does not
+permit other private-network destinations and is not supported in production.
+See [COMPATIBILITY.md](COMPATIBILITY.md#configuration-contract) for lifecycle
+and file-format guarantees.
 
 ### Node.js
 
@@ -819,7 +934,7 @@ pip install redis
 ```python
 import redis
 
-r = redis.Redis(host="localhost", port=6379)
+r = redis.Redis(host="localhost", port=6379, protocol=2)
 r.set("hello", "world")
 print(r.get("hello"))  # b"world"
 ```
@@ -829,7 +944,7 @@ print(r.get("hello"))  # b"world"
 ```go
 import "github.com/redis/go-redis/v9"
 
-rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Protocol: 2})
 rdb.Set(ctx, "hello", "world", 0)
 ```
 
@@ -841,6 +956,7 @@ added and removed with the code they verify.
 
 ```bash
 cargo test
+just client-compat
 ```
 
 ### CI
@@ -850,6 +966,7 @@ The Tests workflow runs on every pull request and every push to `main`:
 - `cargo fmt -- --check`
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo test --all-targets`
+- pinned Valkey differential and third-party client compatibility tests
 - CLI end-to-end tests against a locally built engine
 - TypeScript SDK tests and build
 

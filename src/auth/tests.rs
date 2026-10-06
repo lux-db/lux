@@ -22,6 +22,29 @@ fn principal(uid: &str) -> AuthPrincipal {
 }
 
 #[test]
+fn unrepresentable_flow_lifetime_does_not_replace_the_existing_setting() {
+    let store = Store::new();
+    let cache = Arc::new(RwLock::new(SchemaCache::new()));
+    bootstrap(&store, &cache, &store.config().auth).unwrap();
+    let before = auth_settings(&store, &cache, Instant::now())
+        .unwrap()
+        .flow_token_ttl;
+    let (status, _, body) = admin_update_settings(
+        r#"{"flow_token_ttl_seconds":18446744073709551615}"#,
+        &store,
+        &cache,
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("representable"));
+    assert_eq!(
+        auth_settings(&store, &cache, Instant::now())
+            .unwrap()
+            .flow_token_ttl,
+        before
+    );
+}
+
+#[test]
 fn api_key_cache_is_isolated_per_store() {
     let store_a = Store::new();
     let store_b = Store::new();
@@ -2002,6 +2025,64 @@ fn direct_auth_table_reads_redact_sensitive_values() {
         !joined_users.contains("$argon2"),
         "joined password hash leaked: {joined_users}"
     );
+    let mut aliased_join = bytes::BytesMut::new();
+    crate::cmd::execute(
+        &store,
+        &cache,
+        &broker,
+        &[
+            b"TSELECT",
+            b"u.encrypted_password",
+            b"AS",
+            b"leaked",
+            b"FROM",
+            b"redaction_posts",
+            b"p",
+            b"JOIN",
+            b"auth.users",
+            b"u",
+            b"ON",
+            b"p.user_id",
+            b"=",
+            b"u.id",
+        ],
+        &mut aliased_join,
+        Instant::now(),
+    );
+    let aliased_join = std::str::from_utf8(&aliased_join).unwrap();
+    assert!(aliased_join.contains("<redacted>"), "{aliased_join}");
+    assert!(!aliased_join.contains("$argon2"), "{aliased_join}");
+
+    let mut unqualified_join = bytes::BytesMut::new();
+    crate::cmd::execute(
+        &store,
+        &cache,
+        &broker,
+        &[
+            b"TSELECT",
+            b"encrypted_password",
+            b"AS",
+            b"leaked",
+            b"FROM",
+            b"redaction_posts",
+            b"p",
+            b"JOIN",
+            b"auth.users",
+            b"u",
+            b"ON",
+            b"p.user_id",
+            b"=",
+            b"u.id",
+        ],
+        &mut unqualified_join,
+        Instant::now(),
+    );
+    let unqualified_join = std::str::from_utf8(&unqualified_join).unwrap();
+    assert!(
+        unqualified_join.contains("<redacted>"),
+        "{unqualified_join}"
+    );
+    assert!(!unqualified_join.contains("$argon2"), "{unqualified_join}");
 
     let session = find_row_by_field(
         &store,
@@ -2081,6 +2162,48 @@ fn direct_auth_table_reads_redact_sensitive_values() {
         !settings.contains("server-token"),
         "postmark token leaked: {settings}"
     );
+    for command in [
+        &[
+            b"TSELECT".as_ref(),
+            b"value".as_ref(),
+            b"AS".as_ref(),
+            b"leaked".as_ref(),
+            b"FROM".as_ref(),
+            b"auth.settings".as_ref(),
+            b"WHERE".as_ref(),
+            b"key".as_ref(),
+            b"=".as_ref(),
+            b"email_postmark_server_token".as_ref(),
+        ][..],
+        &[
+            b"TSELECT".as_ref(),
+            b"MAX(value)".as_ref(),
+            b"AS".as_ref(),
+            b"leaked".as_ref(),
+            b"FROM".as_ref(),
+            b"auth.settings".as_ref(),
+            b"WHERE".as_ref(),
+            b"key".as_ref(),
+            b"=".as_ref(),
+            b"email_postmark_server_token".as_ref(),
+        ][..],
+    ] {
+        let mut aliased = bytes::BytesMut::new();
+        crate::cmd::execute(
+            &store,
+            &cache,
+            &broker,
+            command,
+            &mut aliased,
+            Instant::now(),
+        );
+        let aliased = std::str::from_utf8(&aliased).unwrap();
+        assert!(aliased.contains("<redacted>"), "aliased setting: {aliased}");
+        assert!(
+            !aliased.contains("server-token"),
+            "aliased postmark token leaked: {aliased}"
+        );
+    }
 }
 
 #[test]
@@ -2135,6 +2258,41 @@ fn direct_push_credential_reads_redact_legacy_and_encrypted_secrets() {
         "encrypted-vapid-sentinel",
     ] {
         assert!(!response.contains(secret), "push secret leaked: {response}");
+    }
+
+    for command in [
+        &[
+            b"TSELECT".as_ref(),
+            b"apns_p8_pem_encrypted".as_ref(),
+            b"AS".as_ref(),
+            b"leaked".as_ref(),
+            b"FROM".as_ref(),
+            b"push.credentials".as_ref(),
+        ][..],
+        &[
+            b"TSELECT".as_ref(),
+            b"MAX(apns_p8_pem_encrypted)".as_ref(),
+            b"AS".as_ref(),
+            b"leaked".as_ref(),
+            b"FROM".as_ref(),
+            b"push.credentials".as_ref(),
+        ][..],
+    ] {
+        let mut aliased = bytes::BytesMut::new();
+        crate::cmd::execute(
+            &store,
+            &cache,
+            &broker,
+            command,
+            &mut aliased,
+            Instant::now(),
+        );
+        let aliased = std::str::from_utf8(&aliased).unwrap();
+        assert!(aliased.contains("<redacted>"), "aliased secret: {aliased}");
+        assert!(
+            !aliased.contains("encrypted-apns-sentinel"),
+            "aliased push provider secret leaked: {aliased}"
+        );
     }
 }
 
@@ -2971,6 +3129,89 @@ fn postmark_payload_renders_builtin_signup_and_recovery_emails() {
     assert_eq!(recovery_payload.subject, "Reset your password for Pompeii");
     assert!(recovery_payload.text_body.contains("http://app.test/reset"));
     assert!(recovery_payload.html_body.contains("Reset your password"));
+}
+
+#[tokio::test]
+async fn auth_provider_json_rejects_a_declared_oversized_response() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 1024];
+        let _ = socket.read(&mut request).await.unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            AUTH_PROVIDER_RESPONSE_MAX_BYTES + 1
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}"))
+        .send()
+        .await
+        .unwrap();
+    let result = auth_provider_json::<Value>(response, "request_failed", "response_invalid").await;
+    assert_eq!(result.unwrap_err(), "response_invalid");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn auth_provider_json_bounds_a_response_without_a_declared_length() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 1024];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"value\":\"too long\"}")
+            .await
+            .unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}"))
+        .send()
+        .await
+        .unwrap();
+    let result =
+        auth_provider_json_with_limit::<Value>(response, "request_failed", "response_invalid", 8)
+            .await;
+    assert_eq!(result.unwrap_err(), "response_invalid");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn auth_provider_client_returns_redirects_to_the_caller() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 1024];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: /unexpected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+
+    let response = auth_http_client()
+        .unwrap()
+        .get(format!("http://{address}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    server.await.unwrap();
 }
 
 #[test]

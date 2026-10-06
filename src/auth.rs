@@ -13,6 +13,7 @@ use jsonwebtoken::{
 use p256::pkcs8::{EncodePrivateKey, LineEnding};
 use p256::SecretKey;
 use rand_core::{OsRng, RngCore};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -51,9 +52,13 @@ const AUTH_SCHEMA_VERSION_KEY: &[u8] = b"_auth:schema_version";
 const AUTH_SCHEMA_VERSION: &[u8] = b"4";
 const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
 const OAUTH_CALLBACK_BODY_LIMIT: usize = 64 * 1024;
-const POSTMARK_EMAIL_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTH_PROVIDER_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
+const AUTH_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const AUTH_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCESS_REVOKED_AFTER_PREFIX: &[u8] = b"_auth:access_revoked_after:";
 static FLOW_TOKEN_CONSUME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static NONEXISTENT_ACCOUNT_HASH: OnceLock<Result<String, String>> = OnceLock::new();
+static AUTH_HTTP_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ApiKeyKind {
@@ -390,6 +395,75 @@ pub(crate) fn redact_auth_select_row(plan: &SelectPlan, row: &mut [(String, Stri
     for join in &plan.joins {
         redact_auth_table_row(&join.table, row);
     }
+    for projection in &plan.projections {
+        if projection_exposes_sensitive_field(plan, &projection.expr) {
+            let output = projection
+                .alias
+                .as_deref()
+                .unwrap_or_else(|| bare_auth_field(&projection.expr));
+            redact_row_field(row, output);
+        }
+    }
+    for aggregate in &plan.aggregates {
+        if aggregate
+            .col
+            .as_deref()
+            .is_some_and(|column| projection_exposes_sensitive_field(plan, column))
+        {
+            redact_row_field(row, &aggregate.alias);
+        }
+    }
+}
+
+fn projection_exposes_sensitive_field(plan: &SelectPlan, expression: &str) -> bool {
+    let field = bare_auth_field(expression);
+    if let Some(table) = qualified_projection_source_table(plan, expression) {
+        return table_field_is_sensitive(table, field);
+    }
+    // Unqualified joined columns are resolved by the table engine to the first
+    // matching field. If any participating managed table owns a sensitive
+    // field with this name, redact conservatively rather than depending on join
+    // order and accidentally exposing it through an alias.
+    table_field_is_sensitive(&plan.table, field)
+        || plan
+            .joins
+            .iter()
+            .any(|join| table_field_is_sensitive(&join.table, field))
+}
+
+fn table_field_is_sensitive(table: &str, field: &str) -> bool {
+    // A projected settings value can omit or alias its companion `key`, so the
+    // row alone cannot prove that it is safe. Conservatively redact explicit
+    // `value` projections; wildcard rows still use key-aware redaction above.
+    (table == SETTINGS_TABLE && field == "value") || sensitive_auth_fields(table).contains(&field)
+}
+
+fn qualified_projection_source_table<'a>(
+    plan: &'a SelectPlan,
+    expression: &str,
+) -> Option<&'a str> {
+    if expression_is_qualified_by(expression, &plan.table)
+        || plan
+            .alias
+            .as_deref()
+            .is_some_and(|alias| expression_is_qualified_by(expression, alias))
+    {
+        return Some(&plan.table);
+    }
+    for join in &plan.joins {
+        if expression_is_qualified_by(expression, &join.table)
+            || expression_is_qualified_by(expression, &join.alias)
+        {
+            return Some(&join.table);
+        }
+    }
+    None
+}
+
+fn expression_is_qualified_by(expression: &str, qualifier: &str) -> bool {
+    expression
+        .strip_prefix(qualifier)
+        .is_some_and(|rest| rest.starts_with('.'))
 }
 
 fn redact_row_field(row: &mut [(String, String)], field: &str) {
@@ -703,6 +777,9 @@ pub(crate) fn bootstrap_runtime(
     cache: &SharedSchemaCache,
     config: &AuthConfig,
 ) -> Result<AuthRuntimeBootstrap, String> {
+    // Pay this cost before the listener opens so an unknown email follows the
+    // same password-verification path as an existing account from request one.
+    nonexistent_account_hash()?;
     let now = Instant::now();
     let migration = secrets::migrate_storage(store, cache, now)?;
     ensure_signing_key(store, cache, now)?;
@@ -1156,33 +1233,27 @@ fn password_grant(
         Err(response) => return response,
     };
     let now = Instant::now();
-    let Some(user) = find_row_by_field(store, cache, USERS_TABLE, "email", &email, now)
-        .ok()
-        .flatten()
-    else {
+    let user = match find_row_by_field(store, cache, USERS_TABLE, "email", &email, now) {
+        Ok(user) => user,
+        Err(reason) => return error(500, "Internal Server Error", &reason),
+    };
+    let password_hash = match user.as_ref().and_then(|row| row.get("encrypted_password")) {
+        Some(hash) => hash.as_str(),
+        None => match nonexistent_account_hash() {
+            Ok(hash) => hash,
+            Err(reason) => return error(500, "Internal Server Error", &reason),
+        },
+    };
+    let verification = match verify_password_state(password, password_hash) {
+        Ok(verification) => verification,
+        Err(reason) => return error(500, "Internal Server Error", &reason),
+    };
+    let Some(user) = user else {
         return error(400, "Bad Request", "invalid login credentials");
     };
-    let Some(password_hash) = user.get("encrypted_password") else {
-        return error(400, "Bad Request", "invalid login credentials");
-    };
-    if let Err(response) = validate_user_active(&user, unix_seconds()) {
-        return response;
-    }
-    let settings = match auth_settings(store, cache, now) {
-        Ok(settings) => settings,
-        Err(e) => return error(400, "Bad Request", &e),
-    };
-    if settings.email_confirmation_required
-        && user
-            .get("email_confirmed_at")
-            .map(|value| value.trim().is_empty() || value == "0")
-            .unwrap_or(true)
-    {
-        return error(401, "Unauthorized", "email not confirmed");
-    }
-    match verify_password_state(password, password_hash) {
-        Ok(PasswordVerification::Valid) => {}
-        Ok(PasswordVerification::ValidNeedsRehash) => {
+    match verification {
+        PasswordVerification::Valid => {}
+        PasswordVerification::ValidNeedsRehash => {
             if let Some(user_id) = user.get("id") {
                 match hash_password(password) {
                     Ok(hash) => {
@@ -1203,10 +1274,24 @@ fn password_grant(
                 }
             }
         }
-        Ok(PasswordVerification::Invalid) => {
+        PasswordVerification::Invalid => {
             return error(400, "Bad Request", "invalid login credentials")
         }
-        Err(e) => return error(500, "Internal Server Error", &e),
+    }
+    if let Err(response) = validate_user_active(&user, unix_seconds()) {
+        return response;
+    }
+    let settings = match auth_settings(store, cache, now) {
+        Ok(settings) => settings,
+        Err(e) => return error(400, "Bad Request", &e),
+    };
+    if settings.email_confirmation_required
+        && user
+            .get("email_confirmed_at")
+            .map(|value| value.trim().is_empty() || value == "0")
+            .unwrap_or(true)
+    {
+        return error(401, "Unauthorized", "email not confirmed");
     }
     let Some(user_id) = user.get("id") else {
         return error(500, "Internal Server Error", "auth user row is missing id");
@@ -2014,11 +2099,11 @@ fn admin_update_settings(
                 "flow_token_ttl_seconds must be a positive integer",
             );
         };
-        if ttl == 0 {
+        if !crate::valid_auth_token_ttl(Duration::from_secs(ttl)) {
             return error(
                 400,
                 "Bad Request",
-                "flow_token_ttl_seconds must be greater than zero",
+                "flow_token_ttl_seconds must be positive and representable as an expiry timestamp",
             );
         }
         if let Err(e) = set_auth_setting(
@@ -3952,15 +4037,72 @@ async fn exchange_oauth_code(
     }
 }
 
-/// Mint Apple's OAuth "client secret" on demand: an ES256 JWT signed with the
-/// stored .p8. Minted per exchange with a short expiry, so unlike a manually
-/// pasted secret it never goes stale and never needs rotation.
+/// Reuse connections across auth-provider calls while bounding every request.
+/// Provider endpoints are final destinations; redirects are handled as errors.
+fn auth_http_client() -> Result<&'static reqwest::Client, String> {
+    AUTH_HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(AUTH_HTTP_CONNECT_TIMEOUT)
+                .timeout(AUTH_HTTP_REQUEST_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| "auth provider client setup failed".to_string())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+async fn auth_provider_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+    status_error: &str,
+    response_error: &str,
+) -> Result<T, String> {
+    auth_provider_json_with_limit(
+        response,
+        status_error,
+        response_error,
+        AUTH_PROVIDER_RESPONSE_MAX_BYTES,
+    )
+    .await
+}
+
+async fn auth_provider_json_with_limit<T: DeserializeOwned>(
+    mut response: reqwest::Response,
+    status_error: &str,
+    response_error: &str,
+    max_bytes: usize,
+) -> Result<T, String> {
+    response = response
+        .error_for_status()
+        .map_err(|_| status_error.to_string())?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(response_error.to_string());
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| status_error.to_string())?
+    {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(response_error.to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| response_error.to_string())
+}
+
 async fn exchange_google_code(
     config: &OAuthProviderConfig,
     code: &str,
     redirect_uri: &str,
 ) -> Result<OAuthUser, String> {
-    let client = reqwest::Client::new();
+    let client = auth_http_client().map_err(|_| "token_exchange_failed".to_string())?;
     let body = form_body(&[
         ("client_id", config.client_id.as_str()),
         ("client_secret", config.client_secret.as_str()),
@@ -3968,30 +4110,28 @@ async fn exchange_google_code(
         ("grant_type", "authorization_code"),
         ("redirect_uri", redirect_uri),
     ]);
-    let token: Value = client
+    let response = client
         .post("https://oauth2.googleapis.com/token")
         .header("Accept", "application/json")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
         .await
-        .map_err(|_| "token_exchange_failed".to_string())?
-        .json()
-        .await
-        .map_err(|_| "token_response_invalid".to_string())?;
+        .map_err(|_| "token_exchange_failed".to_string())?;
+    let token: Value =
+        auth_provider_json(response, "token_exchange_failed", "token_response_invalid").await?;
     let access_token = token
         .get("access_token")
         .and_then(Value::as_str)
         .ok_or_else(|| "token_exchange_failed".to_string())?;
-    let profile: Value = client
+    let response = client
         .get("https://openidconnect.googleapis.com/v1/userinfo")
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|_| "userinfo_failed".to_string())?
-        .json()
-        .await
-        .map_err(|_| "userinfo_invalid".to_string())?;
+        .map_err(|_| "userinfo_failed".to_string())?;
+    let profile: Value =
+        auth_provider_json(response, "userinfo_failed", "userinfo_invalid").await?;
     oauth_user_from_google(profile)
 }
 
@@ -4000,48 +4140,44 @@ async fn exchange_github_code(
     code: &str,
     redirect_uri: &str,
 ) -> Result<OAuthUser, String> {
-    let client = reqwest::Client::new();
+    let client = auth_http_client().map_err(|_| "token_exchange_failed".to_string())?;
     let body = form_body(&[
         ("client_id", config.client_id.as_str()),
         ("client_secret", config.client_secret.as_str()),
         ("code", code),
         ("redirect_uri", redirect_uri),
     ]);
-    let token: Value = client
+    let response = client
         .post("https://github.com/login/oauth/access_token")
         .header("Accept", "application/json")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
         .await
-        .map_err(|_| "token_exchange_failed".to_string())?
-        .json()
-        .await
-        .map_err(|_| "token_response_invalid".to_string())?;
+        .map_err(|_| "token_exchange_failed".to_string())?;
+    let token: Value =
+        auth_provider_json(response, "token_exchange_failed", "token_response_invalid").await?;
     let access_token = token
         .get("access_token")
         .and_then(Value::as_str)
         .ok_or_else(|| "token_exchange_failed".to_string())?;
-    let profile: Value = client
+    let response = client
         .get("https://api.github.com/user")
         .header("User-Agent", "Lux Auth")
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|_| "userinfo_failed".to_string())?
-        .json()
-        .await
-        .map_err(|_| "userinfo_invalid".to_string())?;
-    let emails: Value = client
+        .map_err(|_| "userinfo_failed".to_string())?;
+    let profile: Value =
+        auth_provider_json(response, "userinfo_failed", "userinfo_invalid").await?;
+    let response = client
         .get("https://api.github.com/user/emails")
         .header("User-Agent", "Lux Auth")
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|_| "userinfo_failed".to_string())?
-        .json()
-        .await
-        .map_err(|_| "userinfo_invalid".to_string())?;
+        .map_err(|_| "userinfo_failed".to_string())?;
+    let emails: Value = auth_provider_json(response, "userinfo_failed", "userinfo_invalid").await?;
     oauth_user_from_github(profile, emails)
 }
 
@@ -4448,10 +4584,8 @@ async fn send_postmark_email(
     server_token: String,
     message: AuthEmailMessage,
 ) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .timeout(POSTMARK_EMAIL_TIMEOUT)
-        .build()
-        .map_err(|_| "postmark email client setup failed".to_string())?;
+    let client =
+        auth_http_client().map_err(|_| "postmark email client setup failed".to_string())?;
     let response = client
         .post("https://api.postmarkapp.com/email")
         .header("Accept", "application/json")
@@ -4508,6 +4642,13 @@ fn create_flow_token(
     let token = random_token(32);
     let token_hash = hash_secret(&token);
     let now_sec = unix_seconds();
+    if !crate::valid_auth_token_ttl(insert.settings.flow_token_ttl) {
+        return Err(error(
+            400,
+            "Bad Request",
+            "flow token lifetime cannot be represented as an expiry timestamp",
+        ));
+    }
     let expires_at = now_sec + insert.settings.flow_token_ttl.as_secs();
     durable_table_insert(
         store,
@@ -5867,6 +6008,15 @@ fn hash_password(password: &str) -> Result<String, String> {
     })
 }
 
+fn nonexistent_account_hash() -> Result<&'static str, String> {
+    match NONEXISTENT_ACCOUNT_HASH
+        .get_or_init(|| hash_password("lux-nonexistent-account-password-verification"))
+    {
+        Ok(hash) => Ok(hash.as_str()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
 #[cfg(test)]
 fn verify_password(password: &str, hash: &str) -> Result<bool, String> {
     verify_password_state(password, hash).map(|state| state != PasswordVerification::Invalid)
@@ -5914,10 +6064,9 @@ where
     }
 }
 
-fn run_async_work<T, F>(future: F) -> T
+fn run_async_work<F>(future: F) -> Result<(), String>
 where
-    T: Send + 'static,
-    F: Future<Output = T> + Send + 'static,
+    F: Future<Output = Result<(), String>> + Send + 'static,
 {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
@@ -5927,15 +6076,15 @@ where
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("failed to build auth email runtime")
+                .map_err(|_| "failed to build auth email runtime".to_string())?
                 .block_on(future)
         })
         .join()
-        .expect("auth email runtime thread panicked"),
+        .map_err(|_| "auth email runtime thread failed".to_string())?,
         Err(_) => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("failed to build auth email runtime")
+            .map_err(|_| "failed to build auth email runtime".to_string())?
             .block_on(future),
     }
 }

@@ -18,6 +18,21 @@ cargo run --release
 
 ## Running tests
 
+Automatic CLI upgrade tests use Node.js 22 or newer, Docker, a built CLI, and
+preloaded old/candidate engine images. No registry push is performed:
+
+```bash
+node cli/tests/upgrade.mjs ./cli/target/debug/lux OLD_IMAGE CANDIDATE_IMAGE
+```
+
+Set `AUTO_TEST_MODE` to `snapshot-failure`, `stopped-snapshot-failure`,
+`probe-failure`, `import-failure`, `verification-write`, `stopped`, `prepare-interruption`, or
+`cutover-interruption` to exercise the corresponding failure boundary. The
+default verifies a running upgrade with concurrent writes and an existing auth
+session. Registry lookups use the preloaded images; container, volume, network,
+snapshot, and recovery operations are real. Fixtures and their volume names are
+retained under `.scratch/` for inspection.
+
 ```bash
 cargo test --all-targets
 ```

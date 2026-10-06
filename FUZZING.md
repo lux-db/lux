@@ -13,6 +13,7 @@ Covered decoders:
 - TSELECT query + WHERE parser
 - Lua MessagePack (`cmsgpack.unpack`)
 - WAL replay + on-disk entry reader (`src/disk.rs`)
+- HTTP request fields, table parameters, migration requests, and live query specifications
 
 There are two complementary layers.
 
@@ -33,9 +34,11 @@ fuzzer has found live next to them (e.g. `malformed_snapshot_large_count_does_no
 ## Layer 2 — coverage-guided cargo-fuzz (deeper, out-of-band)
 
 libFuzzer targets in `fuzz/fuzz_targets/` drive snapshot, RESP, command,
-table-query, and MessagePack decoding via the `fuzz_api` module (compiled only
-under `--features fuzzing`). Disk and WAL decoding currently have in-crate
-property tests but no cargo-fuzz target. Coverage-guided mutation uses execution
+table-query, MessagePack, HTTP, WAL, and tiered-value decoding via the `fuzz_api`
+module (compiled only under `--features fuzzing`). The HTTP target exercises
+parsers without opening a listener. The WAL target covers all three frame
+formats and supplies valid checksums to exercise payload decoding too.
+Coverage-guided mutation uses execution
 feedback to explore paths that random generation may miss.
 
 Requires the nightly toolchain and cargo-fuzz:
@@ -48,12 +51,17 @@ cargo install cargo-fuzz
 Run a target (builds with sanitizers the first time):
 
 ```sh
-cargo +nightly fuzz run snapshot         # or: resp, command, table_query, msgpack
-cargo +nightly fuzz run snapshot -- -max_total_time=60   # time-boxed
+cargo +nightly fuzz run snapshot         # or: resp, command, table_query, msgpack, http, wal, tiered
+cargo +nightly fuzz run snapshot -- -max_total_time=60 -max_len=65536 -timeout=10 -rss_limit_mb=4096
 ```
 
 A crash writes the triggering input to `fuzz/artifacts/<target>/`; reproduce it
 with `cargo +nightly fuzz run <target> <artifact-path>`.
+
+These limits bound the campaign, not the engine's supported input sizes. Larger
+valid values and process recovery are covered by the integration suite. A
+passing parser campaign does not establish recovery behavior after filesystem
+errors or interrupted writes; run the durability and crash-recovery suites too.
 
 ## Corpus
 
@@ -68,6 +76,14 @@ locally and are not committed.
 - snapshot: a claimed collection count drove `Vec::with_capacity`/`reserve` into
   multi-GB allocations on a few bytes of input (hash pairs, stream groups) —
   pre-allocation is now bounded.
+- tiered values: truncated HLL registers and stream collection counts could
+  allocate for entries absent from the input. Stream collections now grow as
+  entries are read. Snapshot and tiered HLL decoding require the fixed register
+  count and valid register values before installation; unit regressions cover
+  these checks and truncated registers.
+- tiered streams: a partial group-count field was treated as an absent legacy
+  section. Only a completely absent section is now accepted; partial counts
+  return an error.
 - msgpack: a map with a nil/NaN key was forwarded to Lua as `table[nil]=v`,
   aborting the process; invalid keys are skipped. Unbounded decode recursion
   could stack-overflow; nesting depth is capped.

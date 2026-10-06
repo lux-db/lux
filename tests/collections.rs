@@ -533,6 +533,15 @@ fn sorted_set_commands_reject_invalid_arguments_without_mutating_state() {
         vec!["ZRANGE", "z", "0", "-1", "LIMIT", "nope", "1"],
         vec!["ZRANGE", "z", "0", "-1", "LIMIT", "0", "nope"],
         vec!["ZRANGEBYSCORE", "z", "nope", "3"],
+        vec!["ZRANGEBYSCORE", "z", "NaN", "3"],
+        vec!["ZRANGEBYSCORE", "z", "1", "NaN"],
+        vec!["ZCOUNT", "z", "NaN", "3"],
+        vec!["ZCOUNT", "z", "1", "NaN"],
+        vec!["ZCOUNT", "z", "nope", "3"],
+        vec!["ZCOUNT", "missing", "1", "NaN"],
+        vec!["ZRANGE", "z", "NaN", "3", "BYSCORE"],
+        vec!["ZREMRANGEBYSCORE", "z", "NaN", "3"],
+        vec!["ZRANGESTORE", "dst", "z", "1", "NaN", "BYSCORE"],
         vec!["ZRANGEBYSCORE", "z", "1", "3", "LIMIT", "nope", "1"],
         vec!["ZSCAN", "z", "nope"],
         vec!["ZSCAN", "z", "0", "COUNT", "nope"],
@@ -550,6 +559,161 @@ fn sorted_set_commands_reject_invalid_arguments_without_mutating_state() {
     assert_has(&send(&mut conn, &["ZSCORE", "z", "one"]), "1");
     assert_has(&send(&mut conn, &["ZSCORE", "z", "two"]), "2");
     assert_has(&send(&mut conn, &["ZSCORE", "z", "three"]), "3");
+}
+
+#[test]
+fn sorted_set_empty_score_ranges_preserve_state_and_server_availability() {
+    for (tiered, durability) in [
+        (false, "ephemeral"),
+        (false, "always_sync"),
+        (true, "always_sync"),
+    ] {
+        let builder = LuxServer::builder().env("LUX_DURABILITY", durability);
+        let mut server = if tiered { builder.tiered() } else { builder }.start();
+        let mut conn = server.conn();
+        assert_eq!(
+            send(
+                &mut conn,
+                &["ZADD", "src", "1", "one", "2", "two", "3", "three"]
+            ),
+            ":3\r\n",
+        );
+        let original = send(&mut conn, &["ZRANGE", "src", "0", "-1", "WITHSCORES"]);
+        for key in ["src", "missing"] {
+            for args in [
+                vec!["ZRANGEBYSCORE", key, "10", "1"],
+                vec!["ZRANGEBYSCORE", key, "+inf", "-inf", "WITHSCORES"],
+                vec!["ZRANGEBYSCORE", key, "(2", "2"],
+                vec!["ZRANGEBYSCORE", key, "2", "(2", "LIMIT", "0", "1"],
+                vec!["ZRANGEBYSCORE", key, "10", "1", "LIMIT", "0", "0"],
+                vec!["ZREVRANGEBYSCORE", key, "1", "10"],
+                vec!["ZREVRANGEBYSCORE", key, "-inf", "+inf"],
+                vec!["ZRANGE", key, "10", "1", "BYSCORE"],
+                vec!["ZRANGE", key, "1", "10", "BYSCORE", "REV"],
+                vec!["ZRANGE", key, "2", "(2", "BYSCORE", "REV"],
+            ] {
+                assert_eq!(send(&mut conn, &args), "*0\r\n", "{args:?}");
+                assert_eq!(send(&mut conn, &["PING"]), "+PONG\r\n");
+            }
+            assert_eq!(
+                send(&mut conn, &["ZREMRANGEBYSCORE", key, "10", "1"]),
+                ":0\r\n"
+            );
+            for bounds in [("10", "1", false), ("1", "10", true), ("(2", "2", false)] {
+                send(&mut conn, &["SET", "dst", "stale"]);
+                let mut args = vec!["ZRANGESTORE", "dst", key, bounds.0, bounds.1, "BYSCORE"];
+                if bounds.2 {
+                    args.push("REV");
+                }
+                assert_eq!(send(&mut conn, &args), ":0\r\n", "{args:?}");
+                assert_eq!(send(&mut conn, &["EXISTS", "dst"]), ":0\r\n");
+            }
+        }
+        send(&mut conn, &["SET", "string", "value"]);
+        for args in [
+            vec!["ZRANGEBYSCORE", "string", "10", "1"],
+            vec!["ZREVRANGEBYSCORE", "string", "1", "10"],
+            vec!["ZRANGE", "string", "1", "10", "BYSCORE", "REV"],
+            vec!["ZREMRANGEBYSCORE", "string", "10", "1"],
+            vec!["ZRANGESTORE", "dst", "string", "10", "1", "BYSCORE"],
+        ] {
+            assert!(send(&mut conn, &args).starts_with("-WRONGTYPE"), "{args:?}");
+        }
+        assert_eq!(
+            send(&mut conn, &["ZRANGE", "src", "0", "-1", "WITHSCORES"]),
+            original
+        );
+        assert_eq!(send(&mut server.conn(), &["PING"]), "+PONG\r\n");
+        if durability != "ephemeral" {
+            drop(conn);
+            server.restart();
+            assert_eq!(
+                send(
+                    &mut server.conn(),
+                    &["ZRANGE", "src", "0", "-1", "WITHSCORES"]
+                ),
+                original
+            );
+        }
+    }
+}
+
+#[test]
+fn sorted_set_reverse_score_ranges_use_max_then_min() {
+    let server = LuxServer::start();
+    let mut conn = server.conn();
+    send(
+        &mut conn,
+        &["ZADD", "src", "1", "one", "2", "two", "3", "three"],
+    );
+    for (max, min) in [
+        ("3", "1"),
+        ("(3", "1"),
+        ("3", "(1"),
+        ("(3", "(1"),
+        ("+inf", "-inf"),
+    ] {
+        let expected = send(
+            &mut conn,
+            &[
+                "ZREVRANGEBYSCORE",
+                "src",
+                max,
+                min,
+                "WITHSCORES",
+                "LIMIT",
+                "0",
+                "2",
+            ],
+        );
+        let count = expected.lines().next().unwrap()[1..]
+            .parse::<usize>()
+            .unwrap()
+            / 2;
+        assert_eq!(
+            send(
+                &mut conn,
+                &[
+                    "ZRANGE",
+                    "src",
+                    max,
+                    min,
+                    "BYSCORE",
+                    "REV",
+                    "WITHSCORES",
+                    "LIMIT",
+                    "0",
+                    "2"
+                ]
+            ),
+            expected
+        );
+        assert_eq!(
+            send(
+                &mut conn,
+                &[
+                    "ZRANGESTORE",
+                    "dst",
+                    "src",
+                    max,
+                    min,
+                    "BYSCORE",
+                    "REV",
+                    "LIMIT",
+                    "0",
+                    "2"
+                ]
+            ),
+            format!(":{count}\r\n")
+        );
+        assert_eq!(
+            send(
+                &mut conn,
+                &["ZRANGE", "dst", "0", "-1", "REV", "WITHSCORES"]
+            ),
+            expected
+        );
+    }
 }
 
 #[test]

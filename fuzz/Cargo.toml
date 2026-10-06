@@ -22,6 +22,27 @@ features = ["fuzzing"]
 debug = 1
 
 [[bin]]
+name = "http"
+path = "fuzz_targets/http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal"
+path = "fuzz_targets/wal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tiered"
+path = "fuzz_targets/tiered.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "snapshot"
 path = "fuzz_targets/snapshot.rs"
 test = false

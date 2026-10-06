@@ -6,7 +6,12 @@ import {
 	createBrowserClient as browserRootCreateBrowserClient,
 	createServerClient as browserRootCreateServerClient,
 } from '../src/index.browser';
+import { projectStorageKey } from '../src/utils';
 import type { LuxBrowserCookieMethods, LuxCookieOptions } from '../src/cookies';
+
+const defaultCookie = projectStorageKey('http://localhost:3957/v1/project', 'lux-auth-session');
+const singletonCookie = projectStorageKey('http://localhost:3957/v1/project-singleton-sync', 'lux-auth-session');
+const defaultStorageKey = projectStorageKey('http://localhost:3957/v1/project', 'lux.auth.session');
 
 describe('browser and SSR clients', () => {
 	test('browser and SSR helpers are exported from package root', () => {
@@ -37,7 +42,7 @@ describe('browser and SSR clients', () => {
 			user: { id: 'usr_123', email: 'user@example.com' },
 		});
 
-		expect(storage.has('lux.auth.session')).toBe(true);
+		expect(storage.has(defaultStorageKey)).toBe(true);
 	});
 
 	test('browser client accepts getAll and setAll cookie methods', async () => {
@@ -63,7 +68,7 @@ describe('browser and SSR clients', () => {
 			user: { id: 'usr_browser', email: 'browser@example.com' },
 		});
 
-		expect(cookies.has('lux-auth-session')).toBe(true);
+		expect(cookies.has(defaultCookie)).toBe(true);
 		expect(optionsWereProvided).toBe(true);
 		expect((await client.auth.getSession()).data?.session?.user.id).toBe('usr_browser');
 	});
@@ -86,7 +91,7 @@ describe('browser and SSR clients', () => {
 			token_type: 'bearer',
 			user: { id: 'usr_123', email: 'user@example.com' },
 		});
-		expect(cookies.has('lux-auth-session')).toBe(true);
+		expect(cookies.has(defaultCookie)).toBe(true);
 		expect(writtenOptions).toMatchObject({
 			httpOnly: false,
 			path: '/',
@@ -105,7 +110,7 @@ describe('browser and SSR clients', () => {
 		expect((await restored.auth.getSession()).data?.session?.access_token).toBe('access-token');
 
 		await restored.auth.clearSession();
-		expect(cookies.has('lux-auth-session')).toBe(false);
+		expect(cookies.has(defaultCookie)).toBe(false);
 	});
 
 	test('server client chunks large session cookies and restores them', async () => {
@@ -123,11 +128,11 @@ describe('browser and SSR clients', () => {
 			user: { id: 'usr_chunked', email: 'chunked@example.com' },
 		});
 
-		expect(cookies.has('lux-auth-session')).toBe(false);
-		expect(cookies.has('lux-auth-session.0')).toBe(true);
-		expect(cookies.has('lux-auth-session.1')).toBe(true);
+		expect(cookies.has(defaultCookie)).toBe(false);
+		expect(cookies.has(`${defaultCookie}.0`)).toBe(true);
+		expect(cookies.has(`${defaultCookie}.1`)).toBe(true);
 		for (const [name, value] of cookies) {
-			if (name.startsWith('lux-auth-session.')) {
+			if (name.startsWith(`${defaultCookie}.`)) {
 				expect(value.length).toBeLessThanOrEqual(3180);
 			}
 		}
@@ -152,7 +157,7 @@ describe('browser and SSR clients', () => {
 			token_type: 'bearer',
 			user: { id: 'usr_chunks', email: 'chunks@example.com' },
 		});
-		expect(cookies.has('lux-auth-session.2')).toBe(true);
+		expect(cookies.has(`${defaultCookie}.2`)).toBe(true);
 
 		await client.auth.setSession({
 			access_token: 'small-access-token',
@@ -162,8 +167,8 @@ describe('browser and SSR clients', () => {
 			user: { id: 'usr_chunks', email: 'chunks@example.com' },
 		});
 
-		expect(cookies.has('lux-auth-session')).toBe(true);
-		expect([...cookies.keys()].some((name) => name.startsWith('lux-auth-session.')))
+		expect(cookies.has(defaultCookie)).toBe(true);
+		expect([...cookies.keys()].some((name) => name.startsWith(`${defaultCookie}.`)))
 			.toBe(false);
 		expect((await client.auth.getSession()).data?.session?.access_token)
 			.toBe('small-access-token');
@@ -182,13 +187,13 @@ describe('browser and SSR clients', () => {
 			token_type: 'bearer',
 			user: { id: 'usr_clear_chunks', email: 'clear-chunks@example.com' },
 		});
-		expect([...cookies.keys()].some((name) => name.startsWith('lux-auth-session.')))
+		expect([...cookies.keys()].some((name) => name.startsWith(`${defaultCookie}.`)))
 			.toBe(true);
 
 		await client.auth.clearSession();
 
-		expect([...cookies.keys()].some((name) => name === 'lux-auth-session' ||
-			name.startsWith('lux-auth-session.'))).toBe(false);
+		expect([...cookies.keys()].some((name) => name === defaultCookie ||
+			name.startsWith(`${defaultCookie}.`))).toBe(false);
 	});
 
 	test('server client can read cookies when setAll is unavailable', async () => {
@@ -230,7 +235,7 @@ describe('browser and SSR clients', () => {
 
 		const originalDocument = (globalThis as any).document;
 		const browserCookies = new Map<string, string>([
-			['lux-auth-session', cookies.get('lux-auth-session')!],
+			[defaultCookie, cookies.get(defaultCookie)!],
 		]);
 		(globalThis as any).document = createCookieDocument(browserCookies);
 
@@ -252,7 +257,7 @@ describe('browser and SSR clients', () => {
 				user: { id: 'usr_shared', email: 'shared@example.com' },
 			});
 
-			cookies.set('lux-auth-session', browserCookies.get('lux-auth-session')!);
+			cookies.set(defaultCookie, browserCookies.get(defaultCookie)!);
 			const nextServer = createServerClient(
 				'http://localhost:3957/v1/project',
 				'lux_pub_test',
@@ -290,7 +295,7 @@ describe('browser and SSR clients', () => {
 
 			await waitFor(() => events.includes('INITIAL_SESSION:none'));
 
-			browserCookies.set('lux-auth-session', encodeSessionCookie({
+			browserCookies.set(defaultCookie, encodeSessionCookie({
 				access_token: 'ssr-access-token',
 				refresh_token: 'ssr-refresh-token',
 				expires_in: 3600,
@@ -300,7 +305,7 @@ describe('browser and SSR clients', () => {
 			document.dispatchVisibilityChange('visible');
 			await waitFor(() => events.includes('SIGNED_IN:ssr-access-token'));
 
-			browserCookies.delete('lux-auth-session');
+			browserCookies.delete(defaultCookie);
 			document.dispatchVisibilityChange('visible');
 			await waitFor(() => events.includes('SIGNED_OUT:none'));
 
@@ -347,7 +352,7 @@ describe('browser and SSR clients', () => {
 				token_type: 'bearer',
 				user: { id: 'usr_server_load', email: 'server-load@example.com' },
 			});
-			browserCookies.set('lux-auth-session', value);
+			browserCookies.set(defaultCookie, value);
 			createBrowserClient(
 				'http://localhost:3957/v1/project',
 				'lux_pub_test',
@@ -392,7 +397,7 @@ describe('browser and SSR clients', () => {
 
 			await waitFor(() => events.includes('INITIAL_SESSION:none'));
 
-			browserCookies.set('lux-auth-session', encodeSessionCookie({
+			browserCookies.set(singletonCookie, encodeSessionCookie({
 				access_token: 'singleton-sync-access-token',
 				refresh_token: 'singleton-sync-refresh-token',
 				expires_in: 3600,
@@ -447,7 +452,7 @@ describe('browser and SSR clients', () => {
 
 			// SvelteKit applies Set-Cookie and performs a client-side redirect,
 			// without reloading the browser client or changing visibility.
-			browserCookies.set('lux-auth-session', encodeSessionCookie({
+			browserCookies.set(defaultCookie, encodeSessionCookie({
 				access_token: 'ssr-access-token',
 				refresh_token: 'ssr-refresh-token',
 				expires_in: 3600,
@@ -459,7 +464,7 @@ describe('browser and SSR clients', () => {
 
 			expect(result.error).toBeNull();
 			expect(authorization).toBe('Bearer ssr-access-token');
-			expect(browserCookies.has('lux-auth-session')).toBe(false);
+			expect(browserCookies.has(defaultCookie)).toBe(false);
 			expect(events.filter((event) => event === 'SIGNED_IN')).toHaveLength(0);
 			expect(events.filter((event) => event === 'SIGNED_OUT')).toHaveLength(1);
 		} finally {

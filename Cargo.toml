@@ -2,6 +2,7 @@
 name = "lux"
 version = "0.37.0"
 edition = "2021"
+publish = false
 description = "An open-source application database engine with tables, cache, vectors, auth, realtime, queues, time series, and Redis-compatible commands."
 license = "MIT"
 repository = "https://github.com/lux-db/lux"

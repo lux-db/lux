@@ -6,7 +6,10 @@ use std::time::Duration;
 use jsonwebtoken::decode_header;
 
 mod common;
-use common::{http_request, http_request_with_headers, read_all, resp_cmd, LuxServer};
+use common::{
+    http_request, http_request_bytes_with_headers, http_request_with_headers, read_all, resp_cmd,
+    LuxServer,
+};
 
 fn get(port: u16, path: &str, auth: &str) -> String {
     http_request(port, "GET", path, None, Some(auth)).1
@@ -59,6 +62,33 @@ fn orchestrator_health_checks_do_not_require_database_credentials() {
     let (status, body) = http_request(http, "GET", "/health/ready", None, None);
     assert_eq!(status, 200, "readiness: {body}");
     assert_eq!(body, r#"{"status":"ready"}"#);
+    let (status, body) = http_request(http, "GET", "/health/startup", None, None);
+    assert_eq!(status, 200);
+    assert_eq!(body, r#"{"status":"started"}"#);
+}
+
+#[test]
+fn http_request_ids_are_generated_and_returned_on_errors() {
+    let server = LuxServer::builder().http().start();
+    let mut previous = None;
+    for _ in 0..3 {
+        let mut socket = TcpStream::connect(("127.0.0.1", server.http_port())).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        socket.write_all(b"GET /not-a-route HTTP/1.1\r\nHost: localhost\r\nX-Lux-Request-Id: client-chosen\r\n\r\n").unwrap();
+        let response = read_all(&mut socket);
+        let id = response
+            .lines()
+            .find_map(|line| line.strip_prefix("X-Lux-Request-Id: "))
+            .expect("request identifier")
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        assert_ne!(previous, Some(id));
+        assert!(!response.contains("client-chosen"));
+        previous = Some(id);
+    }
 }
 
 #[test]
@@ -237,6 +267,39 @@ fn http_snapshot_management_accepts_a_secret_key_when_no_password_exists() {
         Some(secret),
     );
     assert_eq!(status, 400, "secret key did not reach validation: {body}");
+}
+
+#[test]
+fn http_snapshot_management_accepts_each_configured_management_credential() {
+    let password = "operator_restore_management_test";
+    let secret = "lux_sec_restore_management_test";
+    let server = LuxServer::builder()
+        .http()
+        .password(password)
+        .env("LUX_AUTH_ENABLED", "true")
+        .env("LUX_AUTH_SECRET_KEY", secret)
+        .start();
+    let http = server.http_port();
+
+    for (label, credential) in [
+        ("operator password", password),
+        ("project secret key", secret),
+    ] {
+        let (status, body) = http_request(http, "GET", "/v1/snapshot", None, Some(credential));
+        assert_eq!(status, 200, "{label} snapshot: {body}");
+
+        let (status, body) = http_request(
+            http,
+            "POST",
+            "/v1/restore",
+            Some("not-a-dump"),
+            Some(credential),
+        );
+        assert_eq!(
+            status, 400,
+            "{label} did not reach restore validation: {body}"
+        );
+    }
 }
 
 #[test]
@@ -1121,6 +1184,7 @@ fn http_options_allows_auth_api_key_header() {
     let server = LuxServer::builder()
         .http()
         .env("LUX_AUTH_ENABLED", "true")
+        .env("LUX_HTTP_ALLOWED_ORIGINS", "http://localhost:5173")
         .start();
     let http = server.http_port();
 
@@ -1141,6 +1205,295 @@ fn http_options_allows_auth_api_key_header() {
         body.is_empty(),
         "options should have no response body: {body}"
     );
+}
+
+#[test]
+fn http_browser_boundary_uses_exact_cors_and_rejects_before_mutation() {
+    let server = LuxServer::builder()
+        .http()
+        .password("operator-secret")
+        .env("LUX_HTTP_ALLOWED_ORIGINS", "https://app.example.test")
+        .start();
+    let http = server.http_port();
+
+    let trusted = http_request_bytes_with_headers(
+        http,
+        "OPTIONS",
+        "/v1/exec",
+        &[],
+        None,
+        &[
+            ("Origin", "https://app.example.test"),
+            ("Access-Control-Request-Method", "POST"),
+            (
+                "Access-Control-Request-Headers",
+                "authorization, content-type",
+            ),
+        ],
+    );
+    assert_eq!(trusted.status, 204);
+    assert_eq!(
+        trusted.header("Access-Control-Allow-Origin"),
+        Some("https://app.example.test")
+    );
+    assert_eq!(trusted.header("Vary"), Some("Origin"));
+    assert_ne!(trusted.header("Access-Control-Allow-Origin"), Some("*"));
+
+    let malicious = http_request_bytes_with_headers(
+        http,
+        "GET",
+        "/v1",
+        &[],
+        Some("operator-secret"),
+        &[("Origin", "https://attacker.example")],
+    );
+    assert_eq!(malicious.status, 403);
+    assert!(malicious.header("Access-Control-Allow-Origin").is_none());
+
+    let blocked_mutation = http_request_bytes_with_headers(
+        http,
+        "POST",
+        "/v1/exec",
+        br#"{"command":["SET","browser:blocked","yes"]}"#,
+        Some("operator-secret"),
+        &[("Origin", "https://attacker.example")],
+    );
+    assert_eq!(blocked_mutation.status, 403);
+    let native_read = http_request_bytes_with_headers(
+        http,
+        "POST",
+        "/v1/exec",
+        br#"{"command":["GET","browser:blocked"]}"#,
+        Some("operator-secret"),
+        &[],
+    );
+    assert_eq!(native_read.status, 200);
+    let native_read: serde_json::Value = serde_json::from_slice(&native_read.body).unwrap();
+    assert!(native_read["result"].is_null());
+
+    let duplicate_origin = http_request_bytes_with_headers(
+        http,
+        "GET",
+        "/v1",
+        &[],
+        Some("operator-secret"),
+        &[
+            ("Origin", "https://app.example.test"),
+            ("Origin", "https://app.example.test"),
+        ],
+    );
+    assert_eq!(duplicate_origin.status, 403);
+
+    let null_origin = http_request_bytes_with_headers(
+        http,
+        "GET",
+        "/v1",
+        &[],
+        Some("operator-secret"),
+        &[("Origin", "null")],
+    );
+    assert_eq!(null_origin.status, 403);
+
+    let unknown_header = http_request_bytes_with_headers(
+        http,
+        "OPTIONS",
+        "/v1",
+        &[],
+        None,
+        &[
+            ("Origin", "https://app.example.test"),
+            ("Access-Control-Request-Method", "GET"),
+            ("Access-Control-Request-Headers", "x-ambient-authority"),
+        ],
+    );
+    assert_eq!(unknown_header.status, 403);
+}
+
+fn raw_http_status(port: u16, headers: &str) -> u16 {
+    use std::io::{BufRead, BufReader};
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let request = format!("GET /v1 HTTP/1.1\r\n{headers}Content-Length: 0\r\n\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut status_line = String::new();
+    BufReader::new(stream).read_line(&mut status_line).ok();
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .unwrap_or_default()
+}
+
+#[test]
+fn http_host_boundary_blocks_rebinding_and_accepts_loopback_aliases() {
+    let server = LuxServer::builder().http().start();
+    let http = server.http_port();
+
+    assert_eq!(raw_http_status(http, "Host: attacker.example\r\n"), 400);
+    assert_eq!(raw_http_status(http, "Host: 127.0.0.2\r\n"), 200);
+    assert_eq!(raw_http_status(http, "Host: localhost.\r\n"), 200);
+    assert_eq!(raw_http_status(http, ""), 400);
+    assert_eq!(
+        raw_http_status(http, "Host: localhost\r\nHost: localhost\r\n"),
+        400
+    );
+}
+
+#[test]
+fn studio_sessions_are_origin_bound_rotated_http_only_and_not_persistent() {
+    let origin = "http://localhost:5891";
+    let alternate_origin = "http://localhost:5892";
+    let mut server = LuxServer::builder()
+        .http()
+        .password("operator-secret")
+        .env("LUX_AUTH_ENABLED", "true")
+        .env(
+            "LUX_HTTP_ALLOWED_ORIGINS",
+            "http://localhost:5891,http://localhost:5892",
+        )
+        .start();
+    let mut http = server.http_port();
+
+    let minted = http_request_bytes_with_headers(
+        http,
+        "POST",
+        "/v1/studio/sessions",
+        br#"{"origin":"http://localhost:5891"}"#,
+        Some("operator-secret"),
+        &[],
+    );
+    assert_eq!(
+        minted.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&minted.body)
+    );
+    let session: serde_json::Value = serde_json::from_slice(&minted.body).unwrap();
+    let token = session["token"].as_str().unwrap();
+    assert!(token.starts_with("lux_studio_"));
+
+    let no_origin = http_request_bytes_with_headers(http, "GET", "/v1", &[], Some(token), &[]);
+    assert_eq!(no_origin.status, 401);
+
+    let trusted = http_request_bytes_with_headers(
+        http,
+        "GET",
+        "/v1",
+        &[],
+        Some(token),
+        &[("Origin", origin)],
+    );
+    assert_eq!(trusted.status, 200);
+    assert_eq!(trusted.header("Access-Control-Allow-Origin"), Some(origin));
+
+    let wrong_origin = http_request_bytes_with_headers(
+        http,
+        "GET",
+        "/v1",
+        &[],
+        Some(token),
+        &[("Origin", alternate_origin)],
+    );
+    assert_eq!(wrong_origin.status, 401);
+
+    let auth_admin = http_request_bytes_with_headers(
+        http,
+        "GET",
+        "/auth/v1/admin/providers",
+        &[],
+        Some(token),
+        &[("Origin", origin)],
+    );
+    assert_eq!(
+        auth_admin.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&auth_admin.body)
+    );
+
+    let remint = http_request_bytes_with_headers(
+        http,
+        "POST",
+        "/v1/studio/sessions",
+        br#"{"origin":"http://localhost:5891"}"#,
+        Some(token),
+        &[("Origin", origin)],
+    );
+    assert_eq!(remint.status, 403);
+
+    let rotated = http_request_bytes_with_headers(
+        http,
+        "POST",
+        "/v1/studio/sessions",
+        br#"{"origin":"http://localhost:5891"}"#,
+        Some("operator-secret"),
+        &[],
+    );
+    assert_eq!(rotated.status, 201);
+    let rotated: serde_json::Value = serde_json::from_slice(&rotated.body).unwrap();
+    let rotated_token = rotated["token"].as_str().unwrap();
+    assert_ne!(rotated_token, token);
+    let revoked = http_request_bytes_with_headers(
+        http,
+        "GET",
+        "/v1",
+        &[],
+        Some(token),
+        &[("Origin", origin)],
+    );
+    assert_eq!(revoked.status, 401);
+
+    let mut resp = server.conn();
+    let auth = common::send(&mut resp, &["AUTH", rotated_token]);
+    assert!(auth.starts_with('-'), "Studio token reached RESP: {auth}");
+
+    server.restart();
+    http = server.http_port();
+    let after_restart = http_request_bytes_with_headers(
+        http,
+        "GET",
+        "/v1",
+        &[],
+        Some(rotated_token),
+        &[("Origin", origin)],
+    );
+    assert_eq!(after_restart.status, 401);
+}
+
+#[test]
+fn studio_sessions_expire_on_a_real_listener() {
+    let origin = "http://localhost:5891";
+    let server = LuxServer::builder()
+        .http()
+        .password("operator-secret")
+        .env("LUX_HTTP_ALLOWED_ORIGINS", origin)
+        .env("LUX_STUDIO_SESSION_TTL_SECONDS", "1")
+        .start();
+    let http = server.http_port();
+    let minted = http_request_bytes_with_headers(
+        http,
+        "POST",
+        "/v1/studio/sessions",
+        br#"{"origin":"http://localhost:5891"}"#,
+        Some("operator-secret"),
+        &[],
+    );
+    assert_eq!(minted.status, 201);
+    let session: serde_json::Value = serde_json::from_slice(&minted.body).unwrap();
+    let token = session["token"].as_str().unwrap();
+    thread::sleep(Duration::from_millis(1_100));
+    let expired = http_request_bytes_with_headers(
+        http,
+        "GET",
+        "/v1",
+        &[],
+        Some(token),
+        &[("Origin", origin)],
+    );
+    assert_eq!(expired.status, 401);
 }
 
 #[test]
@@ -1430,6 +1783,32 @@ fn http_tables_rest() {
 
     let resp = get(http, "/v1/tables/users/count", "");
     assert!(resp.contains("1"), "count after delete: {resp}");
+}
+
+#[test]
+fn http_timeseries_numeric_timestamps_are_preserved() {
+    let server = LuxServer::builder().http().start();
+    let http = server.http_port();
+    let (status, body) = http_request(
+        http,
+        "POST",
+        "/v1/ts/numeric",
+        Some(r#"{"timestamp":1000,"value":42}"#),
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    let (_, body) = http_request(http, "GET", "/v1/ts/numeric?from=1000&to=1000", None, None);
+    assert!(body.contains("1000") && body.contains("42"), "{body}");
+    for timestamp in ["null", "true", "1.5", "{}", "[]", "9223372036854775808"] {
+        let payload = format!(r#"{{"timestamp":{timestamp},"value":99}}"#);
+        let (status, body) = http_request(http, "POST", "/v1/ts/numeric", Some(&payload), None);
+        assert_eq!(status, 400, "{timestamp}: {body}");
+    }
+    let (_, body) = http_request(http, "GET", "/v1/ts/numeric", None, None);
+    assert!(
+        !body.contains("99"),
+        "invalid timestamps must not write: {body}"
+    );
 }
 
 #[test]

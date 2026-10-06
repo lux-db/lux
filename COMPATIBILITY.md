@@ -34,13 +34,13 @@ separate:
 
 | Surface | 1.0 status | Contract | Executable owner |
 |---|---|---|---|
-| Engine RESP | Stable | RESP2 plus every `Supported` and `LuxNative` command in the command inventory. `Partial` commands are stable only for the exact behavior listed below. | `tests/redis_parity_inventory.rs` and command-family integration tests |
+| Engine RESP | Stable | RESP2 plus every `Supported` and `LuxNative` command in the command inventory. `Partial` commands are stable only for the exact behavior listed below. | `tests/redis_parity_inventory.rs`, command-family integration tests, and `tests/client-compat` |
 | Engine HTTP `/v1` | Stable | Version discovery, migrations, exec, KV, tables, time series, vectors, push, snapshot, and restore route families listed below. | `tests/http.rs`, `tests/auth.rs`, `tests/push.rs`, `tests/live_ws.rs`, and migration tests |
 | Engine app auth `/auth/v1` | Stable | Email/password, anonymous auth, refresh and PKCE flows, user/session lifecycle, Google/GitHub/Apple OAuth, project keys, admin users/providers/settings, and JWKS. | `tests/auth.rs` and auth unit tests |
 | Engine live WebSocket `/live` | Stable | Authenticated key and grant-scoped table subscriptions using the documented message shapes. | `tests/live_ws.rs` |
 | CLI local/self-hosted workflow | Stable | `init`, `start`, `stop`, `studio`, local `status`, `exec`, `connect`, `doctor`, `version`, `update engine`, `update studio`, migrations, auth providers, push, seed, encryption, types, and local env profiles. | CLI unit tests and `cli/tests/e2e-local.sh` |
 | CLI Cloud control-plane workflow | Excluded | Login, linking, project/key lifecycle, Cloud env profiles, logs, snapshots, restarts/updates, billing-aware create/destroy, and Cloud targets are maintained with Lux Cloud, not gated by OSS Engine 1.0. | Cloud integration tests |
-| TypeScript SDK | Stable | Direct RESP client plus HTTP project/browser/SSR clients for auth, tables, vectors, time series, realtime, and push. | `sdk/tests/*.test.ts` plus SDK typecheck/build |
+| TypeScript SDK | Stable | Direct RESP client plus HTTP project/browser/SSR clients for auth, tables, vectors, time series, realtime, and push. | `sdk/tests/*.test.ts`, SDK typecheck/build, and `sdk/tests/engine.integration.ts` against a built Engine |
 | TypeScript SDK storage client | Excluded | Object storage is Cloud-only; the OSS engine has no local object-storage service. | `sdk/tests/storage.test.ts` against its Cloud contract |
 | Swift SDK | Stable | Authentication/session handling and APNs device registration for Apple platforms. | `lux-swift/Tests/LuxTests` |
 | Swift data, realtime, storage, and push sending | Excluded | The 1.0 Swift contract is auth plus device registration, not a general database client. | Explicitly outside the Swift package surface |
@@ -115,6 +115,31 @@ client use unless a partial behavior or difference is documented below:
 Compatibility must be backed by integration tests and, where practical,
 Redis/Valkey differential tests.
 
+### Executable Client Matrix
+
+`just client-compat` builds a fresh Lux process, starts a pinned Valkey reference,
+and runs the same deterministic workload against both. The workload covers every
+compatible family listed above, plus authentication, binary values, pipelining,
+transactions, blocking operations, reconnects, Pub/Sub, explicit unsupported
+errors, and clean shutdown. It then exercises real third-party clients against
+Lux:
+
+| Client/reference | Pinned version | Tested contract |
+|---|---:|---|
+| Valkey | 8.1.9 | Differential reference for compatible command families |
+| `redis-cli` | 7.2.4 | Authentication, ordinary commands, and `--pipe` bulk import |
+| ioredis | 6.0.0 | RESP2, binary values, pipelines, blocking operations, and reconnects |
+| BullMQ | 6.3.4 | Real queues, concurrent workers, delayed jobs, retries, and queue events |
+| go-redis | 9.22.0 | Binary values, pipelines, transactions, blocking operations, Pub/Sub, and reconnects |
+
+redis-py and other RESP2 clients use the same documented protocol contract but
+are not installed as tooling for this repository's executable gate.
+
+The versions, package locks, and container image digests are committed with the
+gate. A version not listed here may work, but is not part of the executable 1.0
+claim until this matrix passes with that version. Modern client releases that
+default to RESP3 must be configured for protocol version 2.
+
 ## Redis OSS/Core Inventory
 
 The pinned Redis OSS/core command inventory lives in
@@ -130,28 +155,6 @@ known command as one of:
   tracked for this parity project.
 - **Excluded**: Redis OSS command intentionally outside this project.
 - **Lux-native**: public Lux command with no Redis compatibility claim.
-
-For local compatibility exploration, run selected Valkey Tcl suites against a
-running Lux RESP listener:
-
-```sh
-# Terminal 1
-cargo build
-LUX_PORT=6379 ./target/debug/lux
-
-# Terminal 2
-VALKEY_DIR="$PWD/../valkey" LUX_PORT=6379 just valkey-compat
-```
-
-The recipe is intentionally local/manual. It runs Redis OSS/core-oriented suites
-for strings, keyspace, lists, hashes, sets, sorted sets, streams, scripting, and
-transactions in durable mode so one missing command does not stop the whole
-report, with `VALKEY_TIMEOUT` defaulting to 60 seconds to keep blocking-command
-failures bounded. It does not run Redis Stack/module suites, cluster suites,
-replication suites, or CI gates. It ignores Valkey internal encoding checks and
-skips individual tests whose assertions are about replication, command
-propagation, or Valkey's exact expiry scheduling; those are separate
-compatibility targets from single-node command semantics.
 
 Current partial/stub surfaces:
 
@@ -275,8 +278,9 @@ deployments should use persisted `ENC` state and an externally supplied
 `LUX_ENC_SEAL_KEY`; the legacy forms remain readable for compatibility.
 
 `LUX_PUSH_ALLOW_PRIVATE_ENDPOINTS` set to `1` is **Excluded** from the
-production contract. It disables the Web Push private-network endpoint guard
-for local integration tests and must not be set in a production deployment.
+production contract. It permits APNs and Web Push delivery only to loopback
+mocks for local integration tests; all other private-network destinations stay
+blocked. It must not be set in a production deployment.
 
 The CLI's stable local configuration file is `lux/config.toml`. Its supported
 keys are `project_id`, `project_name`, `local_http_port`, `local_resp_port`, and
@@ -303,12 +307,19 @@ configuration interface.
 
 | File or payload | 1.0 status | Compatibility promise | Executable owner |
 |---|---|---|---|
-| `lux.dat` snapshot | Stable | Lux writes snapshot version 6 and reads the legacy pre-versioned format plus binary versions 1 through 6. Every Lux 1.x release must keep reading those formats. | snapshot unit tests, `tests/http.rs`, and crash-recovery tests |
+| `lux.dat` snapshot | Stable | Lux writes snapshot version 6 and reads the legacy pre-versioned format plus binary versions 1 through 6. Every Lux 1.x release must keep reading those formats. | snapshot unit tests, `tests/http.rs`, crash-recovery tests, and `cli/tests/lifecycle-matrix.mjs` |
 | `DUMP`/`RESTORE` payload | Stable within Lux | Lux 1.x preserves read compatibility for its own payloads. They are not Redis RDB payloads. | `tests/server.rs` |
 | `lux/migrations/*.lux` | Stable | UTF-8 command files with SHA-256 ledger identity; filename/content mismatches fail until explicitly repaired. | migration unit/integration tests and CLI E2E |
 | `lux/config.toml` | Stable | The five documented keys above retain their meaning throughout 1.x; unknown keys/comments survive CLI edits. | CLI config unit tests |
 | WAL (`LXW3`, with legacy readers) and tiered data (`LXD1`) | Excluded as interchange formats | They are private restart/recovery files. Durability is guaranteed as documented, but external tools must not parse or copy them independently of the complete data directory. | disk, tiered, reliability, and crash-recovery tests |
 | Encryption envelope/state (`LUXENC2`, `LUXENCSTATE1`) | Excluded as interchange formats | Private authenticated-encryption formats; access them only through Lux commands and complete snapshots. | encryption and corruption tests |
+
+The supported v0.37.0-to-1.0 transition is a final old-version snapshot imported
+into a fresh data directory with the required encryption keys. Stop application
+writes before that snapshot and preserve the old installation for backup-based
+rollback. Direct reuse of old WAL/tiered files and in-place downgrade to v0.37.0
+are not supported upgrade/rollback procedures. See the
+[upgrade runbook](DURABILITY.md#upgrading-from-v0370-to-10).
 
 ## Unsupported
 

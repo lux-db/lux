@@ -58,6 +58,7 @@
         "build": "bun scripts/build.ts",
         "licenses": "bun scripts/check-licenses.ts",
         "test": "bun test tests",
+        "test:engine": "bun tests/engine.integration.ts",
         "prepublishOnly": "bun run build"
     },
     "dependencies": {

@@ -550,53 +550,8 @@ impl Wal {
                 self.rollback_to(frame_start)?;
                 break;
             };
-            let payload = payload.as_slice();
-
-            let mut cursor = payload;
-            let argc = read_u32(&mut cursor).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("WAL frame has no argument count: {error}"),
-                )
-            })? as usize;
-            if argc == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "WAL frame contains an empty command",
-                ));
-            }
-
-            let mut args = Vec::new();
-            for _ in 0..argc {
-                args.push(read_bytes(&mut cursor).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("WAL frame contains a malformed argument: {error}"),
-                    )
-                })?);
-            }
-            if !cursor.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "WAL frame contains trailing bytes",
-                ));
-            }
-            checked_tail_offset = None;
-            if args.len() == 2 && args[0] == WAL_BATCH_MARKER {
-                commands.extend(decode_command_batch(&args[1])?);
-            } else if args.len() == 2 && args[0] == WAL_CHECKED_MARKER {
-                let mut checked = decode_command_batch(&args[1])?;
-                if checked.len() != 1 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "checked WAL frame must contain exactly one command",
-                    ));
-                }
-                commands.push(checked.pop().unwrap());
-                checked_tail_offset = Some(frame_start);
-            } else {
-                commands.push(args);
-            }
+            let checked = decode_wal_payload(&payload, &mut commands)?;
+            checked_tail_offset = checked.then_some(frame_start);
         }
         self.file.seek(SeekFrom::End(0))?;
         Ok(WalReplay {
@@ -606,13 +561,21 @@ impl Wal {
     }
 
     fn read_next_frame_payload(&mut self, file_len: u64) -> io::Result<Option<Vec<u8>>> {
-        if self.file.stream_position()? >= file_len {
+        Self::read_next_frame_payload_from(&mut self.file, file_len, self.frame_format)
+    }
+
+    fn read_next_frame_payload_from(
+        reader: &mut (impl Read + Seek),
+        file_len: u64,
+        frame_format: WalFrameFormat,
+    ) -> io::Result<Option<Vec<u8>>> {
+        if reader.stream_position()? >= file_len {
             return Ok(None);
         }
-        match self.frame_format {
+        match frame_format {
             WalFrameFormat::Guarded => {
                 let mut magic = [0u8; 4];
-                if let Err(error) = self.file.read_exact(&mut magic) {
+                if let Err(error) = reader.read_exact(&mut magic) {
                     return if error.kind() == io::ErrorKind::UnexpectedEof {
                         Ok(None)
                     } else {
@@ -625,17 +588,17 @@ impl Wal {
                         "WAL frame boundary marker is corrupt",
                     ));
                 }
-                let frame_len = match read_u32(&mut self.file) {
+                let frame_len = match read_u32(reader) {
                     Ok(value) => value,
                     Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
                     Err(error) => return Err(error),
                 };
-                let complement = match read_u32(&mut self.file) {
+                let complement = match read_u32(reader) {
                     Ok(value) => value,
                     Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
                     Err(error) => return Err(error),
                 };
-                let stored_crc = match read_u32(&mut self.file) {
+                let stored_crc = match read_u32(reader) {
                     Ok(value) => value,
                     Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
                     Err(error) => return Err(error),
@@ -653,7 +616,7 @@ impl Wal {
                         "WAL frame length exceeds maximum",
                     ));
                 }
-                let payload_start = self.file.stream_position()?;
+                let payload_start = reader.stream_position()?;
                 if payload_start
                     .checked_add(frame_len as u64)
                     .is_none_or(|end| end > file_len)
@@ -661,7 +624,7 @@ impl Wal {
                     return Ok(None);
                 }
                 let mut payload = vec![0u8; frame_len];
-                self.file.read_exact(&mut payload)?;
+                reader.read_exact(&mut payload)?;
                 let mut checksum_data = Vec::with_capacity(4 + payload.len());
                 checksum_data.extend_from_slice(&(frame_len as u32).to_le_bytes());
                 checksum_data.extend_from_slice(&payload);
@@ -678,7 +641,7 @@ impl Wal {
                 Ok(Some(payload))
             }
             WalFrameFormat::Checksummed | WalFrameFormat::Legacy => {
-                let frame_len = match read_u32(&mut self.file) {
+                let frame_len = match read_u32(reader) {
                     Ok(value) => value as usize,
                     Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
                     Err(error) => return Err(error),
@@ -689,7 +652,7 @@ impl Wal {
                         "WAL frame length exceeds maximum",
                     ));
                 }
-                let payload_start = self.file.stream_position()?;
+                let payload_start = reader.stream_position()?;
                 if payload_start
                     .checked_add(frame_len as u64)
                     .is_none_or(|end| end > file_len)
@@ -700,8 +663,8 @@ impl Wal {
                     ));
                 }
                 let mut frame = vec![0u8; frame_len];
-                self.file.read_exact(&mut frame)?;
-                if self.frame_format == WalFrameFormat::Legacy {
+                reader.read_exact(&mut frame)?;
+                if frame_format == WalFrameFormat::Legacy {
                     return Ok(Some(frame));
                 }
                 if frame.len() < 4 {
@@ -869,6 +832,85 @@ impl Wal {
                 .ok_or_else(|| io::Error::other("WAL path has no parent directory"))?,
         )
     }
+}
+
+fn decode_wal_payload(payload: &[u8], commands: &mut Vec<Vec<Vec<u8>>>) -> io::Result<bool> {
+    let mut cursor = payload;
+    let argc = read_u32(&mut cursor).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("WAL frame has no argument count: {error}"),
+        )
+    })? as usize;
+    if argc == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WAL frame contains an empty command",
+        ));
+    }
+
+    let mut args = Vec::new();
+    for _ in 0..argc {
+        args.push(read_bytes(&mut cursor).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("WAL frame contains a malformed argument: {error}"),
+            )
+        })?);
+    }
+    if !cursor.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WAL frame contains trailing bytes",
+        ));
+    }
+    if args.len() == 2 && args[0] == WAL_BATCH_MARKER {
+        commands.extend(decode_command_batch(&args[1])?);
+        Ok(false)
+    } else if args.len() == 2 && args[0] == WAL_CHECKED_MARKER {
+        let mut checked = decode_command_batch(&args[1])?;
+        if checked.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "checked WAL frame must contain exactly one command",
+            ));
+        }
+        commands.push(checked.pop().unwrap());
+        Ok(true)
+    } else {
+        commands.push(args);
+        Ok(false)
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn check_wal_input(data: &[u8]) {
+    let _ = decode_wal_payload(data, &mut Vec::new());
+    for format in [
+        WalFrameFormat::Legacy,
+        WalFrameFormat::Checksummed,
+        WalFrameFormat::Guarded,
+    ] {
+        let mut cursor = std::io::Cursor::new(data);
+        while let Ok(Some(payload)) =
+            Wal::read_next_frame_payload_from(&mut cursor, data.len() as u64, format)
+        {
+            let _ = decode_wal_payload(&payload, &mut Vec::new());
+        }
+    }
+    // Supply a valid frame envelope so mutations also reach payload decoding.
+    let mut framed = Vec::new();
+    Wal::encode_guarded_payload(data, &mut framed);
+    let mut cursor = std::io::Cursor::new(&framed);
+    let decoded = Wal::read_next_frame_payload_from(
+        &mut cursor,
+        framed.len() as u64,
+        WalFrameFormat::Guarded,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(decoded, data);
+    let _ = decode_wal_payload(&decoded, &mut Vec::new());
 }
 
 fn wal_header_crc(generation: &[u8; WAL_GENERATION_LEN]) -> u32 {
@@ -1874,28 +1916,31 @@ fn write_stream_groups(w: &mut impl Write, groups: &[StreamGroupDump]) -> io::Re
 }
 
 fn read_stream_groups(r: &mut impl Read) -> io::Result<Vec<StreamGroupDump>> {
-    let group_count = match read_u32(r) {
-        Ok(count) => count as usize,
+    let mut count = [0u8; 4];
+    match r.read_exact(&mut count[..1]) {
+        Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
         Err(e) => return Err(e),
-    };
-    let mut groups = Vec::with_capacity(group_count);
+    }
+    r.read_exact(&mut count[1..])?;
+    let group_count = u32::from_le_bytes(count) as usize;
+    let mut groups = Vec::new();
     for _ in 0..group_count {
         let name = read_string(r)?;
         let last_delivered_id = read_string(r)?;
         let consumer_count = read_u32(r)? as usize;
-        let mut consumers = Vec::with_capacity(consumer_count);
+        let mut consumers = Vec::new();
         for _ in 0..consumer_count {
             let consumer = read_string(r)?;
             let pending_count = read_u32(r)? as usize;
-            let mut pending_ids = Vec::with_capacity(pending_count);
+            let mut pending_ids = Vec::new();
             for _ in 0..pending_count {
                 pending_ids.push(read_string(r)?);
             }
             consumers.push((consumer, pending_ids));
         }
         let pending_count = read_u32(r)? as usize;
-        let mut pending = Vec::with_capacity(pending_count);
+        let mut pending = Vec::new();
         for _ in 0..pending_count {
             let id = read_string(r)?;
             let consumer = read_string(r)?;
@@ -2104,8 +2149,7 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
         }
         b'P' => {
             let len = read_u32(r)? as usize;
-            let mut regs = vec![0u8; len];
-            r.read_exact(&mut regs)?;
+            let regs = crate::hll::read_registers(r, len)?;
             let cached = crate::hll::hll_count(&regs);
             DumpValue::HyperLogLog(regs, cached)
         }
@@ -3362,6 +3406,44 @@ mod tests {
     // -----------------------------------------------------------------------
     use proptest::prelude::*;
 
+    #[test]
+    fn invalid_hll_register_count_is_rejected() {
+        let mut data = vec![b'P'];
+        write_bytes(&mut data, b"hll").unwrap();
+        write_i64(&mut data, -1).unwrap();
+        write_u32(&mut data, u32::MAX).unwrap();
+        assert_eq!(
+            read_single_entry(&mut data.as_slice()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn truncated_stream_collections_return_eof() {
+        assert!(read_stream_groups(&mut &[][..]).unwrap().is_empty());
+        for prefix in 1..4 {
+            assert_eq!(
+                read_stream_groups(&mut &b"\0\0\0"[..prefix])
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+        // Each prefix ends with a declared collection whose entries are absent.
+        for counts in [
+            vec![u32::MAX],
+            vec![1, 0, 0, u32::MAX],
+            vec![1, 0, 0, 1, 0, u32::MAX],
+            vec![1, 0, 0, 0, u32::MAX],
+        ] {
+            let data: Vec<u8> = counts.into_iter().flat_map(u32::to_le_bytes).collect();
+            assert_eq!(
+                read_stream_groups(&mut data.as_slice()).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
+
     fn arb_bytes() -> impl Strategy<Value = Vec<u8>> {
         prop::collection::vec(any::<u8>(), 0..256)
     }
@@ -3387,7 +3469,7 @@ mod tests {
                 prop::option::of(arb_string())
             )
                 .prop_map(|(data, meta)| DumpValue::Vector(data, meta, false)),
-            prop::collection::vec(any::<u8>(), 0..256).prop_map(|regs| {
+            prop::collection::vec(0u8..=51, crate::hll::HLL_REGISTERS).prop_map(|regs| {
                 let cached = crate::hll::hll_count(&regs);
                 DumpValue::HyperLogLog(regs, cached)
             }),

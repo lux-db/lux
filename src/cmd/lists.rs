@@ -42,19 +42,17 @@ fn parse_list_side(arg: &[u8], out: &mut BytesMut) -> Option<bool> {
 }
 
 fn parse_block_timeout(arg: &[u8], out: &mut BytesMut) -> Option<Duration> {
-    match arg_str(arg).parse::<f64>() {
-        Ok(secs) if secs >= 0.0 && secs.is_finite() && secs <= u64::MAX as f64 => {
-            Some(if secs == 0.0 {
-                Duration::from_secs(300)
-            } else {
-                Duration::from_secs_f64(secs)
-            })
-        }
-        _ => {
-            resp::write_error(out, "ERR timeout is not a float or out of range");
-            None
-        }
+    let duration = match arg_str(arg).parse::<f64>() {
+        Ok(0.0) => Some(Duration::from_secs(300)),
+        Ok(secs) if secs > 0.0 => Duration::try_from_secs_f64(secs)
+            .ok()
+            .filter(|duration| tokio::time::Instant::now().checked_add(*duration).is_some()),
+        _ => None,
+    };
+    if duration.is_none() {
+        resp::write_error(out, "ERR timeout is not a float or out of range");
     }
+    duration
 }
 
 /// Decrypt a list element for output, passing plaintext (and, defensively, any

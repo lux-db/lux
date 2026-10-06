@@ -217,6 +217,186 @@ async fn run_with_config_rejects_invalid_shard_counts() {
 }
 
 #[tokio::test]
+async fn run_with_config_rejects_zero_or_incoherent_server_limits() {
+    let count_mutators: &[fn(&mut lux::ServerLimits)] = &[
+        |limits| limits.max_resp_connections = 0,
+        |limits| limits.max_http_connections = 0,
+        |limits| limits.max_blocked_clients = 0,
+        |limits| limits.max_resp_pipeline_commands = 0,
+        |limits| limits.max_resp_command_args = 0,
+        |limits| limits.max_resp_subscriptions = 0,
+        |limits| limits.max_subscription_name_bytes = 0,
+        |limits| limits.max_live_subscriptions = 0,
+        |limits| limits.max_subscriptions = 0,
+        |limits| limits.max_query_candidates = 0,
+        |limits| limits.max_blocking_keys = 0,
+        |limits| limits.max_resp_response = 0,
+        |limits| limits.max_request_buffer_bytes = 0,
+        |limits| limits.max_response_buffer_bytes = 0,
+        |limits| limits.max_auth_workers = 0,
+        |limits| limits.max_script_memory = 0,
+    ];
+    let deadline_mutators: &[fn(&mut lux::ServerLimits)] = &[
+        |limits| limits.resp_idle_timeout = std::time::Duration::ZERO,
+        |limits| limits.resp_request_timeout = std::time::Duration::ZERO,
+        |limits| limits.http_header_timeout = std::time::Duration::ZERO,
+        |limits| limits.http_body_timeout = std::time::Duration::ZERO,
+        |limits| limits.http_keep_alive_timeout = std::time::Duration::ZERO,
+        |limits| limits.live_idle_timeout = std::time::Duration::ZERO,
+        |limits| limits.write_timeout = std::time::Duration::ZERO,
+    ];
+
+    for mutate in count_mutators.iter().chain(deadline_mutators) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut limits = lux::ServerLimits::default();
+        mutate(&mut limits);
+        let cfg = lux::ServerConfig {
+            enable_resp: false,
+            data_dir: tmp.path().display().to_string(),
+            limits,
+            ..Default::default()
+        };
+        let err = match lux::run_with_config(cfg).await {
+            Ok(handle) => {
+                handle.shutdown_and_wait().await.unwrap();
+                panic!("run_with_config accepted an invalid server limit");
+            }
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    for (max_body, max_resp_request) in [(0, 1024), (1024, 0)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = lux::ServerConfig {
+            enable_resp: false,
+            data_dir: tmp.path().display().to_string(),
+            max_body,
+            max_resp_request,
+            ..Default::default()
+        };
+        let err = match lux::run_with_config(cfg).await {
+            Ok(handle) => {
+                handle.shutdown_and_wait().await.unwrap();
+                panic!("run_with_config accepted a zero request limit");
+            }
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let limits = lux::ServerLimits {
+        max_request_buffer_bytes: 1024,
+        ..Default::default()
+    };
+    let cfg = lux::ServerConfig {
+        enable_resp: false,
+        data_dir: tmp.path().display().to_string(),
+        max_body: 2048,
+        max_resp_request: 512,
+        limits,
+        ..Default::default()
+    };
+    let err = match lux::run_with_config(cfg).await {
+        Ok(handle) => {
+            handle.shutdown_and_wait().await.unwrap();
+            panic!("run_with_config accepted a shared request budget below one request");
+        }
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let limits = lux::ServerLimits {
+        max_response_buffer_bytes: 1024,
+        ..Default::default()
+    };
+    let cfg = lux::ServerConfig {
+        enable_resp: false,
+        data_dir: tmp.path().display().to_string(),
+        limits,
+        ..Default::default()
+    };
+    let err = match lux::run_with_config(cfg).await {
+        Ok(handle) => {
+            handle.shutdown_and_wait().await.unwrap();
+            panic!("run_with_config accepted a shared response budget below one response");
+        }
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let limits = lux::ServerLimits {
+        max_resp_response: 35,
+        ..Default::default()
+    };
+    let cfg = lux::ServerConfig {
+        enable_resp: false,
+        data_dir: tmp.path().display().to_string(),
+        limits,
+        ..Default::default()
+    };
+    let err = match lux::run_with_config(cfg).await {
+        Ok(handle) => {
+            handle.shutdown_and_wait().await.unwrap();
+            panic!("run_with_config accepted a response limit smaller than its protocol error");
+        }
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    for mutate in [
+        (|limits: &mut lux::ServerLimits| limits.max_resp_connections = usize::MAX)
+            as fn(&mut lux::ServerLimits),
+        |limits| limits.max_http_connections = usize::MAX,
+        |limits| limits.max_blocked_clients = usize::MAX,
+        |limits| limits.max_auth_workers = usize::MAX,
+        |limits| limits.max_query_candidates = usize::MAX,
+        |limits| limits.resp_idle_timeout = std::time::Duration::MAX,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut limits = lux::ServerLimits::default();
+        mutate(&mut limits);
+        let cfg = lux::ServerConfig {
+            enable_resp: false,
+            data_dir: tmp.path().display().to_string(),
+            limits,
+            ..Default::default()
+        };
+        let err = match lux::run_with_config(cfg).await {
+            Ok(handle) => {
+                handle.shutdown_and_wait().await.unwrap();
+                panic!("run_with_config accepted a limit that can panic at runtime");
+            }
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let limits = lux::ServerLimits {
+        max_resp_response: 512,
+        max_request_buffer_bytes: 4096,
+        max_response_buffer_bytes: 512,
+        ..Default::default()
+    };
+    let cfg = lux::ServerConfig {
+        enable_resp: false,
+        data_dir: tmp.path().display().to_string(),
+        max_body: 4096,
+        max_resp_request: 4096,
+        limits,
+        ..Default::default()
+    };
+    let handle = lux::run_with_config(cfg)
+        .await
+        .expect("request limits larger than the response budget should be supported");
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
 async fn embedded_client_rejects_invalid_utf8_key_identity() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = lux::ServerConfig {

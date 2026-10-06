@@ -3,7 +3,7 @@ mod common;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::Child;
 use std::time::Duration;
 use tokio_tungstenite::connect_async;
@@ -27,11 +27,7 @@ impl Drop for LuxServer {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    common::free_port()
 }
 
 fn start_lux(resp_port: u16, http_port: u16, password: Option<&str>) -> LuxServer {
@@ -45,7 +41,7 @@ fn start_lux_with_env(
     extra_env: &[(&str, &str)],
 ) -> LuxServer {
     let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_lux"));
-    let tmpdir = std::env::temp_dir().join(format!(
+    let tmpdir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "lux_live_ws_test_{}_{}",
         std::process::id(),
         http_port
@@ -72,7 +68,7 @@ fn start_lux_with_env(
         cmd.env(key, value);
     }
 
-    let child = cmd.spawn().expect("failed to start lux");
+    let child = common::spawn_lux(&mut cmd).expect("failed to start lux");
     let server = LuxServer { child, tmpdir };
     for _ in 0..80 {
         if TcpStream::connect(("127.0.0.1", http_port)).is_ok()
@@ -162,6 +158,92 @@ async fn connect_live(http_port: u16, password: Option<&str>) -> TestWs {
     }
     let (ws, _) = connect_async(request).await.expect("websocket connect");
     ws
+}
+
+#[tokio::test]
+async fn websocket_origin_and_studio_expiry_use_the_http_browser_boundary() {
+    let resp_port = free_port();
+    let http_port = free_port();
+    let origin = "https://app.example.test";
+    let _server = start_lux_with_env(
+        resp_port,
+        http_port,
+        Some("secret"),
+        &[
+            ("LUX_HTTP_ALLOWED_ORIGINS", origin),
+            ("LUX_STUDIO_SESSION_TTL_SECONDS", "1"),
+        ],
+    );
+
+    let mut malicious = format!("ws://127.0.0.1:{http_port}/live")
+        .into_client_request()
+        .unwrap();
+    malicious
+        .headers_mut()
+        .insert("Authorization", HeaderValue::from_static("Bearer secret"));
+    malicious.headers_mut().insert(
+        "Origin",
+        HeaderValue::from_static("https://attacker.example"),
+    );
+    let error = connect_async(malicious)
+        .await
+        .expect_err("malicious WebSocket Origin must be rejected");
+    assert!(
+        error.to_string().contains("403"),
+        "unexpected error: {error}"
+    );
+
+    let mut trusted = format!("ws://127.0.0.1:{http_port}/live")
+        .into_client_request()
+        .unwrap();
+    trusted
+        .headers_mut()
+        .insert("Authorization", HeaderValue::from_static("Bearer secret"));
+    trusted
+        .headers_mut()
+        .insert("Origin", HeaderValue::from_static(origin));
+    let (mut operator_socket, response) = connect_async(trusted).await.expect("trusted Origin");
+    assert_eq!(response.status(), 101);
+    operator_socket.close(None).await.unwrap();
+
+    let (status, minted) = http_json_request(
+        http_port,
+        "POST",
+        "/v1/studio/sessions",
+        r#"{"origin":"https://app.example.test"}"#,
+        Some("secret"),
+    );
+    assert_eq!(status, 201, "mint Studio session: {minted}");
+    let token = minted["token"].as_str().unwrap();
+    let mut studio = format!("ws://127.0.0.1:{http_port}/live?token={token}")
+        .into_client_request()
+        .unwrap();
+    studio
+        .headers_mut()
+        .insert("Origin", HeaderValue::from_static(origin));
+    let (mut studio_socket, response) = connect_async(studio)
+        .await
+        .expect("Studio WebSocket session");
+    assert_eq!(response.status(), 101);
+
+    let revoked = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            match studio_socket.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let message: Value = serde_json::from_str(&text).unwrap();
+                    if message["error"]["code"] == "AUTH_REVOKED" {
+                        break true;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => break false,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("Studio WebSocket failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("Studio WebSocket session did not expire");
+    assert!(revoked, "Studio WebSocket closed without an expiry error");
 }
 
 async fn send_json(ws: &mut TestWs, value: Value) {
@@ -1129,7 +1211,7 @@ async fn live_table_where_predicate_transitions_emit_incremental_deltas() {
     let e = recv_live_event(&mut ws, "open").await;
     assert_eq!(e["kind"], "delete", "move-out should read as delete: {e}");
     assert_eq!(e["pk"], "t1");
-    assert_eq!(e["cause"]["kind"], "table.delete");
+    assert_eq!(e["cause"]["kind"], "table.delete", "move-out cause: {e}");
 
     // An UPDATE to a row that is out of the set on both sides -> no event.
     let (status, _) = http_json_request(

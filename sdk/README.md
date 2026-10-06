@@ -4,6 +4,51 @@ Official TypeScript SDK for Lux.
 
 Use the project client for browser, server, and SSR app code. Use the direct client when you want low-level Redis-compatible access to a Lux instance.
 
+## Request lifecycle
+
+HTTP project and auth requests have a 30-second deadline covering response headers
+and body consumption. Set `requestTimeoutMs` when constructing a client to choose
+a different positive millisecond deadline. Auth inherits the project's deadline;
+`auth.requestTimeoutMs` can override it. Cloud object-transfer requests through
+the storage namespace are separate from this Engine HTTP contract.
+
+Pass an `AbortController`'s `signal` in client options to cancel that client's
+HTTP work, including auth. Construct a new client after cancelling it. For an
+individual low-level call, `client.request(method, path, body, { signal })` also
+accepts a request-specific signal; either signal can cancel that request.
+Timeout/cancellation remain in the usual `{ data, error }` result, with
+`LUX_REQUEST_TIMEOUT` or `LUX_REQUEST_ABORTED` in `error.details.code`.
+
+The SDK does not automatically replay HTTP writes after a timeout or connection
+failure: the server may already have applied the operation. Reconcile application
+state before retrying a write. Live connections retry at most once per second,
+resubscribe to the desired queries, and receive fresh snapshots. They do not
+promise replay of every event missed while disconnected. Async iterators are
+bounded to 1,024 buffered events and report `LIVE_ITERATOR_OVERFLOW` rather than
+silently dropping data. Unsubscribe when a view no longer needs its query.
+
+## Validate against an Engine
+
+The SDK source accompanying Lux 1.0 targets the documented Engine 1.x contract.
+SDK and Engine versions are independent; a future incompatible SDK API change
+requires an SDK major version. Object storage remains Cloud-only. Older 0.x
+Engines are not covered by the 1.x compatibility promise.
+
+```bash
+bun install --frozen-lockfile
+bun test tests
+bun run build
+LUX_TEST_ENGINE_BIN=/absolute/path/to/lux \
+  LUX_TEST_WORK_DIR=/absolute/path/to/disposable-output \
+  bun run test:engine
+```
+
+The opt-in integration runner tests the built package against two isolated
+loopback engines, using fresh data directories and test-only credentials. It
+does not connect to an existing local or Cloud project or send notifications.
+It stops its engines and retains fixture data/logs for inspection. Remove the
+chosen output directory after inspecting a run.
+
 ## Install
 
 ```bash
@@ -13,8 +58,8 @@ bun i @luxdb/sdk
 ## Browser app client
 
 Use a publishable key in browser code. The browser client persists auth sessions
-in the shared `lux-auth-session` cookie by default.
-Like Supabase's SSR client, `createBrowserClient` returns a singleton in browser
+in a project-scoped `lux-auth-session-<encoded-project-url>` cookie by default.
+`createBrowserClient` returns a singleton per URL, key, and session storage name in browser
 environments, broadcasts auth changes across tabs, and recovers the cookie-backed
 session when the document becomes visible. Refresh calls are coalesced within a
 JavaScript realm. In browsers that support the Web Locks API, tabs also serialize
@@ -418,9 +463,19 @@ const { data: users, error } = await admin.auth.listUsers();
 ## SSR client
 
 Use `createServerClient` with your framework's cookie methods to persist sessions on the server.
-The SSR and browser clients share the `lux-auth-session` cookie by default, so a
+The SSR and browser clients share the same project-scoped cookie by default, so a
 session created in a SvelteKit action is available to the browser client after
 the response is applied.
+
+Use the same project URL in both clients. Trailing slashes are ignored; different
+hosts, ports, or project paths have separate sessions. Key rotation does not
+rename the session cookie. Custom `auth.storageKey` values remain supported;
+choose a distinct name for each project and use it on both browser and server.
+
+Upgrading from the old unscoped defaults (`lux-auth-session` cookies or
+`lux.auth.session` storage) requires signing in again. The SDK does not import an
+unscoped session because it cannot tell which project owns it. Applications that
+already specify a project-specific `auth.storageKey` keep that name unchanged.
 
 ```ts
 import { createServerClient } from "@luxdb/sdk/ssr";

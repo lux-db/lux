@@ -2,22 +2,27 @@ use base64::Engine;
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpSocket;
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{broadcast, oneshot, watch, Semaphore};
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::lua;
-use crate::pubsub::Broker;
+use crate::pubsub::{Broker, SubscriptionReservation};
 use crate::store::Store;
 use crate::tables::SharedSchemaCache;
-use crate::{CommandExecutor, CommandSession, LuxError};
+use crate::{ByteBudget, CommandExecutor, CommandSession, DeadlineStream, LuxError, ServerLimits};
+
+mod browser_security;
+use browser_security::{normalize_origin, BrowserPolicy, StudioSessions};
 
 const WEBSOCKET_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -30,6 +35,8 @@ enum HttpAuthContext {
     /// password for data.
     Secret,
     Operator,
+    /// In-memory browser session minted by the local CLI for one exact origin.
+    Studio,
     User(crate::auth::AuthPrincipal),
 }
 
@@ -42,7 +49,7 @@ fn decrypt_authorized(ctx: &HttpAuthContext) -> bool {
     match ctx {
         // A secret key is a server-side credential with full project access, so
         // it sees plaintext exactly as the operator does.
-        HttpAuthContext::Operator | HttpAuthContext::Secret => true,
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => true,
         HttpAuthContext::User(p) => !p.is_anonymous,
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => false,
     }
@@ -57,6 +64,11 @@ pub struct HttpServerConfig {
     pub http_port: u16,
     pub max_rows: Option<usize>,
     pub max_body: usize,
+    pub limits: ServerLimits,
+    pub request_budget: ByteBudget,
+    pub response_budget: ByteBudget,
+    pub auth_workers: Arc<Semaphore>,
+    pub browser: crate::HttpBrowserConfig,
     pub on_ready: Option<Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>>,
     pub startup_ready: Option<oneshot::Sender<std::io::Result<std::net::SocketAddr>>>,
 }
@@ -65,12 +77,112 @@ pub struct HttpServerConfig {
 struct RequestLimits {
     max_rows: Option<usize>,
     max_body: usize,
+    server: ServerLimits,
+}
+
+#[derive(Clone)]
+struct HttpServices {
+    store: Arc<Store>,
+    broker: Broker,
+    cache: SharedSchemaCache,
+    script_engine: Arc<lua::ScriptEngine>,
+    browser_policy: BrowserPolicy,
+    studio_sessions: StudioSessions,
+    request_budget: ByteBudget,
+    response_budget: ByteBudget,
+    auth_workers: Arc<Semaphore>,
+}
+
+struct LiveServices {
+    store: Arc<Store>,
+    broker: Broker,
+    cache: SharedSchemaCache,
+    studio_sessions: StudioSessions,
+    request_budget: ByteBudget,
+    limits: RequestLimits,
+}
+
+#[derive(Clone, Copy)]
+struct LiveClientContext<'a> {
+    broker: &'a Broker,
+    store: &'a Arc<Store>,
+    cache: &'a SharedSchemaCache,
+    principal: Option<&'a crate::auth::AuthPrincipal>,
+    limits: RequestLimits,
+}
+
+#[derive(Default)]
+struct HttpResponseContext {
+    cors_origin: Option<String>,
+    diagnostic: Option<HttpDiagnostic>,
+}
+
+struct HttpDiagnostic {
+    store: Arc<Store>,
+    request_id: usize,
+    started: Instant,
+    operation: &'static str,
+    status: std::sync::atomic::AtomicU16,
+}
+
+impl Drop for HttpDiagnostic {
+    fn drop(&mut self) {
+        let elapsed_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let status = self.status.load(std::sync::atomic::Ordering::Relaxed);
+        let failed = status == 0 || status >= 500;
+        if self.operation != "live"
+            && (elapsed_ms >= 1000 || failed)
+            && self.store.config().on_warn.is_some()
+            && self.store.allow_slow_http_log()
+        {
+            let event = if failed {
+                crate::ServerWarnEvent::HttpRequestFailed {
+                    request_id: self.request_id,
+                    operation: self.operation,
+                    status,
+                    elapsed_ms,
+                }
+            } else {
+                crate::ServerWarnEvent::SlowHttpRequest {
+                    request_id: self.request_id,
+                    operation: self.operation,
+                    status,
+                    elapsed_ms,
+                }
+            };
+            crate::emit_warn(self.store.config(), event);
+        }
+    }
+}
+
+impl HttpResponseContext {
+    fn cors_headers(&self) -> String {
+        let mut headers = self
+            .cors_origin
+            .as_ref()
+            .map_or_else(String::new, |origin| {
+                format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\nAccess-Control-Expose-Headers: X-Lux-Request-Id, Content-Range, X-Lux-Snapshot-SHA256, X-Lux-Snapshot-Format\r\n")
+            });
+        if let Some(diagnostic) = &self.diagnostic {
+            headers.push_str(&format!("X-Lux-Request-Id: {}\r\n", diagnostic.request_id));
+        }
+        headers
+    }
+
+    fn record_status(&self, status: u16) {
+        if let Some(diagnostic) = &self.diagnostic {
+            diagnostic
+                .status
+                .store(status, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 struct LiveIdentity {
     principal: Option<crate::auth::AuthPrincipal>,
     user_credential: Option<crate::auth::UserCredential>,
     secret_credential: Option<crate::auth::SecretCredential>,
+    studio_session: Option<(String, String)>,
 }
 
 /// Start the HTTP API listener and serve requests forever.
@@ -82,6 +194,8 @@ pub async fn start_http_server(
     script_engine: Arc<lua::ScriptEngine>,
     mut shutdown_rx: watch::Receiver<Option<std::time::Duration>>,
 ) -> std::io::Result<()> {
+    let browser_policy = BrowserPolicy::try_new(&config.bind_host, &config.browser)?;
+    let studio_sessions = StudioSessions::new(config.browser.studio_session_ttl);
     let addr: std::net::SocketAddr = format!("{}:{}", config.bind_host, config.http_port)
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -106,9 +220,22 @@ pub async fn start_http_server(
     let limits = RequestLimits {
         max_rows: config.max_rows,
         max_body: config.max_body,
+        server: config.limits,
+    };
+    let services = HttpServices {
+        store,
+        broker,
+        cache,
+        script_engine,
+        browser_policy,
+        studio_sessions,
+        request_budget: config.request_budget,
+        response_budget: config.response_budget,
+        auth_workers: config.auth_workers,
     };
 
     let mut connections = JoinSet::new();
+    let connection_permits = Arc::new(Semaphore::new(config.limits.max_http_connections));
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => break,
@@ -116,27 +243,61 @@ pub async fn start_http_server(
                 let _ = joined;
             }
             accepted = listener.accept() => {
-                let (socket, _) = accepted?;
-                let store = store.clone();
-                let broker = broker.clone();
-                let cache = cache.clone();
-                let script_engine = script_engine.clone();
+                let (mut socket, _) = accepted?;
+                // Small keep-alive responses must not wait for a delayed ACK
+                // between their header and body writes, as on the RESP listener.
+                socket.set_nodelay(true).ok();
+                let permit = match connection_permits.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        services.store.reject_http_connection();
+                        let _ = tokio::time::timeout(
+                            config.limits.write_timeout,
+                            socket.write_all(
+                                b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 43\r\n\r\n{\"error\":\"server connection limit reached\"}",
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let services = services.clone();
                 let connection_shutdown = shutdown_rx.clone();
 
                 connections.spawn(async move {
-                    let mut stream = socket;
+                    let _permit = permit;
+                    services.store.http_client_connected();
+                    let mut stream = DeadlineStream::with_write_budget(
+                        socket,
+                        limits.server.write_timeout,
+                        usize::MAX,
+                        services.response_budget.clone(),
+                    );
                     let mut connection_shutdown = connection_shutdown;
-                    while let Ok(true) = handle_request(
-                        &mut stream,
-                        &store,
-                        &broker,
-                        &cache,
-                        &script_engine,
-                        limits,
-                        &mut connection_shutdown,
-                    )
-                    .await
-                    {}
+                    let mut first_request = true;
+                    loop {
+                        match handle_request(
+                            &mut stream,
+                            &services,
+                            limits,
+                            &mut connection_shutdown,
+                            first_request,
+                        )
+                        .await
+                        {
+                            Ok(true) => first_request = false,
+                            Ok(false) => break,
+                            Err(error) => {
+                                if error.kind() == std::io::ErrorKind::TimedOut {
+                                    services.store.record_connection_timeout();
+                                } else if error.kind() == std::io::ErrorKind::OutOfMemory {
+                                    services.store.reject_response_buffer();
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    services.store.http_client_disconnected();
                 });
             }
         }
@@ -154,91 +315,284 @@ fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpL
 }
 
 async fn handle_request(
-    socket: &mut tokio::net::TcpStream,
-    store: &Arc<Store>,
-    broker: &Broker,
-    cache: &SharedSchemaCache,
-    script_engine: &Arc<lua::ScriptEngine>,
+    socket: &mut DeadlineStream,
+    services: &HttpServices,
     limits: RequestLimits,
     shutdown_rx: &mut watch::Receiver<Option<std::time::Duration>>,
+    first_request: bool,
 ) -> std::io::Result<bool> {
-    // Hard limits to prevent memory exhaustion DoS
+    let HttpServices {
+        store,
+        broker,
+        cache,
+        script_engine,
+        browser_policy,
+        studio_sessions,
+        request_budget,
+        auth_workers,
+        ..
+    } = services;
+    let mut response = HttpResponseContext::default();
+    // Hard limits keep request memory finite.
     const MAX_HEADER_SIZE: usize = 64 * 1024; // 64 KB headers
 
     let mut buf = vec![0u8; 65536];
     let mut data = Vec::new();
+    let mut request_reservation = request_budget.reservation();
 
     if shutdown_rx.borrow().is_some() {
         return Ok(false);
     }
 
-    loop {
-        // Before the first byte this is an idle connection. Once any request
-        // bytes arrive, finish that request rather than cutting it off midway.
-        let n = if data.is_empty() {
-            tokio::select! {
-                _ = shutdown_rx.changed() => return Ok(false),
-                read = socket.read(&mut buf) => read?,
-            }
+    let mut first_byte = true;
+    let mut header_deadline = tokio::time::Instant::now()
+        + if first_request {
+            limits.server.http_header_timeout
         } else {
-            socket.read(&mut buf).await?
+            limits.server.http_keep_alive_timeout
         };
+    loop {
+        let read = tokio::select! {
+            _ = shutdown_rx.changed() => return Ok(false),
+            _ = tokio::time::sleep_until(header_deadline) => {
+                store.record_connection_timeout();
+                if data.is_empty() {
+                    return Ok(false);
+                }
+                let _ = send_json(
+                    socket,
+                    408,
+                    "Request Timeout",
+                    r#"{"error":"request header timeout"}"#,
+                    &response,
+                ).await?;
+                return Ok(false);
+            }
+            read = socket.read(&mut buf) => read,
+        };
+        let n = read?;
         if n == 0 {
             return Ok(false);
         }
+        if !request_reservation.try_grow(n) {
+            store.reject_request_buffer();
+            let _ = send_json(
+                socket,
+                503,
+                "Service Unavailable",
+                r#"{"error":"request buffer capacity exhausted"}"#,
+                &response,
+            )
+            .await?;
+            return Ok(false);
+        }
         data.extend_from_slice(&buf[..n]);
-
-        if data.len() > MAX_HEADER_SIZE {
-            let body = r#"{"error":"request headers too large"}"#;
-            return send_json(socket, 431, "Request Header Fields Too Large", body).await;
+        if first_byte {
+            first_byte = false;
+            header_deadline = tokio::time::Instant::now() + limits.server.http_header_timeout;
         }
 
-        if data.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+        if let Some(position) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+            if position + 4 <= MAX_HEADER_SIZE {
+                break;
+            }
+        }
+        if data.len() > MAX_HEADER_SIZE {
+            let body = r#"{"error":"request headers too large"}"#;
+            let _ = send_json(
+                socket,
+                431,
+                "Request Header Fields Too Large",
+                body,
+                &response,
+            )
+            .await?;
+            return Ok(false);
         }
     }
 
     let header_end = data.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     let header_str = String::from_utf8_lossy(&data[..header_end]);
-
-    let content_length: usize = header_str
-        .lines()
-        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.split_once(':'))
-        .and_then(|(_, v)| v.trim().parse().ok())
-        .unwrap_or(0);
     let (method, full_path, headers) = parse_http_head(&header_str);
     drop(header_str);
 
+    if headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        let _ = send_json(
+            socket,
+            501,
+            "Not Implemented",
+            r#"{"error":"transfer encoding is not supported"}"#,
+            &response,
+        )
+        .await?;
+        return Ok(false);
+    }
+
+    let mut content_length = None;
+    for (_, value) in headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+    {
+        let parsed = match value.trim().parse::<usize>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                let _ = send_json(
+                    socket,
+                    400,
+                    "Bad Request",
+                    r#"{"error":"invalid Content-Length"}"#,
+                    &response,
+                )
+                .await?;
+                return Ok(false);
+            }
+        };
+        if content_length.is_some_and(|previous| previous != parsed) {
+            let _ = send_json(
+                socket,
+                400,
+                "Bad Request",
+                r#"{"error":"conflicting Content-Length headers"}"#,
+                &response,
+            )
+            .await?;
+            return Ok(false);
+        }
+        content_length = Some(parsed);
+    }
+    let content_length = content_length.unwrap_or(0);
+
+    if let Err(error) = browser_policy.validate_host(&headers) {
+        let body = format!(r#"{{"error":"{}"}}"#, escape_json(error));
+        return send_json(socket, 400, "Bad Request", &body, &response).await;
+    }
+    response.cors_origin = match browser_policy.request_origin(&headers) {
+        Ok(origin) => origin,
+        Err(error) => {
+            let body = format!(r#"{{"error":"{}"}}"#, escape_json(error));
+            return send_json(socket, 403, "Forbidden", &body, &response).await;
+        }
+    };
+
     if content_length > limits.max_body {
         let body = r#"{"error":"request body too large"}"#;
-        return send_json(socket, 413, "Payload Too Large", body).await;
+        return send_json(socket, 413, "Payload Too Large", body, &response).await;
     }
 
     let Some(total_needed) = header_end.checked_add(content_length) else {
         let body = r#"{"error":"request body size overflow"}"#;
-        return send_json(socket, 413, "Payload Too Large", body).await;
+        return send_json(socket, 413, "Payload Too Large", body, &response).await;
     };
+    let body_deadline = tokio::time::Instant::now() + limits.server.http_body_timeout;
     while data.len() < total_needed {
-        let n = socket.read(&mut buf).await?;
+        let remaining = total_needed - data.len();
+        let read_len = remaining.min(buf.len());
+        let read = tokio::select! {
+            _ = shutdown_rx.changed() => return Ok(false),
+            _ = tokio::time::sleep_until(body_deadline) => {
+                store.record_connection_timeout();
+                let _ = send_json(
+                    socket,
+                    408,
+                    "Request Timeout",
+                    r#"{"error":"request body timeout"}"#,
+                    &response,
+                ).await?;
+                return Ok(false);
+            }
+            read = socket.read(&mut buf[..read_len]) => read,
+        };
+        let n = read?;
         if n == 0 {
             break;
+        }
+        if !request_reservation.try_grow(n) {
+            store.reject_request_buffer();
+            let _ = send_json(
+                socket,
+                503,
+                "Service Unavailable",
+                r#"{"error":"request buffer capacity exhausted"}"#,
+                &response,
+            )
+            .await?;
+            return Ok(false);
         }
         data.extend_from_slice(&buf[..n]);
     }
     if data.len() < total_needed {
         let body = r#"{"error":"request body is shorter than Content-Length"}"#;
-        return send_json(socket, 400, "Bad Request", body).await;
+        return send_json(socket, 400, "Bad Request", body, &response).await;
+    }
+    if data.len() > total_needed {
+        let _ = send_json(
+            socket,
+            400,
+            "Bad Request",
+            r#"{"error":"HTTP request pipelining is not supported"}"#,
+            &response,
+        )
+        .await?;
+        return Ok(false);
     }
 
     if method == "OPTIONS" {
-        let response = "HTTP/1.1 204 No Content\r\n\
-             Access-Control-Allow-Origin: *\r\n\
+        let requested_method = header_value(&headers, "access-control-request-method");
+        if requested_method.is_some_and(|method| {
+            !matches!(
+                method,
+                "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
+            )
+        }) {
+            return send_json(
+                socket,
+                405,
+                "Method Not Allowed",
+                r#"{"error":"preflight method is not allowed"}"#,
+                &response,
+            )
+            .await;
+        }
+        const ALLOWED_HEADERS: &[&str] = &[
+            "authorization",
+            "content-type",
+            "prefer",
+            "apikey",
+            "x-lux-snapshot-sha256",
+        ];
+        let requested_headers_allowed = header_value(&headers, "access-control-request-headers")
+            .map(|value| {
+                value.split(',').all(|header| {
+                    let header = header.trim();
+                    !header.is_empty()
+                        && ALLOWED_HEADERS
+                            .iter()
+                            .any(|allowed| header.eq_ignore_ascii_case(allowed))
+                })
+            })
+            .unwrap_or(true);
+        if !requested_headers_allowed {
+            return send_json(
+                socket,
+                403,
+                "Forbidden",
+                r#"{"error":"preflight header is not allowed"}"#,
+                &response,
+            )
+            .await;
+        }
+        let cors_headers = response.cors_headers();
+        let preflight = format!("HTTP/1.1 204 No Content\r\n\
+             {cors_headers}\
              Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
              Access-Control-Allow-Headers: Authorization, Content-Type, Prefer, apikey, X-Lux-Snapshot-SHA256\r\n\
+             Access-Control-Max-Age: 600\r\n\
              Content-Length: 0\r\n\r\n"
-            .to_string();
-        socket.write_all(response.as_bytes()).await?;
+        );
+        socket.write_all(preflight.as_bytes()).await?;
         return Ok(true);
     }
 
@@ -247,13 +601,28 @@ async fn handle_request(
         None => (full_path.clone(), String::new()),
     };
     let params = parse_query_string(&query_string);
+    response.diagnostic = Some(HttpDiagnostic {
+        store: store.clone(),
+        request_id: store.next_http_request_id(),
+        started: Instant::now(),
+        operation: if path == "/live" {
+            "live"
+        } else if path.starts_with("/auth/") {
+            "auth"
+        } else if path.starts_with("/health/") {
+            "health"
+        } else {
+            "http"
+        },
+        status: std::sync::atomic::AtomicU16::new(0),
+    });
     let is_restore = method == "POST" && matches!(path.as_str(), "/v1/restore" | "/restore");
     // Restore is the only binary request surface. Do not lossy-decode and copy
     // a potentially large snapshot merely to parse the HTTP head.
     let body = if is_restore {
-        String::new()
+        Cow::Borrowed("")
     } else {
-        String::from_utf8_lossy(&data[header_end..total_needed]).into_owned()
+        String::from_utf8_lossy(&data[header_end..total_needed])
     };
 
     // These endpoints intentionally contain no project data and bypass normal
@@ -261,19 +630,14 @@ async fn handle_request(
     // The HTTP listener is created only after recovery completes, making a
     // successful liveness response stronger than a bare process check.
     if method == "GET" && path == "/health/live" {
-        return send_json(socket, 200, "OK", r#"{"status":"live"}"#).await;
+        return send_json(socket, 200, "OK", r#"{"status":"live"}"#, &response).await;
+    }
+    if method == "GET" && path == "/health/startup" {
+        return send_json(socket, 200, "OK", r#"{"status":"started"}"#, &response).await;
     }
     if method == "GET" && path == "/health/ready" {
         let (status, status_text, body) = health_readiness(store);
-        return send_json(socket, status, status_text, &body).await;
-    }
-
-    if path.starts_with("/auth/v1") {
-        let response = crate::auth::route_http_response(
-            &method, &path, &body, &params, &headers, store, cache,
-        )
-        .await;
-        return send_auth_response(socket, response).await;
+        return send_json(socket, status, status_text, &body, &response).await;
     }
 
     let password = &store.config().password;
@@ -329,42 +693,111 @@ async fn handle_request(
         ""
     };
 
-    let credential = match crate::auth::resolve_credential(
-        presented,
-        user_token,
-        crate::auth::Surface::Http,
-        store,
-        cache,
-    ) {
-        Ok(credential) => credential,
-        Err(e) => {
-            let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
-            return send_json(socket, 401, "Unauthorized", &body).await;
-        }
-    };
-    let live_user_credential = if path == "/live" {
-        match &credential {
-            crate::auth::Credential::User(credential) => Some((**credential).clone()),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let live_secret_credential = if path == "/live" {
-        match &credential {
-            crate::auth::Credential::Secret(credential) => Some(credential.clone()),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let auth_context = match credential {
-        crate::auth::Credential::Operator => HttpAuthContext::Operator,
-        crate::auth::Credential::Secret(_) => HttpAuthContext::Secret,
-        crate::auth::Credential::Publishable => HttpAuthContext::Publishable,
-        crate::auth::Credential::User(credential) => HttpAuthContext::User(credential.principal),
-        crate::auth::Credential::Anonymous => HttpAuthContext::Anonymous,
-    };
+    let studio_authorized = studio_sessions.authorize(presented, response.cors_origin.as_deref());
+
+    if path.starts_with("/auth/v1") {
+        let auth_permit = if auth_request_needs_worker(&method, &path) {
+            match auth_workers.try_acquire() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    store.reject_auth_request();
+                    return send_json(
+                        socket,
+                        429,
+                        "Too Many Requests",
+                        r#"{"error":"authentication capacity exhausted"}"#,
+                        &response,
+                    )
+                    .await;
+                }
+            }
+        } else {
+            None
+        };
+        let mut studio_headers = Vec::new();
+        let routed_headers = if studio_authorized {
+            studio_headers.extend(
+                headers
+                    .iter()
+                    .filter(|(name, _)| {
+                        !name.eq_ignore_ascii_case("authorization")
+                            && !name.eq_ignore_ascii_case("apikey")
+                    })
+                    .cloned(),
+            );
+            studio_headers.push(("authorization".to_string(), format!("Bearer {password}")));
+            &studio_headers
+        } else {
+            &headers
+        };
+        let auth_response = crate::auth::route_http_response(
+            &method,
+            &path,
+            &body,
+            &params,
+            routed_headers,
+            store,
+            cache,
+        )
+        .await;
+        // The worker permit protects authentication computation, not socket
+        // delivery. Release it before a slow client receives the response.
+        drop(auth_permit);
+        return send_auth_response(socket, auth_response, &response).await;
+    }
+
+    let (auth_context, live_user_credential, live_secret_credential, live_studio_session) =
+        if studio_authorized {
+            (
+                HttpAuthContext::Studio,
+                None,
+                None,
+                Some((
+                    presented.to_string(),
+                    response.cors_origin.clone().unwrap_or_default(),
+                )),
+            )
+        } else {
+            let credential = match crate::auth::resolve_credential(
+                presented,
+                user_token,
+                crate::auth::Surface::Http,
+                store,
+                cache,
+            ) {
+                Ok(credential) => credential,
+                Err(e) => {
+                    let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
+                    return send_json(socket, 401, "Unauthorized", &body, &response).await;
+                }
+            };
+            let live_user = if path == "/live" {
+                match &credential {
+                    crate::auth::Credential::User(credential) => Some((**credential).clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let live_secret = if path == "/live" {
+                match &credential {
+                    crate::auth::Credential::Secret(credential) => Some(credential.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let context = match credential {
+                crate::auth::Credential::Operator => HttpAuthContext::Operator,
+                crate::auth::Credential::Secret(_) => HttpAuthContext::Secret,
+                crate::auth::Credential::Publishable => HttpAuthContext::Publishable,
+                crate::auth::Credential::User(credential) => {
+                    HttpAuthContext::User(credential.principal)
+                }
+                crate::auth::Credential::Anonymous => HttpAuthContext::Anonymous,
+            };
+            (context, live_user, live_secret, None)
+        };
 
     // An engine is credential-gated once it has either a password or project
     // keys. Before that (a bare local engine) it stays open, as it always has.
@@ -372,12 +805,15 @@ async fn handle_request(
         Ok(configured) => configured,
         Err(e) => {
             let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
-            return send_json(socket, 503, "Service Unavailable", &body).await;
+            return send_json(socket, 503, "Service Unavailable", &body, &response).await;
         }
     };
     if !password.is_empty() || project_keys_configured {
         let permitted = match &auth_context {
-            HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::User(_) => true,
+            HttpAuthContext::Operator
+            | HttpAuthContext::Secret
+            | HttpAuthContext::Studio
+            | HttpAuthContext::User(_) => true,
             // A publishable key identifies the project, not a person. It reaches
             // auth (that is how a person is obtained) and nothing else until an
             // end-user token makes it a User.
@@ -390,23 +826,82 @@ async fn handle_request(
             } else {
                 r#"{"error":"unauthorized"}"#
             };
-            return send_json(socket, 401, "Unauthorized", body).await;
+            return send_json(socket, 401, "Unauthorized", body, &response).await;
         }
     }
 
+    if method == "POST" && path == "/v1/studio/sessions" {
+        if !matches!(auth_context, HttpAuthContext::Operator) {
+            return send_json(
+                socket,
+                403,
+                "Forbidden",
+                r#"{"error":"operator credential required"}"#,
+                &response,
+            )
+            .await;
+        }
+        let requested: Value = match serde_json::from_str(&body) {
+            Ok(value) => value,
+            Err(_) => {
+                return send_json(
+                    socket,
+                    400,
+                    "Bad Request",
+                    r#"{"error":"invalid json"}"#,
+                    &response,
+                )
+                .await;
+            }
+        };
+        let Some(origin) = requested
+            .get("origin")
+            .and_then(Value::as_str)
+            .and_then(normalize_origin)
+        else {
+            return send_json(
+                socket,
+                400,
+                "Bad Request",
+                r#"{"error":"a valid http or https origin is required"}"#,
+                &response,
+            )
+            .await;
+        };
+        if !browser_policy.allows_origin(&origin) {
+            return send_json(
+                socket,
+                403,
+                "Forbidden",
+                r#"{"error":"Studio origin is not allowed"}"#,
+                &response,
+            )
+            .await;
+        }
+        let (token, expires_at) = studio_sessions.issue(origin);
+        let body = json!({ "token": token, "expires_at": expires_at }).to_string();
+        return send_json(socket, 201, "Created", &body, &response).await;
+    }
+
     if method == "GET" && path == "/live" {
+        // The HTTP upgrade request is fully parsed and no longer retained once
+        // the socket becomes a WebSocket. Do not charge its bytes for the
+        // entire lifetime of a live connection.
+        request_reservation.release(data.len());
+        drop(data);
         return handle_live_upgrade(
             socket,
             &headers,
-            store.clone(),
-            broker.clone(),
-            cache.clone(),
+            services.clone(),
             LiveIdentity {
                 principal: live_auth_principal(&auth_context),
                 user_credential: live_user_credential,
                 secret_credential: live_secret_credential,
+                studio_session: live_studio_session,
             },
             shutdown_rx.clone(),
+            &response,
+            limits,
         )
         .await;
     }
@@ -418,7 +913,7 @@ async fn handle_request(
     if method == "GET" && matches!(segments.as_slice(), ["v1", "restore"] | ["restore"]) {
         if !snapshot_management_authorized(store, cache, &auth_context) {
             let body = r#"{"error":"restore status requires management credentials"}"#;
-            return send_json(socket, 403, "Forbidden", body).await;
+            return send_json(socket, 403, "Forbidden", body, &response).await;
         }
         let restore_store = store.clone();
         match tokio::task::spawn_blocking(move || {
@@ -439,24 +934,24 @@ async fn handle_request(
                     "sha256": pending.sha256,
                 })
                 .to_string();
-                return send_json(socket, 200, "OK", &body).await;
+                return send_json(socket, 200, "OK", &body, &response).await;
             }
             Ok(Ok(None)) => {
-                return send_json(socket, 200, "OK", r#"{"pending":false}"#).await;
+                return send_json(socket, 200, "OK", r#"{"pending":false}"#, &response).await;
             }
             Ok(Err(error)) => {
                 let body = format!(
                     r#"{{"error":"restore status failed: {}"}}"#,
                     escape_json(&error.to_string())
                 );
-                return send_json(socket, 500, "Internal Server Error", &body).await;
+                return send_json(socket, 500, "Internal Server Error", &body, &response).await;
             }
             Err(error) => {
                 let body = format!(
                     r#"{{"error":"restore status task failed: {}"}}"#,
                     escape_json(&error.to_string())
                 );
-                return send_json(socket, 500, "Internal Server Error", &body).await;
+                return send_json(socket, 500, "Internal Server Error", &body, &response).await;
             }
         }
     }
@@ -467,7 +962,7 @@ async fn handle_request(
     if is_restore {
         if !snapshot_management_authorized(store, cache, &auth_context) {
             let body = r#"{"error":"restore requires management credentials"}"#;
-            return send_json(socket, 403, "Forbidden", body).await;
+            return send_json(socket, 403, "Forbidden", body, &response).await;
         }
         let checksum = headers
             .iter()
@@ -497,7 +992,7 @@ async fn handle_request(
                     "sha256": staged.sha256,
                 })
                 .to_string();
-                return send_json(socket, 202, "Accepted", &body).await;
+                return send_json(socket, 202, "Accepted", &body, &response).await;
             }
             Ok(Err(e)) => {
                 let (status, status_text) = match e.kind() {
@@ -512,14 +1007,14 @@ async fn handle_request(
                     r#"{{"error":"restore failed: {}"}}"#,
                     escape_json(&e.to_string())
                 );
-                return send_json(socket, status, status_text, &body).await;
+                return send_json(socket, status, status_text, &body, &response).await;
             }
             Err(e) => {
                 let body = format!(
                     r#"{{"error":"restore task failed: {}"}}"#,
                     escape_json(&e.to_string())
                 );
-                return send_json(socket, 500, "Internal Server Error", &body).await;
+                return send_json(socket, 500, "Internal Server Error", &body, &response).await;
             }
         }
     }
@@ -533,9 +1028,9 @@ async fn handle_request(
                 // management credential may use it.
                 if !snapshot_management_authorized(store, cache, &auth_context) {
                     let body = r#"{"error":"snapshot requires management credentials"}"#;
-                    return send_json(socket, 403, "Forbidden", body).await;
+                    return send_json(socket, 403, "Forbidden", body, &response).await;
                 }
-                return stream_snapshot(socket, store).await;
+                return stream_snapshot(socket, store, &response).await;
             }
             ["v1", "tables", table] => {
                 let scoped = match scope_table_query_read(
@@ -548,7 +1043,7 @@ async fn handle_request(
                 ) {
                     Ok(params) => params,
                     Err((status, status_text, body)) => {
-                        return send_json(socket, status, status_text, &body).await;
+                        return send_json(socket, status, status_text, &body, &response).await;
                     }
                 };
                 let prefer = headers
@@ -566,6 +1061,7 @@ async fn handle_request(
                     cache,
                     limits.max_rows,
                     da,
+                    &response,
                 )
                 .await;
             }
@@ -573,12 +1069,12 @@ async fn handle_request(
                 let filter = match enforce_table_read(store, cache, &auth_context, table) {
                     Ok(f) => f,
                     Err((status, status_text, body)) => {
-                        return send_json(socket, status, status_text, &body).await;
+                        return send_json(socket, status, status_text, &body, &response).await;
                     }
                 };
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
                     let body = format!(r#"{{"error":"{}"}}"#, escape_json(&err));
-                    return send_json(socket, 403, "Forbidden", &body).await;
+                    return send_json(socket, 403, "Forbidden", &body, &response).await;
                 }
                 let now = std::time::Instant::now();
                 let scope = filter.as_deref().unwrap_or("");
@@ -590,12 +1086,13 @@ async fn handle_request(
                             r#"{{"error":"database unavailable: {}"}}"#,
                             escape_json(&error.to_string())
                         );
-                        return send_json(socket, 503, "Service Unavailable", &body).await;
+                        return send_json(socket, 503, "Service Unavailable", &body, &response)
+                            .await;
                     }
                     Ok(Ok(n)) => format!(r#"{{"result":{n}}}"#),
                     Ok(Err(e)) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
                 };
-                return send_json(socket, 200, "OK", &body).await;
+                return send_json(socket, 200, "OK", &body, &response).await;
             }
             ["v1", "tables", table, "schema"] => {
                 // Schema is table-shape metadata, not rows: a read grant of any
@@ -603,11 +1100,11 @@ async fn handle_request(
                 if let Err((status, status_text, body)) =
                     enforce_table_read(store, cache, &auth_context, table)
                 {
-                    return send_json(socket, status, status_text, &body).await;
+                    return send_json(socket, status, status_text, &body, &response).await;
                 }
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
                     let body = format!(r#"{{"error":"{}"}}"#, escape_json(&err));
-                    return send_json(socket, 403, "Forbidden", &body).await;
+                    return send_json(socket, 403, "Forbidden", &body, &response).await;
                 }
                 let now = std::time::Instant::now();
                 let body = match with_execution_read(store, || {
@@ -618,7 +1115,8 @@ async fn handle_request(
                             r#"{{"error":"database unavailable: {}"}}"#,
                             escape_json(&error.to_string())
                         );
-                        return send_json(socket, 503, "Service Unavailable", &body).await;
+                        return send_json(socket, 503, "Service Unavailable", &body, &response)
+                            .await;
                     }
                     Ok(result) => match result {
                         Ok(fields) => {
@@ -631,18 +1129,18 @@ async fn handle_request(
                         Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
                     },
                 };
-                return send_json(socket, 200, "OK", &body).await;
+                return send_json(socket, 200, "OK", &body, &response).await;
             }
             ["v1", "tables", table, id] if *id != "count" && *id != "schema" => {
                 let filter = match enforce_table_read(store, cache, &auth_context, table) {
                     Ok(f) => f,
                     Err((status, status_text, body)) => {
-                        return send_json(socket, status, status_text, &body).await;
+                        return send_json(socket, status, status_text, &body, &response).await;
                     }
                 };
                 if let Some(err) = crate::auth::reserved_table_access_error(table) {
                     let body = format!(r#"{{"error":"{}"}}"#, escape_json(&err));
-                    return send_json(socket, 403, "Forbidden", &body).await;
+                    return send_json(socket, 403, "Forbidden", &body, &response).await;
                 }
                 let now = std::time::Instant::now();
                 let scope = filter.as_deref().unwrap_or("");
@@ -663,7 +1161,8 @@ async fn handle_request(
                             r#"{{"error":"database unavailable: {}"}}"#,
                             escape_json(&error.to_string())
                         );
-                        return send_json(socket, 503, "Service Unavailable", &body).await;
+                        return send_json(socket, 503, "Service Unavailable", &body, &response)
+                            .await;
                     }
                     Ok(result) => match result {
                         // A row that exists but is out of grant scope reads as
@@ -676,7 +1175,7 @@ async fn handle_request(
                         Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
                     },
                 };
-                return send_json(socket, 200, "OK", &body).await;
+                return send_json(socket, 200, "OK", &body, &response).await;
             }
             _ => {}
         }
@@ -697,12 +1196,17 @@ async fn handle_request(
                 r#"{{"error":"database unavailable: {}"}}"#,
                 escape_json(&error.to_string())
             );
-            return send_json(socket, 503, "Service Unavailable", &body).await;
+            return send_json(socket, 503, "Service Unavailable", &body, &response).await;
         }
     };
     let (status, status_text, result) = routed;
 
-    send_json(socket, status, status_text, &result).await
+    send_json(socket, status, status_text, &result, &response).await
+}
+
+fn auth_request_needs_worker(method: &str, path: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH")
+        || (method == "GET" && path.starts_with("/auth/v1/callback/"))
 }
 
 fn snapshot_management_authorized(
@@ -710,25 +1214,23 @@ fn snapshot_management_authorized(
     cache: &SharedSchemaCache,
     context: &HttpAuthContext,
 ) -> bool {
-    if !store.config().password.is_empty() {
-        matches!(context, HttpAuthContext::Operator)
-    } else if crate::auth::project_keys_configured(store, cache).unwrap_or(true) {
-        matches!(context, HttpAuthContext::Secret)
-    } else {
-        true
-    }
+    let credentials_configured = !store.config().password.is_empty()
+        || crate::auth::project_keys_configured(store, cache).unwrap_or(true);
+    !credentials_configured
+        || matches!(
+            context,
+            HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio
+        )
 }
 
-/// Stream a table query response using chunked transfer encoding.
-/// Writes rows directly to the socket as they come out of table_select,
-/// without ever building the full JSON string in memory.
 /// Stream a complete, consistent snapshot to the caller. Triggers the same save
 /// the background timer runs (full dump incl. tiered cold data + WAL truncate),
 /// then streams the resulting `lux.dat`. The blocking save runs off the async
 /// runtime via `spawn_blocking`. Caller enforces operator auth.
 async fn stream_snapshot(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     store: &Arc<Store>,
+    response: &HttpResponseContext,
 ) -> std::io::Result<bool> {
     let store = store.clone();
     let artifact = match tokio::task::spawn_blocking(move || {
@@ -747,14 +1249,14 @@ async fn stream_snapshot(
                 r#"{{"error":"snapshot failed: {}"}}"#,
                 escape_json(&e.to_string())
             );
-            return send_json(socket, status, status_text, &body).await;
+            return send_json(socket, status, status_text, &body, response).await;
         }
         Err(e) => {
             let body = format!(
                 r#"{{"error":"snapshot task panicked: {}"}}"#,
                 escape_json(&e.to_string())
             );
-            return send_json(socket, 500, "Internal Server Error", &body).await;
+            return send_json(socket, 500, "Internal Server Error", &body, response).await;
         }
     };
 
@@ -769,15 +1271,17 @@ async fn stream_snapshot(
             500,
             "Internal Server Error",
             r#"{"error":"snapshot changed before it could be streamed"}"#,
+            response,
         )
         .await;
     }
+    response.record_status(200);
+    let cors_headers = response.cors_headers();
     let header = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/octet-stream\r\n\
          Content-Disposition: attachment; filename=\"lux.dat\"\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Expose-Headers: X-Lux-Snapshot-SHA256, X-Lux-Snapshot-Format\r\n\
+         {cors_headers}\
          X-Lux-Snapshot-SHA256: {}\r\n\
          X-Lux-Snapshot-Format: {}\r\n\
          Content-Length: {len}\r\n\r\n",
@@ -788,9 +1292,12 @@ async fn stream_snapshot(
     Ok(true)
 }
 
+/// Stream a table query response using chunked transfer encoding.
+/// Writes rows directly to the socket as they come out of `table_select`,
+/// without building the full JSON response in memory.
 #[allow(clippy::too_many_arguments)]
 async fn stream_table_query(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     table: &str,
     params: &[(String, String)],
     prefer: &str,
@@ -798,16 +1305,15 @@ async fn stream_table_query(
     cache: &SharedSchemaCache,
     max_rows: Option<usize>,
     decrypt_authorized: bool,
+    response: &HttpResponseContext,
 ) -> std::io::Result<bool> {
-    use tokio::io::AsyncWriteExt;
-
     let now = std::time::Instant::now();
 
     let (parsed, mut plan) = match parse_http_table_query(params, table, max_rows) {
         Ok(v) => v,
         Err(e) => {
             let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
-            return send_json(socket, 400, "Bad Request", &body).await;
+            return send_json(socket, 400, "Bad Request", &body, response).await;
         }
     };
     plan.decrypt_authorized = decrypt_authorized;
@@ -823,14 +1329,14 @@ async fn stream_table_query(
                 r#"{{"error":"database unavailable: {}"}}"#,
                 escape_json(&error.to_string())
             );
-            return send_json(socket, 503, "Service Unavailable", &body).await;
+            return send_json(socket, 503, "Service Unavailable", &body, response).await;
         }
     };
 
     match result {
         Err(e) => {
             let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
-            return send_json(socket, 400, "Bad Request", &body).await;
+            return send_json(socket, 400, "Bad Request", &body, response).await;
         }
         Ok(crate::tables::SelectResult::Aggregate(row)) => {
             let body = {
@@ -856,7 +1362,7 @@ async fn stream_table_query(
                 out.push_str("}}");
                 out
             };
-            return send_json(socket, 200, "OK", &body).await;
+            return send_json(socket, 200, "OK", &body, response).await;
         }
         Ok(crate::tables::SelectResult::Rows(rows)) => {
             // Type-aware JSON encoding (JSON/ARRAY raw, VECTOR as array, etc.).
@@ -906,6 +1412,8 @@ async fn stream_table_query(
             };
 
             let content_range = format!("{}-{}/{}", offset, range_end, total_str);
+            response.record_status(200);
+            let cors_headers = response.cors_headers();
 
             const CHUNK_SIZE: usize = 65536;
             let header = format!(
@@ -913,7 +1421,7 @@ async fn stream_table_query(
                  Content-Type: application/json\r\n\
                  Transfer-Encoding: chunked\r\n\
                  Content-Range: {content_range}\r\n\
-                 Access-Control-Allow-Origin: *\r\n\r\n"
+                 {cors_headers}\r\n"
             );
             socket.write_all(header.as_bytes()).await?;
 
@@ -946,8 +1454,7 @@ async fn stream_table_query(
 }
 
 /// Write a single HTTP chunk: `{hex_len}\r\n{data}\r\n`
-async fn write_chunk(socket: &mut tokio::net::TcpStream, data: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
+async fn write_chunk(socket: &mut DeadlineStream, data: &[u8]) -> std::io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
@@ -959,31 +1466,37 @@ async fn write_chunk(socket: &mut tokio::net::TcpStream, data: &[u8]) -> std::io
 }
 
 async fn send_json(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     status: u16,
     status_text: &str,
     body: &str,
+    context: &HttpResponseContext,
 ) -> std::io::Result<bool> {
-    let response = format!(
+    context.record_status(status);
+    let cors_headers = context.cors_headers();
+    let head = format!(
         "HTTP/1.1 {status} {status_text}\r\n\
          Content-Type: application/json\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Content-Length: {}\r\n\r\n{}",
-        body.len(),
-        body
+         {cors_headers}\
+         Content-Length: {}\r\n\r\n",
+        body.len()
     );
-    socket.write_all(response.as_bytes()).await?;
+    socket.write_all(head.as_bytes()).await?;
+    socket.write_all(body.as_bytes()).await?;
     Ok(true)
 }
 
 async fn send_auth_response(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     response: crate::auth::AuthHttpResponse,
+    context: &HttpResponseContext,
 ) -> std::io::Result<bool> {
+    context.record_status(response.status);
+    let cors_headers = context.cors_headers();
     let mut head = format!(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
+         {cors_headers}\
          Content-Length: {}\r\n",
         response.status,
         response.status_text,
@@ -997,9 +1510,26 @@ async fn send_auth_response(
         head.push_str("\r\n");
     }
     head.push_str("\r\n");
-    head.push_str(&response.body);
     socket.write_all(head.as_bytes()).await?;
+    socket.write_all(response.body.as_bytes()).await?;
     Ok(true)
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn check_http_input(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, &text));
+    let (_, path, _) = parse_http_head(head);
+    let query = path
+        .split_once('?')
+        .map_or(text.as_ref(), |(_, query)| query);
+    let params = parse_query_string(query);
+    let _ = parse_http_table_query(&params, "items", Some(100));
+    let _ = parse_migration_request(body);
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        let _ = parse_live_table_spec(&value);
+        let _ = parse_live_vector_near_spec(&value);
+    }
 }
 
 fn parse_http_head(raw: &str) -> (String, String, Vec<(String, String)>) {
@@ -1076,6 +1606,7 @@ fn live_auth_principal(auth: &HttpAuthContext) -> Option<crate::auth::AuthPrinci
         HttpAuthContext::Anonymous
         | HttpAuthContext::Operator
         | HttpAuthContext::Secret
+        | HttpAuthContext::Studio
         | HttpAuthContext::Publishable => None,
     }
 }
@@ -1096,7 +1627,7 @@ fn enforce_table_read(
     }
     match auth {
         // Full project access: no row filter.
-        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(None),
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => Ok(None),
         // Publishable is refused at the gate; deny here too rather than trust
         // that an upstream caller got it right.
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
@@ -1140,7 +1671,9 @@ fn scope_table_query_read(
         return Ok(params.to_vec());
     }
     let principal = match auth {
-        HttpAuthContext::Operator | HttpAuthContext::Secret => return Ok(params.to_vec()),
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => {
+            return Ok(params.to_vec())
+        }
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
             return Err((
                 401,
@@ -1237,7 +1770,7 @@ fn enforce_table_insert(
     }
     match auth {
         // Full project access: no row filter.
-        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(()),
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => Ok(()),
         // Publishable is refused at the gate; deny here too rather than trust
         // that an upstream caller got it right.
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
@@ -1280,7 +1813,7 @@ fn enforce_table_write_where(
     }
     match auth {
         // Full project access: no row filter.
-        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(None),
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => Ok(None),
         // Publishable is refused at the gate; deny here too rather than trust
         // that an upstream caller got it right.
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
@@ -1317,7 +1850,7 @@ fn enforce_table_update_check(
     }
     match auth {
         // Full project access: no row filter.
-        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(()),
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => Ok(()),
         // Publishable is refused at the gate; deny here too rather than trust
         // that an upstream caller got it right.
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
@@ -1382,7 +1915,7 @@ fn require_project_access(
         // A secret key is the project's server-side credential; these routes
         // (exec, raw kv, tables, ts, vectors) are exactly what it exists to
         // reach. The operator password remains valid as break-glass.
-        HttpAuthContext::Operator | HttpAuthContext::Secret => Ok(()),
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => Ok(()),
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => Err((
             401,
             "Unauthorized",
@@ -1473,20 +2006,46 @@ struct LiveQueryState {
     /// primary key so `.live()` works for any PK name, not just `id`. `None`
     /// for non-table queries (vector/raw), which fall back to `id`/`key`.
     pk_field: Option<String>,
+    content_bytes: usize,
+    reserved_bytes: usize,
+}
+
+impl LiveQueryState {
+    fn try_reserve_rows(
+        &mut self,
+        capacity: &mut SubscriptionReservation,
+        row_count: usize,
+        content_bytes: usize,
+    ) -> bool {
+        let Some(next_bytes) = live_state_total_bytes(row_count, content_bytes) else {
+            return false;
+        };
+        if next_bytes > self.reserved_bytes
+            && !capacity.try_grow(0, next_bytes - self.reserved_bytes)
+        {
+            return false;
+        }
+        self.content_bytes = content_bytes;
+        self.reserved_bytes = self.reserved_bytes.max(next_bytes);
+        true
+    }
 }
 
 enum LiveSubscription {
     Key {
         pattern: String,
         receivers: Vec<broadcast::Receiver<crate::pubsub::Message>>,
+        _capacity: SubscriptionReservation,
     },
     Channel {
         channel: String,
         receiver: broadcast::Receiver<crate::pubsub::Message>,
+        _capacity: SubscriptionReservation,
     },
     PubSubPattern {
         pattern: String,
         receiver: broadcast::Receiver<crate::pubsub::Message>,
+        _capacity: SubscriptionReservation,
     },
     Table {
         spec: Box<LiveTableSpec>,
@@ -1497,12 +2056,61 @@ enum LiveSubscription {
         /// primary-key column used to re-evaluate a single changed row.
         delta_rx: Option<broadcast::Receiver<crate::pubsub::RowDelta>>,
         pk_col: String,
+        _capacity: SubscriptionReservation,
     },
     VectorNear {
         spec: LiveVectorNearSpec,
         state: LiveQueryState,
         receiver: broadcast::Receiver<crate::pubsub::Message>,
+        _capacity: SubscriptionReservation,
     },
+}
+
+struct LiveSubscriptions<'a> {
+    broker: &'a Broker,
+    entries: HashMap<String, LiveSubscription>,
+    last_key_event_drops: u64,
+}
+
+impl<'a> LiveSubscriptions<'a> {
+    fn new(broker: &'a Broker) -> Self {
+        Self {
+            broker,
+            entries: HashMap::new(),
+            last_key_event_drops: broker.key_event_stats().dropped,
+        }
+    }
+
+    fn take_key_event_gap(&mut self) -> bool {
+        let dropped = self.broker.key_event_stats().dropped;
+        if dropped == self.last_key_event_drops {
+            return false;
+        }
+        self.last_key_event_drops = dropped;
+        true
+    }
+}
+
+impl std::ops::Deref for LiveSubscriptions<'_> {
+    type Target = HashMap<String, LiveSubscription>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl std::ops::DerefMut for LiveSubscriptions<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
+
+impl Drop for LiveSubscriptions<'_> {
+    fn drop(&mut self) {
+        while let Some(id) = self.entries.keys().next().cloned() {
+            stop_live_subscription(self.broker, &mut self.entries, &id);
+        }
+    }
 }
 
 enum LiveBrokerEvent {
@@ -1521,26 +2129,26 @@ enum LiveBrokerEvent {
 fn live_broker_event_from_message(message: &crate::pubsub::Message) -> Option<LiveBrokerEvent> {
     match message.kind {
         crate::pubsub::MessageKind::PubSub => Some(LiveBrokerEvent::Message {
-            channel: message.channel.clone(),
+            channel: message.channel.to_string(),
             message: String::from_utf8_lossy(&message.payload).to_string(),
-            pattern: message.pattern.clone(),
+            pattern: message.pattern.as_deref().map(str::to_string),
         }),
         crate::pubsub::MessageKind::KeyEvent => Some(LiveBrokerEvent::Key {
-            pattern: message.pattern.clone()?,
-            key: message.channel.clone(),
+            pattern: message.pattern.as_deref()?.to_string(),
+            key: message.channel.to_string(),
             operation: String::from_utf8_lossy(&message.payload).to_string(),
         }),
     }
 }
 
 async fn handle_live_upgrade(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     headers: &[(String, String)],
-    store: Arc<Store>,
-    broker: Broker,
-    cache: SharedSchemaCache,
+    services: HttpServices,
     identity: LiveIdentity,
     shutdown_rx: watch::Receiver<Option<std::time::Duration>>,
+    response: &HttpResponseContext,
+    limits: RequestLimits,
 ) -> std::io::Result<bool> {
     let Some(key) = header_value(headers, "sec-websocket-key") else {
         return send_json(
@@ -1548,6 +2156,7 @@ async fn handle_live_upgrade(
             400,
             "Bad Request",
             r#"{"error":"missing websocket key"}"#,
+            response,
         )
         .await;
     };
@@ -1561,34 +2170,75 @@ async fn handle_live_upgrade(
     );
     socket.write_all(response.as_bytes()).await?;
 
-    let ws = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
-    run_live_socket(ws, store, broker, cache, identity, shutdown_rx).await?;
+    let write_buffer_size = limits.max_body.clamp(1, 128 * 1024);
+    let ws_config = WebSocketConfig {
+        write_buffer_size,
+        max_write_buffer_size: limits.max_body.saturating_add(write_buffer_size),
+        max_message_size: Some(limits.max_body),
+        max_frame_size: Some(limits.max_body.min(16 * 1024 * 1024)),
+        ..WebSocketConfig::default()
+    };
+    let ws = WebSocketStream::from_raw_socket(socket, Role::Server, Some(ws_config)).await;
+    let HttpServices {
+        store,
+        broker,
+        cache,
+        studio_sessions,
+        request_budget,
+        ..
+    } = services;
+    let live_services = LiveServices {
+        store,
+        broker,
+        cache,
+        studio_sessions,
+        request_budget,
+        limits,
+    };
+    run_live_socket(ws, live_services, identity, shutdown_rx).await?;
     Ok(false)
 }
 
 async fn run_live_socket<S>(
     mut ws: WebSocketStream<S>,
-    store: Arc<Store>,
-    broker: Broker,
-    cache: SharedSchemaCache,
+    services: LiveServices,
     identity: LiveIdentity,
     mut shutdown_rx: watch::Receiver<Option<std::time::Duration>>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut subscriptions: HashMap<String, LiveSubscription> = HashMap::new();
+    let LiveServices {
+        store,
+        broker,
+        cache,
+        studio_sessions,
+        request_budget,
+        limits,
+    } = services;
+    // Own cleanup so cancellation and socket-write failures reclaim broker
+    // registrations just like an orderly WebSocket close.
+    let mut subscriptions = LiveSubscriptions::new(&broker);
+    let mut subscription_bytes: HashMap<String, usize> = HashMap::new();
+    let mut retained_subscription_bytes = 0usize;
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Session revocation is bounded to one second. This remains separate from
     // the 1 ms event-drain timer so expensive state checks never run per event.
     let mut auth_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     auth_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let idle = tokio::time::sleep(limits.server.live_idle_timeout);
+    tokio::pin!(idle);
 
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
-                let _ = ws.send(WsMessage::Close(None)).await;
+                let _ = send_live_message(&mut ws, WsMessage::Close(None), limits).await;
+                break;
+            }
+            _ = &mut idle => {
+                store.record_connection_timeout();
+                let _ = send_live_message(&mut ws, WsMessage::Close(None), limits).await;
                 break;
             }
             incoming = ws.next() => {
@@ -1597,50 +2247,62 @@ where
                     Ok(message) => message,
                     Err(_) => break,
                 };
+                let Some(_incoming_capacity) = request_budget.try_reserve(incoming.len()) else {
+                    store.reject_request_buffer();
+                    let _ = send_live_json(
+                        &mut ws,
+                        json!({"type":"live.error","error":{"code":"LIMIT_EXCEEDED","message":"request buffer capacity exhausted"}}),
+                        limits,
+                    )
+                    .await;
+                    break;
+                };
+                idle.as_mut().reset(tokio::time::Instant::now() + limits.server.live_idle_timeout);
                 match incoming {
                     WsMessage::Text(text) => {
                         handle_live_client_message(
                             &mut ws,
                             &mut subscriptions,
-                            &broker,
-                            &store,
-                            &cache,
-                            identity.principal.as_ref(),
+                            &mut subscription_bytes,
+                            &mut retained_subscription_bytes,
+                            LiveClientContext {
+                                broker: &broker,
+                                store: &store,
+                                cache: &cache,
+                                principal: identity.principal.as_ref(),
+                                limits,
+                            },
                             &text,
                         ).await?;
                     }
                     WsMessage::Close(_) => break,
                     WsMessage::Ping(payload) => {
-                        let _ = ws.send(WsMessage::Pong(payload)).await;
+                        let _ = send_live_message(&mut ws, WsMessage::Pong(payload), limits).await;
                     }
                     _ => {}
                 }
             }
             _ = tick.tick() => {
-                drain_live_subscription_events(&mut ws, &mut subscriptions, &store, &cache).await?;
-                drain_live_row_deltas(&mut ws, &mut subscriptions, &store, &cache).await?;
+                drain_live_subscription_events(&mut ws, &mut subscriptions, &store, &cache, limits).await?;
+                drain_live_row_deltas(&mut ws, &mut subscriptions, &store, &cache, limits).await?;
             }
-            _ = auth_tick.tick(), if identity.user_credential.is_some() || identity.secret_credential.is_some() => {
+            _ = auth_tick.tick(), if identity.user_credential.is_some() || identity.secret_credential.is_some() || identity.studio_session.is_some() => {
                 let user_valid = identity.user_credential.as_ref().is_none_or(|credential| {
                     crate::auth::revalidate_user_credential(credential, &store, &cache).is_ok()
                 });
                 let secret_valid = identity.secret_credential.as_ref().is_none_or(|credential| {
                     crate::auth::revalidate_secret_credential(credential, &store, &cache).is_ok()
                 });
-                if !user_valid || !secret_valid {
-                    send_live_json(&mut ws, json!({"type":"live.error","error":{"code":"AUTH_REVOKED","message":"live authorization is no longer valid"}})).await?;
-                    let _ = ws.send(WsMessage::Close(None)).await;
+                let studio_valid = identity.studio_session.as_ref().is_none_or(|(token, origin)| {
+                    studio_sessions.authorize(token, Some(origin))
+                });
+                if !user_valid || !secret_valid || !studio_valid {
+                    send_live_json(&mut ws, json!({"type":"live.error","error":{"code":"AUTH_REVOKED","message":"live authorization is no longer valid"}}), limits).await?;
+                    let _ = send_live_message(&mut ws, WsMessage::Close(None), limits).await;
                     break;
                 }
             }
         }
-    }
-
-    // Tear down every subscription on disconnect so broker bookkeeping (row-delta
-    // subscriber count, per-table channels) doesn't leak past the socket.
-    let ids: Vec<String> = subscriptions.keys().cloned().collect();
-    for id in ids {
-        stop_live_subscription(&broker, &mut subscriptions, &id);
     }
 
     Ok(())
@@ -1649,19 +2311,25 @@ where
 async fn handle_live_client_message<S>(
     ws: &mut WebSocketStream<S>,
     subscriptions: &mut HashMap<String, LiveSubscription>,
-    broker: &Broker,
-    store: &Arc<Store>,
-    cache: &SharedSchemaCache,
-    principal: Option<&crate::auth::AuthPrincipal>,
+    subscription_bytes: &mut HashMap<String, usize>,
+    retained_subscription_bytes: &mut usize,
+    context: LiveClientContext<'_>,
     text: &str,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let LiveClientContext {
+        broker,
+        store,
+        cache,
+        principal,
+        limits,
+    } = context;
     let parsed: Value = match serde_json::from_str(text) {
         Ok(value) => value,
         Err(_) => {
-            send_live_json(ws, json!({"type":"live.error","error":{"code":"INVALID_JSON","message":"invalid json"}})).await?;
+            send_live_json(ws, json!({"type":"live.error","error":{"code":"INVALID_JSON","message":"invalid json"}}), limits).await?;
             return Ok(());
         }
     };
@@ -1682,47 +2350,100 @@ where
                 send_live_json(
                     ws,
                     json!({"type":"live.error","id":id,"error":{"code":"UNAVAILABLE","message":error.to_string()}}),
+                    limits,
                 )
                 .await?;
                 return Ok(());
             }
-            send_live_json(ws, json!({"type":"live.unsubscribed","id":id})).await?;
+            if let Some(bytes) = subscription_bytes.remove(&id) {
+                *retained_subscription_bytes = retained_subscription_bytes.saturating_sub(bytes);
+            }
+            send_live_json(ws, json!({"type":"live.unsubscribed","id":id}), limits).await?;
         }
         return Ok(());
     }
 
     if msg_type != "live.subscribe" {
-        send_live_json(ws, json!({"type":"live.error","id":id,"error":{"code":"UNKNOWN_MESSAGE","message":"unknown live message type"}})).await?;
+        send_live_json(ws, json!({"type":"live.error","id":id,"error":{"code":"UNKNOWN_MESSAGE","message":"unknown live message type"}}), limits).await?;
         return Ok(());
     }
 
     if id.is_empty() {
-        send_live_json(ws, json!({"type":"live.error","error":{"code":"MISSING_ID","message":"live.subscribe requires id"}})).await?;
+        send_live_json(ws, json!({"type":"live.error","error":{"code":"MISSING_ID","message":"live.subscribe requires id"}}), limits).await?;
         return Ok(());
     }
 
     let Some(spec) = parsed.get("spec").or_else(|| parsed.get("query")) else {
-        send_live_json(ws, json!({"type":"live.error","id":id,"error":{"code":"MISSING_SPEC","message":"live.subscribe requires spec"}})).await?;
+        send_live_json(ws, json!({"type":"live.error","id":id,"error":{"code":"MISSING_SPEC","message":"live.subscribe requires spec"}}), limits).await?;
         return Ok(());
     };
 
+    if !subscriptions.contains_key(&id)
+        && subscriptions.len() >= limits.server.max_live_subscriptions
+    {
+        send_live_json(
+            ws,
+            json!({"type":"live.error","id":id,"error":{"code":"LIMIT_EXCEEDED","message":"maximum live subscriptions reached"}}),
+            limits,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let replaced_bytes = subscription_bytes.get(&id).copied().unwrap_or(0);
+    if retained_subscription_bytes
+        .saturating_sub(replaced_bytes)
+        .checked_add(text.len())
+        .is_none_or(|bytes| bytes > limits.max_body)
+    {
+        send_live_json(
+            ws,
+            json!({"type":"live.error","id":id,"error":{"code":"LIMIT_EXCEEDED","message":"live subscription definitions exceed maximum retained bytes"}}),
+            limits,
+        )
+        .await?;
+        return Ok(());
+    }
+
     let subscription = match with_execution_read(store, || {
-        stop_live_subscription(broker, subscriptions, &id);
-        build_live_subscription(spec, broker, store, cache, principal)
+        build_live_subscription(spec, broker, store, cache, principal, limits, text.len())
     }) {
         Ok(subscription) => subscription,
-        Err(error) => Err(live_error("UNAVAILABLE", &error.to_string())),
+        Err(error) => {
+            send_live_json(
+                ws,
+                json!({"type":"live.error","id":id,"error":{"code":"UNAVAILABLE","message":error.to_string()}}),
+                limits,
+            )
+            .await?;
+            return Ok(());
+        }
     };
     match subscription {
         Ok((subscription, initial_events)) => {
+            stop_live_subscription(broker, subscriptions, &id);
+            if let Some(bytes) = subscription_bytes.insert(id.clone(), text.len()) {
+                *retained_subscription_bytes = retained_subscription_bytes.saturating_sub(bytes);
+            }
+            *retained_subscription_bytes = retained_subscription_bytes.saturating_add(text.len());
             subscriptions.insert(id.clone(), subscription);
-            send_live_json(ws, json!({"type":"live.subscribed","id":id})).await?;
+            send_live_json(ws, json!({"type":"live.subscribed","id":id}), limits).await?;
             for event in initial_events {
-                send_live_json(ws, json!({"type":"live.event","id":id,"event":event})).await?;
+                send_live_json(
+                    ws,
+                    json!({"type":"live.event","id":id,"event":event}),
+                    limits,
+                )
+                .await?;
             }
         }
         Err(error) => {
-            send_live_json(ws, json!({"type":"live.error","id":id,"error":error})).await?;
+            send_live_json(
+                ws,
+                json!({"type":"live.error","id":id,"error":error}),
+                limits,
+            )
+            .await?;
         }
     }
 
@@ -1735,16 +2456,21 @@ fn build_live_subscription(
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
     principal: Option<&crate::auth::AuthPrincipal>,
+    limits: RequestLimits,
+    retained_bytes: usize,
 ) -> Result<(LiveSubscription, Vec<Value>), Value> {
     if let Some(pattern) = spec
         .as_str()
         .or_else(|| spec.get("key").and_then(Value::as_str))
     {
         require_live_operator(store, principal)?;
+        ensure_live_subscription_name(pattern, limits)?;
+        let capacity = reserve_live_subscription_capacity(broker, 1, retained_bytes)?;
         return Ok((
             LiveSubscription::Key {
                 pattern: pattern.to_string(),
                 receivers: vec![broker.ksubscribe(pattern)],
+                _capacity: capacity,
             },
             Vec::new(),
         ));
@@ -1754,10 +2480,13 @@ fn build_live_subscription(
     if kind == "key" {
         let pattern = required_str(spec, "pattern")?;
         require_live_operator(store, principal)?;
+        ensure_live_subscription_name(pattern, limits)?;
+        let capacity = reserve_live_subscription_capacity(broker, 1, retained_bytes)?;
         return Ok((
             LiveSubscription::Key {
                 pattern: pattern.to_string(),
                 receivers: vec![broker.ksubscribe(pattern)],
+                _capacity: capacity,
             },
             Vec::new(),
         ));
@@ -1765,10 +2494,13 @@ fn build_live_subscription(
     if kind == "channel" || spec.get("channel").is_some() {
         let channel = required_str(spec, "channel")?;
         require_live_operator(store, principal)?;
+        ensure_live_subscription_name(channel, limits)?;
+        let capacity = reserve_live_subscription_capacity(broker, 1, retained_bytes)?;
         return Ok((
             LiveSubscription::Channel {
                 channel: channel.to_string(),
                 receiver: broker.subscribe(channel),
+                _capacity: capacity,
             },
             Vec::new(),
         ));
@@ -1785,16 +2517,26 @@ fn build_live_subscription(
                 )
             })?;
         require_live_operator(store, principal)?;
+        ensure_live_subscription_name(pattern, limits)?;
+        let capacity = reserve_live_subscription_capacity(broker, 1, retained_bytes)?;
         return Ok((
             LiveSubscription::PubSubPattern {
                 pattern: pattern.to_string(),
                 receiver: broker.psubscribe(pattern),
+                _capacity: capacity,
             },
             Vec::new(),
         ));
     }
     if kind == "table" || spec.get("table").is_some() {
         let mut table_spec = parse_live_table_spec(spec)?;
+        ensure_live_subscription_name(&table_spec.table, limits)?;
+        for join in &table_spec.joins {
+            ensure_live_subscription_name(&join.table, limits)?;
+        }
+        if let Some(max_rows) = limits.max_rows {
+            table_spec.limit = Some(table_spec.limit.unwrap_or(max_rows).min(max_rows));
+        }
         if let Some(err) = crate::auth::reserved_table_access_error(&table_spec.table) {
             return Err(live_error("FORBIDDEN", &err));
         }
@@ -1858,6 +2600,31 @@ fn build_live_subscription(
         } else {
             live_table_dependencies(&table_spec)
         };
+        for table in &key_tables {
+            ensure_live_subscription_name(table, limits)?;
+        }
+        let receiver_count = key_tables
+            .len()
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(usize::from(ivm)))
+            .ok_or_else(|| live_error("LIMIT_EXCEEDED", "subscription capacity overflow"))?;
+        let receiver_bytes = key_tables
+            .iter()
+            .try_fold(retained_bytes, |bytes, table| {
+                bytes
+                    .checked_add(table.len())
+                    .and_then(|bytes| bytes.checked_add(format!("_t:{table}:row:*").len()))
+            })
+            .and_then(|bytes| {
+                if ivm {
+                    bytes.checked_add(table_spec.table.len())
+                } else {
+                    Some(bytes)
+                }
+            })
+            .ok_or_else(|| live_error("LIMIT_EXCEEDED", "subscription bytes overflow"))?;
+        let mut capacity =
+            reserve_live_subscription_capacity(broker, receiver_count, receiver_bytes)?;
         let receivers = key_tables
             .iter()
             .flat_map(|table| {
@@ -1882,11 +2649,29 @@ fn build_live_subscription(
             }
         };
         let query = json!({"type":"table","table":table_spec.table});
-        let state = LiveQueryState {
+        let indexed_rows = index_live_rows(rows.clone(), pk_field.as_deref());
+        let content_bytes = live_state_content_bytes(&indexed_rows)
+            .ok_or_else(|| live_error("LIMIT_EXCEEDED", "live query state size overflow"))?;
+        let mut state = LiveQueryState {
             query: query.clone(),
-            rows: index_live_rows(rows.clone(), pk_field.as_deref()),
+            rows: indexed_rows,
             pk_field,
+            content_bytes: 0,
+            reserved_bytes: 0,
         };
+        if !state.try_reserve_rows(&mut capacity, state.rows.len(), content_bytes) {
+            rollback_live_table_receivers(
+                broker,
+                receivers,
+                delta_rx,
+                &key_tables,
+                &table_spec.table,
+            );
+            return Err(live_error(
+                "LIMIT_EXCEEDED",
+                "process live query state capacity exhausted",
+            ));
+        }
         return Ok((
             LiveSubscription::Table {
                 spec: Box::new(table_spec),
@@ -1894,26 +2679,45 @@ fn build_live_subscription(
                 receivers,
                 delta_rx,
                 pk_col,
+                _capacity: capacity,
             },
             vec![json!({"kind":"snapshot","scope":"query","query":query,"rows":rows})],
         ));
     }
     if kind == "vector.near" {
-        let vector_spec = parse_live_vector_near_spec(spec)?;
+        let mut vector_spec = parse_live_vector_near_spec(spec)?;
+        let max_rows = limits
+            .max_rows
+            .unwrap_or(limits.server.max_query_candidates)
+            .min(limits.server.max_query_candidates);
+        vector_spec.k = vector_spec.k.min(max_rows);
         require_live_operator(store, principal)?;
+        let mut capacity = reserve_live_subscription_capacity(broker, 1, retained_bytes)?;
         let rows = fetch_live_vector_rows(store, &vector_spec);
         let query =
             json!({"type":"vector.near","k":vector_spec.k,"threshold":vector_spec.threshold});
-        let state = LiveQueryState {
+        let indexed_rows = index_live_rows(rows.clone(), None);
+        let content_bytes = live_state_content_bytes(&indexed_rows)
+            .ok_or_else(|| live_error("LIMIT_EXCEEDED", "live query state size overflow"))?;
+        let mut state = LiveQueryState {
             query: query.clone(),
-            rows: index_live_rows(rows.clone(), None),
+            rows: indexed_rows,
             pk_field: None,
+            content_bytes: 0,
+            reserved_bytes: 0,
         };
+        if !state.try_reserve_rows(&mut capacity, state.rows.len(), content_bytes) {
+            return Err(live_error(
+                "LIMIT_EXCEEDED",
+                "process live query state capacity exhausted",
+            ));
+        }
         return Ok((
             LiveSubscription::VectorNear {
                 spec: vector_spec,
                 state,
                 receiver: broker.ksubscribe("*"),
+                _capacity: capacity,
             },
             vec![json!({"kind":"snapshot","scope":"query","query":query,"rows":rows})],
         ));
@@ -1925,53 +2729,137 @@ fn build_live_subscription(
     ))
 }
 
+fn reserve_live_subscription_capacity(
+    broker: &Broker,
+    count: usize,
+    bytes: usize,
+) -> Result<SubscriptionReservation, Value> {
+    let mut capacity = broker.subscription_reservation();
+    if capacity.try_grow(count, bytes) {
+        Ok(capacity)
+    } else {
+        Err(live_error(
+            "LIMIT_EXCEEDED",
+            "process subscription capacity exhausted",
+        ))
+    }
+}
+
+fn ensure_live_subscription_name(name: &str, limits: RequestLimits) -> Result<(), Value> {
+    if name.len() <= limits.server.max_subscription_name_bytes {
+        Ok(())
+    } else {
+        Err(live_error(
+            "LIMIT_EXCEEDED",
+            "subscription name exceeds maximum",
+        ))
+    }
+}
+
 async fn drain_live_subscription_events<S>(
     ws: &mut WebSocketStream<S>,
-    subscriptions: &mut HashMap<String, LiveSubscription>,
+    subscriptions: &mut LiveSubscriptions<'_>,
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
+    limits: RequestLimits,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut events = Vec::new();
-    for subscription in subscriptions.values_mut() {
-        match subscription {
-            LiveSubscription::Key { receivers, .. } | LiveSubscription::Table { receivers, .. } => {
-                for receiver in receivers {
-                    drain_receiver(receiver, &mut events);
-                }
-            }
-            LiveSubscription::Channel { receiver, .. }
-            | LiveSubscription::PubSubPattern { receiver, .. }
-            | LiveSubscription::VectorNear { receiver, .. } => {
-                drain_receiver(receiver, &mut events)
-            }
+    // Drain one broker message per subscription per tick. A WebSocket that
+    // cannot keep pace will lag against the fixed broker queue rather than
+    // materializing an unbounded event batch in this task.
+    let ids: Vec<String> = subscriptions.keys().cloned().collect();
+    let process_gap = subscriptions.take_key_event_gap();
+    for id in ids {
+        if process_gap {
+            handle_live_subscription_gap(ws, subscriptions, store, cache, &id, limits).await?;
+            continue;
         }
-    }
-
-    for event in events {
-        dispatch_live_broker_event(ws, subscriptions, store, cache, event).await?;
+        let input = subscriptions
+            .get_mut(&id)
+            .and_then(next_live_subscription_input);
+        match input {
+            Some(LiveBrokerInput::Message(message)) => {
+                let Some(event) = live_broker_event_from_message(&message) else {
+                    continue;
+                };
+                dispatch_live_broker_event(ws, subscriptions, store, cache, &id, event, limits)
+                    .await?;
+            }
+            Some(LiveBrokerInput::Gap) => {
+                handle_live_subscription_gap(ws, subscriptions, store, cache, &id, limits).await?;
+            }
+            None => {}
+        }
     }
     Ok(())
 }
 
-fn drain_receiver(
+enum LiveBrokerInput {
+    Message(crate::pubsub::Message),
+    Gap,
+}
+
+fn next_receiver_input(
     receiver: &mut broadcast::Receiver<crate::pubsub::Message>,
-    events: &mut Vec<LiveBrokerEvent>,
-) {
-    loop {
-        match receiver.try_recv() {
-            Ok(message) => {
-                if let Some(event) = live_broker_event_from_message(&message) {
-                    events.push(event);
-                }
+) -> Option<LiveBrokerInput> {
+    match receiver.try_recv() {
+        Ok(message) => Some(LiveBrokerInput::Message(message)),
+        Err(broadcast::error::TryRecvError::Lagged(_)) => Some(LiveBrokerInput::Gap),
+        Err(broadcast::error::TryRecvError::Empty)
+        | Err(broadcast::error::TryRecvError::Closed) => None,
+    }
+}
+
+fn next_live_subscription_input(subscription: &mut LiveSubscription) -> Option<LiveBrokerInput> {
+    match subscription {
+        LiveSubscription::Key { receivers, .. } | LiveSubscription::Table { receivers, .. } => {
+            receivers.iter_mut().find_map(next_receiver_input)
+        }
+        LiveSubscription::Channel { receiver, .. }
+        | LiveSubscription::PubSubPattern { receiver, .. }
+        | LiveSubscription::VectorNear { receiver, .. } => next_receiver_input(receiver),
+    }
+}
+
+async fn handle_live_subscription_gap<S>(
+    ws: &mut WebSocketStream<S>,
+    subscriptions: &mut HashMap<String, LiveSubscription>,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+    id: &str,
+    limits: RequestLimits,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(subscription) = subscriptions.get_mut(id) else {
+        return Ok(());
+    };
+    match subscription {
+        LiveSubscription::Table { .. } | LiveSubscription::VectorNear { .. } => {
+            for event in resync_live_query_subscription(subscription, id, store, cache)? {
+                send_live_json(
+                    ws,
+                    json!({"type":"live.event","id":id,"event":event}),
+                    limits,
+                )
+                .await?;
             }
-            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-            Err(broadcast::error::TryRecvError::Empty)
-            | Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+        LiveSubscription::Key { .. }
+        | LiveSubscription::Channel { .. }
+        | LiveSubscription::PubSubPattern { .. } => {
+            send_live_json(
+                ws,
+                json!({"type":"live.error","id":id,"error":{"code":"EVENT_GAP","message":"live event delivery fell behind; resubscribe to establish a new delivery point"}}),
+                limits,
+            )
+            .await?;
         }
     }
+    Ok(())
 }
 
 async fn dispatch_live_broker_event<S>(
@@ -1979,76 +2867,99 @@ async fn dispatch_live_broker_event<S>(
     subscriptions: &mut HashMap<String, LiveSubscription>,
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
+    id: &str,
     event: LiveBrokerEvent,
+    limits: RequestLimits,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut outgoing = Vec::new();
-    for (id, subscription) in subscriptions.iter_mut() {
-        match (subscription, &event) {
-            (
-                LiveSubscription::Key { pattern, .. },
-                LiveBrokerEvent::Key {
-                    pattern: event_pattern,
-                    key,
-                    operation,
-                },
-            ) if pattern == event_pattern => {
-                outgoing.push((id.clone(), live_key_event(event_pattern, key, operation)));
-            }
-            (
-                LiveSubscription::Channel { channel, .. },
-                LiveBrokerEvent::Message {
-                    channel: event_channel,
-                    message,
-                    pattern: None,
-                },
-            ) if channel == event_channel => {
-                outgoing.push((id.clone(), json!({"kind":"pubsub.message","scope":"pubsub","channel":event_channel,"message":message})));
-            }
-            (
-                LiveSubscription::PubSubPattern { pattern, .. },
-                LiveBrokerEvent::Message {
-                    channel,
-                    message,
-                    pattern: Some(event_pattern),
-                },
-            ) if pattern == event_pattern => {
-                outgoing.push((id.clone(), json!({"kind":"pubsub.message","scope":"pubsub","pattern":event_pattern,"channel":channel,"message":message})));
-            }
-            (
-                LiveSubscription::Table { spec, state, .. },
-                LiveBrokerEvent::Key { key, operation, .. },
-            ) => {
-                if let Some(changed_table) = live_table_for_key(spec, key) {
-                    let next = fetch_live_table_rows(store, cache, spec).unwrap_or_default();
-                    outgoing.extend(diff_live_query(
-                        id,
-                        state,
-                        next,
-                        Some(json!({"kind":table_cause_kind(operation),"table":changed_table,"operation":operation,"raw":{"pattern":format!("_t:{changed_table}:row:*"),"key":key,"operation":operation}})),
-                    ));
-                }
-            }
-            (
-                LiveSubscription::VectorNear { spec, state, .. },
-                LiveBrokerEvent::Key { key, operation, .. },
-            ) => {
-                let next = fetch_live_vector_rows(store, spec);
+    let Some(subscription) = subscriptions.get_mut(id) else {
+        return Ok(());
+    };
+    match (subscription, &event) {
+        (
+            LiveSubscription::Key { pattern, .. },
+            LiveBrokerEvent::Key {
+                pattern: event_pattern,
+                key,
+                operation,
+            },
+        ) if pattern == event_pattern => {
+            outgoing.push((
+                id.to_string(),
+                live_key_event(event_pattern, key, operation),
+            ));
+        }
+        (
+            LiveSubscription::Channel { channel, .. },
+            LiveBrokerEvent::Message {
+                channel: event_channel,
+                message,
+                pattern: None,
+            },
+        ) if channel == event_channel => {
+            outgoing.push((id.to_string(), json!({"kind":"pubsub.message","scope":"pubsub","channel":event_channel,"message":message})));
+        }
+        (
+            LiveSubscription::PubSubPattern { pattern, .. },
+            LiveBrokerEvent::Message {
+                channel,
+                message,
+                pattern: Some(event_pattern),
+            },
+        ) if pattern == event_pattern => {
+            outgoing.push((id.to_string(), json!({"kind":"pubsub.message","scope":"pubsub","pattern":event_pattern,"channel":channel,"message":message})));
+        }
+        (
+            LiveSubscription::Table {
+                spec,
+                state,
+                _capacity: capacity,
+                ..
+            },
+            LiveBrokerEvent::Key { key, operation, .. },
+        ) => {
+            if let Some(changed_table) = live_table_for_key(spec, key) {
+                let next = fetch_live_table_rows(store, cache, spec).map_err(live_query_error)?;
                 outgoing.extend(diff_live_query(
                     id,
                     state,
+                    capacity,
                     next,
-                    Some(json!({"kind":vector_cause_kind(operation),"key":key,"operation":operation})),
-                ));
+                    Some(json!({"kind":table_cause_kind(operation),"table":changed_table,"operation":operation,"raw":{"pattern":format!("_t:{changed_table}:row:*"),"key":key,"operation":operation}})),
+                ).map_err(live_state_capacity_error)?);
             }
-            _ => {}
         }
+        (
+            LiveSubscription::VectorNear {
+                spec,
+                state,
+                _capacity: capacity,
+                ..
+            },
+            LiveBrokerEvent::Key { key, operation, .. },
+        ) => {
+            let next = fetch_live_vector_rows(store, spec);
+            outgoing.extend(diff_live_query(
+                id,
+                state,
+                capacity,
+                next,
+                Some(json!({"kind":vector_cause_kind(operation),"key":key,"operation":operation})),
+            ).map_err(live_state_capacity_error)?);
+        }
+        _ => {}
     }
 
     for (id, event) in outgoing {
-        send_live_json(ws, json!({"type":"live.event","id":id,"event":event})).await?;
+        send_live_json(
+            ws,
+            json!({"type":"live.event","id":id,"event":event}),
+            limits,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2062,9 +2973,24 @@ fn stop_live_subscription(
         return;
     };
     match subscription {
-        LiveSubscription::Key { pattern, .. } => broker.kunsub(&pattern),
-        LiveSubscription::Channel { channel, .. } => broker.unsubscribe_channel(&channel),
-        LiveSubscription::PubSubPattern { pattern, .. } => broker.punsubscribe_pattern(&pattern),
+        LiveSubscription::Key {
+            pattern, receivers, ..
+        } => {
+            drop(receivers);
+            broker.kunsub(&pattern);
+        }
+        LiveSubscription::Channel {
+            channel, receiver, ..
+        } => {
+            drop(receiver);
+            broker.unsubscribe_channel(&channel);
+        }
+        LiveSubscription::PubSubPattern {
+            pattern, receiver, ..
+        } => {
+            drop(receiver);
+            broker.punsubscribe_pattern(&pattern);
+        }
         LiveSubscription::Table {
             spec,
             receivers,
@@ -2080,7 +3006,10 @@ fn stop_live_subscription(
             };
             rollback_live_table_receivers(broker, receivers, delta_rx, &key_tables, &spec.table);
         }
-        LiveSubscription::VectorNear { .. } => broker.kunsub("*"),
+        LiveSubscription::VectorNear { receiver, .. } => {
+            drop(receiver);
+            broker.kunsub("*");
+        }
     }
 }
 
@@ -2107,38 +3036,65 @@ fn rollback_live_table_receivers(
 fn diff_live_query(
     id: &str,
     state: &mut LiveQueryState,
+    capacity: &mut SubscriptionReservation,
     next_rows: Vec<Value>,
     cause: Option<Value>,
-) -> Vec<(String, Value)> {
-    let previous = std::mem::take(&mut state.rows);
+) -> Result<Vec<(String, Value)>, ()> {
     let next = index_live_rows(next_rows, state.pk_field.as_deref());
+    let content_bytes = live_state_content_bytes(&next).ok_or(())?;
+    if !state.try_reserve_rows(capacity, next.len(), content_bytes) {
+        return Err(());
+    }
+    let previous = std::mem::replace(&mut state.rows, next);
     let mut events = Vec::new();
 
-    for (pk, row) in &next {
+    for (pk, row) in &state.rows {
         match previous.get(pk) {
             None => events.push((
                 id.to_string(),
-                json!({"kind":"insert","scope":"query","query":state.query,"pk":pk,"row":row,"previous":null,"cause":cause}),
+                json!({"kind":"insert","scope":"query","query":state.query,"pk":pk,"row":row,"previous":null,"cause":live_transition_cause(cause.as_ref(), "insert")}),
             )),
             Some(before) if row_fingerprint(before) != row_fingerprint(row) => events.push((
                 id.to_string(),
-                json!({"kind":"update","scope":"query","query":state.query,"pk":pk,"row":row,"previous":before,"changed":changed_json_fields(before, row),"cause":cause}),
+                json!({"kind":"update","scope":"query","query":state.query,"pk":pk,"row":row,"previous":before,"changed":changed_json_fields(before, row),"cause":live_transition_cause(cause.as_ref(), "update")}),
             )),
             _ => {}
         }
     }
 
     for (pk, before) in &previous {
-        if !next.contains_key(pk) {
+        if !state.rows.contains_key(pk) {
             events.push((
                 id.to_string(),
-                json!({"kind":"delete","scope":"query","query":state.query,"pk":pk,"row":null,"previous":before,"cause":cause}),
+                json!({"kind":"delete","scope":"query","query":state.query,"pk":pk,"row":null,"previous":before,"cause":live_transition_cause(cause.as_ref(), "delete")}),
             ));
         }
     }
 
-    state.rows = next;
-    events
+    Ok(events)
+}
+
+fn live_state_capacity_error(_: ()) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::OutOfMemory,
+        "process live query state capacity exhausted",
+    )
+}
+
+fn live_query_error(error: Value) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+}
+
+fn live_transition_cause(cause: Option<&Value>, transition: &str) -> Option<Value> {
+    let mut cause = cause?.clone();
+    let is_table_cause = cause
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("table."));
+    if is_table_cause {
+        cause["kind"] = Value::String(format!("table.{transition}"));
+    }
+    Some(cause)
 }
 
 /// A single-table query with no joins/near/limit/offset/aggregate can be
@@ -2188,7 +3144,7 @@ fn fetch_live_table_row_for_pk(
     spec: &LiveTableSpec,
     pk_col: &str,
     pk: &str,
-) -> Option<Value> {
+) -> Result<Option<Value>, Value> {
     let mut s = spec.clone();
     s.where_conditions.push((
         pk_col.to_string(),
@@ -2198,103 +3154,225 @@ fn fetch_live_table_row_for_pk(
     s.order_by = None;
     s.offset = None;
     s.limit = Some(1);
-    fetch_live_table_rows(store, cache, &s)
-        .ok()?
-        .into_iter()
-        .next()
+    fetch_live_table_rows(store, cache, &s).map(|rows| rows.into_iter().next())
 }
 
 /// Incremental view maintenance: drain typed row deltas for IVM table
 /// subscriptions and emit per-row insert/update/delete by re-evaluating only the
 /// changed pk, instead of re-running the whole query.
+const LIVE_ROW_DELTA_BATCH_MAX: usize = 64;
+
+enum LiveRowDeltaBatch {
+    Resync,
+    Keys(Vec<Arc<str>>),
+}
+
 async fn drain_live_row_deltas<S>(
     ws: &mut WebSocketStream<S>,
     subscriptions: &mut HashMap<String, LiveSubscription>,
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
+    limits: RequestLimits,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut outgoing: Vec<(String, Value)> = Vec::new();
-    for (id, subscription) in subscriptions.iter_mut() {
-        let LiveSubscription::Table {
-            spec,
-            state,
-            delta_rx: Some(rx),
-            pk_col,
-            ..
-        } = subscription
-        else {
-            continue;
-        };
-        // Distinct changed pks since the last tick (one re-eval each).
-        let mut changed: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut lagged = false;
-        loop {
-            match rx.try_recv() {
-                Ok(delta) => {
-                    if seen.insert(delta.pk.clone()) {
-                        changed.push(delta.pk);
+    let ids: Vec<String> = subscriptions.keys().cloned().collect();
+    for id in ids {
+        let batch = subscriptions
+            .get_mut(&id)
+            .and_then(take_live_row_delta_batch);
+        match batch {
+            None => {}
+            Some(LiveRowDeltaBatch::Resync) => {
+                let events = match subscriptions.get_mut(&id) {
+                    Some(subscription) => {
+                        resync_live_query_subscription(subscription, &id, store, cache)?
                     }
+                    None => Vec::new(),
+                };
+                for event in events {
+                    send_live_json(
+                        ws,
+                        json!({"type":"live.event","id":id,"event":event}),
+                        limits,
+                    )
+                    .await?;
                 }
-                Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                    lagged = true;
-                    continue;
+            }
+            Some(LiveRowDeltaBatch::Keys(keys)) => {
+                for pk in keys {
+                    let event = match subscriptions.get_mut(&id) {
+                        Some(subscription) => {
+                            process_live_row_key(subscription, &pk, store, cache)?
+                        }
+                        None => None,
+                    };
+                    let Some(event) = event else {
+                        continue;
+                    };
+                    send_live_json(
+                        ws,
+                        json!({"type":"live.event","id":id,"event":event}),
+                        limits,
+                    )
+                    .await?;
                 }
-                Err(_) => break,
             }
         }
-        if lagged {
-            // Fell behind the delta stream: resync from a fresh query (safe truth).
-            let rows = fetch_live_table_rows(store, cache, spec).unwrap_or_default();
-            outgoing.extend(diff_live_query(
-                id,
-                state,
-                rows,
-                Some(json!({"kind":"resync","scope":"query"})),
-            ));
-            continue;
-        }
-        for pk in changed {
-            let now_row = fetch_live_table_row_for_pk(store, cache, spec, pk_col, &pk);
-            let prev = state.rows.get(&pk).cloned();
-            // The cause reflects the row's transition in this query's result set
-            // (which is what the client observes); table names the source table.
-            let table = spec.table.as_str();
-            match (prev, now_row) {
-                (None, Some(row)) => {
-                    state.rows.insert(pk.clone(), row.clone());
-                    outgoing.push((
-                        id.clone(),
-                        json!({"kind":"insert","scope":"query","query":state.query,"pk":pk,"row":row,"previous":null,"cause":{"kind":"table.insert","table":table,"operation":"tinsert"}}),
-                    ));
-                }
-                (Some(before), None) => {
-                    state.rows.remove(&pk);
-                    outgoing.push((
-                        id.clone(),
-                        json!({"kind":"delete","scope":"query","query":state.query,"pk":pk,"row":null,"previous":before,"cause":{"kind":"table.delete","table":table,"operation":"tdelete"}}),
-                    ));
-                }
-                (Some(before), Some(row)) => {
-                    if row_fingerprint(&before) != row_fingerprint(&row) {
-                        state.rows.insert(pk.clone(), row.clone());
-                        outgoing.push((
-                            id.clone(),
-                            json!({"kind":"update","scope":"query","query":state.query,"pk":pk,"row":row,"previous":before,"changed":changed_json_fields(&before,&row),"cause":{"kind":"table.update","table":table,"operation":"tupdate"}}),
-                        ));
-                    }
-                }
-                (None, None) => {}
-            }
-        }
-    }
-    for (id, event) in outgoing {
-        send_live_json(ws, json!({"type":"live.event","id":id,"event":event})).await?;
     }
     Ok(())
+}
+
+fn take_live_row_delta_batch(subscription: &mut LiveSubscription) -> Option<LiveRowDeltaBatch> {
+    let LiveSubscription::Table {
+        delta_rx: Some(rx), ..
+    } = subscription
+    else {
+        return None;
+    };
+
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for _ in 0..LIVE_ROW_DELTA_BATCH_MAX {
+        match rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Empty)
+            | Err(broadcast::error::TryRecvError::Closed) => break,
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                while rx.try_recv().is_ok() {}
+                return Some(LiveRowDeltaBatch::Resync);
+            }
+            Ok(delta) => {
+                let Some(pk) = delta.pk else {
+                    while rx.try_recv().is_ok() {}
+                    return Some(LiveRowDeltaBatch::Resync);
+                };
+                if seen.insert(pk.clone()) {
+                    keys.push(pk);
+                }
+            }
+        }
+    }
+
+    (!keys.is_empty()).then_some(LiveRowDeltaBatch::Keys(keys))
+}
+
+fn resync_live_query_subscription(
+    subscription: &mut LiveSubscription,
+    id: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> std::io::Result<Vec<Value>> {
+    let events = match subscription {
+        LiveSubscription::Table {
+            spec,
+            state,
+            _capacity: capacity,
+            ..
+        } => {
+            let rows = fetch_live_table_rows(store, cache, spec).map_err(live_query_error)?;
+            diff_live_query(
+                id,
+                state,
+                capacity,
+                rows,
+                Some(json!({"kind":"resync","scope":"query"})),
+            )
+            .map_err(live_state_capacity_error)?
+        }
+        LiveSubscription::VectorNear {
+            spec,
+            state,
+            _capacity: capacity,
+            ..
+        } => diff_live_query(
+            id,
+            state,
+            capacity,
+            fetch_live_vector_rows(store, spec),
+            Some(json!({"kind":"resync","scope":"query"})),
+        )
+        .map_err(live_state_capacity_error)?,
+        _ => Vec::new(),
+    };
+    Ok(events.into_iter().map(|(_, event)| event).collect())
+}
+
+fn process_live_row_key(
+    subscription: &mut LiveSubscription,
+    pk: &str,
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> std::io::Result<Option<Value>> {
+    let LiveSubscription::Table {
+        spec,
+        state,
+        pk_col,
+        _capacity: capacity,
+        ..
+    } = subscription
+    else {
+        return Ok(None);
+    };
+
+    let now_row =
+        fetch_live_table_row_for_pk(store, cache, spec, pk_col, pk).map_err(live_query_error)?;
+    let prev = state.rows.get(pk).cloned();
+    // The cause reflects the row's transition in this query's result set
+    // (which is what the client observes); table names the source table.
+    let table = spec.table.as_str();
+    match (prev, now_row) {
+        (None, Some(row)) => {
+            let entry_bytes = live_state_entry_content_bytes(pk, &row)
+                .ok_or_else(|| live_state_capacity_error(()))?;
+            let content_bytes = state
+                .content_bytes
+                .checked_add(entry_bytes)
+                .ok_or_else(|| live_state_capacity_error(()))?;
+            if !state.try_reserve_rows(capacity, state.rows.len() + 1, content_bytes) {
+                return Err(live_state_capacity_error(()));
+            }
+            state.rows.insert(pk.to_string(), row.clone());
+            Ok(Some(
+                json!({"kind":"insert","scope":"query","query":state.query,"pk":pk,"row":row,"previous":null,"cause":{"kind":"table.insert","table":table,"operation":"tinsert"}}),
+            ))
+        }
+        (Some(before), None) => {
+            let entry_bytes = live_state_entry_content_bytes(pk, &before)
+                .ok_or_else(|| live_state_capacity_error(()))?;
+            let content_bytes = state.content_bytes.saturating_sub(entry_bytes);
+            if !state.try_reserve_rows(capacity, state.rows.len().saturating_sub(1), content_bytes)
+            {
+                return Err(live_state_capacity_error(()));
+            }
+            state.rows.remove(pk);
+            Ok(Some(
+                json!({"kind":"delete","scope":"query","query":state.query,"pk":pk,"row":null,"previous":before,"cause":{"kind":"table.delete","table":table,"operation":"tdelete"}}),
+            ))
+        }
+        (Some(before), Some(row)) => {
+            if row_fingerprint(&before) == row_fingerprint(&row) {
+                return Ok(None);
+            }
+            let before_bytes = live_state_entry_content_bytes(pk, &before)
+                .ok_or_else(|| live_state_capacity_error(()))?;
+            let after_bytes = live_state_entry_content_bytes(pk, &row)
+                .ok_or_else(|| live_state_capacity_error(()))?;
+            let content_bytes = state
+                .content_bytes
+                .saturating_sub(before_bytes)
+                .checked_add(after_bytes)
+                .ok_or_else(|| live_state_capacity_error(()))?;
+            if !state.try_reserve_rows(capacity, state.rows.len(), content_bytes) {
+                return Err(live_state_capacity_error(()));
+            }
+            state.rows.insert(pk.to_string(), row.clone());
+            Ok(Some(
+                json!({"kind":"update","scope":"query","query":state.query,"pk":pk,"row":row,"previous":before,"changed":changed_json_fields(&before,&row),"cause":{"kind":"table.update","table":table,"operation":"tupdate"}}),
+            ))
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 fn parse_live_table_spec(spec: &Value) -> Result<LiveTableSpec, Value> {
@@ -2684,13 +3762,41 @@ fn fetch_live_vector_rows(store: &Arc<Store>, spec: &LiveVectorNearSpec) -> Vec<
         .collect()
 }
 
-async fn send_live_json<S>(ws: &mut WebSocketStream<S>, value: Value) -> std::io::Result<()>
+async fn send_live_json<S>(
+    ws: &mut WebSocketStream<S>,
+    value: Value,
+    limits: RequestLimits,
+) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    ws.send(WsMessage::Text(value.to_string()))
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))
+    let text = value.to_string();
+    if text.len() > limits.max_body {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "live message exceeds maximum size",
+        ));
+    }
+    send_live_message(ws, WsMessage::Text(text), limits).await
+}
+
+async fn send_live_message<S>(
+    ws: &mut WebSocketStream<S>,
+    message: WsMessage,
+    limits: RequestLimits,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(limits.server.write_timeout, ws.send(message)).await {
+        Ok(result) => {
+            result.map_err(|error| std::io::Error::new(std::io::ErrorKind::BrokenPipe, error))
+        }
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "live socket write deadline exceeded",
+        )),
+    }
 }
 
 fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -2823,6 +3929,50 @@ fn index_live_rows(rows: Vec<Value>, pk_field: Option<&str>) -> HashMap<String, 
         indexed.insert(key, row);
     }
     indexed
+}
+
+fn live_state_content_bytes(rows: &HashMap<String, Value>) -> Option<usize> {
+    rows.iter().try_fold(0usize, |total, (pk, row)| {
+        total.checked_add(live_state_entry_content_bytes(pk, row)?)
+    })
+}
+
+fn live_state_entry_content_bytes(pk: &str, row: &Value) -> Option<usize> {
+    pk.len().checked_add(json_heap_bytes(row)?)
+}
+
+fn live_state_total_bytes(row_count: usize, content_bytes: usize) -> Option<usize> {
+    // HashMap keeps spare buckets. Two buckets per live row is a conservative
+    // allowance across growth and deletion churn; string/value heap storage is
+    // counted separately below.
+    let bucket_bytes = std::mem::size_of::<(String, Value)>().checked_add(1)?;
+    row_count
+        .checked_mul(2)?
+        .checked_mul(bucket_bytes)?
+        .checked_add(content_bytes)
+}
+
+fn json_heap_bytes(value: &Value) -> Option<usize> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => Some(0),
+        Value::String(value) => Some(value.len()),
+        Value::Array(values) => values
+            .capacity()
+            .checked_mul(std::mem::size_of::<Value>())?
+            .checked_add(values.iter().try_fold(0usize, |total, value| {
+                total.checked_add(json_heap_bytes(value)?)
+            })?),
+        Value::Object(values) => {
+            values
+                .len()
+                .checked_mul(128)?
+                .checked_add(values.iter().try_fold(0usize, |total, (key, value)| {
+                    total
+                        .checked_add(key.len())
+                        .and_then(|total| total.checked_add(json_heap_bytes(value)?))
+                })?)
+        }
+    }
 }
 
 fn row_fingerprint(value: &Value) -> String {
@@ -3081,6 +4231,7 @@ struct RouteDeps<'a> {
 }
 
 fn with_execution_read<T>(store: &Store, operation: impl FnOnce() -> T) -> std::io::Result<T> {
+    let _tiered_memory = store.tiered_memory_boundary();
     let _guard = store.execution_read_guard()?;
     Ok(operation())
 }
@@ -3145,8 +4296,8 @@ fn route_request_with_auth(
         ("DELETE", ["push", "config", "apns"]) => push_clear_apns(params, store, cache),
         ("POST", ["push", "config", "vapid"]) => push_enable_vapid(body, store, cache),
         ("DELETE", ["push", "config", "vapid"]) => push_disable_vapid(params, store, cache),
-        ("GET", ["push", "admin", "devices"]) => push_admin_devices(store, cache),
-        ("GET", ["push", "admin", "outbox"]) => push_admin_outbox(store, cache),
+        ("GET", ["push", "admin", "devices"]) => push_admin_devices(params, store, cache),
+        ("GET", ["push", "admin", "outbox"]) => push_admin_outbox(params, store, cache),
         ("GET", ["push", "admin", "stats"]) => push_admin_stats(),
         ("GET", ["push", "vapid"]) => push_vapid_public(params, store, cache),
 
@@ -3530,14 +4681,13 @@ fn persistence_json(store: &Store) -> Value {
 }
 
 fn health_readiness(store: &Store) -> (u16, &'static str, String) {
-    if store.ready_for_traffic() {
-        (200, "OK", r#"{"status":"ready"}"#.to_string())
-    } else {
-        (
+    match store.readiness_reason() {
+        None => (200, "OK", r#"{"status":"ready"}"#.to_string()),
+        Some(reason) => (
             503,
             "Service Unavailable",
-            r#"{"status":"not_ready"}"#.to_string(),
-        )
+            json!({"status": "not_ready", "reason": reason}).to_string(),
+        ),
     }
 }
 
@@ -3725,6 +4875,49 @@ fn ok(result: String) -> (u16, &'static str, String) {
 
 // ── Push handlers (lux push) ──
 
+fn push_page(params: &[(String, String)]) -> Result<(usize, usize), String> {
+    for key in ["limit", "offset"] {
+        if params.iter().filter(|(name, _)| name == key).count() > 1 {
+            return Err(format!("{key} query param must not be repeated"));
+        }
+    }
+    let limit = match get_param(params, "limit") {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| "limit must be a positive integer".to_string())?,
+        None => crate::push::DEFAULT_PAGE_SIZE,
+    };
+    if !(1..=crate::push::MAX_PAGE_SIZE).contains(&limit) {
+        return Err(format!(
+            "limit must be between 1 and {}",
+            crate::push::MAX_PAGE_SIZE
+        ));
+    }
+    let offset = match get_param(params, "offset") {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| "offset must be a non-negative integer".to_string())?,
+        None => 0,
+    };
+    if offset > crate::push::MAX_PAGE_OFFSET {
+        return Err(format!(
+            "offset must not exceed {}",
+            crate::push::MAX_PAGE_OFFSET
+        ));
+    }
+    Ok((limit, offset))
+}
+
+fn push_page_metadata(limit: usize, offset: usize, returned: usize, has_more: bool) -> Value {
+    json!({
+        "limit": limit,
+        "offset": offset,
+        "returned": returned,
+        "has_more": has_more,
+        "next_offset": has_more.then_some(offset + returned),
+    })
+}
+
 fn push_json_error(
     status: u16,
     status_text: &'static str,
@@ -3760,7 +4953,7 @@ fn push_register(
     }
     let subject_id = match auth {
         HttpAuthContext::User(principal) => principal.user_id.clone(),
-        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => {
             let s = parsed["subject_id"].as_str().unwrap_or("");
             if s.is_empty() {
                 return push_json_error(
@@ -3783,7 +4976,7 @@ fn push_register(
     // A self-registering end user is not trusted to name the delivery host, and
     // this route accepts a user's own JWT. See `normalize_environment`.
     let environment_source = match auth {
-        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => {
             crate::push::EnvironmentSource::Trusted
         }
         _ => crate::push::EnvironmentSource::User,
@@ -3816,7 +5009,7 @@ fn push_list_devices(
 ) -> (u16, &'static str, String) {
     let subject_id = match auth {
         HttpAuthContext::User(principal) => principal.user_id.clone(),
-        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => {
             let s = get_param(params, "subject_id").unwrap_or("");
             if s.is_empty() {
                 return push_json_error(400, "Bad Request", "subject_id query param is required");
@@ -3827,8 +5020,24 @@ fn push_list_devices(
             return push_json_error(401, "Unauthorized", "authentication required")
         }
     };
-    match crate::push::list_devices(store, cache, &subject_id, Instant::now()) {
-        Ok(devices) => ok(json!({ "devices": devices }).to_string()),
+    let (limit, offset) = match push_page(params) {
+        Ok(page) => page,
+        Err(error) => return push_json_error(400, "Bad Request", &error),
+    };
+    match crate::push::list_devices_page(
+        store,
+        cache,
+        &subject_id,
+        Some(limit + 1),
+        Some(offset),
+        Instant::now(),
+    ) {
+        Ok(mut devices) => {
+            let has_more = devices.len() > limit;
+            devices.truncate(limit);
+            let page = push_page_metadata(limit, offset, devices.len(), has_more);
+            ok(json!({ "devices": devices, "page": page }).to_string())
+        }
         Err(e) => push_json_error(400, "Bad Request", &e),
     }
 }
@@ -3845,7 +5054,7 @@ fn push_delete_device(
         HttpAuthContext::User(principal) => {
             crate::push::delete_device(store, cache, &principal.user_id, id, Instant::now())
         }
-        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => {
             crate::push::delete_device_by_id(store, cache, id, Instant::now())
         }
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
@@ -3875,7 +5084,13 @@ fn push_send(
         .unwrap_or_else(|| json!({}));
     let now = Instant::now();
     let result = if let Some(arr) = parsed.get("subject_ids").and_then(|v| v.as_array()) {
-        let ids: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        let Some(ids) = arr.iter().map(Value::as_str).collect::<Option<Vec<_>>>() else {
+            return push_json_error(
+                400,
+                "Bad Request",
+                "subject_ids must be an array of strings",
+            );
+        };
         crate::push::enqueue_send_many(store, cache, &ids, &notification, now)
     } else if let Some(subject_id) = parsed["subject_id"].as_str().filter(|s| !s.is_empty()) {
         crate::push::enqueue_send(store, cache, subject_id, &notification, now)
@@ -3890,19 +5105,42 @@ fn push_send(
 
 /// `GET /v1/push/admin/devices` (operator) — every device in the project.
 fn push_admin_devices(
+    params: &[(String, String)],
     store: &Arc<Store>,
     cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
-    match crate::push::list_all_devices(store, cache, Instant::now()) {
-        Ok(devices) => ok(json!({ "devices": devices }).to_string()),
+    let (limit, offset) = match push_page(params) {
+        Ok(page) => page,
+        Err(error) => return push_json_error(400, "Bad Request", &error),
+    };
+    match crate::push::list_all_devices_page(store, cache, limit + 1, offset, Instant::now()) {
+        Ok(mut devices) => {
+            let has_more = devices.len() > limit;
+            devices.truncate(limit);
+            let page = push_page_metadata(limit, offset, devices.len(), has_more);
+            ok(json!({ "devices": devices, "page": page }).to_string())
+        }
         Err(e) => push_json_error(400, "Bad Request", &e),
     }
 }
 
 /// `GET /v1/push/admin/outbox` (operator) — dead-lettered deliveries.
-fn push_admin_outbox(store: &Arc<Store>, cache: &SharedSchemaCache) -> (u16, &'static str, String) {
-    match crate::push::list_dead_letters(store, cache, Instant::now()) {
-        Ok(dead) => ok(json!({ "dead_letters": dead }).to_string()),
+fn push_admin_outbox(
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> (u16, &'static str, String) {
+    let (limit, offset) = match push_page(params) {
+        Ok(page) => page,
+        Err(error) => return push_json_error(400, "Bad Request", &error),
+    };
+    match crate::push::list_dead_letters_page(store, cache, limit + 1, offset, Instant::now()) {
+        Ok(mut dead_letters) => {
+            let has_more = dead_letters.len() > limit;
+            dead_letters.truncate(limit);
+            let page = push_page_metadata(limit, offset, dead_letters.len(), has_more);
+            ok(json!({ "dead_letters": dead_letters, "page": page }).to_string())
+        }
         Err(e) => push_json_error(400, "Bad Request", &e),
     }
 }
@@ -3932,7 +5170,7 @@ fn push_delete_device_by_token(
             token,
             Instant::now(),
         ),
-        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+        HttpAuthContext::Operator | HttpAuthContext::Secret | HttpAuthContext::Studio => {
             crate::push::delete_device_by_token(store, cache, token, Instant::now())
         }
         HttpAuthContext::Anonymous | HttpAuthContext::Publishable => {
@@ -4690,7 +5928,18 @@ fn route_ts_add(
         }
     };
 
-    let timestamp = parsed["timestamp"].as_str().unwrap_or("*").to_string();
+    let timestamp = match parsed.get("timestamp") {
+        None => "*".to_string(),
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Number(value)) if value.as_i64().is_some() => value.to_string(),
+        _ => {
+            return (
+                400,
+                "Bad Request",
+                r#"{"error":"timestamp must be an integer or string"}"#.to_string(),
+            );
+        }
+    };
     let value = match parsed.get("value") {
         Some(serde_json::Value::Number(n)) => n.to_string(),
         Some(serde_json::Value::String(s)) => s.clone(),
@@ -5125,15 +6374,24 @@ fn exec_resp(
     let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
     let mut out = BytesMut::with_capacity(1024);
     let now = Instant::now();
+    let mut session = CommandSession::with_broker(false, broker.clone(), None);
     let executor = CommandExecutor::new(
         store.clone(),
         broker.clone(),
         script_engine.clone(),
         cache.clone(),
     );
-    let mut session = CommandSession::new(false);
     store.add_total_commands(1);
-    if let Some(action) = executor.execute_command(&refs, &mut session, &mut out, now) {
+    let output_limit = crate::resp::limit_output(store.config().limits.max_resp_response);
+    let action = executor.execute_command(&refs, &mut session, &mut out, now);
+    let response_exceeded = output_limit.exceeded();
+    drop(output_limit);
+    if response_exceeded {
+        return Err(LuxError::Unsupported(
+            "command response exceeds maximum".to_string(),
+        ));
+    }
+    if let Some(action) = action {
         let kind = match action {
             crate::cmd::CmdResult::BlockPop { .. } => "BLPOP/BRPOP",
             crate::cmd::CmdResult::BlockMove { .. } => "BLMOVE",
@@ -5315,6 +6573,60 @@ mod tests {
     use crate::tables::JoinType;
     use sha2::{Digest, Sha256};
 
+    #[test]
+    fn live_subscription_registry_reclaims_broker_state_on_drop() {
+        let broker = Broker::new();
+        let mut subscriptions = LiveSubscriptions::new(&broker);
+        let capacity = reserve_live_subscription_capacity(&broker, 1, "abandoned:*".len()).unwrap();
+        let receiver = broker.ksubscribe("abandoned:*");
+        subscriptions.insert(
+            "test".to_string(),
+            LiveSubscription::Key {
+                pattern: "abandoned:*".to_string(),
+                receivers: vec![receiver],
+                _capacity: capacity,
+            },
+        );
+        assert!(broker.has_key_subs());
+
+        drop(subscriptions);
+
+        assert!(!broker.has_key_subs());
+    }
+
+    #[tokio::test]
+    async fn live_subscriptions_observe_each_key_event_gap_once() {
+        let broker = Broker::with_budgets(
+            crate::limits::ByteBudget::new(1),
+            crate::limits::CountBudget::new(8),
+        );
+        let _receiver = broker.ksubscribe("*");
+        let mut subscriptions = LiveSubscriptions::new(&broker);
+
+        broker.enqueue_key_event(b"key", b"set");
+
+        assert!(subscriptions.take_key_event_gap());
+        assert!(!subscriptions.take_key_event_gap());
+    }
+
+    #[test]
+    fn live_receivers_report_a_delivery_gap_before_resuming() {
+        let broker = Broker::new();
+        let mut receiver = broker.subscribe("events");
+        for index in 0..128 {
+            broker.publish("events", bytes::Bytes::from(index.to_string()));
+        }
+
+        assert!(matches!(
+            next_receiver_input(&mut receiver),
+            Some(LiveBrokerInput::Gap)
+        ));
+        assert!(matches!(
+            next_receiver_input(&mut receiver),
+            Some(LiveBrokerInput::Message(_))
+        ));
+    }
+
     #[tokio::test]
     async fn snapshot_stream_serves_the_securely_opened_installed_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -5335,9 +6647,15 @@ mod tests {
             socket.read_to_end(&mut response).await.unwrap();
             response
         });
-        let (mut socket, _) = listener.accept().await.unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket =
+            DeadlineStream::new(socket, std::time::Duration::from_secs(30), usize::MAX);
 
-        assert!(stream_snapshot(&mut socket, &store).await.unwrap());
+        assert!(
+            stream_snapshot(&mut socket, &store, &HttpResponseContext::default())
+                .await
+                .unwrap()
+        );
         drop(socket);
         let response = client.await.unwrap();
         let body_start = response
@@ -5377,12 +6695,125 @@ mod tests {
             &store,
             &cache,
             Some(&principal),
+            RequestLimits {
+                max_rows: Some(10_000),
+                max_body: 64 * 1024 * 1024,
+                server: ServerLimits::default(),
+            },
+            0,
         );
 
         assert!(result.is_err());
         assert!(broker.key_event_loop_started());
         assert!(!broker.has_key_subs());
         assert!(!broker.has_any_row_delta_subs());
+    }
+
+    #[test]
+    fn incremental_live_query_errors_do_not_become_delete_events() {
+        let store = Arc::new(Store::new());
+        let cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let broker = Broker::new();
+        let now = Instant::now();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "live_rows",
+            &["id", "INT", "PRIMARY", "KEY,", "body", "STR"],
+            now,
+        )
+        .unwrap();
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "live_rows",
+            &[("id", "1"), ("body", "present")],
+            now,
+        )
+        .unwrap();
+
+        let (mut subscription, _) = build_live_subscription(
+            &json!({"kind":"table","table":"live_rows"}),
+            &broker,
+            &store,
+            &cache,
+            None,
+            RequestLimits {
+                max_rows: Some(10_000),
+                max_body: 64 * 1024 * 1024,
+                server: ServerLimits::default(),
+            },
+            0,
+        )
+        .unwrap();
+        let before = match &subscription {
+            LiveSubscription::Table { state, .. } => state.rows.clone(),
+            _ => unreachable!(),
+        };
+        if let LiveSubscription::Table { spec, .. } = &mut subscription {
+            spec.where_conditions
+                .push(("id".to_string(), ">>".to_string(), Value::from(1)));
+        }
+
+        let error = process_live_row_key(&mut subscription, "1", &store, &cache).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let after = match &subscription {
+            LiveSubscription::Table { state, .. } => &state.rows,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            after, &before,
+            "query errors must not mutate retained state"
+        );
+    }
+
+    #[test]
+    fn live_query_resync_repairs_retained_table_state() {
+        let store = Arc::new(Store::new());
+        let cache: SharedSchemaCache =
+            Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+        let broker = Broker::new();
+        let now = Instant::now();
+        crate::tables::table_create(
+            &store,
+            &cache,
+            "resync_rows",
+            &["id", "INT", "PRIMARY", "KEY,", "body", "STR"],
+            now,
+        )
+        .unwrap();
+        let (mut subscription, initial) = build_live_subscription(
+            &json!({"kind":"table","table":"resync_rows"}),
+            &broker,
+            &store,
+            &cache,
+            None,
+            RequestLimits {
+                max_rows: Some(10_000),
+                max_body: 64 * 1024 * 1024,
+                server: ServerLimits::default(),
+            },
+            0,
+        )
+        .unwrap();
+        assert!(initial[0]["rows"].as_array().unwrap().is_empty());
+
+        crate::tables::table_insert(
+            &store,
+            &cache,
+            "resync_rows",
+            &[("id", "1"), ("body", "present")],
+            now,
+        )
+        .unwrap();
+        let events =
+            resync_live_query_subscription(&mut subscription, "rows", &store, &cache).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["kind"], "insert");
+        assert_eq!(events[0]["cause"]["kind"], "resync");
+        assert_eq!(events[0]["row"]["body"], "present");
     }
 
     #[test]
@@ -5855,7 +7286,54 @@ mod tests {
         store.begin_shutdown();
         let (status, _, body) = health_readiness(&store);
         assert_eq!(status, 503);
-        assert_eq!(body, r#"{"status":"not_ready"}"#);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["reason"], "shutting_down");
+    }
+
+    #[test]
+    fn slow_http_events_are_bounded_and_exclude_live_sessions() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let config = crate::ServerConfig {
+            durability: crate::DurabilityConfig {
+                policy: crate::DurabilityPolicy::Ephemeral,
+                ..Default::default()
+            },
+            on_warn: Some(Arc::new(move |event| recorded.lock().unwrap().push(event))),
+            ..Default::default()
+        };
+        let store = Arc::new(Store::new_with_config(Arc::new(config)));
+        for (operation, age) in [("live", 2), ("http", 0)] {
+            drop(HttpDiagnostic {
+                store: store.clone(),
+                request_id: store.next_http_request_id(),
+                started: Instant::now() - std::time::Duration::from_secs(age),
+                operation,
+                status: std::sync::atomic::AtomicU16::new(200),
+            });
+        }
+        assert!(events.lock().unwrap().is_empty());
+        for _ in 0..32 {
+            drop(HttpDiagnostic {
+                store: store.clone(),
+                request_id: store.next_http_request_id(),
+                started: Instant::now() - std::time::Duration::from_secs(2),
+                operation: "http",
+                status: std::sync::atomic::AtomicU16::new(200),
+            });
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            crate::ServerWarnEvent::SlowHttpRequest {
+                request_id: 3,
+                status: 200,
+                operation: "http",
+                ..
+            }
+        ));
     }
 
     #[test]

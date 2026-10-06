@@ -51,6 +51,7 @@ impl ShardExecutor {
             .iter()
             .any(|command| command.access == PipelineAccess::Write)
         {
+            let _tiered_memory = self.store.tiered_memory_boundary();
             self.execute_write_batch(shard_idx, commands, out, now)
         } else {
             self.execute_read_batch(shard_idx, commands, out, now)
@@ -67,6 +68,7 @@ impl ShardExecutor {
     ) -> Result<(), ShardExecutionError> {
         debug_assert_eq!(commands.len(), access.len());
         if access.contains(&PipelineAccess::Write) {
+            let _tiered_memory = self.store.tiered_memory_boundary();
             self.execute_argv_write_batch(shard_idx, commands, access, out, now)
         } else {
             self.execute_argv_read_batch(shard_idx, commands, out, now)
@@ -82,7 +84,6 @@ impl ShardExecutor {
     ) -> Result<(), ShardExecutionError> {
         let eviction_enabled = crate::eviction::eviction_enabled(&self.store);
         let tiered = self.store.is_tiered();
-        let wal_enabled = self.store.wal_enabled();
         let mut wal_commands: Vec<&[&[u8]]> = Vec::new();
         for command in commands {
             let args = command.args;
@@ -95,13 +96,13 @@ impl ShardExecutor {
                 if let Some(err) = crate::auth::reserved_table_mutation_error(args, &self.store) {
                     return Err(ShardExecutionError::Command(err));
                 }
-                if eviction_enabled {
+                if eviction_enabled && !tiered {
                     crate::eviction::evict_if_needed(&self.store)
                         .map_err(ShardExecutionError::Eviction)?;
                 }
-                if wal_enabled {
-                    wal_commands.push(args);
-                }
+                // The mutation gate also serializes ephemeral writes against
+                // conditional commands; disabling the WAL must not skip it.
+                wal_commands.push(args);
             }
         }
 
@@ -144,7 +145,6 @@ impl ShardExecutor {
     ) -> Result<(), ShardExecutionError> {
         let eviction_enabled = crate::eviction::eviction_enabled(&self.store);
         let tiered = self.store.is_tiered();
-        let wal_enabled = self.store.wal_enabled();
         let mut wal_commands: Vec<&[&[u8]]> = Vec::new();
         for command in commands {
             let args = command.argv();
@@ -157,13 +157,13 @@ impl ShardExecutor {
                 if let Some(err) = crate::auth::reserved_table_mutation_error(args, &self.store) {
                     return Err(ShardExecutionError::Command(err));
                 }
-                if eviction_enabled {
+                if eviction_enabled && !tiered {
                     crate::eviction::evict_if_needed(&self.store)
                         .map_err(ShardExecutionError::Eviction)?;
                 }
-                if wal_enabled {
-                    wal_commands.push(args);
-                }
+                // The mutation gate also serializes ephemeral writes against
+                // conditional commands; disabling the WAL must not skip it.
+                wal_commands.push(args);
             }
         }
 
@@ -204,32 +204,65 @@ impl ShardExecutor {
         now: Instant,
     ) -> Result<(), ShardExecutionError> {
         if self.store.is_tiered() {
+            if let [command] = commands {
+                let completed = self.store.with_stable_resident_or_absent_key(
+                    shard_idx,
+                    command.args[1],
+                    |shard| Self::write_read_batch(&self.store, commands, shard, out, now),
+                );
+                if completed.is_some() {
+                    return Ok(());
+                }
+            }
+
+            let shard = self.store.lock_read_shard(shard_idx);
+            if commands
+                .iter()
+                .all(|command| shard.data.contains_key(command.args[1]))
+            {
+                Self::write_read_batch(&self.store, commands, &shard, out, now);
+                return Ok(());
+            }
+            drop(shard);
+
+            let _tiered_memory = self.store.tiered_memory_boundary();
             for command in commands {
                 self.store
                     .try_promote(command.args[1], now)
                     .map_err(ShardExecutionError::Command)?;
             }
+            let shard = self.store.lock_read_shard(shard_idx);
+            Self::write_read_batch(&self.store, commands, &shard, out, now);
+            return Ok(());
         }
         let shard = self.store.lock_read_shard(shard_idx);
+        Self::write_read_batch(&self.store, commands, &shard, out, now);
+        Ok(())
+    }
+
+    fn write_read_batch(
+        store: &Store,
+        commands: &[ShardPipelineCommand<'_, '_>],
+        shard: &crate::store::Shard,
+        out: &mut BytesMut,
+        now: Instant,
+    ) {
         if commands
             .iter()
             .all(|command| command.args.len() == 2 && command.args[0].eq_ignore_ascii_case(b"GET"))
         {
             for command in commands {
-                self.store
-                    .get_kv_and_write_from_shard(&shard.data, command.args[1], now, out);
+                store.get_kv_and_write_from_shard(&shard.data, command.args[1], now, out);
             }
         } else {
             for command in commands {
                 if command.args.len() == 2 && command.args[0].eq_ignore_ascii_case(b"GET") {
-                    self.store
-                        .get_kv_and_write_from_shard(&shard.data, command.args[1], now, out);
+                    store.get_kv_and_write_from_shard(&shard.data, command.args[1], now, out);
                 } else {
-                    cmd::execute_on_shard_read(&shard.data, &self.store, command.args, out, now);
+                    cmd::execute_on_shard_read(&shard.data, store, command.args, out, now);
                 }
             }
         }
-        Ok(())
     }
 
     fn execute_argv_read_batch<A: ArgvSlice>(
@@ -240,33 +273,67 @@ impl ShardExecutor {
         now: Instant,
     ) -> Result<(), ShardExecutionError> {
         if self.store.is_tiered() {
+            if let [command] = commands {
+                let args = command.argv();
+                let completed =
+                    self.store
+                        .with_stable_resident_or_absent_key(shard_idx, args[1], |shard| {
+                            Self::write_argv_read_batch(&self.store, commands, shard, out, now)
+                        });
+                if completed.is_some() {
+                    return Ok(());
+                }
+            }
+
+            let shard = self.store.lock_read_shard(shard_idx);
+            if commands
+                .iter()
+                .all(|command| shard.data.contains_key(command.argv()[1]))
+            {
+                Self::write_argv_read_batch(&self.store, commands, &shard, out, now);
+                return Ok(());
+            }
+            drop(shard);
+
+            let _tiered_memory = self.store.tiered_memory_boundary();
             for command in commands {
                 self.store
                     .try_promote(command.argv()[1], now)
                     .map_err(ShardExecutionError::Command)?;
             }
+            let shard = self.store.lock_read_shard(shard_idx);
+            Self::write_argv_read_batch(&self.store, commands, &shard, out, now);
+            return Ok(());
         }
         let shard = self.store.lock_read_shard(shard_idx);
+        Self::write_argv_read_batch(&self.store, commands, &shard, out, now);
+        Ok(())
+    }
+
+    fn write_argv_read_batch<A: ArgvSlice>(
+        store: &Store,
+        commands: &[A],
+        shard: &crate::store::Shard,
+        out: &mut BytesMut,
+        now: Instant,
+    ) {
         if commands.iter().all(|command| {
             let args = command.argv();
             args.len() == 2 && args[0].eq_ignore_ascii_case(b"GET")
         }) {
             for command in commands {
-                self.store
-                    .get_kv_and_write_from_shard(&shard.data, command.argv()[1], now, out);
+                store.get_kv_and_write_from_shard(&shard.data, command.argv()[1], now, out);
             }
         } else {
             for command in commands {
                 let args = command.argv();
                 if args.len() == 2 && args[0].eq_ignore_ascii_case(b"GET") {
-                    self.store
-                        .get_kv_and_write_from_shard(&shard.data, args[1], now, out);
+                    store.get_kv_and_write_from_shard(&shard.data, args[1], now, out);
                 } else {
-                    cmd::execute_on_shard_read(&shard.data, &self.store, args, out, now);
+                    cmd::execute_on_shard_read(&shard.data, store, args, out, now);
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -368,6 +435,55 @@ mod tests {
             .unwrap();
 
         assert_eq!(&out[..], b"$6\r\nabcdef\r\n");
+    }
+
+    #[test]
+    fn write_batch_preserves_existing_string_encryption() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::new_with_config(Arc::new(crate::ServerConfig {
+            data_dir: dir.path().to_string_lossy().to_string(),
+            ..Default::default()
+        })));
+        store.encryption().init(Some("k1")).unwrap();
+        let now = Instant::now();
+        store
+            .set_conditional(
+                b"secret",
+                b"before",
+                SetOptions {
+                    ttl: None,
+                    keep_ttl: false,
+                    nx: false,
+                    xx: false,
+                    ifeq: None,
+                    get: false,
+                    encrypted: true,
+                },
+                now,
+            )
+            .unwrap();
+
+        // Encryption can become active after the connection selects a batch
+        // but before it acquires the key's mutation gate.
+        let executor = ShardExecutor::new(store.clone(), Broker::new());
+        let commands = vec![
+            vec![b"SET".as_slice(), b"secret".as_slice(), b"after".as_slice()],
+            vec![b"GET".as_slice(), b"secret".as_slice()],
+        ];
+        let access = vec![PipelineAccess::Write, PipelineAccess::Read];
+        let mut out = BytesMut::new();
+        executor
+            .execute_argv_pipeline_batch(
+                store.shard_for_key(b"secret"),
+                &commands,
+                &access,
+                &mut out,
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(&out[..], b"+OK\r\n$5\r\nafter\r\n");
+        assert!(store.kv_string_is_encrypted(b"secret", now));
     }
 
     #[test]

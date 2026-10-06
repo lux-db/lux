@@ -294,3 +294,47 @@ Upgrade:
 3. Roll forward through documented upgrade paths.
 4. Do not downgrade across file-format changes unless release notes explicitly
    say it is safe.
+
+### Upgrading from v0.37.0 to 1.0
+
+For CLI-managed local stacks, run `lux update engine`. The CLI disconnects
+application networking, saves using the old engine, imports into a separate
+volume, and verifies the candidate before cutover. It retains the original
+container and data volume. Failed preparation restores the old engine;
+interrupted operations are recovered by `lux start`. After cutover, recovery
+keeps the candidate volume so newly accepted writes are not silently lost.
+
+For standalone binaries and installations not managed by the CLI:
+
+Use a final snapshot produced by v0.37.0, not a direct handoff of its live WAL
+or tiered files. That release can contain duplicate Auth inserts in its journal;
+strict recovery rejects those records instead of silently skipping errors.
+Legacy-format readers do not make arbitrary old recovery histories a supported
+upgrade interface.
+
+1. Stop application writes, including background jobs and authentication
+   traffic. Keep them stopped until the new instance is verified.
+2. On the **old engine**, run `SAVE` and require a successful response. Then
+   stop that engine. Do not substitute `BGSAVE` without waiting for completion.
+3. Preserve an untouched backup of the complete old data directory, any separate
+   tiered directory, the old binary/image digest, configuration, and encryption
+   key material. Keep externally managed seals and data keys available too.
+4. Prepare an empty destination data directory. Copy the final `lux.dat` and
+   the required encryption state into it. Native encryption uses `lux.enc` and,
+   when locally managed, `lux.enc.seal` by default; custom state/seal paths must
+   be configured explicitly. Preserve private permissions. A snapshot does not
+   contain the external keys needed to decrypt it. Do not copy old WAL, tiered
+   data, pending-restore markers, or restore backups into this destination.
+5. Start 1.0 against the destination, using the same encryption keys, Auth
+   issuer, and application credentials. Persistent Auth requires encryption;
+   when upgrading a previously unencrypted Auth deployment, configure it before
+   startup. Keep the old backup untouched.
+6. Verify application data, migration status, login/session behavior, and a
+   restart before redirecting clients and resuming writes.
+
+If verification fails, stop the candidate and restart v0.37.0 against a **copy
+of the preserved old backup**, with its original configuration and keys. Never
+start v0.37.0 against a directory that 1.0 has modified. Backup-based rollback
+returns to the pre-upgrade state: it does not retain writes accepted after
+cutover. Once clients resume writes, stop and reconcile those writes before any
+rollback; do not silently discard them.

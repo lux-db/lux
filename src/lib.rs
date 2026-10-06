@@ -17,11 +17,13 @@ mod file_security;
 #[cfg(feature = "fuzzing")]
 pub mod fuzz_api;
 mod geo;
+mod glob;
 mod grants;
 mod hll;
 mod hnsw;
 mod http;
 mod jsonb;
+mod limits;
 mod lua;
 mod migrations;
 mod pubsub;
@@ -36,17 +38,17 @@ mod tables;
 use bytes::BytesMut;
 use cmd::CmdResult;
 use command::{Command, CommandKind, CommandOutput, PubSubCommand};
-use pubsub::Broker;
+use pubsub::{Broker, SubscriptionReservation};
 use resp::Parser;
 use shard_exec::{ShardExecutionError, ShardExecutor, ShardPipelineCommand};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use store::Store;
 use tables::SharedSchemaCache;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{broadcast, oneshot, watch, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
 pub use disk::{StorageConfig, StorageMode};
@@ -57,6 +59,8 @@ pub use embedded::{
 };
 pub use encryption::{EncryptionConfig, EncryptionKeyConfig};
 pub use eviction::{parse_eviction_policy, parse_memory_size, EvictionConfig, EvictionPolicy};
+pub use limits::ServerLimits;
+use limits::{ByteBudget, ByteReservation, CountBudget, DeadlineStream, RESP_RESPONSE_LIMIT_ERROR};
 
 const SUB_MODE_BATCH_MAX: usize = 64;
 
@@ -271,8 +275,12 @@ pub struct ServerConfig {
     pub max_rows: Option<usize>,
     /// Maximum accepted HTTP request body size in bytes.
     pub max_body: usize,
+    /// Browser-facing HTTP and local Studio trust policy.
+    pub http_browser: HttpBrowserConfig,
     /// Maximum buffered RESP request bytes accepted from one connection.
     pub max_resp_request: usize,
+    /// Connection, buffering, concurrency, and network deadline limits.
+    pub limits: ServerLimits,
     /// Password used by AUTH/HELLO and HTTP bearer auth.
     pub password: String,
     /// Whether RESP connections must authenticate before non-public commands.
@@ -318,7 +326,9 @@ impl std::fmt::Debug for ServerConfig {
             .field("http_port", &self.http_port)
             .field("max_rows", &self.max_rows)
             .field("max_body", &self.max_body)
+            .field("http_browser", &self.http_browser)
             .field("max_resp_request", &self.max_resp_request)
+            .field("limits", &self.limits)
             .field("password", &"<redacted>")
             .field("require_auth", &self.require_auth)
             .field("allow_insecure_no_auth", &self.allow_insecure_no_auth)
@@ -345,9 +355,11 @@ impl Default for ServerConfig {
             bind_host: "127.0.0.1".to_string(),
             port: 6379,
             http_port: 0,
-            max_rows: None,
+            max_rows: Some(10_000),
             max_body: 64 * 1024 * 1024,
+            http_browser: HttpBrowserConfig::default(),
             max_resp_request: 64 * 1024 * 1024,
+            limits: ServerLimits::default(),
             password: String::new(),
             require_auth: false,
             allow_insecure_no_auth: false,
@@ -364,6 +376,33 @@ impl Default for ServerConfig {
             on_info: None,
             on_warn: None,
             on_error: None,
+        }
+    }
+}
+
+/// Browser-facing HTTP policy for CORS, Host validation, and local Studio.
+///
+/// Native and server clients do not send an `Origin` header and are unaffected
+/// by the origin allowlist. A loopback listener accepts loopback Host aliases by
+/// default. A remotely bound listener requires an exact Host allowlist whenever
+/// browser origins are enabled; deployments serving only native/server clients
+/// remain compatible without one.
+#[derive(Clone, Debug)]
+pub struct HttpBrowserConfig {
+    /// Host names accepted by the HTTP listener, without ports.
+    pub allowed_hosts: Vec<String>,
+    /// Exact `http://` or `https://` origins accepted from browsers.
+    pub allowed_origins: Vec<String>,
+    /// Lifetime of an in-memory, origin-bound local Studio session.
+    pub studio_session_ttl: Duration,
+}
+
+impl Default for HttpBrowserConfig {
+    fn default() -> Self {
+        Self {
+            allowed_hosts: Vec::new(),
+            allowed_origins: Vec::new(),
+            studio_session_ttl: Duration::from_secs(12 * 60 * 60),
         }
     }
 }
@@ -397,6 +436,24 @@ pub enum ServerInfoEvent {
 /// database mutation.
 #[derive(Clone, Debug)]
 pub enum ServerWarnEvent {
+    /// Optional migration of older push records could not complete.
+    PushScopeMigrationFailed { error: String },
+    /// An HTTP operation failed or ended without a response. Shares the
+    /// per-engine diagnostic event budget with slow HTTP operations.
+    HttpRequestFailed {
+        request_id: usize,
+        operation: &'static str,
+        status: u16,
+        elapsed_ms: u64,
+    },
+    /// An HTTP operation exceeded one second. Emitted at most once per second
+    /// per engine; identifiers are engine-generated, never client input.
+    SlowHttpRequest {
+        request_id: usize,
+        operation: &'static str,
+        status: u16,
+        elapsed_ms: u64,
+    },
     /// Auth is explicitly running in development-only plaintext memory because
     /// durability is ephemeral and no encryption key is active.
     AuthSecretStorageDegraded,
@@ -423,10 +480,19 @@ pub enum ServerWarnEvent {
 /// durability, or persistence.
 #[derive(Clone, Debug)]
 pub enum ServerErrorEvent {
+    /// Expired table rows were retained for a later retry.
+    TableExpirationFailed { error: String },
+    /// A background push delivery iteration failed.
+    PushDeliveryWorkerFailed { error: String },
     /// Snapshot load failed during startup.
     SnapshotLoadFailed { error: String },
     /// Background snapshot failed.
-    SnapshotSaveFailed { error: String, path: String },
+    SnapshotSaveFailed {
+        error: String,
+        path: String,
+        error_kind: std::io::ErrorKind,
+        os_error: Option<i32>,
+    },
     /// WAL replay failed for a shard.
     WalReplayFailed { shard: usize, error: String },
     /// WAL truncate after snapshot failed.
@@ -440,11 +506,21 @@ pub enum ServerErrorEvent {
     /// Background disk compaction failed.
     DiskCompactionFailed { shard: usize, error: String },
     /// WAL append failed before an in-memory mutation was made durable.
-    WalAppendFailed { error: String },
+    WalAppendFailed {
+        error: String,
+        error_kind: std::io::ErrorKind,
+        os_error: Option<i32>,
+        restart_required: bool,
+    },
     /// Dumping cold data into a snapshot failed.
     SnapshotDiskDumpFailed { error: String },
     /// Periodic WAL fsync failed.
-    WalFsyncFailed { error: String },
+    WalFsyncFailed {
+        error: String,
+        error_kind: std::io::ErrorKind,
+        os_error: Option<i32>,
+        restart_required: bool,
+    },
     /// HTTP server task returned an error after startup.
     HttpServerFailed { error: String },
 }
@@ -539,6 +615,136 @@ fn validate_auth_config(config: &ServerConfig) -> std::io::Result<()> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "auth refresh token ttl must be greater than zero",
+        ));
+    }
+    for (name, ttl) in [
+        ("LUX_AUTH_ACCESS_TOKEN_TTL", config.auth.access_token_ttl),
+        ("LUX_AUTH_REFRESH_TOKEN_TTL", config.auth.refresh_token_ttl),
+        (
+            "LUX_AUTH_FLOW_TOKEN_TTL_SECONDS",
+            config.auth.flow_token_ttl,
+        ),
+    ] {
+        if !valid_auth_token_ttl(ttl) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{name} must be positive and representable as an expiry timestamp"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn valid_auth_token_ttl(ttl: Duration) -> bool {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    !ttl.is_zero()
+        && ttl.as_millis() <= (i64::MAX as u128).saturating_sub(now_ms)
+        && Instant::now().checked_add(ttl).is_some()
+}
+
+fn validate_server_limits(config: &ServerConfig) -> std::io::Result<()> {
+    let limits = &config.limits;
+    let counts = [
+        ("max HTTP body bytes", config.max_body),
+        ("max RESP request bytes", config.max_resp_request),
+        ("max RESP connections", limits.max_resp_connections),
+        ("max HTTP connections", limits.max_http_connections),
+        ("max blocked clients", limits.max_blocked_clients),
+        (
+            "max RESP pipeline commands",
+            limits.max_resp_pipeline_commands,
+        ),
+        ("max RESP command arguments", limits.max_resp_command_args),
+        ("max RESP subscriptions", limits.max_resp_subscriptions),
+        (
+            "max subscription name bytes",
+            limits.max_subscription_name_bytes,
+        ),
+        ("max live subscriptions", limits.max_live_subscriptions),
+        ("max process subscriptions", limits.max_subscriptions),
+        ("max query candidates", limits.max_query_candidates),
+        ("max blocking keys", limits.max_blocking_keys),
+        ("max RESP response bytes", limits.max_resp_response),
+        ("max request buffer bytes", limits.max_request_buffer_bytes),
+        (
+            "max response buffer bytes",
+            limits.max_response_buffer_bytes,
+        ),
+        ("max auth workers", limits.max_auth_workers),
+        ("max script memory bytes", limits.max_script_memory),
+    ];
+    if let Some((name, _)) = counts.into_iter().find(|(_, value)| *value == 0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{name} must be greater than zero"),
+        ));
+    }
+    if limits.max_resp_response < RESP_RESPONSE_LIMIT_ERROR.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "max RESP response bytes must be at least {}",
+                RESP_RESPONSE_LIMIT_ERROR.len()
+            ),
+        ));
+    }
+    for (name, value) in [
+        ("max RESP connections", limits.max_resp_connections),
+        ("max HTTP connections", limits.max_http_connections),
+        ("max blocked clients", limits.max_blocked_clients),
+        ("max auth workers", limits.max_auth_workers),
+    ] {
+        if value > Semaphore::MAX_PERMITS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{name} exceeds the runtime semaphore maximum"),
+            ));
+        }
+    }
+    if limits.max_query_candidates == usize::MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "max query candidates must leave room for an overflow sentinel",
+        ));
+    }
+    let deadlines = [
+        ("RESP idle timeout", limits.resp_idle_timeout),
+        ("RESP request timeout", limits.resp_request_timeout),
+        ("HTTP header timeout", limits.http_header_timeout),
+        ("HTTP body timeout", limits.http_body_timeout),
+        ("HTTP keep-alive timeout", limits.http_keep_alive_timeout),
+        ("live idle timeout", limits.live_idle_timeout),
+        ("socket write timeout", limits.write_timeout),
+    ];
+    if let Some((name, _)) = deadlines.into_iter().find(|(_, value)| value.is_zero()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{name} must be greater than zero"),
+        ));
+    }
+    if let Some((name, _)) = deadlines
+        .into_iter()
+        .find(|(_, value)| std::time::Instant::now().checked_add(*value).is_none())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{name} is too large for deadline arithmetic"),
+        ));
+    }
+    let largest_request = config.max_body.max(config.max_resp_request);
+    if limits.max_request_buffer_bytes < largest_request {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "max request buffer bytes must be at least the larger per-request body limit",
+        ));
+    }
+    if limits.max_response_buffer_bytes < limits.max_resp_response {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "max response buffer bytes must be at least the largest per-response limit",
         ));
     }
     Ok(())
@@ -823,6 +1029,10 @@ struct Runtime {
     schema_cache: SharedSchemaCache,
     script_engine: Arc<lua::ScriptEngine>,
     config: Arc<ServerConfig>,
+    request_budget: ByteBudget,
+    response_budget: ByteBudget,
+    blocked_clients: Arc<Semaphore>,
+    auth_workers: Arc<Semaphore>,
     accepting_work: std::sync::atomic::AtomicBool,
     snapshot_worker: parking_lot::Mutex<Option<snapshot::SnapshotWorker>>,
     /// Open descriptors hold the advisory locks for every persistent root.
@@ -948,7 +1158,11 @@ fn join_server_task(
 
 impl EmbeddedClient {
     fn new(runtime: Arc<Runtime>) -> Self {
-        let mut session = CommandSession::new(false);
+        let mut session = CommandSession::with_broker(
+            false,
+            runtime.broker.clone(),
+            Some(runtime.request_budget.clone()),
+        );
         session.authenticated = true;
         Self {
             runtime,
@@ -2138,9 +2352,9 @@ impl From<pubsub::Message> for EmbeddedMessage {
             pubsub::MessageKind::KeyEvent => EmbeddedMessageKind::KeyEvent,
         };
         Self {
-            channel: message.channel,
+            channel: message.channel.to_string(),
             payload: message.payload,
-            pattern: message.pattern,
+            pattern: message.pattern.as_deref().map(str::to_string),
             kind,
         }
     }
@@ -2397,6 +2611,7 @@ pub async fn run() -> std::io::Result<()> {
 pub async fn run_with_config(mut config: ServerConfig) -> std::io::Result<ServerHandle> {
     validate_listener_security(&config)?;
     validate_auth_config(&config)?;
+    validate_server_limits(&config)?;
     validate_shard_count(&config)?;
     resolve_and_validate_persistence(&mut config)?;
     let persistence_locks = acquire_persistence_locks(&config)?;
@@ -2465,6 +2680,7 @@ async fn server_main(
     let _ = ready_tx.send(Ok(runtime.clone()));
 
     let mut conn_tasks = JoinSet::new();
+    let resp_connections = Arc::new(Semaphore::new(runtime.config.limits.max_resp_connections));
     // HTTP binds inside its task, so wait for its one-shot before reporting the
     // whole runtime as ready to embedded callers.
     let mut runtime_failure = None;
@@ -2487,11 +2703,23 @@ async fn server_main(
                     let _ = joined;
                 }
                 accepted = listener.accept() => {
-                    let (socket, peer) = match accepted {
+                    let (mut socket, peer) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) => {
                             runtime_failure = Some(error);
                             break 'accept DEFAULT_SHUTDOWN_TIMEOUT;
+                        }
+                    };
+                    let permit = match resp_connections.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            runtime.store.reject_resp_connection();
+                            let _ = tokio::time::timeout(
+                                runtime.config.limits.write_timeout,
+                                socket.write_all(b"-ERR max number of clients reached\r\n"),
+                            )
+                            .await;
+                            continue;
                         }
                     };
                     let runtime = runtime.clone();
@@ -2500,7 +2728,14 @@ async fn server_main(
                     socket.set_nodelay(true).ok();
 
                     conn_tasks.spawn(async move {
+                        let _permit = permit;
                         runtime.store.client_connected();
+                        let socket = DeadlineStream::with_write_budget(
+                            socket,
+                            runtime.config.limits.write_timeout,
+                            runtime.config.limits.max_resp_response,
+                            runtime.response_budget.clone(),
+                        );
                         let result = handle_connection(
                             socket,
                             peer,
@@ -2510,6 +2745,11 @@ async fn server_main(
                         .await;
                         runtime.store.client_disconnected();
                         if let Err(e) = result {
+                            if e.kind() == std::io::ErrorKind::TimedOut {
+                                runtime.store.record_connection_timeout();
+                            } else if e.kind() == std::io::ErrorKind::OutOfMemory {
+                                runtime.store.reject_response_buffer();
+                            }
                             if e.kind() != std::io::ErrorKind::ConnectionReset {
                                 if let Some(on_warn) = on_warn {
                                     on_warn(ServerWarnEvent::ConnectionFailed {
@@ -2612,7 +2852,12 @@ impl Runtime {
         let store = Arc::new(Store::try_new_with_config(config.clone())?);
         let schema_cache: SharedSchemaCache =
             std::sync::Arc::new(parking_lot::RwLock::new(tables::SchemaCache::new()));
-        let broker = Broker::new();
+        let request_budget = ByteBudget::new(config.limits.max_request_buffer_bytes);
+        let response_budget = ByteBudget::new(config.limits.max_response_buffer_bytes);
+        let broker = Broker::with_budgets(
+            request_budget.clone(),
+            CountBudget::new(config.limits.max_subscriptions),
+        );
         // Wire the row-delta sink so table writes feed reactive live queries.
         store.set_row_delta_broker(broker.clone());
         let script_engine = Arc::new(lua::ScriptEngine::new());
@@ -2622,6 +2867,10 @@ impl Runtime {
             broker,
             schema_cache,
             script_engine,
+            request_budget,
+            response_budget,
+            blocked_clients: Arc::new(Semaphore::new(config.limits.max_blocked_clients)),
+            auth_workers: Arc::new(Semaphore::new(config.limits.max_auth_workers)),
             config,
             accepting_work: std::sync::atomic::AtomicBool::new(true),
             snapshot_worker: parking_lot::Mutex::new(None),
@@ -2785,14 +3034,21 @@ impl Runtime {
             }
         }
 
-        // One-time migration of any pre-`push.*` data (PR1 stored it under
-        // `auth.*`). Runs post-replay with WAL logging on; a no-op when there is
-        // no legacy data. Best-effort: a failure here must not block startup.
+        // One-time migration of pre-`push.*` data stored under `auth.*`. Runs
+        // post-replay with WAL logging on; a no-op when there is no legacy data.
+        // Best-effort: a failure here must not block startup.
         if let Err(e) =
             push::migrate_from_auth_scope(&runtime.store, &runtime.schema_cache, Instant::now())
         {
-            eprintln!("push scope migration skipped: {e}");
+            emit_warn(
+                &runtime.config,
+                ServerWarnEvent::PushScopeMigrationFailed {
+                    error: e.to_string(),
+                },
+            );
         }
+
+        runtime.store.restore_tiered_memory_ceiling();
 
         let snapshot_worker = snapshot::start_background_save_worker(runtime.store.clone())?;
         *runtime.snapshot_worker.lock() = Some(snapshot_worker);
@@ -2830,7 +3086,12 @@ impl Runtime {
                             }
                         }
                         Err(error) => {
-                            eprintln!("table TTL sweep failed; rows retained for retry: {error}");
+                            emit_error(
+                                store.config(),
+                                ServerErrorEvent::TableExpirationFailed {
+                                    error: error.to_string(),
+                                },
+                            );
                         }
                     }
                 }
@@ -2890,6 +3151,11 @@ impl Runtime {
         let bind_host = self.config.bind_host.clone();
         let max_rows = self.config.max_rows;
         let max_body = self.config.max_body;
+        let limits = self.config.limits;
+        let request_budget = self.request_budget.clone();
+        let response_budget = self.response_budget.clone();
+        let auth_workers = self.auth_workers.clone();
+        let browser = self.config.http_browser.clone();
         let (startup_tx, startup_rx) = oneshot::channel();
         let on_ready = self.config.on_info.clone().map(|on_info| {
             Arc::new(move |addr| on_info(ServerInfoEvent::HttpReady { addr }))
@@ -2902,6 +3168,11 @@ impl Runtime {
                 http_port,
                 max_rows,
                 max_body,
+                limits,
+                request_budget,
+                response_budget,
+                auth_workers,
+                browser,
                 on_ready,
                 startup_ready: Some(startup_tx),
             };
@@ -2983,7 +3254,10 @@ fn handle_tx_cmd(
     in_multi: &mut bool,
     tx_error: &mut bool,
     tx_queue: &mut Vec<Vec<Vec<u8>>>,
+    tx_bytes: &mut usize,
     watched: &mut Vec<(String, usize, u64)>,
+    watched_bytes: &mut usize,
+    retained_capacity: &mut Option<ByteReservation>,
     authenticated: &mut bool,
     secret_credential: &mut Option<crate::auth::SecretCredential>,
     store: &Arc<Store>,
@@ -3009,6 +3283,9 @@ fn handle_tx_cmd(
         } else {
             *in_multi = true;
             *tx_error = false;
+            release_retained_bytes(retained_capacity, *tx_bytes);
+            tx_queue.clear();
+            *tx_bytes = 0;
             resp::write_ok(write_buf);
         }
         return true;
@@ -3028,7 +3305,11 @@ fn handle_tx_cmd(
                     *in_multi = false;
                     *tx_error = false;
                     tx_queue.clear();
+                    release_retained_bytes(retained_capacity, *tx_bytes);
+                    *tx_bytes = 0;
                     watched.clear();
+                    release_retained_bytes(retained_capacity, *watched_bytes);
+                    *watched_bytes = 0;
                     return true;
                 }
             };
@@ -3081,9 +3362,16 @@ fn handle_tx_cmd(
                             );
                         }
                         CmdResult::Publish { channel, message } => {
-                            let count = broker.publish_subscriber_count(&channel);
-                            resp::write_integer(&mut transaction_out, count);
-                            deferred_publishes.push((channel, message));
+                            if let Some(reservation) =
+                                broker.reserve_event_message(channel.len(), message.len())
+                            {
+                                let count = broker.publish_subscriber_count(&channel);
+                                resp::write_integer(&mut transaction_out, count);
+                                deferred_publishes.push((channel, message, reservation));
+                            } else {
+                                broker.record_dropped_event();
+                                resp::write_integer(&mut transaction_out, 0);
+                            }
                         }
                         CmdResult::BlockPop { .. }
                         | CmdResult::BlockMove { .. }
@@ -3117,13 +3405,13 @@ fn handle_tx_cmd(
 
                 let committed_effects = match transaction.commit() {
                     Ok(effects) => {
-                        write_buf.extend_from_slice(&transaction_out);
+                        resp::write_encoded(write_buf, &transaction_out);
                         for owned_args in &effects.key_events {
                             let refs: Vec<&[u8]> = owned_args.iter().map(Vec::as_slice).collect();
                             fire_key_events(broker, &refs);
                         }
-                        for (channel, message) in deferred_publishes {
-                            broker.publish(&channel, message);
+                        for (channel, message, reservation) in deferred_publishes {
+                            broker.publish_reserved(&channel, message, reservation);
                         }
                         Some(effects)
                     }
@@ -3148,7 +3436,11 @@ fn handle_tx_cmd(
         *in_multi = false;
         *tx_error = false;
         tx_queue.clear();
+        release_retained_bytes(retained_capacity, *tx_bytes);
+        *tx_bytes = 0;
         watched.clear();
+        release_retained_bytes(retained_capacity, *watched_bytes);
+        *watched_bytes = 0;
         return true;
     } else if cmd_eq_fast(args[0], b"DISCARD") {
         if !*in_multi {
@@ -3157,7 +3449,11 @@ fn handle_tx_cmd(
             *in_multi = false;
             *tx_error = false;
             tx_queue.clear();
+            release_retained_bytes(retained_capacity, *tx_bytes);
+            *tx_bytes = 0;
             watched.clear();
+            release_retained_bytes(retained_capacity, *watched_bytes);
+            *watched_bytes = 0;
             resp::write_ok(write_buf);
         }
         return true;
@@ -3173,7 +3469,21 @@ fn handle_tx_cmd(
                 write_buf,
                 "ERR wrong number of arguments for 'watch' command",
             );
+        } else if watched.len().saturating_add(args.len() - 1)
+            > store.config().limits.max_blocking_keys
+        {
+            resp::write_error(write_buf, "ERR watched key limit exceeded");
         } else {
+            let added_bytes = args[1..]
+                .iter()
+                .try_fold(0usize, |total, key| total.checked_add(key.len()));
+            if added_bytes
+                .and_then(|bytes| watched_bytes.checked_add(bytes))
+                .is_none_or(|bytes| bytes > store.config().max_resp_request)
+            {
+                resp::write_error(write_buf, "ERR watched key bytes limit exceeded");
+                return true;
+            }
             let _execution_guard = match store.execution_read_guard() {
                 Ok(guard) => guard,
                 Err(error) => {
@@ -3181,17 +3491,25 @@ fn handle_tx_cmd(
                     return true;
                 }
             };
+            let added_bytes = added_bytes.unwrap_or(0);
+            if !try_reserve_retained_bytes(retained_capacity, added_bytes) {
+                resp::write_error(write_buf, "ERR process request capacity exhausted");
+                return true;
+            }
             for key_bytes in &args[1..] {
                 let key = std::str::from_utf8(key_bytes).unwrap_or("").to_string();
                 let shard_idx = store.shard_for_key(key_bytes);
                 let version = store.shard_version(shard_idx);
                 watched.push((key, shard_idx, version));
             }
+            *watched_bytes += added_bytes;
             resp::write_ok(write_buf);
         }
         return true;
     } else if cmd_eq_fast(args[0], b"UNWATCH") {
         watched.clear();
+        release_retained_bytes(retained_capacity, *watched_bytes);
+        *watched_bytes = 0;
         resp::write_ok(write_buf);
         return true;
     }
@@ -3236,9 +3554,38 @@ fn handle_tx_cmd(
         } else {
             match cmd::validate_args(args) {
                 Ok(()) => {
-                    let owned: Vec<Vec<u8>> = args.iter().map(|a| a.to_vec()).collect();
-                    tx_queue.push(owned);
-                    resp::write_queued(write_buf);
+                    if tx_queue.len() >= store.config().limits.max_resp_pipeline_commands {
+                        resp::write_error(write_buf, "ERR transaction command limit exceeded");
+                        *tx_error = true;
+                    } else {
+                        let command_bytes = args
+                            .iter()
+                            .try_fold(0usize, |total, arg| total.checked_add(arg.len()));
+                        if command_bytes
+                            .and_then(|bytes| tx_bytes.checked_add(bytes))
+                            .is_none_or(|bytes| bytes > store.config().max_resp_request)
+                        {
+                            resp::write_error(
+                                write_buf,
+                                "ERR transaction queued bytes limit exceeded",
+                            );
+                            *tx_error = true;
+                        } else {
+                            let command_bytes = command_bytes.unwrap_or(0);
+                            if !try_reserve_retained_bytes(retained_capacity, command_bytes) {
+                                resp::write_error(
+                                    write_buf,
+                                    "ERR process request capacity exhausted",
+                                );
+                                *tx_error = true;
+                            } else {
+                                let owned: Vec<Vec<u8>> = args.iter().map(|a| a.to_vec()).collect();
+                                tx_queue.push(owned);
+                                *tx_bytes += command_bytes;
+                                resp::write_queued(write_buf);
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     resp::write_error(write_buf, &e);
@@ -3252,6 +3599,18 @@ fn handle_tx_cmd(
     false
 }
 
+fn try_reserve_retained_bytes(capacity: &mut Option<ByteReservation>, bytes: usize) -> bool {
+    capacity
+        .as_mut()
+        .is_none_or(|reservation| reservation.try_grow(bytes))
+}
+
+fn release_retained_bytes(capacity: &mut Option<ByteReservation>, bytes: usize) {
+    if let Some(reservation) = capacity.as_mut() {
+        reservation.release(bytes);
+    }
+}
+
 #[inline(always)]
 fn is_public_without_auth_cmd(cmd: &[u8]) -> bool {
     cmd::is_public_without_auth_command(cmd)
@@ -3261,18 +3620,36 @@ fn is_blocking_cmd(cmd: &[u8]) -> bool {
     cmd::is_blocking_command(cmd)
 }
 
+fn blocking_key_count(result: &CmdResult) -> Option<usize> {
+    match result {
+        CmdResult::BlockPop { keys, .. }
+        | CmdResult::BlockStreamRead { keys, .. }
+        | CmdResult::BlockZPop { keys, .. }
+        | CmdResult::BlockZMPop { keys, .. }
+        | CmdResult::BlockListMPop { keys, .. } => Some(keys.len()),
+        CmdResult::BlockMove { .. } => Some(1),
+        _ => None,
+    }
+}
+
 pub(crate) struct CommandSession {
     authenticated: bool,
     secret_credential: Option<crate::auth::SecretCredential>,
     client_name: Option<String>,
     in_multi: bool,
     tx_queue: Vec<Vec<Vec<u8>>>,
+    tx_bytes: usize,
     watched: Vec<(String, usize, u64)>,
+    watched_bytes: usize,
     tx_error: bool,
     subscriptions: HashMap<String, broadcast::Receiver<pubsub::Message>>,
     pattern_subs: HashMap<String, broadcast::Receiver<pubsub::Message>>,
     key_subs: HashMap<String, broadcast::Receiver<pubsub::Message>>,
     sub_mode: bool,
+    subscription_bytes: usize,
+    subscription_capacity: Option<SubscriptionReservation>,
+    retained_capacity: Option<ByteReservation>,
+    broker: Option<Broker>,
 }
 
 impl CommandSession {
@@ -3283,17 +3660,117 @@ impl CommandSession {
             client_name: None,
             in_multi: false,
             tx_queue: Vec::new(),
+            tx_bytes: 0,
             watched: Vec::new(),
+            watched_bytes: 0,
             tx_error: false,
             subscriptions: HashMap::new(),
             pattern_subs: HashMap::new(),
             key_subs: HashMap::new(),
             sub_mode: false,
+            subscription_bytes: 0,
+            subscription_capacity: None,
+            retained_capacity: None,
+            broker: None,
         }
+    }
+
+    fn with_broker(require_auth: bool, broker: Broker, request_budget: Option<ByteBudget>) -> Self {
+        let mut session = Self::new(require_auth);
+        session.subscription_capacity = Some(broker.subscription_reservation());
+        session.retained_capacity = request_budget.map(|budget| budget.reservation());
+        session.broker = Some(broker);
+        session
     }
 
     fn total_subscriptions(&self) -> i64 {
         (self.subscriptions.len() + self.pattern_subs.len() + self.key_subs.len()) as i64
+    }
+
+    fn subscription_limit_error<I>(
+        &self,
+        existing: &HashMap<String, I>,
+        names: &[String],
+        max_count: usize,
+        max_name_bytes: usize,
+        max_bytes: usize,
+    ) -> Option<&'static str> {
+        if names.iter().any(|name| name.len() > max_name_bytes) {
+            return Some("ERR subscription name exceeds maximum");
+        }
+        let added: HashSet<&str> = names
+            .iter()
+            .filter(|name| !existing.contains_key(*name))
+            .map(String::as_str)
+            .collect();
+        if (self.total_subscriptions() as usize).saturating_add(added.len()) > max_count {
+            return Some("ERR maximum subscriptions reached");
+        }
+        let added_bytes = added
+            .into_iter()
+            .try_fold(0usize, |total, name| total.checked_add(name.len()));
+        if added_bytes
+            .and_then(|bytes| self.subscription_bytes.checked_add(bytes))
+            .is_none_or(|bytes| bytes > max_bytes)
+        {
+            return Some("ERR subscription bytes limit exceeded");
+        }
+        None
+    }
+
+    fn new_subscription_count<I>(&self, existing: &HashMap<String, I>, names: &[String]) -> usize {
+        names
+            .iter()
+            .filter(|name| !existing.contains_key(*name))
+            .map(String::as_str)
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    fn new_subscription_bytes<I>(&self, existing: &HashMap<String, I>, names: &[String]) -> usize {
+        names
+            .iter()
+            .filter(|name| !existing.contains_key(*name))
+            .map(String::as_str)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .try_fold(0usize, |total, name| total.checked_add(name.len()))
+            .unwrap_or(usize::MAX)
+    }
+
+    fn try_reserve_subscriptions(&mut self, count: usize, bytes: usize) -> bool {
+        self.subscription_capacity
+            .as_mut()
+            .is_none_or(|reservation| reservation.try_grow(count, bytes))
+    }
+
+    fn release_subscriptions(&mut self, count: usize, bytes: usize) {
+        if let Some(reservation) = self.subscription_capacity.as_mut() {
+            reservation.release(count, bytes);
+        }
+    }
+}
+
+impl Drop for CommandSession {
+    fn drop(&mut self) {
+        let Some(broker) = &self.broker else {
+            return;
+        };
+        let channels: Vec<String> = self.subscriptions.keys().cloned().collect();
+        let patterns: Vec<String> = self.pattern_subs.keys().cloned().collect();
+        let key_patterns: Vec<String> = self.key_subs.keys().cloned().collect();
+        self.subscriptions.clear();
+        self.pattern_subs.clear();
+        self.key_subs.clear();
+        for channel in channels {
+            broker.unsubscribe_channel(&channel);
+        }
+        for pattern in patterns {
+            broker.punsubscribe_pattern(&pattern);
+        }
+        for pattern in key_patterns {
+            broker.kunsub(&pattern);
+        }
     }
 }
 
@@ -3311,7 +3788,21 @@ fn write_client_response(args: &[&[u8]], session: &mut CommandSession, out: &mut
             );
             return;
         }
-        session.client_name = Some(String::from_utf8_lossy(args[2]).into_owned());
+        let name = String::from_utf8_lossy(args[2]).into_owned();
+        let previous_bytes = session.client_name.as_ref().map_or(0, String::len);
+        if name.len() > previous_bytes
+            && !try_reserve_retained_bytes(
+                &mut session.retained_capacity,
+                name.len() - previous_bytes,
+            )
+        {
+            resp::write_error(out, "ERR process request capacity exhausted");
+            return;
+        }
+        if previous_bytes > name.len() {
+            release_retained_bytes(&mut session.retained_capacity, previous_bytes - name.len());
+        }
+        session.client_name = Some(name);
         resp::write_ok(out);
     } else if args[1].eq_ignore_ascii_case(b"GETNAME") {
         if args.len() != 2 {
@@ -3429,7 +3920,10 @@ impl CommandExecutor {
             &mut session.in_multi,
             &mut session.tx_error,
             &mut session.tx_queue,
+            &mut session.tx_bytes,
             &mut session.watched,
+            &mut session.watched_bytes,
+            &mut session.retained_capacity,
             &mut session.authenticated,
             &mut session.secret_credential,
             &self.store,
@@ -3579,7 +4073,11 @@ impl CommandExecutor {
         }
 
         let mut has_special = session.in_multi;
-        let mut all_single_key_rw = true;
+        let mut all_shard_batch_safe = true;
+        let ephemeral_batch_writes = self.store.config().durability.policy
+            == DurabilityPolicy::Ephemeral
+            && !self.store.is_tiered()
+            && !crate::eviction::eviction_enabled(&self.store);
         let mut flags: Vec<cmd::PipelineAccess> = Vec::with_capacity(cmd_count);
         for command in commands {
             let args = command.argv();
@@ -3600,22 +4098,28 @@ impl CommandExecutor {
                     .iter()
                     .any(|arg| cmd::is_reserved_internal_argument(arg))
             {
-                all_single_key_rw = false;
+                all_shard_batch_safe = false;
             }
             let access = cmd::pipeline_access_for_args(args);
             flags.push(access);
             // Writes must cross their per-command authoritative journal
             // boundary so a rejected command cannot leave a durable frame in a
-            // pre-journaled batch. Only read-only runs use shard batching.
-            if access != cmd::PipelineAccess::Read {
-                all_single_key_rw = false;
+            // pre-journaled batch. Only an unlimited, memory-layout ephemeral
+            // engine can batch plain SETs without per-command memory checks
+            // or fallible disk promotion.
+            let ephemeral_plain_set = ephemeral_batch_writes
+                && access == cmd::PipelineAccess::Write
+                && args.len() == 3
+                && cmd_eq_fast(cmd, b"SET");
+            if access != cmd::PipelineAccess::Read && !(cmd_count > 1 && ephemeral_plain_set) {
+                all_shard_batch_safe = false;
             }
         }
 
-        // When encryption is active, the shard-local fast batch path can neither
-        // encrypt writes nor decrypt reads (no keyring there), so force every
-        // command onto the slow path (cmd::execute) which handles both.
-        if has_special || !all_single_key_rw || self.store.encryption().has_active_key() {
+        // Keep encrypted workloads on the resolved command path. Shard-local
+        // SETs also preserve existing encryption if it becomes active after
+        // this check while a selected batch waits for its mutation gate.
+        if has_special || !all_shard_batch_safe || self.store.encryption().has_active_key() {
             for command in commands {
                 let args = command.argv();
                 if !session.authenticated && !is_public_without_auth_cmd(args[0]) {
@@ -3627,7 +4131,10 @@ impl CommandExecutor {
                     &mut session.in_multi,
                     &mut session.tx_error,
                     &mut session.tx_queue,
+                    &mut session.tx_bytes,
                     &mut session.watched,
+                    &mut session.watched_bytes,
+                    &mut session.retained_capacity,
                     &mut session.authenticated,
                     &mut session.secret_credential,
                     &self.store,
@@ -3676,6 +4183,9 @@ impl CommandExecutor {
                 return None;
             }
         };
+        let _script_guard = flags
+            .contains(&cmd::PipelineAccess::Write)
+            .then(|| self.store.script_read_guard());
         for (idx, command) in commands.iter().enumerate() {
             let args = command.argv();
             shards.push(self.store.shard_for_key(args[1]) as u32);
@@ -3731,9 +4241,28 @@ impl CommandExecutor {
                 None
             }
             CmdResult::Subscribe { channels } => {
+                let added = session.new_subscription_count(&session.subscriptions, &channels);
+                let added_bytes = session.new_subscription_bytes(&session.subscriptions, &channels);
+                if let Some(error) = session.subscription_limit_error(
+                    &session.subscriptions,
+                    &channels,
+                    self.store.config().limits.max_resp_subscriptions,
+                    self.store.config().limits.max_subscription_name_bytes,
+                    self.store.config().max_resp_request,
+                ) {
+                    resp::write_error(write_buf, error);
+                    return None;
+                }
+                if !session.try_reserve_subscriptions(added, added_bytes) {
+                    resp::write_error(write_buf, "ERR process subscription capacity exhausted");
+                    return None;
+                }
                 for ch in &channels {
-                    let rx = self.broker.subscribe(ch);
-                    session.subscriptions.insert(ch.clone(), rx);
+                    if !session.subscriptions.contains_key(ch) {
+                        let rx = self.broker.subscribe(ch);
+                        session.subscriptions.insert(ch.clone(), rx);
+                        session.subscription_bytes += ch.len();
+                    }
                     resp::write_array_header(write_buf, 3);
                     resp::write_bulk(write_buf, "subscribe");
                     resp::write_bulk(write_buf, ch);
@@ -3743,9 +4272,28 @@ impl CommandExecutor {
                 None
             }
             CmdResult::PSubscribe { patterns } => {
+                let added = session.new_subscription_count(&session.pattern_subs, &patterns);
+                let added_bytes = session.new_subscription_bytes(&session.pattern_subs, &patterns);
+                if let Some(error) = session.subscription_limit_error(
+                    &session.pattern_subs,
+                    &patterns,
+                    self.store.config().limits.max_resp_subscriptions,
+                    self.store.config().limits.max_subscription_name_bytes,
+                    self.store.config().max_resp_request,
+                ) {
+                    resp::write_error(write_buf, error);
+                    return None;
+                }
+                if !session.try_reserve_subscriptions(added, added_bytes) {
+                    resp::write_error(write_buf, "ERR process subscription capacity exhausted");
+                    return None;
+                }
                 for pat in &patterns {
-                    let rx = self.broker.psubscribe(pat);
-                    session.pattern_subs.insert(pat.clone(), rx);
+                    if !session.pattern_subs.contains_key(pat) {
+                        let rx = self.broker.psubscribe(pat);
+                        session.pattern_subs.insert(pat.clone(), rx);
+                        session.subscription_bytes += pat.len();
+                    }
                     resp::write_array_header(write_buf, 3);
                     resp::write_bulk(write_buf, "psubscribe");
                     resp::write_bulk(write_buf, pat);
@@ -3755,10 +4303,27 @@ impl CommandExecutor {
                 None
             }
             CmdResult::KSubscribe { patterns } => {
+                let added = session.new_subscription_count(&session.key_subs, &patterns);
+                let added_bytes = session.new_subscription_bytes(&session.key_subs, &patterns);
+                if let Some(error) = session.subscription_limit_error(
+                    &session.key_subs,
+                    &patterns,
+                    self.store.config().limits.max_resp_subscriptions,
+                    self.store.config().limits.max_subscription_name_bytes,
+                    self.store.config().max_resp_request,
+                ) {
+                    resp::write_error(write_buf, error);
+                    return None;
+                }
+                if !session.try_reserve_subscriptions(added, added_bytes) {
+                    resp::write_error(write_buf, "ERR process subscription capacity exhausted");
+                    return None;
+                }
                 for pat in &patterns {
                     if !session.key_subs.contains_key(pat) {
                         let rx = self.broker.ksubscribe(pat);
                         session.key_subs.insert(pat.clone(), rx);
+                        session.subscription_bytes += pat.len();
                     }
                     resp::write_array_header(write_buf, 3);
                     resp::write_bulk(write_buf, "ksub");
@@ -3776,6 +4341,9 @@ impl CommandExecutor {
                 };
                 for pat in &pats {
                     if session.key_subs.remove(pat).is_some() {
+                        session.subscription_bytes =
+                            session.subscription_bytes.saturating_sub(pat.len());
+                        session.release_subscriptions(1, pat.len());
                         self.broker.kunsub(pat);
                     }
                     resp::write_array_header(write_buf, 3);
@@ -3861,24 +4429,33 @@ where
 }
 
 async fn handle_connection(
-    mut socket: tokio::net::TcpStream,
+    mut socket: DeadlineStream,
     _peer: std::net::SocketAddr,
     runtime: Arc<Runtime>,
     mut shutdown_rx: watch::Receiver<Option<Duration>>,
 ) -> std::io::Result<()> {
     let store = runtime.store.clone();
     let broker = runtime.broker.clone();
+    let max_resp_response = runtime.config.limits.max_resp_response;
     let mut read_buf = vec![0u8; 65536];
-    let mut write_buf = BytesMut::with_capacity(65536);
+    let mut write_buf = BytesMut::with_capacity(max_resp_response.min(65536));
     let mut pending = BytesMut::new();
+    let mut pending_budget = runtime.request_budget.reservation();
+    let mut partial_started: Option<tokio::time::Instant> = None;
+    let mut last_activity = tokio::time::Instant::now();
     let max_resp_request = runtime.config.max_resp_request;
+    let max_pipeline_commands = runtime.config.limits.max_resp_pipeline_commands;
     // An engine is credential-gated by a password *or* by project keys. Checked
     // per connection rather than per command: `require_auth` is fixed at startup,
     // so without this a key-only engine (no LUX_PASSWORD) would leave RESP wide
     // open, and keys minted at runtime would never start gating it.
     let keys_require_auth =
         crate::auth::project_keys_configured(&runtime.store, &runtime.schema_cache).unwrap_or(true);
-    let mut session = CommandSession::new(runtime.config.require_auth || keys_require_auth);
+    let mut session = CommandSession::with_broker(
+        runtime.config.require_auth || keys_require_auth,
+        broker.clone(),
+        Some(runtime.request_budget.clone()),
+    );
     let executor = CommandExecutor::new(
         runtime.store.clone(),
         runtime.broker.clone(),
@@ -3892,9 +4469,21 @@ async fn handle_connection(
         if shutdown_rx.borrow().is_some() {
             return Ok(());
         }
+        let read_deadline = partial_started.map_or_else(
+            || last_activity + runtime.config.limits.resp_idle_timeout,
+            |started| started + runtime.config.limits.resp_request_timeout,
+        );
         if session.sub_mode {
             tokio::select! {
                 _ = shutdown_rx.changed() => return Ok(()),
+                _ = tokio::time::sleep_until(read_deadline) => {
+                    store.record_connection_timeout();
+                    if partial_started.is_some() {
+                        resp::write_error(&mut write_buf, "ERR RESP request timeout");
+                        let _ = socket.write_all(&write_buf).await;
+                    }
+                    return Ok(());
+                }
                 _ = auth_tick.tick(), if session.secret_credential.is_some() => {
                     if session.secret_credential.as_ref().is_some_and(|credential| {
                         crate::auth::revalidate_secret_credential(
@@ -3915,14 +4504,29 @@ async fn handle_connection(
                         Ok(n) => n,
                         Err(e) => return Err(e),
                     };
+                    let was_empty = pending.is_empty();
+                    if !pending_budget.try_grow(n) {
+                        store.reject_request_buffer();
+                        resp::write_error(&mut write_buf, "ERR request buffer capacity exhausted");
+                        socket.write_all(&write_buf).await?;
+                        return Ok(());
+                    }
                     pending.extend_from_slice(&read_buf[..n]);
+                    if was_empty {
+                        partial_started = Some(tokio::time::Instant::now());
+                    }
                     if pending.len() > max_resp_request {
                         resp::write_error(&mut write_buf, "ERR RESP request exceeds maximum");
                         socket.write_all(&write_buf).await?;
                         return Ok(());
                     }
                     let now = Instant::now();
-                    let mut parser = Parser::with_max_bulk_len(&pending, max_resp_request);
+                    let mut parser = Parser::with_limits(
+                        &pending,
+                        max_resp_request,
+                        runtime.config.limits.max_resp_command_args,
+                    );
+                    let mut command_count = 0usize;
                     loop {
                         let args = match parser.parse_command() {
                             Ok(Some(args)) => args,
@@ -3934,18 +4538,47 @@ async fn handle_connection(
                             }
                         };
                         if args.is_empty() { continue; }
+                        command_count += 1;
+                        if command_count > max_pipeline_commands {
+                            resp::write_error(&mut write_buf, "ERR RESP pipeline command limit exceeded");
+                            socket.write_all(&write_buf).await?;
+                            return Ok(());
+                        }
+                        let output_limit = resp::limit_output_with_budget(
+                            max_resp_response,
+                            write_buf.len(),
+                            runtime.response_budget.clone(),
+                        );
                         let _execution_guard = store.execution_barrier_guard();
                         if cmd_eq_fast(args[0], b"SUBSCRIBE") {
-                            for ch_bytes in &args[1..] {
-                                let ch = std::str::from_utf8(ch_bytes).unwrap_or("").to_string();
-                                if !session.subscriptions.contains_key(&ch) {
-                                    let rx = broker.subscribe(&ch);
-                                    session.subscriptions.insert(ch.clone(), rx);
+                            let channels: Vec<String> = args[1..]
+                                .iter()
+                                .map(|value| std::str::from_utf8(value).unwrap_or("").to_string())
+                                .collect();
+                            let added = session.new_subscription_count(&session.subscriptions, &channels);
+                            let added_bytes = session.new_subscription_bytes(&session.subscriptions, &channels);
+                            if let Some(error) = session.subscription_limit_error(
+                                &session.subscriptions,
+                                &channels,
+                                runtime.config.limits.max_resp_subscriptions,
+                                runtime.config.limits.max_subscription_name_bytes,
+                                runtime.config.max_resp_request,
+                            ) {
+                                resp::write_error(&mut write_buf, error);
+                            } else if !session.try_reserve_subscriptions(added, added_bytes) {
+                                resp::write_error(&mut write_buf, "ERR process subscription capacity exhausted");
+                            } else {
+                                for ch in channels {
+                                    if !session.subscriptions.contains_key(&ch) {
+                                        let rx = broker.subscribe(&ch);
+                                        session.subscriptions.insert(ch.clone(), rx);
+                                        session.subscription_bytes += ch.len();
+                                    }
+                                    resp::write_array_header(&mut write_buf, 3);
+                                    resp::write_bulk(&mut write_buf, "subscribe");
+                                    resp::write_bulk(&mut write_buf, &ch);
+                                    resp::write_integer(&mut write_buf, session.total_subscriptions());
                                 }
-                                resp::write_array_header(&mut write_buf, 3);
-                                resp::write_bulk(&mut write_buf, "subscribe");
-                                resp::write_bulk(&mut write_buf, &ch);
-                                resp::write_integer(&mut write_buf, session.total_subscriptions());
                             }
                         } else if cmd_eq_fast(args[0], b"UNSUBSCRIBE") {
                             let channels: Vec<String> = if args.len() > 1 {
@@ -3954,7 +4587,12 @@ async fn handle_connection(
                                 session.subscriptions.keys().cloned().collect()
                             };
                             for ch in &channels {
-                                session.subscriptions.remove(ch);
+                                if session.subscriptions.remove(ch).is_some() {
+                                    session.subscription_bytes =
+                                        session.subscription_bytes.saturating_sub(ch.len());
+                                    session.release_subscriptions(1, ch.len());
+                                    broker.unsubscribe_channel(ch);
+                                }
                                 resp::write_array_header(&mut write_buf, 3);
                                 resp::write_bulk(&mut write_buf, "unsubscribe");
                                 resp::write_bulk(&mut write_buf, ch);
@@ -3964,16 +4602,34 @@ async fn handle_connection(
                                 session.sub_mode = false;
                             }
                         } else if cmd_eq_fast(args[0], b"PSUBSCRIBE") {
-                            for pat_bytes in &args[1..] {
-                                let pat = std::str::from_utf8(pat_bytes).unwrap_or("").to_string();
-                                if !session.pattern_subs.contains_key(&pat) {
-                                    let rx = broker.psubscribe(&pat);
-                                    session.pattern_subs.insert(pat.clone(), rx);
+                            let patterns: Vec<String> = args[1..]
+                                .iter()
+                                .map(|value| std::str::from_utf8(value).unwrap_or("").to_string())
+                                .collect();
+                            let added = session.new_subscription_count(&session.pattern_subs, &patterns);
+                            let added_bytes = session.new_subscription_bytes(&session.pattern_subs, &patterns);
+                            if let Some(error) = session.subscription_limit_error(
+                                &session.pattern_subs,
+                                &patterns,
+                                runtime.config.limits.max_resp_subscriptions,
+                                runtime.config.limits.max_subscription_name_bytes,
+                                runtime.config.max_resp_request,
+                            ) {
+                                resp::write_error(&mut write_buf, error);
+                            } else if !session.try_reserve_subscriptions(added, added_bytes) {
+                                resp::write_error(&mut write_buf, "ERR process subscription capacity exhausted");
+                            } else {
+                                for pat in patterns {
+                                    if !session.pattern_subs.contains_key(&pat) {
+                                        let rx = broker.psubscribe(&pat);
+                                        session.pattern_subs.insert(pat.clone(), rx);
+                                        session.subscription_bytes += pat.len();
+                                    }
+                                    resp::write_array_header(&mut write_buf, 3);
+                                    resp::write_bulk(&mut write_buf, "psubscribe");
+                                    resp::write_bulk(&mut write_buf, &pat);
+                                    resp::write_integer(&mut write_buf, session.total_subscriptions());
                                 }
-                                resp::write_array_header(&mut write_buf, 3);
-                                resp::write_bulk(&mut write_buf, "psubscribe");
-                                resp::write_bulk(&mut write_buf, &pat);
-                                resp::write_integer(&mut write_buf, session.total_subscriptions());
                             }
                         } else if cmd_eq_fast(args[0], b"PUNSUBSCRIBE") {
                             let patterns: Vec<String> = if args.len() > 1 {
@@ -3982,7 +4638,12 @@ async fn handle_connection(
                                 session.pattern_subs.keys().cloned().collect()
                             };
                             for pat in &patterns {
-                                session.pattern_subs.remove(pat);
+                                if session.pattern_subs.remove(pat).is_some() {
+                                    session.subscription_bytes =
+                                        session.subscription_bytes.saturating_sub(pat.len());
+                                    session.release_subscriptions(1, pat.len());
+                                    broker.punsubscribe_pattern(pat);
+                                }
                                 resp::write_array_header(&mut write_buf, 3);
                                 resp::write_bulk(&mut write_buf, "punsubscribe");
                                 resp::write_bulk(&mut write_buf, pat);
@@ -3995,16 +4656,34 @@ async fn handle_connection(
                             if args.len() < 2 {
                                 resp::write_error(&mut write_buf, "ERR wrong number of arguments for 'ksub' command");
                             } else {
-                                for pat_bytes in &args[1..] {
-                                    let pat = std::str::from_utf8(pat_bytes).unwrap_or("").to_string();
-                                    if !session.key_subs.contains_key(&pat) {
-                                        let rx = broker.ksubscribe(&pat);
-                                        session.key_subs.insert(pat.clone(), rx);
+                                let patterns: Vec<String> = args[1..]
+                                    .iter()
+                                    .map(|value| std::str::from_utf8(value).unwrap_or("").to_string())
+                                    .collect();
+                                let added = session.new_subscription_count(&session.key_subs, &patterns);
+                                let added_bytes = session.new_subscription_bytes(&session.key_subs, &patterns);
+                                if let Some(error) = session.subscription_limit_error(
+                                    &session.key_subs,
+                                    &patterns,
+                                    runtime.config.limits.max_resp_subscriptions,
+                                    runtime.config.limits.max_subscription_name_bytes,
+                                    runtime.config.max_resp_request,
+                                ) {
+                                    resp::write_error(&mut write_buf, error);
+                                } else if !session.try_reserve_subscriptions(added, added_bytes) {
+                                    resp::write_error(&mut write_buf, "ERR process subscription capacity exhausted");
+                                } else {
+                                    for pat in patterns {
+                                        if !session.key_subs.contains_key(&pat) {
+                                            let rx = broker.ksubscribe(&pat);
+                                            session.key_subs.insert(pat.clone(), rx);
+                                            session.subscription_bytes += pat.len();
+                                        }
+                                        resp::write_array_header(&mut write_buf, 3);
+                                        resp::write_bulk(&mut write_buf, "ksub");
+                                        resp::write_bulk(&mut write_buf, &pat);
+                                        resp::write_integer(&mut write_buf, session.total_subscriptions());
                                     }
-                                    resp::write_array_header(&mut write_buf, 3);
-                                    resp::write_bulk(&mut write_buf, "ksub");
-                                    resp::write_bulk(&mut write_buf, &pat);
-                                    resp::write_integer(&mut write_buf, session.total_subscriptions());
                                 }
                             }
                         } else if cmd_eq_fast(args[0], b"KUNSUB") {
@@ -4015,6 +4694,9 @@ async fn handle_connection(
                             };
                             for pat in &patterns {
                                 if session.key_subs.remove(pat).is_some() {
+                                    session.subscription_bytes =
+                                        session.subscription_bytes.saturating_sub(pat.len());
+                                    session.release_subscriptions(1, pat.len());
                                     broker.kunsub(pat);
                                 }
                                 resp::write_array_header(&mut write_buf, 3);
@@ -4034,13 +4716,37 @@ async fn handle_connection(
                         } else {
                             resp::write_error(&mut write_buf, "ERR only SUBSCRIBE, UNSUBSCRIBE, and PING are allowed in subscribe mode");
                         }
+                        let response_exceeded = output_limit.exceeded();
+                        let response_capacity_exhausted = output_limit.capacity_exhausted();
+                        drop(output_limit);
+                        drop(_execution_guard);
+                        if response_exceeded {
+                            if response_capacity_exhausted {
+                                store.reject_response_buffer();
+                            }
+                            write_buf.clear();
+                            resp::write_error(&mut write_buf, "ERR RESP response exceeds maximum");
+                            socket.write_all(&write_buf).await?;
+                            return Ok(());
+                        }
                         let _ = now;
                     }
                     let consumed = parser.pos();
                     let _ = pending.split_to(consumed);
+                    pending_budget.release(consumed);
+                    if pending.is_empty() {
+                        partial_started = None;
+                    }
                     if !write_buf.is_empty() {
+                        if write_buf.len() > max_resp_response {
+                            write_buf.clear();
+                            resp::write_error(&mut write_buf, "ERR RESP response exceeds maximum");
+                            socket.write_all(&write_buf).await?;
+                            return Ok(());
+                        }
                         socket.write_all(&write_buf).await?;
                         write_buf.clear();
+                        last_activity = tokio::time::Instant::now();
                     }
                 }
                 msg = async {
@@ -4091,13 +4797,18 @@ async fn handle_connection(
                     None
                 } => {
                     if let Some(msgs) = msg {
+                        let output_limit = resp::limit_output_with_budget(
+                            max_resp_response,
+                            write_buf.len(),
+                            runtime.response_budget.clone(),
+                        );
                         for msg in msgs {
                             match msg.kind {
                                 pubsub::MessageKind::KeyEvent => {
                                     resp::write_array_header(&mut write_buf, 4);
                                     resp::write_bulk(&mut write_buf, "kmessage");
                                     resp::write_bulk(&mut write_buf, msg.pattern.as_deref().unwrap_or(""));
-                                    resp::write_bulk(&mut write_buf, &msg.channel);
+                                    resp::write_bulk(&mut write_buf, msg.channel.as_ref());
                                     resp::write_bulk_raw(&mut write_buf, &msg.payload);
                                 }
                                 pubsub::MessageKind::PubSub => {
@@ -4105,19 +4816,32 @@ async fn handle_connection(
                                         resp::write_array_header(&mut write_buf, 4);
                                         resp::write_bulk(&mut write_buf, "pmessage");
                                         resp::write_bulk(&mut write_buf, pat);
-                                        resp::write_bulk(&mut write_buf, &msg.channel);
+                                        resp::write_bulk(&mut write_buf, msg.channel.as_ref());
                                         resp::write_bulk_raw(&mut write_buf, &msg.payload);
                                     } else {
                                         resp::write_array_header(&mut write_buf, 3);
                                         resp::write_bulk(&mut write_buf, "message");
-                                        resp::write_bulk(&mut write_buf, &msg.channel);
+                                        resp::write_bulk(&mut write_buf, msg.channel.as_ref());
                                         resp::write_bulk_raw(&mut write_buf, &msg.payload);
                                     }
                                 }
                             }
                         }
+                        let response_exceeded = output_limit.exceeded();
+                        let response_capacity_exhausted = output_limit.capacity_exhausted();
+                        drop(output_limit);
+                        if response_exceeded {
+                            if response_capacity_exhausted {
+                                store.reject_response_buffer();
+                            }
+                            write_buf.clear();
+                            resp::write_error(&mut write_buf, "ERR RESP response exceeds maximum");
+                            socket.write_all(&write_buf).await?;
+                            return Ok(());
+                        }
                         socket.write_all(&write_buf).await?;
                         write_buf.clear();
+                        last_activity = tokio::time::Instant::now();
                     }
                 }
             }
@@ -4127,6 +4851,14 @@ async fn handle_connection(
             // request after the listener closes.
             let read = tokio::select! {
                 _ = shutdown_rx.changed() => return Ok(()),
+                _ = tokio::time::sleep_until(read_deadline) => {
+                    store.record_connection_timeout();
+                    if partial_started.is_some() {
+                        resp::write_error(&mut write_buf, "ERR RESP request timeout");
+                        let _ = socket.write_all(&write_buf).await;
+                    }
+                    return Ok(());
+                }
                 _ = auth_tick.tick(), if session.secret_credential.is_some() => {
                     if session.secret_credential.as_ref().is_some_and(|credential| {
                         crate::auth::revalidate_secret_credential(
@@ -4150,19 +4882,41 @@ async fn handle_connection(
                 Err(e) => return Err(e),
             };
 
+            let was_empty = pending.is_empty();
+            if !pending_budget.try_grow(n) {
+                store.reject_request_buffer();
+                resp::write_error(&mut write_buf, "ERR request buffer capacity exhausted");
+                socket.write_all(&write_buf).await?;
+                return Ok(());
+            }
             pending.extend_from_slice(&read_buf[..n]);
+            if was_empty {
+                partial_started = Some(tokio::time::Instant::now());
+            }
             if pending.len() > max_resp_request {
                 resp::write_error(&mut write_buf, "ERR RESP request exceeds maximum");
                 socket.write_all(&write_buf).await?;
                 return Ok(());
             }
             let now = Instant::now();
-            let mut parser = Parser::with_max_bulk_len(&pending, max_resp_request);
+            let mut parser = Parser::with_limits(
+                &pending,
+                max_resp_request,
+                runtime.config.limits.max_resp_command_args,
+            );
             let mut commands: Vec<resp::CommandArgs<'_>> = Vec::new();
             loop {
                 match parser.parse_command_args() {
                     Ok(Some(args)) => {
                         if !args.is_empty() {
+                            if commands.len() >= max_pipeline_commands {
+                                resp::write_error(
+                                    &mut write_buf,
+                                    "ERR RESP pipeline command limit exceeded",
+                                );
+                                socket.write_all(&write_buf).await?;
+                                return Ok(());
+                            }
                             commands.push(args);
                         }
                     }
@@ -4177,6 +4931,11 @@ async fn handle_connection(
             let consumed = parser.pos();
 
             let mut deferred_action: Option<CmdResult> = None;
+            let output_limit = resp::limit_output_with_budget(
+                max_resp_response,
+                write_buf.len(),
+                runtime.response_budget.clone(),
+            );
 
             if commands.len() <= 1 {
                 for command in &commands {
@@ -4193,16 +4952,55 @@ async fn handle_connection(
                 deferred_action =
                     executor.execute_pipeline(&commands, &mut session, &mut write_buf, now);
             }
+            let response_exceeded = output_limit.exceeded();
+            let response_capacity_exhausted = output_limit.capacity_exhausted();
+            drop(output_limit);
 
             drop(commands);
             let _ = pending.split_to(consumed);
+            pending_budget.release(consumed);
+            if pending.is_empty() {
+                partial_started = None;
+            }
 
+            if response_exceeded {
+                if response_capacity_exhausted {
+                    store.reject_response_buffer();
+                }
+                write_buf.clear();
+                resp::write_error(&mut write_buf, "ERR RESP response exceeds maximum");
+                socket.write_all(&write_buf).await?;
+                return Ok(());
+            }
             if !write_buf.is_empty() {
                 socket.write_all(&write_buf).await?;
                 write_buf.clear();
+                last_activity = tokio::time::Instant::now();
             }
 
             if let Some(action) = deferred_action {
+                let _blocked_permit = if let Some(key_count) = blocking_key_count(&action) {
+                    if key_count > runtime.config.limits.max_blocking_keys {
+                        resp::write_error(&mut write_buf, "ERR blocking key limit exceeded");
+                        socket.write_all(&write_buf).await?;
+                        write_buf.clear();
+                        continue;
+                    }
+                    match runtime.blocked_clients.clone().try_acquire_owned() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            resp::write_error(
+                                &mut write_buf,
+                                "ERR maximum blocked clients reached",
+                            );
+                            socket.write_all(&write_buf).await?;
+                            write_buf.clear();
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 match action {
                     CmdResult::Quit => return Ok(()),
                     CmdResult::BlockPop {
@@ -4343,13 +5141,14 @@ async fn handle_connection(
                     }
                     _ => continue,
                 }
+                last_activity = tokio::time::Instant::now();
             }
         }
     }
 }
 
 async fn handle_block_pop(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     _store: &Arc<Store>,
     broker: &Broker,
     keys: &[String],
@@ -4372,31 +5171,38 @@ async fn handle_block_pop(
     }
     drop(tx);
 
-    let mut write_buf = BytesMut::new();
+    let _waiter = ListWaiterRegistration::new(broker, keys, waiter_id);
+
     let result = tokio::select! {
-        val = rx.recv() => val,
-        _ = tokio::time::sleep(timeout) => None,
+        val = rx.recv() => Some(val),
+        _ = tokio::time::sleep(timeout) => Some(None),
+        closed = socket.wait_for_peer_close() => {
+            closed?;
+            None
+        },
     };
 
-    match result {
+    let Some(result) = result else {
+        return Ok(());
+    };
+
+    let write_buf = bounded_resp_buffer(socket, |write_buf| match result {
         Some((key, val)) => {
-            resp::write_array_header(&mut write_buf, 2);
-            resp::write_bulk(&mut write_buf, &key);
-            resp::write_bulk_raw(&mut write_buf, &val);
+            resp::write_array_header(write_buf, 2);
+            resp::write_bulk(write_buf, &key);
+            resp::write_bulk_raw(write_buf, &val);
         }
         None => {
-            resp::write_null_array(&mut write_buf);
+            resp::write_null_array(write_buf);
         }
-    }
-
-    broker.remove_list_waiters_by_id(keys, waiter_id);
+    });
 
     socket.write_all(&write_buf).await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_block_move(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     _store: &Arc<Store>,
     broker: &Broker,
     src: &str,
@@ -4419,29 +5225,37 @@ async fn handle_block_move(
     );
     drop(tx);
 
-    let mut write_buf = BytesMut::new();
+    let keys = [src.to_string()];
+    let _waiter = ListWaiterRegistration::new(broker, &keys, waiter_id);
+
     let result = tokio::select! {
-        val = rx.recv() => val,
-        _ = tokio::time::sleep(timeout) => None,
+        val = rx.recv() => Some(val),
+        _ = tokio::time::sleep(timeout) => Some(None),
+        closed = socket.wait_for_peer_close() => {
+            closed?;
+            None
+        },
     };
 
-    match result {
+    let Some(result) = result else {
+        return Ok(());
+    };
+
+    let write_buf = bounded_resp_buffer(socket, |write_buf| match result {
         Some((_key, val)) => {
-            resp::write_bulk_raw(&mut write_buf, &val);
+            resp::write_bulk_raw(write_buf, &val);
         }
         None => {
-            resp::write_null(&mut write_buf);
+            resp::write_null(write_buf);
         }
-    }
-
-    broker.remove_list_waiters_by_id(&[src.to_string()], waiter_id);
+    });
 
     socket.write_all(&write_buf).await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_block_stream_read(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     store: &Arc<Store>,
     broker: &Broker,
     keys: &[String],
@@ -4451,11 +5265,13 @@ async fn handle_block_stream_read(
     noack: bool,
     timeout: std::time::Duration,
 ) -> std::io::Result<()> {
+    let tiered_memory = store.tiered_memory_boundary();
     let now_pre = Instant::now();
     for key in keys {
         if let Err(error) = store.try_promote(key.as_bytes(), now_pre) {
             let mut out = BytesMut::new();
             resp::write_error(&mut out, &error);
+            drop(tiered_memory);
             return socket.write_all(&out).await;
         }
     }
@@ -4473,6 +5289,7 @@ async fn handle_block_stream_read(
             }
         })
         .collect();
+    drop(tiered_memory);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
     let waiter_id = broker.next_waiter_id();
@@ -4481,40 +5298,98 @@ async fn handle_block_stream_read(
     }
     drop(tx);
 
-    let mut write_buf = BytesMut::new();
+    let _waiter = StreamWaiterRegistration::new(broker, keys, waiter_id);
+
     let woken = tokio::select! {
-        _ = rx.recv() => true,
-        _ = tokio::time::sleep(timeout) => false,
+        _ = rx.recv() => Some(true),
+        _ = tokio::time::sleep(timeout) => Some(false),
+        closed = socket.wait_for_peer_close() => {
+            closed?;
+            None
+        },
     };
 
-    if woken {
-        let now = Instant::now();
-        let result = if let Some((ref grp, ref consumer)) = group {
-            store.xreadgroup(grp, consumer, keys, &resolved_ids, count, noack, now)
-        } else {
-            let ids: Vec<store::StreamId> = resolved_ids
-                .iter()
-                .map(|s| store::StreamId::parse(s).unwrap_or(store::StreamId::zero()))
-                .collect();
-            store.xread(keys, &ids, count, now)
-        };
+    let Some(woken) = woken else {
+        return Ok(());
+    };
 
-        match result {
-            Ok(r) if !r.is_empty() => {
-                write_xread_response(&mut write_buf, &r);
-            }
-            Ok(_) => {
-                resp::write_null_array(&mut write_buf);
-            }
-            Err(error) => resp::write_error(&mut write_buf, &error),
-        }
-    } else {
-        resp::write_null_array(&mut write_buf);
-    }
+    let write_buf = {
+        let _tiered_memory = store.tiered_memory_boundary();
+        bounded_resp_buffer(socket, |write_buf| {
+            if woken {
+                let now = Instant::now();
+                let result = if let Some((ref grp, ref consumer)) = group {
+                    store.xreadgroup(grp, consumer, keys, &resolved_ids, count, noack, now)
+                } else {
+                    let ids: Vec<store::StreamId> = resolved_ids
+                        .iter()
+                        .map(|s| store::StreamId::parse(s).unwrap_or(store::StreamId::zero()))
+                        .collect();
+                    store.xread(keys, &ids, count, now)
+                };
 
-    broker.remove_stream_waiters_by_id(keys, waiter_id);
+                match result {
+                    Ok(r) if !r.is_empty() => {
+                        write_xread_response(write_buf, &r);
+                    }
+                    Ok(_) => {
+                        resp::write_null_array(write_buf);
+                    }
+                    Err(error) => resp::write_error(write_buf, &error),
+                }
+            } else {
+                resp::write_null_array(write_buf);
+            }
+        })
+    };
 
     socket.write_all(&write_buf).await
+}
+
+struct ListWaiterRegistration {
+    broker: Broker,
+    keys: Vec<String>,
+    waiter_id: u64,
+}
+
+impl ListWaiterRegistration {
+    fn new(broker: &Broker, keys: &[String], waiter_id: u64) -> Self {
+        Self {
+            broker: broker.clone(),
+            keys: keys.to_vec(),
+            waiter_id,
+        }
+    }
+}
+
+impl Drop for ListWaiterRegistration {
+    fn drop(&mut self) {
+        self.broker
+            .remove_list_waiters_by_id(&self.keys, self.waiter_id);
+    }
+}
+
+struct StreamWaiterRegistration {
+    broker: Broker,
+    keys: Vec<String>,
+    waiter_id: u64,
+}
+
+impl StreamWaiterRegistration {
+    fn new(broker: &Broker, keys: &[String], waiter_id: u64) -> Self {
+        Self {
+            broker: broker.clone(),
+            keys: keys.to_vec(),
+            waiter_id,
+        }
+    }
+}
+
+impl Drop for StreamWaiterRegistration {
+    fn drop(&mut self) {
+        self.broker
+            .remove_stream_waiters_by_id(&self.keys, self.waiter_id);
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -4566,7 +5441,7 @@ fn handle_eval(
     let _guard = store.script_write_guard();
     match lua::eval(&actual_script, keys, argv, store, broker, now) {
         Ok(result) => {
-            out.extend_from_slice(&result);
+            resp::write_encoded(out, &result);
         }
         Err(e) => {
             resp::write_error(out, &e);
@@ -4575,7 +5450,7 @@ fn handle_eval(
 }
 
 async fn handle_block_lmpop(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     store: &Arc<Store>,
     keys: &[String],
     pop_left: bool,
@@ -4584,41 +5459,55 @@ async fn handle_block_lmpop(
 ) -> std::io::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
-    let mut write_buf = BytesMut::new();
-
     loop {
         let now = Instant::now();
-        match cmd::journaled_lmpop(store, &key_refs, pop_left, count, now) {
+        let result = {
+            let _tiered_memory = store.tiered_memory_boundary();
+            cmd::journaled_lmpop(store, &key_refs, pop_left, count, now)
+        };
+        match result {
             Ok(Some((key, items))) => {
-                resp::write_array_header(&mut write_buf, 2);
-                resp::write_bulk_raw(&mut write_buf, &key);
-                resp::write_array_header(&mut write_buf, items.len());
-                for item in &items {
-                    let decrypted = store
-                        .decrypt_list_element(item.clone())
-                        .unwrap_or_else(|_| item.clone());
-                    resp::write_bulk_raw(&mut write_buf, &decrypted);
-                }
+                let write_buf = bounded_resp_buffer(socket, |write_buf| {
+                    resp::write_array_header(write_buf, 2);
+                    resp::write_bulk_raw(write_buf, &key);
+                    resp::write_array_header(write_buf, items.len());
+                    for item in &items {
+                        let decrypted = store
+                            .decrypt_list_element(item.clone())
+                            .unwrap_or_else(|_| item.clone());
+                        resp::write_bulk_raw(write_buf, &decrypted);
+                    }
+                });
                 return socket.write_all(&write_buf).await;
             }
             Ok(None) => {}
             Err(e) => {
-                resp::write_error(&mut write_buf, &e);
+                let write_buf = bounded_resp_buffer(socket, |write_buf| {
+                    resp::write_error(write_buf, &e);
+                });
                 return socket.write_all(&write_buf).await;
             }
         }
 
         if tokio::time::Instant::now() >= deadline {
-            resp::write_null_array(&mut write_buf);
+            let write_buf = bounded_resp_buffer(socket, |write_buf| {
+                resp::write_null_array(write_buf);
+            });
             return socket.write_all(&write_buf).await;
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            closed = socket.wait_for_peer_close() => {
+                closed?;
+                return Ok(());
+            }
+        }
     }
 }
 
 async fn handle_block_zmpop(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     store: &Arc<Store>,
     keys: &[String],
     pop_min: bool,
@@ -4627,78 +5516,120 @@ async fn handle_block_zmpop(
 ) -> std::io::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
-    let mut write_buf = BytesMut::new();
-
     loop {
         let now = Instant::now();
-        match cmd::journaled_zmpop(store, &key_refs, pop_min, count, now) {
+        let result = {
+            let _tiered_memory = store.tiered_memory_boundary();
+            cmd::journaled_zmpop(store, &key_refs, pop_min, count, now)
+        };
+        match result {
             Ok(Some((key, items))) => {
-                resp::write_array_header(&mut write_buf, 2);
-                resp::write_bulk_raw(&mut write_buf, &key);
-                resp::write_array_header(&mut write_buf, items.len());
-                for (member, score) in &items {
-                    resp::write_array_header(&mut write_buf, 2);
-                    resp::write_bulk(&mut write_buf, member);
-                    let score_str = if score.fract() == 0.0 && score.abs() < 1e15 {
-                        format!("{}", *score as i64)
-                    } else {
-                        format!("{score}")
-                    };
-                    resp::write_bulk(&mut write_buf, &score_str);
-                }
+                let write_buf = bounded_resp_buffer(socket, |write_buf| {
+                    resp::write_array_header(write_buf, 2);
+                    resp::write_bulk_raw(write_buf, &key);
+                    resp::write_array_header(write_buf, items.len());
+                    for (member, score) in &items {
+                        resp::write_array_header(write_buf, 2);
+                        resp::write_bulk(write_buf, member);
+                        let score_str = if score.fract() == 0.0 && score.abs() < 1e15 {
+                            format!("{}", *score as i64)
+                        } else {
+                            format!("{score}")
+                        };
+                        resp::write_bulk(write_buf, &score_str);
+                    }
+                });
                 return socket.write_all(&write_buf).await;
             }
             Ok(None) => {}
             Err(e) => {
-                resp::write_error(&mut write_buf, &e);
+                let write_buf = bounded_resp_buffer(socket, |write_buf| {
+                    resp::write_error(write_buf, &e);
+                });
                 return socket.write_all(&write_buf).await;
             }
         }
 
         if tokio::time::Instant::now() >= deadline {
-            resp::write_null_array(&mut write_buf);
+            let write_buf = bounded_resp_buffer(socket, |write_buf| {
+                resp::write_null_array(write_buf);
+            });
             return socket.write_all(&write_buf).await;
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            closed = socket.wait_for_peer_close() => {
+                closed?;
+                return Ok(());
+            }
+        }
     }
 }
 
 async fn handle_block_zpop(
-    socket: &mut tokio::net::TcpStream,
+    socket: &mut DeadlineStream,
     store: &Arc<Store>,
     keys: &[String],
     timeout: std::time::Duration,
     pop_min: bool,
 ) -> std::io::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut write_buf = BytesMut::new();
-
     loop {
         let now = Instant::now();
         let key_refs: Vec<&[u8]> = keys.iter().map(|key| key.as_bytes()).collect();
-        if let Ok(Some((key, items))) = cmd::journaled_zmpop(store, &key_refs, pop_min, 1, now) {
+        let result = {
+            let _tiered_memory = store.tiered_memory_boundary();
+            cmd::journaled_zmpop(store, &key_refs, pop_min, 1, now)
+        };
+        if let Ok(Some((key, items))) = result {
             if let Some((member, score)) = items.first() {
-                resp::write_array_header(&mut write_buf, 3);
-                resp::write_bulk_raw(&mut write_buf, &key);
-                resp::write_bulk(&mut write_buf, member);
-                let score_str = if score.fract() == 0.0 && score.abs() < 1e15 {
-                    format!("{}", *score as i64)
-                } else {
-                    format!("{}", score)
-                };
-                resp::write_bulk(&mut write_buf, &score_str);
+                let write_buf = bounded_resp_buffer(socket, |write_buf| {
+                    resp::write_array_header(write_buf, 3);
+                    resp::write_bulk_raw(write_buf, &key);
+                    resp::write_bulk(write_buf, member);
+                    let score_str = if score.fract() == 0.0 && score.abs() < 1e15 {
+                        format!("{}", *score as i64)
+                    } else {
+                        format!("{}", score)
+                    };
+                    resp::write_bulk(write_buf, &score_str);
+                });
                 return socket.write_all(&write_buf).await;
             }
         }
 
         if tokio::time::Instant::now() >= deadline {
-            resp::write_null_array(&mut write_buf);
+            let write_buf = bounded_resp_buffer(socket, |write_buf| {
+                resp::write_null_array(write_buf);
+            });
             return socket.write_all(&write_buf).await;
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            closed = socket.wait_for_peer_close() => {
+                closed?;
+                return Ok(());
+            }
+        }
     }
+}
+
+fn bounded_resp_buffer(socket: &DeadlineStream, write: impl FnOnce(&mut BytesMut)) -> BytesMut {
+    let mut buffer = BytesMut::new();
+    let output_limit = match socket.write_budget() {
+        Some(budget) => resp::limit_output_with_budget(socket.max_write_bytes(), 0, budget),
+        None => resp::limit_output(socket.max_write_bytes()),
+    };
+    write(&mut buffer);
+    let exceeded = output_limit.exceeded();
+    drop(output_limit);
+    if exceeded {
+        buffer.clear();
+        resp::write_error(&mut buffer, "ERR RESP response exceeds maximum");
+    }
+    buffer
 }
 
 fn handle_script_op(out: &mut BytesMut, script_engine: &lua::ScriptEngine, args: &[&[u8]]) {
@@ -4781,6 +5712,159 @@ mod tx_tests {
         assert_eq!(&out[..], b"$1\r\nv\r\n");
     }
 
+    fn limited_pipeline_executor(policy: EvictionPolicy) -> CommandExecutor {
+        let store = Arc::new(Store::new_with_config(Arc::new(ServerConfig {
+            shards: 1,
+            durability: DurabilityConfig {
+                policy: DurabilityPolicy::Ephemeral,
+                ..Default::default()
+            },
+            eviction: EvictionConfig {
+                max_memory: 1,
+                policy,
+                sample_size: 5,
+            },
+            ..ServerConfig::default()
+        })));
+        executor_for(store, Broker::new())
+    }
+
+    fn execute_test_pipeline(
+        executor: &CommandExecutor,
+        session: &mut CommandSession,
+        commands: &[&[&[u8]]],
+    ) -> BytesMut {
+        let commands: Vec<_> = commands.iter().map(|args| args.to_vec()).collect();
+        let mut out = BytesMut::new();
+        executor.execute_pipeline(&commands, session, &mut out, Instant::now());
+        out
+    }
+
+    #[test]
+    fn ephemeral_set_pipeline_checks_memory_before_each_write() {
+        let executor = limited_pipeline_executor(EvictionPolicy::NoEviction);
+        let mut session = CommandSession::new(false);
+        let commands: &[&[&[u8]]] = &[&[b"SET", b"first", b"one"], &[b"SET", b"second", b"two"]];
+
+        let out = execute_test_pipeline(&executor, &mut session, commands);
+
+        assert_eq!(
+            &out[..],
+            b"+OK\r\n-OOM command not allowed when used memory > 'maxmemory'\r\n"
+        );
+        assert_eq!(
+            executor.store.get(b"first", Instant::now()).unwrap(),
+            b"one"[..]
+        );
+        assert!(executor.store.get(b"second", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn ephemeral_set_pipeline_continues_after_memory_rejection() {
+        let executor = limited_pipeline_executor(EvictionPolicy::NoEviction);
+        executor.store.set(b"seed", b"value", None, Instant::now());
+        let mut session = CommandSession::new(false);
+        let commands: &[&[&[u8]]] = &[
+            &[b"SET", b"first", b"one"],
+            &[b"GET", b"seed"],
+            &[b"SET", b"second", b"two"],
+            &[b"GET", b"missing"],
+        ];
+
+        let out = execute_test_pipeline(&executor, &mut session, commands);
+
+        assert_eq!(
+            &out[..],
+            b"-OOM command not allowed when used memory > 'maxmemory'\r\n\
+              $5\r\nvalue\r\n\
+              -OOM command not allowed when used memory > 'maxmemory'\r\n\
+              $-1\r\n"
+        );
+        assert!(executor.store.get(b"first", Instant::now()).is_none());
+        assert!(executor.store.get(b"second", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn ephemeral_set_pipeline_preserves_per_command_eviction() {
+        let executor = limited_pipeline_executor(EvictionPolicy::AllKeysLru);
+        let mut session = CommandSession::new(false);
+        let commands: &[&[&[u8]]] = &[
+            &[b"SET", b"first", b"one"],
+            &[b"SET", b"second", b"two"],
+            &[b"GET", b"first"],
+            &[b"GET", b"second"],
+        ];
+
+        let out = execute_test_pipeline(&executor, &mut session, commands);
+
+        assert_eq!(&out[..], b"+OK\r\n+OK\r\n$-1\r\n$3\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn ephemeral_set_pipeline_waits_for_script_boundary() {
+        let store = Arc::new(Store::new());
+        let script_guard = store.script_write_guard();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                let executor = executor_for(store, Broker::new());
+                let mut session = CommandSession::new(false);
+                let commands: &[&[&[u8]]] =
+                    &[&[b"SET", b"first", b"one"], &[b"SET", b"second", b"two"]];
+                started_tx.send(()).unwrap();
+                let out = execute_test_pipeline(&executor, &mut session, commands);
+                finished_tx.send(out).unwrap();
+            }
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let early_reply = finished_rx.recv_timeout(Duration::from_millis(100));
+        drop(script_guard);
+        writer.join().unwrap();
+
+        assert!(
+            matches!(early_reply, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "pipeline writes crossed an active script boundary"
+        );
+        let out = finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(&out[..], b"+OK\r\n+OK\r\n");
+    }
+
+    #[test]
+    fn ephemeral_set_pipeline_waits_for_key_mutation_boundary() {
+        let store = Arc::new(Store::new());
+        let route: &[&[u8]] = &[b"SET", b"first", b"value", b"NX"];
+        let mutation_guard = store.prepare_journaled(route).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                let executor = executor_for(store, Broker::new());
+                let mut session = CommandSession::new(false);
+                let commands: &[&[&[u8]]] =
+                    &[&[b"SET", b"first", b"one"], &[b"SET", b"second", b"two"]];
+                started_tx.send(()).unwrap();
+                let out = execute_test_pipeline(&executor, &mut session, commands);
+                finished_tx.send(out).unwrap();
+            }
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let early_reply = finished_rx.recv_timeout(Duration::from_millis(100));
+        drop(mutation_guard);
+        writer.join().unwrap();
+
+        assert!(
+            matches!(early_reply, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "pipeline writes crossed an active key mutation boundary"
+        );
+        let out = finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(&out[..], b"+OK\r\n+OK\r\n");
+    }
+
     #[test]
     fn pubsub_commands_are_rejected_inside_multi() {
         let store = Arc::new(Store::new());
@@ -4800,7 +5884,10 @@ mod tx_tests {
             let mut in_multi = true;
             let mut tx_error = false;
             let mut tx_queue = Vec::new();
+            let mut tx_bytes = 0;
             let mut watched = Vec::new();
+            let mut watched_bytes = 0;
+            let mut retained_capacity = None;
             let mut authenticated = true;
             let mut secret_credential = None;
             let mut out = BytesMut::new();
@@ -4811,7 +5898,10 @@ mod tx_tests {
                 &mut in_multi,
                 &mut tx_error,
                 &mut tx_queue,
+                &mut tx_bytes,
                 &mut watched,
+                &mut watched_bytes,
+                &mut retained_capacity,
                 &mut authenticated,
                 &mut secret_credential,
                 &store,
@@ -5395,6 +6485,23 @@ mod persistence_config_tests {
 mod shutdown_tests {
     use super::*;
 
+    #[test]
+    fn auth_expiry_must_fit_both_clocks() {
+        assert!(valid_auth_token_ttl(Duration::from_secs(3600)));
+        assert!(!valid_auth_token_ttl(Duration::ZERO));
+        assert!(!valid_auth_token_ttl(Duration::from_secs(u64::MAX)));
+        assert!(!valid_auth_token_ttl(Duration::from_millis(u64::MAX)));
+        for field in 0..3 {
+            let mut config = ServerConfig::default();
+            config.auth.enabled = true;
+            match field {
+                0 => config.auth.access_token_ttl = Duration::MAX,
+                1 => config.auth.refresh_token_ttl = Duration::MAX,
+                _ => config.auth.flow_token_ttl = Duration::MAX,
+            }
+            assert!(validate_auth_config(&config).is_err());
+        }
+    }
     async fn wait_for_background_save(store: &Store) -> store::SnapshotStatus {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {

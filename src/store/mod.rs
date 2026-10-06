@@ -2,8 +2,11 @@ use bytes::Bytes;
 use hashbrown::{HashMap, HashSet as FxHashSet};
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::Arc;
@@ -16,6 +19,11 @@ mod transactions;
 mod vectors;
 
 pub(crate) use transactions::ExecutionReadGuard;
+
+thread_local! {
+    static TIERED_MEMORY_BOUNDARY_DEPTH: RefCell<BTreeMap<usize, usize>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId {
@@ -524,7 +532,16 @@ pub(crate) struct StoreMetrics {
     used_memory: AtomicUsize,
     lru_clock: AtomicU32,
     connected_clients: AtomicUsize,
+    connected_http_clients: AtomicUsize,
+    rejected_resp_connections: AtomicUsize,
+    rejected_http_connections: AtomicUsize,
+    rejected_auth_requests: AtomicUsize,
+    rejected_request_buffers: AtomicUsize,
+    rejected_response_buffers: AtomicUsize,
+    connection_timeouts: AtomicUsize,
     total_commands: AtomicUsize,
+    http_request_sequence: AtomicUsize,
+    slow_http_log_second: AtomicUsize,
     key_count: AtomicUsize,
     persistence_err_wal_append: AtomicUsize,
     persistence_err_wal_fsync: AtomicUsize,
@@ -538,7 +555,16 @@ impl StoreMetrics {
             used_memory: AtomicUsize::new(0),
             lru_clock: AtomicU32::new(0),
             connected_clients: AtomicUsize::new(0),
+            connected_http_clients: AtomicUsize::new(0),
+            rejected_resp_connections: AtomicUsize::new(0),
+            rejected_http_connections: AtomicUsize::new(0),
+            rejected_auth_requests: AtomicUsize::new(0),
+            rejected_request_buffers: AtomicUsize::new(0),
+            rejected_response_buffers: AtomicUsize::new(0),
+            connection_timeouts: AtomicUsize::new(0),
             total_commands: AtomicUsize::new(0),
+            http_request_sequence: AtomicUsize::new(1),
+            slow_http_log_second: AtomicUsize::new(0),
             key_count: AtomicUsize::new(0),
             persistence_err_wal_append: AtomicUsize::new(0),
             persistence_err_wal_fsync: AtomicUsize::new(0),
@@ -628,6 +654,12 @@ pub struct Store {
     /// ephemeral development exception. Initializing a key later does not make
     /// existing plaintext rows safe; bootstrap migration must clear this flag.
     auth_secret_storage_degraded: AtomicBool,
+    /// Keeps Push outbox capacity checks and batch fan-out inserts in one
+    /// engine-local critical section.
+    push_enqueue: parking_lot::Mutex<()>,
+    /// Serializes device ownership changes so a globally unique token cannot
+    /// be claimed twice through concurrent register/delete requests.
+    push_device_registry: parking_lot::Mutex<()>,
     /// Short-lived API-key resolutions belong to this engine instance. Keeping
     /// this on `Store` prevents one embedded server from authenticating against
     /// another server's `auth.keys` table.
@@ -663,6 +695,10 @@ pub struct Store {
     /// batch is being published. Multi-key readers retry when this changes,
     /// preventing a scan from combining rows from opposite sides of a commit.
     table_publication: AtomicU64,
+    /// Active tiered commands that must finish before hot placement changes.
+    tiered_memory_operations: AtomicUsize,
+    /// Closes admission while an over-limit tiered store is rebalanced.
+    tiered_memory_rebalancing: AtomicBool,
     /// Exact sentinel used only while replaying post-snapshot mutations. It
     /// keeps snapshot entries whose wall-clock TTL elapsed during downtime
     /// visible to TTL-preserving journal commands without reviving them after
@@ -703,6 +739,67 @@ pub struct Store {
     /// live queries. Absent for embedded/replay-only stores, so emission is a
     /// cheap no-op there.
     row_delta_broker: std::sync::OnceLock<crate::pubsub::Broker>,
+}
+
+/// Restores the tiered memory ceiling when the outer synchronous operation
+/// finishes. The marker keeps this guard on the thread where its nesting depth
+/// was registered.
+pub(crate) struct TieredMemoryBoundary<'a> {
+    store: Option<&'a Store>,
+    store_id: usize,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+struct TieredMemoryRebalance<'a>(&'a AtomicBool);
+
+impl Drop for TieredMemoryRebalance<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for TieredMemoryBoundary<'_> {
+    fn drop(&mut self) {
+        let Some(store) = self.store else {
+            return;
+        };
+        let outermost = TIERED_MEMORY_BOUNDARY_DEPTH.with(|depths| {
+            let mut depths = depths.borrow_mut();
+            let depth = depths
+                .get_mut(&self.store_id)
+                .expect("tiered memory boundary depth must exist");
+            *depth -= 1;
+            if *depth == 0 {
+                depths.remove(&self.store_id);
+                true
+            } else {
+                false
+            }
+        });
+        if !outermost {
+            return;
+        }
+
+        let over_limit = store.approximate_memory() > store.config().eviction.max_memory;
+        let rebalance = over_limit
+            && store
+                .tiered_memory_rebalancing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+        store
+            .tiered_memory_operations
+            .fetch_sub(1, Ordering::Release);
+        if !rebalance {
+            return;
+        }
+
+        let _rebalance = TieredMemoryRebalance(&store.tiered_memory_rebalancing);
+        while store.tiered_memory_operations.load(Ordering::Acquire) != 0 {
+            std::thread::yield_now();
+        }
+        let result = crate::eviction::evict_if_needed(store);
+        debug_assert!(result.is_ok(), "tiered rebalancing must not reject data");
+    }
 }
 
 /// A fully resolved mutation ready to cross the journal boundary. The payload
@@ -1658,6 +1755,8 @@ impl Store {
             config,
             encryption,
             auth_secret_storage_degraded: AtomicBool::new(auth_secret_storage_degraded),
+            push_enqueue: parking_lot::Mutex::new(()),
+            push_device_registry: parking_lot::Mutex::new(()),
             api_key_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             shards: shards.into_boxed_slice(),
             metrics: StoreMetrics::new(),
@@ -1672,6 +1771,8 @@ impl Store {
             journal_gates,
             table_mutation_gate: parking_lot::ReentrantMutex::new(()),
             table_publication: AtomicU64::new(0),
+            tiered_memory_operations: AtomicUsize::new(0),
+            tiered_memory_rebalancing: AtomicBool::new(false),
             recovery_expiry_sentinel: parking_lot::Mutex::new(None),
             wal_suppress: std::sync::atomic::AtomicBool::new(false),
             replaying_wal: std::sync::atomic::AtomicBool::new(false),
@@ -1699,6 +1800,50 @@ impl Store {
 
     pub fn config(&self) -> &crate::ServerConfig {
         &self.config
+    }
+
+    /// Keep tiered placement stable for one synchronous command or request and
+    /// restore the configured memory ceiling when the outer boundary ends.
+    pub(crate) fn tiered_memory_boundary(&self) -> TieredMemoryBoundary<'_> {
+        if !self.is_tiered() || !crate::eviction::eviction_enabled(self) {
+            return TieredMemoryBoundary {
+                store: None,
+                store_id: 0,
+                _not_send: PhantomData,
+            };
+        }
+
+        let store_id = std::ptr::from_ref(self).addr();
+        let outermost = TIERED_MEMORY_BOUNDARY_DEPTH.with(|depths| {
+            let mut depths = depths.borrow_mut();
+            let depth = depths.entry(store_id).or_insert(0);
+            *depth += 1;
+            *depth == 1
+        });
+        if outermost {
+            loop {
+                while self.tiered_memory_rebalancing.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                self.tiered_memory_operations.fetch_add(1, Ordering::AcqRel);
+                if !self.tiered_memory_rebalancing.load(Ordering::Acquire) {
+                    break;
+                }
+                self.tiered_memory_operations
+                    .fetch_sub(1, Ordering::Release);
+            }
+        }
+        TieredMemoryBoundary {
+            store: Some(self),
+            store_id,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Restore tiered placement after startup recovery, before the server is
+    /// made available to clients.
+    pub(crate) fn restore_tiered_memory_ceiling(&self) {
+        drop(self.tiered_memory_boundary());
     }
 
     pub(crate) fn snapshot_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
@@ -1848,6 +1993,13 @@ impl Store {
             .store(degraded, Ordering::Release);
     }
 
+    pub(crate) fn push_enqueue_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.push_enqueue.lock()
+    }
+
+    pub(crate) fn push_device_registry_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.push_device_registry.lock()
+    }
     pub(crate) fn begin_recovery(&self) {
         // The sentinel only needs to outlive synchronous startup replay. Its
         // exact value, rather than elapsed time, identifies staged entries.
@@ -2241,6 +2393,90 @@ impl Store {
             .fetch_sub(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn connected_http_clients(&self) -> usize {
+        self.metrics.connected_http_clients.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn http_client_connected(&self) {
+        self.metrics
+            .connected_http_clients
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn http_client_disconnected(&self) {
+        self.metrics
+            .connected_http_clients
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reject_resp_connection(&self) {
+        self.metrics
+            .rejected_resp_connections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rejected_resp_connections(&self) -> usize {
+        self.metrics
+            .rejected_resp_connections
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reject_http_connection(&self) {
+        self.metrics
+            .rejected_http_connections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rejected_http_connections(&self) -> usize {
+        self.metrics
+            .rejected_http_connections
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reject_auth_request(&self) {
+        self.metrics
+            .rejected_auth_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rejected_auth_requests(&self) -> usize {
+        self.metrics.rejected_auth_requests.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reject_request_buffer(&self) {
+        self.metrics
+            .rejected_request_buffers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rejected_request_buffers(&self) -> usize {
+        self.metrics
+            .rejected_request_buffers
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reject_response_buffer(&self) {
+        self.metrics
+            .rejected_response_buffers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rejected_response_buffers(&self) -> usize {
+        self.metrics
+            .rejected_response_buffers
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_connection_timeout(&self) {
+        self.metrics
+            .connection_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn connection_timeouts(&self) -> usize {
+        self.metrics.connection_timeouts.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn total_commands(&self) -> usize {
         self.metrics.total_commands.load(Ordering::Relaxed)
     }
@@ -2378,8 +2614,34 @@ impl Store {
 
     /// Whether this instance can safely accept normal traffic.
     pub(crate) fn ready_for_traffic(&self) -> bool {
-        self.accepting_mutations.load(Ordering::Acquire)
-            && !self.journal_poisoned.load(Ordering::Acquire)
+        self.readiness_reason().is_none()
+    }
+
+    pub(crate) fn next_http_request_id(&self) -> usize {
+        self.metrics
+            .http_request_sequence
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn allow_slow_http_log(&self) -> bool {
+        let second = self.metrics.start_time.elapsed().as_secs() as usize + 1;
+        self.metrics
+            .slow_http_log_second
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                (last < second).then_some(second)
+            })
+            .is_ok()
+    }
+
+    /// Fixed, secret-free reasons suitable for probes and INFO.
+    pub(crate) fn readiness_reason(&self) -> Option<&'static str> {
+        if !self.accepting_mutations.load(Ordering::Acquire) {
+            Some("shutting_down")
+        } else if self.journal_poisoned.load(Ordering::Acquire) {
+            Some("journal_unavailable")
+        } else {
+            None
+        }
     }
 
     pub(crate) fn ensure_journal_healthy(&self) -> std::io::Result<()> {
@@ -2463,10 +2725,7 @@ impl Store {
         let Some(broker) = self.row_delta_broker.get() else {
             return;
         };
-        broker.publish_row_delta(crate::pubsub::RowDelta {
-            table: table.to_string(),
-            pk: pk.to_string(),
-        });
+        broker.publish_row_delta(table, pk);
     }
 
     /// Decode and apply an `LXRESTORE` blob (COPY's resolved journal effect). Only
@@ -2479,6 +2738,30 @@ impl Store {
 
     pub(crate) fn lock_read_shard(&self, idx: usize) -> parking_lot::RwLockReadGuard<'_, Shard> {
         self.shards[idx].read()
+    }
+
+    /// Run a single-key read while its hot-or-absent placement is stable.
+    /// A cold key returns `None` so the caller can enter a promotion boundary.
+    pub(crate) fn with_stable_resident_or_absent_key<T>(
+        &self,
+        shard_idx: usize,
+        key: &[u8],
+        operation: impl FnOnce(&Shard) -> T,
+    ) -> Option<T> {
+        let _placement_guard = self.journal_gates[self.journal_gate_index(key)].lock();
+        let shard = self.shards[shard_idx].read();
+        if shard.data.contains_key(key) {
+            return Some(operation(&shard));
+        }
+
+        let cold = self.disk_shards.as_ref().is_some_and(|disk_shards| {
+            let disk_idx = self.disk_shard_index(key);
+            let key = std::str::from_utf8(key).unwrap_or_default();
+            disk_shards[disk_idx]
+                .lock()
+                .contains_valid(key, Instant::now())
+        });
+        (!cold).then(|| operation(&shard))
     }
 
     pub(crate) fn lock_write_shard(&self, idx: usize) -> parking_lot::RwLockWriteGuard<'_, Shard> {
@@ -2791,6 +3074,9 @@ impl Store {
                 self.record_wal_append_error();
                 self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
                     error: error.to_string(),
+                    error_kind: error.kind(),
+                    os_error: error.raw_os_error(),
+                    restart_required: self.journal_poisoned.load(Ordering::Acquire),
                 });
                 return Err(std::io::Error::other(format!(
                     "failed to remove rejected WAL command: {error}"
@@ -3057,6 +3343,9 @@ impl Store {
             self.record_wal_append_error();
             self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
                 error: error.to_string(),
+                error_kind: error.kind(),
+                os_error: error.raw_os_error(),
+                restart_required: self.journal_poisoned.load(Ordering::Acquire),
             });
             return Err(error);
         }
@@ -3082,6 +3371,9 @@ impl Store {
             self.record_wal_append_error();
             self.emit_error(crate::ServerErrorEvent::WalAppendFailed {
                 error: error.to_string(),
+                error_kind: error.kind(),
+                os_error: error.raw_os_error(),
+                restart_required: self.journal_poisoned.load(Ordering::Acquire),
             });
             return Err(match rollback_error {
                 Some(rollback_error) => std::io::Error::other(format!(
@@ -3099,6 +3391,9 @@ impl Store {
                 self.record_wal_fsync_error();
                 self.emit_error(crate::ServerErrorEvent::WalFsyncFailed {
                     error: error.to_string(),
+                    error_kind: error.kind(),
+                    os_error: error.raw_os_error(),
+                    restart_required: self.journal_poisoned.load(Ordering::Acquire),
                 });
                 return Err(match rollback_error {
                     Some(rollback_error) => std::io::Error::other(format!(
@@ -3353,6 +3648,9 @@ impl Store {
                 self.record_wal_fsync_error();
                 self.emit_error(crate::ServerErrorEvent::WalFsyncFailed {
                     error: e.to_string(),
+                    error_kind: e.kind(),
+                    os_error: e.raw_os_error(),
+                    restart_required: true,
                 });
                 return Err(e);
             }
@@ -3399,7 +3697,11 @@ impl Store {
             .map(Bytes::from)
     }
 
-    fn encrypt_kv_string_value(&self, key: &[u8], value: &[u8]) -> Result<Vec<u8>, String> {
+    pub(crate) fn encrypt_kv_string_value(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<Vec<u8>, String> {
         let key_name = Self::user_kv_key(key);
         self.encryption()
             .encrypt("__lux_kv", "value", &key_name, value)
@@ -5059,6 +5361,24 @@ impl Store {
                 _ => Err(WRONGTYPE.to_string()),
             },
             _ => Ok(vec![]),
+        }
+    }
+
+    pub(crate) fn smembers_limited(
+        &self,
+        key: &[u8],
+        limit: usize,
+        now: Instant,
+    ) -> Result<Vec<String>, String> {
+        self.try_promote(key, now)?;
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::Set(set) => Ok(set.iter().take(limit).cloned().collect()),
+                _ => Err(WRONGTYPE.to_string()),
+            },
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -7263,61 +7583,18 @@ pub struct DumpEntry {
 }
 
 struct GlobMatcher {
-    pattern: Vec<char>,
+    pattern: crate::glob::GlobPattern,
 }
 
 impl GlobMatcher {
     fn new(pattern: &str) -> Self {
         Self {
-            pattern: pattern.chars().collect(),
+            pattern: crate::glob::GlobPattern::new(pattern),
         }
     }
 
     fn matches(&self, s: &str) -> bool {
-        if self.pattern.len() == 1 && self.pattern[0] == '*' {
-            return true;
-        }
-        if self.pattern.len() > 10_000
-            && self.pattern.iter().filter(|&&ch| ch == '*').count() > 1_000
-        {
-            return false;
-        }
-        let s: Vec<char> = s.chars().collect();
-        Self::do_match(&self.pattern, &s)
-    }
-
-    /// Iterative glob matching (linear time). Avoids the exponential
-    /// backtracking of the naive recursive approach where patterns like
-    /// `a*a*a*a*b` against long strings would cause CPU exhaustion.
-    fn do_match(pattern: &[char], s: &[char]) -> bool {
-        let mut pi = 0;
-        let mut si = 0;
-        let mut star_pi = usize::MAX; // pattern index of last '*'
-        let mut star_si = 0; // string index when last '*' was hit
-
-        while si < s.len() {
-            if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == s[si]) {
-                pi += 1;
-                si += 1;
-            } else if pi < pattern.len() && pattern[pi] == '*' {
-                star_pi = pi;
-                star_si = si;
-                pi += 1; // try matching '*' with empty string first
-            } else if star_pi != usize::MAX {
-                // Mismatch: backtrack to last '*' and consume one more char.
-                pi = star_pi + 1;
-                star_si += 1;
-                si = star_si;
-            } else {
-                return false;
-            }
-        }
-
-        // Consume trailing '*'s in pattern.
-        while pi < pattern.len() && pattern[pi] == '*' {
-            pi += 1;
-        }
-        pi == pattern.len()
+        self.pattern.matches(s)
     }
 }
 #[cfg(test)]
@@ -8296,6 +8573,310 @@ mod tests {
     }
 
     #[test]
+    fn sorted_set_score_pagination_matches_complete_range() {
+        let store = Store::new();
+        let n = now();
+        let mut reference: Vec<(String, f64)> = (0..257)
+            .map(|index| (format!("member-{index:03}"), (index % 13) as f64 - 6.0))
+            .collect();
+        reference.push(("negative-infinity".to_string(), f64::NEG_INFINITY));
+        reference.push(("positive-infinity".to_string(), f64::INFINITY));
+        reference.push(("🦀".to_string(), 3.0));
+        reference.push(("𐀀".to_string(), 6.0));
+        reference.push(("🦀-infinity".to_string(), f64::INFINITY));
+        reference.push(("".to_string(), -6.0));
+        reference.push(("largest-finite".to_string(), f64::MAX));
+        reference.push(("smallest-positive".to_string(), f64::from_bits(1)));
+        let members: Vec<(&[u8], f64)> = reference
+            .iter()
+            .map(|(member, score)| (member.as_bytes(), *score))
+            .collect();
+        store
+            .zadd(b"pages", &members, false, false, false, false, false, n)
+            .unwrap();
+        reference.sort_by(|(left_member, left_score), (right_member, right_score)| {
+            left_score
+                .total_cmp(right_score)
+                .then_with(|| left_member.cmp(right_member))
+        });
+
+        for (min, max) in [
+            (f64::NEG_INFINITY, f64::INFINITY),
+            (-3.0, 3.0),
+            (0.0, 0.0),
+            (-6.0, 6.0),
+            (f64::MAX, f64::MAX),
+            (f64::from_bits(1), f64::from_bits(1)),
+            (3.0, -3.0),
+            (f64::INFINITY, f64::NEG_INFINITY),
+        ] {
+            for min_exclusive in [false, true] {
+                for max_exclusive in [false, true] {
+                    for reverse in [false, true] {
+                        let mut complete: Vec<_> = reference
+                            .iter()
+                            .filter(|(_, score)| {
+                                (if min_exclusive {
+                                    *score > min
+                                } else {
+                                    *score >= min
+                                }) && (if max_exclusive {
+                                    *score < max
+                                } else {
+                                    *score <= max
+                                })
+                            })
+                            .cloned()
+                            .collect();
+                        if reverse {
+                            complete.reverse();
+                        }
+                        for offset in [None, Some(0), Some(3), Some(256), Some(usize::MAX)] {
+                            for count in [None, Some(0), Some(1), Some(7), Some(300)] {
+                                let expected: Vec<_> = complete
+                                    .iter()
+                                    .skip(offset.unwrap_or(0))
+                                    .take(count.unwrap_or(usize::MAX))
+                                    .cloned()
+                                    .collect();
+                                let actual = store
+                                    .zrangebyscore(
+                                        b"pages",
+                                        min,
+                                        max,
+                                        min_exclusive,
+                                        max_exclusive,
+                                        reverse,
+                                        offset,
+                                        count,
+                                        false,
+                                        n,
+                                    )
+                                    .unwrap();
+                                assert_eq!(actual, expected, "bounds={min}..{max}, exclusive={min_exclusive}/{max_exclusive}, reverse={reverse}, offset={offset:?}, count={count:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(store
+            .zrangebyscore(
+                b"missing",
+                -1.0,
+                1.0,
+                false,
+                false,
+                false,
+                Some(0),
+                Some(0),
+                false,
+                n
+            )
+            .unwrap()
+            .is_empty());
+        store.set(b"string", b"value", None, n);
+        assert_eq!(
+            store
+                .zrangebyscore(
+                    b"string",
+                    -1.0,
+                    1.0,
+                    false,
+                    false,
+                    false,
+                    Some(0),
+                    Some(0),
+                    false,
+                    n
+                )
+                .unwrap_err(),
+            WRONGTYPE,
+        );
+    }
+
+    #[test]
+    fn sorted_set_score_counts_and_visitors_match_numeric_bounds() {
+        let store = Store::new();
+        let n = now();
+        let mut reference = vec![
+            ("\u{10ffff}\u{10ffff}suffix".to_string(), 1.0),
+            ("🦀".to_string(), 1.0),
+            ("ascii".to_string(), 2.0),
+            ("".to_string(), 0.0),
+            ("negative-zero".to_string(), -0.0),
+            ("negative-infinity".to_string(), f64::NEG_INFINITY),
+            ("\u{10ffff}\u{10ffff}infinity".to_string(), f64::INFINITY),
+            ("largest-finite".to_string(), f64::MAX),
+            ("smallest-positive".to_string(), f64::from_bits(1)),
+        ];
+        let members: Vec<_> = reference
+            .iter()
+            .map(|(member, score)| (member.as_bytes(), *score))
+            .collect();
+        store
+            .zadd(b"bounds", &members, false, false, false, false, false, n)
+            .unwrap();
+        reference.sort_by(|(left_member, left_score), (right_member, right_score)| {
+            OrderedFloat(*left_score)
+                .cmp(&OrderedFloat(*right_score))
+                .then_with(|| left_member.cmp(right_member))
+        });
+
+        for (min, max) in [
+            (1.0, 1.0),
+            (1.0, 2.0),
+            (f64::NEG_INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY),
+            (f64::INFINITY, f64::INFINITY),
+            (f64::MAX, f64::MAX),
+            (f64::from_bits(1), f64::from_bits(1)),
+            (-0.0, 0.0),
+            (2.0, 1.0),
+            (f64::INFINITY, f64::NEG_INFINITY),
+        ] {
+            for min_exclusive in [false, true] {
+                for max_exclusive in [false, true] {
+                    let expected: Vec<_> = reference
+                        .iter()
+                        .filter(|(_, score)| {
+                            (if min_exclusive {
+                                *score > min
+                            } else {
+                                *score >= min
+                            }) && (if max_exclusive {
+                                *score < max
+                            } else {
+                                *score <= max
+                            })
+                        })
+                        .cloned()
+                        .collect();
+                    assert_eq!(
+                        store
+                            .zcount(b"bounds", min, max, min_exclusive, max_exclusive, n)
+                            .unwrap(),
+                        expected.len() as i64,
+                        "count bounds={min}..{max}, exclusive={min_exclusive}/{max_exclusive}",
+                    );
+                    assert_eq!(
+                        store
+                            .zrangebyscore(
+                                b"bounds",
+                                min,
+                                max,
+                                min_exclusive,
+                                max_exclusive,
+                                false,
+                                None,
+                                None,
+                                false,
+                                n,
+                            )
+                            .unwrap(),
+                        expected,
+                    );
+                    if !min_exclusive && !max_exclusive {
+                        let mut visited = Vec::new();
+                        store
+                            .zvisit_scores_inclusive(b"bounds", min, max, n, |member, score| {
+                                visited.push((member.to_string(), score));
+                            })
+                            .unwrap();
+                        assert_eq!(visited, expected, "visitor bounds={min}..{max}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sorted_set_score_readers_reject_nan_bounds() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"bounds",
+                &[(b"one", 1.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        for key in [b"bounds".as_slice(), b"missing".as_slice()] {
+            for (min, max) in [(f64::NAN, 1.0), (1.0, f64::NAN), (f64::NAN, f64::NAN)] {
+                assert_eq!(
+                    store
+                        .zrangebyscore(key, min, max, false, false, false, None, None, false, n)
+                        .unwrap_err(),
+                    "ERR min or max is not a float",
+                );
+                assert_eq!(
+                    store.zcount(key, min, max, false, false, n).unwrap_err(),
+                    "ERR min or max is not a float",
+                );
+                assert_eq!(
+                    store
+                        .zvisit_scores_inclusive(key, min, max, n, |_, _| {
+                            panic!("invalid score bounds must not visit members");
+                        })
+                        .unwrap_err(),
+                    "ERR min or max is not a float",
+                );
+            }
+        }
+        store.set(b"string", b"value", None, n);
+        assert_eq!(
+            store
+                .zrangebyscore(b"string", 2.0, 1.0, false, false, false, None, None, false, n)
+                .unwrap_err(),
+            WRONGTYPE,
+        );
+        assert_eq!(
+            store
+                .zvisit_scores_inclusive(b"string", 2.0, 1.0, n, |_, _| {
+                    panic!("wrong-type values must not visit members");
+                })
+                .unwrap_err(),
+            WRONGTYPE,
+        );
+    }
+
+    #[test]
+    fn sorted_set_infinite_upper_bound_excludes_non_numeric_scores() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"bounds",
+                &[(b"nan" as &[u8], f64::NAN), (b"infinity", f64::INFINITY)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .zcount(b"bounds", 0.0, f64::INFINITY, false, false, n)
+                .unwrap(),
+            1
+        );
+        let mut visited = Vec::new();
+        store
+            .zvisit_scores_inclusive(b"bounds", 0.0, f64::INFINITY, n, |member, _| {
+                visited.push(member.to_string());
+            })
+            .unwrap();
+        assert_eq!(visited, ["infinity"]);
+    }
+
+    #[test]
     fn sorted_set_zcount() {
         let store = Store::new();
         let n = now();
@@ -8683,14 +9264,14 @@ mod tests {
     }
 
     #[test]
-    fn keys_matches_very_long_nested_pattern() {
+    fn keys_matches_very_long_nested_pattern_without_recursion() {
         let store = Store::new();
         let n = now();
         let key = "a".repeat(50_000);
         let pattern = "*?".repeat(50_000);
 
         store.set(key.as_bytes(), b"1", None, n);
-        assert!(store.keys(pattern.as_bytes(), n).is_empty());
+        assert_eq!(store.keys(pattern.as_bytes(), n), vec![key]);
     }
 
     #[test]
@@ -8746,6 +9327,8 @@ mod tests {
         });
         let store = Store::new_with_config(config);
         store.poison_journal();
+
+        assert_eq!(store.readiness_reason(), Some("journal_unavailable"));
 
         let command: [&[u8]; 3] = [b"SET", b"unsafe", b"value"];
         let error = store
