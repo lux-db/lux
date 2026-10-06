@@ -5,6 +5,10 @@
 //! callers cannot mutate state outside the normal command, WAL, and snapshot
 //! pipeline.
 
+// The 0.37 maintenance line builds with the current stable toolchain. Keep its
+// fixed-size chunk loops as shipped rather than rewriting them in a patch.
+#![allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
+
 mod auth;
 mod cmd;
 mod command;

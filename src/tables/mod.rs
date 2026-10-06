@@ -2327,12 +2327,25 @@ pub fn table_upsert_returning(
     conflict_col: Option<&str>,
     now: Instant,
 ) -> Result<Vec<(String, String)>, String> {
-    table_upsert_returning_ttl(store, cache, table, field_values, conflict_col, None, now)
+    table_upsert_returning_ttl(
+        store,
+        cache,
+        table,
+        field_values,
+        conflict_col,
+        None,
+        None,
+        now,
+    )
 }
 
 /// `table_upsert_returning` with a TTL op applied to the resulting row. A bare
 /// op (`None`) leaves any existing deadline untouched, so re-upserting a row
 /// without a TTL keeps it alive on its current schedule.
+/// Checks the existing row an upsert would overwrite before it is changed.
+pub type ExistingRowGuard<'a> = &'a dyn Fn(&[(String, String)]) -> Result<(), String>;
+
+#[allow(clippy::too_many_arguments)]
 pub fn table_upsert_returning_ttl(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -2340,6 +2353,7 @@ pub fn table_upsert_returning_ttl(
     field_values: &[(&str, &str)],
     conflict_col: Option<&str>,
     ttl: Option<TtlOp>,
+    existing_guard: Option<ExistingRowGuard<'_>>,
     now: Instant,
 ) -> Result<Vec<(String, String)>, String> {
     let schema = load_schema(store, cache, table, now)?;
@@ -2411,6 +2425,11 @@ pub fn table_upsert_returning_ttl(
 
     match existing_pk {
         Some(pk) => {
+            if let Some(guard) = existing_guard {
+                let existing = get_row(store, table, &schema, &pk, now, true)
+                    .ok_or_else(|| format!("ERR upserted row not found in table '{}'", table))?;
+                guard(&existing)?;
+            }
             // Update the conflicting row with the non-key fields, then return it.
             let mut updates: Vec<(&str, &str)> = field_values
                 .iter()
@@ -5168,6 +5187,7 @@ mod tests {
             &[("email", "a@example.com"), ("name", "updated")],
             Some("email"),
             Some(TtlOp::Clear),
+            None,
             now,
         )
         .unwrap();

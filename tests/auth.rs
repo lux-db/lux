@@ -468,3 +468,109 @@ fn publishable_with_end_user_token_reads_and_writes_per_grants() {
         "end-user principal must not reach secret-key routes: {status} {body}"
     );
 }
+
+// An upsert that hits an existing row overwrites it. The write grant must cover
+// that existing row (RLS USING), not just the values being written, or any user
+// can take over another user's row by sending its key with their own owner id.
+#[test]
+fn upsert_cannot_overwrite_another_users_row() {
+    let server = keyed_server();
+    let port = server.http_port();
+    let exec = |cmd: &str| {
+        common::http_request(
+            port,
+            "POST",
+            "/v1/exec",
+            Some(&format!(r#"{{"command":{cmd}}}"#)),
+            Some(SECRET),
+        )
+    };
+    let (status, out) = exec(
+        r#"["TCREATE","notes","id STR PRIMARY KEY,","slug STR UNIQUE,","owner_id STR,","body STR"]"#,
+    );
+    assert!(status < 400, "create table: {status} {out}");
+    let (status, out) =
+        exec(r#"["GRANT","read","write","ON","notes","WHERE","owner_id","=","auth.uid()"]"#);
+    assert!(
+        status < 400 && !out.contains("error"),
+        "grant: {status} {out}"
+    );
+
+    let field = |body: &str, key: &str| -> String {
+        body.split(&format!("\"{key}\":\""))
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let sign_up = |email: &str| -> (String, String) {
+        let (status, body) = common::http_request_with_headers(
+            port,
+            "POST",
+            "/auth/v1/signup",
+            Some(&format!(
+                r#"{{"email":"{email}","password":"hunter2hunter2"}}"#
+            )),
+            None,
+            &[&format!("apikey: {PUBLISHABLE}")],
+        );
+        assert!(status < 400, "signup {email}: {status} {body}");
+        (field(&body, "access_token"), field(&body, "id"))
+    };
+    let (alice_jwt, alice) = sign_up("alice-upsert@example.com");
+    let (bob_jwt, bob) = sign_up("bob-upsert@example.com");
+    let as_user = |jwt: &str, method: &str, path: &str, body: &str| {
+        let auth = format!("Authorization: Bearer {jwt}");
+        let apikey = format!("apikey: {PUBLISHABLE}");
+        common::http_request_with_headers(port, method, path, Some(body), None, &[&apikey, &auth])
+    };
+
+    let (status, body) = as_user(
+        &alice_jwt,
+        "POST",
+        "/v1/tables/notes",
+        &format!(r#"{{"id":"n1","slug":"alice-note","owner_id":"{alice}","body":"secret"}}"#),
+    );
+    assert!(status < 400, "alice writes her row: {status} {body}");
+
+    let attacks = [
+        (
+            "/v1/tables/notes?on_conflict=id",
+            format!(r#"{{"id":"n1","owner_id":"{bob}","body":"hijacked"}}"#),
+        ),
+        (
+            "/v1/tables/notes?upsert=true",
+            format!(r#"[{{"id":"n1","owner_id":"{bob}","body":"hijacked"}}]"#),
+        ),
+        (
+            "/v1/tables/notes?on_conflict=slug",
+            format!(r#"{{"id":"n9","slug":"alice-note","owner_id":"{bob}","body":"hijacked"}}"#),
+        ),
+    ];
+    for (path, payload) in &attacks {
+        let (status, body) = as_user(&bob_jwt, "POST", path, payload);
+        assert_eq!(
+            status, 403,
+            "bob must not overwrite alice's row via {path}: {body}"
+        );
+    }
+
+    let (status, rows) = common::http_request(port, "GET", "/v1/tables/notes", None, Some(SECRET));
+    assert!(status < 400, "secret read: {status} {rows}");
+    assert!(
+        rows.contains(&format!(r#""owner_id":"{alice}""#)) && rows.contains("secret"),
+        "alice's row must be untouched: {rows}"
+    );
+    assert!(!rows.contains("hijacked"), "no attack may land: {rows}");
+
+    // Legitimate upserts still work: a new row, then an update to one's own row.
+    let own = format!(r#"{{"id":"n2","slug":"bob-note","owner_id":"{bob}","body":"v1"}}"#);
+    let (status, body) = as_user(&bob_jwt, "POST", "/v1/tables/notes?on_conflict=id", &own);
+    assert!(status < 400, "bob inserts via upsert: {status} {body}");
+    let own = format!(r#"{{"id":"n2","owner_id":"{bob}","body":"v2"}}"#);
+    let (status, body) = as_user(&bob_jwt, "POST", "/v1/tables/notes?on_conflict=id", &own);
+    assert!(
+        status < 400 && body.contains("v2"),
+        "bob updates his own row via upsert: {status} {body}"
+    );
+}
