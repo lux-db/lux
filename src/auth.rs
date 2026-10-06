@@ -5877,24 +5877,55 @@ pub(crate) fn check_write_row(
     row_value: impl Fn(&str) -> Option<String>,
     now: Instant,
 ) -> Result<(), String> {
-    let Some(conds) = enforced_conds(
-        store,
-        cache,
-        principal,
-        table,
-        crate::grants::Scope::Write,
-        now,
-    )?
-    else {
-        return Err(format!("no write access to '{table}'"));
-    };
-    if conds
-        .iter()
-        .any(|clause| crate::grants::enforced_row_satisfies(clause, &row_value))
-    {
-        Ok(())
-    } else {
-        Err(format!("row not permitted by write grant on '{table}'"))
+    WriteGrant::resolve(store, cache, principal, table, now)?.check(row_value)
+}
+
+/// A caller's resolved write grant on one table. Resolve it before a mutation
+/// takes its locks, then test any existing row the mutation would overwrite
+/// (RLS `USING`) as well as the row it would write (`WITH CHECK`).
+pub(crate) struct WriteGrant {
+    table: String,
+    clauses: Vec<Vec<crate::grants::EnforcedCondition>>,
+}
+
+impl WriteGrant {
+    pub(crate) fn resolve(
+        store: &Store,
+        cache: &SharedSchemaCache,
+        principal: &AuthPrincipal,
+        table: &str,
+        now: Instant,
+    ) -> Result<Self, String> {
+        let Some(clauses) = enforced_conds(
+            store,
+            cache,
+            principal,
+            table,
+            crate::grants::Scope::Write,
+            now,
+        )?
+        else {
+            return Err(format!("no write access to '{table}'"));
+        };
+        Ok(Self {
+            table: table.to_string(),
+            clauses,
+        })
+    }
+
+    pub(crate) fn check(&self, row_value: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+        if self
+            .clauses
+            .iter()
+            .any(|clause| crate::grants::enforced_row_satisfies(clause, &row_value))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "row not permitted by write grant on '{}'",
+                self.table
+            ))
+        }
     }
 }
 
