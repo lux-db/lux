@@ -1,11 +1,11 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
+use aws_lc_rs::encoding::AsDer;
+use aws_lc_rs::rsa::{KeyPair as RsaKeyPair, KeySize, PublicKeyComponents};
+use aws_lc_rs::signature::KeyPair as _;
 use p256::pkcs8::EncodePublicKey;
 use parking_lot::RwLock;
-use rsa::pkcs8::EncodePrivateKey as EncodeRsaPrivateKey;
-use rsa::traits::PublicKeyParts;
-use rsa::RsaPrivateKey;
 
 use super::*;
 use crate::tables::SchemaCache;
@@ -4026,13 +4026,11 @@ struct AppleTestRsaKey {
 fn apple_test_rsa_key() -> &'static AppleTestRsaKey {
     static KEY: OnceLock<AppleTestRsaKey> = OnceLock::new();
     KEY.get_or_init(|| {
-        let private = RsaPrivateKey::new(&mut OsRng, 2048).expect("generate test RSA key");
-        let private_pem = private
-            .to_pkcs8_pem(LineEnding::LF)
-            .expect("encode test RSA key")
-            .to_string();
-        let n = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(private.n().to_bytes_be());
-        let e = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(private.e().to_bytes_be());
+        let private = RsaKeyPair::generate(KeySize::Rsa2048).expect("generate test RSA key");
+        let private_pem = rsa_pkcs8_pem(&private);
+        let public = PublicKeyComponents::<Vec<u8>>::from(private.public_key());
+        let n = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public.n);
+        let e = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public.e);
         let jwks = serde_json::from_value(json!({
             "keys": [{
                 "kty": "RSA",
@@ -4046,6 +4044,18 @@ fn apple_test_rsa_key() -> &'static AppleTestRsaKey {
         .expect("build test Apple JWKS");
         AppleTestRsaKey { private_pem, jwks }
     })
+}
+
+fn rsa_pkcs8_pem(key: &RsaKeyPair) -> String {
+    let der = key.as_der().expect("encode test RSA key");
+    let body = base64::engine::general_purpose::STANDARD.encode(der.as_ref());
+    let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
+    for line in body.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(line).unwrap());
+        pem.push('\n');
+    }
+    pem.push_str("-----END PRIVATE KEY-----\n");
+    pem
 }
 
 fn apple_test_jwks() -> JwkSet {
@@ -4136,6 +4146,43 @@ fn verify_apple_id_token_rejects_expired() {
     let jwks = apple_test_jwks();
     let token = mint_apple_id_token("com.pompeii.app", "s", None, None, -3600);
     assert!(verify_apple_id_token(&jwks, &token, &["com.pompeii.app".to_string()], None).is_err());
+}
+
+#[test]
+fn verify_apple_id_token_rejects_forged_signature() {
+    let jwks = apple_test_jwks();
+    let audience = ["com.pompeii.app".to_string()];
+    let token = mint_apple_id_token("com.pompeii.app", "apple-sub-001", None, None, 3600);
+    assert!(verify_apple_id_token(&jwks, &token, &audience, None).is_ok());
+
+    // Same claims and kid, signed by a key Apple never published.
+    let forger = RsaKeyPair::generate(KeySize::Rsa2048).unwrap();
+    let (signing_input, _) = token.rsplit_once('.').unwrap();
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(APPLE_TEST_KID.to_string());
+    let claims: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(signing_input.split('.').nth(1).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let forged = encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_pem(rsa_pkcs8_pem(&forger).as_bytes()).unwrap(),
+    )
+    .unwrap();
+    assert!(verify_apple_id_token(&jwks, &forged, &audience, None).is_err());
+
+    // A genuine signature over altered claims.
+    let (_, signature) = token.rsplit_once('.').unwrap();
+    let mut altered = claims.clone();
+    altered["sub"] = json!("apple-sub-attacker");
+    let altered_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&altered).unwrap());
+    let header_part = signing_input.split('.').next().unwrap();
+    let spliced = format!("{header_part}.{altered_payload}.{signature}");
+    assert!(verify_apple_id_token(&jwks, &spliced, &audience, None).is_err());
 }
 
 #[test]
