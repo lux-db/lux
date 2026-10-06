@@ -2988,6 +2988,11 @@ pub fn table_insert_many_returning_ttl(
     Ok(out)
 }
 
+/// Checks the existing row an upsert would overwrite. It runs inside the table
+/// mutation, so the row cannot change between the check and the write.
+pub type ExistingRowGuard<'a> = &'a dyn Fn(&[(String, String)]) -> Result<(), String>;
+
+#[allow(clippy::too_many_arguments)]
 pub fn table_upsert_many_returning_ttl(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -2995,6 +3000,7 @@ pub fn table_upsert_many_returning_ttl(
     rows: &[Vec<(String, String)>],
     conflict_col: Option<&str>,
     ttl: Option<TtlOp>,
+    existing_guard: Option<ExistingRowGuard<'_>>,
     now: Instant,
 ) -> Result<Vec<Vec<(String, String)>>, String> {
     if rows.is_empty() {
@@ -3014,6 +3020,7 @@ pub fn table_upsert_many_returning_ttl(
             &field_values,
             conflict_col,
             ttl,
+            existing_guard,
             now,
             &mut mutation,
         )?;
@@ -3053,12 +3060,22 @@ pub fn table_upsert_returning(
     conflict_col: Option<&str>,
     now: Instant,
 ) -> Result<Vec<(String, String)>, String> {
-    table_upsert_returning_ttl(store, cache, table, field_values, conflict_col, None, now)
+    table_upsert_returning_ttl(
+        store,
+        cache,
+        table,
+        field_values,
+        conflict_col,
+        None,
+        None,
+        now,
+    )
 }
 
 /// `table_upsert_returning` with a TTL op applied to the resulting row. A bare
 /// op (`None`) leaves any existing deadline untouched, so re-upserting a row
 /// without a TTL keeps it alive on its current schedule.
+#[allow(clippy::too_many_arguments)]
 pub fn table_upsert_returning_ttl(
     store: &Store,
     cache: &SharedSchemaCache,
@@ -3066,6 +3083,7 @@ pub fn table_upsert_returning_ttl(
     field_values: &[(&str, &str)],
     conflict_col: Option<&str>,
     ttl: Option<TtlOp>,
+    existing_guard: Option<ExistingRowGuard<'_>>,
     now: Instant,
 ) -> Result<Vec<(String, String)>, String> {
     let route: [&[u8]; 2] = [b"TROWSET", table.as_bytes()];
@@ -3076,6 +3094,7 @@ pub fn table_upsert_returning_ttl(
         field_values,
         conflict_col,
         ttl,
+        existing_guard,
         now,
         &mut mutation,
     )?;
@@ -3083,12 +3102,14 @@ pub fn table_upsert_returning_ttl(
     Ok(staged.row)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage_table_upsert(
     cache: &SharedSchemaCache,
     table: &str,
     field_values: &[(&str, &str)],
     conflict_col: Option<&str>,
     ttl: Option<TtlOp>,
+    existing_guard: Option<ExistingRowGuard<'_>>,
     now: Instant,
     mutation: &mut TableMutation<'_>,
 ) -> Result<StagedTableRow, String> {
@@ -3167,6 +3188,11 @@ fn stage_table_upsert(
     };
     match existing_pk {
         Some(pk) => {
+            if let Some(guard) = existing_guard {
+                let existing = get_row(store, table, &schema, &pk, now, true)?
+                    .ok_or_else(|| format!("ERR upserted row not found in table '{}'", table))?;
+                guard(&existing)?;
+            }
             // Update the conflicting row with the non-key fields, then return it.
             let updates: Vec<(&str, &str)> = field_values
                 .iter()
@@ -5406,9 +5432,17 @@ mod tests {
             ],
         ];
 
-        let error =
-            table_upsert_many_returning_ttl(&store, &cache, "nodes", &rows, Some("id"), None, n)
-                .expect_err("a staged update must stop satisfying its old unique value");
+        let error = table_upsert_many_returning_ttl(
+            &store,
+            &cache,
+            "nodes",
+            &rows,
+            Some("id"),
+            None,
+            None,
+            n,
+        )
+        .expect_err("a staged update must stop satisfying its old unique value");
         assert!(error.contains("foreign key violation"), "{error}");
         let original = table_get(&store, &cache, "nodes", 1, n).unwrap();
         assert_eq!(row_field(&original, "code"), Some("old"));
@@ -7558,6 +7592,7 @@ mod tests {
             &[("email", "a@example.com"), ("name", "updated")],
             Some("email"),
             Some(TtlOp::Clear),
+            None,
             now,
         )
         .unwrap();

@@ -5612,6 +5612,45 @@ fn route_table_insert(
     let is_upsert = conflict.is_some() || get_param(params, "upsert") == Some("true");
     let ttl = parse_ttl_param(params);
 
+    // An upsert that hits an existing row overwrites it, so a token user's write
+    // grant must cover that row too (RLS USING), not only the new values.
+    let existing_grant = match auth {
+        HttpAuthContext::User(principal) if is_upsert && store.config().auth.enabled => {
+            match crate::auth::WriteGrant::resolve(store, cache, principal, table, now) {
+                Ok(grant) => Some(grant),
+                Err(e) => return forbidden(&e),
+            }
+        }
+        _ => None,
+    };
+    let existing_denied = std::cell::Cell::new(false);
+    let check_existing = |row: &[(String, String)]| -> Result<(), String> {
+        let Some(grant) = existing_grant.as_ref() else {
+            return Ok(());
+        };
+        grant
+            .check(|col| {
+                row.iter()
+                    .find(|(name, _)| name == col)
+                    .map(|(_, value)| value.clone())
+            })
+            .inspect_err(|_| existing_denied.set(true))
+    };
+    let existing_guard: Option<crate::tables::ExistingRowGuard<'_>> = existing_grant
+        .as_ref()
+        .map(|_| &check_existing as crate::tables::ExistingRowGuard<'_>);
+    let write_error = |e: String| {
+        if existing_denied.get() {
+            forbidden(&e)
+        } else {
+            (
+                400,
+                "Bad Request",
+                format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+            )
+        }
+    };
+
     let write_one = |obj: &serde_json::Map<String, serde_json::Value>| {
         let pairs = json_obj_to_pairs(obj);
         let fv: Vec<(&str, &str)> = pairs
@@ -5619,7 +5658,16 @@ fn route_table_insert(
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         if is_upsert {
-            crate::tables::table_upsert_returning_ttl(store, cache, table, &fv, conflict, ttl, now)
+            crate::tables::table_upsert_returning_ttl(
+                store,
+                cache,
+                table,
+                &fv,
+                conflict,
+                ttl,
+                existing_guard,
+                now,
+            )
         } else {
             crate::tables::table_insert_returning_ttl(store, cache, table, &fv, ttl, now)
         }
@@ -5643,7 +5691,14 @@ fn route_table_insert(
         }
         let result = if is_upsert {
             crate::tables::table_upsert_many_returning_ttl(
-                store, cache, table, &rows_in, conflict, ttl, now,
+                store,
+                cache,
+                table,
+                &rows_in,
+                conflict,
+                ttl,
+                existing_guard,
+                now,
             )
         } else {
             crate::tables::table_insert_many_returning_ttl(store, cache, table, &rows_in, ttl, now)
@@ -5656,11 +5711,7 @@ fn route_table_insert(
                     &render_columns(store, cache, table, Instant::now()),
                 ))
             }
-            Err(e) => (
-                400,
-                "Bad Request",
-                format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
-            ),
+            Err(e) => write_error(e),
         };
     }
 
@@ -5682,12 +5733,16 @@ fn route_table_insert(
                 &render_columns(store, cache, table, Instant::now()),
             ))
         }
-        Err(e) => (
-            400,
-            "Bad Request",
-            format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
-        ),
+        Err(e) => write_error(e),
     }
+}
+
+fn forbidden(message: &str) -> (u16, &'static str, String) {
+    (
+        403,
+        "Forbidden",
+        format!(r#"{{"error":"{}"}}"#, escape_json(message)),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
