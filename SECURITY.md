@@ -12,9 +12,12 @@ The default production model is:
   authenticated gateway.
 - Expose the HTTP API only behind operator/app authentication and normal network
   controls.
-- Configure exact `LUX_HTTP_ALLOWED_HOSTS` and `LUX_HTTP_ALLOWED_ORIGINS` values
-  for every browser-facing HTTP listener. A non-loopback bind that enables any
-  browser origin fails closed without an explicit Host allowlist.
+- Configure an operator password or project keys on every browser-facing HTTP
+  listener. A credential-gated Engine answers any browser origin and Host name,
+  so credentials and grants are the boundary. An Engine without credentials
+  answers only the exact `LUX_HTTP_ALLOWED_ORIGINS` and `LUX_HTTP_ALLOWED_HOSTS`
+  values, and a non-loopback bind that enables any origin fails closed without
+  an explicit Host allowlist.
 - Use long random operator credentials when `LUX_PASSWORD` is enabled.
 - Run Lux as an unprivileged OS user with access only to its data and storage
   directories.
