@@ -166,7 +166,7 @@ impl Broker {
     /// Drop one live-query subscription to `table`'s row deltas.
     pub fn unsubscribe_row_deltas(&self, table: &str) {
         self.row_delta_sub_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))
             })
             .ok();
